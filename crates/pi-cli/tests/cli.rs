@@ -43,19 +43,22 @@ fn foreign_fixture(home: &Path, cwd: &Path, source: &str, id: &str) -> PathBuf {
     let cwd = cwd.display().to_string().replace('\\', "\\\\");
     let (path, body) = match source {
         "omp" => (
-            home.join(".omp/agent/sessions/project").join(format!("{id}.jsonl")),
+            home.join(".omp/agent/sessions/project")
+                .join(format!("{id}.jsonl")),
             format!(
                 "{{\"type\":\"title\",\"v\":1,\"title\":\"OMP fixture\",\"updatedAt\":\"2026-01-01T00:00:00Z\",\"pad\":\" \"}}\n{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"{cwd}\"}}\n{{\"type\":\"message\",\"id\":\"u\",\"parentId\":null,\"message\":{{\"role\":\"user\",\"content\":\"omp question\"}}}}\n{{\"type\":\"message\",\"id\":\"a\",\"parentId\":\"u\",\"message\":{{\"role\":\"assistant\",\"content\":\"omp answer\"}}}}\n"
             ),
         ),
         "codex" => (
-            home.join(".codex/sessions").join(format!("rollout-{id}.jsonl")),
+            home.join(".codex/sessions")
+                .join(format!("rollout-{id}.jsonl")),
             format!(
                 "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"{cwd}\"}}}}\n{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"codex question\"}}]}}}}\n{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"codex answer\"}}]}}}}\n"
             ),
         ),
         "claude" => (
-            home.join(".claude/projects/project").join(format!("{id}.jsonl")),
+            home.join(".claude/projects/project")
+                .join(format!("{id}.jsonl")),
             format!(
                 "{{\"type\":\"user\",\"uuid\":\"u\",\"parentUuid\":null,\"isSidechain\":false,\"sessionId\":\"{id}\",\"cwd\":\"{cwd}\",\"message\":{{\"role\":\"user\",\"content\":\"claude question\"}}}}\n{{\"type\":\"assistant\",\"uuid\":\"a\",\"parentUuid\":\"u\",\"isSidechain\":false,\"sessionId\":\"{id}\",\"cwd\":\"{cwd}\",\"message\":{{\"role\":\"assistant\",\"content\":\"claude answer\"}}}}\n{{\"type\":\"last-prompt\",\"leafUuid\":\"a\",\"sessionId\":\"{id}\"}}\n"
             ),
@@ -93,13 +96,15 @@ fn command(home: &Path) -> Command {
         .env("HOME", home)
         .env("SESSIONS_HOME", home)
         .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("PI_CODING_AGENT_SESSION_DIR")
         .env_remove("PI_PROFILE")
         .env_remove("CODEX_HOME")
+        .env_remove("RPI_HOME")
         .env_remove("CLAUDE_CONFIG_DIR");
     command
 }
 fn set_session_import_sources(home: &Path, sources: &[&str]) {
-    let agent_dir = home.join(".pi/agent");
+    let agent_dir = home.join(".rpi");
     fs::create_dir_all(&agent_dir).expect("agent settings directory");
     fs::write(
         agent_dir.join("settings.json"),
@@ -171,6 +176,19 @@ fn plant_session(home: &Path, cwd: &Path, id: &str, timestamp: &str) -> PathBuf 
         id,
         timestamp,
     )
+}
+
+/// Create the hermetic session store directory for `cwd` (the per-cwd
+/// `<agent>/sessions/--<encoded-cwd>--` subtree). The sandbox authority now
+/// fails closed when the bootstrapping session's store root is absent, so
+/// spawned-binary fixtures that point their cwd here must create it first.
+fn plant_session_store(home: &Path, cwd: &Path) {
+    let dir = home
+        .join(".pi")
+        .join("agent")
+        .join("sessions")
+        .join(format!("--{}--", encode_cwd_safe_path(cwd)));
+    fs::create_dir_all(&dir).expect("create session store dir");
 }
 
 /// Write a minimal native Pi v3 session under an explicit sessions root (used
@@ -259,10 +277,31 @@ fn help_lists_flags_and_subcommands() {
     let home = TempDir::new().unwrap();
     let (ok, out, _) = run(home.path(), &["--help"]);
     assert!(ok, "--help must exit 0");
-    for flag in ["--provider", "--system-prompt", "--append-system-prompt", "--add-dir", "--session", "--session-id", "--models", "--tools", "--extension", "--list-models", "--offline", "--profile"] {
+    for flag in [
+        "--provider",
+        "--system-prompt",
+        "--append-system-prompt",
+        "--add-dir",
+        "--session",
+        "--session-id",
+        "--models",
+        "--tools",
+        "--extension",
+        "--list-models",
+        "--offline",
+        "--profile",
+    ] {
         assert!(out.contains(flag), "help lists {flag}");
     }
-    for command in ["import-session", "models", "sessions", "install", "remove", "update", "config"] {
+    for command in [
+        "import-session",
+        "models",
+        "sessions",
+        "install",
+        "remove",
+        "update",
+        "config",
+    ] {
         assert!(out.contains(command), "help lists {command}");
     }
 }
@@ -272,7 +311,10 @@ fn version_is_emitted() {
     let home = TempDir::new().unwrap();
     let (ok, out, _) = run(home.path(), &["--version"]);
     assert!(ok, "--version must exit 0");
-    assert!(out.starts_with("rpi "), "--version prints \"rpi <version>\"");
+    assert!(
+        out.starts_with("rpi "),
+        "--version prints \"rpi <version>\""
+    );
 }
 
 #[test]
@@ -293,10 +335,22 @@ fn models_quarantines_malformed_optional_radius_cache_once_and_stays_quiet() {
     fs::write(&store, b"{}").expect("write malformed Radius cache");
 
     let (ok, out, err) = run(home.path(), &["--offline", "models"]);
-    assert!(ok, "models must recover from malformed optional cache: {err}");
-    assert!(out.contains("faux-1"), "builtin catalog must remain available: {out}");
-    assert!(err.trim().is_empty(), "normal models output must stay quiet: {err:?}");
-    assert!(!out.contains("models-store"), "cache diagnostics leaked to stdout: {out}");
+    assert!(
+        ok,
+        "models must recover from malformed optional cache: {err}"
+    );
+    assert!(
+        out.contains("faux-1"),
+        "builtin catalog must remain available: {out}"
+    );
+    assert!(
+        err.trim().is_empty(),
+        "normal models output must stay quiet: {err:?}"
+    );
+    assert!(
+        !out.contains("models-store"),
+        "cache diagnostics leaked to stdout: {out}"
+    );
     assert!(!store.exists(), "malformed cache must be quarantined");
     assert_eq!(
         fs::read_dir(&agent_dir)
@@ -315,7 +369,10 @@ fn models_quarantines_malformed_optional_radius_cache_once_and_stays_quiet() {
     let (ok, out, err) = run(home.path(), &["--offline", "models"]);
     assert!(ok, "subsequent models launch must stay healthy: {err}");
     assert!(out.contains("faux-1"));
-    assert!(err.trim().is_empty(), "subsequent launch repeated warning: {err:?}");
+    assert!(
+        err.trim().is_empty(),
+        "subsequent launch repeated warning: {err:?}"
+    );
 }
 
 #[test]
@@ -372,6 +429,7 @@ fn models_empty_filter_is_silent() {
 fn sessions_empty_for_fresh_dir() {
     let home = TempDir::new().unwrap();
     let cwd = TempDir::new().unwrap();
+    plant_session_store(home.path(), cwd.path());
     let output = Command::new(rpi_bin())
         .arg("sessions")
         .env("HOME", home.path())
@@ -485,6 +543,44 @@ fn import_session_codex_fixture_succeeds() {
         "an emitted .jsonl exists in output dir"
     );
 }
+#[test]
+fn implicit_import_session_creates_missing_configured_root() {
+    let home = TempDir::new().expect("home");
+    let fixtures = TempDir::new().expect("fixtures");
+    let fixture = codex_fixture(fixtures.path(), "implicit-missing-root");
+    let session_dir = home.path().join("missing/nested/session-root");
+    assert!(!session_dir.exists());
+
+    let output = command(home.path())
+        .args(["import-session", "codex"])
+        .arg(&fixture)
+        .arg("--session-dir")
+        .arg(&session_dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run implicit import-session");
+
+    assert!(
+        output.status.success(),
+        "implicit import-session succeeds: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        session_dir.is_dir(),
+        "configured root is created as a directory"
+    );
+    let emitted = fs::read_dir(&session_dir)
+        .expect("read configured root")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(emitted.len(), 1, "one imported JSONL under configured root");
+    assert_eq!(emitted[0].parent(), Some(session_dir.as_path()));
+}
 
 #[test]
 fn import_session_no_convertible_fails() {
@@ -509,9 +605,6 @@ fn import_session_no_convertible_fails() {
         "error explains no convertible messages: {err}"
     );
 }
-
-
-
 
 #[test]
 fn unified_resume_honors_sessions_home_for_native_and_foreign() {
@@ -635,10 +728,13 @@ fn unified_resume_accepts_foreign_path_and_reuses_idempotent_import() {
         assert!(ok, "resume {input} failed: {err}");
     }
 
-    let native_root = home.path().join(".pi/agent/sessions");
+    let native_root = home.path().join(".rpi/sessions");
     let emitted = walk_files(&native_root)
         .into_iter()
-        .filter(|path| path.extension().is_some_and(|extension| extension == "jsonl"))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
         .collect::<Vec<_>>();
     assert_eq!(emitted.len(), 1, "idempotent resume emitted {emitted:?}");
 }
@@ -693,9 +789,11 @@ fn unified_resume_rejects_ambiguous_malformed_and_oversized_inputs() {
         ],
     );
     assert!(!ok, "oversized foreign input must fail");
-    assert!(err.contains("exceeds import limits"), "oversized error: {err}");
+    assert!(
+        err.contains("exceeds import limits"),
+        "oversized error: {err}"
+    );
 }
-
 
 #[test]
 fn repl_resume_lists_unified_catalog_and_switches_by_id() {
@@ -734,7 +832,10 @@ fn automatic_resume_defaults_native_only_and_rejects_foreign_path_and_id() {
             ],
         );
         assert!(!ok, "default policy must reject foreign resume {input}");
-        assert!(err.contains("session not found"), "unexpected rejection: {err}");
+        assert!(
+            err.contains("session not found"),
+            "unexpected rejection: {err}"
+        );
     }
 }
 
@@ -751,14 +852,12 @@ fn manual_repl_import_remains_available_with_native_only_policy() {
     );
 
     let input = format!("/import {}\n/quit\n", source.display());
-    let (ok, out, err) = run_stdin(
-        home.path(),
-        cwd.path(),
-        &["-m", "faux/faux-1"],
-        &input,
-    );
+    let (ok, out, err) = run_stdin(home.path(), cwd.path(), &["-m", "faux/faux-1"], &input);
     assert!(ok, "manual /import failed under native-only policy: {err}");
-    assert!(out.contains("imported and resumed"), "manual import output: {out}");
+    assert!(
+        out.contains("imported and resumed"),
+        "manual import output: {out}"
+    );
 }
 
 fn walk_files(root: &Path) -> Vec<PathBuf> {
@@ -781,6 +880,9 @@ fn resume_native_restores_faux_model_and_message_count() {
     let home = TempDir::new().unwrap();
     let cwd = TempDir::new().unwrap();
     let path = plant_full_session(home.path(), cwd.path(), "r1", "2026-03-01T00:00:00.000Z");
+    // No --cwd, so the spawned binary bootstraps against the process cwd and
+    // needs its hermetic session store present for the sandbox authority.
+    plant_session_store(home.path(), &std::env::current_dir().expect("cwd"));
 
     // No -m override: the faux model must be restored from the session's
     // model_change record rather than defaulting to anthropic.
@@ -808,6 +910,10 @@ fn resume_native_restores_cwd_from_session_header() {
         "2026-03-02T00:00:00.000Z",
     );
 
+    // No --cwd, so the spawned binary bootstraps against the process cwd and
+    // needs its hermetic session store present for the sandbox authority.
+    plant_session_store(home.path(), &std::env::current_dir().expect("cwd"));
+
     // Run without --cwd: the session header's cwd must override the process
     // cwd so the REPL reflects the directory the session was started in.
     let (ok, out, err) = run(home.path(), &["--resume", path.to_str().unwrap()]);
@@ -829,6 +935,9 @@ fn resume_native_cwd_flag_overrides_session_header_cwd() {
         "cwd-override",
         "2026-03-03T00:00:00.000Z",
     );
+    // --cwd steers the spawned binary's bootstrap, so its hermetic session
+    // store must exist for the sandbox authority.
+    plant_session_store(home.path(), override_cwd.path());
 
     // An explicit --cwd wins over the session header's stored cwd.
     let (ok, out, err) = run(
@@ -942,8 +1051,14 @@ fn profile_relocates_agent_config_skills_and_sessions() {
     // Named profile: doctor resolves the profile-scoped agent dir and auth.
     let (ok, out, err) = run(home.path(), &["--profile", "work", "doctor", "--json"]);
     assert!(ok, "doctor with profile exits 0: {err}");
-    assert!(out.contains("profiles/work"), "agent dir is profile-scoped: {out}");
-    assert!(out.contains("work-provider"), "auth read from the profile dir: {out}");
+    assert!(
+        out.contains("profiles/work"),
+        "agent dir is profile-scoped: {out}"
+    );
+    assert!(
+        out.contains("work-provider"),
+        "auth read from the profile dir: {out}"
+    );
     assert!(
         !out.contains("default-provider"),
         "profile must not read the default auth: {out}"
@@ -956,7 +1071,10 @@ fn profile_relocates_agent_config_skills_and_sessions() {
     // Settings/resource snapshot loads from the profile dir.
     let (ok, out, err) = run(home.path(), &["--profile", "work", "reload"]);
     assert!(ok, "reload with profile exits 0: {err}");
-    assert!(out.contains("work-skill"), "profile snapshot lists profile skills: {out}");
+    assert!(
+        out.contains("work-skill"),
+        "profile snapshot lists profile skills: {out}"
+    );
     assert!(
         !out.contains("default-skill"),
         "profile snapshot must not list default skills: {out}"
@@ -977,11 +1095,173 @@ fn profile_relocates_agent_config_skills_and_sessions() {
 
     let (ok, out, err) = run(home.path(), &["reload"]);
     assert!(ok, "reload exits 0: {err}");
-    assert!(out.contains("default-skill"), "default snapshot lists default skills: {out}");
+    assert!(
+        out.contains("default-skill"),
+        "default snapshot lists default skills: {out}"
+    );
     assert!(
         !out.contains("work-skill"),
         "default snapshot must not list profile skills: {out}"
     );
+}
+
+#[test]
+fn reload_failure_redacts_workspace_and_agent_paths() {
+    let home = TempDir::new().expect("home");
+    let workspace_parent = TempDir::new().expect("workspace parent");
+    let workspace = workspace_parent.path().join("distinct-private-workspace");
+    let agent_dir = home.path().join(".pi/agent");
+    fs::create_dir_all(workspace.join(".pi")).expect("project resources");
+    fs::create_dir_all(&agent_dir).expect("agent resources");
+
+    fs::write(
+        workspace.join(".pi/keybindings.json"),
+        "{ malformed project",
+    )
+    .expect("project keybindings");
+    let (ok, out, err) = run(
+        home.path(),
+        &[
+            "--approve",
+            "--cwd",
+            workspace.to_str().expect("workspace UTF-8"),
+            "reload",
+        ],
+    );
+    assert!(!ok, "malformed project resource must fail");
+    assert!(out.is_empty(), "failed reload keeps stdout empty: {out:?}");
+    assert!(err.contains("<workspace>/.pi/keybindings.json"), "{err}");
+    assert!(!err.contains(workspace.to_string_lossy().as_ref()), "{err}");
+
+    fs::remove_file(workspace.join(".pi/keybindings.json")).expect("remove project fixture");
+    fs::write(agent_dir.join("keybindings.json"), "{ malformed global").expect("agent keybindings");
+    let (ok, out, err) = run(
+        home.path(),
+        &[
+            "--cwd",
+            workspace.to_str().expect("workspace UTF-8"),
+            "reload",
+        ],
+    );
+    assert!(!ok, "malformed agent resource must fail");
+    assert!(out.is_empty(), "failed reload keeps stdout empty: {out:?}");
+    assert!(err.contains("<agent-dir>/keybindings.json"), "{err}");
+    assert!(!err.contains(agent_dir.to_string_lossy().as_ref()), "{err}");
+}
+
+#[test]
+fn reload_context_failure_reports_safe_candidate_and_reason() {
+    let home = TempDir::new().expect("home");
+    let workspace_parent = TempDir::new().expect("workspace parent");
+    let workspace = workspace_parent.path().join("private-context-workspace");
+    let agent_dir = home.path().join(".pi/agent");
+    fs::create_dir_all(&workspace).expect("workspace");
+    fs::create_dir_all(&agent_dir).expect("agent resources");
+    fs::write(workspace.join("CLAUDE.md"), [0xff, 0xfe]).expect("invalid context");
+    // --cwd steers the spawned binary's bootstrap under `workspace`.
+    plant_session_store(home.path(), &workspace);
+
+    let (ok, out, err) = run(
+        home.path(),
+        &[
+            "--approve",
+            "--cwd",
+            workspace.to_str().expect("workspace UTF-8"),
+            "reload",
+        ],
+    );
+    assert!(!ok, "invalid context candidate must fail");
+    assert!(out.is_empty(), "failed reload keeps stdout empty: {out:?}");
+    assert!(err.contains("<workspace>/CLAUDE.md"), "{err}");
+    assert!(err.contains("not valid UTF-8"), "{err}");
+    assert!(!err.contains(workspace.to_string_lossy().as_ref()), "{err}");
+    assert!(!err.contains(agent_dir.to_string_lossy().as_ref()), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn reload_accepts_rpi_home_directory_link_and_rejects_invalid_roots() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TempDir::new().expect("reload root fixture");
+    let real = fixture.path().join("real-agent");
+    let link = fixture.path().join("agent-link");
+    let workspace = fixture.path().join("workspace");
+    let home = fixture.path().join("home");
+    fs::create_dir_all(real.join("extensions")).expect("real agent root");
+    fs::create_dir_all(&workspace).expect("workspace");
+    fs::create_dir_all(&home).expect("home");
+    fs::write(
+        real.join("settings.json"),
+        r#"{"theme":"linked-cli-theme"}"#,
+    )
+    .expect("global settings");
+    symlink(&real, &link).expect("agent root link");
+
+    let run_reload = |agent_dir: &Path| {
+        Command::new(rpi_bin())
+            .args(["--offline", "--cwd"])
+            .arg(&workspace)
+            .arg("reload")
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", &home)
+            .env("RPI_HOME", agent_dir)
+            .env("RPI_OFFLINE", "1")
+            .output()
+            .expect("run reload")
+    };
+
+    let success = run_reload(&link);
+    assert!(
+        success.status.success(),
+        "{}",
+        String::from_utf8_lossy(&success.stderr)
+    );
+    let stdout = String::from_utf8(success.stdout).expect("reload stdout");
+    let snapshot: serde_json::Value = serde_json::from_str(&stdout).expect("reload JSON");
+    assert_eq!(snapshot["generation"], 1);
+
+    let missing = fixture.path().join("missing-link");
+    symlink(fixture.path().join("missing-target"), &missing).expect("missing link");
+    let missing_output = run_reload(&missing);
+    assert!(
+        !missing_output.status.success(),
+        "missing target must fail closed"
+    );
+    assert!(missing_output.stdout.is_empty());
+
+    let file = fixture.path().join("not-directory");
+    fs::write(&file, "x").expect("file target");
+    let file_link = fixture.path().join("file-link");
+    symlink(&file, &file_link).expect("file link");
+    let file_output = run_reload(&file_link);
+    assert!(
+        !file_output.status.success(),
+        "non-directory target must fail closed"
+    );
+    assert!(file_output.stdout.is_empty());
+
+    let project_link = fixture.path().join("project-link");
+    symlink(&workspace, &project_link).expect("project target link");
+    let project_output = run_reload(&project_link);
+    assert!(
+        !project_output.status.success(),
+        "project target must fail closed"
+    );
+    assert!(project_output.stdout.is_empty());
+
+    let nested_real = fixture.path().join("nested-real");
+    fs::create_dir(&nested_real).expect("nested real parent");
+    fs::create_dir(nested_real.join("agent")).expect("nested agent root");
+    let nested_parent = fixture.path().join("nested-parent");
+    symlink(&nested_real, &nested_parent).expect("nested parent link");
+    let nested_output = run_reload(&nested_parent.join("agent"));
+    assert!(
+        !nested_output.status.success(),
+        "nested path component link must fail closed"
+    );
+    assert!(nested_output.stdout.is_empty());
 }
 
 #[test]
@@ -1016,8 +1296,14 @@ fn profile_env_honored_and_cli_flag_wins() {
         .expect("run rpi with PI_PROFILE");
     assert!(output.status.success(), "PI_PROFILE doctor exits 0");
     let out = String::from_utf8_lossy(&output.stdout);
-    assert!(out.contains("profiles/envwork"), "PI_PROFILE relocates: {out}");
-    assert!(out.contains("env-provider"), "PI_PROFILE auth is read: {out}");
+    assert!(
+        out.contains("profiles/envwork"),
+        "PI_PROFILE relocates: {out}"
+    );
+    assert!(
+        out.contains("env-provider"),
+        "PI_PROFILE auth is read: {out}"
+    );
 
     // The CLI flag wins over the environment.
     let output = command(home.path())
@@ -1028,8 +1314,14 @@ fn profile_env_honored_and_cli_flag_wins() {
         .expect("run rpi with flag and env");
     assert!(output.status.success(), "flag+env doctor exits 0");
     let out = String::from_utf8_lossy(&output.stdout);
-    assert!(out.contains("profiles/cliwork"), "CLI flag wins over env: {out}");
-    assert!(out.contains("cli-provider"), "CLI profile auth is read: {out}");
+    assert!(
+        out.contains("profiles/cliwork"),
+        "CLI flag wins over env: {out}"
+    );
+    assert!(
+        out.contains("cli-provider"),
+        "CLI profile auth is read: {out}"
+    );
     assert!(
         !out.contains("env-provider"),
         "env profile must lose to the flag: {out}"
@@ -1056,7 +1348,10 @@ fn profile_invalid_name_rejected_actionably() {
         .expect("run rpi with invalid PI_PROFILE");
     assert!(!output.status.success(), "invalid PI_PROFILE must fail");
     let err = String::from_utf8_lossy(&output.stderr);
-    assert!(err.contains("profile name"), "error names the profile: {err}");
+    assert!(
+        err.contains("profile name"),
+        "error names the profile: {err}"
+    );
     assert!(
         err.contains("letters, digits"),
         "error explains the allowed charset: {err}"
@@ -1093,8 +1388,14 @@ fn profile_scoped_session_listing_is_isolated() {
         ],
     );
     assert!(ok, "profile sessions exits 0: {err}");
-    assert!(out.contains("profiled-session"), "profile lists its session: {out}");
-    assert!(out.contains("profiles/work"), "listed path is profile-scoped: {out}");
+    assert!(
+        out.contains("profiled-session"),
+        "profile lists its session: {out}"
+    );
+    assert!(
+        out.contains("profiles/work"),
+        "listed path is profile-scoped: {out}"
+    );
     assert!(
         !out.contains("default-session"),
         "profile must not see default sessions: {out}"
@@ -1106,7 +1407,10 @@ fn profile_scoped_session_listing_is_isolated() {
         &["--cwd", cwd.path().to_str().unwrap(), "sessions"],
     );
     assert!(ok, "default sessions exits 0: {err}");
-    assert!(out.contains("default-session"), "default lists its session: {out}");
+    assert!(
+        out.contains("default-session"),
+        "default lists its session: {out}"
+    );
     assert!(
         !out.contains("profiled-session"),
         "default must not see profile sessions: {out}"

@@ -93,7 +93,13 @@ impl AgentsPanel {
         parent_model: Model,
         available_models: Vec<Model>,
     ) -> Self {
-        Self::new_with_effective(definitions, global_agents, global_agents, parent_model, available_models)
+        Self::new_with_effective(
+            definitions,
+            global_agents,
+            global_agents,
+            parent_model,
+            available_models,
+        )
     }
 
     pub(crate) fn new_with_effective(
@@ -139,8 +145,11 @@ impl AgentsPanel {
         let global_agents = application
             .session()
             .resource_manager()
-            .map(|resources| resources.settings_manager().global_settings().agents)
-            .unwrap_or_default();
+            .context("session has no resource manager")?
+            .settings_manager()
+            .context("settings manager is unavailable")?
+            .global_settings()
+            .agents;
         let mut panel = Self::new_with_effective(
             snapshot.agents.clone(),
             &global_agents,
@@ -229,7 +238,8 @@ impl AgentsPanel {
             self.model_selected = 0;
             return;
         }
-        self.model_selected = (self.model_selected as isize + delta).rem_euclid(count as isize) as usize;
+        self.model_selected =
+            (self.model_selected as isize + delta).rem_euclid(count as isize) as usize;
     }
 
     pub(crate) fn toggle_selected_enabled(&mut self) {
@@ -298,7 +308,11 @@ impl AgentsPanel {
             .edits
             .get(&name)
             .and_then(|entry| entry.enabled)
-            .or_else(|| self.effective_baseline.get(&name).and_then(|entry| entry.enabled));
+            .or_else(|| {
+                self.effective_baseline
+                    .get(&name)
+                    .and_then(|entry| entry.enabled)
+            });
         let tools = self.edits.get(&name).and_then(|entry| entry.tools.clone());
         // Persist an empty-model tombstone so a global clear shadows project-effective models.
         self.upsert_edit(
@@ -325,7 +339,11 @@ impl AgentsPanel {
             .edits
             .get(&name)
             .and_then(|entry| entry.enabled)
-            .or_else(|| self.effective_baseline.get(&name).and_then(|entry| entry.enabled));
+            .or_else(|| {
+                self.effective_baseline
+                    .get(&name)
+                    .and_then(|entry| entry.enabled)
+            });
         let tools = self.edits.get(&name).and_then(|entry| entry.tools.clone());
         self.upsert_edit(
             name.clone(),
@@ -349,7 +367,7 @@ impl AgentsPanel {
     pub(crate) fn handle_key(
         &mut self,
         key: KeyEvent,
-        settings: Option<&SettingsManager>,
+        settings: Option<std::result::Result<&SettingsManager, &anyhow::Error>>,
     ) -> AgentsPanelAction {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return AgentsPanelAction::Continue(None);
@@ -429,9 +447,20 @@ impl AgentsPanel {
         }
     }
 
-    pub(crate) fn save(&mut self, settings: Option<&SettingsManager>) -> AgentsPanelAction {
-        let Some(manager) = settings else {
-            return AgentsPanelAction::Error("session has no settings manager".to_owned());
+    pub(crate) fn save(
+        &mut self,
+        settings: Option<std::result::Result<&SettingsManager, &anyhow::Error>>,
+    ) -> AgentsPanelAction {
+        let Some(settings) = settings else {
+            return AgentsPanelAction::Error("session has no resource manager".to_owned());
+        };
+        let manager = match settings {
+            Ok(manager) => manager,
+            Err(error) => {
+                return AgentsPanelAction::Error(format!(
+                    "settings manager is unavailable: {error:#}"
+                ));
+            }
         };
         if let Some(row) = self.rows.iter().find(|row| row.model_error.is_some()) {
             return AgentsPanelAction::Error(format!(
@@ -551,14 +580,19 @@ impl AgentsPanel {
                     }
                 };
                 let is_persona = definition.is_persona();
-                let (persona_summary, memory_entries, transcript_count, state_error) =
-                    if is_persona {
-                        let summary = persona_contract_summary(&definition);
-                        let counts = persona_state_counts(definition.persona_root());
-                        (summary, counts.memory_entries, counts.transcript_count, counts.error)
-                    } else {
-                        (String::new(), None, None, None)
-                    };
+                let (persona_summary, memory_entries, transcript_count, state_error) = if is_persona
+                {
+                    let summary = persona_contract_summary(&definition);
+                    let counts = persona_state_counts(definition.persona_root());
+                    (
+                        summary,
+                        counts.memory_entries,
+                        counts.transcript_count,
+                        counts.error,
+                    )
+                } else {
+                    (String::new(), None, None, None)
+                };
                 let preferred = self.preferred.as_deref() == Some(definition.name.as_str());
                 AgentPanelRow {
                     name: definition.name.clone(),
@@ -842,7 +876,8 @@ fn count_persona_memory(path: &Path) -> Result<usize> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(error) => return Err(error.into()),
     }
-    let file = std::fs::File::open(path).with_context(|| format!("opening persona memory {}", path.display()))?;
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("opening persona memory {}", path.display()))?;
     let reader = std::io::BufReader::new(file);
     use std::io::BufRead;
     let mut count = 0;
@@ -902,16 +937,13 @@ pub(crate) fn preferred_agent(application: &Application) -> Option<String> {
     {
         return Some(name);
     }
-    application
-        .settings_manager()
-        .ok()
-        .and_then(|manager| {
-            manager
-                .settings()
-                .orchestration
-                .as_ref()
-                .and_then(|orchestration| orchestration.preferred_agent.clone())
-        })
+    application.settings_manager().ok().and_then(|manager| {
+        manager
+            .settings()
+            .orchestration
+            .as_ref()
+            .and_then(|orchestration| orchestration.preferred_agent.clone())
+    })
 }
 
 #[cfg(test)]
@@ -931,20 +963,28 @@ mod tests {
     }
 
     fn definition(name: &str, models: Option<Vec<&str>>) -> AgentDefinition {
-        AgentDefinition { name: name.to_owned(),
-        description: format!("{name} does work"),
-        system_prompt: "prompt".to_owned(),
-        tools: Some(vec!["read".to_owned(), "bash".to_owned()]),
-        autoload_skills: vec!["rust".to_owned()],
-        model: models.map(|values| values.into_iter().map(str::to_owned).collect()),
-        thinking_level: Some(ThinkingLevel::Medium),
-        max_turns: None,
-        max_tool_calls: None,
-        timeout_secs: None,
-        disallowed_tools: Vec::new(),
-        capability_ceiling: None,
-        source: AgentDefinitionSource::User,
-        path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None }
+        AgentDefinition {
+            name: name.to_owned(),
+            description: format!("{name} does work"),
+            system_prompt: "prompt".to_owned(),
+            tools: Some(vec!["read".to_owned(), "bash".to_owned()]),
+            autoload_skills: vec!["rust".to_owned()],
+            model: models.map(|values| values.into_iter().map(str::to_owned).collect()),
+            thinking_level: Some(ThinkingLevel::Medium),
+            max_turns: None,
+            max_tool_calls: None,
+            timeout_secs: None,
+            disallowed_tools: Vec::new(),
+            capability_ceiling: None,
+            source: AgentDefinitionSource::User,
+            path: None,
+            trusted: true,
+            kind: pi_coding::AgentDefinitionKind::Agent,
+            personality: None,
+            soft_budget: None,
+            knowledge_roots: Vec::new(),
+            user_proxy: false,
+        }
     }
 
     #[test]
@@ -1037,7 +1077,7 @@ mod tests {
             panel.model_selected = index;
         }
         panel.apply_selected_model();
-        let action = panel.save(Some(&manager));
+        let action = panel.save(Some(Ok(&manager)));
         assert!(matches!(action, AgentsPanelAction::Saved));
         assert!(!panel.dirty());
 
@@ -1091,7 +1131,7 @@ mod tests {
             available,
         );
         panel.toggle_selected_enabled();
-        let _ = panel.save(Some(&manager));
+        let _ = panel.save(Some(Ok(&manager)));
         let reloaded =
             SettingsManager::load_phase_one(cwd.path(), agent_dir.path()).expect("reload");
         assert!(reloaded.settings().agent_settings("task").is_some());
@@ -1207,7 +1247,10 @@ mod tests {
         );
         assert!(panel.selected_row().unwrap().override_model.is_none());
         assert!(
-            panel.edits.get("task").is_some_and(|entry| entry.clears_model()),
+            panel
+                .edits
+                .get("task")
+                .is_some_and(|entry| entry.clears_model()),
             "tombstone must remain in draft edits"
         );
     }
@@ -1256,7 +1299,7 @@ mod tests {
             vec![model("openai", "gpt-4.1")],
         );
         panel.toggle_selected_enabled();
-        let action = panel.save(Some(&manager));
+        let action = panel.save(Some(Ok(&manager)));
         assert_eq!(action, AgentsPanelAction::Saved);
         assert!(
             !panel.status.to_lowercase().contains("saved"),
@@ -1291,7 +1334,10 @@ mod tests {
         );
         panel.open_model_picker();
         panel.clear_model_override();
-        assert!(matches!(panel.save(Some(&manager)), AgentsPanelAction::Saved));
+        assert!(matches!(
+            panel.save(Some(Ok(&manager))),
+            AgentsPanelAction::Saved
+        ));
         let reloaded =
             SettingsManager::load_phase_one(cwd.path(), agent_dir.path()).expect("reload");
         let settings = reloaded.settings();
@@ -1413,6 +1459,8 @@ mod tests {
             kind: pi_coding::AgentDefinitionKind::Persona,
             personality: personality.map(str::to_owned),
             soft_budget,
+            knowledge_roots: Vec::new(),
+            user_proxy: false,
         }
     }
 
@@ -1474,7 +1522,10 @@ mod tests {
         let panel = persona_panel_with(def);
         let line = persona_view_line(&panel, "scout");
         assert!(line.contains("mem=0"), "missing memory tolerated: {line}");
-        assert!(line.contains("sessions=0"), "missing sessions tolerated: {line}");
+        assert!(
+            line.contains("sessions=0"),
+            "missing sessions tolerated: {line}"
+        );
         assert!(line.contains("personality:absent"), "{line}");
     }
 
@@ -1509,7 +1560,10 @@ mod tests {
         let def = persona_definition("sneaky", root.path(), None, None, None);
         let panel = persona_panel_with(def);
         let line = persona_view_line(&panel, "sneaky");
-        assert!(line.contains("state=ERR"), "symlinked memory reported: {line}");
+        assert!(
+            line.contains("state=ERR"),
+            "symlinked memory reported: {line}"
+        );
         assert!(!line.contains("secret"), "no leak via symlink: {line}");
     }
 
@@ -1528,7 +1582,10 @@ mod tests {
         let def = persona_definition("sneaky", root.path(), None, None, None);
         let panel = persona_panel_with(def);
         let line = persona_view_line(&panel, "sneaky");
-        assert!(line.contains("state=ERR"), "symlinked transcript reported: {line}");
+        assert!(
+            line.contains("state=ERR"),
+            "symlinked transcript reported: {line}"
+        );
         assert!(!line.contains("secret"), "no leak via symlink: {line}");
     }
 
@@ -1540,7 +1597,10 @@ mod tests {
         let def = persona_definition("odd", root.path(), None, None, None);
         let panel = persona_panel_with(def);
         let line = persona_view_line(&panel, "odd");
-        assert!(line.contains("state=ERR"), "non-regular transcript reported: {line}");
+        assert!(
+            line.contains("state=ERR"),
+            "non-regular transcript reported: {line}"
+        );
     }
 
     #[test]

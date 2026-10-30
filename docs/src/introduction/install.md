@@ -1,167 +1,55 @@
 # Installation
 
-## Supported platforms
+The release archive contains the compiled `rpi` executable; ordinary installation does not require Rust or a source checkout.
 
-The release workflow builds five native targets:
-
-- `aarch64-apple-darwin`
-- `aarch64-unknown-linux-gnu` (glibc 2.31 baseline, Ubuntu 20.04)
-- `x86_64-apple-darwin`
-- `x86_64-pc-windows-msvc`
-- `x86_64-unknown-linux-gnu` (glibc 2.31 baseline)
-
-Prebuilt binaries are published as GitHub Release assets named
-`rpi-<version>-<target>.tar.gz` (or `.zip` on Windows), alongside a
-`SHA256SUMS` manifest. Installation does not require Rust or a source checkout.
-The installers download, verify, and atomically activate the matching binary.
-
-Or use the built-in updater after installation:
-
-```sh
-rpi update --self
-```
-
-## Supported install paths
-
-- **Prebuilt binary installer** — `install.sh` (macOS / Linux) or `install.ps1` (Windows); recommended for users.
-- **Prebuilt GitHub Release asset** — download the matching `.tar.gz` / `.zip` and `SHA256SUMS`, then verify and extract manually.
-- **Self-update** — `rpi update --self` after the binary is installed.
-- **Source build** — developer fallback requiring Rust 1.88 or later.
-
-See [`update.md`](../reference/update.md) for release-check behavior and in-place update safety.
-
-## One-line installer
-
-macOS / Linux:
+## Linux and macOS
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/master/install.sh | sh
 ```
 
-Windows (PowerShell):
+The installer selects x86-64 or AArch64 Linux/macOS assets, downloads the release archive, verifies it against `SHA256SUMS`, and activates the binary. Its ordinary install root is the user's `.rpi` directory, with `bin/rpi` selecting a versioned download. `RPI_HOME` overrides that install root.
+
+For reproducible installation, download an installer from a reviewed release tag and pass `--version` with that release version. Do not mix an unreviewed moving installer with a claim of fully pinned installation.
+
+The Unix installer rejects unsupported operating systems/architectures and obsolete `PI_HOME` or `PI_UPDATE_BASE_URL` installer variables. Use `RPI_HOME` and `RPI_UPDATE_BASE_URL` instead.
+
+## Windows
+
+Use the repository's PowerShell installer:
 
 ```powershell
 irm https://raw.githubusercontent.com/0x8f701/rpi/master/install.ps1 | iex
 ```
 
-By default the installer resolves the **latest published stable binary release**.
-If the release does not contain the exact platform archive and `SHA256SUMS`, the
-installer fails without changing the existing installation.
+Windows does not provide the Linux/macOS confinement backends. Confined modes are rejected; `danger-full-access` runs with host authority. Read [sandbox confinement](../reference/sandbox-isolation.md) before running untrusted code.
 
-## Pin a version
+## Verify and configure
 
-Pin both the installer script and the requested release tag:
+Open a new terminal if installation changed your executable search path, then run:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/v0.2.11/install.sh | bash -s -- --version v0.2.11
-```
-
-On Windows, download the script from the same tag before invoking it:
-
-```powershell
-irm https://raw.githubusercontent.com/0x8f701/rpi/v0.2.11/install.ps1 -OutFile install.ps1
-powershell -ExecutionPolicy Bypass -File ./install.ps1 -Version v0.2.11
-```
-
-## What the installer does
-
-1. Detects the host OS/architecture.
-2. Fetches release metadata from the GitHub API.
-3. Downloads the archive and `SHA256SUMS`.
-4. Verifies the archive digest.
-5. Extracts the `rpi` / `rpi.exe` binary.
-6. Smoke-tests the binary with `--version`.
-7. Writes it to a content-addressed path under `PI_HOME/downloads` and atomically
-   swaps `PI_HOME/bin/rpi` to that path on Unix. Windows atomically replaces
-   `PI_HOME/bin/rpi.exe` because a running executable cannot be a symlink target.
-8. Records the installed identity in `PI_HOME/update-state.json`.
-9. On Unix, removes a legacy installer-managed `PI_HOME/bin/pi` symlink only
-   when it still points at a previous installer-owned download path.
-
-If any step fails, the installer rolls back the active symlink and leaves the
-previous install untouched.
-
-When the install directory is not already on `PATH`, the Unix installer updates
-the detected shell profile and the Windows installer updates the user `PATH`.
-Open a new terminal before running `rpi` after such a change.
-
-## Installer environment variables
-
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `PI_HOME` | `~/.rpi` (Unix) / `%USERPROFILE%\.rpi` (Windows) | Install root for the binary and update state |
-| `PI_UPDATE_BASE_URL` | `https://api.github.com/repos/0x8f701/rpi/releases` | Release API base |
-| `GITHUB_TOKEN` | (none) | Authenticates the GitHub API call to avoid unauthenticated rate limits |
-
-The token is sent **only** to the fixed GitHub API endpoint
-(`https://api.github.com/repos/0x8f701/rpi/releases`), never to release-asset
-hosts or a custom `PI_UPDATE_BASE_URL` endpoint. `install.sh`, `install.ps1`,
-and `rpi update --self` all apply the same scoping.
-
-## Developer source build
-
-This is not the normal installation path. Building from source requires Rust
-**1.88** or later and Node.js **20** (with npm): the embedded web client
-bundle (`crates/pi-cli/web/dist/`, gitignored build output) must be generated
-before the first cargo command.
-
-```sh
-git clone https://github.com/0x8f701/rpi.git
-cd rpi
-(cd crates/pi-cli/web && npm ci && npm run build)
-cargo install --path crates/pi-cli --locked --bin rpi
 rpi --version
+rpi setup
+rpi doctor
+rpi login
+rpi models
 ```
 
-To build a distribution binary in-tree without installing into Cargo's bin
-directory (the web bundle must already be present from the step above):
+Setup locates configuration; doctor reports diagnostics; login configures a provider. Installation and provider access are separate requirements. See [quick start](quickstart.md).
+
+## Source builds
+
+Maintainers can build from a checkout with the workspace's Rust 1.88 toolchain or newer compatible toolchain:
 
 ```sh
-cargo build --package pi-cli --bin rpi --profile release-dist --locked
-./target/release-dist/rpi --version
+cargo +1.88.0 build -p pi-cli --release
 ```
 
-The JSONL RPC control plane is the `rpi rpc` subcommand (≡ `--mode rpc`), so no
-companion binary is built or installed separately.
+The executable is `target/release/rpi`. Build the current Web bundle through the repository's Web build instructions when changing embedded browser assets; a Rust compile alone does not establish that newly edited browser source was bundled.
 
-The released binaries embed the bundle, so **binary installs (installer,
-release asset, self-update) do not require Node.js**.
+Do not use debug-profile product execution for verification in this repository. Build/test coordination follows the repository rules, particularly when other writers are changing participating files.
 
-## Verifying a downloaded release
+## Updates and safety
 
-After a release is published, replace `<version>` and `<target>` with an actual
-tag version and one of the supported target triples:
-
-```sh
-version="<version>"
-target="x86_64-unknown-linux-gnu"
-curl -fsSL -O "https://github.com/0x8f701/rpi/releases/download/v${version}/rpi-${version}-${target}.tar.gz"
-curl -fsSL -O "https://github.com/0x8f701/rpi/releases/download/v${version}/SHA256SUMS"
-sha256sum -c --ignore-missing SHA256SUMS
-```
-
-## Directory layout
-
-After installation:
-
-```text
-$PI_HOME/   # default ~/.rpi on Unix, %USERPROFILE%\.rpi on Windows
-├── bin/
-│   └── rpi -> ../downloads/rpi-<version>-<os>-<arch>-sha256-<digest>
-├── downloads/
-│   └── rpi-<version>-<os>-<arch>-sha256-<digest>
-└── update-state.json
-```
-
-On Windows the active executable is `$PI_HOME/bin/rpi.exe` rather than a
-symlink into `downloads/`.
-
-On Unix, the installer creates the managed directories (`$PI_HOME`,
-`bin/`, `downloads/`) owner-only (`0700`) and writes `update-state.json` and
-the install lock as owner-only (`0600`), independent of the caller's umask.
-Installed binaries keep their executable mode (`0755`).
-
-Runtime configuration and sessions are stored separately under `<agent-dir>/`
-(the upstream pi layout, defaulting to `~/.pi/agent`). The binary location and
-the agent directory are independent, so you can point `PI_CODING_AGENT_DIR` at
-a different config tree.
+`rpi update --self` updates a managed installation after download, checksum verification, and staged executable checking. Protect release endpoints and installation files. A checksum validates consistency with the publisher's manifest, not independent trust in the publisher. See [update safety](../reference/update.md).

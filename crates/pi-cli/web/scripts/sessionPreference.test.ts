@@ -13,6 +13,7 @@ import {
   loadSessionPreference,
   saveSessionPreference,
   selectSessionFromCatalog,
+  catalogRuntimeSessionId,
 } from '../src/sessionPreference.ts';
 const failures = [];
 let ran = 0;
@@ -142,6 +143,27 @@ function makeStorage() {
   check('unusable rows skipped; saved match found', pick !== null && pick.sessionId === 's2' && pick.path === 'p2');
   const pickFirst = selectSessionFromCatalog(mixed, 'missing');
   check('unusable rows skipped; first usable returned', pickFirst !== null && pickFirst.sessionId === 's2');
+}
+
+{
+  const imported = {
+    sessionId: 'chat-572ffbd33c99218e65f67417',
+    path: 'omp.jsonl',
+    status: 'already_imported',
+    nativeSessionId: '01a08bfa-native',
+  };
+  check('already-imported runtime id is the native UUID, never the display name',
+    catalogRuntimeSessionId(imported) === '01a08bfa-native');
+  check('already-imported without native id has no runtime identity',
+    catalogRuntimeSessionId({ ...imported, nativeSessionId: undefined }) === '');
+  check('native/foreign catalog id is the runtime id',
+    catalogRuntimeSessionId({ sessionId: '01a08bfa-native', path: 'n.jsonl' }) === '01a08bfa-native');
+  const pickByName = selectSessionFromCatalog([imported], 'chat-572ffbd33c99218e65f67417');
+  check('saved OMP display name still finds the already-imported row',
+    pickByName === imported);
+  const pickByNative = selectSessionFromCatalog([imported], '01a08bfa-native');
+  check('saved native UUID finds the already-imported row via nativeSessionId',
+    pickByNative === imported);
 }
 
 console.log(`\nsessionPreference.test: ${ran} assertions, ${failures.length} failure(s)`);

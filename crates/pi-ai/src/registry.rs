@@ -1,11 +1,11 @@
 use crate::{
     AssistantMessageEventStream, Context, ImageGenerationOptions, ImageGenerationResult, Model,
-    SimpleStreamOptions, StreamOptions,
+    ResolveHttpAuthoritiesFn, ResolvedHttpAuthority, SimpleStreamOptions, StreamOptions,
 };
 use anyhow::Result;
 use futures_util::future::BoxFuture;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     sync::{Arc, LazyLock, RwLock},
 };
@@ -33,6 +33,7 @@ pub struct ApiProvider {
     /// Optional image-generation capability (`images/generations`). Absent for
     /// chat-only providers; the imagegen/openrouter-images providers set it.
     pub generate_image: Option<ImageGenFn>,
+    pub resolve_http_authorities: ResolveHttpAuthoritiesFn,
 }
 #[derive(Clone)]
 struct Entry {
@@ -64,6 +65,8 @@ pub fn register_api_provider(mut provider: ApiProvider, source_id: Option<String
         .generate_image
         .take()
         .map(|inner| guard_image_gen(&api, inner));
+    provider.resolve_http_authorities =
+        guard_authority_resolver(&api, provider.resolve_http_authorities);
     REGISTRY
         .write()
         .expect("registry lock")
@@ -93,6 +96,8 @@ pub fn register_extension_provider(mut provider: ApiProvider, namespace: String)
         .generate_image
         .take()
         .map(|inner| guard_image_gen(&api, inner));
+    provider.resolve_http_authorities =
+        guard_authority_resolver(&api, provider.resolve_http_authorities);
     REGISTRY
         .write()
         .expect("registry lock")
@@ -112,13 +117,10 @@ pub fn register_extension_provider(mut provider: ApiProvider, namespace: String)
 /// untouched, so shutting down or reloading one runtime never affects
 /// another.
 pub fn unregister_extension_providers(namespace: &str) {
-    REGISTRY
-        .write()
-        .expect("registry lock")
-        .retain(|_, slots| {
-            slots.remove(&Some(namespace.to_owned()));
-            !slots.is_empty()
-        });
+    REGISTRY.write().expect("registry lock").retain(|_, slots| {
+        slots.remove(&Some(namespace.to_owned()));
+        !slots.is_empty()
+    });
 }
 
 /// True when `api` is owned by at least one extension runtime.
@@ -144,6 +146,14 @@ pub fn get_api_provider(api: &str) -> Option<ApiProvider> {
     }
     single_extension_owner(slots).map(|entry| entry.provider.clone())
 }
+pub fn resolve_provider_http_authorities(
+    model: &Model,
+    options: &StreamOptions,
+) -> Result<BTreeSet<ResolvedHttpAuthority>> {
+    let provider = get_api_provider(&model.api)
+        .ok_or_else(|| anyhow::anyhow!("No API provider registered for api: {}", model.api))?;
+    (provider.resolve_http_authorities)(model, options)
+}
 
 /// Every globally resolvable provider: all builtins plus extension entries
 /// whose api has exactly one owner (ambiguous apis are excluded).
@@ -165,23 +175,19 @@ pub fn get_api_providers() -> Vec<ApiProvider> {
 /// plain source id). Namespace-scoped extension owners use
 /// [`unregister_extension_providers`].
 pub fn unregister_api_providers(source_id: &str) {
-    REGISTRY
-        .write()
-        .expect("registry lock")
-        .retain(|_, slots| {
-            // Drop the global builtin entry registered under this source.
-            if slots
-                .get(&None)
-                .is_some_and(|entry| entry.source_id.as_deref() == Some(source_id))
-            {
-                slots.remove(&None);
-            }
-            // Drop extension namespaces that exactly match this source id.
-            slots.retain(|namespace, _| {
-                !matches!(namespace, Some(namespace) if namespace == source_id)
-            });
-            !slots.is_empty()
-        });
+    REGISTRY.write().expect("registry lock").retain(|_, slots| {
+        // Drop the global builtin entry registered under this source.
+        if slots
+            .get(&None)
+            .is_some_and(|entry| entry.source_id.as_deref() == Some(source_id))
+        {
+            slots.remove(&None);
+        }
+        // Drop extension namespaces that exactly match this source id.
+        slots
+            .retain(|namespace, _| !matches!(namespace, Some(namespace) if namespace == source_id));
+        !slots.is_empty()
+    });
 }
 pub fn clear_api_providers() {
     REGISTRY.write().expect("registry lock").clear();
@@ -197,7 +203,10 @@ pub enum ProviderScopeError {
     ExtensionNotInNamespace { api: String, namespace: String },
     /// `api` is owned by several extension runtimes and the lookup carried no
     /// namespace; any pick would be arbitrary.
-    AmbiguousExtension { api: String, namespaces: Vec<String> },
+    AmbiguousExtension {
+        api: String,
+        namespaces: Vec<String>,
+    },
 }
 
 impl fmt::Display for ProviderScopeError {
@@ -311,6 +320,16 @@ fn guard_image_gen(api: &str, inner: ImageGenFn) -> ImageGenFn {
         inner(model, options)
     })
 }
+fn guard_authority_resolver(
+    api: &str,
+    inner: ResolveHttpAuthoritiesFn,
+) -> ResolveHttpAuthoritiesFn {
+    let api = api.to_string();
+    Arc::new(move |model, options| {
+        assert_api_matches(&model.api, &api);
+        inner(model, options)
+    })
+}
 
 #[cfg(test)]
 mod tests {
@@ -334,6 +353,7 @@ mod tests {
             stream,
             stream_simple: simple,
             generate_image: None,
+            resolve_http_authorities: Arc::new(|_, _| Ok(BTreeSet::new())),
         }
     }
 
@@ -356,6 +376,7 @@ mod tests {
             stream,
             stream_simple: simple,
             generate_image: None,
+            resolve_http_authorities: Arc::new(|_, _| Ok(BTreeSet::new())),
         };
         register_api_provider(provider.clone(), Some("test-source".into()));
         assert!(get_api_provider("registry-test").is_some());
@@ -495,7 +516,11 @@ mod tests {
     /// Invoke a resolved provider's guarded stream and report which provider
     /// flag fired.
     fn invoke_stream(provider: &ApiProvider, api: &str) {
-        let _stream = (provider.stream)(matching_model(api), Context::default(), StreamOptions::default());
+        let _stream = (provider.stream)(
+            matching_model(api),
+            Context::default(),
+            StreamOptions::default(),
+        );
     }
 
     #[test]
@@ -566,16 +591,17 @@ mod tests {
             .expect("namespace-b provides the api");
         invoke_stream(&resolved_a, "ns-shared-api");
         assert!(invoked_a.load(Ordering::SeqCst), "a's stream must run");
-        assert!(!invoked_b.load(Ordering::SeqCst), "a must not run b's stream");
+        assert!(
+            !invoked_b.load(Ordering::SeqCst),
+            "a must not run b's stream"
+        );
         invoke_stream(&resolved_b, "ns-shared-api");
         assert!(invoked_b.load(Ordering::SeqCst), "b's stream must run");
 
         // An unscoped lookup must fail closed: two owners, no arbitrary pick.
         assert!(get_api_provider("ns-shared-api").is_none());
         assert!(
-            get_api_providers()
-                .iter()
-                .all(|p| p.api != "ns-shared-api"),
+            get_api_providers().iter().all(|p| p.api != "ns-shared-api"),
             "ambiguous apis must be excluded from unscoped listings"
         );
         assert!(is_extension_provider("ns-shared-api"));
@@ -595,7 +621,10 @@ mod tests {
             .expect("scoped lookup must resolve")
             .expect("namespace-b still provides the api");
         invoke_stream(&survivor, "ns-shared-api");
-        assert!(!invoked_a.load(Ordering::SeqCst), "b must never hit a's entry");
+        assert!(
+            !invoked_a.load(Ordering::SeqCst),
+            "b must never hit a's entry"
+        );
         assert!(matches!(
             resolve_extension_provider("ns-shared-api", Some("namespace-a")),
             Err(ProviderScopeError::ExtensionNotInNamespace { ref api, ref namespace })
@@ -649,14 +678,20 @@ mod tests {
         let unscoped = get_api_provider("mixed-api").expect("builtin resolves globally");
         invoke_stream(&unscoped, "mixed-api");
         assert!(invoked_builtin.load(Ordering::SeqCst));
-        assert!(!invoked_ext.load(Ordering::SeqCst), "unscoped must pick the builtin");
+        assert!(
+            !invoked_ext.load(Ordering::SeqCst),
+            "unscoped must pick the builtin"
+        );
 
         // Scoped to the owning runtime: the extension's own entry wins.
         let scoped = resolve_extension_provider("mixed-api", Some("mixed-ext-namespace"))
             .expect("scoped lookup must resolve")
             .expect("the extension namespace provides the api");
         invoke_stream(&scoped, "mixed-api");
-        assert!(invoked_ext.load(Ordering::SeqCst), "scoped must pick the extension");
+        assert!(
+            invoked_ext.load(Ordering::SeqCst),
+            "scoped must pick the extension"
+        );
 
         // Scoped to a foreign namespace: fail closed rather than serving the
         // builtin or leaking into the other runtime.

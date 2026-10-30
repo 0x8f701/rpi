@@ -10,6 +10,7 @@ use super::{
     ImportSessionError, ImportedMessage, ImportedMessageRole, OpenedSource, OpenedSourceParts,
     SourceSessionFormat,
 };
+use crate::session_catalog::text_has_genuine_content;
 
 /// Per-file source cap applied to every member of a parsed source, including
 /// OMP rotation chain members. Exposed crate-wide so the catalog's OMP chain
@@ -37,10 +38,16 @@ pub(super) struct ParsedSession {
     pub cwd: PathBuf,
     pub started_at: Option<String>,
     pub messages: Vec<ImportedMessage>,
-    /// User/assistant turns with meaningful content (text or supported
-    /// non-text such as image), counted over the active path. Independent of
-    /// the lossy text projection in `messages`.
+    /// User/assistant turns with meaningful content (text or a supported
+    /// non-text image block). Independent of the lossy text projection in
+    /// `messages`: every foreign format (Codex, Claude, Grok, Droid) computes
+    /// it from the raw content of each turn.
     pub meaningful_count: usize,
+    /// Meaningful turns carrying genuine (non-bootstrap) content: any
+    /// non-envelope text block or supported non-text image block, scanned
+    /// losslessly over every content block — not the first-text projection.
+    /// Uniform across Codex, Claude, Grok, and Droid.
+    pub genuine_count: usize,
 }
 
 #[derive(Debug)]
@@ -53,6 +60,7 @@ struct TreeNode {
     entry_type: Option<String>,
     first_kept_entry_id: Option<String>,
     meaningful: bool,
+    genuine: bool,
 }
 
 pub(super) fn parse_source(
@@ -74,9 +82,7 @@ pub(super) fn parse_opened_source(
         grok_cwd,
     } = opened.into_parts();
     match source {
-        SourceSessionFormat::Pi | SourceSessionFormat::Omp => {
-            parse_native(source, &path, primary)
-        }
+        SourceSessionFormat::Pi | SourceSessionFormat::Omp => parse_native(source, &path, primary),
         SourceSessionFormat::Codex => parse_codex(&path, primary),
         SourceSessionFormat::Claude => parse_claude(&path, primary),
         SourceSessionFormat::Grok => parse_grok(&path, primary, grok_chat, grok_cwd),
@@ -98,13 +104,16 @@ pub(super) fn source_id_opened(
 ) -> Result<Option<String>, ImportSessionError> {
     let OpenedSourceParts { path, primary, .. } = opened.into_parts();
     match source {
-        SourceSessionFormat::Grok => read_json(primary, &path).map(|value| {
-            value
+        SourceSessionFormat::Grok => {
+            let value = read_json(primary, &path)?;
+            let id = value
                 .pointer("/info/id")
                 .and_then(Value::as_str)
                 .filter(|id| !id.is_empty())
-                .map(str::to_owned)
-        }),
+                .map(str::to_owned);
+            drop_json_value_iterative(value);
+            Ok(id)
+        }
         _ => {
             let values = read_jsonl(primary, &path)?;
             let id = match source {
@@ -127,12 +136,16 @@ pub(super) fn source_id_opened(
                 }),
                 SourceSessionFormat::Droid => values
                     .iter()
-                    .find(|value| value.get("type").and_then(Value::as_str) == Some("session_start"))
+                    .find(|value| {
+                        value.get("type").and_then(Value::as_str) == Some("session_start")
+                    })
                     .and_then(|value| value.get("id"))
                     .and_then(Value::as_str),
                 SourceSessionFormat::Grok => unreachable!(),
             };
-            Ok(id.filter(|id| !id.is_empty()).map(str::to_owned))
+            let id = id.filter(|id| !id.is_empty()).map(str::to_owned);
+            drop_jsonl_values_iterative(values);
+            Ok(id)
         }
     }
 }
@@ -143,13 +156,14 @@ fn parse_native(
     file: fs::File,
 ) -> Result<ParsedSession, ImportSessionError> {
     let native = read_native_turns(source, path, file)?;
-    let (messages, meaningful_count) = project_turns(&native.turns);
+    let (messages, meaningful_count, genuine_count) = project_turns(&native.turns);
     Ok(ParsedSession {
         source_session_id: native.source_session_id,
         cwd: native.cwd,
         started_at: native.started_at,
         messages,
         meaningful_count,
+        genuine_count,
     })
 }
 
@@ -184,50 +198,68 @@ fn read_native_turns_from_contents(
             path: path.to_path_buf(),
         });
     }
-    let values = read_jsonl_text(source, path, &contents)?;
-    let header_index = if source == SourceSessionFormat::Omp
-        && values.first().is_some_and(valid_omp_title_slot)
-    {
-        1
+    let mut records = native_jsonl_records(source, path, contents);
+    let first =
+        records
+            .next()
+            .transpose()?
+            .ok_or_else(|| ImportSessionError::InvalidNativeHeader {
+                format: source,
+                path: path.to_path_buf(),
+            })?;
+    let header = if source == SourceSessionFormat::Omp && valid_omp_title_slot(&first) {
+        drop_json_value_iterative(first);
+        records
+            .next()
+            .transpose()?
+            .ok_or_else(|| ImportSessionError::InvalidNativeHeader {
+                format: source,
+                path: path.to_path_buf(),
+            })?
     } else {
-        0
+        first
     };
-    let Some(header) = values.get(header_index).and_then(Value::as_object) else {
+    let header_fields = header.as_object().and_then(|header| {
+        let is_valid = header.get("type").and_then(Value::as_str) == Some("session")
+            && header
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.is_empty());
+        is_valid.then(|| {
+            (
+                header.get("id").and_then(Value::as_str).map(str::to_owned),
+                header
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .map(PathBuf::from)
+                    .unwrap_or_default(),
+                header
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                header
+                    .get("parentSession")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned),
+            )
+        })
+    });
+    drop_json_value_iterative(header);
+    let Some((source_session_id, cwd, started_at, parent_session)) = header_fields else {
         return Err(ImportSessionError::InvalidNativeHeader {
             format: source,
             path: path.to_path_buf(),
         });
     };
-    let valid_header = header.get("type").and_then(Value::as_str) == Some("session")
-        && header
-            .get("id")
-            .and_then(Value::as_str)
-            .is_some_and(|id| !id.is_empty());
-    if !valid_header {
-        return Err(ImportSessionError::InvalidNativeHeader {
-            format: source,
-            path: path.to_path_buf(),
-        });
+    let mut nodes = Vec::new();
+    for value in records {
+        let value = value?;
+        if let Some(node) = native_node(source, &value) {
+            nodes.push(node);
+        }
+        drop_json_value_iterative(value);
     }
-    let source_session_id = header.get("id").and_then(Value::as_str).map(str::to_owned);
-    let cwd = header
-        .get("cwd")
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    let started_at = header
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let parent_session = header
-        .get("parentSession")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned);
-    let nodes = values[header_index + 1..]
-        .iter()
-        .filter_map(native_node)
-        .collect::<Vec<_>>();
     Ok(NativeTurns {
         source_session_id,
         cwd,
@@ -243,6 +275,7 @@ struct ActiveTurn {
     /// Record `id`, used to deduplicate entries copied across rotated files.
     id: String,
     meaningful: bool,
+    genuine: bool,
     message: Option<ImportedMessage>,
 }
 
@@ -368,7 +401,8 @@ pub(super) fn parse_omp_chain(
             let bytes = read_bounded_bytes_from(primary, &path, MAX_SOURCE_BYTES)?;
             let contents = std::str::from_utf8(&bytes)
                 .map_err(|_| resource_limit(&path, "source is not valid UTF-8".to_owned()))?;
-            let native = read_native_turns_from_contents(SourceSessionFormat::Omp, &path, contents)?;
+            let native =
+                read_native_turns_from_contents(SourceSessionFormat::Omp, &path, contents)?;
             Ok(ParsedChainMember {
                 path,
                 parent_session: native.parent_session.clone(),
@@ -428,7 +462,7 @@ pub(super) fn parse_omp_chain(
             }
         }
     }
-    let (messages, meaningful_count) = project_turns(&turns);
+    let (messages, meaningful_count, genuine_count) = project_turns(&turns);
     let fingerprint = chain_fingerprint(&digests);
     Ok((
         ParsedSession {
@@ -437,11 +471,11 @@ pub(super) fn parse_omp_chain(
             started_at,
             messages,
             meaningful_count,
+            genuine_count,
         },
         fingerprint,
     ))
 }
-
 /// Read the OMP `parentSession` header reference (absolute path of the prior
 /// rotated session file) from an already-secured handle. Non-OMP sources and
 /// files without the field return `None`; malformed headers fail closed.
@@ -465,15 +499,17 @@ fn read_omp_parent_session(
     path: &Path,
 ) -> Result<Option<String>, ImportSessionError> {
     let mut reader = BufReader::new(file);
-    reader.seek(SeekFrom::Start(0)).map_err(|source| ImportSessionError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let mut values = Vec::new();
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|source| ImportSessionError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let mut values = IterativeDropGuard::new();
     let mut buffer = Vec::new();
     let mut bytes_read = 0_u64;
     let mut records = 0_usize;
-    while values.len() < 2 {
+    while values.0.len() < 2 {
         buffer.clear();
         let read = reader
             .by_ref()
@@ -521,7 +557,7 @@ fn read_omp_parent_session(
         records += 1;
         match serde_json::from_str::<Value>(line) {
             Ok(value) if value.is_object() => values.push(value),
-            Ok(_) => {}
+            Ok(value) => drop_json_value_iterative(value),
             Err(source) => {
                 return Err(ImportSessionError::Json {
                     path: path.to_path_buf(),
@@ -530,16 +566,85 @@ fn read_omp_parent_session(
             }
         }
     }
-    let header = values
-        .into_iter()
-        .find(|value| value.get("type").and_then(Value::as_str) == Some("session"));
-    Ok(header.and_then(|value| {
-        value
-            .get("parentSession")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-    }))
+    let values = values.into_inner();
+    let mut parent_session = None;
+    for value in values {
+        if parent_session.is_none() && value.get("type").and_then(Value::as_str) == Some("session")
+        {
+            parent_session = value
+                .get("parentSession")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+        }
+        drop_json_value_iterative(value);
+    }
+    Ok(parent_session)
+}
+
+#[cfg(test)]
+thread_local! {
+    static ITERATIVE_VALUE_DROPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ITERATIVE_GUARD_DROPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_iterative_drop_probes() {
+    ITERATIVE_VALUE_DROPS.set(0);
+    ITERATIVE_GUARD_DROPS.set(0);
+}
+
+#[cfg(test)]
+fn iterative_drop_probes() -> (usize, usize) {
+    (ITERATIVE_VALUE_DROPS.get(), ITERATIVE_GUARD_DROPS.get())
+}
+
+fn drop_json_value_iterative(value: Value) {
+    #[cfg(test)]
+    ITERATIVE_VALUE_DROPS.set(ITERATIVE_VALUE_DROPS.get() + 1);
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Array(values) => pending.extend(values),
+            Value::Object(object) => pending.extend(object.into_iter().map(|(_, value)| value)),
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+        }
+    }
+}
+
+fn drop_jsonl_values_iterative(values: Vec<Value>) {
+    for value in values {
+        drop_json_value_iterative(value);
+    }
+}
+
+/// Ensures accumulated `Vec<Value>` is iteratively destructed on any exit
+/// path, including early `return Err` and `?` propagation. On success,
+/// call `.into_inner()` to extract the owned `Vec` (which disables the
+/// iterative `Drop`).
+struct IterativeDropGuard(Vec<Value>);
+
+impl IterativeDropGuard {
+    fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    fn push(&mut self, value: Value) {
+        self.0.push(value);
+    }
+    fn into_inner(mut self) -> Vec<Value> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for IterativeDropGuard {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        ITERATIVE_GUARD_DROPS.set(ITERATIVE_GUARD_DROPS.get() + 1);
+        while let Some(value) = self.0.pop() {
+            drop_json_value_iterative(value);
+        }
+    }
 }
 
 fn valid_omp_title_slot(value: &Value) -> bool {
@@ -550,7 +655,7 @@ fn valid_omp_title_slot(value: &Value) -> bool {
         && value.get("pad").and_then(Value::as_str).is_some()
 }
 
-fn native_node(value: &Value) -> Option<TreeNode> {
+fn native_node(source: SourceSessionFormat, value: &Value) -> Option<TreeNode> {
     let object = value.as_object()?;
     let id = object.get("id").and_then(Value::as_str)?.to_owned();
     if id.is_empty() {
@@ -562,7 +667,10 @@ fn native_node(value: &Value) -> Option<TreeNode> {
         .filter(|id| !id.is_empty())
         .map(str::to_owned);
     let timestamp = string_field(object, &["timestamp"]);
-    let entry_type = object.get("type").and_then(Value::as_str).map(str::to_owned);
+    let entry_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let first_kept_entry_id = object
         .get("firstKeptEntryId")
         .and_then(Value::as_str)
@@ -578,8 +686,14 @@ fn native_node(value: &Value) -> Option<TreeNode> {
     // Meaningful: a user/assistant turn with non-empty text OR a supported
     // non-text content block (image attachment). Empty pending assistant
     // placeholders (no content blocks) and tool/system roles are not meaningful.
-    let meaningful = role.is_some()
-        && content.is_some_and(|content| message_content_meaningful(content));
+    let meaningful =
+        role.is_some()
+            && content.is_some_and(|content| message_content_meaningful(source, content));
+    // Genuine: the turn carries non-bootstrap content — a supported non-text
+    // block (image) or at least one text block that is not an injected
+    // envelope. Scanned over ALL blocks, not the first-text projection.
+    let genuine =
+        role.is_some() && content.is_some_and(|content| message_content_genuine(source, content));
     Some(TreeNode {
         id,
         parent_id,
@@ -589,22 +703,23 @@ fn native_node(value: &Value) -> Option<TreeNode> {
         entry_type,
         first_kept_entry_id,
         meaningful,
+        genuine,
     })
 }
-
-fn active_messages(nodes: &[TreeNode]) -> (Vec<ImportedMessage>, usize) {
+fn active_messages(nodes: &[TreeNode]) -> (Vec<ImportedMessage>, usize, usize) {
     project_turns(&active_turns(nodes))
 }
 
-/// Project ordered active-path turns into the lossy message list and the
-/// meaningful-turn count.
-fn project_turns(turns: &[ActiveTurn]) -> (Vec<ImportedMessage>, usize) {
+/// Project ordered active-path turns into the lossy message list, the
+/// meaningful-turn count, and the genuine-turn count.
+fn project_turns(turns: &[ActiveTurn]) -> (Vec<ImportedMessage>, usize, usize) {
     let meaningful_count = turns.iter().filter(|turn| turn.meaningful).count();
+    let genuine_count = turns.iter().filter(|turn| turn.genuine).count();
     let messages = turns
         .iter()
         .filter_map(|turn| turn.message.clone())
         .collect::<Vec<_>>();
-    (messages, meaningful_count)
+    (messages, meaningful_count, genuine_count)
 }
 
 /// Ordered active-path turns (root → leaf) of one native/OMP file, retaining
@@ -666,30 +781,71 @@ fn active_turns(nodes: &[TreeNode]) -> Vec<ActiveTurn> {
             ActiveTurn {
                 id: node.id.clone(),
                 meaningful: node.meaningful,
+                genuine: node.genuine,
                 message,
             }
         })
         .collect()
 }
 
+/// Whether a content block is a supported non-text image attachment for
+/// `source`. The Codex/OpenAI Responses wire shape (`parse_codex`) carries
+/// user-provided images as `input_image`; every other format (native/OMP,
+/// Claude, Grok, Droid) uses `image`. Matching is scoped per format so an
+/// arbitrary block type — including a foreign shape like `image` inside a
+/// Codex rollout — is never misclassified as image content.
+fn supported_image_block(source: SourceSessionFormat, block_type: &str) -> bool {
+    match source {
+        SourceSessionFormat::Codex => block_type == "input_image",
+        _ => block_type == "image",
+    }
+}
+
 /// Whether message content carries a meaningful user/assistant turn: non-empty
-/// text or a supported non-text block (image attachment). Mirrors
+/// text or a supported non-text image block (`supported_image_block`). Mirrors
 /// `crate::session_catalog::lineage::message_meaningful` for the import parser.
-fn message_content_meaningful(content: &Value) -> bool {
+fn message_content_meaningful(source: SourceSessionFormat, content: &Value) -> bool {
     match content {
         Value::String(text) => !text.trim().is_empty(),
         Value::Array(blocks) => blocks.iter().any(|block| {
             let Some(block_type) = block.get("type").and_then(Value::as_str) else {
                 return false;
             };
-            match block_type {
-                "text" | "input_text" | "output_text" => block
+            if supported_image_block(source, block_type) {
+                return true;
+            }
+            matches!(block_type, "text" | "input_text" | "output_text")
+                && block
                     .get("text")
                     .and_then(Value::as_str)
-                    .is_some_and(|text| !text.trim().is_empty()),
-                "image" => true,
-                _ => false,
+                    .is_some_and(|text| !text.trim().is_empty())
+        }),
+        _ => false,
+    }
+}
+
+/// Whether message content carries genuine (non-bootstrap) content: a
+/// supported non-text image block (`supported_image_block`) always counts,
+/// while text counts only when at least one block is not an injected-context
+/// envelope (`<environment_context>`, `<user_info>`, `<system-reminder>`,
+/// AGENTS/project instruction blocks). Scanned over ALL blocks — the lossless
+/// per-turn signal the first-text projection cannot express. Mirrors
+/// `crate::session_catalog::lineage::message_genuine` for the import parser.
+fn message_content_genuine(source: SourceSessionFormat, content: &Value) -> bool {
+    match content {
+        Value::String(text) => text_has_genuine_content(text),
+        Value::Array(blocks) => blocks.iter().any(|block| {
+            let Some(block_type) = block.get("type").and_then(Value::as_str) else {
+                return false;
+            };
+            if supported_image_block(source, block_type) {
+                return true;
             }
+            matches!(block_type, "text" | "input_text" | "output_text")
+                && block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(text_has_genuine_content)
         }),
         _ => false,
     }
@@ -701,6 +857,8 @@ fn parse_codex(path: &Path, file: fs::File) -> Result<ParsedSession, ImportSessi
     let mut cwd = PathBuf::new();
     let mut started_at = None;
     let mut messages = Vec::new();
+    let mut meaningful_count = 0usize;
+    let mut genuine_count = 0usize;
     for value in &values {
         let timestamp = value.get("timestamp").and_then(Value::as_str);
         if started_at.is_none() {
@@ -727,27 +885,36 @@ fn parse_codex(path: &Path, file: fs::File) -> Result<ParsedSession, ImportSessi
                     .map(PathBuf::from)
                     .unwrap_or_default();
             }
-            "response_item"
-                if payload.get("type").and_then(Value::as_str) == Some("message") =>
-            {
-                if let Some(message) = message_from_fields(
-                    payload.get("role").and_then(Value::as_str),
-                    payload.get("content"),
-                    timestamp,
-                ) {
+            "response_item" if payload.get("type").and_then(Value::as_str) == Some("message") => {
+                let role = payload.get("role").and_then(Value::as_str);
+                let content = payload.get("content");
+                // Both counts are scanned losslessly over the raw content
+                // blocks (all text blocks plus supported non-text images —
+                // `input_image` in the Codex Responses wire shape) BEFORE the
+                // first-text projection, with the same semantics as the
+                // Claude/Grok/Droid parsers. Only user/assistant turns count.
+                accumulate_raw_turn_counts(
+                    SourceSessionFormat::Codex,
+                    role,
+                    content,
+                    &mut meaningful_count,
+                    &mut genuine_count,
+                );
+                if let Some(message) = message_from_fields(role, content, timestamp) {
                     messages.push(message);
                 }
             }
             _ => {}
         }
     }
-    let meaningful_count = messages.len();
+    drop_jsonl_values_iterative(values);
     Ok(ParsedSession {
         source_session_id,
         cwd,
         started_at,
         messages,
         meaningful_count,
+        genuine_count,
     })
 }
 
@@ -805,16 +972,32 @@ fn parse_claude(path: &Path, file: fs::File) -> Result<ParsedSession, ImportSess
             .and_then(first_direct_text)
             .map(str::to_owned);
         let timestamp = string_field(object, &["timestamp"]);
-        let meaningful = role.is_some() && text.is_some();
+        // Meaningful: non-empty text in ANY block or a supported non-text
+        // block (image), scanned losslessly over the raw content — not the
+        // first-text projection (`text`), so an image-only turn counts even
+        // though the projection drops it. Mirrors `native_node` and the
+        // Grok/Droid `accumulate_raw_turn_counts` semantics.
+        let meaningful = role.is_some()
+            && message
+                .and_then(|message| message.get("content"))
+                .is_some_and(|content| message_content_meaningful(SourceSessionFormat::Claude, content));
+        let genuine = role.is_some()
+            && message
+                .and_then(|message| message.get("content"))
+                .is_some_and(|content| message_content_genuine(SourceSessionFormat::Claude, content));
         nodes.push(TreeNode {
             id: id.to_owned(),
             parent_id,
             role,
             text,
             timestamp,
-            entry_type: object.get("type").and_then(Value::as_str).map(str::to_owned),
+            entry_type: object
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             first_kept_entry_id: None,
             meaningful,
+            genuine,
         });
     }
 
@@ -830,8 +1013,11 @@ fn parse_claude(path: &Path, file: fs::File) -> Result<ParsedSession, ImportSess
             nodes.push(leaf_node);
         }
     }
-    let (messages, meaningful_count) = active_messages(&nodes);
-    let started_at = messages.first().and_then(|message| message.timestamp.clone());
+    let (messages, meaningful_count, genuine_count) = active_messages(&nodes);
+    let started_at = messages
+        .first()
+        .and_then(|message| message.timestamp.clone());
+    drop_jsonl_values_iterative(values);
     Ok(ParsedSession {
         source_session_id: source_session_id.or_else(|| {
             path.file_stem()
@@ -842,6 +1028,7 @@ fn parse_claude(path: &Path, file: fs::File) -> Result<ParsedSession, ImportSess
         started_at,
         messages,
         meaningful_count,
+        genuine_count,
     })
 }
 
@@ -876,34 +1063,53 @@ fn parse_grok(
         .map(str::to_owned);
     let chat_path = path.with_file_name("chat_history.jsonl");
     let values = match chat_file {
-        Some(file) => read_jsonl(file, &chat_path)?,
+        Some(file) => match read_jsonl(file, &chat_path) {
+            Ok(values) => values,
+            Err(error) => {
+                drop_json_value_iterative(summary);
+                return Err(error);
+            }
+        },
         None => Vec::new(),
     };
+    let mut meaningful_count = 0usize;
+    let mut genuine_count = 0usize;
     let messages = values
         .iter()
         .filter_map(|value| {
             let object = value.as_object()?;
             let record_type = object.get("type").and_then(Value::as_str);
-            let role = object
-                .get("role")
-                .and_then(Value::as_str)
-                .or(record_type);
+            let role = object.get("role").and_then(Value::as_str).or(record_type);
+            let content = object.get("content");
+            // Both counts are scanned losslessly over the raw content blocks
+            // (all text blocks plus supported non-text such as images)
+            // BEFORE the first-text projection, with the same semantics as
+            // the Codex/Claude parsers.
+            accumulate_raw_turn_counts(
+                SourceSessionFormat::Grok,
+                role,
+                content,
+                &mut meaningful_count,
+                &mut genuine_count,
+            );
             message_from_fields(
                 role,
-                object.get("content"),
+                content,
                 ["timestamp", "created_at", "updated_at", "time"]
                     .into_iter()
                     .find_map(|key| object.get(key).and_then(Value::as_str)),
             )
         })
         .collect::<Vec<_>>();
-    let meaningful_count = messages.len();
+    drop_jsonl_values_iterative(values);
+    drop_json_value_iterative(summary);
     Ok(ParsedSession {
         source_session_id,
         cwd,
         started_at,
         messages,
         meaningful_count,
+        genuine_count,
     })
 }
 
@@ -919,27 +1125,40 @@ fn parse_droid(path: &Path, file: fs::File) -> Result<ParsedSession, ImportSessi
         .and_then(|start| string_field(start, &["cwd"]))
         .map(PathBuf::from)
         .unwrap_or_default();
+    let mut meaningful_count = 0usize;
+    let mut genuine_count = 0usize;
     let messages = values
         .iter()
         .filter(|value| value.get("type").and_then(Value::as_str) == Some("message"))
         .filter_map(|value| {
             let object = value.as_object()?;
             let message = object.get("message")?.as_object()?;
-            message_from_fields(
-                message.get("role").and_then(Value::as_str),
-                message.get("content"),
-                object.get("timestamp").and_then(Value::as_str),
-            )
+            let role = message.get("role").and_then(Value::as_str);
+            let content = message.get("content");
+            // Same lossless raw-content scan as the Grok parser (see
+            // `accumulate_raw_turn_counts`): both counts cover every content
+            // block before the first-text projection.
+            accumulate_raw_turn_counts(
+                SourceSessionFormat::Droid,
+                role,
+                content,
+                &mut meaningful_count,
+                &mut genuine_count,
+            );
+            message_from_fields(role, content, object.get("timestamp").and_then(Value::as_str))
         })
         .collect::<Vec<_>>();
-    let started_at = messages.first().and_then(|message| message.timestamp.clone());
-    let meaningful_count = messages.len();
+    let started_at = messages
+        .first()
+        .and_then(|message| message.timestamp.clone());
+    drop_jsonl_values_iterative(values);
     Ok(ParsedSession {
         source_session_id,
         cwd,
         started_at,
         messages,
         meaningful_count,
+        genuine_count,
     })
 }
 
@@ -953,6 +1172,38 @@ fn message_from_fields(
         text: first_text(content?)?.to_owned(),
         timestamp: timestamp.map(str::to_owned),
     })
+}
+
+/// Accumulate the lossless per-turn counts over the RAW content, before the
+/// first-text projection — the uniform foreign-format count contract shared
+/// by every foreign parser: Codex, Grok, and Droid call this directly and
+/// Claude derives the same per-node flags from the identical helpers. A
+/// user/assistant turn is meaningful when any content block carries
+/// non-empty text or a supported non-text image block
+/// (`supported_image_block`), and genuine when a supported image block or at
+/// least one non-envelope text block exists. An image-only turn counts even
+/// though the projection drops it, and genuine text in a later block still
+/// counts — neither signal is expressible through the first-text projection
+/// in `messages`.
+fn accumulate_raw_turn_counts(
+    source: SourceSessionFormat,
+    role: Option<&str>,
+    content: Option<&Value>,
+    meaningful_count: &mut usize,
+    genuine_count: &mut usize,
+) {
+    if !role.is_some_and(|role| parse_role(role).is_some()) {
+        return;
+    }
+    let Some(content) = content else {
+        return;
+    };
+    if message_content_meaningful(source, content) {
+        *meaningful_count += 1;
+    }
+    if message_content_genuine(source, content) {
+        *genuine_count += 1;
+    }
 }
 
 fn parse_role(role: &str) -> Option<ImportedMessageRole> {
@@ -1018,7 +1269,6 @@ const fn hex_digit(value: u8) -> Option<u8> {
     }
 }
 
-
 fn first_text(content: &Value) -> Option<&str> {
     match content {
         Value::String(text) if !text.is_empty() => Some(text),
@@ -1078,7 +1328,7 @@ fn read_jsonl_from(
 ) -> Result<Vec<Value>, ImportSessionError> {
     validate_file_size(&file, path, max_bytes)?;
     let mut reader = BufReader::new(file);
-    let mut values = Vec::new();
+    let mut values = IterativeDropGuard::new();
     let mut records = 0_usize;
     let mut buffer = Vec::new();
     loop {
@@ -1120,17 +1370,18 @@ fn read_jsonl_from(
             ));
         }
         records += 1;
-        let value = serde_json::from_str::<Value>(line).map_err(|source| {
-            ImportSessionError::Json {
+        let value =
+            serde_json::from_str::<Value>(line).map_err(|source| ImportSessionError::Json {
                 path: path.to_path_buf(),
                 source,
-            }
-        })?;
+            })?;
         if value.is_object() {
             values.push(value);
+        } else {
+            drop_json_value_iterative(value);
         }
     }
-    Ok(values)
+    Ok(values.into_inner())
 }
 
 fn open_bounded_file(path: &Path, max_bytes: u64) -> Result<fs::File, ImportSessionError> {
@@ -1152,7 +1403,10 @@ fn validate_file_size(
         source,
     })?;
     if !metadata.is_file() {
-        return Err(resource_limit(path, "source is not a regular file".to_owned()));
+        return Err(resource_limit(
+            path,
+            "source is not a regular file".to_owned(),
+        ));
     }
     if metadata.len() > max_bytes {
         return Err(resource_limit(
@@ -1216,47 +1470,242 @@ fn resource_limit(path: &Path, reason: String) -> ImportSessionError {
     }
 }
 
-fn read_jsonl_text(
-    format: SourceSessionFormat,
-    path: &Path,
-    contents: &str,
-) -> Result<Vec<Value>, ImportSessionError> {
-    let mut values = Vec::new();
+fn native_jsonl_records<'a>(
+    _format: SourceSessionFormat,
+    path: &'a Path,
+    contents: &'a str,
+) -> impl Iterator<Item = Result<Value, ImportSessionError>> + 'a {
     let mut records = 0_usize;
-    for line in contents.lines() {
+    contents.lines().filter_map(move |line| {
         if line.len() > MAX_LINE_BYTES {
-            return Err(resource_limit(
+            return Some(Err(resource_limit(
                 path,
                 format!("JSONL line exceeds {MAX_LINE_BYTES} bytes"),
-            ));
+            )));
         }
         let line = line.trim();
         if line.is_empty() {
-            continue;
+            return None;
         }
         if records == MAX_RECORDS {
-            return Err(resource_limit(
+            return Some(Err(resource_limit(
                 path,
                 format!("session exceeds {MAX_RECORDS} JSON records"),
-            ));
+            )));
         }
         records += 1;
         match serde_json::from_str::<Value>(line) {
-            Ok(value) if value.is_object() => values.push(value),
-            Ok(_) => {}
-            Err(source) => {
-                return Err(ImportSessionError::Json {
-                    path: path.to_path_buf(),
-                    source,
-                });
+            Ok(value) if value.is_object() => Some(Ok(value)),
+            Ok(value) => {
+                drop_json_value_iterative(value);
+                None
             }
+            Err(source) => Some(Err(ImportSessionError::Json {
+                path: path.to_path_buf(),
+                source,
+            })),
         }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Depth used by every constrained-stack regression below. serde_json's
+    /// default recursion limit is 128, so 120 nested arrays parse cleanly
+    /// (this is the repo fixture convention, e.g. the catalog fixture) while
+    /// staying within one `Value::drop` recursion of the cap.
+    const SERDE_LIMIT_DEPTH: usize = 120;
+
+    /// Stack budget that comfortably fits the production parse path for a
+    /// `SERDE_LIMIT_DEPTH` record (a ~122-level `Value`), measured at ~197 KiB
+    /// of thread stack under the debug test profile (rustc 1.88, linux x64).
+    /// 512 KiB gives ~2.5x headroom over the parse peak while still being a
+    /// controlled small-stack boundary (vs the 2-8 MiB default).
+    const PRODUCTION_PARSE_STACK: usize = 512 * 1024;
+
+    /// Stack budget for the destruction-isolation proofs. Recursive
+    /// destruction of a `SERDE_LIMIT_DEPTH` object needs ~27 KiB of stack
+    /// (measured: `Vec<Value>` drop of one depth-120 object overflows below
+    /// 27 KiB), while the iterative/guard destruction is constant-stack
+    /// (~4 KiB). 16 KiB sits inside that window with ~4x margin to the
+    /// iterative floor and ~1.7x below the recursive threshold, so the
+    /// iterative path survives and a reverted recursive path overflows the
+    /// guard page and aborts the process.
+    const DESTRUCTION_STACK: usize = 16 * 1024;
+
+    fn deep_array_text(depth: usize) -> String {
+        format!("{}null{}", "[".repeat(depth), "]".repeat(depth))
     }
-    if values.is_empty() && !contents.trim().is_empty() {
-        return Err(ImportSessionError::InvalidNativeHeader {
-            format,
-            path: path.to_path_buf(),
-        });
+
+    /// `drop_json_value_iterative` — the free function the production
+    /// success-path loop in `read_omp_parent_session` and the non-object
+    /// branch in `read_jsonl_from` route destruction through — must destruct
+    /// a `SERDE_LIMIT_DEPTH` nested `Value` on a `DESTRUCTION_STACK` thread.
+    /// The value is parsed on the caller (test) stack, proving it fits
+    /// serde_json's 128 recursion limit; only the destruction runs on the
+    /// constrained stack. The iterative drop uses a heap-allocated worklist
+    /// so stack depth stays constant. A regression to recursive `Value::drop`
+    /// (~27 KiB at this depth) overflows the 16 KiB guard page and aborts the
+    /// test process.
+    #[test]
+    fn iterative_drop_survives_constrained_stack_with_serde_limit_depth() {
+        let nested = deep_array_text(SERDE_LIMIT_DEPTH);
+        let value: Value = serde_json::from_str(&nested).expect("120-deep parses under 128 limit");
+
+        let result = std::thread::Builder::new()
+            .stack_size(DESTRUCTION_STACK)
+            .spawn(move || drop_json_value_iterative(value))
+            .expect("constrained-stack thread")
+            .join();
+
+        assert!(
+            result.is_ok(),
+            "iterative drop must not overflow 16KB stack at 120 depth"
+        );
     }
-    Ok(values)
+
+    /// The real OMP parent-session probe must route both retained header
+    /// values through `drop_json_value_iterative` after scanning. The
+    /// thread-local production primitive probe makes that wiring directly
+    /// observable: restoring the old early `break` leaves the retained guard
+    /// to destruct values instead, so the exact explicit-drop count changes.
+    #[test]
+    fn omp_parent_session_drops_deep_remainder_iteratively() {
+        let deep = deep_array_text(SERDE_LIMIT_DEPTH);
+        let dir = tempfile::tempdir().expect("fixture dir");
+        let prior_path = dir.path().join("prior.jsonl");
+        let prior_str = prior_path.to_string_lossy().into_owned();
+        let path = dir.path().join("omp-parent.jsonl");
+        let mut file = fs::File::create(&path).expect("create fixture");
+        writeln!(
+            file,
+            r#"{{"type":"session","id":"s","parentSession":"{prior}"}}"#,
+            prior = prior_str,
+        )
+        .expect("write header");
+        writeln!(
+            file,
+            r#"{{"type":"message","id":"m","diagnostic":{deep}}}"#,
+            deep = deep,
+        )
+        .expect("write deep record");
+        drop(file);
+
+        let path_clone = path.clone();
+        let result = std::thread::Builder::new()
+            .stack_size(PRODUCTION_PARSE_STACK)
+            .spawn(move || {
+                reset_iterative_drop_probes();
+                let file = fs::File::open(&path_clone).expect("open fixture");
+                let parent = read_omp_parent_session(&file, &path_clone);
+                (parent, iterative_drop_probes())
+            })
+            .expect("production-parse-stack thread")
+            .join()
+            .expect("production parent-session probe must not panic");
+        assert_eq!(
+            result.0.expect("parent-session probe must succeed"),
+            Some(prior_str)
+        );
+        assert_eq!(
+            result.1.0, 2,
+            "both retained OMP records must use explicit iterative drop"
+        );
+        assert_eq!(result.1.1, 1, "the emptied guard still drops exactly once");
+    }
+
+    /// The real bounded JSONL reader must keep its accumulated values in an
+    /// `IterativeDropGuard` until an early resource-limit exit. The
+    /// thread-local primitive probes make that caller wiring directly
+    /// observable: replacing the guard with `Vec<Value>` removes the guard
+    /// drop event and the iterative value destruction event.
+    #[test]
+    fn read_jsonl_with_limits_accumulated_deep_object_early_exit_is_bounded() {
+        let deep = deep_array_text(SERDE_LIMIT_DEPTH);
+        let dir = tempfile::tempdir().expect("fixture dir");
+        let path = dir.path().join("omp-accumulated.jsonl");
+        let mut file = fs::File::create(&path).expect("create fixture");
+        // Record 1: a deep object the guard accumulates.
+        writeln!(
+            file,
+            r#"{{"type":"message","id":"m","diagnostic":{deep}}}"#,
+            deep = deep,
+        )
+        .expect("write deep record");
+        // Record 2: a line longer than max_line_bytes so the parser returns
+        // ResourceLimit without ever parsing this record.
+        writeln!(file, "{}", "x".repeat(2000)).expect("write over-long record");
+        drop(file);
+
+        let path_clone = path.clone();
+        let result = std::thread::Builder::new()
+            .stack_size(PRODUCTION_PARSE_STACK)
+            .spawn(move || {
+                reset_iterative_drop_probes();
+                // max_line_bytes sits above the deep record's line (~273 bytes)
+                // so it parses, and below the over-long record (2000 bytes) so
+                // the early-exit guard fires with the deep object accumulated.
+                let outcome = read_jsonl_with_limits(&path_clone, 64 * 1024, 1024, 1000);
+                (outcome, iterative_drop_probes())
+            })
+            .expect("production-parse-stack thread")
+            .join()
+            .expect("production read_jsonl_with_limits must not panic");
+        let error = result
+            .0
+            .expect_err("read_jsonl_with_limits must return Err on the over-long record");
+        match error {
+            ImportSessionError::ResourceLimit { reason, .. } => {
+                assert!(
+                    reason.contains("exceeds 1024 bytes"),
+                    "ResourceLimit reason must cite the line-byte limit, got: {reason}"
+                );
+            }
+            other => panic!("expected ResourceLimit, got {other:?}"),
+        }
+        assert_eq!(
+            result.1.0, 1,
+            "the accumulated deep record must be iteratively destroyed"
+        );
+        assert_eq!(
+            result.1.1, 1,
+            "the production early-exit guard must drop exactly once"
+        );
+    }
+
+    /// Destruction proof for scenario (b)'s early-exit guard. The
+    /// `IterativeDropGuard` is the production destruction mechanism for every
+    /// early-exit path in `read_omp_parent_session` and `read_jsonl_from`: on
+    /// `?`/`return Err` its `Drop` drains each accumulated `Value`
+    /// iteratively via a heap worklist. This test accumulates a real
+    /// `SERDE_LIMIT_DEPTH` object (parsed on the caller stack, fitting the
+    /// 128 limit) into a guard and drops the guard on a `DESTRUCTION_STACK`
+    /// thread. Reverting the guard to a plain `Vec<Value>` (recursive drop)
+    /// overflows the 16 KB guard page and aborts the test process; the
+    /// iterative `Drop` completes in constant stack.
+    #[test]
+    fn read_jsonl_early_exit_guard_drops_accumulated_deep_object_iteratively() {
+        let deep = format!(
+            r#"{{"type":"message","id":"m","diagnostic":{}}}"#,
+            deep_array_text(SERDE_LIMIT_DEPTH)
+        );
+        let value: Value =
+            serde_json::from_str(&deep).expect("120-deep object parses under 128 limit");
+        let mut guard = IterativeDropGuard::new();
+        guard.push(value);
+
+        let result = std::thread::Builder::new()
+            .stack_size(DESTRUCTION_STACK)
+            .spawn(move || drop(guard))
+            .expect("constrained-stack thread")
+            .join();
+
+        assert!(
+            result.is_ok(),
+            "IterativeDropGuard::drop must drain the accumulated depth-120 object on 16KB stack"
+        );
+    }
 }

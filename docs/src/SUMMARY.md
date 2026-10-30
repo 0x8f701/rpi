@@ -1,5 +1,7 @@
 # Summary
 
+<!-- Chapter paths and ordering are retained; steering queue integration status is documented on the affected pages. -->
+
 [Introduction](README.md)
 
 # Introduction
@@ -25,11 +27,11 @@
 
 # Reference
 
-- [Settings, configuration, and trust](reference/settings-trust.md)
+- [Settings, trust, and atomic generations](reference/settings-trust.md)
 - [Architecture](reference/architecture.md)
 - [Configuration profiles, TOML settings, and scoped auth](reference/configuration-profiles.md)
 - [Environment variables](reference/environment-variables.md)
-- [Sandbox and overlayfs isolation](reference/sandbox-isolation.md)
+- [Sandbox confinement, Browser proof, and workflow isolation](reference/sandbox-isolation.md)
 - [Hooks and trust hooks](reference/hooks.md)
 - [Extensions and process protocol](reference/extensions.md)
 - [Skills](reference/skills.md)

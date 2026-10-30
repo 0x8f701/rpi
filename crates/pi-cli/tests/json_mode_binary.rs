@@ -34,8 +34,8 @@ fn run_json_mode(prompt: &str) -> (Vec<Value>, Output) {
             prompt,
         ])
         .env("HOME", home.path())
-        .env("PI_OFFLINE", "1")
-        .env("PI_SKIP_VERSION_CHECK", "1")
+        .env("RPI_OFFLINE", "1")
+        .env("RPI_SKIP_VERSION_CHECK", "1")
         .env("PI_FAUX_RESPONSE", FAUX_TEXT)
         .env_remove("PI_CODING_AGENT_DIR")
         .env_remove("PI_PROFILE")
@@ -219,10 +219,7 @@ fn json_mode_lf_event_order_text_lifecycle_and_stdout_purity() {
         message_end < turn_end,
         "message_end before turn_end: {lines:?}"
     );
-    assert!(
-        turn_end < agent_end,
-        "turn_end before agent_end: {lines:?}"
-    );
+    assert!(turn_end < agent_end, "turn_end before agent_end: {lines:?}");
     assert!(
         agent_end < settled,
         "agent_end before agent_settled: {lines:?}"
@@ -251,10 +248,7 @@ fn json_mode_lf_event_order_text_lifecycle_and_stdout_purity() {
         }
         match nested_assistant_event_type(line) {
             Some("text_start") => {
-                assert!(
-                    !saw_text_end,
-                    "text_start must precede text_end: {lines:?}"
-                );
+                assert!(!saw_text_end, "text_start must precede text_end: {lines:?}");
                 saw_text_start = true;
                 last_text_kind = Some("text_start");
                 let event = &line["assistantMessageEvent"];
@@ -269,10 +263,7 @@ fn json_mode_lf_event_order_text_lifecycle_and_stdout_purity() {
                     saw_text_start,
                     "text_delta requires prior text_start: {lines:?}"
                 );
-                assert!(
-                    !saw_text_end,
-                    "text_delta must precede text_end: {lines:?}"
-                );
+                assert!(!saw_text_end, "text_delta must precede text_end: {lines:?}");
                 saw_text_delta = true;
                 last_text_kind = Some("text_delta");
                 let delta = line["assistantMessageEvent"]["delta"]
@@ -324,9 +315,10 @@ fn json_mode_lf_event_order_text_lifecycle_and_stdout_purity() {
     );
 
     // Final assistant message_end must surface the faux text on the public wire.
-    let assistant_end = lines.iter().rev().find(|line| {
-        event_type(line) == "message_end" && line["message"]["role"] == "assistant"
-    });
+    let assistant_end = lines
+        .iter()
+        .rev()
+        .find(|line| event_type(line) == "message_end" && line["message"]["role"] == "assistant");
     let assistant_end = assistant_end.expect("assistant message_end on wire");
     let end_text = assistant_end["message"]["content"]
         .as_array()

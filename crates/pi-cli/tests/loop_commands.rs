@@ -1,8 +1,15 @@
 use pi_agent::ThinkingLevel;
 use pi_ai::Model;
 use pi_ai::providers::{FauxProviderOptions, register_faux_provider};
-use pi_coding::{Application, Session, SessionOptions};
 use pi_cli::loop_commands::{execute_interactive_loop_command, parse_interactive_loop_command};
+use pi_coding::{Application, Session, SessionOptions};
+
+/// Hermetic session-store fixture (see approvals `prepare_session_store`).
+fn prepare_session_store(session: &Session, cwd: &std::path::Path) {
+    let session_dir = cwd.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session directory");
+    session.set_session_dir(session_dir);
+}
 
 #[tokio::test]
 async fn cli_loop_commands_drive_application_create_list_update_delete_and_cancel() {
@@ -32,8 +39,10 @@ async fn cli_loop_commands_drive_application_create_list_update_delete_and_cance
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: None,
+        auth_manager: None,
     })
     .expect("session");
+    prepare_session_store(&session, cwd.path());
     let application = Application::new(session).await;
 
     let seconds_create = parse_interactive_loop_command("loop", Some("3s echo hello"))
@@ -61,7 +70,10 @@ async fn cli_loop_commands_drive_application_create_list_update_delete_and_cance
         (seconds_task.next_fire_at() - seconds_task.created_at).num_seconds(),
         3
     );
-    application.loop_cancel(&seconds_id).await.expect("cancel seconds task");
+    application
+        .loop_cancel(&seconds_id)
+        .await
+        .expect("cancel seconds task");
 
     let bare_create = parse_interactive_loop_command("loop", Some("300 bare seconds"))
         .expect("parse bare seconds")
@@ -75,7 +87,10 @@ async fn cli_loop_commands_drive_application_create_list_update_delete_and_cance
         .and_then(|rest| rest.split_once(" · ").map(|(id, _)| id))
         .expect("bare seconds task id")
         .to_owned();
-    application.loop_cancel(&bare_id).await.expect("cancel bare seconds task");
+    application
+        .loop_cancel(&bare_id)
+        .await
+        .expect("cancel bare seconds task");
 
     let create = parse_interactive_loop_command("loop", Some("1h cli scheduled"))
         .expect("parse create")
@@ -98,12 +113,10 @@ async fn cli_loop_commands_drive_application_create_list_update_delete_and_cance
     assert!(listed.contains(&task_id));
     assert!(listed.contains("cli scheduled"));
 
-    let update = parse_interactive_loop_command(
-        "loop",
-        Some(&format!("update {task_id} 2h cli updated")),
-    )
-    .expect("parse update")
-    .expect("update command");
+    let update =
+        parse_interactive_loop_command("loop", Some(&format!("update {task_id} 2h cli updated")))
+            .expect("parse update")
+            .expect("update command");
     let updated = execute_interactive_loop_command(&application, update)
         .await
         .expect("execute update");
@@ -142,12 +155,10 @@ async fn cli_loop_commands_drive_application_create_list_update_delete_and_cance
     );
 
     // The explicit `create` subcommand is the same operation as the bare form.
-    let explicit_create = parse_interactive_loop_command(
-        "loop",
-        Some("create 1h explicit create subcommand"),
-    )
-    .expect("parse explicit create")
-    .expect("explicit create command");
+    let explicit_create =
+        parse_interactive_loop_command("loop", Some("create 1h explicit create subcommand"))
+            .expect("parse explicit create")
+            .expect("explicit create command");
     let explicit_created = execute_interactive_loop_command(&application, explicit_create)
         .await
         .expect("execute explicit create");

@@ -1,42 +1,233 @@
+//! Codex transport proof contracts (§10.4, §17 of the sandbox design):
+//! the provider executes exclusively over governed HTTP/SSE (`Sse` and the
+//! runtime-default `Auto` both resolve to that path) through the injected
+//! `HttpExecutor` instead of an ambient reqwest client. The removed
+//! WebSocket modes no longer exist as selectable values.
+
 use base64::Engine as _;
-use futures_util::{SinkExt, StreamExt};
-use pi_ai::*;
-use pi_ai::providers::{OpenAICodexResponsesOptions, close_openai_codex_websocket_sessions, reset_openai_codex_transport_state, stream_openai_codex_responses};
+use std::sync::Arc;
+
+use futures_util::{FutureExt as _, StreamExt};
+use pi_ai::providers::{OpenAICodexResponsesOptions, stream_openai_codex_responses};
+use pi_ai::{
+    API_OPENAI_CODEX_RESPONSES, AssistantMessageEventStream, Context, HttpMethod, HttpRequest,
+    HttpResponse, Message, Model, ResolvedHttpAuthority, ResolvedHttpHost, ResolvedHttpScheme,
+    StopReason, StreamOptions, Transport,
+};
 use serde_json::{Value, json};
-use std::{collections::HashMap, sync::{Arc, Mutex as StdMutex}};
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener, sync::{Mutex, oneshot}};
-use tokio_tungstenite::{accept_hdr_async, tungstenite::{Message as WsMessage, handshake::server::{Request, Response as HandshakeResponse}}};
 
-fn token(a:&str)->String{let p=base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json!({"https://api.openai.com/auth":{"chatgpt_account_id":a}}).to_string());format!("h.{p}.s")}
-fn model(u:String)->Model{Model{id:"codex".into(),name:"Codex".into(),api:API_OPENAI_CODEX_RESPONSES.into(),provider:"openai-codex".into(),base_url:u,reasoning:true,input:vec!["text".into()],context_window:128000,max_tokens:8192,..Model::default()}}
-fn events(id:&str)->Vec<Value>{vec![json!({"type":"response.created","response":{"id":id}}),json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"r"}}),json!({"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"plan"}),json!({"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"r","summary":[{"type":"summary_text","text":"plan"}],"encrypted_content":"enc"}}),json!({"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":"m","content":[]}}),json!({"type":"response.output_text.delta","output_index":1,"delta":"hi"}),json!({"type":"response.output_item.done","output_index":1,"item":{"type":"message","id":"m","content":[{"type":"output_text","text":"hi"}]}}),json!({"type":"response.output_item.added","output_index":2,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup","arguments":""}}),json!({"type":"response.function_call_arguments.delta","output_index":2,"delta":"{\"q\":\"pi\"}"}),json!({"type":"response.output_item.done","output_index":2,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup","arguments":"{\"q\":\"pi\"}"}}),json!({"type":"response.completed","response":{"id":id,"status":"completed","usage":{"input_tokens":12,"output_tokens":5,"input_tokens_details":{"cached_tokens":2},"output_tokens_details":{"reasoning_tokens":1}}}})]}
-async fn drain(s:&AssistantMessageEventStream){while s.next().await.is_some(){}}
-async fn request(s:&mut tokio::net::TcpStream)->String{let mut a=vec![];let mut b=[0;4096];loop{let n=s.read(&mut b).await.unwrap();if n==0{break}a.extend_from_slice(&b[..n]);if let Some(p)=a.windows(4).position(|w|w==b"\r\n\r\n"){let h=String::from_utf8_lossy(&a[..p]);let n=h.lines().find_map(|l|l.to_ascii_lowercase().strip_prefix("content-length:").and_then(|v|v.trim().parse::<usize>().ok())).unwrap_or(0);if a.len()>=p+4+n{break}}}String::from_utf8(a).unwrap()}
-async fn sse(s:&mut tokio::net::TcpStream,id:&str){let b=events(id).into_iter().map(|e|format!("data: {e}\n\n")).collect::<String>();let r=format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{b}",b.len());s.write_all(r.as_bytes()).await.unwrap()}
-async fn ws(n:usize)->(String,Arc<Mutex<Vec<(HashMap<String,String>,Value)>>>) {let l=TcpListener::bind("127.0.0.1:0").await.unwrap();let a=l.local_addr().unwrap();let seen=Arc::new(Mutex::new(vec![]));let out=seen.clone();tokio::spawn(async move{let(s,_)=l.accept().await.unwrap();let hs=Arc::new(StdMutex::new(HashMap::new()));let hc=hs.clone();let mut w=accept_hdr_async(s,move|r:&Request,mut p:HandshakeResponse|{for(k,v)in r.headers(){if let Ok(v)=v.to_str(){hc.lock().unwrap().insert(k.as_str().to_ascii_lowercase(),v.into());}}p.headers_mut().insert("x-fixture","ws".parse().unwrap());Ok(p)}).await.unwrap();for i in 0..n{let m=w.next().await.unwrap().unwrap();out.lock().await.push((hs.lock().unwrap().clone(),serde_json::from_str(m.to_text().unwrap()).unwrap()));for e in events(&format!("r{}",i+1)){w.send(WsMessage::Text(e.to_string().into())).await.unwrap();}}});(format!("http://{a}"),seen)}
+fn token(account: &str) -> String {
+    let payload = json!({"https://api.openai.com/auth":{"chatgpt_account_id":account}});
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string());
+    format!("h.{encoded}.s")
+}
 
-#[tokio::test]
-async fn websocket_auth_mapping_events_usage_hook(){reset_openai_codex_transport_state(None).await;let(u,seen)=ws(1).await;let h=Arc::new(StdMutex::new(None));let hc=h.clone();let x=stream_openai_codex_responses(model(u),Context{system_prompt:"sys".into(),messages:vec![Message::user_text("hi",1)],tools:vec![]},OpenAICodexResponsesOptions{stream:StreamOptions{api_key:Some(token("acct")),transport:Transport::WebSocket,session_id:Some("session".into()),on_response:Some(Arc::new(move|r,_|{*hc.lock().unwrap()=Some(r);Ok(())})),..Default::default()},reasoning_effort:Some("high".into()),..Default::default()});drain(&x).await;let o=x.result().await.unwrap();assert_eq!(o.stop_reason,StopReason::ToolUse);assert_eq!((o.usage.input,o.usage.cache_read,o.usage.output),(10,2,5));assert!(matches!(&o.content[2],ContentBlock::ToolCall(c)if c.arguments==json!({"q":"pi"})));let z=seen.lock().await;assert_eq!(z[0].0.get("authorization"),Some(&format!("Bearer {}",token("acct"))));assert_eq!(z[0].0.get("openai-beta").map(String::as_str),Some("responses_websockets=2026-02-06"));assert_eq!(z[0].1["type"],"response.create");assert_eq!(h.lock().unwrap().as_ref().unwrap().status,101);}
+fn model(base_url: String) -> Model {
+    Model {
+        id: "codex".into(),
+        name: "Codex".into(),
+        api: API_OPENAI_CODEX_RESPONSES.into(),
+        provider: "openai-codex".into(),
+        base_url,
+        reasoning: true,
+        input: vec!["text".into()],
+        context_window: 128000,
+        max_tokens: 8192,
+        ..Model::default()
+    }
+}
 
-#[tokio::test]
-async fn cached_continuation_and_targeted_close(){
-    reset_openai_codex_transport_state(None).await;
-    let(u,seen)=ws(2).await;
-    let m=model(u);
-    let c=Context{messages:vec![Message::user_text("one",1)],..Default::default()};
-    let o=OpenAICodexResponsesOptions{stream:StreamOptions{api_key:Some(token("a")),transport:Transport::WebSocketCached,cache_retention:CacheRetention::Short,session_id:Some("same".into()),..Default::default()},..Default::default()};
-    let x=stream_openai_codex_responses(m.clone(),c.clone(),o.clone());
-    drain(&x).await;
-    let first=x.result().await.unwrap();
-    let x=stream_openai_codex_responses(m,Context{messages:vec![c.messages[0].clone(),Message::Assistant(first),Message::ToolResult(ToolResultMessage{tool_call_id:"call_1|fc_1".into(),tool_name:"lookup".into(),content:vec![ContentBlock::text("result")],usage:None,details:None,added_tool_names:vec![],is_error:false,timestamp:2}),Message::user_text("two",3)],..Default::default()},o);
-    drain(&x).await;
-    x.result().await.unwrap();
-    let z=seen.lock().await;
-    assert_eq!(z[1].1["previous_response_id"],"r1","requests: {}",serde_json::to_string_pretty(&vec![&z[0].1,&z[1].1]).unwrap());
-    assert_eq!(z[1].1["input"].as_array().unwrap().len(),2);
-    drop(z);
-    close_openai_codex_websocket_sessions(Some("same")).await;
+fn events(id: &str) -> Vec<Value> {
+    vec![
+        json!({"type":"response.created","response":{"id":id}}),
+        json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"r"}}),
+        json!({"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"plan"}),
+        json!({"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"r","summary":[{"type":"summary_text","text":"plan"}],"encrypted_content":"enc"}}),
+        json!({"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":"m","content":[]}}),
+        json!({"type":"response.output_text.delta","output_index":1,"delta":"hi"}),
+        json!({"type":"response.output_item.done","output_index":1,"item":{"type":"message","id":"m","content":[{"type":"output_text","text":"hi"}]}}),
+        json!({"type":"response.completed","response":{"id":id,"status":"completed","usage":{"input_tokens":12,"output_tokens":5,"input_tokens_details":{"cached_tokens":2},"output_tokens_details":{"reasoning_tokens":1}}}}),
+    ]
+}
+
+async fn drain(stream: &AssistantMessageEventStream) {
+    while stream.next().await.is_some() {}
+}
+
+/// Records every request routed through the injected executor and answers
+/// with a canned SSE transcript, so the provider path is exercised without
+/// any real HTTP.
+struct RecordingExecutor {
+    requests: Arc<std::sync::Mutex<Vec<HttpRequest>>>,
+}
+
+impl pi_ai::HttpExecutor for RecordingExecutor {
+    fn execute<'a>(
+        &'a self,
+        request: HttpRequest,
+    ) -> futures_util::future::BoxFuture<'a, anyhow::Result<HttpResponse>> {
+        async move {
+            self.requests.lock().expect("requests lock").push(request);
+            let mut body = String::new();
+            for event in events("injected") {
+                body.push_str(&format!("data: {event}\n\n"));
+            }
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("text/event-stream"),
+            );
+            let stream = futures_util::stream::iter(vec![Ok(body.into_bytes())]);
+            Ok(HttpResponse::new(
+                http::StatusCode::OK,
+                headers,
+                Box::pin(stream),
+            ))
+        }
+        .boxed()
+    }
+}
+
+/// Answers with an HTTP error whose body stream fails mid-read, so the
+/// provider must propagate the collection failure instead of swallowing it.
+struct FailingBodyExecutor;
+
+impl pi_ai::HttpExecutor for FailingBodyExecutor {
+    fn execute<'a>(
+        &'a self,
+        _request: HttpRequest,
+    ) -> futures_util::future::BoxFuture<'a, anyhow::Result<HttpResponse>> {
+        async move {
+            let stream = futures_util::stream::iter(vec![Err(anyhow::anyhow!(
+                "simulated body read failure"
+            ))]);
+            Ok(HttpResponse::new(
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                http::HeaderMap::new(),
+                Box::pin(stream),
+            ))
+        }
+        .boxed()
+    }
 }
 
 #[tokio::test]
-async fn sse_auto_fallback_retry_cancel_redaction(){reset_openai_codex_transport_state(None).await;let l=TcpListener::bind("127.0.0.1:0").await.unwrap();let a=l.local_addr().unwrap();tokio::spawn(async move{let(mut s,_)=l.accept().await.unwrap();request(&mut s).await;sse(&mut s,"sse").await});let x=stream_openai_codex_responses(model(format!("http://{a}")),Context::default(),OpenAICodexResponsesOptions{stream:StreamOptions{api_key:Some(token("a")),transport:Transport::Sse,..Default::default()},..Default::default()});drain(&x).await;assert_eq!(x.result().await.unwrap().response_id.as_deref(),Some("sse"));let l=TcpListener::bind("127.0.0.1:0").await.unwrap();let a=l.local_addr().unwrap();let methods=Arc::new(Mutex::new(Vec::<String>::new()));let mc=methods.clone();tokio::spawn(async move{for _ in 0..3{let(mut s,_)=l.accept().await.unwrap();let r=request(&mut s).await;let m=r.split_whitespace().next().unwrap().to_owned();mc.lock().await.push(m);if r.starts_with("GET"){s.write_all(b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await.unwrap()}else{sse(&mut s,"f").await}}});let m=model(format!("http://{a}"));let o=OpenAICodexResponsesOptions{stream:StreamOptions{api_key:Some(token("a")),transport:Transport::Auto,cache_retention:CacheRetention::Short,session_id:Some("route".into()),..Default::default()},..Default::default()};for _ in 0..2{let x=stream_openai_codex_responses(m.clone(),Context::default(),o.clone());drain(&x).await;x.result().await.unwrap();}assert_eq!(*methods.lock().await,vec!["GET","POST","POST"]);reset_openai_codex_transport_state(Some("route")).await;let l=TcpListener::bind("127.0.0.1:0").await.unwrap();let a=l.local_addr().unwrap();tokio::spawn(async move{for i in 0..2{let(mut s,_)=l.accept().await.unwrap();request(&mut s).await;if i==0{s.write_all(b"HTTP/1.1 503 Service Unavailable\r\nretry-after-ms: 0\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await.unwrap()}else{sse(&mut s,"retry").await}}});let x=stream_openai_codex_responses(model(format!("http://{a}")),Context::default(),OpenAICodexResponsesOptions{stream:StreamOptions{api_key:Some(token("a")),transport:Transport::Sse,max_retries:1,..Default::default()},..Default::default()});drain(&x).await;assert_eq!(x.result().await.unwrap().response_id.as_deref(),Some("retry"));let l=TcpListener::bind("127.0.0.1:0").await.unwrap();let a=l.local_addr().unwrap();let(tx,rx)=oneshot::channel();tokio::spawn(async move{let(s,_)=l.accept().await.unwrap();let mut w=tokio_tungstenite::accept_async(s).await.unwrap();w.next().await;tx.send(()).unwrap();w.next().await;});let c=tokio_util::sync::CancellationToken::new();let x=stream_openai_codex_responses(model(format!("http://{a}")),Context::default(),OpenAICodexResponsesOptions{stream:StreamOptions{api_key:Some(token("a")),transport:Transport::WebSocket,abort_signal:Some(c.clone()),..Default::default()},..Default::default()});rx.await.unwrap();c.cancel();drain(&x).await;assert_eq!(x.result().await.unwrap().stop_reason,StopReason::Aborted);let l=TcpListener::bind("127.0.0.1:0").await.unwrap();let a=l.local_addr().unwrap();let secret=token("secret");let sc=secret.clone();tokio::spawn(async move{let(mut s,_)=l.accept().await.unwrap();request(&mut s).await;let b=json!({"error":{"message":format!("{sc} header-secret")}}).to_string();let r=format!("HTTP/1.1 400 Bad Request\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{b}",b.len());s.write_all(r.as_bytes()).await.unwrap()});let x=stream_openai_codex_responses(model(format!("http://{a}")),Context::default(),OpenAICodexResponsesOptions{stream:StreamOptions{api_key:Some(secret.clone()),transport:Transport::Sse,headers:HashMap::from([("x".into(),"header-secret".into())]),..Default::default()},..Default::default()});drain(&x).await;let e=x.result().await.unwrap().error_message.unwrap();assert!(!e.contains(&secret));assert!(!e.contains("header-secret"));}
+async fn provider_http_uses_injected_executor() {
+    let recorder = Arc::new(RecordingExecutor {
+        requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+    });
+    let executor: pi_ai::SharedHttpExecutor = recorder.clone();
+    let stream = stream_openai_codex_responses(
+        model("https://api.example.com/v1".to_owned()),
+        Context {
+            system_prompt: "sys".into(),
+            messages: vec![Message::user_text("hi", 1)],
+            tools: vec![],
+        },
+        OpenAICodexResponsesOptions {
+            stream: StreamOptions {
+                api_key: Some(token("account")),
+                transport: Transport::Sse,
+                http_executor: Some(executor),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    drain(&stream).await;
+    let output = stream.result().await.expect("stream result");
+    assert_eq!(output.response_id.as_deref(), Some("injected"));
+    assert_eq!(output.stop_reason, StopReason::Stop);
+    assert_eq!(
+        recorder.requests.lock().expect("requests lock").len(),
+        1,
+        "exactly one request through the injected executor",
+    );
+    let request = recorder
+        .requests
+        .lock()
+        .expect("requests lock")
+        .pop()
+        .expect("exactly one recorded request");
+    let parts = request.into_parts();
+    assert_eq!(parts.method, HttpMethod::Post);
+    assert_eq!(parts.authority.scheme(), ResolvedHttpScheme::Https);
+    assert_eq!(
+        parts.authority.host(),
+        &ResolvedHttpHost::Dns("api.example.com".to_owned())
+    );
+    assert_eq!(parts.authority.port(), 443);
+    assert_eq!(parts.path_and_query, "/v1/codex/responses");
+    let auth = parts
+        .headers
+        .iter()
+        .find(|(name, _)| name.as_str() == "authorization")
+        .expect("authorization header");
+    let expected = format!("Bearer {}", token("account"));
+    assert_eq!(
+        auth.1.to_str().expect("authorization header text"),
+        expected
+    );
+}
+
+#[tokio::test]
+async fn auto_transport_is_normalized_to_governed_sse() {
+    // `Auto` (the runtime default transport) must resolve to the governed
+    // HTTP/SSE path: the request goes through the injected executor exactly
+    // once and completes normally, exactly like `Sse`.
+    let recorder = Arc::new(RecordingExecutor {
+        requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+    });
+    let executor: pi_ai::SharedHttpExecutor = recorder.clone();
+    let stream = stream_openai_codex_responses(
+        model("https://api.example.com/v1".to_owned()),
+        Context {
+            system_prompt: "sys".into(),
+            messages: vec![Message::user_text("hi", 1)],
+            tools: vec![],
+        },
+        OpenAICodexResponsesOptions {
+            stream: StreamOptions {
+                api_key: Some(token("account")),
+                transport: Transport::Auto,
+                http_executor: Some(executor),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    drain(&stream).await;
+    let output = stream.result().await.expect("stream result");
+    assert_eq!(output.response_id.as_deref(), Some("injected"));
+    assert_eq!(output.stop_reason, StopReason::Stop);
+    assert_eq!(
+        recorder.requests.lock().expect("requests lock").len(),
+        1,
+        "Auto must execute exactly one governed SSE request",
+    );
+}
+
+#[tokio::test]
+async fn response_body_collection_failure_propagates() {
+    // A body stream that errors mid-read must surface the collection
+    // failure instead of silently degrading into an empty error body.
+    let executor: pi_ai::SharedHttpExecutor = Arc::new(FailingBodyExecutor);
+    let stream = stream_openai_codex_responses(
+        model("https://api.example.com/v1".to_owned()),
+        Context::default(),
+        OpenAICodexResponsesOptions {
+            stream: StreamOptions {
+                api_key: Some(token("account")),
+                transport: Transport::Sse,
+                http_executor: Some(executor),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    drain(&stream).await;
+    let output = stream.result().await.expect("stream result");
+    assert_eq!(output.stop_reason, StopReason::Error);
+    let message = output.error_message.expect("error message");
+    assert!(message.contains("simulated body read failure"), "{message}");
+}

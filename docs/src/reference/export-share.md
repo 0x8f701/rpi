@@ -1,205 +1,35 @@
 # Export and share
 
-`rpi` can export a session to a self-contained HTML file or to a Pi v3 JSONL
-branch, and it can share a session as a secret GitHub gist. The export step
-needs no model, auth, or network access; only gist sharing requires the `gh`
-CLI.
+Export creates a local artifact. Share uploads an artifact through GitHub CLI. Import converts a foreign conversation into a native session. These operations have different privacy and persistence effects.
 
-## Export a session from the CLI
-
-```sh
-# Export a session file to a self-contained HTML file
-rpi export <agent-dir>/sessions/--cwd--/timestamp_id.jsonl
-
-# Export to a specific path
-rpi export session.jsonl --output report.html
-
-# Export the current branch as JSONL (suitable for --resume)
-rpi export session.jsonl --jsonl
-
-# JSONL output with an explicit path
-rpi export session.jsonl --jsonl --output backup.jsonl
-```
-
-Source: `crates/pi-cli/src/args.rs:232-247`,
-`crates/pi-cli/src/commands.rs:129-145`.
-
-`--output` sets the destination path. Without it, the output path is derived
-from the session file by swapping the extension to `.html` or `.jsonl`. Writes
-are atomic: a temporary file is created in the same directory and renamed into
-place.
-Source: `crates/pi-coding/src/export/mod.rs:91-145`,
-`crates/pi-coding/src/export/mod.rs:693-732`.
-
-### HTML export
-
-HTML export produces a single self-contained `.html` file with inline CSS and
-JavaScript and no external dependencies. The rendered transcript is the full
-chronological record from the session file, including compaction markers. All
-user, model, and tool content is HTML-escaped at render time, so arbitrary
-markup cannot escape into the page.
-Source: `crates/pi-coding/src/export/mod.rs:1-10`,
-`crates/pi-coding/src/export/mod.rs:188-204`.
-
-### JSONL export
-
-JSONL export writes only the current branch (root → leaf) of the session and
-produces a valid Pi v3 session file. It is suitable for archiving or for passing
-to `--resume`.
-Source: `crates/pi-coding/src/export/mod.rs:107-132`.
-
-## Export during a session
-
-In the TUI or line REPL, use the `/export` slash command:
+## Local export
 
 ```text
-/export                  # write HTML to the default path
-/export report.html      # write HTML to the named file
-/export backup.jsonl     # write the current branch as JSONL
+rpi export SESSION_PATH --output conversation.html
+rpi export SESSION_PATH --output conversation.jsonl --jsonl
+rpi --export SESSION_PATH --output conversation.html
 ```
 
-If the argument ends in `.jsonl` (case-insensitive), the export is JSONL;
-otherwise it is HTML. The path is printed to the REPL or shown as a TUI status
-message.
-Source: `crates/pi-cli/src/repl.rs`, `crates/pi-cli/src/tui.rs`,
-`crates/pi-cli/src/interactive_commands.rs`.
+Standalone export does not require a model, provider authentication, or network access. It prints the output path. HTML export includes the full chronological file record, including compaction markers, with inline assets and escaped transcript content. It is not restricted to the active branch.
 
-`/dump` is the same export surface with an explicit format flag:
+JSONL export writes the current root-to-leaf branch as a Pi v3 session suitable for resume. Export rejects writing over the source identity and publishes stored output atomically.
 
-```text
-/dump                    # write HTML to the default path (session-file derived)
-/dump --jsonl            # write the current branch as JSONL to cwd/<name>.jsonl
-/dump report.html        # write HTML to the named file
-/dump --jsonl backup     # write JSONL to the named file
-```
+Interactive `/dump [--jsonl] [path]` uses the live session export path. HTML is the ordinary format; `--jsonl` or a `.jsonl` output suffix selects JSONL. With no explicit JSONL destination, the output is placed in the session working directory rather than overwriting the stored journal.
 
-`--jsonl` forces JSONL; a `.jsonl` output path does too (matching `/export`).
-Without `--jsonl` and without a path, HTML is written next to the session
-file. JSONL with no path defaults to `<session-stem>.jsonl` in the session
-working directory, since the session-dir default would collide with the
-`.jsonl` source file.
-Source: `crates/pi-cli/src/interactive_commands.rs`
-(`parse_dump_invocation` / `execute_dump`).
+## Share
 
-### RPC export
+`/share` uses `gh gist create` with secret-gist visibility. GitHub CLI must be installed and authenticated; credentials remain owned by `gh`. A secret gist is unlisted, **not access-controlled private storage**. Anyone with its URL can read it.
 
-In RPC mode, send:
+`PI_SHARE_VIEWER_URL` changes the returned viewer URL. If it contains `{url}`, the gist URL is substituted; otherwise the configured value is used directly. Without it, the gist URL itself is returned.
 
-```json
-{"type":"export_html","outputPath":"report.html"}
-```
+Sharing is refused when the session is offline or `RPI_OFFLINE` is truthy (`1`, `true`, or `yes`, case-insensitive). Local export remains a separate operation.
 
-The response contains `{ "path": "..." }`. RPC export always produces HTML.
-Source: `crates/pi-cli/src/modes/rpc.rs:138-141`,
-`crates/pi-cli/src/modes/rpc.rs:894-896`.
+## Import
 
-## Start a fresh session
+`rpi import-session SOURCE INPUT [--output PATH]` accepts `pi`, `omp`, `codex`, `claude`, `grok`, and `droid`. Conversion is delegated to agent-loader; an explicit output must not already exist. Empty/unconvertible content fails.
 
-```text
-/fresh
-```
+OMP chain import preserves root-to-leaf order, leaf identity/working directory, root start time, and first-occurrence message-identifier deduplication. Oversize chain members are excluded from conversion while retained as lineage boundaries. See [session recovery](../user-guide/session-recovery.md).
 
-`/fresh` (alias for `/new`) starts a new, clean session: the current one is
-archived in place — the session store keeps every session file, so the old
-recorder stays on disk with a new recorder getting a fresh id. The TUI resets
-the transcript view to the new session.
-Source: `crates/pi-cli/src/interactive_commands.rs`,
-`crates/pi-cli/src/tui.rs` (`"new" | "fresh"` dispatch arm).
+## Safety
 
-## Share a session as a gist
-
-```text
-/share
-```
-
-`/share` is available in the TUI, the REPL, and through the application API. It
-exports the current session to HTML and uploads it as a **secret** GitHub gist
-using `gh gist create --desc "rpi session export"`. The command intentionally
-omits visibility flags so GitHub CLI's secret-gist default applies.
-Source: `crates/pi-cli/src/interactive_commands.rs`,
-`crates/pi-cli/src/repl.rs`, `crates/pi-coding/src/share.rs`.
-
-Requirements:
-
-- `gh` must be installed.
-- `gh auth login` must have completed successfully.
-
-If either check fails, the command returns an actionable error such as
-"`gh CLI not found; install it from https://cli.github.com/`" or
-"`gh is not authenticated; run `gh auth login` to sign in`".
-Source: `crates/pi-coding/src/share.rs:40-60`.
-
-### Encrypted share (`/share --encrypt`)
-
-```text
-/share --encrypt                # prompt for a passphrase (hidden input)
-/share --encrypt <passphrase>   # passphrase on the command line
-```
-
-`--encrypt` exports the current session branch as JSONL and encrypts it with
-the passphrase using **AES-256-GCM**, writing `<name>.jsonl.enc`. The plaintext
-JSONL is staged in the system temp directory and removed after encryption.
-When the `gh` CLI is available and authenticated the ciphertext is also
-uploaded to a secret gist (non-fatal if `gh` is missing).
-
-The passphrase is never stored or logged. The scheme is documented for
-interoperability in `crates/pi-coding/src/encrypt.rs`:
-
-- key = SHA-256(passphrase) (32 bytes)
-- nonce = 12 fresh random bytes per encryption
-- file layout: `nonce (12 bytes) || AES-256-GCM ciphertext` (ciphertext
-  includes the 16-byte authentication tag)
-
-Decrypt by splitting the 12-byte nonce prefix and authenticating the tag with
-the same passphrase; a wrong passphrase or any tampering fails tag
-verification.
-Source: `crates/pi-coding/src/encrypt.rs`,
-`crates/pi-coding/src/share.rs`
-(`encrypt_session_share_to_file` / `share_session_encrypted`),
-`crates/pi-cli/src/interactive_commands.rs`
-(`parse_share_invocation` / `execute_encrypted_share`).
-
-By default the returned URL is the raw gist URL, which renders on
-`gist.github.com`. You can substitute a custom viewer by setting
-`PI_SHARE_VIEWER_URL`. If the value contains `{url}`, the gist URL is substituted
-into the template; otherwise the value is used verbatim.
-Source: `crates/pi-coding/src/share.rs:20-24`,
-`crates/pi-coding/src/share.rs:67-89`.
-
-## Copy to clipboard
-
-The last assistant response can be copied to the system clipboard:
-
-- Slash command: `/copy`
-- Default keybindings: `ctrl+x` or `ctrl+shift+c` (action name `app.message.copy`
-  / `copy_last_assistant`)
-
-Source: `crates/pi-cli/src/repl.rs:350`,
-`crates/pi-cli/src/interactive_commands.rs:175-179`,
-`crates/pi-cli/src/keybindings.rs:53-59`,
-`crates/pi-cli/src/keybindings.rs:128-135`,
-`crates/pi-cli/src/keybindings.rs:396-401`.
-
-Clipboard writing is implemented per platform: PowerShell on Windows,
-`pbcopy` on macOS, and `xclip`/`xsel` on Linux. The TUI and REPL also support
-pasting clipboard images with `ctrl+v` / `alt+v` (action `app.clipboard.pasteImage`
-/ `clipboard_paste`).
-Source: `crates/pi-cli/src/clipboard.rs:52-112`.
-
-## Manual portability
-
-Native Pi v3 session files are plain JSONL and live under:
-
-```text
-<agent-dir>/sessions/--<encoded-cwd>--/<timestamp>_<id>.jsonl
-```
-
-You can copy, move, or archive these files directly. A session file may contain
-multiple branches linked by `parentId`; the active branch is followed from the
-leaf entry. The JSONL export writes only that active branch.
-
-## Environment variables
-
-| Variable | Purpose |
-|----------|---------|
-| `PI_SHARE_VIEWER_URL` | Viewer URL template; use `{url}` to substitute the gist URL |
+Review exported content before upload. HTML escaping prevents transcript markup injection; it does not remove every sensitive fact in a conversation. Redaction is not a substitute for reviewing paths, proprietary code, personal information, and credentials. Keep native journals and recovery sidecars when lossless recovery matters.

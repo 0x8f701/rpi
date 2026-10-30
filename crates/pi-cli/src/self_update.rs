@@ -1,9 +1,8 @@
 //! Installer-compatible GitHub release notification and native self-update.
 //!
-//! `PI_UPDATE_BASE_URL` overrides the default `0x8f701/rpi` GitHub releases
-//! API, matching `install.sh` and `install.ps1`. `PI_OFFLINE=1|true|yes`
-//! disables updater networking; `PI_SKIP_VERSION_CHECK` disables only the
-//! nonfatal interactive startup check.
+//! Release metadata and assets use fixed operator-owned GitHub operations.
+//! `RPI_OFFLINE=1|true|yes` disables updater networking;
+//! `RPI_SKIP_VERSION_CHECK` disables only the nonfatal interactive startup check.
 
 use std::env;
 use std::fmt::Write as _;
@@ -15,24 +14,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use futures_util::StreamExt;
-use reqwest::Client;
+use pi_coding::self_update_http::{SelfUpdateChannel, SelfUpdateOperatorHttp};
 use semver::Version;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-const DEFAULT_API: &str = "https://api.github.com/repos/0x8f701/rpi/releases";
-const API_LIMIT: u64 = 4 * 1024 * 1024;
 const SUMS_LIMIT: u64 = 1024 * 1024;
 const FILE_LIMIT: u64 = 1024 * 1024 * 1024;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const LOCK_OWNER_LIMIT: u64 = 64;
 const STALE_MALFORMED_LOCK_AGE: Duration = Duration::from_secs(5);
 static UNIQUE: AtomicU64 = AtomicU64::new(0);
+const RPI_OFFLINE_ENV: &str = "RPI_OFFLINE";
+const RPI_SKIP_VERSION_CHECK_ENV: &str = "RPI_SKIP_VERSION_CHECK";
+const RPI_HOME_ENV: &str = "RPI_HOME";
+const RPI_UPDATE_BASE_URL_ENV: &str = "RPI_UPDATE_BASE_URL";
 
 #[derive(Clone, Deserialize)]
 struct GithubRelease {
@@ -51,6 +48,11 @@ struct GithubRelease {
 #[derive(Clone, Deserialize)]
 struct ReleaseAsset {
     name: String,
+    /// Exact download URL reported by the release metadata. The operator
+    /// transport pins this against `RPI_UPDATE_BASE_URL` (override) or the
+    /// fixed GitHub release download host, so a metadata endpoint can never
+    /// redirect an asset fetch to an arbitrary authority. Mirrors
+    /// `browser_download_url` used by `install.sh`/`install.ps1`.
     browser_download_url: String,
     #[serde(default)]
     size: u64,
@@ -89,64 +91,37 @@ struct DeferredUpdateResult {
 }
 
 struct ReleaseClient {
-    http: Client,
-    api: String,
-    authenticate: bool,
+    http: SelfUpdateOperatorHttp,
 }
 
 impl ReleaseClient {
     fn new() -> Result<Self> {
-        let api = env::var("PI_UPDATE_BASE_URL")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_API.to_owned())
-            .trim_end_matches('/')
-            .to_owned();
         Ok(Self {
-            authenticate: api == DEFAULT_API,
-            api,
-            http: Client::builder()
-                .user_agent(format!("rpi/{}", env!("CARGO_PKG_VERSION")))
-                .connect_timeout(REQUEST_TIMEOUT)
-                .redirect(reqwest::redirect::Policy::limited(5))
-                .build()
-                .context("creating GitHub release client")?,
+            http: SelfUpdateOperatorHttp::new()
+                .context("creating self-update operator transport")?,
         })
     }
 
-    async fn json<T: DeserializeOwned>(&self, url: &str) -> Result<T> {
-        let mut request = self
+    async fn metadata<T: serde::de::DeserializeOwned>(
+        &self,
+        channel: SelfUpdateChannel,
+    ) -> Result<T> {
+        let bytes = self
             .http
-            .get(url)
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json");
-        if self.authenticate
-            && api_child(url, &self.api)
-            && let Some(token) = env::var("GITHUB_TOKEN")
-                .ok()
-                .filter(|token| !token.trim().is_empty())
-        {
-            request = request.bearer_auth(token);
-        }
-        let bytes = tokio::time::timeout(REQUEST_TIMEOUT, response_bytes(request, API_LIMIT))
+            .metadata(channel)
             .await
-            .context("release metadata request timed out")?
-            .with_context(|| format!("fetching release metadata from {url}"))?;
-        serde_json::from_slice(&bytes)
-            .with_context(|| format!("parsing release metadata from {url}"))
+            .context("fetching release metadata")?;
+        serde_json::from_slice(&bytes).context("parsing release metadata")
     }
 
-    async fn download(&self, url: &str, path: &Path, limit: u64) -> Result<String> {
-        let response = self
+    async fn download(&self, url: &str, asset: &str, path: &Path, limit: u64) -> Result<String> {
+        let bytes = self
             .http
-            .get(url)
-            .header(reqwest::header::ACCEPT, "application/octet-stream")
-            .send()
+            .asset(url.to_owned())
             .await
-            .with_context(|| format!("downloading {url}"))?
-            .error_for_status()
-            .with_context(|| format!("downloading {url}"))?;
-        if response.content_length().is_some_and(|size| size > limit) {
-            bail!("download from {url} exceeds the {limit}-byte safety limit");
+            .with_context(|| format!("downloading release asset {asset}"))?;
+        if bytes.len() as u64 > limit {
+            bail!("release asset {asset} exceeds the {limit}-byte safety limit");
         }
         let mut output = tokio::fs::OpenOptions::new()
             .create_new(true)
@@ -154,41 +129,24 @@ impl ReleaseClient {
             .open(path)
             .await
             .with_context(|| format!("creating download {}", path.display()))?;
-        let mut stream = response.bytes_stream();
-        let mut size = 0_u64;
-        let mut hasher = Sha256::new();
-        while let Some(chunk) = tokio::time::timeout(DOWNLOAD_IDLE_TIMEOUT, stream.next())
+        let digest = Sha256::digest(bytes.as_ref());
+        tokio::io::AsyncWriteExt::write_all(&mut output, &bytes)
             .await
-            .with_context(|| format!("download from {url} stalled"))?
-        {
-            let chunk = chunk.with_context(|| format!("reading download from {url}"))?;
-            size = size
-                .checked_add(chunk.len() as u64)
-                .ok_or_else(|| anyhow!("download size overflow from {url}"))?;
-            if size > limit {
-                bail!("download from {url} exceeds the {limit}-byte safety limit");
-            }
-            hasher.update(&chunk);
-            output
-                .write_all(&chunk)
-                .await
-                .with_context(|| format!("writing download {}", path.display()))?;
-        }
-        output
-            .flush()
+            .with_context(|| format!("writing download {}", path.display()))?;
+        tokio::io::AsyncWriteExt::flush(&mut output)
             .await
             .with_context(|| format!("flushing download {}", path.display()))?;
         output
             .sync_all()
             .await
             .with_context(|| format!("syncing download {}", path.display()))?;
-        Ok(hex(&hasher.finalize()))
+        Ok(hex(&digest))
     }
 }
 
 /// Check for a newer release without delaying or failing interactive startup.
 pub async fn startup_notice() -> Option<String> {
-    if offline() || env::var_os("PI_SKIP_VERSION_CHECK").is_some() {
+    if startup_notice_suppressed(offline(), env::var_os(RPI_SKIP_VERSION_CHECK_ENV).is_some()) {
         return None;
     }
     let current = Version::parse(env!("CARGO_PKG_VERSION")).ok()?;
@@ -214,15 +172,15 @@ pub async fn startup_notice() -> Option<String> {
 /// Download, checksum, smoke-test, and atomically activate the latest release.
 pub async fn update_self(force: bool) -> Result<()> {
     if offline() {
-        bail!("self-update is unavailable while PI_OFFLINE is enabled");
+        bail!("self-update is unavailable while RPI_OFFLINE is enabled");
     }
     let current = Version::parse(env!("CARGO_PKG_VERSION"))
         .context("the running rpi version is not valid semantic versioning")?;
     let install = ManagedInstall::detect(&current)?;
     #[cfg(windows)]
     check_deferred_update_result(&install.root)?;
-    let mut lock = InstallLock::acquire(&install.root).await?;
     let client = ReleaseClient::new()?;
+    let mut lock = InstallLock::acquire(&install.root).await?;
     let latest = select_release(&client, &current).await?;
     if latest.version < current {
         println!(
@@ -259,7 +217,12 @@ pub async fn update_self(force: bool) -> Result<()> {
     let scratch = ScratchDir::new(&install.root)?;
     let sums_path = scratch.path.join("SHA256SUMS");
     client
-        .download(&sums_asset.browser_download_url, &sums_path, SUMS_LIMIT)
+        .download(
+            &sums_asset.browser_download_url,
+            "SHA256SUMS",
+            &sums_path,
+            SUMS_LIMIT,
+        )
         .await?;
     let expected = expected_checksum(&sums_path, &asset_name)?;
     if !force && latest.version == current && install.state.installed_sha256 == expected {
@@ -272,6 +235,7 @@ pub async fn update_self(force: bool) -> Result<()> {
     let actual = client
         .download(
             &archive_asset.browser_download_url,
+            &asset_name,
             &archive_path,
             FILE_LIMIT,
         )
@@ -305,7 +269,7 @@ pub async fn update_self(force: bool) -> Result<()> {
 async fn select_release(client: &ReleaseClient, current: &Version) -> Result<ReleaseInfo> {
     if current.pre.is_empty() {
         let release = client
-            .json::<GithubRelease>(&format!("{}/latest", client.api))
+            .metadata::<GithubRelease>(SelfUpdateChannel::Stable)
             .await?;
         let info = validate_release(release)?;
         if info.release.draft || info.release.prerelease || !info.version.pre.is_empty() {
@@ -314,7 +278,7 @@ async fn select_release(client: &ReleaseClient, current: &Version) -> Result<Rel
         return Ok(info);
     }
     client
-        .json::<Vec<GithubRelease>>(&client.api)
+        .metadata::<Vec<GithubRelease>>(SelfUpdateChannel::Prerelease)
         .await?
         .into_iter()
         .filter_map(|release| validate_release(release).ok())
@@ -353,30 +317,7 @@ fn exact_asset<'a>(release: &'a GithubRelease, name: &str) -> Result<&'a Release
             release.tag_name
         );
     }
-    if asset.browser_download_url.trim().is_empty() {
-        bail!("release asset {name} has no download URL");
-    }
     Ok(asset)
-}
-
-async fn response_bytes(request: reqwest::RequestBuilder, limit: u64) -> Result<Vec<u8>> {
-    let response = request.send().await?.error_for_status()?;
-    if response.content_length().is_some_and(|size| size > limit) {
-        bail!("HTTP response exceeds the {limit}-byte safety limit");
-    }
-    let mut output = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        if (output.len() as u64)
-            .checked_add(chunk.len() as u64)
-            .is_none_or(|size| size > limit)
-        {
-            bail!("HTTP response exceeds the {limit}-byte safety limit");
-        }
-        output.extend_from_slice(&chunk);
-    }
-    Ok(output)
 }
 
 fn expected_checksum(path: &Path, asset: &str) -> Result<String> {
@@ -486,21 +427,11 @@ impl ManagedInstall {
             .context("locating the running rpi executable")?
             .canonicalize()
             .context("resolving the running rpi executable")?;
-        let hinted = match env::var_os("PI_HOME") {
-            Some(value) => absolute(PathBuf::from(value))?,
-            None if cfg!(windows) => executable
-                .parent()
-                .filter(|parent| parent.file_name().is_some_and(|name| name == "bin"))
-                .and_then(Path::parent)
-                .map(Path::to_path_buf)
-                .ok_or_else(unknown_install)?,
-            None => executable
-                .parent()
-                .filter(|parent| parent.file_name().is_some_and(|name| name == "downloads"))
-                .and_then(Path::parent)
-                .map(Path::to_path_buf)
-                .ok_or_else(unknown_install)?,
-        };
+        let hinted = managed_install_root(
+            env::var_os(RPI_HOME_ENV).map(PathBuf::from),
+            &executable,
+            cfg!(windows),
+        )?;
         reject_symlink(&hinted, "install root")?;
         let root = hinted
             .canonicalize()
@@ -1329,15 +1260,44 @@ fn sync_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn offline() -> bool {
-    crate::session_run::offline()
+#[must_use]
+fn offline_from(value: Option<&str>) -> bool {
+    matches!(
+        value
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+#[must_use]
+const fn startup_notice_suppressed(offline: bool, skip_version_check_present: bool) -> bool {
+    offline || skip_version_check_present
 }
 
-fn api_child(url: &str, base: &str) -> bool {
-    url == base
-        || url
-            .strip_prefix(base)
-            .is_some_and(|suffix| suffix.starts_with('/'))
+fn managed_install_root(
+    configured: Option<PathBuf>,
+    executable: &Path,
+    windows: bool,
+) -> Result<PathBuf> {
+    match configured {
+        Some(value) => absolute(value),
+        None if windows => executable
+            .parent()
+            .filter(|parent| parent.file_name().is_some_and(|name| name == "bin"))
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .ok_or_else(unknown_install),
+        None => executable
+            .parent()
+            .filter(|parent| parent.file_name().is_some_and(|name| name == "downloads"))
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .ok_or_else(unknown_install),
+    }
+}
+
+fn offline() -> bool {
+    crate::session_run::offline() || offline_from(env::var(RPI_OFFLINE_ENV).ok().as_deref())
 }
 
 fn changelog_summary(body: Option<&str>) -> Option<String> {
@@ -1383,6 +1343,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn canonical_offline_control_preserves_truthy_semantics() {
+        for value in ["1", "true", "TRUE", " yes ", "tRuE"] {
+            assert!(offline_from(Some(value)), "{value:?} must count as offline");
+        }
+        for value in ["", "0", "false", "no", "off", "2", "disabled"] {
+            assert!(!offline_from(Some(value)), "{value:?} must stay online");
+        }
+        assert!(!offline_from(None), "missing RPI_OFFLINE stays online");
+    }
+    #[test]
+    fn canonical_environment_names_are_exact() {
+        assert_eq!(RPI_OFFLINE_ENV, "RPI_OFFLINE");
+        assert_eq!(RPI_SKIP_VERSION_CHECK_ENV, "RPI_SKIP_VERSION_CHECK");
+        assert_eq!(RPI_HOME_ENV, "RPI_HOME");
+        assert_eq!(RPI_UPDATE_BASE_URL_ENV, "RPI_UPDATE_BASE_URL");
+    }
+
+    #[test]
+    fn canonical_skip_version_check_uses_presence_semantics() {
+        assert!(!startup_notice_suppressed(false, false));
+        assert!(startup_notice_suppressed(false, true));
+        assert!(startup_notice_suppressed(true, false));
+        assert!(startup_notice_suppressed(true, true));
+    }
+
+    #[test]
+    fn canonical_home_controls_managed_install_root() {
+        let root = tempfile::tempdir().expect("install root");
+        let executable = root.path().join("other").join("rpi");
+        assert_eq!(
+            managed_install_root(Some(root.path().to_path_buf()), &executable, false)
+                .expect("canonical home"),
+            root.path()
+        );
+    }
+
+    #[test]
+    fn managed_install_layout_is_used_only_without_canonical_home() {
+        let root = tempfile::tempdir().expect("install root");
+        assert_eq!(
+            managed_install_root(None, &root.path().join("downloads").join("rpi"), false)
+                .expect("unix layout"),
+            root.path()
+        );
+        assert_eq!(
+            managed_install_root(None, &root.path().join("bin").join("rpi.exe"), true)
+                .expect("windows layout"),
+            root.path()
+        );
+    }
+
+    #[test]
     fn Windows_mutex_name_matches_installer_replacement() {
         let install_root = Path::new("C:\\").join("rpi-fixtures").join("managed");
         assert_eq!(
@@ -1424,9 +1436,9 @@ mod tests {
             .find("[IO.File]::WriteAllText($Ready")
             .expect("ready signal");
         assert!(catch < ownership && ownership < ready);
-        assert!(WINDOWS_LOCKER.contains(
-            "if ($mutexAcquired) {try {$mutex.ReleaseMutex()} catch {}}"
-        ));
+        assert!(
+            WINDOWS_LOCKER.contains("if ($mutexAcquired) {try {$mutex.ReleaseMutex()} catch {}}")
+        );
     }
 
     #[test]
@@ -1450,10 +1462,9 @@ mod tests {
             WINDOWS_LOCKER.contains("$LASTEXITCODE -ne 0 -or $versionOutput -cne"),
             "exit status alone must not prove identity"
         );
-        assert!(
-            WINDOWS_LOCKER
-                .contains("throw 'new binary failed identity check; previous binary restored and verified'")
-        );
+        assert!(WINDOWS_LOCKER.contains(
+            "throw 'new binary failed identity check; previous binary restored and verified'"
+        ));
     }
 
     #[cfg(unix)]
@@ -1496,11 +1507,13 @@ mod tests {
         let path = root.path().join(".install.lock");
         for content in [Vec::new(), b"not-a-pid\n".to_vec(), vec![b'9'; 65]] {
             fs::write(&path, &content).expect("malformed lock");
-            assert!(!stale_lock_with(&path, |_| ProcessLiveness::Dead)
-                .expect("fresh malformed owner"));
+            assert!(
+                !stale_lock_with(&path, |_| ProcessLiveness::Dead).expect("fresh malformed owner")
+            );
             age_lock(&path);
-            assert!(stale_lock_with(&path, |_| ProcessLiveness::Alive)
-                .expect("aged malformed owner"));
+            assert!(
+                stale_lock_with(&path, |_| ProcessLiveness::Alive).expect("aged malformed owner")
+            );
         }
     }
 
@@ -1569,8 +1582,21 @@ mod tests {
     }
 
     #[test]
-    fn stable_selection_and_download_timeouts_are_separate() {
-        assert_eq!(REQUEST_TIMEOUT, Duration::from_secs(10));
-        assert!(DOWNLOAD_IDLE_TIMEOUT > REQUEST_TIMEOUT);
+    fn release_asset_authority_is_not_consumed() {
+        let release: GithubRelease = serde_json::from_value(serde_json::json!({
+            "tag_name": "v1.2.3",
+            "html_url": "https://github.com/0x8f701/rpi/releases/tag/v1.2.3",
+            "assets": [{
+                "name": "SHA256SUMS",
+                "browser_download_url": "https://example.invalid/untrusted"
+            }]
+        }))
+        .expect("release metadata");
+        assert_eq!(
+            exact_asset(&release, "SHA256SUMS")
+                .expect("compiled asset")
+                .name,
+            "SHA256SUMS"
+        );
     }
 }

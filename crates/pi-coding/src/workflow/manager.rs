@@ -1,22 +1,28 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
-use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::store::{StoreDiagnostic, StoreDiagnosticKind, StoreRecord, WorkflowStore};
+use super::{WorkflowId, WorkflowStatus};
+use crate::TodoState;
+use crate::fs::CapabilityRootLease;
+use crate::sandbox::DurablePolicyState;
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, broadcast};
-use super::store::{StoreDiagnostic, StoreDiagnosticKind, StoreRecord, WorkflowStore};
-use super::{WorkflowId, WorkflowStatus}; use crate::TodoState;
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WorkflowFailure { pub message: String }
+pub struct WorkflowFailure {
+    pub message: String,
+}
 impl fmt::Debug for WorkflowFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("WorkflowFailure").finish_non_exhaustive()
+        formatter
+            .debug_struct("WorkflowFailure")
+            .finish_non_exhaustive()
     }
 }
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,14 +30,20 @@ impl fmt::Debug for WorkflowFailure {
 pub enum WorkflowIntegration {
     #[default]
     None,
-    Applied { result_commit: String },
-    Conflicted { conflicts: Vec<String> },
+    Applied {
+        result_commit: String,
+    },
+    Conflicted {
+        conflicts: Vec<String>,
+    },
 }
 impl fmt::Debug for WorkflowIntegration {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::None => formatter.write_str("WorkflowIntegration::None"),
-            Self::Applied { .. } => formatter.debug_struct("WorkflowIntegration::Applied").finish_non_exhaustive(),
+            Self::Applied { .. } => formatter
+                .debug_struct("WorkflowIntegration::Applied")
+                .finish_non_exhaustive(),
             Self::Conflicted { conflicts } => formatter
                 .debug_struct("WorkflowIntegration::Conflicted")
                 .field("conflict_count", &conflicts.len())
@@ -50,6 +62,7 @@ pub struct WorkflowSnapshot {
     pub updated_at_ms: u64,
     pub generation: u64,
     pub todo: TodoState,
+    pub durable_policy: DurablePolicyState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -62,45 +75,84 @@ pub struct WorkflowSnapshot {
     pub failure: Option<WorkflowFailure>,
     #[serde(default)]
     pub integration: WorkflowIntegration,
+    /// Planning prompts already consumed in this durable Planning phase.
+    /// Serde-default 0 so records written before this field still load.
+    /// Never overloads `supervisor_job_id`.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub planning_prompts_consumed: u8,
 }
 impl fmt::Debug for WorkflowSnapshot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("WorkflowSnapshot")
+        formatter
+            .debug_struct("WorkflowSnapshot")
             .field("status", &self.status)
             .field("generation", &self.generation)
             .field("phase_count", &self.todo.phases.len())
             .finish_non_exhaustive()
     }
 }
-impl StoreRecord for WorkflowSnapshot { fn workflow_id(&self) -> &WorkflowId { &self.workflow_id } }
-#[derive(Clone, PartialEq, Eq)]
-pub struct WorkflowCreateRequest { pub name: String, pub objective: String }
-impl fmt::Debug for WorkflowCreateRequest {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("WorkflowCreateRequest").finish_non_exhaustive()
+impl StoreRecord for WorkflowSnapshot {
+    fn workflow_id(&self) -> &WorkflowId {
+        &self.workflow_id
     }
 }
 #[derive(Clone, PartialEq, Eq)]
-pub struct WorkflowRuntimeRequest { pub workflow_id: WorkflowId, pub name: String, pub objective: String, pub generation: u64 }
+pub struct WorkflowCreateRequest {
+    pub name: String,
+    pub objective: String,
+}
+impl fmt::Debug for WorkflowCreateRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkflowCreateRequest")
+            .finish_non_exhaustive()
+    }
+}
+#[derive(Clone, PartialEq, Eq)]
+pub struct WorkflowRuntimeRequest {
+    pub workflow_id: WorkflowId,
+    pub name: String,
+    pub objective: String,
+    pub generation: u64,
+}
 impl fmt::Debug for WorkflowRuntimeRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("WorkflowRuntimeRequest").field("generation", &self.generation).finish_non_exhaustive()
+        formatter
+            .debug_struct("WorkflowRuntimeRequest")
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
     }
 }
 #[derive(Clone, PartialEq, Eq)]
 pub struct WorkflowRuntimeIdentity {
-    pub worktree_label: Option<String>, pub branch: Option<String>,
-    pub supervisor_agent_id: Option<String>, pub supervisor_job_id: Option<String>, pub todo: TodoState,
+    pub worktree_label: Option<String>,
+    pub branch: Option<String>,
+    pub supervisor_agent_id: Option<String>,
+    pub supervisor_job_id: Option<String>,
+    pub todo: TodoState,
+    pub durable_policy: DurablePolicyState,
 }
 impl fmt::Debug for WorkflowRuntimeIdentity {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("WorkflowRuntimeIdentity").field("phase_count", &self.todo.phases.len()).finish_non_exhaustive()
+        formatter
+            .debug_struct("WorkflowRuntimeIdentity")
+            .field("phase_count", &self.todo.phases.len())
+            .finish_non_exhaustive()
     }
 }
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowRuntimeUpdate {
-    pub status: WorkflowStatus, pub todo: TodoState, pub supervisor_agent_id: Option<String>,
-    pub supervisor_job_id: Option<String>, pub failure: Option<WorkflowFailure>, pub integration: WorkflowIntegration,
+    pub status: WorkflowStatus,
+    pub todo: TodoState,
+    pub supervisor_agent_id: Option<String>,
+    pub supervisor_job_id: Option<String>,
+    pub failure: Option<WorkflowFailure>,
+    pub integration: WorkflowIntegration,
+    pub durable_policy: DurablePolicyState,
+    /// Planning prompts already consumed; copied onto the durable snapshot
+    /// so a restart cannot reset the 1+1 planning budget.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub planning_prompts_consumed: u8,
 }
 impl fmt::Debug for WorkflowRuntimeUpdate {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -113,10 +165,19 @@ impl fmt::Debug for WorkflowRuntimeUpdate {
             .finish_non_exhaustive()
     }
 }
+fn is_zero_u8(value: &u8) -> bool {
+    *value == 0
+}
+
 #[async_trait]
 pub trait WorkflowRuntimeFactory: Send + Sync {
     async fn create(&self, request: &WorkflowRuntimeRequest) -> Result<WorkflowRuntimeIdentity>;
-    async fn restore(&self, request: &WorkflowRuntimeRequest, snapshot: &WorkflowSnapshot) -> Result<WorkflowRuntimeIdentity>;
+    async fn start_created(&self, snapshot: &WorkflowSnapshot) -> Result<()>;
+    async fn restore(
+        &self,
+        request: &WorkflowRuntimeRequest,
+        snapshot: &WorkflowSnapshot,
+    ) -> Result<WorkflowRuntimeIdentity>;
     async fn pause(&self, snapshot: &WorkflowSnapshot) -> Result<WorkflowRuntimeUpdate>;
     async fn resume(&self, snapshot: &WorkflowSnapshot) -> Result<WorkflowRuntimeUpdate>;
     async fn cancel(&self, snapshot: &WorkflowSnapshot) -> Result<WorkflowRuntimeUpdate>;
@@ -126,16 +187,36 @@ pub trait WorkflowRuntimeFactory: Send + Sync {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkflowEvent {
-    Created { snapshot: WorkflowSnapshot }, Updated { snapshot: WorkflowSnapshot },
-    StatusChanged { workflow_id: WorkflowId, generation: u64, status: WorkflowStatus },
-    Removed { workflow_id: WorkflowId, generation: u64 },
+    Created {
+        snapshot: WorkflowSnapshot,
+    },
+    Updated {
+        snapshot: WorkflowSnapshot,
+    },
+    StatusChanged {
+        workflow_id: WorkflowId,
+        generation: u64,
+        status: WorkflowStatus,
+    },
+    Removed {
+        workflow_id: WorkflowId,
+        generation: u64,
+    },
 }
 impl fmt::Debug for WorkflowEvent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Created { snapshot } => formatter.debug_struct("WorkflowEvent::Created").field("snapshot", snapshot).finish(),
-            Self::Updated { snapshot } => formatter.debug_struct("WorkflowEvent::Updated").field("snapshot", snapshot).finish(),
-            Self::StatusChanged { generation, status, .. } => formatter
+            Self::Created { snapshot } => formatter
+                .debug_struct("WorkflowEvent::Created")
+                .field("snapshot", snapshot)
+                .finish(),
+            Self::Updated { snapshot } => formatter
+                .debug_struct("WorkflowEvent::Updated")
+                .field("snapshot", snapshot)
+                .finish(),
+            Self::StatusChanged {
+                generation, status, ..
+            } => formatter
                 .debug_struct("WorkflowEvent::StatusChanged")
                 .field("generation", generation)
                 .field("status", status)
@@ -148,7 +229,10 @@ impl fmt::Debug for WorkflowEvent {
     }
 }
 #[derive(Clone, PartialEq, Eq)]
-pub struct WorkflowStoreDiagnostic { pub workflow_id: Option<WorkflowId>, pub message: String }
+pub struct WorkflowStoreDiagnostic {
+    pub workflow_id: Option<WorkflowId>,
+    pub message: String,
+}
 impl fmt::Debug for WorkflowStoreDiagnostic {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -160,13 +244,34 @@ impl fmt::Debug for WorkflowStoreDiagnostic {
 struct UnconfiguredWorkflowRuntimeFactory;
 #[async_trait]
 impl WorkflowRuntimeFactory for UnconfiguredWorkflowRuntimeFactory {
-    async fn create(&self, _: &WorkflowRuntimeRequest) -> Result<WorkflowRuntimeIdentity> { bail!("workflow runtime factory is not configured") }
-    async fn restore(&self, _: &WorkflowRuntimeRequest, _: &WorkflowSnapshot) -> Result<WorkflowRuntimeIdentity> { bail!("workflow runtime factory is not configured") }
-    async fn pause(&self, _: &WorkflowSnapshot) -> Result<WorkflowRuntimeUpdate> { bail!("workflow runtime factory is not configured") }
-    async fn resume(&self, _: &WorkflowSnapshot) -> Result<WorkflowRuntimeUpdate> { bail!("workflow runtime factory is not configured") }
-    async fn cancel(&self, _: &WorkflowSnapshot) -> Result<WorkflowRuntimeUpdate> { bail!("workflow runtime factory is not configured") }
-    async fn integrate(&self, _: &WorkflowSnapshot) -> Result<WorkflowRuntimeUpdate> { bail!("workflow runtime factory is not configured") }
-    async fn remove(&self, _: &WorkflowSnapshot) -> Result<()> { bail!("workflow runtime factory is not configured") }
+    async fn create(&self, _: &WorkflowRuntimeRequest) -> Result<WorkflowRuntimeIdentity> {
+        bail!("workflow runtime factory is not configured")
+    }
+    async fn start_created(&self, _: &WorkflowSnapshot) -> Result<()> {
+        bail!("workflow runtime factory is not configured")
+    }
+    async fn restore(
+        &self,
+        _: &WorkflowRuntimeRequest,
+        _: &WorkflowSnapshot,
+    ) -> Result<WorkflowRuntimeIdentity> {
+        bail!("workflow runtime factory is not configured")
+    }
+    async fn pause(&self, _: &WorkflowSnapshot) -> Result<WorkflowRuntimeUpdate> {
+        bail!("workflow runtime factory is not configured")
+    }
+    async fn resume(&self, _: &WorkflowSnapshot) -> Result<WorkflowRuntimeUpdate> {
+        bail!("workflow runtime factory is not configured")
+    }
+    async fn cancel(&self, _: &WorkflowSnapshot) -> Result<WorkflowRuntimeUpdate> {
+        bail!("workflow runtime factory is not configured")
+    }
+    async fn integrate(&self, _: &WorkflowSnapshot) -> Result<WorkflowRuntimeUpdate> {
+        bail!("workflow runtime factory is not configured")
+    }
+    async fn remove(&self, _: &WorkflowSnapshot) -> Result<()> {
+        bail!("workflow runtime factory is not configured")
+    }
 }
 struct WorkflowManagerInner {
     store: WorkflowStore,
@@ -179,53 +284,135 @@ struct WorkflowManagerInner {
     failpoints: parking_lot::Mutex<WorkflowManagerFailpoints>,
 }
 #[derive(Default)]
-struct WorkflowManagerState { workflows: BTreeMap<WorkflowId, WorkflowSnapshot>, selected: Option<WorkflowId>, diagnostics: Vec<WorkflowStoreDiagnostic> }
+struct WorkflowManagerState {
+    workflows: BTreeMap<WorkflowId, WorkflowSnapshot>,
+    selected: Option<WorkflowId>,
+    diagnostics: Vec<WorkflowStoreDiagnostic>,
+}
 #[derive(Default)]
 struct WorkflowReservations {
     names: HashSet<String>,
     operations: HashMap<WorkflowId, Arc<AsyncMutex<()>>>,
     creating: HashMap<WorkflowId, CreatingWorkflow>,
 }
-struct CreatingWorkflow { generation: u64, status: WorkflowStatus, projection: Option<WorkflowRuntimeUpdate> }
+struct CreatingWorkflow {
+    generation: u64,
+    status: WorkflowStatus,
+    projection: Option<WorkflowRuntimeUpdate>,
+    planning_prompts_consumed: u8,
+    durable_snapshot: Option<WorkflowSnapshot>,
+}
+
 #[derive(Clone, Copy)]
-enum WorkflowManagerFailpoint { SelectAfterWrite, CreateSelectionAfterWrite, PersistAfterWrite, RemoveSelectionAfterWrite, RemoveAfterDelete }
+enum WorkflowManagerFailpoint {
+    SelectAfterWrite,
+    CreateSelectionAfterWrite,
+    PersistAfterWrite,
+    RemoveSelectionAfterWrite,
+    RemoveAfterDelete,
+}
 #[cfg(test)]
 #[derive(Default)]
-struct WorkflowManagerFailpoints { select_after_write: usize, create_selection_after_write: usize, persist_after_write: usize, remove_selection_after_write: usize, remove_after_delete: usize }
-#[derive(Clone)]
-pub struct WorkflowManager { inner: Arc<WorkflowManagerInner> }
-impl fmt::Debug for WorkflowManager {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { formatter.debug_struct("WorkflowManager").field("workflow_count", &self.inner.state.read().workflows.len()).finish_non_exhaustive() }
+struct WorkflowManagerFailpoints {
+    select_after_write: usize,
+    create_selection_after_write: usize,
+    persist_after_write: usize,
+    remove_selection_after_write: usize,
+    remove_after_delete: usize,
 }
 #[derive(Clone)]
-pub(crate) struct WorkflowRuntimeProjectionSink { inner: Weak<WorkflowManagerInner> }
+pub struct WorkflowManager {
+    inner: Arc<WorkflowManagerInner>,
+}
+impl fmt::Debug for WorkflowManager {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkflowManager")
+            .field("workflow_count", &self.inner.state.read().workflows.len())
+            .finish_non_exhaustive()
+    }
+}
+#[derive(Clone)]
+pub(crate) struct WorkflowRuntimeProjectionSink {
+    inner: Weak<WorkflowManagerInner>,
+}
 impl fmt::Debug for WorkflowRuntimeProjectionSink {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("WorkflowRuntimeProjectionSink").finish_non_exhaustive()
+        formatter
+            .debug_struct("WorkflowRuntimeProjectionSink")
+            .finish_non_exhaustive()
     }
 }
 impl WorkflowRuntimeProjectionSink {
-    pub(crate) async fn project(&self, id: &WorkflowId, generation: u64, update: WorkflowRuntimeUpdate) -> Result<Option<WorkflowSnapshot>> {
-        let inner = self.inner.upgrade().ok_or_else(|| anyhow!("workflow manager is unavailable"))?;
-        WorkflowManager { inner }.project_runtime_update(id, generation, update).await
+    pub(crate) async fn project(
+        &self,
+        id: &WorkflowId,
+        generation: u64,
+        update: WorkflowRuntimeUpdate,
+    ) -> Result<Option<WorkflowSnapshot>> {
+        let inner = self
+            .inner
+            .upgrade()
+            .ok_or_else(|| anyhow!("workflow manager is unavailable"))?;
+        WorkflowManager { inner }
+            .project_runtime_update(id, generation, update)
+            .await
     }
+    /// Persist the spent planning-prompt count and wait for the durable
+    /// write. Same-generation updates are monotonic (`max`); only a new
+    /// workflow/generation starts at 0. Failure to persist must fail
+    /// planning without calling the model.
+    pub(crate) async fn persist_planning_attempt(
+        &self,
+        id: &WorkflowId,
+        generation: u64,
+        count: u8,
+    ) -> Result<()> {
+        let inner = self
+            .inner
+            .upgrade()
+            .ok_or_else(|| anyhow!("workflow manager is unavailable"))?;
+        WorkflowManager { inner }
+            .persist_planning_attempt(id, generation, count)
+            .await
+    }
+
 }
 impl WorkflowManager {
-    pub fn open(root: impl Into<PathBuf>) -> Result<Self> { Self::open_with_factory(root, Arc::new(UnconfiguredWorkflowRuntimeFactory)) }
-    pub fn open_with_factory(root: impl Into<PathBuf>, factory: Arc<dyn WorkflowRuntimeFactory>) -> Result<Self> {
-        let store = WorkflowStore::open(root.into()).map_err(|_| anyhow!("workflow storage could not be opened"))?;
-        let loaded = store.load_all::<WorkflowSnapshot>().map_err(|_| anyhow!("workflow records could not be loaded"))?;
-        let selection = store.load_selection().map_err(|_| anyhow!("workflow selection could not be loaded"))?;
-        let workflows = loaded.records.into_iter().map(|snapshot| (snapshot.workflow_id.clone(), snapshot)).collect::<BTreeMap<_, _>>();
+    pub(crate) fn open_with_factory(
+        root: CapabilityRootLease,
+        factory: Arc<dyn WorkflowRuntimeFactory>,
+    ) -> Result<Self> {
+        let store = WorkflowStore::open(root)
+            .map_err(|_| anyhow!("workflow storage could not be opened"))?;
+        let loaded = store
+            .load_all::<WorkflowSnapshot>()
+            .map_err(|_| anyhow!("workflow records could not be loaded"))?;
+        let selection = store
+            .load_selection()
+            .map_err(|_| anyhow!("workflow selection could not be loaded"))?;
+        let workflows = loaded
+            .records
+            .into_iter()
+            .map(|snapshot| (snapshot.workflow_id.clone(), snapshot))
+            .collect::<BTreeMap<_, _>>();
         let selected = selection.selected.filter(|id| workflows.contains_key(id));
-        let mut diagnostics = loaded.diagnostics.into_iter().map(safe_store_diagnostic).collect::<Vec<_>>();
+        let mut diagnostics = loaded
+            .diagnostics
+            .into_iter()
+            .map(safe_store_diagnostic)
+            .collect::<Vec<_>>();
         diagnostics.extend(selection.diagnostics.into_iter().map(safe_store_diagnostic));
         let (events, _) = broadcast::channel(256);
         Ok(Self {
             inner: Arc::new(WorkflowManagerInner {
                 store,
                 factory,
-                state: RwLock::new(WorkflowManagerState { workflows, selected, diagnostics }),
+                state: RwLock::new(WorkflowManagerState {
+                    workflows,
+                    selected,
+                    diagnostics,
+                }),
                 events,
                 reservations: parking_lot::Mutex::new(WorkflowReservations::default()),
                 selection_gate: parking_lot::Mutex::new(()),
@@ -234,255 +421,832 @@ impl WorkflowManager {
             }),
         })
     }
-    #[must_use] pub fn subscribe(&self) -> broadcast::Receiver<WorkflowEvent> { self.inner.events.subscribe() }
-    pub(crate) fn runtime_projection_sink(&self) -> WorkflowRuntimeProjectionSink { WorkflowRuntimeProjectionSink { inner: Arc::downgrade(&self.inner) } }
-    #[must_use] pub fn list(&self) -> Vec<WorkflowSnapshot> {
-        let mut items = self.inner.state.read().workflows.values().cloned().collect::<Vec<_>>();
-        items.sort_by(|a, b| a.created_at_ms.cmp(&b.created_at_ms).then_with(|| a.workflow_id.cmp(&b.workflow_id))); items
+    #[must_use]
+    pub fn subscribe(&self) -> broadcast::Receiver<WorkflowEvent> {
+        self.inner.events.subscribe()
     }
-    pub fn get(&self, id: &WorkflowId) -> Result<WorkflowSnapshot> { self.inner.state.read().workflows.get(id).cloned().ok_or_else(|| anyhow!("workflow was not found")) }
+    pub(crate) fn runtime_projection_sink(&self) -> WorkflowRuntimeProjectionSink {
+        WorkflowRuntimeProjectionSink {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+    #[must_use]
+    pub fn list(&self) -> Vec<WorkflowSnapshot> {
+        let mut items = self
+            .inner
+            .state
+            .read()
+            .workflows
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        items.sort_by(|a, b| {
+            a.created_at_ms
+                .cmp(&b.created_at_ms)
+                .then_with(|| a.workflow_id.cmp(&b.workflow_id))
+        });
+        items
+    }
+    pub fn get(&self, id: &WorkflowId) -> Result<WorkflowSnapshot> {
+        self.inner
+            .state
+            .read()
+            .workflows
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow!("workflow was not found"))
+    }
     pub fn get_by_name(&self, name: &str) -> Result<WorkflowSnapshot> {
-        let items = self.inner.state.read().workflows.values().filter(|item| item.name == name).cloned().collect::<Vec<_>>();
-        match items.as_slice() { [item] => Ok(item.clone()), [] => bail!("workflow was not found"), _ => bail!("workflow name is ambiguous") }
+        let items = self
+            .inner
+            .state
+            .read()
+            .workflows
+            .values()
+            .filter(|item| item.name == name)
+            .cloned()
+            .collect::<Vec<_>>();
+        match items.as_slice() {
+            [item] => Ok(item.clone()),
+            [] => bail!("workflow was not found"),
+            _ => bail!("workflow name is ambiguous"),
+        }
     }
-    #[must_use] pub fn selected(&self) -> Option<WorkflowSnapshot> { let state = self.inner.state.read(); state.selected.as_ref().and_then(|id| state.workflows.get(id)).cloned() }
+    #[must_use]
+    pub fn selected(&self) -> Option<WorkflowSnapshot> {
+        let state = self.inner.state.read();
+        state
+            .selected
+            .as_ref()
+            .and_then(|id| state.workflows.get(id))
+            .cloned()
+    }
     pub fn select(&self, id: Option<&WorkflowId>) -> Result<Option<WorkflowSnapshot>> {
         let _selection = self.inner.selection_gate.lock();
         let (prior, selected) = {
             let state = self.inner.state.read();
-            if let Some(id) = id && !state.workflows.contains_key(id) { bail!("workflow was not found"); }
-            (state.selected.clone(), id.and_then(|id| state.workflows.get(id)).cloned())
+            if let Some(id) = id
+                && !state.workflows.contains_key(id)
+            {
+                bail!("workflow was not found");
+            }
+            (
+                state.selected.clone(),
+                id.and_then(|id| state.workflows.get(id)).cloned(),
+            )
         };
         let mut write_failed = self.inner.store.write_selection(id).is_err();
         write_failed |= self.take_failpoint(WorkflowManagerFailpoint::SelectAfterWrite);
         if write_failed {
-            if self.inner.store.write_selection(prior.as_ref()).is_err() { bail!("workflow selection rollback failed"); }
+            if self.inner.store.write_selection(prior.as_ref()).is_err() {
+                bail!("workflow selection rollback failed");
+            }
             bail!("workflow selection could not be saved");
         }
         self.inner.state.write().selected = id.cloned();
         Ok(selected)
     }
     pub async fn create(&self, request: WorkflowCreateRequest) -> Result<WorkflowSnapshot> {
-        let name = request.name.trim().to_owned(); let objective = request.objective.trim().to_owned();
-        if name.is_empty() { bail!("workflow name must not be empty"); } if objective.is_empty() { bail!("workflow objective must not be empty"); }
+        let name = request.name.trim().to_owned();
+        let objective = request.objective.trim().to_owned();
+        if name.is_empty() {
+            bail!("workflow name must not be empty");
+        }
+        if objective.is_empty() {
+            bail!("workflow objective must not be empty");
+        }
+        if self
+            .inner
+            .state
+            .read()
+            .workflows
+            .values()
+            .any(|item| item.name == name)
         {
-            let state = self.inner.state.read();
-            let mut reservations = self.inner.reservations.lock();
-            if state.workflows.values().any(|item| item.name == name) || !reservations.names.insert(name.clone()) { bail!("workflow name already exists"); }
+            bail!("workflow name already exists");
+        }
+        if !self.inner.reservations.lock().names.insert(name.clone()) {
+            bail!("workflow name already exists");
         }
         let result = self.create_reserved(name.clone(), objective).await;
         self.inner.reservations.lock().names.remove(&name);
         result
     }
     async fn create_reserved(&self, name: String, objective: String) -> Result<WorkflowSnapshot> {
-        let workflow_id = WorkflowId::new(uuid::Uuid::now_v7().to_string()); let generation = 1;
-        let gate = self.operation_gate(&workflow_id); let operation = gate.lock().await;
-        self.inner.reservations.lock().creating.insert(workflow_id.clone(), CreatingWorkflow { generation, status: WorkflowStatus::Queued, projection: None });
-        let runtime_request = WorkflowRuntimeRequest { workflow_id: workflow_id.clone(), name: name.clone(), objective: objective.clone(), generation };
+        let workflow_id = WorkflowId::new(uuid::Uuid::now_v7().to_string());
+        let generation = 1;
+        let gate = self.operation_gate(&workflow_id);
+        let operation = gate.lock().await;
+        self.inner.reservations.lock().creating.insert(
+            workflow_id.clone(),
+            CreatingWorkflow {
+                generation,
+                status: WorkflowStatus::Queued,
+                projection: None,
+                planning_prompts_consumed: 0,
+                durable_snapshot: None,
+            },
+        );
+
+        let runtime_request = WorkflowRuntimeRequest {
+            workflow_id: workflow_id.clone(),
+            name: name.clone(),
+            objective: objective.clone(),
+            generation,
+        };
         let identity = match self.inner.factory.create(&runtime_request).await {
             Ok(identity) => identity,
-            Err(_) => { self.clear_create_reservation(&workflow_id, true); drop(operation); bail!("workflow runtime creation failed"); }
+            Err(error) => {
+                self.clear_create_reservation(&workflow_id, true);
+                drop(operation);
+                // Surface the underlying failure reason (e.g. the actionable
+                // "source is not inside a git repository" worktree category)
+                // so a failed create reads as a bounded, actionable error
+                // instead of a bare generic message. The error is bounded and
+                // credential-redacted before it reaches the public API; the
+                // factory remains responsible for masking paths/secrets in its
+                // own error text (see `worktree_creation_failure`).
+                bail!(
+                    "workflow runtime creation failed: {}",
+                    crate::redact::redact_bounded(&format!("{error:#}"), 600)
+                );
+            }
         };
         let timestamp = now_ms();
-        let mut snapshot = WorkflowSnapshot { workflow_id: workflow_id.clone(), name, objective, status: WorkflowStatus::Queued, created_at_ms: timestamp, updated_at_ms: timestamp, generation, todo: identity.todo, worktree_label: identity.worktree_label, branch: identity.branch, supervisor_agent_id: identity.supervisor_agent_id, supervisor_job_id: identity.supervisor_job_id, failure: None, integration: WorkflowIntegration::None };
-        if let Some(update) = self.take_create_projection(&workflow_id, generation) { apply_runtime_projection(&mut snapshot, update); }
+        let mut snapshot = WorkflowSnapshot {
+            workflow_id: workflow_id.clone(),
+            name,
+            objective,
+            status: WorkflowStatus::Queued,
+            created_at_ms: timestamp,
+            updated_at_ms: timestamp,
+            generation,
+            durable_policy: identity.durable_policy,
+            todo: identity.todo,
+            worktree_label: identity.worktree_label,
+            branch: identity.branch,
+            supervisor_agent_id: identity.supervisor_agent_id,
+            supervisor_job_id: identity.supervisor_job_id,
+            failure: None,
+            integration: WorkflowIntegration::None,
+            planning_prompts_consumed: 0,
+        };
+        snapshot.planning_prompts_consumed =
+            self.take_create_planning_count(&workflow_id, generation);
+        let mut create_auto_integrate = false;
+        if let Some(update) = self.take_create_projection(&workflow_id, generation) {
+            apply_runtime_projection(&mut snapshot, update);
+            if snapshot.status == WorkflowStatus::Completed
+                && snapshot.integration == WorkflowIntegration::None
+            {
+                snapshot.status = WorkflowStatus::Integrating;
+                create_auto_integrate = true;
+            }
+        }
+
         let selection = self.inner.selection_gate.lock();
         let prior_selection = self.inner.state.read().selected.clone();
         if self.inner.store.write(&snapshot).is_err() {
-            let record_cleanup_failed = self.inner.store.remove(&workflow_id).is_err(); self.clear_create_reservation(&workflow_id, true);
-            drop(selection); drop(operation); let runtime_cleanup_failed = self.inner.factory.remove(&snapshot).await.is_err();
-            if record_cleanup_failed || runtime_cleanup_failed { bail!("workflow creation rollback failed"); } bail!("workflow creation could not be saved");
+            let record_cleanup_failed = self.inner.store.remove(&workflow_id).is_err();
+            self.clear_create_reservation(&workflow_id, true);
+            drop(selection);
+            drop(operation);
+            let runtime_cleanup_failed = self.inner.factory.remove(&snapshot).await.is_err();
+            if record_cleanup_failed || runtime_cleanup_failed {
+                bail!("workflow creation rollback failed");
+            }
+            bail!("workflow creation could not be saved");
         }
-        let mut selection_failed = self.inner.store.write_selection(Some(&workflow_id)).is_err();
-        selection_failed |= self.take_failpoint(WorkflowManagerFailpoint::CreateSelectionAfterWrite);
+        let mut selection_failed = self
+            .inner
+            .store
+            .write_selection(Some(&workflow_id))
+            .is_err();
+        selection_failed |=
+            self.take_failpoint(WorkflowManagerFailpoint::CreateSelectionAfterWrite);
         if selection_failed {
             let record_cleanup_failed = self.inner.store.remove(&workflow_id).is_err();
-            let selection_cleanup_failed = self.inner.store.write_selection(prior_selection.as_ref()).is_err(); self.clear_create_reservation(&workflow_id, true);
-            drop(selection); drop(operation); let runtime_cleanup_failed = self.inner.factory.remove(&snapshot).await.is_err();
-            if record_cleanup_failed || selection_cleanup_failed || runtime_cleanup_failed { bail!("workflow creation rollback failed"); } bail!("workflow creation could not be saved");
-        }
-        while let Some(update) = self.take_create_projection_or_commit(&snapshot) {
-            apply_runtime_projection(&mut snapshot, update); snapshot.updated_at_ms = now_ms();
-            if self.inner.store.write(&snapshot).is_err() {
-                let record_cleanup_failed = self.inner.store.remove(&workflow_id).is_err();
-                let selection_cleanup_failed = self.inner.store.write_selection(prior_selection.as_ref()).is_err(); self.clear_create_reservation(&workflow_id, true);
-                drop(selection); drop(operation); let runtime_cleanup_failed = self.inner.factory.remove(&snapshot).await.is_err();
-                if record_cleanup_failed || selection_cleanup_failed || runtime_cleanup_failed { bail!("workflow creation rollback failed"); } bail!("workflow creation could not be saved");
+            let selection_cleanup_failed = self
+                .inner
+                .store
+                .write_selection(prior_selection.as_ref())
+                .is_err();
+            self.clear_create_reservation(&workflow_id, true);
+            drop(selection);
+            drop(operation);
+            let runtime_cleanup_failed = self.inner.factory.remove(&snapshot).await.is_err();
+            if record_cleanup_failed || selection_cleanup_failed || runtime_cleanup_failed {
+                bail!("workflow creation rollback failed");
             }
+            bail!("workflow creation could not be saved");
         }
-        drop(selection); drop(operation);
-        let _ = self.inner.events.send(WorkflowEvent::Created { snapshot: snapshot.clone() }); Ok(snapshot)
+        self.set_create_durable_snapshot(&snapshot)?;
+        {
+            let mut state = self.inner.state.write();
+            state
+                .workflows
+                .insert(snapshot.workflow_id.clone(), snapshot.clone());
+            state.selected = Some(snapshot.workflow_id.clone());
+        }
+        while let Some(update) = self.take_create_projection(&workflow_id, generation) {
+            apply_runtime_projection(&mut snapshot, update);
+            if snapshot.status == WorkflowStatus::Completed
+                && snapshot.integration == WorkflowIntegration::None
+            {
+                snapshot.status = WorkflowStatus::Integrating;
+                create_auto_integrate = true;
+            }
+            snapshot.updated_at_ms = now_ms();
+            if self.inner.store.write(&snapshot).is_err() {
+                let rollback_selection = {
+                    let mut state = self.inner.state.write();
+                    state.workflows.remove(&workflow_id);
+                    if state.selected.as_ref() == Some(&workflow_id) {
+                        state.selected = prior_selection.clone();
+                    }
+                    state.selected.clone()
+                };
+                let record_cleanup_failed = self.inner.store.remove(&workflow_id).is_err();
+                let selection_cleanup_failed = self
+                    .inner
+                    .store
+                    .write_selection(rollback_selection.as_ref())
+                    .is_err();
+                self.clear_create_reservation(&workflow_id, true);
+                drop(selection);
+                drop(operation);
+                let runtime_cleanup_failed = self.inner.factory.remove(&snapshot).await.is_err();
+                if record_cleanup_failed || selection_cleanup_failed || runtime_cleanup_failed {
+                    bail!("workflow creation rollback failed");
+                }
+                bail!("workflow creation could not be saved");
+            }
+            self.inner
+                .state
+                .write()
+                .workflows
+                .insert(snapshot.workflow_id.clone(), snapshot.clone());
+        }
+        let planning_count = self.take_create_planning_count(&workflow_id, generation);
+        if planning_count > snapshot.planning_prompts_consumed {
+            snapshot.planning_prompts_consumed = planning_count;
+            snapshot.updated_at_ms = now_ms();
+            if self.inner.store.write(&snapshot).is_err() {
+                let rollback_selection = {
+                    let mut state = self.inner.state.write();
+                    state.workflows.remove(&workflow_id);
+                    if state.selected.as_ref() == Some(&workflow_id) {
+                        state.selected = prior_selection.clone();
+                    }
+                    state.selected.clone()
+                };
+                let record_cleanup_failed = self.inner.store.remove(&workflow_id).is_err();
+                let selection_cleanup_failed = self
+                    .inner
+                    .store
+                    .write_selection(rollback_selection.as_ref())
+                    .is_err();
+                self.clear_create_reservation(&workflow_id, true);
+                drop(selection);
+                drop(operation);
+                let runtime_cleanup_failed = self.inner.factory.remove(&snapshot).await.is_err();
+                if record_cleanup_failed || selection_cleanup_failed || runtime_cleanup_failed {
+                    bail!("workflow creation rollback failed");
+                }
+                bail!("workflow creation could not be saved");
+            }
+            self.inner
+                .state
+                .write()
+                .workflows
+                .insert(snapshot.workflow_id.clone(), snapshot.clone());
+        }
+        self.clear_create_reservation(&workflow_id, false);
+        drop(selection);
+        drop(operation);
+        if let Err(error) = self.inner.factory.start_created(&snapshot).await {
+            let operation = gate.lock().await;
+            let selection = self.inner.selection_gate.lock();
+            let rollback_selection = {
+                let mut state = self.inner.state.write();
+                state.workflows.remove(&workflow_id);
+                if state.selected.as_ref() == Some(&workflow_id) {
+                    state.selected = prior_selection.clone();
+                }
+                state.selected.clone()
+            };
+            let record_cleanup_failed = self.inner.store.remove(&workflow_id).is_err();
+            let selection_cleanup_failed = self
+                .inner
+                .store
+                .write_selection(rollback_selection.as_ref())
+                .is_err();
+            self.clear_create_reservation(&workflow_id, true);
+            drop(selection);
+            drop(operation);
+            let runtime_cleanup_failed = self.inner.factory.remove(&snapshot).await.is_err();
+            if record_cleanup_failed || selection_cleanup_failed || runtime_cleanup_failed {
+                bail!("workflow creation rollback failed");
+            }
+            bail!(
+                "workflow runtime start failed: {}",
+                crate::redact::redact_bounded(&format!("{error:#}"), 600)
+            );
+        }
+        if create_auto_integrate {
+            snapshot = self
+                .lifecycle(&workflow_id, generation, WorkflowAction::Integrate)
+                .await?;
+        }
+        let _ = self.inner.events.send(WorkflowEvent::Created {
+            snapshot: snapshot.clone(),
+        });
+        Ok(snapshot)
     }
     pub async fn restore_all(&self) -> Result<Vec<WorkflowSnapshot>> {
-        let snapshots = self.list().into_iter().filter(|snapshot| !snapshot.status.is_terminal()).collect::<Vec<_>>();
+        let snapshots = self
+            .list()
+            .into_iter()
+            .filter(|snapshot| !snapshot.status.is_terminal())
+            .collect::<Vec<_>>();
         let mut restored = Vec::with_capacity(snapshots.len());
         for listed in snapshots {
-            let gate = self.operation_gate(&listed.workflow_id); let _operation = gate.lock().await;
+            let gate = self.operation_gate(&listed.workflow_id);
+            let _operation = gate.lock().await;
             let snapshot = self.checked(&listed.workflow_id, listed.generation)?;
-            if snapshot.status.is_terminal() { continue; }
-            let request = WorkflowRuntimeRequest { workflow_id: snapshot.workflow_id.clone(), name: snapshot.name.clone(), objective: snapshot.objective.clone(), generation: snapshot.generation };
+            if snapshot.status.is_terminal() {
+                continue;
+            }
+            if snapshot.status == WorkflowStatus::Integrating
+                && snapshot.integration == WorkflowIntegration::None
+            {
+                drop(_operation);
+                match self
+                    .lifecycle(
+                        &snapshot.workflow_id,
+                        snapshot.generation,
+                        WorkflowAction::Integrate,
+                    )
+                    .await
+                {
+                    Ok(integrated) => restored.push(integrated),
+                    Err(_) => {
+                        let live = match self.get(&snapshot.workflow_id) {
+                            Ok(live) => live,
+                            Err(_) => continue,
+                        };
+                        if live.status == WorkflowStatus::Integrating
+                            && live.integration == WorkflowIntegration::None
+                        {
+                            restored.push(live);
+                        }
+                    }
+                }
+                continue;
+            }
+            let request = WorkflowRuntimeRequest {
+                workflow_id: snapshot.workflow_id.clone(),
+                name: snapshot.name.clone(),
+                objective: snapshot.objective.clone(),
+                generation: snapshot.generation,
+            };
             match self.inner.factory.restore(&request, &snapshot).await {
                 Ok(identity) => {
-                    let mut next = snapshot.clone(); next.todo = identity.todo; next.worktree_label = identity.worktree_label; next.branch = identity.branch;
-                    next.supervisor_agent_id = identity.supervisor_agent_id; next.supervisor_job_id = identity.supervisor_job_id; next.updated_at_ms = now_ms();
+                    let mut next = snapshot.clone();
+                    next.durable_policy = identity.durable_policy;
+                    next.todo = identity.todo;
+                    next.worktree_label = identity.worktree_label;
+                    next.branch = identity.branch;
+                    next.supervisor_agent_id = identity.supervisor_agent_id;
+                    next.supervisor_job_id = identity.supervisor_job_id;
+                    next.updated_at_ms = now_ms();
                     self.persist_replace(&snapshot, &next)?;
-                    let _ = self.inner.events.send(WorkflowEvent::Updated { snapshot: next.clone() }); restored.push(next);
+                    let _ = self.inner.events.send(WorkflowEvent::Updated {
+                        snapshot: next.clone(),
+                    });
+                    restored.push(next);
                 }
                 Err(_) => {
-                    let mut failed = snapshot.clone(); failed.status = WorkflowStatus::Failed; failed.failure = Some(WorkflowFailure { message: "workflow runtime recovery failed".to_owned() }); failed.updated_at_ms = now_ms();
+                    let mut failed = snapshot.clone();
+                    failed.status = WorkflowStatus::Failed;
+                    failed.failure = Some(WorkflowFailure {
+                        message: "workflow runtime recovery failed".to_owned(),
+                    });
+                    failed.updated_at_ms = now_ms();
                     self.persist_replace(&snapshot, &failed)?;
-                    if snapshot.status != failed.status { let _ = self.inner.events.send(WorkflowEvent::StatusChanged { workflow_id: failed.workflow_id.clone(), generation: failed.generation, status: failed.status }); }
-                    let _ = self.inner.events.send(WorkflowEvent::Updated { snapshot: failed });
+                    if snapshot.status != failed.status {
+                        let _ = self.inner.events.send(WorkflowEvent::StatusChanged {
+                            workflow_id: failed.workflow_id.clone(),
+                            generation: failed.generation,
+                            status: failed.status,
+                        });
+                    }
+                    let _ = self
+                        .inner
+                        .events
+                        .send(WorkflowEvent::Updated { snapshot: failed });
                 }
             }
         }
         Ok(restored)
     }
-    pub async fn pause(&self, id: &WorkflowId, generation: u64) -> Result<WorkflowSnapshot> { let gate = self.operation_gate(id); let _operation = gate.lock().await; self.lifecycle(id, generation, WorkflowAction::Pause).await }
-    pub async fn resume(&self, id: &WorkflowId, generation: u64) -> Result<WorkflowSnapshot> { let gate = self.operation_gate(id); let _operation = gate.lock().await; self.lifecycle(id, generation, WorkflowAction::Resume).await }
-    pub async fn cancel(&self, id: &WorkflowId, generation: u64) -> Result<WorkflowSnapshot> { let gate = self.operation_gate(id); let _operation = gate.lock().await; let current = self.checked(id, generation)?; if current.status == WorkflowStatus::Cancelled { return Ok(current); } self.lifecycle(id, generation, WorkflowAction::Cancel).await }
-    pub async fn integrate(&self, id: &WorkflowId, generation: u64) -> Result<WorkflowSnapshot> { let gate = self.operation_gate(id); let _operation = gate.lock().await; self.lifecycle(id, generation, WorkflowAction::Integrate).await }
-    pub(crate) async fn project_runtime_update(&self, id: &WorkflowId, generation: u64, update: WorkflowRuntimeUpdate) -> Result<Option<WorkflowSnapshot>> {
+    pub async fn pause(&self, id: &WorkflowId, generation: u64) -> Result<WorkflowSnapshot> {
+        let gate = self.operation_gate(id);
+        let _operation = gate.lock().await;
+        self.lifecycle(id, generation, WorkflowAction::Pause).await
+    }
+    pub async fn resume(&self, id: &WorkflowId, generation: u64) -> Result<WorkflowSnapshot> {
+        let gate = self.operation_gate(id);
+        let _operation = gate.lock().await;
+        self.lifecycle(id, generation, WorkflowAction::Resume).await
+    }
+    pub async fn cancel(&self, id: &WorkflowId, generation: u64) -> Result<WorkflowSnapshot> {
+        let gate = self.operation_gate(id);
+        let _operation = gate.lock().await;
+        let current = self.checked(id, generation)?;
+        if current.status == WorkflowStatus::Cancelled {
+            return Ok(current);
+        }
+        self.lifecycle(id, generation, WorkflowAction::Cancel).await
+    }
+    pub async fn integrate(&self, id: &WorkflowId, generation: u64) -> Result<WorkflowSnapshot> {
+        let gate = self.operation_gate(id);
+        let _operation = gate.lock().await;
+        self.lifecycle(id, generation, WorkflowAction::Integrate)
+            .await
+    }
+    /// Persist the spent planning-prompt count and wait for the durable
+    /// write. Same-generation updates are monotonic (`max`); during creation
+    /// the call fails closed until the initial record is durably acknowledged.
+    pub(crate) async fn persist_planning_attempt(
+        &self,
+        id: &WorkflowId,
+        generation: u64,
+        count: u8,
+    ) -> Result<()> {
+        let creating_update = {
+            let mut reservations = self.inner.reservations.lock();
+            if let Some(creating) = reservations.creating.get_mut(id) {
+                if creating.generation != generation {
+                    bail!("workflow generation is stale");
+                }
+                let Some(current) = creating.durable_snapshot.clone() else {
+                    bail!("workflow record is not durably created");
+                };
+                if current.planning_prompts_consumed >= count {
+                    return Ok(());
+                }
+                let mut next = current.clone();
+                next.planning_prompts_consumed = next.planning_prompts_consumed.max(count);
+                next.updated_at_ms = now_ms();
+                let mut write_failed = self.inner.store.write(&next).is_err();
+                write_failed |= self.take_failpoint(WorkflowManagerFailpoint::PersistAfterWrite);
+                if write_failed {
+                    if self.inner.store.write(&current).is_err() {
+                        bail!("workflow durable rollback failed");
+                    }
+                    bail!("workflow update could not be saved");
+                }
+                creating.planning_prompts_consumed = next.planning_prompts_consumed;
+                creating.durable_snapshot = Some(next.clone());
+                if let Some(projection) = creating.projection.as_mut() {
+                    projection.planning_prompts_consumed =
+                        projection.planning_prompts_consumed.max(count);
+                }
+                Some(next)
+            } else {
+                None
+            }
+        };
+        if let Some(next) = creating_update {
+            self.inner.state.write().workflows.insert(id.clone(), next);
+            return Ok(());
+        }
+        let gate = self.operation_gate(id);
+        let _operation = gate.lock().await;
+        let current = self.checked(id, generation)?;
+        if current.planning_prompts_consumed >= count {
+            return Ok(());
+        }
+        let mut next = current.clone();
+        next.planning_prompts_consumed = next.planning_prompts_consumed.max(count);
+        next.updated_at_ms = now_ms();
+        self.persist_replace(&current, &next)?;
+        let _ = self.inner.events.send(WorkflowEvent::Updated {
+            snapshot: next,
+        });
+        Ok(())
+    }
+
+    pub(crate) async fn project_runtime_update(
+        &self,
+        id: &WorkflowId,
+        generation: u64,
+        update: WorkflowRuntimeUpdate,
+    ) -> Result<Option<WorkflowSnapshot>> {
         {
             let mut reservations = self.inner.reservations.lock();
             if let Some(creating) = reservations.creating.get_mut(id) {
-                if creating.generation != generation { bail!("workflow generation is stale"); }
+                if creating.generation != generation {
+                    bail!("workflow generation is stale");
+                }
                 validate_runtime_projection(creating.status, update.status)?;
-                creating.status = update.status; creating.projection = Some(update);
+                creating.status = update.status;
+                creating.projection = Some(update);
                 return Ok(None);
             }
         }
-        let gate = self.operation_gate(id); let _operation = gate.lock().await;
+        let gate = self.operation_gate(id);
+        let _operation = gate.lock().await;
         let current = self.checked(id, generation)?;
         validate_runtime_projection(current.status, update.status)?;
-        let mut next = current.clone(); apply_runtime_projection(&mut next, update); next.updated_at_ms = now_ms();
-        self.persist_replace(&current, &next)?;
-        if current.status != next.status { let _ = self.inner.events.send(WorkflowEvent::StatusChanged { workflow_id: next.workflow_id.clone(), generation: next.generation, status: next.status }); }
-        let _ = self.inner.events.send(WorkflowEvent::Updated { snapshot: next.clone() });
-        // Auto-integrate: when the Todo DAG settles into Completed the
-        // workflow merges its worktree back to the source branch through the
-        // same lifecycle path as `/workflow integrate`. Gated so the merge
-        // never re-runs on a repeated Completed projection (e.g. a straggler
-        // event after a manual integrate already applied/conflicted the
-        // worktree) and never runs while Paused (a Paused runtime can never
-        // project a status change, so this projection cannot originate from
-        // one). A merge conflict lands the workflow in Conflicted for manual
-        // resolution, exactly like the manual integrate path.
-        if next.status == WorkflowStatus::Completed
+        let mut next = current.clone();
+        apply_runtime_projection(&mut next, update);
+        next.updated_at_ms = now_ms();
+        let auto_integrate = next.status == WorkflowStatus::Completed
             && current.status != WorkflowStatus::Completed
-            && next.integration == WorkflowIntegration::None
-        {
+            && current.status != WorkflowStatus::Integrating
+            && next.integration == WorkflowIntegration::None;
+        if auto_integrate {
+            next.status = WorkflowStatus::Integrating;
+        }
+        self.persist_replace(&current, &next)?;
+        if current.status != next.status {
+            let _ = self.inner.events.send(WorkflowEvent::StatusChanged {
+                workflow_id: next.workflow_id.clone(),
+                generation: next.generation,
+                status: next.status,
+            });
+        }
+        let _ = self.inner.events.send(WorkflowEvent::Updated {
+            snapshot: next.clone(),
+        });
+        // Auto-integrate: persist Integrating (nonterminal, unmerged) before
+        // factory.integrate so a crash never restores Completed+None. Zero
+        // new commits is not Applied work: the factory maps MissingCommits
+        // to Failed with integration None.
+        if auto_integrate {
             drop(_operation);
-            return self.lifecycle(id, generation, WorkflowAction::Integrate).await.map(Some);
+            return self
+                .lifecycle(id, generation, WorkflowAction::Integrate)
+                .await
+                .map(Some);
         }
         Ok(Some(next))
     }
     /// Remove a workflow. Non-terminal workflows are cancelled first; a cancellation
     /// failure aborts removal and leaves the workflow in place.
     pub async fn remove(&self, id: &WorkflowId, generation: u64) -> Result<WorkflowSnapshot> {
-        let gate = self.operation_gate(id); let _operation = gate.lock().await;
+        let gate = self.operation_gate(id);
+        let _operation = gate.lock().await;
         let snapshot = self.checked(id, generation)?;
-        let snapshot = if snapshot.status.is_terminal() { snapshot } else {
-            self.lifecycle(id, generation, WorkflowAction::Cancel).await.map_err(|error| anyhow!("workflow could not be cancelled before removal: {error:#}"))?
+        let snapshot = if snapshot.status.is_terminal() {
+            snapshot
+        } else {
+            self.lifecycle(id, generation, WorkflowAction::Cancel)
+                .await
+                .map_err(|error| {
+                    anyhow!("workflow could not be cancelled before removal: {error:#}")
+                })?
         };
-        self.inner.factory.remove(&snapshot).await.map_err(|_| anyhow!("workflow runtime removal failed"))?;
+        self.inner
+            .factory
+            .remove(&snapshot)
+            .await
+            .map_err(|_| anyhow!("workflow runtime removal failed"))?;
         let selection = self.inner.selection_gate.lock();
         let prior_selection = self.inner.state.read().selected.clone();
         let clear = prior_selection.as_ref() == Some(id);
         let mut selection_failed = clear && self.inner.store.write_selection(None).is_err();
-        selection_failed |= clear && self.take_failpoint(WorkflowManagerFailpoint::RemoveSelectionAfterWrite);
+        selection_failed |=
+            clear && self.take_failpoint(WorkflowManagerFailpoint::RemoveSelectionAfterWrite);
         if selection_failed {
-            let selection_rollback_failed = self.inner.store.write_selection(prior_selection.as_ref()).is_err();
+            let selection_rollback_failed = self
+                .inner
+                .store
+                .write_selection(prior_selection.as_ref())
+                .is_err();
             drop(selection);
             let runtime_rollback_failed = self.restore_removed_runtime(&snapshot).await;
-            if selection_rollback_failed || runtime_rollback_failed { bail!("workflow removal rollback failed"); }
+            if selection_rollback_failed || runtime_rollback_failed {
+                bail!("workflow removal rollback failed");
+            }
             bail!("workflow removal could not be committed");
         }
         let mut remove_failed = self.inner.store.remove(id).is_err();
         remove_failed |= self.take_failpoint(WorkflowManagerFailpoint::RemoveAfterDelete);
         if remove_failed {
             let record_rollback_failed = self.inner.store.write(&snapshot).is_err();
-            let selection_rollback_failed = clear && self.inner.store.write_selection(prior_selection.as_ref()).is_err();
+            let selection_rollback_failed = clear
+                && self
+                    .inner
+                    .store
+                    .write_selection(prior_selection.as_ref())
+                    .is_err();
             drop(selection);
             let runtime_rollback_failed = self.restore_removed_runtime(&snapshot).await;
-            if record_rollback_failed || selection_rollback_failed || runtime_rollback_failed { bail!("workflow removal rollback failed"); }
+            if record_rollback_failed || selection_rollback_failed || runtime_rollback_failed {
+                bail!("workflow removal rollback failed");
+            }
             bail!("workflow removal could not be committed");
         }
-        { let mut state = self.inner.state.write(); state.workflows.remove(id); if clear { state.selected = None; } }
+        {
+            let mut state = self.inner.state.write();
+            state.workflows.remove(id);
+            if clear {
+                state.selected = None;
+            }
+        }
         drop(selection);
         self.inner.reservations.lock().operations.remove(id);
-        let _ = self.inner.events.send(WorkflowEvent::Removed { workflow_id: id.clone(), generation }); Ok(snapshot)
+        let _ = self.inner.events.send(WorkflowEvent::Removed {
+            workflow_id: id.clone(),
+            generation,
+        });
+        Ok(snapshot)
     }
-    async fn lifecycle(&self, id: &WorkflowId, generation: u64, action: WorkflowAction) -> Result<WorkflowSnapshot> {
-        let current = self.checked(id, generation)?; ensure_allowed(current.status, action)?;
+    async fn lifecycle(
+        &self,
+        id: &WorkflowId,
+        generation: u64,
+        action: WorkflowAction,
+    ) -> Result<WorkflowSnapshot> {
+        let current = self.checked(id, generation)?;
+        ensure_allowed(current.status, action)?;
+        let mut integrating = current.clone();
+        if action == WorkflowAction::Integrate && current.status != WorkflowStatus::Integrating {
+            integrating.status = WorkflowStatus::Integrating;
+            integrating.updated_at_ms = now_ms();
+            self.persist_replace(&current, &integrating)?;
+            if current.status != integrating.status {
+                let _ = self.inner.events.send(WorkflowEvent::StatusChanged {
+                    workflow_id: integrating.workflow_id.clone(),
+                    generation: integrating.generation,
+                    status: integrating.status,
+                });
+            }
+            let _ = self.inner.events.send(WorkflowEvent::Updated {
+                snapshot: integrating.clone(),
+            });
+        }
         let update = match action {
-            WorkflowAction::Pause => self.inner.factory.pause(&current).await,
-            WorkflowAction::Resume => self.inner.factory.resume(&current).await,
-            WorkflowAction::Cancel => self.inner.factory.cancel(&current).await,
-            WorkflowAction::Integrate => self.inner.factory.integrate(&current).await,
-        }.map_err(|_| anyhow!(action.factory_error()))?;
+            WorkflowAction::Pause => self.inner.factory.pause(&integrating).await,
+            WorkflowAction::Resume => self.inner.factory.resume(&integrating).await,
+            WorkflowAction::Cancel => self.inner.factory.cancel(&integrating).await,
+            WorkflowAction::Integrate => self.inner.factory.integrate(&integrating).await,
+        }
+        .map_err(|_| anyhow!(action.factory_error()))?;
         validate_status(action, update.status)?;
         let latest = self.checked(id, generation)?;
-        if latest.status != current.status || latest.updated_at_ms != current.updated_at_ms { bail!("workflow operation result is stale"); }
-        let mut next = current.clone(); next.status = update.status; next.todo = update.todo; next.supervisor_agent_id = update.supervisor_agent_id; next.supervisor_job_id = update.supervisor_job_id; next.failure = update.failure; next.integration = update.integration; next.updated_at_ms = now_ms();
-        self.persist_replace(&current, &next)?;
-        if current.status != next.status { let _ = self.inner.events.send(WorkflowEvent::StatusChanged { workflow_id: next.workflow_id.clone(), generation: next.generation, status: next.status }); }
-        let _ = self.inner.events.send(WorkflowEvent::Updated { snapshot: next.clone() });
-        // A Resume that settles the Todo DAG into Completed (the DAG finished
-        // while the workflow was Paused) cannot project that settle through
-        // the Paused record — the runtime projection is rejected — so the
-        // settled-complete state arrives here. Run the same auto-integrate
-        // merge the projection path would have run once the workflow is no
-        // longer Paused. A workflow that already integrated (manual or auto)
-        // carries a recorded integration and is never re-merged.
-        if action == WorkflowAction::Resume
-            && next.status == WorkflowStatus::Completed
-            && next.integration == WorkflowIntegration::None
+        if latest.status != integrating.status || latest.updated_at_ms != integrating.updated_at_ms
         {
-            // Async recursion (see E0733).
+            bail!("workflow operation result is stale");
+        }
+        let mut next = integrating.clone();
+        next.status = update.status;
+        next.todo = update.todo;
+        next.supervisor_agent_id = update.supervisor_agent_id;
+        next.supervisor_job_id = update.supervisor_job_id;
+        next.failure = update.failure;
+        if update.integration != WorkflowIntegration::None {
+            next.integration = update.integration;
+        }
+        next.durable_policy = update.durable_policy;
+        next.planning_prompts_consumed = next
+            .planning_prompts_consumed
+            .max(update.planning_prompts_consumed);
+        next.updated_at_ms = now_ms();
+        let resume_auto_integrate = action == WorkflowAction::Resume
+            && next.status == WorkflowStatus::Completed
+            && next.integration == WorkflowIntegration::None;
+        if resume_auto_integrate {
+            next.status = WorkflowStatus::Integrating;
+        }
+        self.persist_replace(&integrating, &next)?;
+        if integrating.status != next.status {
+            let _ = self.inner.events.send(WorkflowEvent::StatusChanged {
+                workflow_id: next.workflow_id.clone(),
+                generation: next.generation,
+                status: next.status,
+            });
+        }
+        let _ = self.inner.events.send(WorkflowEvent::Updated {
+            snapshot: next.clone(),
+        });
+        if resume_auto_integrate {
             return Box::pin(self.lifecycle(id, generation, WorkflowAction::Integrate)).await;
         }
         Ok(next)
     }
     fn operation_gate(&self, id: &WorkflowId) -> Arc<AsyncMutex<()>> {
-        self.inner.reservations.lock().operations.entry(id.clone()).or_insert_with(|| Arc::new(AsyncMutex::new(()))).clone()
+        self.inner
+            .reservations
+            .lock()
+            .operations
+            .entry(id.clone())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
     }
-    fn checked(&self, id: &WorkflowId, generation: u64) -> Result<WorkflowSnapshot> { let item = self.get(id)?; if item.generation != generation { bail!("workflow generation is stale"); } Ok(item) }
+    fn checked(&self, id: &WorkflowId, generation: u64) -> Result<WorkflowSnapshot> {
+        let item = self.get(id)?;
+        if item.generation != generation {
+            bail!("workflow generation is stale");
+        }
+        Ok(item)
+    }
     fn persist_replace(&self, prior: &WorkflowSnapshot, next: &WorkflowSnapshot) -> Result<()> {
         let mut write_failed = self.inner.store.write(next).is_err();
         write_failed |= self.take_failpoint(WorkflowManagerFailpoint::PersistAfterWrite);
         if write_failed {
-            if self.inner.store.write(prior).is_err() { bail!("workflow durable rollback failed"); }
+            if self.inner.store.write(prior).is_err() {
+                bail!("workflow durable rollback failed");
+            }
             bail!("workflow update could not be saved");
         }
-        self.inner.state.write().workflows.insert(next.workflow_id.clone(), next.clone()); Ok(())
+        self.inner
+            .state
+            .write()
+            .workflows
+            .insert(next.workflow_id.clone(), next.clone());
+        Ok(())
     }
     async fn restore_removed_runtime(&self, snapshot: &WorkflowSnapshot) -> bool {
-        let request = WorkflowRuntimeRequest { workflow_id: snapshot.workflow_id.clone(), name: snapshot.name.clone(), objective: snapshot.objective.clone(), generation: snapshot.generation };
-        self.inner.factory.restore(&request, snapshot).await.is_err()
+        let request = WorkflowRuntimeRequest {
+            workflow_id: snapshot.workflow_id.clone(),
+            name: snapshot.name.clone(),
+            objective: snapshot.objective.clone(),
+            generation: snapshot.generation,
+        };
+        self.inner
+            .factory
+            .restore(&request, snapshot)
+            .await
+            .is_err()
     }
-    fn take_create_projection(&self, id: &WorkflowId, generation: u64) -> Option<WorkflowRuntimeUpdate> {
-        let mut reservations = self.inner.reservations.lock(); let creating = reservations.creating.get_mut(id)?;
-        if creating.generation == generation { creating.projection.take() } else { None }
-    }
-    fn take_create_projection_or_commit(&self, snapshot: &WorkflowSnapshot) -> Option<WorkflowRuntimeUpdate> {
+    fn take_create_projection(
+        &self,
+        id: &WorkflowId,
+        generation: u64,
+    ) -> Option<WorkflowRuntimeUpdate> {
         let mut reservations = self.inner.reservations.lock();
-        if let Some(update) = reservations.creating.get_mut(&snapshot.workflow_id)?.projection.take() { return Some(update); }
-        reservations.creating.remove(&snapshot.workflow_id);
-        let mut state = self.inner.state.write(); state.workflows.insert(snapshot.workflow_id.clone(), snapshot.clone()); state.selected = Some(snapshot.workflow_id.clone()); None
+        let creating = reservations.creating.get_mut(id)?;
+        if creating.generation != generation {
+            return None;
+        }
+        let count = creating.planning_prompts_consumed;
+        creating.projection.take().map(|mut update| {
+            update.planning_prompts_consumed = update.planning_prompts_consumed.max(count);
+            update
+        })
     }
+
+    fn take_create_planning_count(&self, id: &WorkflowId, generation: u64) -> u8 {
+        let reservations = self.inner.reservations.lock();
+        reservations
+            .creating
+            .get(id)
+            .filter(|creating| creating.generation == generation)
+            .map(|creating| creating.planning_prompts_consumed)
+            .unwrap_or(0)
+    }
+
+    fn set_create_durable_snapshot(&self, snapshot: &WorkflowSnapshot) -> Result<()> {
+        let mut reservations = self.inner.reservations.lock();
+        let creating = reservations
+            .creating
+            .get_mut(&snapshot.workflow_id)
+            .ok_or_else(|| anyhow!("workflow create reservation is unavailable"))?;
+        if creating.generation != snapshot.generation {
+            bail!("workflow generation is stale");
+        }
+        creating.planning_prompts_consumed = creating
+            .planning_prompts_consumed
+            .max(snapshot.planning_prompts_consumed);
+        let mut durable = snapshot.clone();
+        durable.planning_prompts_consumed = creating.planning_prompts_consumed;
+        creating.durable_snapshot = Some(durable);
+        Ok(())
+    }
+
     fn clear_create_reservation(&self, id: &WorkflowId, remove_operation: bool) {
-        let mut reservations = self.inner.reservations.lock(); reservations.creating.remove(id);
-        if remove_operation { reservations.operations.remove(id); }
+        let mut reservations = self.inner.reservations.lock();
+        reservations.creating.remove(id);
+        if remove_operation {
+            reservations.operations.remove(id);
+        }
     }
     #[cfg(test)]
     fn fail_next(&self, failpoint: WorkflowManagerFailpoint) {
         let mut failpoints = self.inner.failpoints.lock();
         let count = match failpoint {
             WorkflowManagerFailpoint::SelectAfterWrite => &mut failpoints.select_after_write,
-            WorkflowManagerFailpoint::CreateSelectionAfterWrite => &mut failpoints.create_selection_after_write,
+            WorkflowManagerFailpoint::CreateSelectionAfterWrite => {
+                &mut failpoints.create_selection_after_write
+            }
             WorkflowManagerFailpoint::PersistAfterWrite => &mut failpoints.persist_after_write,
-            WorkflowManagerFailpoint::RemoveSelectionAfterWrite => &mut failpoints.remove_selection_after_write,
+            WorkflowManagerFailpoint::RemoveSelectionAfterWrite => {
+                &mut failpoints.remove_selection_after_write
+            }
             WorkflowManagerFailpoint::RemoveAfterDelete => &mut failpoints.remove_after_delete,
         };
         *count += 1;
@@ -492,18 +1256,35 @@ impl WorkflowManager {
         let mut failpoints = self.inner.failpoints.lock();
         let count = match failpoint {
             WorkflowManagerFailpoint::SelectAfterWrite => &mut failpoints.select_after_write,
-            WorkflowManagerFailpoint::CreateSelectionAfterWrite => &mut failpoints.create_selection_after_write,
+            WorkflowManagerFailpoint::CreateSelectionAfterWrite => {
+                &mut failpoints.create_selection_after_write
+            }
             WorkflowManagerFailpoint::PersistAfterWrite => &mut failpoints.persist_after_write,
-            WorkflowManagerFailpoint::RemoveSelectionAfterWrite => &mut failpoints.remove_selection_after_write,
+            WorkflowManagerFailpoint::RemoveSelectionAfterWrite => {
+                &mut failpoints.remove_selection_after_write
+            }
             WorkflowManagerFailpoint::RemoveAfterDelete => &mut failpoints.remove_after_delete,
         };
-        if *count > 0 { *count -= 1; true } else { false }
+        if *count > 0 {
+            *count -= 1;
+            true
+        } else {
+            false
+        }
     }
     #[cfg(not(test))]
-    const fn take_failpoint(&self, _: WorkflowManagerFailpoint) -> bool { false }
+    const fn take_failpoint(&self, _: WorkflowManagerFailpoint) -> bool {
+        false
+    }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)] enum WorkflowAction { Pause, Resume, Cancel, Integrate }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkflowAction {
+    Pause,
+    Resume,
+    Cancel,
+    Integrate,
+}
 impl WorkflowAction {
     const fn factory_error(self) -> &'static str {
         match self {
@@ -515,19 +1296,111 @@ impl WorkflowAction {
     }
 }
 fn ensure_allowed(status: WorkflowStatus, action: WorkflowAction) -> Result<()> {
-    let ok = match action { WorkflowAction::Pause => matches!(status, WorkflowStatus::Queued | WorkflowStatus::Planning | WorkflowStatus::Running), WorkflowAction::Resume => matches!(status, WorkflowStatus::Paused | WorkflowStatus::Planning | WorkflowStatus::Running), WorkflowAction::Cancel => !status.is_terminal(), WorkflowAction::Integrate => matches!(status, WorkflowStatus::Completed | WorkflowStatus::Paused | WorkflowStatus::Conflicted) }; if ok { Ok(()) } else { bail!("workflow lifecycle transition is not allowed") }
+    let ok = match action {
+        WorkflowAction::Pause => matches!(
+            status,
+            WorkflowStatus::Queued | WorkflowStatus::Planning | WorkflowStatus::Running
+        ),
+        WorkflowAction::Resume => matches!(
+            status,
+            WorkflowStatus::Paused | WorkflowStatus::Planning | WorkflowStatus::Running
+        ),
+        WorkflowAction::Cancel => !status.is_terminal(),
+        WorkflowAction::Integrate => matches!(
+            status,
+            WorkflowStatus::Completed
+                | WorkflowStatus::Paused
+                | WorkflowStatus::Conflicted
+                | WorkflowStatus::Failed
+                | WorkflowStatus::Integrating
+        ),
+    };
+    if ok {
+        Ok(())
+    } else {
+        bail!("workflow lifecycle transition is not allowed")
+    }
 }
 fn validate_status(action: WorkflowAction, status: WorkflowStatus) -> Result<()> {
-    let ok = match action { WorkflowAction::Pause => status == WorkflowStatus::Paused, WorkflowAction::Resume => matches!(status, WorkflowStatus::Planning | WorkflowStatus::Running | WorkflowStatus::Completed | WorkflowStatus::Failed), WorkflowAction::Cancel => status == WorkflowStatus::Cancelled, WorkflowAction::Integrate => matches!(status, WorkflowStatus::Completed | WorkflowStatus::Conflicted | WorkflowStatus::Failed) }; if ok { Ok(()) } else { bail!("workflow runtime returned an invalid lifecycle status") }
-}
-fn validate_runtime_projection(prior: WorkflowStatus, next: WorkflowStatus) -> Result<()> {
-    let allowed = prior == next || match prior {
-        WorkflowStatus::Queued => matches!(next, WorkflowStatus::Planning | WorkflowStatus::Running | WorkflowStatus::Completed | WorkflowStatus::Failed),
-        WorkflowStatus::Planning => matches!(next, WorkflowStatus::Running | WorkflowStatus::Completed | WorkflowStatus::Failed),
-        WorkflowStatus::Running => matches!(next, WorkflowStatus::Completed | WorkflowStatus::Failed),
-        WorkflowStatus::Paused | WorkflowStatus::Integrating | WorkflowStatus::Completed | WorkflowStatus::Failed | WorkflowStatus::Cancelled | WorkflowStatus::Conflicted => false,
+    let ok = match action {
+        WorkflowAction::Pause => status == WorkflowStatus::Paused,
+        WorkflowAction::Resume => matches!(
+            status,
+            WorkflowStatus::Planning
+                | WorkflowStatus::Running
+                | WorkflowStatus::Completed
+                | WorkflowStatus::Failed
+        ),
+        WorkflowAction::Cancel => status == WorkflowStatus::Cancelled,
+        WorkflowAction::Integrate => matches!(
+            status,
+            WorkflowStatus::Completed | WorkflowStatus::Conflicted | WorkflowStatus::Failed
+        ),
     };
-    if allowed { Ok(()) } else { bail!("workflow runtime projection is invalid") }
+    if ok {
+        Ok(())
+    } else {
+        bail!("workflow runtime returned an invalid lifecycle status")
+    }
+}
+#[derive(Debug)]
+struct InvalidRuntimeProjection {
+    prior: WorkflowStatus,
+    next: WorkflowStatus,
+}
+
+impl fmt::Display for InvalidRuntimeProjection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "workflow runtime projection is invalid: {:?} -> {:?}",
+            self.prior, self.next
+        )
+    }
+}
+
+impl std::error::Error for InvalidRuntimeProjection {}
+
+/// A stale Completed projection after auto-integrate settled Failed or Conflicted.
+pub(crate) fn ignores_settled_auto_integrate_projection(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<InvalidRuntimeProjection>(),
+        Some(InvalidRuntimeProjection {
+            prior: WorkflowStatus::Failed | WorkflowStatus::Conflicted,
+            next: WorkflowStatus::Completed,
+        })
+    )
+}
+
+fn validate_runtime_projection(prior: WorkflowStatus, next: WorkflowStatus) -> Result<()> {
+    let allowed = prior == next
+        || match prior {
+            WorkflowStatus::Queued => matches!(
+                next,
+                WorkflowStatus::Planning
+                    | WorkflowStatus::Running
+                    | WorkflowStatus::Completed
+                    | WorkflowStatus::Failed
+            ),
+            WorkflowStatus::Planning => matches!(
+                next,
+                WorkflowStatus::Running | WorkflowStatus::Completed | WorkflowStatus::Failed
+            ),
+            WorkflowStatus::Running => {
+                matches!(next, WorkflowStatus::Completed | WorkflowStatus::Failed)
+            }
+            WorkflowStatus::Paused
+            | WorkflowStatus::Integrating
+            | WorkflowStatus::Completed
+            | WorkflowStatus::Failed
+            | WorkflowStatus::Cancelled
+            | WorkflowStatus::Conflicted => false,
+        };
+    if allowed {
+        Ok(())
+    } else {
+        Err(InvalidRuntimeProjection { prior, next }.into())
+    }
 }
 fn apply_runtime_projection(snapshot: &mut WorkflowSnapshot, update: WorkflowRuntimeUpdate) {
     snapshot.status = update.status;
@@ -535,39 +1408,85 @@ fn apply_runtime_projection(snapshot: &mut WorkflowSnapshot, update: WorkflowRun
     snapshot.supervisor_agent_id = update.supervisor_agent_id;
     snapshot.supervisor_job_id = update.supervisor_job_id;
     snapshot.failure = update.failure;
+    if update.integration != WorkflowIntegration::None {
+        snapshot.integration = update.integration;
+    }
+    snapshot.durable_policy = update.durable_policy;
+    snapshot.planning_prompts_consumed = snapshot
+        .planning_prompts_consumed
+        .max(update.planning_prompts_consumed);
 }
 fn safe_store_diagnostic(diagnostic: StoreDiagnostic) -> WorkflowStoreDiagnostic {
     let message = match diagnostic.kind {
         StoreDiagnosticKind::CorruptRecord => "ignored a corrupt workflow record",
         StoreDiagnosticKind::InvalidRecordName => "ignored a workflow record with an invalid name",
-        StoreDiagnosticKind::UnsupportedRecordVersion => "ignored a workflow record with an unsupported version",
-        StoreDiagnosticKind::RecordIdentityMismatch => "ignored a workflow record with inconsistent identity",
-        StoreDiagnosticKind::RecordLimitExceeded => "ignored a workflow record exceeding storage limits",
+        StoreDiagnosticKind::UnsupportedRecordVersion => {
+            "ignored a workflow record with an unsupported version"
+        }
+        StoreDiagnosticKind::RecordIdentityMismatch => {
+            "ignored a workflow record with inconsistent identity"
+        }
+        StoreDiagnosticKind::RecordLimitExceeded => {
+            "ignored a workflow record exceeding storage limits"
+        }
         StoreDiagnosticKind::UnsafeRecord => "ignored an unsafe workflow record",
         StoreDiagnosticKind::CorruptSelection => "ignored corrupt workflow selection",
-        StoreDiagnosticKind::UnsupportedSelectionVersion => "ignored workflow selection with an unsupported version",
+        StoreDiagnosticKind::UnsupportedSelectionVersion => {
+            "ignored workflow selection with an unsupported version"
+        }
         StoreDiagnosticKind::UnsafeSelection => "ignored unsafe workflow selection",
     };
-    WorkflowStoreDiagnostic { workflow_id: diagnostic.record_id, message: message.to_owned() }
+    WorkflowStoreDiagnostic {
+        workflow_id: diagnostic.record_id,
+        message: message.to_owned(),
+    }
 }
-fn now_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).ok().and_then(|value| u64::try_from(value.as_millis()).ok()).unwrap_or(0) }
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|value| u64::try_from(value.as_millis()).ok())
+        .unwrap_or(0)
+}
 #[cfg(test)]
 mod tests {
+    fn durable_policy() -> DurablePolicyState {
+        crate::sandbox::generation::test_durable_policy_state()
+    }
     use std::collections::{HashMap, VecDeque};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use anyhow::anyhow; use parking_lot::Mutex; use tokio::sync::{Barrier, Notify};
     use super::*;
     use crate::TodoStorage;
+    use anyhow::anyhow;
+    use parking_lot::Mutex;
+    use tokio::sync::{Barrier, Notify};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-    enum FactoryCall { Create, Restore, Pause, Resume, Cancel, Integrate, Remove }
+    enum FactoryCall {
+        Create,
+        StartCreated,
+        ProviderCall,
+        Restore,
+        Pause,
+        Resume,
+        Cancel,
+        Integrate,
+        Remove,
+    }
     impl Default for FakeFactory {
         fn default() -> Self {
             Self {
-                calls: Mutex::new(Vec::new()), failures: Mutex::new(HashMap::new()), pause_started: Notify::new(), pause_release: Notify::new(),
-                block_pause: AtomicUsize::new(0), projection_sink: Mutex::new(None), create_projection: Mutex::new(Vec::new()),
-                integrate_outcome: Mutex::new(None), resume_outcome: Mutex::new(None),
+                calls: Mutex::new(Vec::new()),
+                failures: Mutex::new(HashMap::new()),
+                pause_started: Notify::new(),
+                pause_release: Notify::new(),
+                block_pause: AtomicUsize::new(0),
+                projection_sink: Mutex::new(None),
+                create_projection: Mutex::new(Vec::new()),
+                integrate_outcome: Mutex::new(None),
+                resume_outcome: Mutex::new(None),
+                provider_probe: Mutex::new(None),
             }
         }
     }
@@ -580,6 +1499,7 @@ mod tests {
         block_pause: AtomicUsize,
         projection_sink: Mutex<Option<WorkflowRuntimeProjectionSink>>,
         create_projection: Mutex<Vec<WorkflowRuntimeUpdate>>,
+        provider_probe: Mutex<Option<Arc<dyn Fn(&WorkflowId) + Send + Sync>>>,
         /// Overrides the status the fake integrate returns (default: Conflicted).
         integrate_outcome: Mutex<Option<WorkflowStatus>>,
         /// Overrides the status the fake resume returns (default: Running).
@@ -593,6 +1513,7 @@ mod tests {
                 supervisor_agent_id: Some("private-agent".to_owned()),
                 supervisor_job_id: Some("private-job".to_owned()),
                 todo: todo(),
+                durable_policy: durable_policy(),
             }
         }
         fn update(status: WorkflowStatus) -> WorkflowRuntimeUpdate {
@@ -603,344 +1524,1562 @@ mod tests {
                 supervisor_job_id: Some("updated-private-job".to_owned()),
                 failure: None,
                 integration: WorkflowIntegration::None,
+                durable_policy: durable_policy(),
+                planning_prompts_consumed: 0,
             }
         }
         fn record(&self, call: FactoryCall, id: &WorkflowId) -> Result<()> {
             self.calls.lock().push((call, id.clone()));
-            if let Some(message) = self.failures.lock().get_mut(&call).and_then(VecDeque::pop_front) { Err(anyhow!(message)) } else { Ok(()) }
+            if let Some(message) = self
+                .failures
+                .lock()
+                .get_mut(&call)
+                .and_then(VecDeque::pop_front)
+            {
+                Err(anyhow!(message))
+            } else {
+                Ok(())
+            }
         }
-        fn fail(&self, call: FactoryCall, message: &str) { self.failures.lock().entry(call).or_default().push_back(message.to_owned()); }
-        fn count(&self, call: FactoryCall) -> usize { self.calls.lock().iter().filter(|(seen, _)| *seen == call).count() }
-        fn project_on_create(&self, sink: WorkflowRuntimeProjectionSink, update: WorkflowRuntimeUpdate) {
-            *self.projection_sink.lock() = Some(sink); self.create_projection.lock().push(update);
+        fn fail(&self, call: FactoryCall, message: &str) {
+            self.failures
+                .lock()
+                .entry(call)
+                .or_default()
+                .push_back(message.to_owned());
         }
-        fn block_next_pause(&self) { self.block_pause.store(1, Ordering::SeqCst); }
+        fn count(&self, call: FactoryCall) -> usize {
+            self.calls
+                .lock()
+                .iter()
+                .filter(|(seen, _)| *seen == call)
+                .count()
+        }
+        fn project_on_create(
+            &self,
+            sink: WorkflowRuntimeProjectionSink,
+            update: WorkflowRuntimeUpdate,
+        ) {
+            *self.projection_sink.lock() = Some(sink);
+            self.create_projection.lock().push(update);
+        }
+        fn probe_before_provider(
+            &self,
+            probe: Arc<dyn Fn(&WorkflowId) + Send + Sync>,
+        ) {
+            *self.provider_probe.lock() = Some(probe);
+        }
+        fn block_next_pause(&self) {
+            self.block_pause.store(1, Ordering::SeqCst);
+        }
     }
     #[async_trait]
     impl WorkflowRuntimeFactory for FakeFactory {
-        async fn create(&self, request: &WorkflowRuntimeRequest) -> Result<WorkflowRuntimeIdentity> {
+        async fn create(
+            &self,
+            request: &WorkflowRuntimeRequest,
+        ) -> Result<WorkflowRuntimeIdentity> {
             self.record(FactoryCall::Create, &request.workflow_id)?;
-            let sink = self.projection_sink.lock().clone(); let updates = std::mem::take(&mut *self.create_projection.lock());
-            if let Some(sink) = sink { for update in updates { sink.project(&request.workflow_id, request.generation, update).await?; } }
             Ok(Self::identity())
         }
-        async fn restore(&self, request: &WorkflowRuntimeRequest, _: &WorkflowSnapshot) -> Result<WorkflowRuntimeIdentity> {
-            self.record(FactoryCall::Restore, &request.workflow_id)?; Ok(Self::identity())
+        async fn start_created(&self, snapshot: &WorkflowSnapshot) -> Result<()> {
+            self.record(FactoryCall::StartCreated, &snapshot.workflow_id)?;
+            let sink = self.projection_sink.lock().clone();
+            if let Some(sink) = sink {
+                sink.persist_planning_attempt(&snapshot.workflow_id, snapshot.generation, 1)
+                    .await?;
+                let probe = self.provider_probe.lock().clone();
+                if let Some(probe) = probe {
+                    probe(&snapshot.workflow_id);
+                }
+                self.record(FactoryCall::ProviderCall, &snapshot.workflow_id)?;
+                let updates = std::mem::take(&mut *self.create_projection.lock());
+                for update in updates {
+                    sink.project(&snapshot.workflow_id, snapshot.generation, update)
+                        .await?;
+                }
+            }
+            Ok(())
+        }
+        async fn restore(
+            &self,
+            request: &WorkflowRuntimeRequest,
+            _: &WorkflowSnapshot,
+        ) -> Result<WorkflowRuntimeIdentity> {
+            self.record(FactoryCall::Restore, &request.workflow_id)?;
+            Ok(Self::identity())
         }
         async fn pause(&self, snapshot: &WorkflowSnapshot) -> Result<WorkflowRuntimeUpdate> {
             self.record(FactoryCall::Pause, &snapshot.workflow_id)?;
-            if self.block_pause.swap(0, Ordering::SeqCst) == 1 { self.pause_started.notify_one(); self.pause_release.notified().await; }
+            if self.block_pause.swap(0, Ordering::SeqCst) == 1 {
+                self.pause_started.notify_one();
+                self.pause_release.notified().await;
+            }
             Ok(Self::update(WorkflowStatus::Paused))
         }
         async fn resume(&self, snapshot: &WorkflowSnapshot) -> Result<WorkflowRuntimeUpdate> {
             self.record(FactoryCall::Resume, &snapshot.workflow_id)?;
-            let status = self.resume_outcome.lock().unwrap_or(WorkflowStatus::Running);
+            let status = self
+                .resume_outcome
+                .lock()
+                .unwrap_or(WorkflowStatus::Running);
             Ok(Self::update(status))
         }
         async fn cancel(&self, snapshot: &WorkflowSnapshot) -> Result<WorkflowRuntimeUpdate> {
-            self.record(FactoryCall::Cancel, &snapshot.workflow_id)?; Ok(Self::update(WorkflowStatus::Cancelled))
+            self.record(FactoryCall::Cancel, &snapshot.workflow_id)?;
+            Ok(Self::update(WorkflowStatus::Cancelled))
         }
         async fn integrate(&self, snapshot: &WorkflowSnapshot) -> Result<WorkflowRuntimeUpdate> {
             self.record(FactoryCall::Integrate, &snapshot.workflow_id)?;
-            let status = self.integrate_outcome.lock().unwrap_or(WorkflowStatus::Conflicted);
+            let status = self
+                .integrate_outcome
+                .lock()
+                .unwrap_or(WorkflowStatus::Conflicted);
             let mut update = Self::update(status);
             update.integration = match status {
-                WorkflowStatus::Completed => WorkflowIntegration::Applied { result_commit: "private-result-commit".to_owned() },
-                WorkflowStatus::Conflicted => WorkflowIntegration::Conflicted { conflicts: vec!["private/path".to_owned()] },
+                WorkflowStatus::Completed => WorkflowIntegration::Applied {
+                    result_commit: "private-result-commit".to_owned(),
+                },
+                WorkflowStatus::Conflicted => WorkflowIntegration::Conflicted {
+                    conflicts: vec!["private/path".to_owned()],
+                },
+                WorkflowStatus::Failed => {
+                    update.failure = Some(WorkflowFailure {
+                        message: "workflow has no commits to integrate; commit the worktree changes before integration".to_owned(),
+                    });
+                    WorkflowIntegration::None
+                }
                 _ => WorkflowIntegration::None,
             };
             Ok(update)
         }
-        async fn remove(&self, snapshot: &WorkflowSnapshot) -> Result<()> { self.record(FactoryCall::Remove, &snapshot.workflow_id) }
+        async fn remove(&self, snapshot: &WorkflowSnapshot) -> Result<()> {
+            self.record(FactoryCall::Remove, &snapshot.workflow_id)
+        }
     }
 
-    fn todo() -> TodoState { TodoState { phases: Vec::new(), storage: TodoStorage::Memory } }
-    fn request(name: &str) -> WorkflowCreateRequest { WorkflowCreateRequest { name: name.to_owned(), objective: format!("objective-{name}") } }
+    fn todo() -> TodoState {
+        TodoState {
+            phases: Vec::new(),
+            storage: TodoStorage::Memory,
+        }
+    }
+    fn request(name: &str) -> WorkflowCreateRequest {
+        WorkflowCreateRequest {
+            name: name.to_owned(),
+            objective: format!("objective-{name}"),
+        }
+    }
     fn manager(factory: Arc<FakeFactory>) -> (tempfile::TempDir, WorkflowManager) {
         let directory = tempfile::tempdir().expect("temporary workflow directory");
-        let manager = WorkflowManager::open_with_factory(directory.path(), factory).expect("open workflow manager");
+        let capabilities = crate::fs::CapabilityFs::new().expect("capability fs");
+        let lease = capabilities
+            .open_root(
+                crate::fs::CapabilityRootPurpose::WorkflowStore,
+                pi_sandbox::AbsolutePath::parse(directory.path().to_path_buf())
+                    .expect("workflow path"),
+                crate::fs::CapabilityAccess::PrivateReadWrite,
+                crate::fs::RootCreation::Existing,
+            )
+            .expect("workflow lease");
+        let manager =
+            WorkflowManager::open_with_factory(lease, factory).expect("open workflow manager");
         (directory, manager)
     }
     fn reload(directory: &tempfile::TempDir, factory: Arc<FakeFactory>) -> WorkflowManager {
-        WorkflowManager::open_with_factory(directory.path(), factory).expect("reload workflow manager")
+        let capabilities = crate::fs::CapabilityFs::new().expect("capability fs");
+        let lease = capabilities
+            .open_root(
+                crate::fs::CapabilityRootPurpose::WorkflowStore,
+                pi_sandbox::AbsolutePath::parse(directory.path().to_path_buf())
+                    .expect("workflow path"),
+                crate::fs::CapabilityAccess::PrivateReadWrite,
+                crate::fs::RootCreation::Existing,
+            )
+            .expect("workflow lease");
+        WorkflowManager::open_with_factory(lease, factory).expect("reload workflow manager")
     }
-    async fn created(manager: &WorkflowManager, name: &str) -> WorkflowSnapshot { manager.create(request(name)).await.expect("create workflow") }
+
+    #[tokio::test]
+    async fn durable_policy_round_trips_with_workflow_record() {
+        let factory = Arc::new(FakeFactory::default());
+        let (directory, manager) = manager(factory.clone());
+        let created = created(&manager, "durable-policy").await;
+        assert_eq!(created.durable_policy, durable_policy());
+        let reopened = reload(&directory, factory);
+        assert_eq!(
+            reopened
+                .get(&created.workflow_id)
+                .expect("durable workflow record")
+                .durable_policy,
+            durable_policy(),
+        );
+    }
+
+    #[tokio::test]
+    async fn create_persists_planning_attempt_before_provider_call() {
+        let factory = Arc::new(FakeFactory::default());
+        let (directory, manager) = manager(factory.clone());
+        let durable_root = directory.path().to_path_buf();
+        factory.probe_before_provider(Arc::new(move |workflow_id| {
+            let capabilities = crate::fs::CapabilityFs::new().expect("capability fs");
+            let lease = capabilities
+                .open_root(
+                    crate::fs::CapabilityRootPurpose::WorkflowStore,
+                    pi_sandbox::AbsolutePath::parse(durable_root.clone())
+                        .expect("workflow path"),
+                    crate::fs::CapabilityAccess::PrivateReadWrite,
+                    crate::fs::RootCreation::Existing,
+                )
+                .expect("workflow lease");
+            let durable = WorkflowManager::open_with_factory(
+                lease,
+                Arc::new(FakeFactory::default()),
+            )
+            .expect("reopen at provider boundary")
+            .get(workflow_id)
+            .expect("record exists before provider");
+            assert_eq!(
+                durable.planning_prompts_consumed, 1,
+                "planning attempt must be durable before provider invocation"
+            );
+        }));
+        factory.project_on_create(
+            manager.runtime_projection_sink(),
+            FakeFactory::update(WorkflowStatus::Planning),
+        );
+        let created = manager
+            .create(request("durable-before-provider"))
+            .await
+            .expect("create workflow");
+        assert_eq!(created.status, WorkflowStatus::Queued);
+        assert_eq!(
+            manager
+                .get(&created.workflow_id)
+                .expect("live after start")
+                .planning_prompts_consumed,
+            1
+        );
+        assert_eq!(factory.count(FactoryCall::ProviderCall), 1);
+    }
+
+    #[tokio::test]
+    async fn start_created_failure_rolls_back_record_selection_and_runtime() {
+        let factory = Arc::new(FakeFactory::default());
+        factory.fail(FactoryCall::StartCreated, "injected start failure");
+        let (directory, manager) = manager(factory.clone());
+        let error = manager
+            .create(request("start-rollback"))
+            .await
+            .expect_err("start failure must roll back create");
+        assert!(
+            error.to_string().starts_with("workflow runtime start failed: "),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("injected start failure"),
+            "{error}"
+        );
+        assert!(manager.list().is_empty());
+        assert!(manager.selected().is_none());
+        assert!(reload(&directory, factory.clone()).list().is_empty());
+        assert_eq!(factory.count(FactoryCall::Remove), 1);
+    }
+
+    #[test]
+    fn settled_auto_integrate_projection_is_the_only_ignored_transition() {
+        let ignored = |prior, next| {
+            let error = anyhow::Error::from(InvalidRuntimeProjection { prior, next });
+            ignores_settled_auto_integrate_projection(&error)
+        };
+        assert!(ignored(WorkflowStatus::Failed, WorkflowStatus::Completed));
+        assert!(ignored(
+            WorkflowStatus::Conflicted,
+            WorkflowStatus::Completed
+        ));
+        assert!(!ignored(
+            WorkflowStatus::Cancelled,
+            WorkflowStatus::Completed
+        ));
+        assert!(!ignored(WorkflowStatus::Paused, WorkflowStatus::Running));
+        assert!(!ignored(WorkflowStatus::Failed, WorkflowStatus::Running));
+        assert!(!ignored(
+            WorkflowStatus::Integrating,
+            WorkflowStatus::Completed
+        ));
+        assert!(!ignored(
+            WorkflowStatus::Running,
+            WorkflowStatus::Paused
+        ));
+    }
+
+    #[tokio::test]
+    async fn illegal_start_projection_rolls_back_record_and_runtime() {
+        let factory = Arc::new(FakeFactory::default());
+        let (directory, manager) = manager(factory.clone());
+        factory.project_on_create(
+            manager.runtime_projection_sink(),
+            FakeFactory::update(WorkflowStatus::Running),
+        );
+        factory.project_on_create(
+            manager.runtime_projection_sink(),
+            FakeFactory::update(WorkflowStatus::Paused),
+        );
+        let error = manager
+            .create(request("illegal-start-projection"))
+            .await
+            .expect_err("a non-settled illegal projection must roll back create");
+        assert!(
+            error
+                .to_string()
+                .contains("workflow runtime projection is invalid: Running -> Paused"),
+            "{error}"
+        );
+        assert!(manager.list().is_empty());
+        assert!(manager.selected().is_none());
+        assert!(reload(&directory, factory.clone()).list().is_empty());
+        assert_eq!(factory.count(FactoryCall::Remove), 1);
+    }
+
+    #[tokio::test]
+    async fn create_persist_failure_never_reaches_provider_and_rolls_back() {
+        let factory = Arc::new(FakeFactory::default());
+        let (directory, manager) = manager(factory.clone());
+        factory.project_on_create(
+            manager.runtime_projection_sink(),
+            FakeFactory::update(WorkflowStatus::Planning),
+        );
+        manager.fail_next(WorkflowManagerFailpoint::PersistAfterWrite);
+        let error = manager
+            .create(request("persist-before-provider-fail"))
+            .await
+            .expect_err("planning persist failure must fail create");
+        assert!(
+            error.to_string().starts_with("workflow runtime start failed: "),
+            "{error}"
+        );
+        assert_eq!(factory.count(FactoryCall::ProviderCall), 0);
+        assert_eq!(factory.count(FactoryCall::Remove), 1);
+        assert!(manager.list().is_empty());
+        assert!(reload(&directory, factory).list().is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_creates_and_planning_persist_complete_without_lock_inversion() {
+        let factory = Arc::new(FakeFactory::default());
+        let (_directory, manager) = manager(factory.clone());
+        factory.project_on_create(
+            manager.runtime_projection_sink(),
+            FakeFactory::update(WorkflowStatus::Planning),
+        );
+        let barrier = Arc::new(Barrier::new(3));
+        let first = {
+            let manager = manager.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                manager.create(request("lock-order-a")).await
+            })
+        };
+        let second = {
+            let manager = manager.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                manager.create(request("lock-order-b")).await
+            })
+        };
+        barrier.wait().await;
+        let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            (
+                first.await.expect("first join").expect("first create"),
+                second.await.expect("second join").expect("second create"),
+            )
+        })
+        .await
+        .expect("concurrent create/persist must not deadlock");
+        assert!(
+            [&first, &second].into_iter().any(|snapshot| {
+                manager
+                    .get(&snapshot.workflow_id)
+                    .expect("live after start")
+                    .planning_prompts_consumed
+                    == 1
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn planning_attempt_count_is_monotonic_within_generation() {
+        let factory = Arc::new(FakeFactory::default());
+        let (_directory, manager) = manager(factory.clone());
+        let created = created(&manager, "planning-budget").await;
+        manager
+            .persist_planning_attempt(&created.workflow_id, created.generation, 1)
+            .await
+            .expect("persist first planning attempt");
+        let recorded = manager
+            .get(&created.workflow_id)
+            .expect("durable planning count");
+        assert_eq!(recorded.planning_prompts_consumed, 1);
+        let mut zeroed = FakeFactory::update(WorkflowStatus::Planning);
+        zeroed.planning_prompts_consumed = 0;
+        manager
+            .project_runtime_update(&created.workflow_id, created.generation, zeroed)
+            .await
+            .expect("unrelated same-generation update");
+        let retained = manager
+            .get(&created.workflow_id)
+            .expect("retained planning count");
+        assert_eq!(
+            retained.planning_prompts_consumed, 1,
+            "a default-zero same-generation update must not reset the planning budget"
+        );
+        manager
+            .persist_planning_attempt(&created.workflow_id, created.generation, 2)
+            .await
+            .expect("persist second planning attempt");
+        let second = manager
+            .get(&created.workflow_id)
+            .expect("second planning count");
+        assert_eq!(second.planning_prompts_consumed, 2);
+    }
+
+    #[tokio::test]
+    async fn persist_planning_attempt_failure_does_not_advance_count() {
+        let factory = Arc::new(FakeFactory::default());
+        let (_directory, manager) = manager(factory);
+        let created = created(&manager, "planning-persist-fail").await;
+        manager.fail_next(WorkflowManagerFailpoint::PersistAfterWrite);
+        let error = manager
+            .persist_planning_attempt(&created.workflow_id, created.generation, 1)
+            .await
+            .expect_err("persist failure must surface");
+        assert_eq!(error.to_string(), "workflow update could not be saved");
+        assert_eq!(
+            manager
+                .get(&created.workflow_id)
+                .expect("unchanged planning count")
+                .planning_prompts_consumed,
+            0,
+            "a failed persist ack must not spend the planning budget"
+        );
+    }
+
+    async fn created(manager: &WorkflowManager, name: &str) -> WorkflowSnapshot {
+        manager
+            .create(request(name))
+            .await
+            .expect("create workflow")
+    }
     async fn cancelled(manager: &WorkflowManager, name: &str) -> WorkflowSnapshot {
         let snapshot = created(manager, name).await;
-        manager.cancel(&snapshot.workflow_id, snapshot.generation).await.expect("cancel workflow")
+        manager
+            .cancel(&snapshot.workflow_id, snapshot.generation)
+            .await
+            .expect("cancel workflow")
     }
 
     #[tokio::test]
     async fn concurrent_duplicate_names_have_one_durable_winner() {
-        let factory = Arc::new(FakeFactory::default()); let (directory, manager) = manager(factory.clone());
+        let factory = Arc::new(FakeFactory::default());
+        let (directory, manager) = manager(factory.clone());
         let barrier = Arc::new(Barrier::new(3));
-        let first = { let manager = manager.clone(); let barrier = barrier.clone(); tokio::spawn(async move { barrier.wait().await; manager.create(request("same")).await }) };
-        let second = { let manager = manager.clone(); let barrier = barrier.clone(); tokio::spawn(async move { barrier.wait().await; manager.create(request("same")).await }) };
+        let first = {
+            let manager = manager.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                manager.create(request("same")).await
+            })
+        };
+        let second = {
+            let manager = manager.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                manager.create(request("same")).await
+            })
+        };
         barrier.wait().await;
-        let outcomes = [first.await.expect("first join"), second.await.expect("second join")];
+        let outcomes = [
+            first.await.expect("first join"),
+            second.await.expect("second join"),
+        ];
         assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
-        assert_eq!(outcomes.iter().filter(|result| result.as_ref().is_err_and(|error| error.to_string() == "workflow name already exists")).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|result| result
+                    .as_ref()
+                    .is_err_and(|error| error.to_string() == "workflow name already exists"))
+                .count(),
+            1
+        );
         assert_eq!(reload(&directory, factory).list().len(), 1);
     }
 
     #[tokio::test]
     async fn stale_generation_is_rejected_before_factory_call() {
-        let factory = Arc::new(FakeFactory::default()); let (_directory, manager) = manager(factory.clone()); let snapshot = created(&manager, "stale").await;
-        let error = manager.pause(&snapshot.workflow_id, snapshot.generation + 1).await.expect_err("stale generation must fail");
-        assert_eq!(error.to_string(), "workflow generation is stale"); assert_eq!(factory.count(FactoryCall::Pause), 0);
+        let factory = Arc::new(FakeFactory::default());
+        let (_directory, manager) = manager(factory.clone());
+        let snapshot = created(&manager, "stale").await;
+        let error = manager
+            .pause(&snapshot.workflow_id, snapshot.generation + 1)
+            .await
+            .expect_err("stale generation must fail");
+        assert_eq!(error.to_string(), "workflow generation is stale");
+        assert_eq!(factory.count(FactoryCall::Pause), 0);
     }
 
     #[tokio::test]
     async fn pause_and_cancel_are_serialized_per_workflow() {
-        let factory = Arc::new(FakeFactory::default()); factory.block_next_pause(); let (_directory, manager) = manager(factory.clone()); let snapshot = created(&manager, "serialized").await;
+        let factory = Arc::new(FakeFactory::default());
+        factory.block_next_pause();
+        let (_directory, manager) = manager(factory.clone());
+        let snapshot = created(&manager, "serialized").await;
         let generation = snapshot.generation;
-        let pause = { let manager = manager.clone(); let id = snapshot.workflow_id.clone(); tokio::spawn(async move { manager.pause(&id, generation).await }) };
+        let pause = {
+            let manager = manager.clone();
+            let id = snapshot.workflow_id.clone();
+            tokio::spawn(async move { manager.pause(&id, generation).await })
+        };
         factory.pause_started.notified().await;
-        let cancel = { let manager = manager.clone(); let id = snapshot.workflow_id.clone(); tokio::spawn(async move { manager.cancel(&id, generation).await }) };
-        tokio::task::yield_now().await; assert_eq!(factory.count(FactoryCall::Cancel), 0);
-        factory.pause_release.notify_one(); assert_eq!(pause.await.expect("pause join").expect("pause").status, WorkflowStatus::Paused);
-        assert_eq!(cancel.await.expect("cancel join").expect("cancel").status, WorkflowStatus::Cancelled);
-        assert_eq!(factory.count(FactoryCall::Pause), 1); assert_eq!(factory.count(FactoryCall::Cancel), 1);
+        let cancel = {
+            let manager = manager.clone();
+            let id = snapshot.workflow_id.clone();
+            tokio::spawn(async move { manager.cancel(&id, generation).await })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(factory.count(FactoryCall::Cancel), 0);
+        factory.pause_release.notify_one();
+        assert_eq!(
+            pause.await.expect("pause join").expect("pause").status,
+            WorkflowStatus::Paused
+        );
+        assert_eq!(
+            cancel.await.expect("cancel join").expect("cancel").status,
+            WorkflowStatus::Cancelled
+        );
+        assert_eq!(factory.count(FactoryCall::Pause), 1);
+        assert_eq!(factory.count(FactoryCall::Cancel), 1);
     }
 
     #[tokio::test]
     async fn remove_failure_restores_runtime_record_selection_and_memory() {
-        let factory = Arc::new(FakeFactory::default()); let (directory, manager) = manager(factory.clone()); let snapshot = cancelled(&manager, "remove-rollback").await;
+        let factory = Arc::new(FakeFactory::default());
+        let (directory, manager) = manager(factory.clone());
+        let snapshot = cancelled(&manager, "remove-rollback").await;
         manager.fail_next(WorkflowManagerFailpoint::RemoveAfterDelete);
-        let error = manager.remove(&snapshot.workflow_id, snapshot.generation).await.expect_err("injected remove failure");
-        assert_eq!(error.to_string(), "workflow removal could not be committed"); assert_eq!(factory.count(FactoryCall::Restore), 1);
-        assert_eq!(manager.get(&snapshot.workflow_id).expect("memory restored"), snapshot); assert_eq!(manager.selected(), Some(snapshot.clone()));
-        let reopened = reload(&directory, factory); assert_eq!(reopened.get(&snapshot.workflow_id).expect("record restored"), snapshot); assert_eq!(reopened.selected(), Some(snapshot));
+        let error = manager
+            .remove(&snapshot.workflow_id, snapshot.generation)
+            .await
+            .expect_err("injected remove failure");
+        assert_eq!(error.to_string(), "workflow removal could not be committed");
+        assert_eq!(factory.count(FactoryCall::Restore), 1);
+        assert_eq!(
+            manager.get(&snapshot.workflow_id).expect("memory restored"),
+            snapshot
+        );
+        assert_eq!(manager.selected(), Some(snapshot.clone()));
+        let reopened = reload(&directory, factory);
+        assert_eq!(
+            reopened
+                .get(&snapshot.workflow_id)
+                .expect("record restored"),
+            snapshot
+        );
+        assert_eq!(reopened.selected(), Some(snapshot));
     }
 
     #[tokio::test]
     async fn remove_non_terminal_auto_cancels_then_removes() {
-        let factory = Arc::new(FakeFactory::default()); let (_directory, manager) = manager(factory.clone());
+        let factory = Arc::new(FakeFactory::default());
+        let (_directory, manager) = manager(factory.clone());
         let snapshot = created(&manager, "auto-cancel").await;
-        let planning = manager.project_runtime_update(&snapshot.workflow_id, snapshot.generation, FakeFactory::update(WorkflowStatus::Planning)).await.expect("project planning").expect("existing snapshot");
+        let planning = manager
+            .project_runtime_update(
+                &snapshot.workflow_id,
+                snapshot.generation,
+                FakeFactory::update(WorkflowStatus::Planning),
+            )
+            .await
+            .expect("project planning")
+            .expect("existing snapshot");
         assert_eq!(planning.status, WorkflowStatus::Planning);
-        let removed = manager.remove(&planning.workflow_id, planning.generation).await.expect("remove auto-cancels");
+        let removed = manager
+            .remove(&planning.workflow_id, planning.generation)
+            .await
+            .expect("remove auto-cancels");
         assert_eq!(removed.status, WorkflowStatus::Cancelled);
-        assert_eq!(factory.calls.lock().clone(), vec![
-            (FactoryCall::Create, planning.workflow_id.clone()),
-            (FactoryCall::Cancel, planning.workflow_id.clone()),
-            (FactoryCall::Remove, planning.workflow_id.clone()),
-        ]);
+        assert_eq!(
+            factory.calls.lock().clone(),
+            vec![
+                (FactoryCall::Create, planning.workflow_id.clone()),
+                (FactoryCall::StartCreated, planning.workflow_id.clone()),
+                (FactoryCall::Cancel, planning.workflow_id.clone()),
+                (FactoryCall::Remove, planning.workflow_id.clone()),
+            ]
+        );
         assert!(manager.list().is_empty());
     }
 
     #[tokio::test]
     async fn remove_terminal_skips_cancel() {
-        let factory = Arc::new(FakeFactory::default()); let (_directory, manager) = manager(factory.clone());
+        let factory = Arc::new(FakeFactory::default());
+        let (_directory, manager) = manager(factory.clone());
         let snapshot = cancelled(&manager, "terminal-remove").await;
-        let removed = manager.remove(&snapshot.workflow_id, snapshot.generation).await.expect("remove terminal");
+        let removed = manager
+            .remove(&snapshot.workflow_id, snapshot.generation)
+            .await
+            .expect("remove terminal");
         assert_eq!(removed, snapshot);
-        assert_eq!(factory.calls.lock().clone(), vec![
-            (FactoryCall::Create, snapshot.workflow_id.clone()),
-            (FactoryCall::Cancel, snapshot.workflow_id.clone()),
-            (FactoryCall::Remove, snapshot.workflow_id.clone()),
-        ]);
+        assert_eq!(
+            factory.calls.lock().clone(),
+            vec![
+                (FactoryCall::Create, snapshot.workflow_id.clone()),
+                (FactoryCall::StartCreated, snapshot.workflow_id.clone()),
+                (FactoryCall::Cancel, snapshot.workflow_id.clone()),
+                (FactoryCall::Remove, snapshot.workflow_id.clone()),
+            ]
+        );
         assert!(manager.list().is_empty());
     }
 
     #[tokio::test]
     async fn remove_non_terminal_cancel_failure_is_actionable() {
         let secret = "private cancellation failure /secret/path";
-        let factory = Arc::new(FakeFactory::default()); let (_directory, manager) = manager(factory.clone());
+        let factory = Arc::new(FakeFactory::default());
+        let (_directory, manager) = manager(factory.clone());
         let snapshot = created(&manager, "cancel-failure").await;
         factory.fail(FactoryCall::Cancel, secret);
-        let error = manager.remove(&snapshot.workflow_id, snapshot.generation).await.expect_err("cancel failure must surface");
-        assert_eq!(error.to_string(), "workflow could not be cancelled before removal: workflow runtime cancellation failed");
+        let error = manager
+            .remove(&snapshot.workflow_id, snapshot.generation)
+            .await
+            .expect_err("cancel failure must surface");
+        assert_eq!(
+            error.to_string(),
+            "workflow could not be cancelled before removal: workflow runtime cancellation failed"
+        );
         assert!(!error.to_string().contains(secret));
         assert_eq!(factory.count(FactoryCall::Remove), 0);
-        assert_eq!(manager.get(&snapshot.workflow_id).expect("workflow remains"), snapshot);
+        assert_eq!(
+            manager
+                .get(&snapshot.workflow_id)
+                .expect("workflow remains"),
+            snapshot
+        );
     }
 
     #[tokio::test]
     async fn lifecycle_durable_failure_rewrites_prior_snapshot() {
-        let factory = Arc::new(FakeFactory::default()); let (directory, manager) = manager(factory.clone()); let snapshot = created(&manager, "persist-rollback").await;
+        let factory = Arc::new(FakeFactory::default());
+        let (directory, manager) = manager(factory.clone());
+        let snapshot = created(&manager, "persist-rollback").await;
         manager.fail_next(WorkflowManagerFailpoint::PersistAfterWrite);
-        let error = manager.pause(&snapshot.workflow_id, snapshot.generation).await.expect_err("injected persist failure");
-        assert_eq!(error.to_string(), "workflow update could not be saved"); assert_eq!(manager.get(&snapshot.workflow_id).expect("memory prior"), snapshot);
-        assert_eq!(reload(&directory, factory).get(&snapshot.workflow_id).expect("disk prior"), snapshot);
+        let error = manager
+            .pause(&snapshot.workflow_id, snapshot.generation)
+            .await
+            .expect_err("injected persist failure");
+        assert_eq!(error.to_string(), "workflow update could not be saved");
+        assert_eq!(
+            manager.get(&snapshot.workflow_id).expect("memory prior"),
+            snapshot
+        );
+        assert_eq!(
+            reload(&directory, factory)
+                .get(&snapshot.workflow_id)
+                .expect("disk prior"),
+            snapshot
+        );
     }
 
     #[tokio::test]
     async fn restore_failure_emits_status_before_updated() {
-        let first_factory = Arc::new(FakeFactory::default()); let (directory, first) = manager(first_factory); let snapshot = created(&first, "restore-order").await;
-        let factory = Arc::new(FakeFactory::default()); factory.fail(FactoryCall::Restore, "private restore failure /secret/path"); let manager = reload(&directory, factory); let mut events = manager.subscribe();
+        let first_factory = Arc::new(FakeFactory::default());
+        let (directory, first) = manager(first_factory);
+        let snapshot = created(&first, "restore-order").await;
+        let factory = Arc::new(FakeFactory::default());
+        factory.fail(FactoryCall::Restore, "private restore failure /secret/path");
+        let manager = reload(&directory, factory);
+        let mut events = manager.subscribe();
         assert!(manager.restore_all().await.expect("restore all").is_empty());
-        assert!(matches!(events.recv().await.expect("status event"), WorkflowEvent::StatusChanged { status: WorkflowStatus::Failed, .. }));
-        assert!(matches!(events.recv().await.expect("updated event"), WorkflowEvent::Updated { snapshot: failed } if failed.workflow_id == snapshot.workflow_id && failed.status == WorkflowStatus::Failed));
+        assert!(matches!(
+            events.recv().await.expect("status event"),
+            WorkflowEvent::StatusChanged {
+                status: WorkflowStatus::Failed,
+                ..
+            }
+        ));
+        assert!(
+            matches!(events.recv().await.expect("updated event"), WorkflowEvent::Updated { snapshot: failed } if failed.workflow_id == snapshot.workflow_id && failed.status == WorkflowStatus::Failed)
+        );
     }
 
     #[tokio::test]
     async fn factory_errors_and_creation_cleanup_errors_are_safe() {
-        let secret = "private-id private-label private-branch /private/path";
-        let create_factory = Arc::new(FakeFactory::default()); create_factory.fail(FactoryCall::Create, secret); let (_directory, create_manager) = manager(create_factory);
-        let create_error = create_manager.create(request("factory-safe")).await.expect_err("create factory failure");
-        assert_eq!(create_error.to_string(), "workflow runtime creation failed"); assert!(!create_error.to_string().contains(secret));
+        let secret = "sk-abcdefghijklmnop1234";
+        let create_factory = Arc::new(FakeFactory::default());
+        create_factory.fail(FactoryCall::Create, secret);
+        let (_directory, create_manager) = manager(create_factory);
+        let create_error = create_manager
+            .create(request("factory-safe"))
+            .await
+            .expect_err("create factory failure");
+        // The manager chains the underlying factory reason (so a failed create
+        // reads as an actionable error instead of a bare generic message) but
+        // bounds and credential-redacts it before it reaches the public API.
+        // The factory remains responsible for masking paths/secrets in its own
+        // error text (see `worktree_creation_failure`).
+        assert!(
+            create_error
+                .to_string()
+                .starts_with("workflow runtime creation failed: "),
+            "create error must chain the underlying reason: {create_error}"
+        );
+        assert!(
+            create_error.to_string().contains("[REDACTED]"),
+            "credential-shaped factory text must be redacted: {create_error}"
+        );
+        assert!(!create_error.to_string().contains(secret));
 
-        let factory = Arc::new(FakeFactory::default()); let (_directory, workflow_manager) = manager(factory.clone()); let snapshot = created(&workflow_manager, "pause-safe").await;
-        factory.fail(FactoryCall::Pause, secret); let pause_error = workflow_manager.pause(&snapshot.workflow_id, snapshot.generation).await.expect_err("pause factory failure");
-        assert_eq!(pause_error.to_string(), "workflow runtime pause failed"); assert!(!pause_error.to_string().contains(secret));
+        let factory = Arc::new(FakeFactory::default());
+        let (_directory, workflow_manager) = manager(factory.clone());
+        let snapshot = created(&workflow_manager, "pause-safe").await;
+        factory.fail(FactoryCall::Pause, secret);
+        let pause_error = workflow_manager
+            .pause(&snapshot.workflow_id, snapshot.generation)
+            .await
+            .expect_err("pause factory failure");
+        assert_eq!(pause_error.to_string(), "workflow runtime pause failed");
+        assert!(!pause_error.to_string().contains(secret));
 
-        let cleanup_factory = Arc::new(FakeFactory::default()); let (_directory, cleanup_manager) = manager(cleanup_factory.clone()); cleanup_manager.fail_next(WorkflowManagerFailpoint::CreateSelectionAfterWrite); cleanup_factory.fail(FactoryCall::Remove, secret);
-        let cleanup_error = cleanup_manager.create(request("cleanup-safe")).await.expect_err("cleanup failure");
-        assert_eq!(cleanup_error.to_string(), "workflow creation rollback failed"); assert!(!cleanup_error.to_string().contains(secret));
+        let cleanup_factory = Arc::new(FakeFactory::default());
+        let (_directory, cleanup_manager) = manager(cleanup_factory.clone());
+        cleanup_manager.fail_next(WorkflowManagerFailpoint::CreateSelectionAfterWrite);
+        cleanup_factory.fail(FactoryCall::Remove, secret);
+        let cleanup_error = cleanup_manager
+            .create(request("cleanup-safe"))
+            .await
+            .expect_err("cleanup failure");
+        assert_eq!(
+            cleanup_error.to_string(),
+            "workflow creation rollback failed"
+        );
+        assert!(!cleanup_error.to_string().contains(secret));
     }
 
     #[tokio::test]
     async fn pause_resume_cancel_and_integrate_cover_lifecycle_contracts() {
-        let factory = Arc::new(FakeFactory::default()); let (_directory, manager) = manager(factory.clone());
+        let factory = Arc::new(FakeFactory::default());
+        let (_directory, manager) = manager(factory.clone());
         let first = created(&manager, "lifecycle").await;
-        let paused = manager.pause(&first.workflow_id, first.generation).await.expect("pause");
-        let resumed = manager.resume(&paused.workflow_id, paused.generation).await.expect("resume");
+        let paused = manager
+            .pause(&first.workflow_id, first.generation)
+            .await
+            .expect("pause");
+        let resumed = manager
+            .resume(&paused.workflow_id, paused.generation)
+            .await
+            .expect("resume");
         assert_eq!(resumed.status, WorkflowStatus::Running);
-        let cancelled = manager.cancel(&resumed.workflow_id, resumed.generation).await.expect("cancel");
+        let cancelled = manager
+            .cancel(&resumed.workflow_id, resumed.generation)
+            .await
+            .expect("cancel");
         assert_eq!(cancelled.status, WorkflowStatus::Cancelled);
-        assert_eq!(manager.cancel(&cancelled.workflow_id, cancelled.generation).await.expect("repeat cancel"), cancelled);
+        assert_eq!(
+            manager
+                .cancel(&cancelled.workflow_id, cancelled.generation)
+                .await
+                .expect("repeat cancel"),
+            cancelled
+        );
         assert_eq!(factory.count(FactoryCall::Cancel), 1);
 
         let second = created(&manager, "integration").await;
-        let paused = manager.pause(&second.workflow_id, second.generation).await.expect("pause for integration");
-        let integrated = manager.integrate(&paused.workflow_id, paused.generation).await.expect("integrate");
+        let paused = manager
+            .pause(&second.workflow_id, second.generation)
+            .await
+            .expect("pause for integration");
+        let integrated = manager
+            .integrate(&paused.workflow_id, paused.generation)
+            .await
+            .expect("integrate");
         assert_eq!(integrated.status, WorkflowStatus::Conflicted);
-        assert!(matches!(integrated.integration, WorkflowIntegration::Conflicted { ref conflicts } if conflicts.len() == 1));
+        assert!(
+            matches!(integrated.integration, WorkflowIntegration::Conflicted { ref conflicts } if conflicts.len() == 1)
+        );
     }
 
     #[tokio::test]
     async fn independent_workflows_are_not_globally_serialized() {
-        let factory = Arc::new(FakeFactory::default()); let (_directory, manager) = manager(factory.clone());
-        let first = created(&manager, "first-independent").await; let second = created(&manager, "second-independent").await;
-        factory.block_next_pause(); let first_generation = first.generation;
-        let first_pause = { let manager = manager.clone(); let id = first.workflow_id.clone(); tokio::spawn(async move { manager.pause(&id, first_generation).await }) };
+        let factory = Arc::new(FakeFactory::default());
+        let (_directory, manager) = manager(factory.clone());
+        let first = created(&manager, "first-independent").await;
+        let second = created(&manager, "second-independent").await;
+        factory.block_next_pause();
+        let first_generation = first.generation;
+        let first_pause = {
+            let manager = manager.clone();
+            let id = first.workflow_id.clone();
+            tokio::spawn(async move { manager.pause(&id, first_generation).await })
+        };
         factory.pause_started.notified().await;
-        let second_paused = tokio::time::timeout(std::time::Duration::from_secs(1), manager.pause(&second.workflow_id, second.generation)).await.expect("second workflow not blocked").expect("pause second");
+        let second_paused = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            manager.pause(&second.workflow_id, second.generation),
+        )
+        .await
+        .expect("second workflow not blocked")
+        .expect("pause second");
         assert_eq!(second_paused.status, WorkflowStatus::Paused);
-        factory.pause_release.notify_one(); assert_eq!(first_pause.await.expect("first join").expect("pause first").status, WorkflowStatus::Paused);
+        factory.pause_release.notify_one();
+        assert_eq!(
+            first_pause
+                .await
+                .expect("first join")
+                .expect("pause first")
+                .status,
+            WorkflowStatus::Paused
+        );
     }
 
     #[tokio::test]
     async fn selection_failure_restores_prior_durable_and_memory_selection() {
-        let factory = Arc::new(FakeFactory::default()); let (directory, manager) = manager(factory.clone());
-        let first = created(&manager, "selected-first").await; let second = created(&manager, "selected-second").await;
+        let factory = Arc::new(FakeFactory::default());
+        let (directory, manager) = manager(factory.clone());
+        let first = created(&manager, "selected-first").await;
+        let second = created(&manager, "selected-second").await;
         assert_eq!(manager.selected(), Some(second.clone()));
         manager.fail_next(WorkflowManagerFailpoint::SelectAfterWrite);
-        let error = manager.select(Some(&first.workflow_id)).expect_err("injected selection failure");
-        assert_eq!(error.to_string(), "workflow selection could not be saved"); assert_eq!(manager.selected(), Some(second.clone()));
+        let error = manager
+            .select(Some(&first.workflow_id))
+            .expect_err("injected selection failure");
+        assert_eq!(error.to_string(), "workflow selection could not be saved");
+        assert_eq!(manager.selected(), Some(second.clone()));
         assert_eq!(reload(&directory, factory).selected(), Some(second));
     }
 
     #[tokio::test]
     async fn remove_compensation_failure_reports_only_safe_message() {
         let secret = "private restore failure /secret/path";
-        let factory = Arc::new(FakeFactory::default()); let (_directory, manager) = manager(factory.clone()); let snapshot = cancelled(&manager, "remove-rollback-failure").await;
-        manager.fail_next(WorkflowManagerFailpoint::RemoveAfterDelete); factory.fail(FactoryCall::Restore, secret);
-        let error = manager.remove(&snapshot.workflow_id, snapshot.generation).await.expect_err("rollback must report failure");
-        assert_eq!(error.to_string(), "workflow removal rollback failed"); assert!(!error.to_string().contains(secret));
-        assert_eq!(manager.get(&snapshot.workflow_id).expect("memory remains prior"), snapshot);
+        let factory = Arc::new(FakeFactory::default());
+        let (_directory, manager) = manager(factory.clone());
+        let snapshot = cancelled(&manager, "remove-rollback-failure").await;
+        manager.fail_next(WorkflowManagerFailpoint::RemoveAfterDelete);
+        factory.fail(FactoryCall::Restore, secret);
+        let error = manager
+            .remove(&snapshot.workflow_id, snapshot.generation)
+            .await
+            .expect_err("rollback must report failure");
+        assert_eq!(error.to_string(), "workflow removal rollback failed");
+        assert!(!error.to_string().contains(secret));
+        assert_eq!(
+            manager
+                .get(&snapshot.workflow_id)
+                .expect("memory remains prior"),
+            snapshot
+        );
     }
 
     #[tokio::test]
     async fn runtime_projection_persists_orders_events_and_rejects_stale_or_terminal_regression() {
-        let factory = Arc::new(FakeFactory::default()); let (directory, manager) = manager(factory.clone()); let snapshot = created(&manager, "projection").await; let mut events = manager.subscribe();
-        let running = manager.project_runtime_update(&snapshot.workflow_id, snapshot.generation, FakeFactory::update(WorkflowStatus::Running)).await.expect("project running").expect("existing snapshot"); assert_eq!(running.status, WorkflowStatus::Running);
-        assert!(matches!(events.recv().await.expect("status"), WorkflowEvent::StatusChanged { status: WorkflowStatus::Running, .. })); assert!(matches!(events.recv().await.expect("updated"), WorkflowEvent::Updated { snapshot } if snapshot.status == WorkflowStatus::Running));
-        let completed = manager.project_runtime_update(&snapshot.workflow_id, snapshot.generation, FakeFactory::update(WorkflowStatus::Completed)).await.expect("project completed").expect("existing snapshot");
+        let factory = Arc::new(FakeFactory::default());
+        let (directory, manager) = manager(factory.clone());
+        let snapshot = created(&manager, "projection").await;
+        let mut events = manager.subscribe();
+        let running = manager
+            .project_runtime_update(
+                &snapshot.workflow_id,
+                snapshot.generation,
+                FakeFactory::update(WorkflowStatus::Running),
+            )
+            .await
+            .expect("project running")
+            .expect("existing snapshot");
+        assert_eq!(running.status, WorkflowStatus::Running);
+        assert!(matches!(
+            events.recv().await.expect("status"),
+            WorkflowEvent::StatusChanged {
+                status: WorkflowStatus::Running,
+                ..
+            }
+        ));
+        assert!(
+            matches!(events.recv().await.expect("updated"), WorkflowEvent::Updated { snapshot } if snapshot.status == WorkflowStatus::Running)
+        );
+        let completed = manager
+            .project_runtime_update(
+                &snapshot.workflow_id,
+                snapshot.generation,
+                FakeFactory::update(WorkflowStatus::Completed),
+            )
+            .await
+            .expect("project completed")
+            .expect("existing snapshot");
         // The settled DAG auto-integrates through the same lifecycle as
         // `/workflow integrate`: the fake runtime merge conflicts, so the
         // workflow lands Conflicted with the merge recorded.
         assert_eq!(completed.status, WorkflowStatus::Conflicted);
-        assert!(matches!(&completed.integration, WorkflowIntegration::Conflicted { conflicts } if conflicts.as_slice() == ["private/path"]));
+        assert!(
+            matches!(&completed.integration, WorkflowIntegration::Conflicted { conflicts } if conflicts.as_slice() == ["private/path"])
+        );
         assert_eq!(factory.count(FactoryCall::Integrate), 1);
-        assert!(matches!(events.recv().await.expect("status"), WorkflowEvent::StatusChanged { status: WorkflowStatus::Completed, .. }));
-        assert!(matches!(events.recv().await.expect("updated"), WorkflowEvent::Updated { snapshot } if snapshot.status == WorkflowStatus::Completed && snapshot.integration == WorkflowIntegration::None));
-        assert!(matches!(events.recv().await.expect("status"), WorkflowEvent::StatusChanged { status: WorkflowStatus::Conflicted, .. }));
-        assert!(matches!(events.recv().await.expect("updated"), WorkflowEvent::Updated { snapshot } if snapshot.status == WorkflowStatus::Conflicted));
-        assert_eq!(reload(&directory, factory).get(&snapshot.workflow_id).expect("durable projection"), completed);
-        assert_eq!(manager.project_runtime_update(&snapshot.workflow_id, snapshot.generation + 1, FakeFactory::update(WorkflowStatus::Completed)).await.expect_err("stale").to_string(), "workflow generation is stale");
-        assert_eq!(manager.project_runtime_update(&snapshot.workflow_id, snapshot.generation, FakeFactory::update(WorkflowStatus::Running)).await.expect_err("terminal regression").to_string(), "workflow runtime projection is invalid");
+        assert!(matches!(
+            events.recv().await.expect("status"),
+            WorkflowEvent::StatusChanged {
+                status: WorkflowStatus::Integrating,
+                ..
+            }
+        ));
+        assert!(
+            matches!(events.recv().await.expect("updated"), WorkflowEvent::Updated { snapshot } if snapshot.status == WorkflowStatus::Integrating && snapshot.integration == WorkflowIntegration::None)
+        );
+        assert!(matches!(
+            events.recv().await.expect("status"),
+            WorkflowEvent::StatusChanged {
+                status: WorkflowStatus::Conflicted,
+                ..
+            }
+        ));
+        assert!(
+            matches!(events.recv().await.expect("updated"), WorkflowEvent::Updated { snapshot } if snapshot.status == WorkflowStatus::Conflicted)
+        );
+        assert_eq!(
+            reload(&directory, factory)
+                .get(&snapshot.workflow_id)
+                .expect("durable projection"),
+            completed
+        );
+        assert_eq!(
+            manager
+                .project_runtime_update(
+                    &snapshot.workflow_id,
+                    snapshot.generation + 1,
+                    FakeFactory::update(WorkflowStatus::Completed)
+                )
+                .await
+                .expect_err("stale")
+                .to_string(),
+            "workflow generation is stale"
+        );
+        let regression = manager
+            .project_runtime_update(
+                &snapshot.workflow_id,
+                snapshot.generation,
+                FakeFactory::update(WorkflowStatus::Running),
+            )
+            .await
+            .expect_err("terminal regression")
+            .to_string();
+        assert!(
+            regression.starts_with("workflow runtime projection is invalid:"),
+            "{regression}"
+        );
     }
     #[tokio::test]
-    async fn dag_settle_auto_integrates_once_and_repeat_completed_is_noop() {
+    async fn dag_settle_auto_integrates_once_and_repeat_completed_preserves_applied_outcome() {
         let factory = Arc::new(FakeFactory::default());
         *factory.integrate_outcome.lock() = Some(WorkflowStatus::Completed);
         let (_directory, manager) = manager(factory.clone());
         let snapshot = created(&manager, "auto-integrate-once").await;
-        manager.project_runtime_update(&snapshot.workflow_id, snapshot.generation, FakeFactory::update(WorkflowStatus::Running)).await.expect("project running").expect("existing snapshot");
-        let integrated = manager.project_runtime_update(&snapshot.workflow_id, snapshot.generation, FakeFactory::update(WorkflowStatus::Completed)).await.expect("project completed").expect("existing snapshot");
+        manager
+            .project_runtime_update(
+                &snapshot.workflow_id,
+                snapshot.generation,
+                FakeFactory::update(WorkflowStatus::Running),
+            )
+            .await
+            .expect("project running")
+            .expect("existing snapshot");
+        let integrated = manager
+            .project_runtime_update(
+                &snapshot.workflow_id,
+                snapshot.generation,
+                FakeFactory::update(WorkflowStatus::Completed),
+            )
+            .await
+            .expect("project completed")
+            .expect("existing snapshot");
         assert_eq!(integrated.status, WorkflowStatus::Completed);
-        assert!(matches!(integrated.integration, WorkflowIntegration::Applied { ref result_commit } if result_commit == "private-result-commit"));
+        assert!(
+            matches!(integrated.integration, WorkflowIntegration::Applied { ref result_commit } if result_commit == "private-result-commit")
+        );
         assert_eq!(factory.count(FactoryCall::Integrate), 1);
         // A repeated Completed projection (e.g. a straggler event after the
-        // merge applied) never re-runs the merge.
-        let again = manager.project_runtime_update(&snapshot.workflow_id, snapshot.generation, FakeFactory::update(WorkflowStatus::Completed)).await.expect("repeat completed").expect("existing snapshot");
-        assert_eq!(again.status, WorkflowStatus::Completed);
-        assert!(matches!(again.integration, WorkflowIntegration::Applied { .. }));
+        // merge applied) preserves the authoritative merge result and never
+        // re-runs the merge.
+        let again = manager
+            .project_runtime_update(
+                &snapshot.workflow_id,
+                snapshot.generation,
+                FakeFactory::update(WorkflowStatus::Completed),
+            )
+            .await
+            .expect("repeat completed")
+            .expect("existing snapshot");
+        assert_eq!(again.status, integrated.status);
+        assert_eq!(again.generation, integrated.generation);
+        assert_eq!(again.integration, integrated.integration);
         assert_eq!(factory.count(FactoryCall::Integrate), 1);
     }
     #[tokio::test]
+    async fn auto_integrate_missing_commits_fails_unmerged_and_retry_applies() {
+        let factory = Arc::new(FakeFactory::default());
+        *factory.integrate_outcome.lock() = Some(WorkflowStatus::Failed);
+        let (_directory, manager) = manager(factory.clone());
+        let snapshot = created(&manager, "missing-commits").await;
+        manager
+            .project_runtime_update(
+                &snapshot.workflow_id,
+                snapshot.generation,
+                FakeFactory::update(WorkflowStatus::Running),
+            )
+            .await
+            .expect("project running")
+            .expect("existing snapshot");
+        let failed = manager
+            .project_runtime_update(
+                &snapshot.workflow_id,
+                snapshot.generation,
+                FakeFactory::update(WorkflowStatus::Completed),
+            )
+            .await
+            .expect("project completed triggers integrate")
+            .expect("existing snapshot");
+        assert_eq!(failed.status, WorkflowStatus::Failed);
+        assert_eq!(failed.integration, WorkflowIntegration::None);
+        assert_eq!(
+            failed
+                .failure
+                .as_ref()
+                .map(|failure| failure.message.as_str()),
+            Some(
+                "workflow has no commits to integrate; commit the worktree changes before integration"
+            )
+        );
+        assert_eq!(factory.count(FactoryCall::Integrate), 1);
+
+        *factory.integrate_outcome.lock() = Some(WorkflowStatus::Completed);
+        let retried = manager
+            .integrate(&failed.workflow_id, failed.generation)
+            .await
+            .expect("retry integrate after commits exist");
+        assert_eq!(retried.status, WorkflowStatus::Completed);
+        assert!(
+            matches!(&retried.integration, WorkflowIntegration::Applied { result_commit } if result_commit == "private-result-commit")
+        );
+        assert_eq!(factory.count(FactoryCall::Integrate), 2);
+    }
+    #[tokio::test]
+    async fn crash_at_integrating_boundary_restores_unmerged_then_applies() {
+        let factory = Arc::new(FakeFactory::default());
+        *factory.integrate_outcome.lock() = Some(WorkflowStatus::Completed);
+        let (directory, manager) = manager(factory.clone());
+        let snapshot = created(&manager, "crash-integrate").await;
+        manager
+            .project_runtime_update(
+                &snapshot.workflow_id,
+                snapshot.generation,
+                FakeFactory::update(WorkflowStatus::Running),
+            )
+            .await
+            .expect("project running")
+            .expect("existing snapshot");
+        let mut integrating = manager
+            .get(&snapshot.workflow_id)
+            .expect("running snapshot")
+            .clone();
+        integrating.status = WorkflowStatus::Integrating;
+        integrating.integration = WorkflowIntegration::None;
+        integrating.updated_at_ms = now_ms();
+        manager
+            .persist_replace(
+                &manager.get(&snapshot.workflow_id).expect("live"),
+                &integrating,
+            )
+            .expect("persist integrating crash record");
+        drop(manager);
+
+        let restored_manager = reload(&directory, factory.clone());
+        let crashed = restored_manager
+            .get(&snapshot.workflow_id)
+            .expect("crashed record");
+        assert_eq!(crashed.status, WorkflowStatus::Integrating);
+        assert_eq!(crashed.integration, WorkflowIntegration::None);
+
+        let recovered = restored_manager.restore_all().await.expect("restore");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].status, WorkflowStatus::Completed);
+        assert!(
+            matches!(&recovered[0].integration, WorkflowIntegration::Applied { result_commit } if result_commit == "private-result-commit")
+        );
+        assert_eq!(factory.count(FactoryCall::Restore), 0);
+        assert_eq!(factory.count(FactoryCall::Integrate), 1);
+    }
+    #[tokio::test]
+    async fn restore_all_keeps_later_workflow_when_integrating_retry_fails() {
+        let factory = Arc::new(FakeFactory::default());
+        *factory.integrate_outcome.lock() = Some(WorkflowStatus::Completed);
+        let (directory, manager) = manager(factory.clone());
+        let first = created(&manager, "first-integrating").await;
+        let second = created(&manager, "second-running").await;
+        manager
+            .project_runtime_update(
+                &first.workflow_id,
+                first.generation,
+                FakeFactory::update(WorkflowStatus::Running),
+            )
+            .await
+            .expect("project first running")
+            .expect("existing first");
+        manager
+            .project_runtime_update(
+                &second.workflow_id,
+                second.generation,
+                FakeFactory::update(WorkflowStatus::Running),
+            )
+            .await
+            .expect("project second running")
+            .expect("existing second");
+        let mut integrating = manager.get(&first.workflow_id).expect("first live").clone();
+        integrating.status = WorkflowStatus::Integrating;
+        integrating.integration = WorkflowIntegration::None;
+        integrating.updated_at_ms = now_ms();
+        manager
+            .persist_replace(
+                &manager.get(&first.workflow_id).expect("first live"),
+                &integrating,
+            )
+            .expect("persist first integrating");
+        drop(manager);
+
+        factory.fail(FactoryCall::Integrate, "injected integrate failure");
+        let restored_manager = reload(&directory, factory.clone());
+        let recovered = restored_manager.restore_all().await.expect("restore continues");
+        let first_live = restored_manager
+            .get(&first.workflow_id)
+            .expect("first still present");
+        assert_eq!(first_live.status, WorkflowStatus::Integrating);
+        assert_eq!(first_live.integration, WorkflowIntegration::None);
+        let second_live = recovered
+            .iter()
+            .find(|snapshot| snapshot.workflow_id == second.workflow_id)
+            .expect("second restored");
+        assert_eq!(second_live.status, WorkflowStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn restore_all_keeps_later_workflow_when_runtime_restore_fails() {
+        let factory = Arc::new(FakeFactory::default());
+        let (directory, manager) = manager(factory.clone());
+        let first = created(&manager, "first-restore-fail").await;
+        let second = created(&manager, "second-restore-ok").await;
+        manager
+            .project_runtime_update(
+                &first.workflow_id,
+                first.generation,
+                FakeFactory::update(WorkflowStatus::Running),
+            )
+            .await
+            .expect("project first running")
+            .expect("existing first");
+        manager
+            .project_runtime_update(
+                &second.workflow_id,
+                second.generation,
+                FakeFactory::update(WorkflowStatus::Running),
+            )
+            .await
+            .expect("project second running")
+            .expect("existing second");
+        drop(manager);
+
+        factory.fail(FactoryCall::Restore, "injected restore failure");
+        let restored_manager = reload(&directory, factory.clone());
+        let recovered = restored_manager
+            .restore_all()
+            .await
+            .expect("restore continues after one failure");
+        let first_live = restored_manager
+            .get(&first.workflow_id)
+            .expect("first still present");
+        assert_eq!(first_live.status, WorkflowStatus::Failed);
+        assert_eq!(
+            first_live
+                .failure
+                .as_ref()
+                .map(|failure| failure.message.as_str()),
+            Some("workflow runtime recovery failed")
+        );
+        let second_live = recovered
+            .iter()
+            .find(|snapshot| snapshot.workflow_id == second.workflow_id)
+            .expect("second restored");
+        assert_eq!(second_live.status, WorkflowStatus::Running);
+        assert_eq!(factory.count(FactoryCall::Restore), 2);
+    }
+    #[tokio::test]
+    async fn same_status_projection_preserves_conflict_until_new_explicit_outcome() {
+        let factory = Arc::new(FakeFactory::default());
+        let (_directory, manager) = manager(factory.clone());
+        let snapshot = created(&manager, "conflicted-projection").await;
+        manager
+            .project_runtime_update(
+                &snapshot.workflow_id,
+                snapshot.generation,
+                FakeFactory::update(WorkflowStatus::Running),
+            )
+            .await
+            .expect("project running")
+            .expect("existing snapshot");
+        let integrated = manager
+            .project_runtime_update(
+                &snapshot.workflow_id,
+                snapshot.generation,
+                FakeFactory::update(WorkflowStatus::Completed),
+            )
+            .await
+            .expect("project completed")
+            .expect("existing snapshot");
+        assert_eq!(integrated.status, WorkflowStatus::Conflicted);
+
+        let repeated = manager
+            .project_runtime_update(
+                &snapshot.workflow_id,
+                snapshot.generation,
+                FakeFactory::update(WorkflowStatus::Conflicted),
+            )
+            .await
+            .expect("repeat conflicted")
+            .expect("existing snapshot");
+        assert_eq!(repeated.integration, integrated.integration);
+
+        let newer_conflicts = vec!["private/new-conflict".to_owned()];
+        let mut explicit = FakeFactory::update(WorkflowStatus::Conflicted);
+        explicit.integration = WorkflowIntegration::Conflicted {
+            conflicts: newer_conflicts.clone(),
+        };
+        let updated = manager
+            .project_runtime_update(&snapshot.workflow_id, snapshot.generation, explicit)
+            .await
+            .expect("new explicit conflict")
+            .expect("existing snapshot");
+        assert_eq!(
+            updated.integration,
+            WorkflowIntegration::Conflicted {
+                conflicts: newer_conflicts
+            }
+        );
+        assert_eq!(factory.count(FactoryCall::Integrate), 1);
+    }
+    #[tokio::test]
+    async fn lifecycle_update_without_new_outcome_preserves_applied_result() {
+        let factory = Arc::new(FakeFactory::default());
+        *factory.integrate_outcome.lock() = Some(WorkflowStatus::Completed);
+        let (_directory, manager) = manager(factory.clone());
+        let snapshot = created(&manager, "applied-lifecycle").await;
+        let paused = manager
+            .pause(&snapshot.workflow_id, snapshot.generation)
+            .await
+            .expect("pause for integration");
+        let integrated = manager
+            .integrate(&paused.workflow_id, paused.generation)
+            .await
+            .expect("integrate applied");
+        assert_eq!(integrated.status, WorkflowStatus::Completed);
+        assert!(
+            matches!(integrated.integration, WorkflowIntegration::Applied { ref result_commit } if result_commit == "private-result-commit")
+        );
+        // A retry integrate whose runtime reports no outcome (hard failure,
+        // integration None) must never erase the authoritative Applied result.
+        *factory.integrate_outcome.lock() = Some(WorkflowStatus::Failed);
+        let retried = manager
+            .integrate(&integrated.workflow_id, integrated.generation)
+            .await
+            .expect("retry integrate");
+        assert_eq!(retried.status, WorkflowStatus::Failed);
+        assert!(
+            matches!(&retried.integration, WorkflowIntegration::Applied { result_commit } if result_commit == "private-result-commit")
+        );
+        assert_eq!(
+            manager
+                .get(&integrated.workflow_id)
+                .expect("durable applied record")
+                .integration,
+            retried.integration
+        );
+    }
+    #[tokio::test]
+    async fn lifecycle_update_without_new_outcome_preserves_conflict() {
+        let factory = Arc::new(FakeFactory::default());
+        let (_directory, manager) = manager(factory.clone());
+        let snapshot = created(&manager, "conflicted-lifecycle").await;
+        let paused = manager
+            .pause(&snapshot.workflow_id, snapshot.generation)
+            .await
+            .expect("pause for integration");
+        let integrated = manager
+            .integrate(&paused.workflow_id, paused.generation)
+            .await
+            .expect("integrate conflicted");
+        assert_eq!(integrated.status, WorkflowStatus::Conflicted);
+        assert!(
+            matches!(&integrated.integration, WorkflowIntegration::Conflicted { conflicts } if conflicts.as_slice() == ["private/path"])
+        );
+        // A retry integrate with no recorded outcome preserves the conflicts
+        // for manual resolution instead of wiping them.
+        *factory.integrate_outcome.lock() = Some(WorkflowStatus::Failed);
+        let retried = manager
+            .integrate(&integrated.workflow_id, integrated.generation)
+            .await
+            .expect("retry integrate");
+        assert_eq!(retried.status, WorkflowStatus::Failed);
+        assert!(
+            matches!(&retried.integration, WorkflowIntegration::Conflicted { conflicts } if conflicts.as_slice() == ["private/path"])
+        );
+        assert_eq!(
+            manager
+                .get(&integrated.workflow_id)
+                .expect("durable conflicted record")
+                .integration,
+            retried.integration
+        );
+    }
+    #[tokio::test]
+    async fn lifecycle_newer_explicit_outcome_replaces_prior_outcome() {
+        let factory = Arc::new(FakeFactory::default());
+        *factory.integrate_outcome.lock() = Some(WorkflowStatus::Completed);
+        let (_directory, manager) = manager(factory.clone());
+        let snapshot = created(&manager, "outcome-precedence").await;
+        let paused = manager
+            .pause(&snapshot.workflow_id, snapshot.generation)
+            .await
+            .expect("pause for integration");
+        let applied = manager
+            .integrate(&paused.workflow_id, paused.generation)
+            .await
+            .expect("integrate applied");
+        assert!(matches!(
+            applied.integration,
+            WorkflowIntegration::Applied { .. }
+        ));
+        // A newer explicit Conflicted outcome from a retry replaces Applied.
+        *factory.integrate_outcome.lock() = Some(WorkflowStatus::Conflicted);
+        let conflicted = manager
+            .integrate(&applied.workflow_id, applied.generation)
+            .await
+            .expect("integrate conflicted");
+        assert_eq!(conflicted.status, WorkflowStatus::Conflicted);
+        assert!(
+            matches!(&conflicted.integration, WorkflowIntegration::Conflicted { conflicts } if conflicts.as_slice() == ["private/path"])
+        );
+        assert_eq!(
+            manager
+                .get(&applied.workflow_id)
+                .expect("durable precedence record")
+                .integration,
+            conflicted.integration
+        );
+    }
+    #[tokio::test]
     async fn paused_workflow_projection_cannot_settle_or_auto_integrate() {
-        let factory = Arc::new(FakeFactory::default()); let (_directory, manager) = manager(factory.clone());
+        let factory = Arc::new(FakeFactory::default());
+        let (_directory, manager) = manager(factory.clone());
         let snapshot = created(&manager, "paused-settle").await;
-        let paused = manager.pause(&snapshot.workflow_id, snapshot.generation).await.expect("pause");
+        let paused = manager
+            .pause(&snapshot.workflow_id, snapshot.generation)
+            .await
+            .expect("pause");
         assert_eq!(paused.status, WorkflowStatus::Paused);
         // A Paused runtime never projects a status change; even a forged
         // Completed projection is rejected, so the merge can never run while
         // the workflow is paused.
-        let error = manager.project_runtime_update(&paused.workflow_id, paused.generation, FakeFactory::update(WorkflowStatus::Completed)).await.expect_err("paused settle must be rejected");
-        assert_eq!(error.to_string(), "workflow runtime projection is invalid");
+        let error = manager
+            .project_runtime_update(
+                &paused.workflow_id,
+                paused.generation,
+                FakeFactory::update(WorkflowStatus::Completed),
+            )
+            .await
+            .expect_err("paused settle must be rejected");
+        assert!(
+            error
+                .to_string()
+                .starts_with("workflow runtime projection is invalid:"),
+            "{error}"
+        );
         assert_eq!(factory.count(FactoryCall::Integrate), 0);
-        assert_eq!(manager.get(&paused.workflow_id).expect("paused record").status, WorkflowStatus::Paused);
+        assert_eq!(
+            manager
+                .get(&paused.workflow_id)
+                .expect("paused record")
+                .status,
+            WorkflowStatus::Paused
+        );
     }
     #[tokio::test]
     async fn resume_settling_completed_dag_auto_integrates() {
         let factory = Arc::new(FakeFactory::default());
         *factory.integrate_outcome.lock() = Some(WorkflowStatus::Completed);
         *factory.resume_outcome.lock() = Some(WorkflowStatus::Completed);
-        let (_directory, manager) = manager(factory.clone());
+        let (directory, manager) = manager(factory.clone());
         let snapshot = created(&manager, "resume-settle").await;
-        let paused = manager.pause(&snapshot.workflow_id, snapshot.generation).await.expect("pause");
-        // The DAG settles while paused; resume returns Completed and the
-        // manager auto-integrates through the same lifecycle path.
-        let integrated = manager.resume(&paused.workflow_id, paused.generation).await.expect("resume settle");
+        let paused = manager
+            .pause(&snapshot.workflow_id, snapshot.generation)
+            .await
+            .expect("pause");
+        let mut events = manager.subscribe();
+        let integrated = manager
+            .resume(&paused.workflow_id, paused.generation)
+            .await
+            .expect("resume settle");
         assert_eq!(integrated.status, WorkflowStatus::Completed);
-        assert!(matches!(integrated.integration, WorkflowIntegration::Applied { .. }));
+        assert!(matches!(
+            integrated.integration,
+            WorkflowIntegration::Applied { .. }
+        ));
         assert_eq!(factory.count(FactoryCall::Integrate), 1);
+        let mut saw_integrating = false;
+        while let Ok(event) = events.try_recv() {
+            if let WorkflowEvent::StatusChanged {
+                status: WorkflowStatus::Integrating,
+                ..
+            } = event
+            {
+                saw_integrating = true;
+            }
+        }
+        assert!(saw_integrating, "resume must persist Integrating before integrate");
+        let _ = directory;
     }
     #[tokio::test]
     async fn create_folds_latest_synchronous_projection_without_deadlock() {
-        let factory = Arc::new(FakeFactory::default()); let (directory, manager) = manager(factory.clone()); let sink = manager.runtime_projection_sink();
-        factory.project_on_create(sink.clone(), FakeFactory::update(WorkflowStatus::Planning)); factory.project_on_create(sink, FakeFactory::update(WorkflowStatus::Completed));
-        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(1), manager.create(request("create-race"))).await.expect("no deadlock").expect("create"); assert_eq!(snapshot.status, WorkflowStatus::Completed);
-        assert_eq!(reload(&directory, factory).get(&snapshot.workflow_id).expect("first durable projection").status, WorkflowStatus::Completed);
+        let factory = Arc::new(FakeFactory::default());
+        *factory.integrate_outcome.lock() = Some(WorkflowStatus::Completed);
+        let (directory, manager) = manager(factory.clone());
+        let sink = manager.runtime_projection_sink();
+        factory.project_on_create(sink.clone(), FakeFactory::update(WorkflowStatus::Planning));
+        factory.project_on_create(sink, FakeFactory::update(WorkflowStatus::Completed));
+        let snapshot = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            manager.create(request("create-race")),
+        )
+        .await
+        .expect("no deadlock")
+        .expect("create");
+        assert_eq!(snapshot.status, WorkflowStatus::Queued);
+        assert_eq!(snapshot.integration, WorkflowIntegration::None);
+        let live = manager
+            .get(&snapshot.workflow_id)
+            .expect("live after start");
+        assert_eq!(live.status, WorkflowStatus::Completed);
+        assert!(matches!(
+            live.integration,
+            WorkflowIntegration::Applied { .. }
+        ));
+        let durable = reload(&directory, factory.clone())
+            .get(&snapshot.workflow_id)
+            .expect("first durable projection");
+        assert_eq!(durable.status, WorkflowStatus::Completed);
+        assert!(matches!(
+            durable.integration,
+            WorkflowIntegration::Applied { .. }
+        ));
+        assert_eq!(factory.count(FactoryCall::Integrate), 1);
     }
     #[tokio::test]
     async fn projection_rejects_updates_before_record_or_exact_create_reservation() {
-        let factory = Arc::new(FakeFactory::default()); let (_directory, manager) = manager(factory); let id = WorkflowId::new("private-missing-id");
-        let error = manager.runtime_projection_sink().project(&id, 1, FakeFactory::update(WorkflowStatus::Running)).await.expect_err("missing workflow"); assert_eq!(error.to_string(), "workflow was not found"); assert!(!format!("{error:?}").contains(id.as_str()));
+        let factory = Arc::new(FakeFactory::default());
+        let (_directory, manager) = manager(factory);
+        let id = WorkflowId::new("private-missing-id");
+        let error = manager
+            .runtime_projection_sink()
+            .project(&id, 1, FakeFactory::update(WorkflowStatus::Running))
+            .await
+            .expect_err("missing workflow");
+        assert_eq!(error.to_string(), "workflow was not found");
+        assert!(!format!("{error:?}").contains(id.as_str()));
     }
 
     #[test]
     fn debug_output_redacts_public_manager_payloads() {
-        let secret = "private-id private-label private-branch private-agent private-job /private/path";
+        let secret =
+            "private-id private-label private-branch private-agent private-job /private/path";
         let snapshot = WorkflowSnapshot {
-            workflow_id: WorkflowId::new("private-id"), name: "private-label".to_owned(), objective: "/private/path".to_owned(), status: WorkflowStatus::Failed,
-            created_at_ms: 1, updated_at_ms: 2, generation: 3, todo: todo(), worktree_label: Some("private-label".to_owned()), branch: Some("private-branch".to_owned()),
-            supervisor_agent_id: Some("private-agent".to_owned()), supervisor_job_id: Some("private-job".to_owned()), failure: Some(WorkflowFailure { message: secret.to_owned() }),
-            integration: WorkflowIntegration::Conflicted { conflicts: vec!["/private/path".to_owned()] },
+            workflow_id: WorkflowId::new("private-id"),
+            name: "private-label".to_owned(),
+            objective: "/private/path".to_owned(),
+            status: WorkflowStatus::Failed,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            generation: 3,
+            durable_policy: durable_policy(),
+            todo: todo(),
+            worktree_label: Some("private-label".to_owned()),
+            branch: Some("private-branch".to_owned()),
+            supervisor_agent_id: Some("private-agent".to_owned()),
+            supervisor_job_id: Some("private-job".to_owned()),
+            failure: Some(WorkflowFailure {
+                message: secret.to_owned(),
+            }),
+            integration: WorkflowIntegration::Conflicted {
+                conflicts: vec!["/private/path".to_owned()],
+            },
+            planning_prompts_consumed: 0,
         };
         let values = [
-            format!("{:?}", WorkflowCreateRequest { name: secret.to_owned(), objective: secret.to_owned() }),
-            format!("{:?}", WorkflowRuntimeRequest { workflow_id: snapshot.workflow_id.clone(), name: secret.to_owned(), objective: secret.to_owned(), generation: 3 }),
+            format!(
+                "{:?}",
+                WorkflowCreateRequest {
+                    name: secret.to_owned(),
+                    objective: secret.to_owned()
+                }
+            ),
+            format!(
+                "{:?}",
+                WorkflowRuntimeRequest {
+                    workflow_id: snapshot.workflow_id.clone(),
+                    name: secret.to_owned(),
+                    objective: secret.to_owned(),
+                    generation: 3
+                }
+            ),
             format!("{:?}", FakeFactory::identity()),
-            format!("{:?}", WorkflowRuntimeUpdate { status: WorkflowStatus::Failed, todo: todo(), supervisor_agent_id: Some(secret.to_owned()), supervisor_job_id: Some(secret.to_owned()), failure: snapshot.failure.clone(), integration: snapshot.integration.clone() }),
-            format!("{:?}", WorkflowEvent::Updated { snapshot: snapshot.clone() }),
-            format!("{:?}", WorkflowStoreDiagnostic { workflow_id: Some(snapshot.workflow_id.clone()), message: secret.to_owned() }),
+            format!(
+                "{:?}",
+                WorkflowRuntimeUpdate {
+                    status: WorkflowStatus::Failed,
+                    todo: todo(),
+                    supervisor_agent_id: Some(secret.to_owned()),
+                    supervisor_job_id: Some(secret.to_owned()),
+                    failure: snapshot.failure.clone(),
+                    integration: snapshot.integration.clone(),
+                    durable_policy: durable_policy(),
+                    planning_prompts_consumed: 0,
+                }
+            ),
+            format!(
+                "{:?}",
+                WorkflowEvent::Updated {
+                    snapshot: snapshot.clone()
+                }
+            ),
+            format!(
+                "{:?}",
+                WorkflowStoreDiagnostic {
+                    workflow_id: Some(snapshot.workflow_id.clone()),
+                    message: secret.to_owned()
+                }
+            ),
             format!("{:?}", snapshot.failure.clone().expect("failure")),
             format!("{:?}", snapshot.integration.clone()),
         ];
-        for debug in values { for private in secret.split_whitespace() { assert!(!debug.contains(private), "debug leaked {private}: {debug}"); } }
+        for debug in values {
+            for private in secret.split_whitespace() {
+                assert!(!debug.contains(private), "debug leaked {private}: {debug}");
+            }
+        }
     }
 }

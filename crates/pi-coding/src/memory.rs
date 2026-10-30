@@ -13,9 +13,14 @@
 //! workflow worktree namespace pattern. It is deterministic for a given
 //! checkout (so memory persists across sessions in the same project — the
 //! whole point), distinct between projects, and free of path separators, so a
-//! hostile cwd can never escape the memory root. `PI_CODING_AGENT_DIR` (or
-//! `~/.pi/agent`) selects the agent directory, the same knob the rest of the
+//! hostile cwd can never escape the memory root. `RPI_HOME` (or `~/.rpi`)
+//! selects the agent directory, the same knob the rest of the
 //! harness uses; no extra settings surface is introduced.
+//!
+//! When a repository moves on disk, `migrate_repo_namespace` copies the old
+//! namespace's entries into the moved checkout's namespace additively and
+//! idempotently; the old archive stays behind as recovery metadata until the
+//! session-move core finalizes via `commit_repo_namespace_migration`.
 //!
 //! Actions:
 //! - `learn <content> [tags]` — append an entry stamped with the write time
@@ -53,19 +58,21 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
-use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
 use pi_agent::{AbortSignal, AgentTool, AgentToolResult, ToolCallContext, ToolCapability};
+use pi_sandbox::AbsolutePath;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::fs::{
+    CapabilityAccess, CapabilityFs, CapabilityRootLease, CapabilityRootPurpose, FileMode, FsError,
+    Replacement, RootCreation,
+};
 use crate::redact::redact_secrets;
-use crate::settings::atomic_write;
 use crate::tools::{
     SessionEnvFn, arg_int, arg_str, check_aborted, s_array, s_number, s_object, s_string,
     text_result,
@@ -78,6 +85,7 @@ const ENTRIES_FILE_NAME: &str = "entries.jsonl";
 /// Maximum entries kept per namespace; learn evicts the oldest beyond this.
 const MAX_ENTRIES: usize = 100;
 const MAX_ENTRY_BYTES: usize = 1024 * 1024;
+const MAX_MEMORY_STORE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_ENTRY_BYTES_LABEL: &str = "1 MiB";
 const RECALL_DEFAULT_LIMIT: usize = 10;
 const RECALL_MAX_LIMIT: usize = 50;
@@ -108,43 +116,135 @@ pub(crate) struct MemoryEntry {
 
 pub(crate) struct MemoryStore {
     entries_path: PathBuf,
-    persona_root: Option<PathBuf>,
+    lease: CapabilityRootLease,
 }
 
 impl MemoryStore {
     /// Builds the store for the default agent directory and the repo digest of
     /// `cwd`. The digest namespace is always valid, so this never fails.
     pub(crate) fn default_for(cwd: &Path) -> Arc<MemoryStore> {
+        Self::default_for_with_capabilities(&PROCESS_CAPABILITIES, cwd)
+    }
+
+    pub(crate) fn default_for_with_capabilities(
+        capabilities: &Arc<CapabilityFs>,
+        cwd: &Path,
+    ) -> Arc<MemoryStore> {
+        Self::try_default_for_with_capabilities(capabilities, cwd)
+            .expect("digest namespace is always path-safe")
+    }
+
+    fn try_default_for_with_capabilities(
+        capabilities: &Arc<CapabilityFs>,
+        cwd: &Path,
+    ) -> Result<Arc<MemoryStore>> {
         let namespace = repo_namespace(cwd);
-        Arc::new(
-            MemoryStore::new(&crate::resources::agent_dir_path(), &namespace)
-                .expect("digest namespace is always path-safe"),
-        )
+        Ok(Arc::new(MemoryStore::new_with_capabilities(
+            capabilities,
+            &crate::resources::agent_dir_path(),
+            &namespace,
+        )?))
     }
 
     /// Builds a store rooted at `agent_dir` under the given namespace.
     /// Rejects namespaces that could traverse out of the memory root.
     pub(crate) fn new(agent_dir: &Path, namespace: &str) -> Result<Self> {
-        validate_namespace(namespace)?;
-        Ok(Self {
-            entries_path: agent_dir
-                .join(MEMORY_DIR_NAME)
-                .join(namespace)
-                .join(ENTRIES_FILE_NAME),
-            persona_root: None,
-        })
+        Self::new_with_capabilities(&PROCESS_CAPABILITIES, agent_dir, namespace)
     }
-    /// Builds a persona-local store at the durable persona layout's exact
-    /// `<persona-root>/memory/entries.jsonl` path. Every operation revalidates
-    /// direct non-symlink containment before access.
-    pub(crate) fn persona(persona_root: &Path) -> Arc<MemoryStore> {
-        Arc::new(Self {
-            entries_path: persona_root.join(MEMORY_DIR_NAME).join(ENTRIES_FILE_NAME),
-            persona_root: Some(persona_root.to_path_buf()),
+
+    pub(crate) fn new_with_capabilities(
+        capabilities: &Arc<CapabilityFs>,
+        agent_dir: &Path,
+        namespace: &str,
+    ) -> Result<Self> {
+        Self::open_namespace_store(
+            capabilities,
+            agent_dir,
+            namespace,
+            RootCreation::CreateDirectory,
+        )
+    }
+
+    /// Builds a namespace store under `agent_dir`, creating the namespace
+    /// directory only when `creation` asks for it. Namespace-migration probes
+    /// pass [`RootCreation::Existing`] so a missing old archive surfaces as
+    /// an error instead of being silently created.
+    fn open_namespace_store(
+        capabilities: &Arc<CapabilityFs>,
+        agent_dir: &Path,
+        namespace: &str,
+        creation: RootCreation,
+    ) -> Result<Self> {
+        validate_namespace(namespace)?;
+        let agent_root = capabilities.open_root(
+            CapabilityRootPurpose::AgentStore,
+            absolute_capability_path(agent_dir)?,
+            CapabilityAccess::PrivateReadWrite,
+            RootCreation::CreateDirectory,
+        )?;
+        let lease = agent_root.lease_directory(
+            &Path::new(MEMORY_DIR_NAME).join(namespace),
+            CapabilityAccess::PrivateReadWrite,
+            creation,
+        )?;
+        Ok(Self {
+            entries_path: lease.display_root().join(ENTRIES_FILE_NAME),
+            lease,
         })
     }
 
-    pub(crate) fn learn(&self, content: &str, tags: Vec<String>, session: &str) -> Result<(String, usize)> {
+    /// Builds a persona-local store at the durable persona layout's exact
+    /// `<persona-root>/memory/entries.jsonl` path.
+    pub(crate) fn persona(persona_root: &Path) -> Arc<MemoryStore> {
+        Arc::new(
+            Self::persona_with_capabilities(&PROCESS_CAPABILITIES, persona_root)
+                .expect("persona memory root must be capability-accessible"),
+        )
+    }
+    pub(crate) fn persona_with_capabilities(
+        capabilities: &Arc<CapabilityFs>,
+        persona_root: &Path,
+    ) -> Result<Self> {
+        let persona = capabilities.open_root(
+            CapabilityRootPurpose::PersonaStore,
+            absolute_capability_path(persona_root)?,
+            CapabilityAccess::PrivateReadWrite,
+            RootCreation::Existing,
+        )?;
+        let lease = persona.lease_directory(
+            Path::new(MEMORY_DIR_NAME),
+            CapabilityAccess::PrivateReadWrite,
+            RootCreation::CreateDirectory,
+        )?;
+        Ok(Self {
+            entries_path: lease.display_root().join(ENTRIES_FILE_NAME),
+            lease,
+        })
+    }
+
+    pub(crate) fn persona_from_lease(persona: &CapabilityRootLease) -> Result<Self> {
+        if persona.purpose() != CapabilityRootPurpose::PersonaStore
+            || persona.access() != CapabilityAccess::PrivateReadWrite
+        {
+            bail!("persona memory requires a private persona-store lease");
+        }
+        let lease = persona.lease_directory(
+            Path::new(MEMORY_DIR_NAME),
+            CapabilityAccess::PrivateReadWrite,
+            RootCreation::CreateDirectory,
+        )?;
+        Ok(Self {
+            entries_path: lease.display_root().join(ENTRIES_FILE_NAME),
+            lease,
+        })
+    }
+
+    pub(crate) fn learn(
+        &self,
+        content: &str,
+        tags: Vec<String>,
+        session: &str,
+    ) -> Result<(String, usize)> {
         self.learn_with_ts(content, tags, session, pi_ai::now_millis())
     }
 
@@ -166,17 +266,20 @@ impl MemoryStore {
         let entry = MemoryEntry {
             id: id.clone(),
             content: redact_secrets(content),
-            tags: tags.into_iter().filter_map(|tag| sanitize_tag(&tag)).collect(),
+            tags: tags
+                .into_iter()
+                .filter_map(|tag| sanitize_tag(&tag))
+                .collect(),
             ts,
             session: sanitize_session(session),
         };
         let _guard = MEMORY_STORE_LOCK.lock().expect("memory lock poisoned");
-        let mut entries = self.read_entries()?;
+        let (mut entries, expected) = self.read_entries_with_identity()?;
         entries.push(entry);
         entries.sort_by(entry_order);
         entries.truncate(MAX_ENTRIES);
         let count = entries.len();
-        self.write_entries(&entries)?;
+        self.write_entries(&entries, expected)?;
         Ok((id, count))
     }
 
@@ -195,10 +298,12 @@ impl MemoryStore {
                 (score > 0).then_some((score, entry))
             })
             .collect();
-        scored.sort_by(|a, b| {
-            b.0.cmp(&a.0).then_with(|| entry_order(&a.1, &b.1))
-        });
-        Ok(scored.into_iter().take(limit).map(|(_, entry)| entry).collect())
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| entry_order(&a.1, &b.1)));
+        Ok(scored
+            .into_iter()
+            .take(limit)
+            .map(|(_, entry)| entry)
+            .collect())
     }
 
     /// Newest-first listing, optionally filtered to entries carrying `tag`
@@ -209,7 +314,7 @@ impl MemoryStore {
         if let Some(tag) = tag {
             let tag = tag.trim().to_lowercase();
             if !tag.is_empty() {
-                entries.retain(|entry| entry.tags.iter().any(|t| t.to_lowercase() == tag));
+                entries.retain(|entry| entry.tags.iter().any(|value| value.to_lowercase() == tag));
             }
         }
         Ok(entries)
@@ -217,28 +322,35 @@ impl MemoryStore {
 
     pub(crate) fn forget(&self, id: &str) -> Result<bool> {
         let _guard = MEMORY_STORE_LOCK.lock().expect("memory lock poisoned");
-        let mut entries = self.read_entries()?;
+        let (mut entries, expected) = self.read_entries_with_identity()?;
         let before = entries.len();
         entries.retain(|entry| entry.id != id);
         if entries.len() == before {
             return Ok(false);
         }
-        self.write_entries(&entries)?;
+        self.write_entries(&entries, expected)?;
         Ok(true)
     }
 
     /// Loads all entries. A missing file is an empty store. Malformed lines
     /// are skipped: the file is only ever written atomically by this module,
     /// so a bad line implies external tampering, and failing the whole read
-    /// would brick recall/list for the project over one stray byte.
     fn read_entries(&self) -> Result<Vec<MemoryEntry>> {
-        let raw = match self.persona_root.as_deref() {
-            Some(root) => read_persona_memory(root)?,
-            None => match std::fs::read(&self.entries_path) {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-                Err(_) => return Err(anyhow!("failed to read memory entries")),
-            },
+        self.read_entries_with_identity()
+            .map(|(entries, _)| entries)
+    }
+
+    fn read_entries_with_identity(
+        &self,
+    ) -> Result<(Vec<MemoryEntry>, Option<crate::fs::FileIdentity>)> {
+        let (raw, identity) = match self.lease.open_file(Path::new(ENTRIES_FILE_NAME)) {
+            Ok(file) => (
+                file.read_bounded(MAX_MEMORY_STORE_BYTES)
+                    .context("reading memory entries")?,
+                Some(file.identity()),
+            ),
+            Err(error) if fs_error_is_missing(&error) => (Vec::new(), None),
+            Err(error) => return Err(error).context("opening memory entries"),
         };
         let mut entries = Vec::new();
         for line in String::from_utf8_lossy(&raw).lines() {
@@ -250,109 +362,62 @@ impl MemoryStore {
                 entries.push(entry);
             }
         }
-        Ok(entries)
+        Ok((entries, identity))
     }
 
-    fn write_entries(&self, entries: &[MemoryEntry]) -> Result<()> {
+    fn write_entries(
+        &self,
+        entries: &[MemoryEntry],
+        expected: Option<crate::fs::FileIdentity>,
+    ) -> Result<()> {
         let mut bytes = Vec::with_capacity(entries.len() * 160);
         for entry in entries {
-            serde_json::to_writer(&mut bytes, entry)
-                .context("serializing memory entry")?;
+            serde_json::to_writer(&mut bytes, entry).context("serializing memory entry")?;
             bytes.push(b'\n');
         }
-        match self.persona_root.as_deref() {
-            Some(root) => write_persona_memory(root, &bytes),
-            None => atomic_write(&self.entries_path, &bytes)
-                .map_err(|_| anyhow!("failed to persist memory entries")),
+        if let Some(expected) = expected {
+            self.lease
+                .replace_file(Replacement {
+                    relative: PathBuf::from(ENTRIES_FILE_NAME),
+                    expected: Some(expected),
+                    bytes,
+                    mode: FileMode::Private,
+                })
+                .map(|_| ())
+                .context("persisting memory entries")
+        } else {
+            let mut file = self
+                .lease
+                .create_new(Path::new(ENTRIES_FILE_NAME), FileMode::Private)
+                .context("creating memory entries")?;
+            file.write_all(&bytes).context("writing memory entries")?;
+            file.finish().map(|_| ()).context("syncing memory entries")
         }
     }
 }
 
-fn persona_memory_directory(persona_root: &Path, create: bool) -> Result<Option<Dir>> {
-    let root_metadata = std::fs::symlink_metadata(persona_root)
-        .context("reading persona root metadata")?;
-    if root_metadata.file_type().is_symlink() || !root_metadata.file_type().is_dir() {
-        bail!("persona root must be a non-symlink directory");
-    }
-    let canonical_root = std::fs::canonicalize(persona_root)
-        .context("resolving persona root")?;
-    let root = Dir::open_ambient_dir(&canonical_root, cap_std::ambient_authority())
-        .context("opening persona root")?;
-    match root.open_dir(MEMORY_DIR_NAME) {
-        Ok(memory) => Ok(Some(memory)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
-            root.create_dir(MEMORY_DIR_NAME)
-                .context("creating persona memory directory")?;
-            root.open_dir(MEMORY_DIR_NAME)
-                .map(Some)
-                .context("opening created persona memory directory")
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => bail!("persona memory path must be a non-symlink directory"),
-    }
-}
+static PROCESS_CAPABILITIES: LazyLock<Arc<CapabilityFs>> =
+    LazyLock::new(|| CapabilityFs::new().expect("capability filesystem initialization"));
 
-fn read_persona_memory(persona_root: &Path) -> Result<Vec<u8>> {
-    use std::io::Read as _;
-    let Some(memory) = persona_memory_directory(persona_root, false)? else {
-        return Ok(Vec::new());
+fn absolute_capability_path(path: &Path) -> Result<AbsolutePath> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("resolving memory store root")?
+            .join(path)
     };
-    let mut options = CapOpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No);
-    let mut file = match memory.open_with(ENTRIES_FILE_NAME, &options) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(_) => bail!("persona memory entries must be a regular non-symlink file"),
-    };
-    if !file.metadata()?.is_file() {
-        bail!("persona memory entries must be a regular non-symlink file");
-    }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .context("reading persona memory entries")?;
-    Ok(bytes)
+    AbsolutePath::parse(path).map_err(|_| anyhow!("invalid memory store root"))
 }
 
-fn write_persona_memory(persona_root: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write as _;
-    let memory = persona_memory_directory(persona_root, true)?
-        .ok_or_else(|| anyhow!("persona memory directory was not created"))?;
-    match memory.symlink_metadata(ENTRIES_FILE_NAME) {
-        Ok(metadata) if metadata.is_symlink() || !metadata.is_file() => {
-            bail!("persona memory entries must be a regular non-symlink file");
+fn fs_error_is_missing(error: &FsError) -> bool {
+    matches!(
+        error,
+        FsError::System {
+            kind: std::io::ErrorKind::NotFound,
+            ..
         }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context("reading persona memory entries metadata"),
-    }
-    let temporary = format!(".{ENTRIES_FILE_NAME}.{}.tmp", Uuid::new_v4().simple());
-    let result = (|| -> Result<()> {
-        let mut options = CapOpenOptions::new();
-        options.write(true).create_new(true).follow(FollowSymlinks::No);
-        let mut file = memory
-            .open_with(&temporary, &options)
-            .context("creating persona memory temporary")?;
-        file.write_all(bytes)
-            .context("writing persona memory temporary")?;
-        file.sync_all().context("syncing persona memory temporary")?;
-        drop(file);
-        memory
-            .rename(&temporary, &memory, ENTRIES_FILE_NAME)
-            .context("installing persona memory entries")?;
-        let mut directory_options = CapOpenOptions::new();
-        directory_options.read(true).follow(FollowSymlinks::No);
-        memory
-            .open_with(".", &directory_options)
-            .context("opening persona memory directory for sync")?
-            .into_std()
-            .sync_all()
-            .context("syncing persona memory directory")?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = memory.remove_file(&temporary);
-    }
-    result
+    )
 }
 
 fn entry_order(a: &MemoryEntry, b: &MemoryEntry) -> std::cmp::Ordering {
@@ -387,21 +452,52 @@ fn score_entry(entry: &MemoryEntry, terms: &[String], full_query: &str) -> usize
     score
 }
 
-/// Filesystem-safe repo namespace: hex SHA-256 of the canonical working
-/// directory, anchored at the first ancestor holding a `.git` entry so nested
-/// sessions in the same checkout share one store. Always 32 hex chars — no
-/// separators, no traversal, stable across sessions.
+/// Filesystem-safe repo namespace anchored at the nearest retained `.git`
+/// entry. Always 32 hex chars with no separators or traversal.
 pub(crate) fn repo_namespace(cwd: &Path) -> String {
     repo_digest_hex(&repo_anchor(cwd))
 }
 
-/// Canonical repository anchor: the cwd resolved to an absolute path and
-/// anchored at the first ancestor holding a `.git` entry so nested paths in
-/// one checkout share an identity. Falls back to the canonical cwd when no
-/// repository is present, which stays deterministic for a given directory.
 fn repo_anchor(cwd: &Path) -> PathBuf {
-    let canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    git_anchor(&canonical).unwrap_or(canonical)
+    let absolute = absolutized(cwd);
+    git_anchor(&absolute).unwrap_or(absolute)
+}
+
+fn absolutized(cwd: &Path) -> PathBuf {
+    if cwd.is_absolute() {
+        cwd.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| cwd.to_path_buf(), |base| base.join(cwd))
+    }
+}
+
+/// Old/new repository namespace digests for a migration. The old namespace
+/// cannot be recomputed from `old_cwd` alone: by the time the session move
+/// commits, the old checkout and its `.git` ancestor may already be gone,
+/// and walking up from the stale path would silently hash a nested directory
+/// instead of the repository root. Instead the old anchor is inferred: the
+/// new cwd's repository-relative suffix is stripped from `old_cwd`,
+/// mirroring a move that preserved the working directory's position inside
+/// the repository. A cwd rooted at its repository (empty suffix) maps the
+/// old anchor to `old_cwd` itself; a suffix that does not align lexically
+/// falls back to hashing `old_cwd` directly, which the missing-store probe
+/// then turns into a no-op.
+fn moved_repo_namespaces(old_cwd: &Path, new_cwd: &Path) -> (String, String) {
+    let new_absolute = absolutized(new_cwd);
+    let new_anchor = git_anchor(&new_absolute).unwrap_or_else(|| new_absolute.clone());
+    let new_namespace = repo_digest_hex(&new_anchor);
+    let old_absolute = absolutized(old_cwd);
+    let suffix = new_absolute
+        .strip_prefix(&new_anchor)
+        .unwrap_or(new_absolute.as_path());
+    let mut old_anchor = old_absolute.clone();
+    for _ in suffix.components() {
+        if !old_anchor.pop() {
+            old_anchor = old_absolute;
+            break;
+        }
+    }
+    (repo_digest_hex(&old_anchor), new_namespace)
 }
 
 /// Hex SHA-256 (first 16 bytes, 32 chars) of a canonical repository anchor.
@@ -418,12 +514,20 @@ fn repo_digest_hex(anchor: &Path) -> String {
 }
 
 fn git_anchor(start: &Path) -> Option<PathBuf> {
+    let capabilities = CapabilityFs::new().ok()?;
     let mut dir = Some(start);
-    while let Some(d) = dir {
-        if d.join(".git").exists() {
-            return Some(d.to_path_buf());
+    while let Some(candidate) = dir {
+        let absolute = pi_sandbox::AbsolutePath::parse(candidate.to_path_buf()).ok()?;
+        if let Ok(lease) = capabilities.open_root(
+            CapabilityRootPurpose::ProjectResources,
+            absolute,
+            CapabilityAccess::ReadOnly,
+            RootCreation::Existing,
+        ) && lease.entry_exists(Path::new(".git")).ok()?
+        {
+            return Some(candidate.to_path_buf());
         }
-        dir = d.parent();
+        dir = candidate.parent();
     }
     None
 }
@@ -439,6 +543,217 @@ fn validate_namespace(namespace: &str) -> Result<()> {
         return Err(anyhow!("invalid memory namespace: {namespace:?}"));
     }
     Ok(())
+}
+
+/// Whether an anyhow-wrapped store open failed because the namespace does
+/// not exist (the migration no-op probe path).
+fn namespace_store_missing(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<FsError>().is_some_and(fs_error_is_missing)
+}
+
+/// Copies the memory namespace of the repository that used to live at
+/// `old_cwd` into the namespace of `new_cwd` after the repository moved on
+/// disk. The old namespace is inferred from the two paths (see
+/// [`moved_repo_namespaces`]) because the old checkout may already be gone.
+/// Additive and idempotent: entries merge into the target keyed by id (a
+/// colliding target entry wins, so the live namespace after rebind is never
+/// clobbered), the old archive stays on disk untouched as recovery metadata,
+/// and re-running the migration copies nothing once every id is present.
+/// Copied entries pass through the same write boundary as [`learn`]
+/// (redaction, tag/session sanitization, per-entry size bound; oversize or
+/// invalid entries are skipped), and the target is authoritative under the
+/// per-namespace cap: all of its entries are retained, copied entries fill
+/// the remaining slots newest-first. Reports `Ok(false)` when both paths
+/// resolve to the same namespace, the old store is missing or empty, or
+/// nothing new was copied; `Ok(true)` when the target namespace gained
+/// entries. The session-move core drops the old archive afterwards via
+/// [`commit_repo_namespace_migration`].
+pub(crate) fn migrate_repo_namespace(old_cwd: &Path, new_cwd: &Path) -> Result<bool> {
+    migrate_repo_namespace_with_capabilities(
+        &PROCESS_CAPABILITIES,
+        &crate::resources::agent_dir_path(),
+        old_cwd,
+        new_cwd,
+    )
+}
+
+/// [`migrate_repo_namespace`] over an explicit agent store (hermetic tests).
+pub(crate) fn migrate_repo_namespace_with_capabilities(
+    capabilities: &Arc<CapabilityFs>,
+    agent_dir: &Path,
+    old_cwd: &Path,
+    new_cwd: &Path,
+) -> Result<bool> {
+    let (old_namespace, new_namespace) = moved_repo_namespaces(old_cwd, new_cwd);
+    if old_namespace == new_namespace {
+        return Ok(false);
+    }
+    let _guard = MEMORY_STORE_LOCK.lock().expect("memory lock poisoned");
+    let old_store = match MemoryStore::open_namespace_store(
+        capabilities,
+        agent_dir,
+        &old_namespace,
+        RootCreation::Existing,
+    ) {
+        Ok(store) => store,
+        Err(error) if namespace_store_missing(&error) => return Ok(false),
+        Err(error) => return Err(error).context("opening old memory namespace"),
+    };
+    let (old_entries, _) = old_store
+        .read_entries_with_identity()
+        .context("reading old memory namespace")?;
+    if old_entries.is_empty() {
+        return Ok(false);
+    }
+    let new_store = MemoryStore::open_namespace_store(
+        capabilities,
+        agent_dir,
+        &new_namespace,
+        RootCreation::CreateDirectory,
+    )
+    .context("opening new memory namespace")?;
+    let (mut entries, expected) = new_store.read_entries_with_identity()?;
+    let fresh: Vec<MemoryEntry> = {
+        let known: BTreeSet<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
+        let mut fresh: Vec<MemoryEntry> = old_entries
+            .iter()
+            .filter(|entry| !known.contains(entry.id.as_str()))
+            .filter_map(entry_for_target)
+            .collect();
+        // Retention under the per-namespace cap: the live target namespace
+        // is authoritative and always retained; copied entries fill the
+        // remaining slots, newest first.
+        fresh.sort_by(entry_order);
+        let budget = MAX_ENTRIES.saturating_sub(entries.len());
+        fresh.into_iter().take(budget).collect()
+    };
+    if fresh.is_empty() {
+        return Ok(false);
+    }
+    entries.extend(fresh);
+    entries.sort_by(entry_order);
+    new_store.write_entries(&entries, expected)?;
+    Ok(true)
+}
+
+/// Re-normalizes a copied entry through the same write-boundary rules as
+/// [`MemoryStore::learn`]: redaction, tag/session sanitization, and the
+/// per-entry size bound. Oversize or id-less entries are skipped, so a
+/// hostile or corrupt old archive can never push the target past its read
+/// bound. The id and timestamp are preserved so migration stays idempotent
+/// and order-stable.
+fn entry_for_target(entry: &MemoryEntry) -> Option<MemoryEntry> {
+    if entry.content.len() > MAX_ENTRY_BYTES || entry.id.is_empty() {
+        return None;
+    }
+    Some(MemoryEntry {
+        id: entry.id.clone(),
+        content: redact_secrets(&entry.content),
+        tags: entry
+            .tags
+            .iter()
+            .filter_map(|tag| sanitize_tag(tag))
+            .collect(),
+        ts: entry.ts,
+        session: sanitize_session(&entry.session),
+    })
+}
+
+/// Removes the old repository namespace archive once the session move has
+/// committed. Refuses with an error while the new namespace does not yet
+/// contain every entry from the old store, so recovery data is never dropped
+/// before (or instead of) the copy. Idempotent: a missing archive (or an
+/// identical repository anchor) reports `Ok(false)`; a removed archive
+/// reports `Ok(true)`.
+pub(crate) fn commit_repo_namespace_migration(old_cwd: &Path, new_cwd: &Path) -> Result<bool> {
+    commit_repo_namespace_migration_with_capabilities(
+        &PROCESS_CAPABILITIES,
+        &crate::resources::agent_dir_path(),
+        old_cwd,
+        new_cwd,
+    )
+}
+
+/// [`commit_repo_namespace_migration`] over an explicit agent store.
+pub(crate) fn commit_repo_namespace_migration_with_capabilities(
+    capabilities: &Arc<CapabilityFs>,
+    agent_dir: &Path,
+    old_cwd: &Path,
+    new_cwd: &Path,
+) -> Result<bool> {
+    let (old_namespace, new_namespace) = moved_repo_namespaces(old_cwd, new_cwd);
+    if old_namespace == new_namespace {
+        return Ok(false);
+    }
+    let _guard = MEMORY_STORE_LOCK.lock().expect("memory lock poisoned");
+    let old_store = match MemoryStore::open_namespace_store(
+        capabilities,
+        agent_dir,
+        &old_namespace,
+        RootCreation::Existing,
+    ) {
+        Ok(store) => store,
+        Err(error) if namespace_store_missing(&error) => return Ok(false),
+        Err(error) => return Err(error).context("opening old memory namespace"),
+    };
+    let (old_entries, _) = old_store
+        .read_entries_with_identity()
+        .context("reading old memory namespace")?;
+    if !old_entries.is_empty() {
+        let new_store = match MemoryStore::open_namespace_store(
+            capabilities,
+            agent_dir,
+            &new_namespace,
+            RootCreation::Existing,
+        ) {
+            Ok(store) => store,
+            Err(error) if namespace_store_missing(&error) => {
+                bail!("new memory namespace is missing; refusing to remove the old archive")
+            }
+            Err(error) => return Err(error).context("opening new memory namespace"),
+        };
+        let new_entries = new_store.read_entries()?;
+        let known: BTreeSet<&str> = new_entries
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect();
+        let unaccounted = old_entries
+            .iter()
+            .filter(|entry| !known.contains(entry.id.as_str()))
+            .count();
+        if unaccounted > 0 {
+            bail!("{unaccounted} old memory entries are absent from the new namespace; refusing to remove the old archive");
+        }
+    }
+    drop(old_store);
+    remove_namespace_archive(capabilities, agent_dir, &old_namespace)?;
+    Ok(true)
+}
+
+/// Removes `<agent_dir>/memory/<namespace>` through an identity-checked
+/// subtree removal, then syncs the memory root so the deletion is durable.
+fn remove_namespace_archive(
+    capabilities: &Arc<CapabilityFs>,
+    agent_dir: &Path,
+    namespace: &str,
+) -> Result<()> {
+    let agent_root = capabilities.open_root(
+        CapabilityRootPurpose::AgentStore,
+        absolute_capability_path(agent_dir)?,
+        CapabilityAccess::PrivateReadWrite,
+        RootCreation::Existing,
+    )?;
+    let memory_root = agent_root.lease_directory(
+        Path::new(MEMORY_DIR_NAME),
+        CapabilityAccess::PrivateReadWrite,
+        RootCreation::Existing,
+    )?;
+    let relative = Path::new(namespace);
+    let expected = memory_root.metadata(relative)?.identity;
+    memory_root.remove_tree_expected(relative, expected)?;
+    memory_root
+        .sync_directory(Path::new(""))
+        .context("syncing memory root after archive removal")
 }
 
 /// Tags are short tokens; drop control characters and over-long/empty values.
@@ -557,6 +872,35 @@ pub(crate) fn memory_tool_with_session_env(
 ) -> AgentTool {
     memory_tool_with_store(MemoryStore::default_for(Path::new(cwd)), session_env)
 }
+
+pub(crate) fn memory_tool_with_capabilities(
+    capabilities: &Arc<CapabilityFs>,
+    cwd: &str,
+    session_env: Option<SessionEnvFn>,
+) -> AgentTool {
+    memory_tool_with_store(
+        MemoryStore::default_for_with_capabilities(capabilities, Path::new(cwd)),
+        session_env,
+    )
+}
+
+fn memory_tool_with_generation(
+    cwd: &str,
+    session_env: Option<SessionEnvFn>,
+    capture: crate::tools::GenerationCaptureFn,
+) -> AgentTool {
+    let cwd = PathBuf::from(cwd);
+    memory_tool_with_store_factory(
+        Arc::new(move || {
+            let generation = capture()?;
+            MemoryStore::try_default_for_with_capabilities(
+                generation.sandbox().capabilities(),
+                &cwd,
+            )
+        }),
+        session_env,
+    )
+}
 /// [`memory_tool_with_session_env`] rooted at a durable persona's exact
 /// `<persona-root>/memory/entries.jsonl` store.
 pub(crate) fn persona_memory_tool_with_session_env(
@@ -566,8 +910,31 @@ pub(crate) fn persona_memory_tool_with_session_env(
     memory_tool_with_store(MemoryStore::persona(persona_root), session_env)
 }
 
+pub(crate) fn persona_memory_tool_with_capabilities(
+    capabilities: &Arc<CapabilityFs>,
+    persona_root: &Path,
+    session_env: Option<SessionEnvFn>,
+) -> Result<AgentTool> {
+    Ok(memory_tool_with_store(
+        Arc::new(MemoryStore::persona_with_capabilities(
+            capabilities,
+            persona_root,
+        )?),
+        session_env,
+    ))
+}
+
 /// [`memory_tool`] over an explicitly rooted store (hermetic tests).
 fn memory_tool_with_store(store: Arc<MemoryStore>, session_env: Option<SessionEnvFn>) -> AgentTool {
+    memory_tool_with_store_factory(Arc::new(move || Ok(store.clone())), session_env)
+}
+
+type MemoryStoreFactory = Arc<dyn Fn() -> Result<Arc<MemoryStore>> + Send + Sync>;
+
+fn memory_tool_with_store_factory(
+    store_factory: MemoryStoreFactory,
+    session_env: Option<SessionEnvFn>,
+) -> AgentTool {
     let op_schema = schema_with_enum(
         "Memory action to perform",
         ["learn", "recall", "list", "forget"],
@@ -579,7 +946,10 @@ fn memory_tool_with_store(store: Arc<MemoryStore>, session_env: Option<SessionEn
                 "content",
                 s_string("Entry content (required for learn; at most 1 MiB)"),
             ),
-            ("tags", s_array(s_string("tag"), "Optional tags (learn, at most 20)")),
+            (
+                "tags",
+                s_array(s_string("tag"), "Optional tags (learn, at most 20)"),
+            ),
             ("query", s_string("Search query (required for recall)")),
             (
                 "limit",
@@ -599,9 +969,12 @@ fn memory_tool_with_store(store: Arc<MemoryStore>, session_env: Option<SessionEn
         OUTPUT_MAX_BYTES / 1024
     );
     AgentTool::new("memory", description, parameters, move |ctx| {
-        let store = store.clone();
+        let store_factory = store_factory.clone();
         let session_env = session_env.clone();
-        async move { run_memory(store, session_env, ctx.arguments, ctx.abort).await }
+        async move {
+            let store = store_factory()?;
+            run_memory(store, session_env, ctx.arguments, ctx.abort).await
+        }
     })
     .with_capability(ToolCapability::Write)
 }
@@ -611,7 +984,10 @@ fn schema_with_enum(description: &str, values: [&str; 4]) -> Schema {
     Schema {
         schema_type: Some(Value::String("string".into())),
         description: Some(description.to_string()),
-        enum_values: values.iter().map(|value| Value::String((*value).to_owned())).collect(),
+        enum_values: values
+            .iter()
+            .map(|value| Value::String((*value).to_owned()))
+            .collect(),
         ..Default::default()
     }
 }
@@ -630,8 +1006,11 @@ pub(crate) async fn run_memory(
             if content.trim().is_empty() {
                 return Err(anyhow!("content is required for memory learn"));
             }
-            let (id, count) =
-                store.learn(&content, parse_tags(&args), &source_session(session_env.as_ref()))?;
+            let (id, count) = store.learn(
+                &content,
+                parse_tags(&args),
+                &source_session(session_env.as_ref()),
+            )?;
             format!("Learned memory entry {id} ({count} total for this project).")
         }
         "recall" => {
@@ -727,16 +1106,30 @@ impl std::fmt::Debug for MemoryConfig {
             .field("hindsight_retain_mission", &self.hindsight_retain_mission)
             .field("hindsight_injection", &self.hindsight_injection)
             .field("hindsight_recall_budget", &self.hindsight_recall_budget)
-            .field("hindsight_recall_max_tokens", &self.hindsight_recall_max_tokens)
+            .field(
+                "hindsight_recall_max_tokens",
+                &self.hindsight_recall_max_tokens,
+            )
             .field("hindsight_recall_types", &self.hindsight_recall_types)
-            .field("hindsight_request_timeout_ms", &self.hindsight_request_timeout_ms)
-            .field("hindsight_recall_timeout_ms", &self.hindsight_recall_timeout_ms)
-            .field("hindsight_retain_timeout_ms", &self.hindsight_retain_timeout_ms)
-            .field("hindsight_reflect_timeout_ms", &self.hindsight_reflect_timeout_ms)
+            .field(
+                "hindsight_request_timeout_ms",
+                &self.hindsight_request_timeout_ms,
+            )
+            .field(
+                "hindsight_recall_timeout_ms",
+                &self.hindsight_recall_timeout_ms,
+            )
+            .field(
+                "hindsight_retain_timeout_ms",
+                &self.hindsight_retain_timeout_ms,
+            )
+            .field(
+                "hindsight_reflect_timeout_ms",
+                &self.hindsight_reflect_timeout_ms,
+            )
             .finish()
     }
 }
-
 
 impl Default for MemoryConfig {
     fn default() -> Self {
@@ -753,7 +1146,10 @@ impl Default for MemoryConfig {
             hindsight_injection: false,
             hindsight_recall_budget: crate::settings::HindsightBudget::default(),
             hindsight_recall_max_tokens: DEFAULT_HINDSIGHT_RECALL_MAX_TOKENS,
-            hindsight_recall_types: DEFAULT_HINDSIGHT_RECALL_TYPES.iter().map(|value| (*value).to_owned()).collect(),
+            hindsight_recall_types: DEFAULT_HINDSIGHT_RECALL_TYPES
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
             hindsight_request_timeout_ms: DEFAULT_HINDSIGHT_REQUEST_TIMEOUT_MS,
             hindsight_recall_timeout_ms: DEFAULT_HINDSIGHT_RECALL_TIMEOUT_MS,
             hindsight_retain_timeout_ms: DEFAULT_HINDSIGHT_RETAIN_TIMEOUT_MS,
@@ -776,15 +1172,32 @@ pub(crate) struct HindsightBankScope {
 }
 
 pub(crate) fn hindsight_bank_scope(config: &MemoryConfig, cwd: &Path) -> HindsightBankScope {
-    let base = config.hindsight_bank_id_prefix.as_deref()
+    let base = config
+        .hindsight_bank_id_prefix
+        .as_deref()
         .map(|prefix| format!("{prefix}-{}", config.hindsight_bank_id))
         .unwrap_or_else(|| config.hindsight_bank_id.clone());
     match config.hindsight_scoping {
-        crate::settings::HindsightScoping::Global => HindsightBankScope { bank_id: base, retain_tags: Vec::new(), recall_tags: Vec::new(), recall_tags_match: None },
-        crate::settings::HindsightScoping::PerProject => HindsightBankScope { bank_id: format!("{base}-{}", hindsight_project_label(cwd)), retain_tags: Vec::new(), recall_tags: Vec::new(), recall_tags_match: None },
+        crate::settings::HindsightScoping::Global => HindsightBankScope {
+            bank_id: base,
+            retain_tags: Vec::new(),
+            recall_tags: Vec::new(),
+            recall_tags_match: None,
+        },
+        crate::settings::HindsightScoping::PerProject => HindsightBankScope {
+            bank_id: format!("{base}-{}", hindsight_project_label(cwd)),
+            retain_tags: Vec::new(),
+            recall_tags: Vec::new(),
+            recall_tags_match: None,
+        },
         crate::settings::HindsightScoping::PerProjectTagged => {
             let tag = format!("project:{}", hindsight_project_label(cwd));
-            HindsightBankScope { bank_id: base, retain_tags: vec![tag.clone()], recall_tags: vec![tag], recall_tags_match: Some("any") }
+            HindsightBankScope {
+                bank_id: base,
+                retain_tags: vec![tag.clone()],
+                recall_tags: vec![tag],
+                recall_tags_match: Some("any"),
+            }
         }
     }
 }
@@ -816,11 +1229,13 @@ fn hindsight_project_label(cwd: &Path) -> String {
 fn sanitize_scope_label(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for ch in name.chars() {
-        out.push(if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-            ch
-        } else {
-            '-'
-        });
+        out.push(
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            },
+        );
     }
     let mut parts = out.split('-').filter(|part| !part.is_empty());
     let mut label = String::with_capacity(out.len());
@@ -831,12 +1246,16 @@ fn sanitize_scope_label(name: &str) -> String {
             label.push_str(part);
         }
     }
-    if label.is_empty() { "unknown".to_owned() } else { label }
+    if label.is_empty() {
+        "unknown".to_owned()
+    } else {
+        label
+    }
 }
 
 #[derive(Clone)]
 pub(crate) struct HindsightClient {
-    client: reqwest::Client,
+    executor: pi_ai::SharedHttpExecutor,
     base_url: url::Url,
     api_token: Option<String>,
     scope: HindsightBankScope,
@@ -844,75 +1263,52 @@ pub(crate) struct HindsightClient {
 }
 
 #[derive(Debug, Deserialize)]
-struct HindsightRecallResponse { #[serde(default)] results: Vec<HindsightRecallResult> }
+struct HindsightRecallResponse {
+    #[serde(default)]
+    results: Vec<HindsightRecallResult>,
+}
 #[derive(Debug, Deserialize)]
 struct HindsightRecallResult {
     text: String,
-    #[serde(default, rename = "type")] memory_type: Option<String>,
-    #[serde(default)] mentioned_at: Option<String>,
+    #[serde(default, rename = "type")]
+    memory_type: Option<String>,
+    #[serde(default)]
+    mentioned_at: Option<String>,
 }
 #[derive(Debug, Deserialize)]
-struct HindsightReflectResponse { #[serde(default)] text: String }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HindsightRedirectDecision {
-    Follow,
-    RejectPlaintext,
-    RejectLimit,
+struct HindsightReflectResponse {
+    #[serde(default)]
+    text: String,
 }
-
-fn hindsight_redirect_decision(
-    allow_insecure: bool,
-    previous_scheme: &str,
-    next_scheme: &str,
-    previous_hops: usize,
-) -> HindsightRedirectDecision {
-    const MAX_REDIRECTS: usize = 10;
-    if !allow_insecure && (previous_scheme != "https" || next_scheme != "https") {
-        HindsightRedirectDecision::RejectPlaintext
-    } else if previous_hops > MAX_REDIRECTS {
-        HindsightRedirectDecision::RejectLimit
-    } else {
-        HindsightRedirectDecision::Follow
-    }
-}
-
-fn hindsight_http_client(allow_insecure: bool) -> Result<reqwest::Client> {
-    hindsight_http_client_builder(allow_insecure)
-        .build()
-        .map_err(|_| anyhow!("failed to initialize Hindsight HTTP client"))
-}
-
-fn hindsight_http_client_builder(allow_insecure: bool) -> reqwest::ClientBuilder {
-    let redirect = reqwest::redirect::Policy::custom(move |attempt| {
-        let previous_scheme = attempt.previous().last().map(url::Url::scheme).unwrap_or("");
-        match hindsight_redirect_decision(allow_insecure, previous_scheme, attempt.url().scheme(), attempt.previous().len()) {
-            HindsightRedirectDecision::Follow => attempt.follow(),
-            HindsightRedirectDecision::RejectPlaintext => attempt.error("refusing plaintext Hindsight redirect"),
-            HindsightRedirectDecision::RejectLimit => attempt.error("too many Hindsight redirects"),
-        }
-    });
-    reqwest::Client::builder()
-        .user_agent("pi-rs")
-        .https_only(!allow_insecure)
-        .redirect(redirect)
-}
-
 
 impl HindsightClient {
-    pub(crate) fn new(config: &MemoryConfig, cwd: &Path) -> Result<Self> {
-        let raw_url = config.hindsight_api_url.as_deref().ok_or_else(|| anyhow!("Hindsight is not configured: set settings.memory.hindsightApiUrl"))?;
-        let mut base_url = url::Url::parse(raw_url).map_err(|_| anyhow!("settings.memory.hindsightApiUrl is not a valid URL"))?;
+    pub(crate) fn new_with_executor(
+        config: &MemoryConfig,
+        cwd: &Path,
+        executor: pi_ai::SharedHttpExecutor,
+    ) -> Result<Self> {
+        let raw_url = config.hindsight_api_url.as_deref().ok_or_else(|| {
+            anyhow!("Hindsight is not configured: set settings.memory.hindsightApiUrl")
+        })?;
+        let mut base_url = url::Url::parse(raw_url)
+            .map_err(|_| anyhow!("settings.memory.hindsightApiUrl is not a valid URL"))?;
         match base_url.scheme() {
             "https" => {}
             "http" if config.hindsight_allow_insecure => {}
-            "http" => bail!("refusing plaintext Hindsight API endpoint; use https or set settings.memory.hindsightAllowInsecure=true"),
+            "http" => bail!(
+                "refusing plaintext Hindsight API endpoint; use https or set settings.memory.hindsightAllowInsecure=true"
+            ),
             scheme => bail!("unsupported Hindsight API URL scheme {scheme:?}; use http or https"),
         }
         base_url.set_query(None);
         base_url.set_fragment(None);
-        let client = hindsight_http_client(config.hindsight_allow_insecure)?;
-        Ok(Self { client, base_url, api_token: config.hindsight_api_token.clone(), scope: hindsight_bank_scope(config, cwd), config: config.clone() })
+        Ok(Self {
+            executor,
+            base_url,
+            api_token: config.hindsight_api_token.clone(),
+            scope: hindsight_bank_scope(config, cwd),
+            config: config.clone(),
+        })
     }
 
     pub(crate) async fn recall(&self, query: &str, abort: &AbortSignal) -> Result<String> {
@@ -925,22 +1321,54 @@ impl HindsightClient {
             "tags": self.scope.recall_tags,
             "tags_match": self.scope.recall_tags_match,
         });
-        let response: HindsightRecallResponse = self.request("POST", "memories/recall", "recall", Some(body), self.config.hindsight_recall_timeout_ms, abort).await?;
+        let response: HindsightRecallResponse = self
+            .request(
+                "POST",
+                "memories/recall",
+                "recall",
+                Some(body),
+                self.config.hindsight_recall_timeout_ms,
+                abort,
+            )
+            .await?;
         Ok(format_hindsight_memories(&response.results))
     }
 
-    pub(crate) async fn retain(&self, content: &str, context: Option<&str>, abort: &AbortSignal) -> Result<String> {
+    pub(crate) async fn retain(
+        &self,
+        content: &str,
+        context: Option<&str>,
+        abort: &AbortSignal,
+    ) -> Result<String> {
         validate_required_hindsight_input("retain content", content)?;
-        if let Some(context) = context { validate_hindsight_input("retain context", context)?; }
+        if let Some(context) = context {
+            validate_hindsight_input("retain context", context)?;
+        }
         self.ensure_bank(abort).await?;
         let body = serde_json::json!({ "items": [{ "content": content, "context": context, "tags": self.scope.retain_tags }], "async": false });
-        let _: Value = self.request("POST", "memories", "retain", Some(body), self.config.hindsight_retain_timeout_ms, abort).await?;
+        let _: Value = self
+            .request(
+                "POST",
+                "memories",
+                "retain",
+                Some(body),
+                self.config.hindsight_retain_timeout_ms,
+                abort,
+            )
+            .await?;
         Ok("1 memory retained.".to_owned())
     }
 
-    pub(crate) async fn reflect(&self, query: &str, context: Option<&str>, abort: &AbortSignal) -> Result<String> {
+    pub(crate) async fn reflect(
+        &self,
+        query: &str,
+        context: Option<&str>,
+        abort: &AbortSignal,
+    ) -> Result<String> {
         validate_required_hindsight_input("reflect query", query)?;
-        if let Some(context) = context { validate_hindsight_input("reflect context", context)?; }
+        if let Some(context) = context {
+            validate_hindsight_input("reflect context", context)?;
+        }
         self.ensure_bank(abort).await?;
         let body = serde_json::json!({
             "query": query,
@@ -949,142 +1377,531 @@ impl HindsightClient {
             "tags": self.scope.recall_tags,
             "tags_match": self.scope.recall_tags_match,
         });
-        let response: HindsightReflectResponse = self.request("POST", "reflect", "reflect", Some(body), self.config.hindsight_reflect_timeout_ms, abort).await?;
+        let response: HindsightReflectResponse = self
+            .request(
+                "POST",
+                "reflect",
+                "reflect",
+                Some(body),
+                self.config.hindsight_reflect_timeout_ms,
+                abort,
+            )
+            .await?;
         let text = response.text.trim();
-        Ok(if text.is_empty() { "No relevant information found to reflect on.".to_owned() } else { redact_secrets(text) })
+        Ok(if text.is_empty() {
+            "No relevant information found to reflect on.".to_owned()
+        } else {
+            redact_secrets(text)
+        })
     }
 
     async fn ensure_bank(&self, abort: &AbortSignal) -> Result<()> {
         let body = serde_json::json!({ "reflect_mission": self.config.hindsight_bank_mission, "retain_mission": self.config.hindsight_retain_mission });
-        self.request::<Value>("PUT", "", "createBank", Some(body), self.config.hindsight_request_timeout_ms, abort).await?;
+        self.request::<Value>(
+            "PUT",
+            "",
+            "createBank",
+            Some(body),
+            self.config.hindsight_request_timeout_ms,
+            abort,
+        )
+        .await?;
         Ok(())
     }
 
-    async fn request<T: serde::de::DeserializeOwned>(&self, method: &str, suffix: &str, operation: &str, body: Option<Value>, timeout_ms: u64, abort: &AbortSignal) -> Result<T> {
+    async fn request<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        suffix: &str,
+        operation: &str,
+        body: Option<Value>,
+        timeout_ms: u64,
+        abort: &AbortSignal,
+    ) -> Result<T> {
         check_aborted(abort)?;
         let mut url = self.base_url.clone();
         let mut path = url.path().trim_end_matches('/').to_owned();
         path.push_str("/v1/default/banks/");
-        path.push_str(&url::form_urlencoded::byte_serialize(self.scope.bank_id.as_bytes()).collect::<String>());
-        if !suffix.is_empty() { path.push('/'); path.push_str(suffix); }
-        url.set_path(&path);
-        let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|_| anyhow!("invalid Hindsight HTTP method"))?;
-        let mut request = self.client.request(method, url).timeout(std::time::Duration::from_millis(timeout_ms));
-        if let Some(token) = self.api_token.as_deref() { request = request.bearer_auth(token); }
-        if let Some(body) = body { request = request.json(&body); }
-        let send = request.send();
-        tokio::pin!(send);
-        let response = tokio::select! {
-            _ = abort.cancelled() => return Err(anyhow!("operation aborted")),
-            response = &mut send => response.map_err(|error| if error.is_timeout() {
-                anyhow!("hindsight {operation} request timed out after {}s", timeout_ms.div_ceil(1000))
-            } else {
-                anyhow!("hindsight {operation} request failed: {}", redact_secrets(&error.to_string()))
-            })?,
-        };
-        let status = response.status();
-        let bytes = read_bounded_response(response, HINDSIGHT_RESPONSE_MAX_BYTES).await?;
-        if !status.is_success() {
-            let detail = redact_secrets(&String::from_utf8_lossy(&bytes[..bytes.len().min(HINDSIGHT_ERROR_MAX_BYTES)]));
-            bail!("hindsight {operation} failed (HTTP {}): {}", status.as_u16(), detail.trim());
+        path.push_str(
+            &url::form_urlencoded::byte_serialize(self.scope.bank_id.as_bytes())
+                .collect::<String>(),
+        );
+        if !suffix.is_empty() {
+            path.push('/');
+            path.push_str(suffix);
         }
-        serde_json::from_slice(&bytes).map_err(|_| anyhow!("hindsight {operation} returned invalid JSON"))
+        url.set_path(&path);
+        let method = match method {
+            "POST" => pi_ai::HttpMethod::Post,
+            "PUT" => pi_ai::HttpMethod::Put,
+            _ => return Err(anyhow!("invalid Hindsight HTTP method")),
+        };
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::ACCEPT,
+            http::HeaderValue::from_static("application/json"),
+        );
+        if let Some(token) = self.api_token.as_deref() {
+            headers.insert(
+                http::header::AUTHORIZATION,
+                http::HeaderValue::from_str(&format!("Bearer {token}"))?,
+            );
+        }
+        let bytes = body
+            .map(|body| serde_json::to_vec(&body))
+            .transpose()?
+            .unwrap_or_default();
+        if !bytes.is_empty() {
+            headers.insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("application/json"),
+            );
+        }
+        let request = pi_ai::request_from_url(
+            method,
+            url.as_str(),
+            &headers,
+            bytes,
+            &pi_ai::StreamOptions {
+                timeout_ms: Some(timeout_ms),
+                abort_signal: Some(abort.cancellation_token()),
+                ..Default::default()
+            },
+            HINDSIGHT_RESPONSE_MAX_BYTES as u64,
+        )?;
+        let response = self
+            .executor
+            .execute(request)
+            .await
+            .map_err(|_| anyhow!("hindsight {operation} request failed"))?;
+        let status = response.status();
+        let bytes = pi_ai::collect_response_body(response).await?;
+        if !status.is_success() {
+            let detail = redact_secrets(&String::from_utf8_lossy(
+                &bytes[..bytes.len().min(HINDSIGHT_ERROR_MAX_BYTES)],
+            ));
+            bail!(
+                "hindsight {operation} failed (HTTP {}): {}",
+                status.as_u16(),
+                detail.trim()
+            );
+        }
+        serde_json::from_slice(&bytes)
+            .map_err(|_| anyhow!("hindsight {operation} returned invalid JSON"))
     }
-}
-
-async fn read_bounded_response(mut response: reqwest::Response, cap: usize) -> Result<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(cap.min(8192));
-    while let Some(chunk) = response.chunk().await.map_err(|_| anyhow!("failed to read Hindsight response"))? {
-        if bytes.len().saturating_add(chunk.len()) > cap { bail!("Hindsight response exceeds the {cap}-byte limit"); }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(bytes)
 }
 
 fn validate_hindsight_input(label: &str, value: &str) -> Result<()> {
-    if value.len() > HINDSIGHT_INPUT_MAX_BYTES { bail!("{label} exceeds the 1 MiB limit"); }
+    if value.len() > HINDSIGHT_INPUT_MAX_BYTES {
+        bail!("{label} exceeds the 1 MiB limit");
+    }
     Ok(())
 }
 fn validate_required_hindsight_input(label: &str, value: &str) -> Result<()> {
-    if value.trim().is_empty() { bail!("{label} is required"); }
+    if value.trim().is_empty() {
+        bail!("{label} is required");
+    }
     validate_hindsight_input(label, value)
 }
 
 const fn hindsight_budget_name(budget: crate::settings::HindsightBudget) -> &'static str {
-    match budget { crate::settings::HindsightBudget::Low => "low", crate::settings::HindsightBudget::Mid => "mid", crate::settings::HindsightBudget::High => "high" }
-}
-
-fn format_hindsight_memories(results: &[HindsightRecallResult]) -> String {
-    if results.is_empty() { return "No relevant memories found.".to_owned(); }
-    results.iter().map(|memory| {
-        let kind = memory.memory_type.as_deref().map(|value| format!(" [{value}]")).unwrap_or_default();
-        let mentioned = memory.mentioned_at.as_deref().map(|value| format!(" ({value})")).unwrap_or_default();
-        format!("- {}{kind}{mentioned}", redact_secrets(&memory.text))
-    }).collect::<Vec<_>>().join("\n\n")
-}
-
-pub(crate) fn memory_tools_for(cwd: &str, session_env: Option<SessionEnvFn>, config: Option<MemoryConfig>) -> Vec<AgentTool> {
-    let config = config.unwrap_or_default();
-    match config.backend {
-        crate::settings::MemoryBackend::Off => Vec::new(),
-        crate::settings::MemoryBackend::Local => vec![memory_tool_with_session_env(cwd, session_env)],
-        crate::settings::MemoryBackend::Hindsight => vec![recall_tool(cwd, config.clone()), retain_tool(cwd, config.clone()), reflect_tool(cwd, config)],
+    match budget {
+        crate::settings::HindsightBudget::Low => "low",
+        crate::settings::HindsightBudget::Mid => "mid",
+        crate::settings::HindsightBudget::High => "high",
     }
 }
 
-pub(crate) fn memory_tools_for_persona(cwd: &str, persona_root: &Path, session_env: Option<SessionEnvFn>, config: Option<MemoryConfig>) -> Vec<AgentTool> {
+fn format_hindsight_memories(results: &[HindsightRecallResult]) -> String {
+    if results.is_empty() {
+        return "No relevant memories found.".to_owned();
+    }
+    results
+        .iter()
+        .map(|memory| {
+            let kind = memory
+                .memory_type
+                .as_deref()
+                .map(|value| format!(" [{value}]"))
+                .unwrap_or_default();
+            let mentioned = memory
+                .mentioned_at
+                .as_deref()
+                .map(|value| format!(" ({value})"))
+                .unwrap_or_default();
+            format!("- {}{kind}{mentioned}", redact_secrets(&memory.text))
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+pub(crate) fn memory_tools_for(
+    cwd: &str,
+    session_env: Option<SessionEnvFn>,
+    config: Option<MemoryConfig>,
+) -> Vec<AgentTool> {
+    memory_tools_for_with_generation(cwd, session_env, config, None)
+}
+
+pub(crate) fn memory_tools_for_with_generation(
+    cwd: &str,
+    session_env: Option<SessionEnvFn>,
+    config: Option<MemoryConfig>,
+    capture: Option<crate::tools::GenerationCaptureFn>,
+) -> Vec<AgentTool> {
     let config = config.unwrap_or_default();
     match config.backend {
         crate::settings::MemoryBackend::Off => Vec::new(),
-        crate::settings::MemoryBackend::Local => vec![persona_memory_tool_with_session_env(persona_root, session_env)],
-        crate::settings::MemoryBackend::Hindsight => vec![recall_tool(cwd, config.clone()), retain_tool(cwd, config.clone()), reflect_tool(cwd, config)],
+        crate::settings::MemoryBackend::Local => match capture {
+            Some(capture) => vec![memory_tool_with_generation(cwd, session_env, capture)],
+            None => vec![memory_tool_with_session_env(cwd, session_env)],
+        },
+        crate::settings::MemoryBackend::Hindsight => vec![
+            recall_tool_with_generation(cwd, config.clone(), capture.clone()),
+            retain_tool_with_generation(cwd, config.clone(), capture.clone()),
+            reflect_tool_with_generation(cwd, config, capture),
+        ],
+    }
+}
+
+pub(crate) fn memory_tools_for_with_live_config_and_generation(
+    cwd: &str,
+    session_env: Option<SessionEnvFn>,
+    config: Option<crate::tools::MemoryConfigFn>,
+    capture: crate::tools::GenerationCaptureFn,
+) -> Vec<AgentTool> {
+    let resolved = config
+        .as_ref()
+        .and_then(|resolve| resolve())
+        .unwrap_or_default();
+    match resolved.backend {
+        crate::settings::MemoryBackend::Off => Vec::new(),
+        crate::settings::MemoryBackend::Hindsight => {
+            memory_tools_for_with_generation(cwd, session_env, Some(resolved), Some(capture))
+        }
+        crate::settings::MemoryBackend::Local => {
+            let cwd = PathBuf::from(cwd);
+            vec![memory_tool_with_store_factory(
+                Arc::new(move || {
+                    let config = config
+                        .as_ref()
+                        .and_then(|resolve| resolve())
+                        .unwrap_or_default();
+                    if config.backend != crate::settings::MemoryBackend::Local {
+                        bail!(
+                            "local memory tool is disabled by the published application generation"
+                        );
+                    }
+                    let generation = capture()?;
+                    MemoryStore::try_default_for_with_capabilities(
+                        generation.sandbox().capabilities(),
+                        &cwd,
+                    )
+                }),
+                session_env,
+            )]
+        }
+    }
+}
+
+pub(crate) fn memory_tools_for_with_capabilities(
+    capabilities: &Arc<CapabilityFs>,
+    cwd: &str,
+    session_env: Option<SessionEnvFn>,
+    config: Option<MemoryConfig>,
+) -> Vec<AgentTool> {
+    let config = config.unwrap_or_default();
+    match config.backend {
+        crate::settings::MemoryBackend::Off => Vec::new(),
+        crate::settings::MemoryBackend::Local => {
+            vec![memory_tool_with_capabilities(
+                capabilities,
+                cwd,
+                session_env,
+            )]
+        }
+        crate::settings::MemoryBackend::Hindsight => vec![
+            recall_tool(cwd, config.clone()),
+            retain_tool(cwd, config.clone()),
+            reflect_tool(cwd, config),
+        ],
+    }
+}
+
+pub(crate) fn memory_tools_for_with_capabilities_and_generation(
+    capabilities: &Arc<CapabilityFs>,
+    cwd: &str,
+    session_env: Option<SessionEnvFn>,
+    config: Option<MemoryConfig>,
+    capture: crate::tools::GenerationCaptureFn,
+) -> Vec<AgentTool> {
+    let config = config.unwrap_or_default();
+    match config.backend {
+        crate::settings::MemoryBackend::Off => Vec::new(),
+        crate::settings::MemoryBackend::Local => {
+            vec![memory_tool_with_capabilities(
+                capabilities,
+                cwd,
+                session_env,
+            )]
+        }
+        crate::settings::MemoryBackend::Hindsight => vec![
+            recall_tool_with_generation(cwd, config.clone(), Some(capture.clone())),
+            retain_tool_with_generation(cwd, config.clone(), Some(capture.clone())),
+            reflect_tool_with_generation(cwd, config, Some(capture)),
+        ],
+    }
+}
+
+pub(crate) fn memory_tools_for_persona(
+    cwd: &str,
+    persona_root: &Path,
+    session_env: Option<SessionEnvFn>,
+    config: Option<MemoryConfig>,
+) -> Vec<AgentTool> {
+    let config = config.unwrap_or_default();
+    match config.backend {
+        crate::settings::MemoryBackend::Off => Vec::new(),
+        crate::settings::MemoryBackend::Local => vec![persona_memory_tool_with_session_env(
+            persona_root,
+            session_env,
+        )],
+        crate::settings::MemoryBackend::Hindsight => vec![
+            recall_tool(cwd, config.clone()),
+            retain_tool(cwd, config.clone()),
+            reflect_tool(cwd, config),
+        ],
+    }
+}
+
+pub(crate) fn memory_tools_for_persona_with_capabilities(
+    capabilities: &Arc<CapabilityFs>,
+    cwd: &str,
+    persona_root: &Path,
+    session_env: Option<SessionEnvFn>,
+    config: Option<MemoryConfig>,
+) -> Result<Vec<AgentTool>> {
+    let config = config.unwrap_or_default();
+    match config.backend {
+        crate::settings::MemoryBackend::Off => Ok(Vec::new()),
+        crate::settings::MemoryBackend::Local => Ok(vec![persona_memory_tool_with_capabilities(
+            capabilities,
+            persona_root,
+            session_env,
+        )?]),
+        crate::settings::MemoryBackend::Hindsight => Ok(vec![
+            recall_tool(cwd, config.clone()),
+            retain_tool(cwd, config.clone()),
+            reflect_tool(cwd, config),
+        ]),
     }
 }
 
 pub(crate) fn recall_tool(cwd: &str, config: MemoryConfig) -> AgentTool {
-    let parameters = s_object(vec![("query", s_string("Natural-language search query"))], vec!["query"]);
+    recall_tool_with_generation(cwd, config, None)
+}
+
+fn recall_tool_with_generation(
+    cwd: &str,
+    config: MemoryConfig,
+    capture: Option<crate::tools::GenerationCaptureFn>,
+) -> AgentTool {
+    let parameters = s_object(
+        vec![("query", s_string("Natural-language search query"))],
+        vec!["query"],
+    );
     let cwd = cwd.to_owned();
-    AgentTool::new("recall", "Search the configured Hindsight memory bank for relevant prior context.", parameters, move |ctx| {
-        let client = HindsightClient::new(&config, Path::new(&cwd));
-        async move { run_hindsight_op(client, "recall", ctx.arguments, ctx.abort).await }
-    }).with_capability(ToolCapability::Read)
+    AgentTool::new(
+        "recall",
+        "Search the configured Hindsight memory bank for relevant prior context.",
+        parameters,
+        move |ctx| {
+            let executor =
+                capture
+                    .as_ref()
+                    .map(|capture| capture())
+                    .transpose()
+                    .map(|generation| {
+                        generation.map(|generation| {
+                            generation
+                                .sandbox()
+                                .http()
+                                .executor(pi_sandbox::HostHttpClass::MemoryApi)
+                        })
+                    });
+            let client = executor
+                .and_then(|executor| {
+                    executor.ok_or_else(|| anyhow!("Hindsight requires an application generation"))
+                })
+                .and_then(|executor| {
+                    HindsightClient::new_with_executor(&config, Path::new(&cwd), executor)
+                });
+            async move { run_hindsight_op(client, "recall", ctx.arguments, ctx.abort).await }
+        },
+    )
+    .with_capability(ToolCapability::Read)
 }
 
 pub(crate) fn retain_tool(cwd: &str, config: MemoryConfig) -> AgentTool {
-    let parameters = s_object(vec![("content", s_string("Information to remember")), ("context", s_string("Optional source context"))], vec!["content"]);
+    retain_tool_with_generation(cwd, config, None)
+}
+
+fn retain_tool_with_generation(
+    cwd: &str,
+    config: MemoryConfig,
+    capture: Option<crate::tools::GenerationCaptureFn>,
+) -> AgentTool {
+    let parameters = s_object(
+        vec![
+            ("content", s_string("Information to remember")),
+            ("context", s_string("Optional source context")),
+        ],
+        vec!["content"],
+    );
     let cwd = cwd.to_owned();
-    AgentTool::new("retain", "Store important facts in the configured Hindsight memory bank.", parameters, move |ctx| {
-        let client = HindsightClient::new(&config, Path::new(&cwd));
-        async move { run_hindsight_op(client, "retain", ctx.arguments, ctx.abort).await }
-    }).with_capability(ToolCapability::Write)
+    AgentTool::new(
+        "retain",
+        "Store important facts in the configured Hindsight memory bank.",
+        parameters,
+        move |ctx| {
+            let executor =
+                capture
+                    .as_ref()
+                    .map(|capture| capture())
+                    .transpose()
+                    .map(|generation| {
+                        generation.map(|generation| {
+                            generation
+                                .sandbox()
+                                .http()
+                                .executor(pi_sandbox::HostHttpClass::MemoryApi)
+                        })
+                    });
+            let client = executor
+                .and_then(|executor| {
+                    executor.ok_or_else(|| anyhow!("Hindsight requires an application generation"))
+                })
+                .and_then(|executor| {
+                    HindsightClient::new_with_executor(&config, Path::new(&cwd), executor)
+                });
+            async move { run_hindsight_op(client, "retain", ctx.arguments, ctx.abort).await }
+        },
+    )
+    .with_capability(ToolCapability::Write)
 }
 
 pub(crate) fn reflect_tool(cwd: &str, config: MemoryConfig) -> AgentTool {
-    let parameters = s_object(vec![("query", s_string("Question to answer from long-term memory")), ("context", s_string("Optional additional context"))], vec!["query"]);
-    let cwd = cwd.to_owned();
-    AgentTool::new("reflect", "Synthesize an answer from the configured Hindsight memory bank.", parameters, move |ctx| {
-        let client = HindsightClient::new(&config, Path::new(&cwd));
-        async move { run_hindsight_op(client, "reflect", ctx.arguments, ctx.abort).await }
-    }).with_capability(ToolCapability::Read)
+    reflect_tool_with_generation(cwd, config, None)
 }
 
-async fn run_hindsight_op(client: Result<HindsightClient>, op: &str, args: Value, abort: AbortSignal) -> Result<AgentToolResult> {
+fn reflect_tool_with_generation(
+    cwd: &str,
+    config: MemoryConfig,
+    capture: Option<crate::tools::GenerationCaptureFn>,
+) -> AgentTool {
+    let parameters = s_object(
+        vec![
+            (
+                "query",
+                s_string("Question to answer from long-term memory"),
+            ),
+            ("context", s_string("Optional additional context")),
+        ],
+        vec!["query"],
+    );
+    let cwd = cwd.to_owned();
+    AgentTool::new(
+        "reflect",
+        "Synthesize an answer from the configured Hindsight memory bank.",
+        parameters,
+        move |ctx| {
+            let executor =
+                capture
+                    .as_ref()
+                    .map(|capture| capture())
+                    .transpose()
+                    .map(|generation| {
+                        generation.map(|generation| {
+                            generation
+                                .sandbox()
+                                .http()
+                                .executor(pi_sandbox::HostHttpClass::MemoryApi)
+                        })
+                    });
+            let client = executor
+                .and_then(|executor| {
+                    executor.ok_or_else(|| anyhow!("Hindsight requires an application generation"))
+                })
+                .and_then(|executor| {
+                    HindsightClient::new_with_executor(&config, Path::new(&cwd), executor)
+                });
+            async move { run_hindsight_op(client, "reflect", ctx.arguments, ctx.abort).await }
+        },
+    )
+    .with_capability(ToolCapability::Read)
+}
+
+async fn run_hindsight_op(
+    client: Result<HindsightClient>,
+    op: &str,
+    args: Value,
+    abort: AbortSignal,
+) -> Result<AgentToolResult> {
     check_aborted(&abort)?;
     let client = client?;
     let rendered = match op {
-        "recall" => { let query = arg_str(&args, "query"); if query.trim().is_empty() { return Err(anyhow!("query is required for recall")); } validate_hindsight_input("recall query", &query)?; client.recall(&query, &abort).await? }
-        "retain" => { let content = arg_str(&args, "content"); if content.trim().is_empty() { return Err(anyhow!("content is required for retain")); } let context = arg_str(&args, "context"); client.retain(&content, (!context.trim().is_empty()).then_some(context.as_str()), &abort).await? }
-        "reflect" => { let query = arg_str(&args, "query"); if query.trim().is_empty() { return Err(anyhow!("query is required for reflect")); } validate_hindsight_input("reflect query", &query)?; let context = arg_str(&args, "context"); client.reflect(&query, (!context.trim().is_empty()).then_some(context.as_str()), &abort).await? }
+        "recall" => {
+            let query = arg_str(&args, "query");
+            if query.trim().is_empty() {
+                return Err(anyhow!("query is required for recall"));
+            }
+            validate_hindsight_input("recall query", &query)?;
+            client.recall(&query, &abort).await?
+        }
+        "retain" => {
+            let content = arg_str(&args, "content");
+            if content.trim().is_empty() {
+                return Err(anyhow!("content is required for retain"));
+            }
+            let context = arg_str(&args, "context");
+            client
+                .retain(
+                    &content,
+                    (!context.trim().is_empty()).then_some(context.as_str()),
+                    &abort,
+                )
+                .await?
+        }
+        "reflect" => {
+            let query = arg_str(&args, "query");
+            if query.trim().is_empty() {
+                return Err(anyhow!("query is required for reflect"));
+            }
+            validate_hindsight_input("reflect query", &query)?;
+            let context = arg_str(&args, "context");
+            client
+                .reflect(
+                    &query,
+                    (!context.trim().is_empty()).then_some(context.as_str()),
+                    &abort,
+                )
+                .await?
+        }
         other => return Err(anyhow!("Unknown hindsight op: {other}")),
     };
     check_aborted(&abort)?;
-    Ok(text_result(truncate_head(&rendered, usize::MAX, OUTPUT_MAX_BYTES).content))
+    Ok(text_result(
+        truncate_head(&rendered, usize::MAX, OUTPUT_MAX_BYTES).content,
+    ))
 }
 
 pub(crate) fn hindsight_injection_message(body: &str) -> pi_ai::Message {
     pi_ai::Message::Custom(pi_ai::CustomMessage {
         custom_type: "hindsight_memory".to_owned(),
-        content: format!("Related memories from the Hindsight backend for the latest user request:\n{body}").into(),
+        content: format!(
+            "Related memories from the Hindsight backend for the latest user request:\n{body}"
+        )
+        .into(),
         display: false,
         details: None,
         timestamp: pi_ai::now_millis(),
@@ -1093,14 +1910,44 @@ pub(crate) fn hindsight_injection_message(body: &str) -> pi_ai::Message {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{Arc, Mutex};
 
+    use futures_util::{FutureExt as _, stream};
     use pi_agent::{AbortController, ToolCallContext};
     use serde_json::json;
 
+    fn test_capabilities() -> Arc<CapabilityFs> {
+        CapabilityFs::new().expect("test filesystem capabilities")
+    }
+
+    fn store_in_with_capabilities(
+        capabilities: &Arc<CapabilityFs>,
+        dir: &Path,
+        namespace: &str,
+    ) -> Arc<MemoryStore> {
+        Arc::new(
+            MemoryStore::new_with_capabilities(capabilities, dir, namespace).expect("store builds"),
+        )
+    }
+
     fn store_in(dir: &Path, namespace: &str) -> Arc<MemoryStore> {
-        Arc::new(MemoryStore::new(dir, namespace).expect("store builds"))
+        store_in_with_capabilities(&test_capabilities(), dir, namespace)
+    }
+
+    fn error_rejects_symlink(error: &anyhow::Error) -> bool {
+        error.chain().any(|source| {
+            source.downcast_ref::<FsError>().is_some_and(|error| {
+                matches!(error, FsError::UnsupportedEntryType)
+                    || matches!(
+                        error,
+                        FsError::System {
+                            raw_os_error: Some(40),
+                            ..
+                        }
+                    )
+            })
+        })
     }
 
     fn noop_update() -> pi_agent::ToolUpdateFn {
@@ -1116,6 +1963,7 @@ mod tests {
             on_update: noop_update(),
             abort,
             model: None,
+            approval_token: None,
         }
     }
 
@@ -1136,7 +1984,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("dir");
         let store = store_in(dir.path(), "ns");
         let (id, count) = store
-            .learn("The release script lives in scripts/release.sh", vec!["release".into()], "s1")
+            .learn(
+                "The release script lives in scripts/release.sh",
+                vec!["release".into()],
+                "s1",
+            )
             .expect("learn");
         assert_eq!(count, 1);
         let hits = store.recall("release script", 10).expect("recall");
@@ -1182,7 +2034,11 @@ mod tests {
         // The full-phrase bonus beats same-term matches, and term matches
         // still rank below it, newest-first among ties.
         let phrase = store.recall("alpha beta gamma", 10).expect("recall");
-        assert_eq!(phrase.len(), 3, "term matches still qualify for the phrase query");
+        assert_eq!(
+            phrase.len(),
+            3,
+            "term matches still qualify for the phrase query"
+        );
         assert_eq!(phrase[0].id, by_content("newest"));
         assert_eq!(phrase[1].id, by_content("old note"));
         assert_eq!(phrase[2].id, by_content("beta only"));
@@ -1205,13 +2061,22 @@ mod tests {
     fn list_filters_by_tag() {
         let dir = tempfile::tempdir().expect("dir");
         let store = store_in(dir.path(), "ns");
-        store.learn("note one", vec!["alpha".into()], "s").expect("learn");
-        store.learn("note two", vec!["beta".into(), "alpha".into()], "s").expect("learn");
+        store
+            .learn("note one", vec!["alpha".into()], "s")
+            .expect("learn");
+        store
+            .learn("note two", vec!["beta".into(), "alpha".into()], "s")
+            .expect("learn");
         store.learn("note three", vec![], "s").expect("learn");
         assert_eq!(store.list(None).expect("list").len(), 3);
         let alpha = store.list(Some("ALPHA")).expect("list");
         assert_eq!(alpha.len(), 2, "case-insensitive tag filter");
-        assert!(alpha.iter().all(|entry| entry.tags.iter().any(|tag| tag.eq_ignore_ascii_case("alpha"))));
+        assert!(alpha.iter().all(|entry| {
+            entry
+                .tags
+                .iter()
+                .any(|tag| tag.eq_ignore_ascii_case("alpha"))
+        }));
         assert_eq!(store.list(Some("missing")).expect("list").len(), 0);
     }
 
@@ -1220,7 +2085,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("dir");
         let (id, count) = {
             let store = store_in(dir.path(), "ns");
-            store.learn_with_ts("durable note", vec!["durable".into()], "session-one", 5_000)
+            store
+                .learn_with_ts("durable note", vec!["durable".into()], "session-one", 5_000)
                 .expect("learn")
         };
         assert_eq!(count, 1);
@@ -1243,7 +2109,9 @@ mod tests {
         std::fs::create_dir_all(&persona_root).expect("persona root");
         std::fs::create_dir_all(&cwd).expect("cwd");
 
-        let first = persona_memory_tool_with_session_env(&persona_root, None);
+        let capabilities = test_capabilities();
+        let first = persona_memory_tool_with_capabilities(&capabilities, &persona_root, None)
+            .expect("first persona tool");
         (first.execute)(ctx(json!({
             "op": "learn",
             "content": "persona-only durable note"
@@ -1251,24 +2119,41 @@ mod tests {
         .await
         .expect("persona learn");
 
-        let second = persona_memory_tool_with_session_env(&persona_root, None);
-        let recalled = text_of(&(second.execute)(ctx(json!({
-            "op": "recall",
-            "query": "persona-only"
-        })))
-        .await
-        .expect("persona recall"));
+        let second = persona_memory_tool_with_capabilities(&capabilities, &persona_root, None)
+            .expect("second persona tool");
+        let recalled = text_of(
+            &(second.execute)(ctx(json!({
+                "op": "recall",
+                "query": "persona-only"
+            })))
+            .await
+            .expect("persona recall"),
+        );
         assert!(recalled.contains("persona-only durable note"));
         assert_eq!(
-            MemoryStore::persona(&persona_root).entries_path,
+            MemoryStore::persona_with_capabilities(&capabilities, &persona_root)
+                .expect("persona store")
+                .entries_path,
             persona_root.join("memory").join("entries.jsonl")
         );
 
-        let ordinary = MemoryStore::default_for(&cwd);
-        assert!(ordinary.recall("persona-only", 10).expect("ordinary recall").is_empty());
-        ordinary.learn("repo-only note", vec![], "repo").expect("repo learn");
+        let ordinary = store_in_with_capabilities(
+            &capabilities,
+            &root.path().join("agent"),
+            &repo_namespace(&cwd),
+        );
         assert!(
-            MemoryStore::persona(&persona_root)
+            ordinary
+                .recall("persona-only", 10)
+                .expect("ordinary recall")
+                .is_empty()
+        );
+        ordinary
+            .learn("repo-only note", vec![], "repo")
+            .expect("repo learn");
+        assert!(
+            MemoryStore::persona_with_capabilities(&capabilities, &persona_root)
+                .expect("persona store")
                 .recall("repo-only", 10)
                 .expect("persona recall")
                 .is_empty()
@@ -1283,13 +2168,12 @@ mod tests {
         let outside = root.path().join("outside");
         std::fs::create_dir_all(&persona_root).expect("persona root");
         std::fs::create_dir_all(&outside).expect("outside");
-        std::os::unix::fs::symlink(&outside, persona_root.join("memory"))
-            .expect("memory symlink");
-        let store = MemoryStore::persona(&persona_root);
-        let error = store
-            .learn("must not escape", vec![], "session")
-            .expect_err("symlinked memory directory must fail");
-        assert!(error.to_string().contains("non-symlink directory"), "{error:#}");
+        std::os::unix::fs::symlink(&outside, persona_root.join("memory")).expect("memory symlink");
+        let capabilities = test_capabilities();
+        let error = MemoryStore::persona_with_capabilities(&capabilities, &persona_root)
+            .err()
+            .expect("symlinked memory directory must fail");
+        assert!(error_rejects_symlink(&error), "{error:#}");
         assert!(!outside.join("entries.jsonl").exists());
 
         std::fs::remove_file(persona_root.join("memory")).expect("remove memory symlink");
@@ -1301,11 +2185,16 @@ mod tests {
             persona_root.join("memory").join("entries.jsonl"),
         )
         .expect("entries symlink");
+        let store = MemoryStore::persona_with_capabilities(&capabilities, &persona_root)
+            .expect("persona store with real memory directory");
         let error = store
             .list(None)
             .expect_err("symlinked entries file must fail");
-        assert!(error.to_string().contains("regular non-symlink file"), "{error:#}");
-        assert_eq!(std::fs::read_to_string(outside_entries).expect("outside intact"), "outside\n");
+        assert!(error_rejects_symlink(&error), "{error:#}");
+        assert_eq!(
+            std::fs::read_to_string(outside_entries).expect("outside intact"),
+            "outside\n"
+        );
     }
 
     #[test]
@@ -1313,7 +2202,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("dir");
         let store = store_in(dir.path(), "ns");
         let oversized = "x".repeat(MAX_ENTRY_BYTES + 1);
-        assert!(store.learn(&oversized, vec![], "s").is_err(), "oversized entry rejected");
+        assert!(
+            store.learn(&oversized, vec![], "s").is_err(),
+            "oversized entry rejected"
+        );
         // 105 learns → capped at 100, oldest five evicted. Each recall query is
         // a single token unique to one entry (a shared word like `entry` would
         // match every entry, and a bare digit would substring-match others).
@@ -1325,13 +2217,19 @@ mod tests {
         assert_eq!(store.list(None).expect("list").len(), MAX_ENTRIES);
         for i in 0..5 {
             assert!(
-                store.recall(&format!("unique-token-{i:03}"), 10).expect("recall").is_empty(),
+                store
+                    .recall(&format!("unique-token-{i:03}"), 10)
+                    .expect("recall")
+                    .is_empty(),
                 "oldest entry {i} must be evicted"
             );
         }
         for i in 5..105 {
             assert!(
-                !store.recall(&format!("unique-token-{i:03}"), 10).expect("recall").is_empty(),
+                !store
+                    .recall(&format!("unique-token-{i:03}"), 10)
+                    .expect("recall")
+                    .is_empty(),
                 "entry {i} must survive the cap"
             );
         }
@@ -1354,13 +2252,20 @@ mod tests {
         assert_ne!(repo_namespace(dir.path()), repo_namespace(other.path()));
         // Hostile namespaces are rejected outright.
         for hostile in ["../../escape", "a/b", "a\\b", "a:b", "..", ".", "", "\u{0}"] {
-            assert!(MemoryStore::new(dir.path(), hostile).is_err(), "{hostile:?} must be rejected");
+            assert!(
+                MemoryStore::new_with_capabilities(&test_capabilities(), dir.path(), hostile)
+                    .is_err(),
+                "{hostile:?} must be rejected"
+            );
         }
         // The store path for a valid digest namespace stays under the memory root.
         let store = store_in(dir.path(), &namespace);
         let entries = store.entries_path.clone();
         assert!(entries.starts_with(dir.path().join(MEMORY_DIR_NAME)));
-        assert_eq!(entries.file_name().and_then(|n| n.to_str()), Some(ENTRIES_FILE_NAME));
+        assert_eq!(
+            entries.file_name().and_then(|n| n.to_str()),
+            Some(ENTRIES_FILE_NAME)
+        );
         store.learn("safe", vec![], "s").expect("learn");
         assert!(entries.exists(), "entries written inside the memory root");
     }
@@ -1378,16 +2283,17 @@ mod tests {
             "KEY-----",
         ]
         .concat();
-        let secret_content = format!(
-            "token {token} and key\n{private_key}\nand github {github} and {aws}"
-        );
+        let secret_content =
+            format!("token {token} and key\n{private_key}\nand github {github} and {aws}");
         store.learn(&secret_content, vec![], "s").expect("learn");
-        let output = text_of(&(memory_tool_with_store(store.clone(), None).execute)(ctx(json!({
-            "op": "recall",
-            "query": "token"
-        })))
-        .await
-        .expect("recall executes"));
+        let output = text_of(
+            &(memory_tool_with_store(store.clone(), None).execute)(ctx(json!({
+                "op": "recall",
+                "query": "token"
+            })))
+            .await
+            .expect("recall executes"),
+        );
         assert!(output.contains("[REDACTED]"), "redaction marker present");
         let leaked = [
             ["sk", "-", "abcdefghijklmnop"].concat(),
@@ -1397,11 +2303,17 @@ mod tests {
             ["PRIVATE ", "KEY-----"].concat(),
         ];
         for leaked in &leaked {
-            assert!(!output.contains(leaked), "secret fragment {leaked:?} must not leak");
+            assert!(
+                !output.contains(leaked),
+                "secret fragment {leaked:?} must not leak"
+            );
         }
         // Output shape must never expose the store layout.
         let agent_dir = dir.path().to_string_lossy();
-        assert!(!output.contains(agent_dir.as_ref()), "agent dir must not appear in output");
+        assert!(
+            !output.contains(agent_dir.as_ref()),
+            "agent dir must not appear in output"
+        );
         assert!(!output.contains("entries.jsonl"));
         assert!(!output.contains("memory/"));
     }
@@ -1412,13 +2324,15 @@ mod tests {
         let store = store_in(dir.path(), "ns");
         // Session-backed tool records PI_SESSION_ID.
         let tool = memory_tool_with_store(store.clone(), Some(session_env_with("sess-abc")));
-        let result = text_of(&(tool.execute)(ctx(json!({
-            "op": "learn",
-            "content": "provenance note",
-            "tags": ["p"],
-        })))
-        .await
-        .expect("learn executes"));
+        let result = text_of(
+            &(tool.execute)(ctx(json!({
+                "op": "learn",
+                "content": "provenance note",
+                "tags": ["p"],
+            })))
+            .await
+            .expect("learn executes"),
+        );
         assert!(result.starts_with("Learned memory entry "));
         assert_eq!(store.list(None).expect("list")[0].session, "sess-abc");
         // Standalone tool records `standalone`.
@@ -1452,29 +2366,42 @@ mod tests {
             .expect_err("missing query errors");
         assert!(error.to_string().contains("query is required"));
         // Empty list renders a friendly message.
-        let output = text_of(&(tool.execute)(ctx(json!({ "op": "list" })))
-            .await
-            .expect("list executes"));
+        let output = text_of(
+            &(tool.execute)(ctx(json!({ "op": "list" })))
+                .await
+                .expect("list executes"),
+        );
         assert_eq!(output, "No memory entries.");
         // recall on an empty store renders a friendly message.
-        let output = text_of(&(tool.execute)(ctx(json!({ "op": "recall", "query": "x" })))
-            .await
-            .expect("recall executes"));
+        let output = text_of(
+            &(tool.execute)(ctx(json!({ "op": "recall", "query": "x" })))
+                .await
+                .expect("recall executes"),
+        );
         assert_eq!(output, "No memory entries match \"x\".");
         // forget with a bogus id renders a miss.
-        let output = text_of(&(tool.execute)(ctx(json!({ "op": "forget", "id": "nope" })))
-            .await
-            .expect("forget executes"));
+        let output = text_of(
+            &(tool.execute)(ctx(json!({ "op": "forget", "id": "nope" })))
+                .await
+                .expect("forget executes"),
+        );
         assert_eq!(output, "No memory entry with id nope.");
         // limit clamps: 0 → 1, huge → 50.
         let (id, _) = store.learn("clamp me", vec![], "s").expect("learn");
-        let output = text_of(&(tool.execute)(ctx(json!({ "op": "recall", "query": "clamp", "limit": 0 })))
-            .await
-            .expect("recall executes"));
-        assert!(output.contains(&id), "limit 0 clamped to at least one result");
-        let output = text_of(&(tool.execute)(ctx(json!({ "op": "forget", "id": &id })))
-            .await
-            .expect("forget executes"));
+        let output = text_of(
+            &(tool.execute)(ctx(json!({ "op": "recall", "query": "clamp", "limit": 0 })))
+                .await
+                .expect("recall executes"),
+        );
+        assert!(
+            output.contains(&id),
+            "limit 0 clamped to at least one result"
+        );
+        let output = text_of(
+            &(tool.execute)(ctx(json!({ "op": "forget", "id": &id })))
+                .await
+                .expect("forget executes"),
+        );
         assert_eq!(output, format!("Forgot memory entry {id}."));
     }
 
@@ -1493,169 +2420,317 @@ mod tests {
         }
     }
 
-    fn http_response(status: &str, body: &[u8]) -> Vec<u8> {
-        let mut response = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).into_bytes();
-        response.extend_from_slice(body);
-        response
+    #[derive(Debug)]
+    struct RecordedHttpRequest {
+        path_and_query: String,
+        body: Value,
     }
 
-    fn serve_responses(responses: Vec<Vec<u8>>) -> (String, Arc<std::sync::Mutex<Vec<(String, Value)>>>) {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock Hindsight");
-        let address = listener.local_addr().expect("mock address");
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let captured = requests.clone();
-        std::thread::spawn(move || {
-            for response in responses {
-                let (mut socket, _) = listener.accept().expect("accept mock Hindsight");
-                let mut request = Vec::new();
-                let mut buffer = [0u8; 4096];
-                let header_end = loop {
-                    if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") { break position + 4; }
-                    let read = socket.read(&mut buffer).expect("read request");
-                    if read == 0 { break request.len(); }
-                    request.extend_from_slice(&buffer[..read]);
-                };
-                let head = String::from_utf8_lossy(&request[..header_end]).into_owned();
-                let length = head.lines().find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().expect("length"))
-                }).unwrap_or(0);
-                while request.len() < header_end + length {
-                    let read = socket.read(&mut buffer).expect("read body");
-                    if read == 0 { break; }
-                    request.extend_from_slice(&buffer[..read]);
+    struct TestHttpResponse {
+        status: http::StatusCode,
+        headers: http::HeaderMap,
+        chunks: Vec<Vec<u8>>,
+    }
+
+    #[derive(Clone)]
+    struct TestHttpExecutor {
+        responses: Arc<Mutex<VecDeque<TestHttpResponse>>>,
+        requests: Arc<Mutex<Vec<RecordedHttpRequest>>>,
+    }
+    impl pi_ai::HttpExecutor for TestHttpExecutor {
+        fn execute<'a>(
+            &'a self,
+            request: pi_ai::HttpRequest,
+        ) -> futures_util::future::BoxFuture<'a, Result<pi_ai::HttpResponse>> {
+            async move {
+                let parts = request.into_parts();
+                let bound = parts.max_response_bytes.get();
+                let request_body = serde_json::from_slice(&parts.body).unwrap_or(Value::Null);
+                self.requests
+                    .lock()
+                    .expect("request lock")
+                    .push(RecordedHttpRequest {
+                        path_and_query: parts.path_and_query,
+                        body: request_body.clone(),
+                    });
+                let mut response = self
+                    .responses
+                    .lock()
+                    .expect("response lock")
+                    .pop_front()
+                    .ok_or_else(|| anyhow!("unexpected test HTTP request"))?;
+                if response.status.is_redirection() {
+                    let location = response
+                        .headers
+                        .get(http::header::LOCATION)
+                        .and_then(|value| value.to_str().ok())
+                        .ok_or_else(|| anyhow!("test redirect is missing Location"))?;
+                    let target =
+                        url::Url::parse(location).context("parsing test redirect target")?;
+                    let mut path_and_query = target.path().to_owned();
+                    if let Some(query) = target.query() {
+                        path_and_query.push('?');
+                        path_and_query.push_str(query);
+                    }
+                    self.requests
+                        .lock()
+                        .expect("request lock")
+                        .push(RecordedHttpRequest {
+                            path_and_query,
+                            body: request_body,
+                        });
+                    response = self
+                        .responses
+                        .lock()
+                        .expect("response lock")
+                        .pop_front()
+                        .ok_or_else(|| anyhow!("test redirect is missing its target response"))?;
                 }
-                let path = head.split_whitespace().nth(1).unwrap_or("").to_owned();
-                let body = serde_json::from_slice(&request[header_end..]).unwrap_or(Value::Null);
-                captured.lock().expect("capture lock").push((path, body));
-                socket.write_all(&response).expect("write response");
+                let declared_oversize = response
+                    .headers
+                    .get(http::header::CONTENT_LENGTH)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .is_some_and(|length| length > bound);
+                let streamed_bytes = response
+                    .chunks
+                    .iter()
+                    .try_fold(0_u64, |total, chunk| total.checked_add(chunk.len() as u64));
+                let chunks: Vec<Result<Vec<u8>>> =
+                    if declared_oversize || streamed_bytes.is_none_or(|total| total > bound) {
+                        vec![Err(anyhow!("test HTTP response exceeds {bound} bytes"))]
+                    } else {
+                        response.chunks.into_iter().map(Ok).collect()
+                    };
+                Ok(pi_ai::HttpResponse::new(
+                    response.status,
+                    response.headers,
+                    Box::pin(stream::iter(chunks)),
+                ))
             }
-        });
-        (format!("http://{address}"), requests)
-    }
-    fn serve_redirect(location: String) -> (String, std::sync::mpsc::Receiver<String>) {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind redirect source");
-        let address = listener.local_addr().expect("redirect source address");
-        let (sent, received) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().expect("accept redirect source");
-            let mut request = Vec::new();
-            let mut buffer = [0u8; 4096];
-            loop {
-                let read = socket.read(&mut buffer).expect("read redirect request");
-                if read == 0 { break; }
-                request.extend_from_slice(&buffer[..read]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") { break; }
-            }
-            sent.send(String::from_utf8_lossy(&request).into_owned()).expect("capture redirect source");
-            let response = format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-            socket.write_all(response.as_bytes()).expect("write redirect");
-        });
-        (format!("http://{address}"), received)
-    }
-
-    #[test]
-    fn hindsight_redirect_hop_policy_enforces_secure_and_insecure_schemes() {
-        assert_eq!(
-            hindsight_redirect_decision(false, "https", "http", 1),
-            HindsightRedirectDecision::RejectPlaintext,
-            "secure mode must reject HTTPS-to-HTTP downgrade"
-        );
-        assert_eq!(
-            hindsight_redirect_decision(false, "https", "https", 1),
-            HindsightRedirectDecision::Follow,
-            "secure mode permits an HTTPS-to-HTTPS hop"
-        );
-        assert_eq!(
-            hindsight_redirect_decision(false, "http", "https", 1),
-            HindsightRedirectDecision::RejectPlaintext,
-            "secure mode rejects a chain whose previous hop was plaintext"
-        );
-        assert_eq!(
-            hindsight_redirect_decision(true, "http", "http", 1),
-            HindsightRedirectDecision::Follow,
-            "explicit insecure opt-in permits plaintext hops"
-        );
-        assert_eq!(
-            hindsight_redirect_decision(false, "https", "https", 10),
-            HindsightRedirectDecision::Follow,
-            "secure redirect chains allow the same ten-hop maximum as reqwest"
-        );
-        assert_eq!(
-            hindsight_redirect_decision(false, "https", "https", 11),
-            HindsightRedirectDecision::RejectLimit,
-            "secure redirect chains remain bounded"
-        );
-    }
-
-    #[tokio::test]
-    async fn hindsight_secure_redirect_hook_rejects_plaintext_before_target_request() {
-        use std::io::Read;
-
-        let target = std::net::TcpListener::bind("127.0.0.1:0").expect("bind plaintext target");
-        target.set_nonblocking(true).expect("nonblocking plaintext target");
-        let target_url = format!("http://{}", target.local_addr().expect("plaintext target address"));
-        let (source, source_request) = serve_redirect(target_url);
-        let authorization_material = ["redirect", "-", "marker"].concat();
-        let request = hindsight_http_client_builder(false)
-            .https_only(false)
-            .build()
-            .expect("redirect policy integration client")
-            .get(source)
-            .bearer_auth(&authorization_material)
-            .send()
-            .await
-            .expect_err("plaintext redirect must fail");
-
-        let source_request = source_request.recv_timeout(std::time::Duration::from_secs(1)).expect("source received request");
-        assert!(source_request.contains(&authorization_material));
-        assert!(request.to_string().contains("redirect"), "{request:#}");
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        match target.accept() {
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Ok((mut socket, _)) => {
-                let mut leaked = String::new();
-                socket.read_to_string(&mut leaked).expect("read unexpected plaintext request");
-                panic!("secure redirect hook reached plaintext target: {leaked}");
-            }
-            Err(error) => panic!("checking plaintext target: {error}"),
+            .boxed()
         }
+    }
+
+    fn http_response(status: &str, body: impl Into<Vec<u8>>) -> TestHttpResponse {
+        let body = body.into();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from_str(&body.len().to_string()).expect("content length"),
+        );
+        TestHttpResponse {
+            status: status
+                .split_whitespace()
+                .next()
+                .expect("HTTP status code")
+                .parse()
+                .expect("HTTP status"),
+            headers,
+            chunks: vec![body],
+        }
+    }
+
+    fn redirect_response(location: &str) -> TestHttpResponse {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::LOCATION,
+            http::HeaderValue::from_str(location).expect("redirect location"),
+        );
+        TestHttpResponse {
+            status: http::StatusCode::TEMPORARY_REDIRECT,
+            headers,
+            chunks: Vec::new(),
+        }
+    }
+
+    fn test_hindsight_client(
+        config: &MemoryConfig,
+        responses: Vec<TestHttpResponse>,
+    ) -> (HindsightClient, Arc<Mutex<Vec<RecordedHttpRequest>>>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let executor = TestHttpExecutor {
+            responses: Arc::new(Mutex::new(responses.into())),
+            requests: requests.clone(),
+        };
+        let client = HindsightClient::new_with_executor(config, Path::new("."), Arc::new(executor))
+            .expect("test Hindsight client");
+        (client, requests)
+    }
+
+    async fn test_generation_capture(
+        cwd: &Path,
+    ) -> (
+        tempfile::TempDir,
+        crate::Application,
+        crate::tools::GenerationCaptureFn,
+        pi_ai::providers::FauxProviderRegistration,
+    ) {
+        let agent_dir = tempfile::tempdir().expect("agent dir");
+        let mut resource_options = crate::ResourceManagerOptions::new(cwd);
+        let session_dir = agent_dir.path().join("sessions");
+        std::fs::create_dir_all(&session_dir).expect("session dir");
+        std::fs::write(
+            agent_dir.path().join("settings.json"),
+            r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+        )
+        .expect("isolated settings");
+        resource_options.agent_dir = agent_dir.path().to_path_buf();
+        resource_options.project_trust_override = Some(true);
+        resource_options.disable_extensions = true;
+        resource_options.disable_skills = true;
+        resource_options.disable_prompt_templates = true;
+        resource_options.disable_themes = true;
+        resource_options.disable_context_files = true;
+        let resources = crate::ResourceManager::new(resource_options).expect("resources");
+        let registration = pi_ai::providers::register_faux_provider(Default::default());
+        let session = crate::Session::new_with_additional_tools_filtered_and_discovery(
+            crate::SessionOptions {
+                cwd: cwd.to_path_buf(),
+                system_prompt: String::new(),
+                model: registration.model(None).expect("generation faux model"),
+                thinking_level: pi_agent::ThinkingLevel::Off,
+                tools: Some(Vec::new()),
+                compaction: None,
+                stream_options: Default::default(),
+                api_key: "test".to_owned(),
+                before_tool_call: None,
+                after_tool_call: None,
+                stream_fn: None,
+                auth_resolver: None,
+                auth_manager: None,
+            },
+            Vec::new(),
+            crate::ToolSelection::default(),
+            crate::ResourceDiscovery::Disabled,
+        )
+        .expect("session");
+        session.set_session_dir(session_dir);
+        session
+            .attach_resources(resources)
+            .await
+            .expect("attach resources");
+        let application = crate::Application::new(session).await;
+        let capture = application.generation_capture_fn();
+        (agent_dir, application, capture, registration)
     }
 
     #[tokio::test]
     async fn hindsight_insecure_opt_in_follows_plaintext_redirect() {
-        let (target, target_requests) = serve_responses(vec![http_response("200 OK", br#"{"results":[]}"#)]);
-        let (source, source_request) = serve_redirect(format!("{target}/v1/default/banks/testbank/memories/recall"));
-        let client = HindsightClient::new(&hindsight_config(source), Path::new(".")).expect("insecure client");
-        let output = client.recall("redirect opt in", &AbortSignal::none()).await.expect("plaintext redirect follows");
+        let config = hindsight_config("http://source.test".to_owned());
+        let target = "http://target.test/v1/default/banks/testbank/memories/recall";
+        let (client, requests) = test_hindsight_client(
+            &config,
+            vec![
+                redirect_response(target),
+                http_response("200 OK", br#"{"results":[]}"#.to_vec()),
+            ],
+        );
+        let output = client
+            .recall("redirect opt in", &AbortSignal::none())
+            .await
+            .expect("plaintext redirect follows");
         assert_eq!(output, "No relevant memories found.");
-        source_request.recv_timeout(std::time::Duration::from_secs(1)).expect("redirect source reached");
-        assert_eq!(target_requests.lock().expect("target requests").len(), 1);
+        let requests = requests.lock().expect("requests");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].path_and_query,
+            "/v1/default/banks/testbank/memories/recall"
+        );
+        assert_eq!(
+            requests[1].path_and_query,
+            "/v1/default/banks/testbank/memories/recall"
+        );
     }
 
     #[test]
     fn memory_config_debug_redacts_hindsight_token() {
         let token = ["debug", "-", "sensitive-value"].concat();
-        let rendered = format!("{:?}", MemoryConfig { hindsight_api_token: Some(token.clone()), ..Default::default() });
+        let rendered = format!(
+            "{:?}",
+            MemoryConfig {
+                hindsight_api_token: Some(token.clone()),
+                ..Default::default()
+            }
+        );
         assert!(rendered.contains("[REDACTED]"), "{rendered}");
         assert!(!rendered.contains(&token), "{rendered}");
     }
 
     #[tokio::test]
     async fn hindsight_client_methods_enforce_input_bounds_before_network() {
-        let client = HindsightClient::new(&hindsight_config("http://127.0.0.1:9".to_owned()), Path::new(".")).expect("client");
+        let config = hindsight_config("http://hindsight.test".to_owned());
+        let (client, _) = test_hindsight_client(&config, Vec::new());
         let oversized = "x".repeat(HINDSIGHT_INPUT_MAX_BYTES + 1);
         let abort = AbortSignal::none();
-        assert!(client.recall("   ", &abort).await.expect_err("blank recall").to_string().contains("required"));
-        assert!(client.recall(&oversized, &abort).await.expect_err("large recall").to_string().contains("1 MiB"));
-        assert!(client.retain("", None, &abort).await.expect_err("blank retain").to_string().contains("required"));
-        assert!(client.retain(&oversized, None, &abort).await.expect_err("large retain content").to_string().contains("1 MiB"));
-        assert!(client.retain("ok", Some(&oversized), &abort).await.expect_err("large retain context").to_string().contains("1 MiB"));
-        assert!(client.reflect(" ", None, &abort).await.expect_err("blank reflect").to_string().contains("required"));
-        assert!(client.reflect(&oversized, None, &abort).await.expect_err("large reflect query").to_string().contains("1 MiB"));
-        assert!(client.reflect("ok", Some(&oversized), &abort).await.expect_err("large reflect context").to_string().contains("1 MiB"));
+        assert!(
+            client
+                .recall("   ", &abort)
+                .await
+                .expect_err("blank recall")
+                .to_string()
+                .contains("required")
+        );
+        assert!(
+            client
+                .recall(&oversized, &abort)
+                .await
+                .expect_err("large recall")
+                .to_string()
+                .contains("1 MiB")
+        );
+        assert!(
+            client
+                .retain("", None, &abort)
+                .await
+                .expect_err("blank retain")
+                .to_string()
+                .contains("required")
+        );
+        assert!(
+            client
+                .retain(&oversized, None, &abort)
+                .await
+                .expect_err("large retain content")
+                .to_string()
+                .contains("1 MiB")
+        );
+        assert!(
+            client
+                .retain("ok", Some(&oversized), &abort)
+                .await
+                .expect_err("large retain context")
+                .to_string()
+                .contains("1 MiB")
+        );
+        assert!(
+            client
+                .reflect(" ", None, &abort)
+                .await
+                .expect_err("blank reflect")
+                .to_string()
+                .contains("required")
+        );
+        assert!(
+            client
+                .reflect(&oversized, None, &abort)
+                .await
+                .expect_err("large reflect query")
+                .to_string()
+                .contains("1 MiB")
+        );
+        assert!(
+            client
+                .reflect("ok", Some(&oversized), &abort)
+                .await
+                .expect_err("large reflect context")
+                .to_string()
+                .contains("1 MiB")
+        );
     }
 
     #[tokio::test]
@@ -1666,77 +2741,160 @@ mod tests {
             ("reflect", "401 Unauthorized", 401),
             ("reflect", "503 Service Unavailable", 503),
         ] {
-            let (base, requests) = serve_responses(vec![http_response(status, br#"{"detail":"bank unavailable"}"#)]);
-            let client = HindsightClient::new(&hindsight_config(base), Path::new(".")).expect("client");
+            let config = hindsight_config("http://hindsight.test".to_owned());
+            let (client, requests) = test_hindsight_client(
+                &config,
+                vec![http_response(
+                    status,
+                    br#"{"detail":"bank unavailable"}"#.to_vec(),
+                )],
+            );
             let error = if operation == "retain" {
-                client.retain("bounded content", None, &AbortSignal::none()).await.expect_err("ensure failure")
+                client
+                    .retain("bounded content", None, &AbortSignal::none())
+                    .await
+                    .expect_err("ensure failure")
             } else {
-                client.reflect("bounded query", None, &AbortSignal::none()).await.expect_err("ensure failure")
+                client
+                    .reflect("bounded query", None, &AbortSignal::none())
+                    .await
+                    .expect_err("ensure failure")
             };
-            assert!(error.to_string().contains(&format!("createBank failed (HTTP {code})")), "{error:#}");
-            assert_eq!(requests.lock().expect("requests").len(), 1, "{operation} must not continue after ensure failure");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("createBank failed (HTTP {code})")),
+                "{error:#}"
+            );
+            assert_eq!(
+                requests.lock().expect("requests").len(),
+                1,
+                "{operation} must not continue after ensure failure"
+            );
         }
     }
 
     #[tokio::test]
     async fn hindsight_recall_matches_http_wire_contract() {
         let body = br#"{"results":[{"text":"release script lives in scripts/release.sh","type":"world","mentioned_at":"2026-08-09"}]}"#;
-        let (base, requests) = serve_responses(vec![http_response("200 OK", body)]);
-        let client = HindsightClient::new(&hindsight_config(base), Path::new(".")).expect("client");
-        let output = client.recall("release script", &AbortSignal::none()).await.expect("recall");
+        let config = hindsight_config("http://hindsight.test".to_owned());
+        let (client, requests) =
+            test_hindsight_client(&config, vec![http_response("200 OK", body.to_vec())]);
+        let output = client
+            .recall("release script", &AbortSignal::none())
+            .await
+            .expect("recall");
         assert!(output.contains("scripts/release.sh"), "{output}");
         let requests = requests.lock().expect("requests");
-        assert_eq!(requests[0].0, "/v1/default/banks/testbank/memories/recall");
-        assert_eq!(requests[0].1["query"], "release script");
-        assert_eq!(requests[0].1["budget"], "mid");
-        assert_eq!(requests[0].1["max_tokens"], 1024);
-        assert_eq!(requests[0].1["types"], json!(["world", "experience"]));
+        assert_eq!(
+            requests[0].path_and_query,
+            "/v1/default/banks/testbank/memories/recall"
+        );
+        assert_eq!(requests[0].body["query"], "release script");
+        assert_eq!(requests[0].body["budget"], "mid");
+        assert_eq!(requests[0].body["max_tokens"], 1024);
+        assert_eq!(requests[0].body["types"], json!(["world", "experience"]));
     }
 
     #[tokio::test]
     async fn hindsight_retain_ensures_bank_and_sends_item() {
-        let (base, requests) = serve_responses(vec![http_response("200 OK", br#"{}"#), http_response("200 OK", br#"{}"#)]);
-        let client = HindsightClient::new(&hindsight_config(base), Path::new(".")).expect("client");
-        let output = client.retain("cache lives in target/", Some("build"), &AbortSignal::none()).await.expect("retain");
+        let config = hindsight_config("http://hindsight.test".to_owned());
+        let (client, requests) = test_hindsight_client(
+            &config,
+            vec![
+                http_response("200 OK", br#"{}"#.to_vec()),
+                http_response("200 OK", br#"{}"#.to_vec()),
+            ],
+        );
+        let output = client
+            .retain(
+                "cache lives in target/",
+                Some("build"),
+                &AbortSignal::none(),
+            )
+            .await
+            .expect("retain");
         assert_eq!(output, "1 memory retained.");
         let requests = requests.lock().expect("requests");
-        assert_eq!(requests[0].0, "/v1/default/banks/testbank");
-        assert_eq!(requests[1].0, "/v1/default/banks/testbank/memories");
-        assert_eq!(requests[1].1["items"][0]["content"], "cache lives in target/");
-        assert_eq!(requests[1].1["items"][0]["context"], "build");
+        assert_eq!(requests[0].path_and_query, "/v1/default/banks/testbank");
+        assert_eq!(
+            requests[1].path_and_query,
+            "/v1/default/banks/testbank/memories"
+        );
+        assert_eq!(
+            requests[1].body["items"][0]["content"],
+            "cache lives in target/"
+        );
+        assert_eq!(requests[1].body["items"][0]["context"], "build");
     }
 
     #[tokio::test]
     async fn hindsight_http_errors_are_redacted() {
         let token = ["sk", "-", "abcdefghijklmnop1234567890"].concat();
         let body = format!(r#"{{"detail":"boom {token}"}}"#);
-        let (base, _) = serve_responses(vec![http_response("500 Internal Server Error", body.as_bytes())]);
-        let client = HindsightClient::new(&hindsight_config(base), Path::new(".")).expect("client");
-        let message = client.recall("x", &AbortSignal::none()).await.expect_err("HTTP error").to_string();
+        let config = hindsight_config("http://hindsight.test".to_owned());
+        let (client, _) = test_hindsight_client(
+            &config,
+            vec![http_response(
+                "500 Internal Server Error",
+                body.into_bytes(),
+            )],
+        );
+        let message = client
+            .recall("x", &AbortSignal::none())
+            .await
+            .expect_err("HTTP error")
+            .to_string();
         assert!(message.contains("HTTP 500"), "{message}");
         assert!(message.contains("[REDACTED]"), "{message}");
-        assert!(!message.contains(&["sk", "-", "abcdefghijklmnop"].concat()), "{message}");
+        assert!(
+            !message.contains(&["sk", "-", "abcdefghijklmnop"].concat()),
+            "{message}"
+        );
     }
 
     #[tokio::test]
     async fn hindsight_large_response_is_rejected_without_hanging() {
         let oversized = vec![b'x'; HINDSIGHT_RESPONSE_MAX_BYTES + 1];
-        let (base, _) = serve_responses(vec![http_response("200 OK", &oversized)]);
-        let client = HindsightClient::new(&hindsight_config(base), Path::new(".")).expect("client");
-        let error = client.recall("x", &AbortSignal::none()).await.expect_err("oversized response");
+        let config = hindsight_config("http://hindsight.test".to_owned());
+        let (client, _) = test_hindsight_client(&config, vec![http_response("200 OK", oversized)]);
+        let error = client
+            .recall("x", &AbortSignal::none())
+            .await
+            .expect_err("oversized response");
         assert!(error.to_string().contains("exceeds"), "{error:#}");
     }
 
     #[test]
     fn hindsight_rejects_unconfigured_and_plaintext_endpoints() {
-        let error = HindsightClient::new(&MemoryConfig { backend: crate::settings::MemoryBackend::Hindsight, ..Default::default() }, Path::new("."))
-            .err().expect("missing URL errors");
+        let error = HindsightClient::new_with_executor(
+            &MemoryConfig {
+                backend: crate::settings::MemoryBackend::Hindsight,
+                ..Default::default()
+            },
+            Path::new("."),
+            Arc::new(TestHttpExecutor {
+                responses: Arc::new(Mutex::new(VecDeque::new())),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }),
+        )
+        .err()
+        .expect("missing URL errors");
         assert!(error.to_string().contains("hindsightApiUrl"));
-        let error = HindsightClient::new(&MemoryConfig {
-            backend: crate::settings::MemoryBackend::Hindsight,
-            hindsight_api_url: Some("http://127.0.0.1:8888".to_owned()),
-            ..Default::default()
-        }, Path::new(".")).err().expect("plaintext errors");
+        let error = HindsightClient::new_with_executor(
+            &MemoryConfig {
+                backend: crate::settings::MemoryBackend::Hindsight,
+                hindsight_api_url: Some("http://127.0.0.1:8888".to_owned()),
+                ..Default::default()
+            },
+            Path::new("."),
+            Arc::new(TestHttpExecutor {
+                responses: Arc::new(Mutex::new(VecDeque::new())),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }),
+        )
+        .err()
+        .expect("plaintext errors");
         assert!(error.to_string().contains("hindsightAllowInsecure"));
     }
 
@@ -1760,15 +2918,23 @@ mod tests {
         let nested = repo_a.join("crates").join("pi-coding");
         std::fs::create_dir_all(&nested).expect("nested");
 
-        for scoping in [HindsightScoping::PerProject, HindsightScoping::PerProjectTagged] {
+        for scoping in [
+            HindsightScoping::PerProject,
+            HindsightScoping::PerProjectTagged,
+        ] {
             let scope_at = |path: &std::path::Path| hindsight_bank_scope(&config(scoping), path);
             let a = scope_at(&repo_a);
             let b = scope_at(&repo_b);
-            assert_ne!(a, b, "{scoping:?}: same-basename repos under different parents must differ");
+            assert_ne!(
+                a, b,
+                "{scoping:?}: same-basename repos under different parents must differ"
+            );
             let rendered_a = format!("{a:?}");
             let rendered_b = format!("{b:?}");
-            assert!(rendered_a.contains("same-name") && rendered_b.contains("same-name"),
-                "{scoping:?}: the human-readable basename must be retained: {rendered_a} / {rendered_b}");
+            assert!(
+                rendered_a.contains("same-name") && rendered_b.contains("same-name"),
+                "{scoping:?}: the human-readable basename must be retained: {rendered_a} / {rendered_b}"
+            );
             // The distinguishing component is the same identity digest local
             // memory digests (its prefix), not the basename.
             let namespace_a = repo_namespace(&repo_a);
@@ -1777,17 +2943,33 @@ mod tests {
             let prefix_a = &namespace_a[..HINDSIGHT_SCOPE_DIGEST_PREFIX];
             let prefix_b = &namespace_b[..HINDSIGHT_SCOPE_DIGEST_PREFIX];
             assert_ne!(prefix_a, prefix_b, "sanity: digest prefixes differ");
-            assert!(rendered_a.contains(prefix_a), "{scoping:?}: scope must embed the local-memory digest prefix {prefix_a}: {rendered_a}");
-            assert!(rendered_b.contains(prefix_b), "{scoping:?}: scope must embed the local-memory digest prefix {prefix_b}: {rendered_b}");
+            assert!(
+                rendered_a.contains(prefix_a),
+                "{scoping:?}: scope must embed the local-memory digest prefix {prefix_a}: {rendered_a}"
+            );
+            assert!(
+                rendered_b.contains(prefix_b),
+                "{scoping:?}: scope must embed the local-memory digest prefix {prefix_b}: {rendered_b}"
+            );
             // Nested paths inside one checkout share the repo-root scope.
-            assert_eq!(scope_at(&nested), a, "{scoping:?}: nested paths must resolve identically to the repo root");
+            assert_eq!(
+                scope_at(&nested),
+                a,
+                "{scoping:?}: nested paths must resolve identically to the repo root"
+            );
         }
 
         // Per-project keys the bank id by the label; per-project-tagged keeps
         // the shared bank id and tags each item by the label.
         let per_project = hindsight_bank_scope(&config(HindsightScoping::PerProject), &repo_a);
-        let label = format!("same-name-{}", &repo_namespace(&repo_a)[..HINDSIGHT_SCOPE_DIGEST_PREFIX]);
-        assert_eq!(per_project.bank_id, format!("{DEFAULT_HINDSIGHT_BANK_ID}-{label}"));
+        let label = format!(
+            "same-name-{}",
+            &repo_namespace(&repo_a)[..HINDSIGHT_SCOPE_DIGEST_PREFIX]
+        );
+        assert_eq!(
+            per_project.bank_id,
+            format!("{DEFAULT_HINDSIGHT_BANK_ID}-{label}")
+        );
         assert!(per_project.retain_tags.is_empty() && per_project.recall_tags.is_empty());
         assert_eq!(per_project.recall_tags_match, None);
         let tagged = hindsight_bank_scope(&config(HindsightScoping::PerProjectTagged), &repo_a);
@@ -1820,15 +3002,33 @@ mod tests {
         let hostile = dir.path().join("weird name!@#\u{7f}");
         std::fs::create_dir_all(hostile.join(".git")).expect("git");
         let scope = hindsight_bank_scope(&scoped_config(), &hostile);
-        assert!(scope.bank_id.starts_with(&format!("{DEFAULT_HINDSIGHT_BANK_ID}-weird-name-")), "{}", scope.bank_id);
-        assert!(scope.bank_id.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')),
-            "bank id must stay token-safe: {}", scope.bank_id);
+        assert!(
+            scope
+                .bank_id
+                .starts_with(&format!("{DEFAULT_HINDSIGHT_BANK_ID}-weird-name-")),
+            "{}",
+            scope.bank_id
+        );
+        assert!(
+            scope
+                .bank_id
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')),
+            "bank id must stay token-safe: {}",
+            scope.bank_id
+        );
         // A basename with no readable characters falls back to `unknown` but
         // stays unique via the digest prefix.
         let bare = dir.path().join("!!!");
         std::fs::create_dir_all(bare.join(".git")).expect("git");
         let bare_scope = hindsight_bank_scope(&scoped_config(), &bare);
-        assert!(bare_scope.bank_id.starts_with(&format!("{DEFAULT_HINDSIGHT_BANK_ID}-unknown-")), "{}", bare_scope.bank_id);
+        assert!(
+            bare_scope
+                .bank_id
+                .starts_with(&format!("{DEFAULT_HINDSIGHT_BANK_ID}-unknown-")),
+            "{}",
+            bare_scope.bank_id
+        );
         assert_ne!(bare_scope.bank_id, scope.bank_id);
     }
 
@@ -1837,17 +3037,19 @@ mod tests {
         let dir = tempfile::tempdir().expect("dir");
         let cwd = dir.path().to_string_lossy().into_owned();
         let names = |config: Option<MemoryConfig>| {
-            memory_tools_for(&cwd, None, config)
+            memory_tools_for_with_capabilities(&test_capabilities(), &cwd, None, config)
                 .into_iter()
                 .map(|tool| tool.name)
                 .collect::<Vec<_>>()
         };
         // off hides every memory tool.
-        assert!(names(Some(MemoryConfig {
-            backend: crate::settings::MemoryBackend::Off,
-            ..Default::default()
-        }))
-        .is_empty());
+        assert!(
+            names(Some(MemoryConfig {
+                backend: crate::settings::MemoryBackend::Off,
+                ..Default::default()
+            }))
+            .is_empty()
+        );
         // local keeps the built-in memory tool.
         assert_eq!(
             names(Some(MemoryConfig {
@@ -1862,7 +3064,11 @@ mod tests {
                 backend: crate::settings::MemoryBackend::Hindsight,
                 ..Default::default()
             })),
-            vec!["recall".to_owned(), "retain".to_owned(), "reflect".to_owned()]
+            vec![
+                "recall".to_owned(),
+                "retain".to_owned(),
+                "reflect".to_owned()
+            ]
         );
         // No config → default local backend (existing behavior).
         assert_eq!(names(None), vec!["memory".to_owned()]);
@@ -1871,18 +3077,32 @@ mod tests {
     #[tokio::test]
     async fn hindsight_tools_validate_arguments() {
         let dir = tempfile::tempdir().expect("dir");
-        let config = hindsight_config("http://127.0.0.1:9".to_owned());
-        let recall = recall_tool(dir.path().to_string_lossy().as_ref(), config.clone());
+        let (_agent_dir, _application, capture, _registration) =
+            test_generation_capture(dir.path()).await;
+        let config = hindsight_config("http://hindsight.test".to_owned());
+        let recall = recall_tool_with_generation(
+            dir.path().to_string_lossy().as_ref(),
+            config.clone(),
+            Some(capture.clone()),
+        );
         let error = (recall.execute)(ctx(json!({})))
             .await
             .expect_err("missing query errors");
         assert!(error.to_string().contains("query is required"));
-        let retain = retain_tool(dir.path().to_string_lossy().as_ref(), config.clone());
+        let retain = retain_tool_with_generation(
+            dir.path().to_string_lossy().as_ref(),
+            config.clone(),
+            Some(capture.clone()),
+        );
         let error = (retain.execute)(ctx(json!({})))
             .await
             .expect_err("missing content errors");
         assert!(error.to_string().contains("content is required"));
-        let reflect = reflect_tool(dir.path().to_string_lossy().as_ref(), config);
+        let reflect = reflect_tool_with_generation(
+            dir.path().to_string_lossy().as_ref(),
+            config,
+            Some(capture),
+        );
         let error = (reflect.execute)(ctx(json!({})))
             .await
             .expect_err("missing query errors");
@@ -1896,12 +3116,13 @@ mod tests {
             panic!("injection must be a custom message");
         };
         assert_eq!(custom.custom_type, "hindsight_memory");
-        assert!(!custom.display, "injection must never auto-submit to the UI");
+        assert!(
+            !custom.display,
+            "injection must never auto-submit to the UI"
+        );
         let text = match &custom.content {
             pi_ai::CustomMessageContent::Text(text) => text.clone(),
-            pi_ai::CustomMessageContent::Blocks(blocks) => {
-                text_of_blocks(blocks)
-            }
+            pi_ai::CustomMessageContent::Blocks(blocks) => text_of_blocks(blocks),
         };
         assert!(text.contains("target/"), "{text}");
     }
@@ -1914,5 +3135,399 @@ mod tests {
             }
         }
         out
+    }
+
+    fn seed_entries(agent_dir: &Path, namespace: &str, entries: &[MemoryEntry]) {
+        let dir = agent_dir.join("memory").join(namespace);
+        std::fs::create_dir_all(&dir).expect("namespace dir");
+        let mut body = String::new();
+        for entry in entries {
+            body.push_str(&serde_json::to_string(entry).expect("entry serializes"));
+            body.push('\n');
+        }
+        std::fs::write(dir.join(ENTRIES_FILE_NAME), body).expect("entries written");
+    }
+
+    fn namespace_dir(agent_dir: &Path, namespace: &str) -> PathBuf {
+        agent_dir.join("memory").join(namespace)
+    }
+
+    #[test]
+    fn migrate_same_repo_anchor_is_a_noop() {
+        let root = tempfile::tempdir().expect("root");
+        let agent_dir = root.path().join("agent");
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("git");
+        let nested = repo.join("docs");
+        std::fs::create_dir_all(&nested).expect("nested");
+        assert_eq!(repo_namespace(&repo), repo_namespace(&nested));
+        let capabilities = test_capabilities();
+        let store = store_in_with_capabilities(&capabilities, &agent_dir, &repo_namespace(&repo));
+        store.learn("anchored note", vec![], "s1").expect("learn");
+
+        let migrated =
+            migrate_repo_namespace_with_capabilities(&capabilities, &agent_dir, &repo, &nested)
+                .expect("migrate");
+        assert!(!migrated, "same repository anchor must not copy");
+        assert_eq!(store.list(None).expect("list").len(), 1);
+        // No second namespace appeared under the memory root.
+        assert_eq!(
+            std::fs::read_dir(agent_dir.join("memory"))
+                .expect("memory dir")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn migrate_copies_entries_when_the_repo_path_changes() {
+        let root = tempfile::tempdir().expect("root");
+        let agent_dir = root.path().join("agent");
+        let old_repo = root.path().join("old").join("repo");
+        let new_repo = root.path().join("new").join("renamed");
+        std::fs::create_dir_all(old_repo.join(".git")).expect("git old");
+        std::fs::create_dir_all(new_repo.join(".git")).expect("git new");
+        assert_ne!(repo_namespace(&old_repo), repo_namespace(&new_repo));
+        let capabilities = test_capabilities();
+        let old = store_in_with_capabilities(&capabilities, &agent_dir, &repo_namespace(&old_repo));
+        let (carried_id, _) = old
+            .learn("carried note", vec!["alpha".into()], "s1")
+            .expect("learn");
+        let resident = store_in_with_capabilities(&capabilities, &agent_dir, &repo_namespace(&new_repo));
+        let (resident_id, _) = resident
+            .learn("already there", vec![], "s2")
+            .expect("learn");
+
+        let migrated =
+            migrate_repo_namespace_with_capabilities(&capabilities, &agent_dir, &old_repo, &new_repo)
+                .expect("migrate");
+        assert!(migrated);
+
+        let merged = store_in_with_capabilities(&capabilities, &agent_dir, &repo_namespace(&new_repo));
+        let entries = merged.list(None).expect("list");
+        assert_eq!(entries.len(), 2);
+        let carried = entries
+            .iter()
+            .find(|entry| entry.id == carried_id)
+            .expect("carried entry");
+        assert_eq!(carried.content, "carried note");
+        assert_eq!(carried.tags, vec!["alpha".to_string()]);
+        assert_eq!(carried.session, "s1");
+        assert!(entries.iter().any(|entry| entry.id == resident_id));
+        // The old archive is recovery metadata: untouched until core commits.
+        assert_eq!(old.list(None).expect("old list").len(), 1);
+    }
+
+    #[test]
+    fn migrate_colliding_equal_entry_is_a_noop() {
+        let root = tempfile::tempdir().expect("root");
+        let agent_dir = root.path().join("agent");
+        let old_repo = root.path().join("old").join("repo");
+        let new_repo = root.path().join("new").join("repo");
+        std::fs::create_dir_all(old_repo.join(".git")).expect("git old");
+        std::fs::create_dir_all(new_repo.join(".git")).expect("git new");
+        let capabilities = test_capabilities();
+        let old = store_in_with_capabilities(&capabilities, &agent_dir, &repo_namespace(&old_repo));
+        old.learn("shared note", vec!["alpha".into()], "s1")
+            .expect("learn");
+        let entry = old.list(None).expect("list").remove(0);
+        let new_namespace = repo_namespace(&new_repo);
+        seed_entries(&agent_dir, &new_namespace, std::slice::from_ref(&entry));
+
+        let migrated =
+            migrate_repo_namespace_with_capabilities(&capabilities, &agent_dir, &old_repo, &new_repo)
+                .expect("migrate");
+        assert!(!migrated, "an identical target entry must not be copied again");
+        let target = store_in_with_capabilities(&capabilities, &agent_dir, &new_namespace);
+        assert_eq!(target.list(None).expect("list").len(), 1);
+        assert_eq!(old.list(None).expect("old list").len(), 1);
+    }
+
+    #[test]
+    fn migrate_collision_keeps_the_target_entry_on_conflict() {
+        let root = tempfile::tempdir().expect("root");
+        let agent_dir = root.path().join("agent");
+        let old_repo = root.path().join("old").join("repo");
+        let new_repo = root.path().join("new").join("repo");
+        std::fs::create_dir_all(old_repo.join(".git")).expect("git old");
+        std::fs::create_dir_all(new_repo.join(".git")).expect("git new");
+        let capabilities = test_capabilities();
+        let old = store_in_with_capabilities(&capabilities, &agent_dir, &repo_namespace(&old_repo));
+        old.learn("old version", vec![], "s1").expect("learn");
+        let mut conflict = old.list(None).expect("list").remove(0);
+        conflict.content = "target version".to_string();
+        let new_namespace = repo_namespace(&new_repo);
+        seed_entries(&agent_dir, &new_namespace, std::slice::from_ref(&conflict));
+
+        let migrated =
+            migrate_repo_namespace_with_capabilities(&capabilities, &agent_dir, &old_repo, &new_repo)
+                .expect("migrate");
+        assert!(!migrated, "a colliding id must not be overwritten");
+        let target = store_in_with_capabilities(&capabilities, &agent_dir, &new_namespace);
+        let entries = target.list(None).expect("list");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "target version");
+        assert_eq!(old.list(None).expect("old list")[0].content, "old version");
+    }
+
+    #[test]
+    fn migrate_is_idempotent() {
+        let root = tempfile::tempdir().expect("root");
+        let agent_dir = root.path().join("agent");
+        let old_repo = root.path().join("old").join("repo");
+        let new_repo = root.path().join("new").join("repo");
+        std::fs::create_dir_all(old_repo.join(".git")).expect("git old");
+        std::fs::create_dir_all(new_repo.join(".git")).expect("git new");
+        let capabilities = test_capabilities();
+        let old = store_in_with_capabilities(&capabilities, &agent_dir, &repo_namespace(&old_repo));
+        old.learn("first note", vec![], "s1").expect("learn");
+        old.learn("second note", vec![], "s1").expect("learn");
+
+        assert!(
+            migrate_repo_namespace_with_capabilities(&capabilities, &agent_dir, &old_repo, &new_repo)
+                .expect("first migrate")
+        );
+        assert!(
+            !migrate_repo_namespace_with_capabilities(&capabilities, &agent_dir, &old_repo, &new_repo)
+                .expect("second migrate"),
+            "a completed migration must not copy again"
+        );
+        let merged = store_in_with_capabilities(&capabilities, &agent_dir, &repo_namespace(&new_repo));
+        let entries = merged.list(None).expect("list");
+        assert_eq!(entries.len(), 2);
+        let ids: BTreeSet<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
+        assert_eq!(ids.len(), 2, "entries must not be duplicated");
+    }
+
+    #[test]
+    fn commit_removes_the_old_archive_only_after_migration() {
+        let root = tempfile::tempdir().expect("root");
+        let agent_dir = root.path().join("agent");
+        let old_repo = root.path().join("old").join("repo");
+        let new_repo = root.path().join("new").join("repo");
+        std::fs::create_dir_all(old_repo.join(".git")).expect("git old");
+        std::fs::create_dir_all(new_repo.join(".git")).expect("git new");
+        let old_namespace = repo_namespace(&old_repo);
+        let new_namespace = repo_namespace(&new_repo);
+        let capabilities = test_capabilities();
+        let old = store_in_with_capabilities(&capabilities, &agent_dir, &old_namespace);
+        old.learn("precious note", vec![], "s1").expect("learn");
+
+        // Refuses before the copy: recovery data must never be dropped first.
+        let error = commit_repo_namespace_migration_with_capabilities(
+            &capabilities,
+            &agent_dir,
+            &old_repo,
+            &new_repo,
+        )
+        .expect_err("commit must refuse before migration");
+        assert!(error.to_string().contains("refusing"), "{error:#}");
+        assert!(namespace_dir(&agent_dir, &old_namespace).exists());
+
+        assert!(
+            migrate_repo_namespace_with_capabilities(&capabilities, &agent_dir, &old_repo, &new_repo)
+                .expect("migrate")
+        );
+        assert!(
+            commit_repo_namespace_migration_with_capabilities(
+                &capabilities,
+                &agent_dir,
+                &old_repo,
+                &new_repo,
+            )
+            .expect("commit")
+        );
+        assert!(
+            !namespace_dir(&agent_dir, &old_namespace).exists(),
+            "old archive removed"
+        );
+        let target = store_in_with_capabilities(&capabilities, &agent_dir, &new_namespace);
+        assert_eq!(target.list(None).expect("list").len(), 1);
+        // Idempotent: the archive is already gone.
+        assert!(
+            !commit_repo_namespace_migration_with_capabilities(
+                &capabilities,
+                &agent_dir,
+                &old_repo,
+                &new_repo,
+            )
+            .expect("second commit")
+        );
+    }
+
+    #[test]
+    fn migrates_after_the_old_checkout_is_deleted_with_nested_cwd() {
+        let root = tempfile::tempdir().expect("root");
+        let agent_dir = root.path().join("agent");
+        let old_repo = root.path().join("old").join("repo");
+        let old_cwd = old_repo.join("docs");
+        let new_repo = root.path().join("new").join("renamed");
+        let new_cwd = new_repo.join("docs");
+        std::fs::create_dir_all(old_repo.join(".git")).expect("git old");
+        std::fs::create_dir_all(&old_cwd).expect("old cwd");
+        std::fs::create_dir_all(new_repo.join(".git")).expect("git new");
+        std::fs::create_dir_all(&new_cwd).expect("new cwd");
+        let capabilities = test_capabilities();
+        // Pre-move store: anchored at the old repository root, not the cwd.
+        let old = store_in_with_capabilities(&capabilities, &agent_dir, &repo_namespace(&old_repo));
+        let (carried_id, _) = old
+            .learn("carried nested note", vec![], "s1")
+            .expect("learn");
+        // The move already happened: the old checkout (and its .git) is gone,
+        // so the old namespace must be inferred from the two cwds.
+        std::fs::remove_dir_all(&old_repo).expect("old checkout removed");
+
+        let migrated =
+            migrate_repo_namespace_with_capabilities(&capabilities, &agent_dir, &old_cwd, &new_cwd)
+                .expect("migrate");
+        assert!(migrated);
+        let merged = store_in_with_capabilities(&capabilities, &agent_dir, &repo_namespace(&new_repo));
+        let entries = merged.list(None).expect("list");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, carried_id);
+        assert_eq!(entries[0].content, "carried nested note");
+    }
+
+    fn planted_entries(id_prefix: &str, count: usize, ts_base: i64) -> Vec<MemoryEntry> {
+        (0..count)
+            .map(|i| MemoryEntry {
+                id: format!("{id_prefix}-{i:032}"),
+                content: format!("{id_prefix} note {i}"),
+                tags: Vec::new(),
+                ts: ts_base + i as i64,
+                session: "s1".to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn migrate_caps_the_merged_namespace_at_max_entries() {
+        // Target below the cap: target entries are authoritative, old entries
+        // fill the remaining slots newest-first.
+        let root = tempfile::tempdir().expect("root");
+        let agent_dir = root.path().join("agent");
+        let old_repo = root.path().join("old").join("repo");
+        let new_repo = root.path().join("new").join("repo");
+        std::fs::create_dir_all(old_repo.join(".git")).expect("git old");
+        std::fs::create_dir_all(new_repo.join(".git")).expect("git new");
+        let old_namespace = repo_namespace(&old_repo);
+        let new_namespace = repo_namespace(&new_repo);
+        let capabilities = test_capabilities();
+        let target_entries = planted_entries("target", MAX_ENTRIES - 40, 10_000);
+        let old_entries = planted_entries("old", MAX_ENTRIES, 0);
+        seed_entries(&agent_dir, &old_namespace, &old_entries);
+        seed_entries(&agent_dir, &new_namespace, &target_entries);
+
+        assert!(
+            migrate_repo_namespace_with_capabilities(&capabilities, &agent_dir, &old_repo, &new_repo)
+                .expect("migrate")
+        );
+        let merged = store_in_with_capabilities(&capabilities, &agent_dir, &new_namespace);
+        let entries = merged.list(None).expect("list");
+        assert_eq!(entries.len(), MAX_ENTRIES, "merge respects the cap");
+        let ids: BTreeSet<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
+        for entry in &target_entries {
+            assert!(ids.contains(entry.id.as_str()), "target entry lost");
+        }
+        // The 40 newest old entries (ts 60..=99) took the remaining slots.
+        for i in 0..MAX_ENTRIES {
+            let id = format!("old-{i:032}");
+            assert_eq!(
+                ids.contains(id.as_str()),
+                i >= MAX_ENTRIES - 40,
+                "retention must be newest-first within the cap"
+            );
+        }
+
+        // Full target namespace: nothing is copied and the target is intact.
+        let root_b = tempfile::tempdir().expect("root b");
+        let agent_dir_b = root_b.path().join("agent");
+        let old_repo_b = root_b.path().join("old").join("repo");
+        let new_repo_b = root_b.path().join("new").join("repo");
+        std::fs::create_dir_all(old_repo_b.join(".git")).expect("git old b");
+        std::fs::create_dir_all(new_repo_b.join(".git")).expect("git new b");
+        let target_entries_b = planted_entries("target", MAX_ENTRIES, 10_000);
+        let old_entries_b = planted_entries("old", MAX_ENTRIES, 0);
+        seed_entries(&agent_dir_b, &repo_namespace(&old_repo_b), &old_entries_b);
+        seed_entries(&agent_dir_b, &repo_namespace(&new_repo_b), &target_entries_b);
+        assert!(
+            !migrate_repo_namespace_with_capabilities(&capabilities, &agent_dir_b, &old_repo_b, &new_repo_b)
+                .expect("migrate b"),
+            "a full target namespace cannot accept copies"
+        );
+        let merged_b = store_in_with_capabilities(&capabilities, &agent_dir_b, &repo_namespace(&new_repo_b));
+        let entries_b = merged_b.list(None).expect("list b");
+        assert_eq!(entries_b.len(), MAX_ENTRIES);
+        let ids_b: BTreeSet<&str> = entries_b.iter().map(|entry| entry.id.as_str()).collect();
+        for entry in &target_entries_b {
+            assert!(ids_b.contains(entry.id.as_str()), "target entry lost");
+        }
+        assert!(
+            ids_b.iter().all(|id| !id.starts_with("old-")),
+            "no old entry may evict a target entry"
+        );
+    }
+
+    #[test]
+    fn migrate_redacts_planted_secrets_and_skips_oversize_entries() {
+        let root = tempfile::tempdir().expect("root");
+        let agent_dir = root.path().join("agent");
+        let old_repo = root.path().join("old").join("repo");
+        let new_repo = root.path().join("new").join("repo");
+        std::fs::create_dir_all(old_repo.join(".git")).expect("git old");
+        std::fs::create_dir_all(new_repo.join(".git")).expect("git new");
+        let secret = ["sk", "-", "abcdefghijklmnop1234567890"].concat();
+        let planted = vec![
+            MemoryEntry {
+                id: "secret-1".to_string(),
+                content: format!("the token is {secret}"),
+                tags: Vec::new(),
+                ts: 1,
+                session: "s1".to_string(),
+            },
+            MemoryEntry {
+                id: "oversize-1".to_string(),
+                content: "x".repeat(MAX_ENTRY_BYTES + 1),
+                tags: Vec::new(),
+                ts: 2,
+                session: "s1".to_string(),
+            },
+            MemoryEntry {
+                id: "clean-1".to_string(),
+                content: "clean note".to_string(),
+                tags: Vec::new(),
+                ts: 3,
+                session: "s1".to_string(),
+            },
+        ];
+        let capabilities = test_capabilities();
+        seed_entries(&agent_dir, &repo_namespace(&old_repo), &planted);
+
+        assert!(
+            migrate_repo_namespace_with_capabilities(&capabilities, &agent_dir, &old_repo, &new_repo)
+                .expect("migrate")
+        );
+        let merged = store_in_with_capabilities(&capabilities, &agent_dir, &repo_namespace(&new_repo));
+        let entries = merged.list(None).expect("list");
+        assert_eq!(entries.len(), 2, "oversize entry is skipped");
+        let copied = entries
+            .iter()
+            .find(|entry| entry.id == "secret-1")
+            .expect("secret entry copied");
+        assert!(
+            !copied.content.contains(&secret),
+            "planted secret must be redacted: {}",
+            copied.content
+        );
+        assert!(copied.content.contains("the token is"), "prose preserved");
+        assert!(entries.iter().any(|entry| entry.id == "clean-1"));
+        // The old archive still holds the planted entries untouched.
+        assert_eq!(
+            store_in_with_capabilities(&capabilities, &agent_dir, &repo_namespace(&old_repo))
+                .list(None)
+                .expect("old list")
+                .len(),
+            3
+        );
     }
 }

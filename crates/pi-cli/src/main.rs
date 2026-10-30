@@ -8,21 +8,39 @@ use clap::Parser;
 
 use pi_cli::Cli;
 
-#[tokio::main]
-async fn main() {
-    // Best-effort parent-process hardening (non-dumpable, no core dumps) runs
-    // before anything else so no path — panic hook, arg parsing, dispatch —
-    // executes in an unprotected state. cfg-guarded and failure-ignored, so
-    // unsupported platforms start normally.
+fn main() {
+    #[cfg(unix)]
+    {
+        let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+        if arguments.as_slice()
+            == [
+                std::ffi::OsString::from("__sandbox-child"),
+                std::ffi::OsString::from("3"),
+                std::ffi::OsString::from("4"),
+            ]
+        {
+            match pi_cli::sandbox_child_main() {
+                Ok(never) => match never {},
+                Err(error) => {
+                    pi_cli::output::error_line(&error.to_string());
+                    std::process::exit(125);
+                }
+            }
+        }
+    }
+
     pi_cli::harden_process();
-    // Install the terminal-restoring panic hook before any dispatch so every
-    // path (TUI, RPC, JSON, print, subcommands) is covered. It is a no-op
-    // outside the TUI: `TUI_ACTIVE` stays false for structured-output modes,
-    // which therefore never acquire a TUI guard.
     pi_cli::tui::install_panic_hook();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|error| {
+            pi_cli::output::error_line(&format!("failed to start runtime: {error}"));
+            std::process::exit(1);
+        });
     let cli = Cli::parse();
-    if let Err(e) = pi_cli::run(cli).await {
-        pi_cli::output::error_line(&format!("{e:#}"));
+    if let Err(error) = runtime.block_on(pi_cli::run(cli)) {
+        pi_cli::output::error_line(&format!("{error:#}"));
         std::process::exit(1);
     }
 }

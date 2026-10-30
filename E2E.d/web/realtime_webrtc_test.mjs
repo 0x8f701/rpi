@@ -305,9 +305,10 @@ const SETUP_LOOPBACK = async () => {
     let parsed = null;
     try { parsed = JSON.parse(frame); } catch (e) { out.errors.push('parse session.update: ' + String(e)); }
     out.sessionUpdateType = parsed && parsed.type;
-    out.sessionUpdateModel = parsed && parsed.session && parsed.session.model;
+    out.sessionUpdateHasModel = parsed && parsed.session ? Object.prototype.hasOwnProperty.call(parsed.session, 'model') : false;
     out.sessionUpdateVoice = parsed && parsed.session && parsed.session.audio && parsed.session.audio.output && parsed.session.audio.output.voice;
-    log('session.update arrived type=' + out.sessionUpdateType + ' model=' + out.sessionUpdateModel + ' voice=' + out.sessionUpdateVoice);
+    out.sessionUpdateDelegation = parsed && parsed.session && parsed.session.delegation && parsed.session.delegation.type;
+    log('session.update arrived type=' + out.sessionUpdateType + ' hasModel=' + out.sessionUpdateHasModel + ' voice=' + out.sessionUpdateVoice + ' delegation=' + out.sessionUpdateDelegation);
 
     result.pc.close(); answerer.close();
     stream.getTracks().forEach((t) => t.stop());
@@ -394,11 +395,12 @@ async function main() {
     if (r2.postedSdpHasCandidates !== true) fail(`loopback2: setupRealtimeCall posted a candidate-less SDP: ${JSON.stringify(r2)}`);
     if (r2.answererDcOpened !== true) fail(`loopback2: answerer datachannel never opened: ${JSON.stringify(r2)}`);
     if (!r2.remoteTrack || r2.remoteTrack.kind !== 'audio') fail(`loopback2: remote audio track never arrived: ${JSON.stringify(r2)}`);
-    // session.update rode the oai-events datachannel with the V1 quicksilver
-    // session shape (voice nested under audio.output.voice).
+    // session.update is the frameless v3 shape (realtime.ts:48-57): voice
+    // nested under audio.output.voice, model omitted (proxy-owned).
     if (r2.sessionUpdateType !== 'session.update') fail(`loopback2: session.update type wrong: ${r2.sessionUpdateType}`);
-    if (r2.sessionUpdateModel !== 'gpt-realtime-1.5') fail(`loopback2: session.update model not propagated: ${r2.sessionUpdateModel}`);
+    if (r2.sessionUpdateHasModel === true) fail(`loopback2: session.update must omit model: ${JSON.stringify(r2)}`);
     if (r2.sessionUpdateVoice !== 'sol') fail(`loopback2: session.update voice not nested under audio.output.voice: ${r2.sessionUpdateVoice}`);
+    if (r2.sessionUpdateDelegation !== 'client') fail(`loopback2: session.update delegation.type not client: ${r2.sessionUpdateDelegation}`);
     console.log('web-realtime-webrtc: loopback2 (real setupRealtimeCall + session.update over oai-events) PASSED');
 
     await page.screenshot({ path: `${evidence}/realtime-webrtc.png`, fullPage: true });

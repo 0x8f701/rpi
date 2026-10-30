@@ -5,25 +5,37 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::ffi::OsStr;
-use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Output};
-use std::sync::{OnceLock, atomic::{AtomicU64, Ordering}};
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use globset::{GlobBuilder, GlobMatcher};
 use parking_lot::{Mutex, MutexGuard};
+use pi_sandbox::{AbsolutePath, RelativePath};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use walkdir::{DirEntry, WalkDir};
+
+use crate::fs::{
+    CapabilityAccess, CapabilityDirectory, CapabilityEntry, CapabilityFs, CapabilityRootLease,
+    CapabilityRootPurpose, EntryKind, FileIdentity, FileMode, FsError, Replacement, RootCreation,
+};
+
+use crate::process::{GovernedProcessContext, GovernedProcessOutput, GovernedProcessSpec};
+
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_GIT_STDOUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_GIT_STDERR_BYTES: usize = 64 * 1024;
 
 pub const PACKAGE_SOURCE_SCHEMA_VERSION: u32 = 1;
 pub const PACKAGE_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const PACKAGE_STATE_SCHEMA_VERSION: u32 = 1;
 
-const CONFIG_DIR_NAME: &str = ".pi";
+const CONFIG_DIR_NAME: &str = ".rpi";
 const SETTINGS_FILE_NAME: &str = "settings.json";
 const STATE_FILE_NAME: &str = "package-state.json";
 const OPERATION_LOCK_FILE_NAME: &str = ".package-operation.lock";
@@ -123,8 +135,7 @@ impl ManagedPackageSource {
     fn identity(&self) -> String {
         match &self.kind {
             ManagedPackageSourceKind::Local { path } => {
-                let identity_path = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
-                format!("local:{}", identity_path.to_string_lossy())
+                format!("local:{}", path.to_string_lossy())
             }
             ManagedPackageSourceKind::Git { host, path, .. } => {
                 format!("git:{}/{}", host.to_ascii_lowercase(), path)
@@ -136,10 +147,7 @@ impl ManagedPackageSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PackageManifest {
-    #[serde(
-        default = "package_manifest_schema_version",
-        rename = "schemaVersion"
-    )]
+    #[serde(default = "package_manifest_schema_version", rename = "schemaVersion")]
     pub schema_version: u32,
     #[serde(default)]
     pub extensions: Vec<String>,
@@ -203,6 +211,8 @@ pub enum PackageResourceKind {
 pub struct PackageResourceSpec {
     pub kind: PackageResourceKind,
     pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_root: Option<PathBuf>,
     pub package_id: String,
     pub scope: PackageScope,
     pub trusted: bool,
@@ -236,11 +246,7 @@ impl PackageResources {
         }
     }
 
-    fn append_deduped(
-        &mut self,
-        other: Self,
-        seen: &mut HashSet<(PackageResourceKind, PathBuf)>,
-    ) {
+    fn append_deduped(&mut self, other: Self, seen: &mut HashSet<(PackageResourceKind, PathBuf)>) {
         for resource in other.extensions {
             if seen.insert((resource.kind, resource.path.clone())) {
                 self.extensions.push(resource);
@@ -320,7 +326,8 @@ impl PackageState {
         self.packages
             .retain(|existing| existing.identity != package.identity);
         self.packages.push(package);
-        self.packages.sort_by(|left, right| left.identity.cmp(&right.identity));
+        self.packages
+            .sort_by(|left, right| left.identity.cmp(&right.identity));
     }
 
     fn remove(&mut self, identity: &str) {
@@ -378,24 +385,32 @@ pub struct ScopePackage {
     pub resources: PackageResources,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PackageManager {
     cwd: PathBuf,
     agent_dir: PathBuf,
+    capabilities: Arc<CapabilityFs>,
+    global: CapabilityRootLease,
+    project: Option<CapabilityRootLease>,
     project_trusted: bool,
+    process: Option<GovernedProcessContext>,
+}
+
+impl std::fmt::Debug for PackageManager {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PackageManager")
+            .field("cwd", &self.cwd)
+            .field("agent_dir", &self.agent_dir)
+            .field("project_trusted", &self.project_trusted)
+            .finish()
+    }
 }
 
 impl PackageManager {
-    /// Construct a manager using `PI_CODING_AGENT_DIR`, or `~/.pi/agent`.
     pub fn new(cwd: impl AsRef<Path>, project_trusted: bool) -> Result<Self> {
-        let cwd = absolute_existing_or_lexical(cwd.as_ref())
-            .with_context(|| format!("resolving working directory {}", cwd.as_ref().display()))?;
-        let agent_dir = agent_directory()?;
-        Ok(Self {
-            cwd,
-            agent_dir,
-            project_trusted,
-        })
+        let agent_dir = crate::resources::agent_dir_path();
+        Self::with_agent_dir(cwd, agent_dir, project_trusted)
     }
 
     pub fn with_agent_dir(
@@ -403,11 +418,103 @@ impl PackageManager {
         agent_dir: impl AsRef<Path>,
         project_trusted: bool,
     ) -> Result<Self> {
+        let cwd = absolute_existing_or_lexical(cwd.as_ref())?;
+        let agent_dir = absolute_existing_or_lexical(agent_dir.as_ref())?;
+        let capabilities =
+            CapabilityFs::new().context("creating package filesystem capabilities")?;
+        let global = capabilities
+            .open_root(
+                CapabilityRootPurpose::AgentStore,
+                AbsolutePath::parse(agent_dir.clone()).map_err(|_| FsError::InvalidPath)?,
+                CapabilityAccess::PrivateReadWrite,
+                RootCreation::CreateDirectory,
+            )
+            .context("opening global package store")?;
+        let project = project_trusted
+            .then(|| {
+                capabilities.open_root(
+                    CapabilityRootPurpose::ProjectResources,
+                    AbsolutePath::parse(cwd.join(CONFIG_DIR_NAME))
+                        .map_err(|_| FsError::InvalidPath)?,
+                    CapabilityAccess::PrivateReadWrite,
+                    RootCreation::CreateDirectory,
+                )
+            })
+            .transpose()
+            .context("opening project package resources")?;
         Ok(Self {
-            cwd: absolute_existing_or_lexical(cwd.as_ref())?,
-            agent_dir: absolute_existing_or_lexical(agent_dir.as_ref())?,
+            cwd,
+            agent_dir,
+            capabilities,
+            global,
+            project,
             project_trusted,
+            process: None,
         })
+    }
+
+    pub(crate) fn for_retained_resource_resolution(
+        cwd: impl AsRef<Path>,
+        capabilities: Arc<CapabilityFs>,
+        global: CapabilityRootLease,
+        project_root: Option<&CapabilityRootLease>,
+        project_trusted: bool,
+    ) -> Result<Self> {
+        let cwd = absolute_existing_or_lexical(cwd.as_ref())?;
+        let agent_dir = global.authority_root().to_path_buf();
+        let project = if project_trusted {
+            match project_root {
+                Some(root) => match root.lease_directory(
+                    Path::new(CONFIG_DIR_NAME),
+                    CapabilityAccess::ReadOnly,
+                    RootCreation::Existing,
+                ) {
+                    Ok(project) => Some(project),
+                    Err(FsError::System {
+                        kind: std::io::ErrorKind::NotFound,
+                        ..
+                    }) => None,
+                    Err(error) => return Err(error.into()),
+                },
+                None => match capabilities.open_root(
+                    CapabilityRootPurpose::ProjectResources,
+                    AbsolutePath::parse(cwd.join(CONFIG_DIR_NAME))
+                        .map_err(|_| FsError::InvalidPath)?,
+                    CapabilityAccess::ReadOnly,
+                    RootCreation::Existing,
+                ) {
+                    Ok(project) => Some(project),
+                    Err(FsError::System {
+                        kind: std::io::ErrorKind::NotFound,
+                        ..
+                    }) => None,
+                    Err(error) => return Err(error.into()),
+                },
+            }
+        } else {
+            None
+        };
+        Ok(Self {
+            cwd,
+            agent_dir,
+            capabilities,
+            global,
+            project,
+            project_trusted,
+            process: None,
+        })
+    }
+
+    #[must_use]
+    pub fn with_process_context(mut self, process: GovernedProcessContext) -> Self {
+        self.process = Some(process);
+        self
+    }
+
+    fn process_context(&self) -> Result<&GovernedProcessContext> {
+        self.process
+            .as_ref()
+            .ok_or_else(|| anyhow!("package process generation is unavailable"))
     }
 
     #[must_use]
@@ -425,6 +532,14 @@ impl PackageManager {
         match scope {
             PackageScope::Global => self.agent_dir.clone(),
             PackageScope::Project => self.cwd.join(CONFIG_DIR_NAME),
+        }
+    }
+    fn scope_lease(&self, scope: PackageScope) -> Result<&CapabilityRootLease> {
+        match scope {
+            PackageScope::Global => Ok(&self.global),
+            PackageScope::Project => self.project.as_ref().ok_or_else(|| {
+                anyhow!("project is not trusted; refusing to access project package storage")
+            }),
         }
     }
 
@@ -449,13 +564,25 @@ impl PackageManager {
         }
         let parsed = self.parse_configured_source(source, scope)?;
         let path = self.installed_root(&parsed, scope)?;
-        if !path.exists() {
-            return Ok(None);
-        }
-        if matches!(parsed.kind, ManagedPackageSourceKind::Git { .. }) {
-            ensure_managed_git_path(&self.scope_root(scope).join("git"), &path)?;
-        }
-        Ok(Some(path))
+        let exists = match &parsed.kind {
+            ManagedPackageSourceKind::Local { path } => {
+                operator_path_exists(&self.capabilities, path)
+            }
+            ManagedPackageSourceKind::Git { .. } => {
+                match self
+                    .scope_lease(scope)?
+                    .metadata(&self.installed_relative(&parsed)?)
+                {
+                    Ok(_) => true,
+                    Err(FsError::System {
+                        kind: std::io::ErrorKind::NotFound,
+                        ..
+                    }) => false,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        };
+        Ok(exists.then_some(path))
     }
 
     pub fn install(&self, source: &str, scope: PackageScope) -> Result<PackageOperation> {
@@ -564,7 +691,7 @@ impl PackageManager {
     /// global entries with the same package identity.
     pub fn resolve_resources(&self) -> Result<PackageResources> {
         let global = self.load_configured_scope(PackageScope::Global)?;
-        let project = if self.project_trusted {
+        let project = if self.project_trusted && self.project.is_some() {
             self.load_configured_scope(PackageScope::Project)?
         } else {
             Vec::new()
@@ -582,16 +709,34 @@ impl PackageManager {
         let mut paths = HashSet::new();
         for entry in effective {
             if entry.source.trim_start().starts_with("npm:") {
-                // Resource resolution must not invent installs for npm entries.
-                // Surface them as unsupported at list/config time; never load.
                 continue;
             }
             let parsed = self.parse_configured_source(&entry.source, entry.scope)?;
             let root = self.installed_root(&parsed, entry.scope)?;
-            if !root.exists() {
-                continue;
-            }
-            let discovered = discover_package(&root, &parsed.identity(), entry.scope, true)?;
+            let store_relative = match &parsed.kind {
+                ManagedPackageSourceKind::Local { .. } => None,
+                ManagedPackageSourceKind::Git { .. } => {
+                    let relative = self.installed_relative(&parsed)?;
+                    if self.scope_lease(entry.scope)?.metadata(&relative).is_err() {
+                        continue;
+                    }
+                    Some(relative)
+                }
+            };
+            let discovered = discover_package(
+                &self.capabilities,
+                store_relative.as_deref().map(|relative| {
+                    (
+                        self.scope_lease(entry.scope)
+                            .expect("scope already validated"),
+                        relative,
+                    )
+                }),
+                &root,
+                &parsed.identity(),
+                entry.scope,
+                true,
+            )?;
             resources.append_deduped(discovered.resources, &mut paths);
         }
         Ok(resources)
@@ -605,10 +750,14 @@ impl PackageManager {
     }
 
     fn lock_operations(&self) -> Result<OperationLock<'_>> {
-        OperationLock::acquire(&self.agent_dir)
+        OperationLock::acquire(&self.global)
     }
 
-    fn parse_configured_source(&self, source: &str, scope: PackageScope) -> Result<ManagedPackageSource> {
+    fn parse_configured_source(
+        &self,
+        source: &str,
+        scope: PackageScope,
+    ) -> Result<ManagedPackageSource> {
         if source.trim_start().starts_with("npm:") {
             bail!(npm_deferred_error());
         }
@@ -647,12 +796,18 @@ impl PackageManager {
         source.validate_version()?;
         self.assert_scope_trusted(scope)?;
         let identity = source.identity();
+        let lease = self.scope_lease(scope)?;
         let state_path = self.state_path(scope);
-        let mut state = load_state(&state_path)?;
-        let state_snapshot = FileSnapshot::capture(&state_path)?;
+        let mut state = load_state(lease, Path::new(STATE_FILE_NAME), &state_path)?;
+        let state_snapshot =
+            FileSnapshot::capture(lease.clone(), PathBuf::from(STATE_FILE_NAME), state_path)?;
         let settings_path = self.settings_path(scope);
         let (settings_snapshot, next_settings) = if persist_settings {
-            let snapshot = FileSnapshot::capture(&settings_path)?;
+            let snapshot = FileSnapshot::capture(
+                lease.clone(),
+                PathBuf::from(SETTINGS_FILE_NAME),
+                settings_path.clone(),
+            )?;
             let next = add_source_to_settings(
                 snapshot.bytes.as_deref(),
                 &settings_source,
@@ -667,23 +822,18 @@ impl PackageManager {
 
         match &source.kind {
             ManagedPackageSourceKind::Local { path } => {
-                if !path.exists() {
+                if !operator_path_exists(&self.capabilities, path) {
                     bail!("local package path does not exist: {}", path.display());
                 }
-                let discovered = discover_package(path, &identity, scope, true)?;
-                let installed = installed_package(
-                    source.clone(),
-                    scope,
-                    path.clone(),
-                    None,
-                    discovered,
-                )?;
+                let discovered =
+                    discover_package(&self.capabilities, None, path, &identity, scope, true)?;
+                let installed =
+                    installed_package(source.clone(), scope, path.clone(), None, discovered)?;
                 state.upsert(installed);
                 commit_metadata(
-                    &state_path,
+                    lease,
                     &state,
                     &state_snapshot,
-                    &settings_path,
                     next_settings.as_deref(),
                     settings_snapshot.as_ref(),
                 )?;
@@ -696,18 +846,48 @@ impl PackageManager {
                 })
             }
             ManagedPackageSourceKind::Git { .. } => {
-                let target = self.installed_root(&source, scope)?;
-                let staging = unique_sibling(&target, "staging");
-                let mut staging_guard = RemovePathOnDrop::new(staging.clone());
-                prepare_git_checkout(&source, &target, &staging)?;
-                discover_package(&staging, &identity, scope, true)
-                    .context("validating staged package resources")?;
-
-                let mut checkout_swap = CheckoutSwap::activate(staging, target.clone())?;
+                let target_relative = self.installed_relative(&source)?;
+                let target = self.scope_root(scope).join(&target_relative);
+                let staging_relative = unique_sibling_relative(&target_relative, "staging");
+                let staging = self.scope_root(scope).join(&staging_relative);
+                let mut staging_guard =
+                    RemovePathOnDrop::new(lease.clone(), staging_relative.clone());
+                prepare_git_checkout(
+                    lease,
+                    self.process_context()?,
+                    &self.cwd,
+                    &source,
+                    &target_relative,
+                    &target,
+                    &staging_relative,
+                    &staging,
+                )?;
+                discover_package(
+                    &self.capabilities,
+                    Some((lease, &staging_relative)),
+                    &staging,
+                    &identity,
+                    scope,
+                    true,
+                )
+                .context("validating staged package resources")?;
+                let mut checkout_swap = CheckoutSwap::activate(
+                    lease.clone(),
+                    staging_relative,
+                    target_relative.clone(),
+                    target.clone(),
+                )?;
                 staging_guard.disarm();
                 let result = (|| -> Result<PackageOperation> {
-                    let revision = git_revision(&target)?;
-                    let discovered = discover_package(&target, &identity, scope, true)?;
+                    let revision = git_revision(self.process_context()?, &self.cwd, &target)?;
+                    let discovered = discover_package(
+                        &self.capabilities,
+                        Some((lease, &target_relative)),
+                        &target,
+                        &identity,
+                        scope,
+                        true,
+                    )?;
                     let installed = installed_package(
                         source.clone(),
                         scope,
@@ -717,10 +897,9 @@ impl PackageManager {
                     )?;
                     state.upsert(installed);
                     commit_metadata(
-                        &state_path,
+                        lease,
                         &state,
                         &state_snapshot,
-                        &settings_path,
                         next_settings.as_deref(),
                         settings_snapshot.as_ref(),
                     )?;
@@ -732,15 +911,13 @@ impl PackageManager {
                         revision: Some(revision),
                     })
                 })();
-
                 match result {
                     Ok(operation) => {
                         checkout_swap.finalize();
                         Ok(operation)
                     }
                     Err(error) => {
-                        let rollback = checkout_swap.rollback();
-                        if let Err(rollback_error) = rollback {
+                        if let Err(rollback_error) = checkout_swap.rollback() {
                             return Err(anyhow!(
                                 "{error:#}; additionally failed to restore the previous checkout: {rollback_error:#}"
                             ));
@@ -759,13 +936,22 @@ impl PackageManager {
         scope: PackageScope,
     ) -> Result<()> {
         let identity = source.identity();
+        let lease = self.scope_lease(scope)?;
         let state_path = self.state_path(scope);
-        let state_snapshot = FileSnapshot::capture(&state_path)?;
-        let mut state = load_state(&state_path)?;
+        let state_snapshot = FileSnapshot::capture(
+            lease.clone(),
+            PathBuf::from(STATE_FILE_NAME),
+            state_path.clone(),
+        )?;
+        let mut state = load_state(lease, Path::new(STATE_FILE_NAME), &state_path)?;
         state.remove(&identity);
 
         let settings_path = self.settings_path(scope);
-        let settings_snapshot = FileSnapshot::capture(&settings_path)?;
+        let settings_snapshot = FileSnapshot::capture(
+            lease.clone(),
+            PathBuf::from(SETTINGS_FILE_NAME),
+            settings_path.clone(),
+        )?;
         let next_settings = remove_source_from_settings(
             settings_snapshot.bytes.as_deref(),
             settings_source,
@@ -778,16 +964,26 @@ impl PackageManager {
             ManagedPackageSourceKind::Git { .. } => Some(self.installed_root(source, scope)?),
             ManagedPackageSourceKind::Local { .. } => None,
         };
-        let mut removed_checkout = match checkout.filter(|path| path.exists()) {
-            Some(path) => Some(RemovedCheckout::activate(path)?),
-            None => None,
+        let mut removed_checkout = match checkout {
+            Some(path)
+                if self
+                    .scope_lease(scope)?
+                    .metadata(&self.installed_relative(source)?)
+                    .is_ok() =>
+            {
+                Some(RemovedCheckout::activate(
+                    self.scope_lease(scope)?.clone(),
+                    self.installed_relative(source)?,
+                    path,
+                )?)
+            }
+            _ => None,
         };
 
         let metadata_result = commit_metadata(
-            &state_path,
+            lease,
             &state,
             &state_snapshot,
-            &settings_path,
             next_settings.as_deref(),
             Some(&settings_snapshot),
         );
@@ -807,12 +1003,26 @@ impl PackageManager {
         Ok(())
     }
 
-    fn installed_root(&self, source: &ManagedPackageSource, scope: PackageScope) -> Result<PathBuf> {
+    fn installed_root(
+        &self,
+        source: &ManagedPackageSource,
+        scope: PackageScope,
+    ) -> Result<PathBuf> {
         match &source.kind {
             ManagedPackageSourceKind::Local { path } => Ok(path.clone()),
+            ManagedPackageSourceKind::Git { .. } => Ok(self
+                .scope_root(scope)
+                .join(self.installed_relative(source)?)),
+        }
+    }
+
+    fn installed_relative(&self, source: &ManagedPackageSource) -> Result<PathBuf> {
+        match &source.kind {
+            ManagedPackageSourceKind::Local { .. } => {
+                Err(anyhow!("local packages are not store-relative"))
+            }
             ManagedPackageSourceKind::Git { host, path, .. } => {
-                let root = self.scope_root(scope).join("git");
-                managed_join(&root, host, path)
+                managed_join(Path::new("git"), host, path)
             }
         }
     }
@@ -838,7 +1048,22 @@ impl PackageManager {
             result.push(ConfiguredPackage {
                 source: entry.source,
                 scope,
-                installed_path: installed_path.exists().then_some(installed_path),
+                installed_path: match &parsed.kind {
+                    ManagedPackageSourceKind::Local { path }
+                        if operator_path_exists(&self.capabilities, path) =>
+                    {
+                        Some(installed_path)
+                    }
+                    ManagedPackageSourceKind::Git { .. }
+                        if self
+                            .scope_lease(scope)?
+                            .metadata(&self.installed_relative(&parsed)?)
+                            .is_ok() =>
+                    {
+                        Some(installed_path)
+                    }
+                    _ => None,
+                },
                 pinned: parsed.is_pinned(),
                 supported: true,
             });
@@ -848,7 +1073,12 @@ impl PackageManager {
 
     fn check_scope_available_updates(&self, scope: PackageScope) -> Result<Vec<PackageUpdate>> {
         self.assert_scope_trusted(scope)?;
-        let state = load_state(&self.state_path(scope))?;
+        let state_path = self.state_path(scope);
+        let state = load_state(
+            self.scope_lease(scope)?,
+            Path::new(STATE_FILE_NAME),
+            &state_path,
+        )?;
         let mut updates = Vec::new();
         for entry in self.load_configured_scope(scope)? {
             if entry.source.trim_start().starts_with("npm:") {
@@ -863,14 +1093,17 @@ impl PackageManager {
             };
             let update_type = match &parsed.kind {
                 ManagedPackageSourceKind::Git { .. } => {
-                    let local = git_revision(&root)?;
-                    let Ok(remote) = resolve_remote_git_revision(&parsed) else {
+                    let local = git_revision(self.process_context()?, &self.cwd, &root)?;
+                    let Ok(remote) =
+                        resolve_remote_git_revision(self.process_context()?, &self.cwd, &parsed)
+                    else {
                         continue;
                     };
                     (local != remote).then_some(PackageUpdateType::Git)
                 }
                 ManagedPackageSourceKind::Local { path } => {
-                    let discovered = discover_package(path, &identity, scope, true)?;
+                    let discovered =
+                        discover_package(&self.capabilities, None, path, &identity, scope, true)?;
                     let installed = state
                         .packages
                         .iter()
@@ -894,7 +1127,7 @@ impl PackageManager {
 
     fn load_configured_scope(&self, scope: PackageScope) -> Result<Vec<SettingsPackageEntry>> {
         self.assert_scope_trusted(scope)?;
-        load_settings_packages(&self.settings_path(scope), scope)
+        load_settings_packages(self.scope_lease(scope)?, &self.settings_path(scope), scope)
     }
 
     /// Re-discover configured packages and their resources for one scope, for
@@ -913,11 +1146,30 @@ impl PackageManager {
             }
             let parsed = self.parse_configured_source(&entry.source, scope)?;
             let root = self.installed_root(&parsed, scope)?;
-            if !root.exists() {
-                continue;
-            }
+            let store_relative = match &parsed.kind {
+                ManagedPackageSourceKind::Local { .. } => None,
+                ManagedPackageSourceKind::Git { .. } => {
+                    let relative = self.installed_relative(&parsed)?;
+                    if self.scope_lease(scope)?.metadata(&relative).is_err() {
+                        continue;
+                    }
+                    Some(relative)
+                }
+            };
             let identity = parsed.identity();
-            let discovered = discover_package(&root, &identity, scope, true)?;
+            let discovered = discover_package(
+                &self.capabilities,
+                store_relative.as_deref().map(|relative| {
+                    (
+                        self.scope_lease(scope).expect("scope already validated"),
+                        relative,
+                    )
+                }),
+                &root,
+                &identity,
+                scope,
+                true,
+            )?;
             out.push(ScopePackage {
                 identity,
                 source: entry.source,
@@ -1041,7 +1293,10 @@ const fn npm_deferred_error() -> &'static str {
 }
 
 fn split_git_reference(raw: &str) -> Result<(String, Option<String>)> {
-    if raw.bytes().any(|byte| matches!(byte, b'\0' | b'\n' | b'\r')) {
+    if raw
+        .bytes()
+        .any(|byte| matches!(byte, b'\0' | b'\n' | b'\r'))
+    {
         bail!("git package source contains an invalid control character");
     }
     if raw.contains('?') || raw.contains('#') {
@@ -1079,7 +1334,10 @@ fn split_reference_at(raw: &str, path_start: usize) -> Result<(String, Option<St
     if repo.is_empty() || reference.is_empty() {
         bail!("git package source has an empty repository or ref");
     }
-    Ok((repo.trim_end_matches('/').to_string(), Some(reference.to_string())))
+    Ok((
+        repo.trim_end_matches('/').to_string(),
+        Some(reference.to_string()),
+    ))
 }
 
 fn validate_git_reference(reference: &str) -> Result<()> {
@@ -1093,9 +1351,13 @@ fn validate_git_reference(reference: &str) -> Result<()> {
             || candidate.contains("..")
             || candidate.contains("//")
             || candidate.contains("@{")
-            || candidate.chars().any(|ch| matches!(ch, '\\' | ':' | '?' | '*' | '[' | '^' | '~' | ' '))
+            || candidate
+                .chars()
+                .any(|ch| matches!(ch, '\\' | ':' | '?' | '*' | '[' | '^' | '~' | ' '))
             || candidate.bytes().any(|byte| byte.is_ascii_control())
-            || candidate.split('/').any(|part| part.is_empty() || part == "." || part == ".." || part.ends_with(".lock"))
+            || candidate.split('/').any(|part| {
+                part.is_empty() || part == "." || part == ".." || part.ends_with(".lock")
+            })
         {
             bail!("unsafe or invalid git ref: {reference}");
         }
@@ -1121,7 +1383,10 @@ fn normalize_git_host(host: &str) -> Result<String> {
 }
 
 fn normalize_git_path(path: &str) -> Result<String> {
-    let trimmed = path.trim_matches('/').strip_suffix(".git").unwrap_or(path.trim_matches('/'));
+    let trimmed = path
+        .trim_matches('/')
+        .strip_suffix(".git")
+        .unwrap_or(path.trim_matches('/'));
     let decoded = percent_decode_for_validation(trimmed)?;
     for candidate in [trimmed, decoded.as_str()] {
         if candidate.is_empty()
@@ -1206,23 +1471,48 @@ const fn hex_value(value: u8) -> Option<u8> {
     }
 }
 
-fn prepare_git_checkout(source: &ManagedPackageSource, target: &Path, staging: &Path) -> Result<()> {
+fn prepare_git_checkout(
+    lease: &CapabilityRootLease,
+    process: &GovernedProcessContext,
+    default_cwd: &Path,
+    source: &ManagedPackageSource,
+    target_relative: &Path,
+    target: &Path,
+    staging_relative: &Path,
+    staging: &Path,
+) -> Result<()> {
     let ManagedPackageSourceKind::Git {
         repo, reference, ..
     } = &source.kind
     else {
         bail!("internal error: attempted git checkout for a local package");
     };
-    if let Some(parent) = staging.parent() {
-        fs::create_dir_all(parent)
+    if let Some(parent) = staging_relative.parent() {
+        lease
+            .create_dir_all(parent, package_mode(lease))
             .with_context(|| format!("creating git staging directory {}", parent.display()))?;
     }
-    if staging.exists() {
-        fs::remove_dir_all(staging)
-            .with_context(|| format!("removing stale git staging path {}", staging.display()))?;
+    match lease.metadata(staging_relative) {
+        Ok(metadata) if metadata.identity.kind() == EntryKind::Directory => lease
+            .remove_tree(staging_relative)
+            .with_context(|| format!("removing stale git staging path {}", staging.display()))?,
+        Ok(_) => bail!("git staging path is not a directory: {}", staging.display()),
+        Err(error) if fs_error_kind(&error) == Some(std::io::ErrorKind::NotFound) => {}
+        Err(error) => return Err(error).context("inspecting git staging path"),
     }
 
-    if target.join(".git").exists() {
+    let target_metadata = match lease.metadata(target_relative) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if fs_error_kind(&error) == Some(std::io::ErrorKind::NotFound) => None,
+        Err(error) => return Err(error).context("inspecting package checkout target"),
+    };
+    let git_relative = target_relative.join(".git");
+    let is_git_checkout = target_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.identity.kind() == EntryKind::Directory)
+        && lease.metadata(&git_relative).is_ok();
+
+    if is_git_checkout {
         let args = vec![
             "clone".to_string(),
             "--no-hardlinks".to_string(),
@@ -1230,13 +1520,21 @@ fn prepare_git_checkout(source: &ManagedPackageSource, target: &Path, staging: &
             target.to_string_lossy().into_owned(),
             staging.to_string_lossy().into_owned(),
         ];
-        run_git(&args, None).context("cloning the previous checkout into staging")?;
+        run_git(process, default_cwd, &args, None)
+            .context("cloning the previous checkout into staging")?;
         run_git(
-            &["remote".into(), "set-url".into(), "origin".into(), repo.clone()],
+            process,
+            default_cwd,
+            &[
+                "remote".into(),
+                "set-url".into(),
+                "origin".into(),
+                repo.clone(),
+            ],
             Some(staging),
         )
         .context("setting the staged checkout origin")?;
-    } else if target.exists() {
+    } else if target_metadata.is_some() {
         bail!(
             "package install path exists but is not a git checkout: {}",
             target.display()
@@ -1248,11 +1546,13 @@ fn prepare_git_checkout(source: &ManagedPackageSource, target: &Path, staging: &
             repo.clone(),
             staging.to_string_lossy().into_owned(),
         ];
-        run_git(&args, None).context("cloning git package")?;
+        run_git(process, default_cwd, &args, None).context("cloning git package")?;
     }
 
     let commit = if let Some(reference) = reference {
         run_git(
+            process,
+            default_cwd,
             &[
                 "fetch".into(),
                 "--force".into(),
@@ -1264,19 +1564,25 @@ fn prepare_git_checkout(source: &ManagedPackageSource, target: &Path, staging: &
         )
         .with_context(|| format!("fetching configured git ref {reference}"))?;
         run_git_capture(
+            process,
+            default_cwd,
             &["rev-parse".into(), "FETCH_HEAD^{commit}".into()],
             Some(staging),
         )?
     } else {
-        reconcile_remote_default(staging)?
+        reconcile_remote_default(process, default_cwd, staging)?
     };
 
     run_git(
+        process,
+        default_cwd,
         &["reset".into(), "--hard".into(), commit.trim().into()],
         Some(staging),
     )
     .context("resetting staged package checkout")?;
     run_git(
+        process,
+        default_cwd,
         &["clean".into(), "-fdx".into()],
         Some(staging),
     )
@@ -1284,13 +1590,21 @@ fn prepare_git_checkout(source: &ManagedPackageSource, target: &Path, staging: &
     Ok(())
 }
 
-fn reconcile_remote_default(checkout: &Path) -> Result<String> {
+fn reconcile_remote_default(
+    process: &GovernedProcessContext,
+    default_cwd: &Path,
+    checkout: &Path,
+) -> Result<String> {
     run_git(
+        process,
+        default_cwd,
         &["fetch".into(), "--prune".into(), "origin".into()],
         Some(checkout),
     )
     .context("fetching remote default branch")?;
     let _ = run_git(
+        process,
+        default_cwd,
         &[
             "remote".into(),
             "set-head".into(),
@@ -1301,6 +1615,8 @@ fn reconcile_remote_default(checkout: &Path) -> Result<String> {
     );
 
     if let Ok(commit) = run_git_capture(
+        process,
+        default_cwd,
         &["rev-parse".into(), "origin/HEAD^{commit}".into()],
         Some(checkout),
     ) {
@@ -1308,6 +1624,8 @@ fn reconcile_remote_default(checkout: &Path) -> Result<String> {
     }
 
     let remote = run_git_capture(
+        process,
+        default_cwd,
         &[
             "ls-remote".into(),
             "--symref".into(),
@@ -1325,6 +1643,8 @@ fn reconcile_remote_default(checkout: &Path) -> Result<String> {
     validate_git_reference(branch)?;
     let remote_ref = format!("refs/remotes/origin/{branch}");
     run_git(
+        process,
+        default_cwd,
         &[
             "fetch".into(),
             "--force".into(),
@@ -1334,12 +1654,18 @@ fn reconcile_remote_default(checkout: &Path) -> Result<String> {
         Some(checkout),
     )?;
     run_git_capture(
+        process,
+        default_cwd,
         &["rev-parse".into(), format!("{remote_ref}^{{commit}}")],
         Some(checkout),
     )
 }
 
-fn resolve_remote_git_revision(source: &ManagedPackageSource) -> Result<String> {
+fn resolve_remote_git_revision(
+    process: &GovernedProcessContext,
+    default_cwd: &Path,
+    source: &ManagedPackageSource,
+) -> Result<String> {
     let ManagedPackageSourceKind::Git {
         repo, reference, ..
     } = &source.kind
@@ -1350,6 +1676,8 @@ fn resolve_remote_git_revision(source: &ManagedPackageSource) -> Result<String> 
         validate_git_reference(reference)?;
         if is_git_object_id(reference) {
             let output = run_git_capture(
+                process,
+                default_cwd,
                 &[
                     "ls-remote".into(),
                     "--exit-code".into(),
@@ -1359,9 +1687,8 @@ fn resolve_remote_git_revision(source: &ManagedPackageSource) -> Result<String> 
                 None,
             )?;
             let advertised = output.lines().any(|line| {
-                line.split_once('\t').is_some_and(|(revision, _)| {
-                    revision.eq_ignore_ascii_case(reference)
-                })
+                line.split_once('\t')
+                    .is_some_and(|(revision, _)| revision.eq_ignore_ascii_case(reference))
             });
             if !advertised {
                 bail!("remote does not advertise configured git commit {reference}");
@@ -1369,11 +1696,17 @@ fn resolve_remote_git_revision(source: &ManagedPackageSource) -> Result<String> 
             return Ok(reference.to_ascii_lowercase());
         }
         let names = remote_reference_names(reference);
-        let mut args = vec!["ls-remote".to_string(), "--exit-code".to_string(), repo.clone()];
+        let mut args = vec![
+            "ls-remote".to_string(),
+            "--exit-code".to_string(),
+            repo.clone(),
+        ];
         args.extend(names.iter().cloned());
-        run_git_capture(&args, None)?
+        run_git_capture(process, default_cwd, &args, None)?
     } else {
         run_git_capture(
+            process,
+            default_cwd,
             &[
                 "ls-remote".into(),
                 "--symref".into(),
@@ -1443,8 +1776,17 @@ fn is_git_object_id(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn git_revision(checkout: &Path) -> Result<String> {
-    let revision = run_git_capture(&["rev-parse".into(), "HEAD".into()], Some(checkout))?;
+fn git_revision(
+    process: &GovernedProcessContext,
+    default_cwd: &Path,
+    checkout: &Path,
+) -> Result<String> {
+    let revision = run_git_capture(
+        process,
+        default_cwd,
+        &["rev-parse".into(), "HEAD".into()],
+        Some(checkout),
+    )?;
     let revision = revision.trim();
     if revision.is_empty() {
         bail!("git checkout has no HEAD revision");
@@ -1452,41 +1794,82 @@ fn git_revision(checkout: &Path) -> Result<String> {
     Ok(revision.to_string())
 }
 
-fn run_git(args: &[String], cwd: Option<&Path>) -> Result<()> {
-    let output = git_command(args, cwd)?;
-    if output.status.success() {
+fn run_git(
+    process: &GovernedProcessContext,
+    default_cwd: &Path,
+    args: &[String],
+    cwd: Option<&Path>,
+) -> Result<()> {
+    let output = git_command(process, default_cwd, args, cwd)?;
+    if output.status == Some(0) {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let message = stderr.trim();
-    if message.is_empty() {
-        bail!("git operation failed with status {}", output.status);
-    }
-    bail!("git operation failed: {message}");
+    git_failure(&output)
 }
 
-fn run_git_capture(args: &[String], cwd: Option<&Path>) -> Result<String> {
-    let output = git_command(args, cwd)?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let message = stderr.trim();
-        if message.is_empty() {
-            bail!("git operation failed with status {}", output.status);
-        }
-        bail!("git operation failed: {message}");
+fn run_git_capture(
+    process: &GovernedProcessContext,
+    default_cwd: &Path,
+    args: &[String],
+    cwd: Option<&Path>,
+) -> Result<String> {
+    let output = git_command(process, default_cwd, args, cwd)?;
+    if output.status != Some(0) {
+        git_failure(&output)?;
     }
     String::from_utf8(output.stdout).context("git output was not UTF-8")
 }
 
-fn git_command(args: &[String], cwd: Option<&Path>) -> Result<Output> {
-    let mut command = Command::new("git");
-    command.args(["-c", "color.ui=false"]);
-    command.args(args);
-    command.env("GIT_TERMINAL_PROMPT", "0");
-    if let Some(cwd) = cwd {
-        command.current_dir(cwd);
+fn git_command(
+    process: &GovernedProcessContext,
+    default_cwd: &Path,
+    args: &[String],
+    cwd: Option<&Path>,
+) -> Result<GovernedProcessOutput> {
+    let mut git_args = vec!["-c".into(), "color.ui=false".into()];
+    git_args.extend_from_slice(args);
+    process.run_blocking(
+        pi_sandbox::SpawnFamily::PackageHelper,
+        GovernedProcessSpec {
+            program: process.git_program()?,
+            args: git_args,
+            cwd: cwd.unwrap_or(default_cwd).to_path_buf(),
+            environment: std::collections::BTreeMap::from([(
+                "GIT_TERMINAL_PROMPT".to_owned(),
+                Some("0".to_owned()),
+            )]),
+            timeout: GIT_COMMAND_TIMEOUT,
+            stdout_bytes: MAX_GIT_STDOUT_BYTES,
+            stderr_bytes: MAX_GIT_STDERR_BYTES,
+            #[cfg(unix)]
+            mount_sources: Vec::new(),
+            #[cfg(unix)]
+            retained_executable: None,
+            #[cfg(unix)]
+            retained_working_directory: None,
+        },
+    )
+}
+
+fn git_failure(output: &GovernedProcessOutput) -> Result<()> {
+    if output.timed_out {
+        bail!("git operation timed out");
     }
-    command.output().context("starting git")
+    if output.cancelled {
+        bail!("git operation was cancelled");
+    }
+    if output.stdout_capped || output.stderr_capped {
+        bail!("git operation exceeded its output limit");
+    }
+    let stderr = crate::redact::redact_bounded(
+        &String::from_utf8_lossy(&output.stderr),
+        MAX_GIT_STDERR_BYTES,
+    );
+    let message = stderr.trim();
+    if message.is_empty() {
+        bail!("git operation failed with status {:?}", output.status);
+    }
+    bail!("git operation failed: {message}")
 }
 
 struct DiscoveredPackage {
@@ -1495,57 +1878,104 @@ struct DiscoveredPackage {
 }
 
 fn discover_package(
+    capabilities: &Arc<CapabilityFs>,
+    store_root: Option<(&CapabilityRootLease, &Path)>,
     root: &Path,
     package_id: &str,
     scope: PackageScope,
     trusted: bool,
 ) -> Result<DiscoveredPackage> {
-    if root.is_file() {
-        let path = canonical_resource(root, root.parent().unwrap_or_else(|| Path::new(".")))?;
-        return Ok(DiscoveredPackage {
-            manifest: PackageManifest::default(),
-            resources: PackageResources {
-                extensions: vec![PackageResourceSpec {
-                    kind: PackageResourceKind::Extension,
-                    path,
-                    package_id: package_id.to_string(),
-                    scope,
-                    trusted,
-                }],
-                ..PackageResources::default()
+    let lease = if let Some((scope_lease, relative)) = store_root {
+        scope_lease
+            .lease_directory(relative, CapabilityAccess::ReadOnly, RootCreation::Existing)
+            .context("leasing installed package root")?
+    } else {
+        let absolute = AbsolutePath::parse(root.to_path_buf()).map_err(|_| FsError::InvalidPath)?;
+        let directory = capabilities.open_root(
+            CapabilityRootPurpose::OperatorImport,
+            absolute.clone(),
+            CapabilityAccess::ReadOnly,
+            RootCreation::Existing,
+        );
+        match directory {
+            Ok(lease) => lease,
+            Err(directory_error) => match capabilities
+                .open_exact_file(CapabilityRootPurpose::OperatorImport, absolute)
+            {
+                Ok(file) => {
+                    return Ok(DiscoveredPackage {
+                        manifest: PackageManifest::default(),
+                        resources: PackageResources {
+                            extensions: vec![PackageResourceSpec {
+                                kind: PackageResourceKind::Extension,
+                                path: file.display_path(),
+                                managed_root: Some(root.to_path_buf()),
+                                package_id: package_id.to_string(),
+                                scope,
+                                trusted,
+                            }],
+                            ..PackageResources::default()
+                        },
+                    });
+                }
+                Err(file_error)
+                    if fs_error_kind(&directory_error) == Some(std::io::ErrorKind::NotFound)
+                        || fs_error_kind(&file_error) == Some(std::io::ErrorKind::NotFound) =>
+                {
+                    bail!("package root does not exist: {}", root.display());
+                }
+                Err(file_error) => {
+                    return Err(file_error).context("opening package source");
+                }
             },
-        });
-    }
-    if !root.is_dir() {
-        bail!("package root is not a file or directory: {}", root.display());
-    }
-
-    let manifest = read_package_manifest(root)?;
+        }
+    };
+    let manifest = read_package_manifest(&lease, root)?;
+    let entries = collect_package_entries(lease.open_directory(Path::new(""))?, PathBuf::new())?;
     let mut resources = PackageResources::default();
     if let Some(manifest) = &manifest {
         resources.extensions = discover_manifest_resources(
             root,
+            &entries,
             &manifest.extensions,
             PackageResourceKind::Extension,
         )?;
-        resources.skills =
-            discover_manifest_resources(root, &manifest.skills, PackageResourceKind::Skill)?;
-        resources.prompts =
-            discover_manifest_resources(root, &manifest.prompts, PackageResourceKind::Prompt)?;
-        resources.themes =
-            discover_manifest_resources(root, &manifest.themes, PackageResourceKind::Theme)?;
-    } else {
-        resources.extensions = discover_conventional(
+        resources.skills = discover_manifest_resources(
             root,
-            "extensions",
-            PackageResourceKind::Extension,
+            &entries,
+            &manifest.skills,
+            PackageResourceKind::Skill,
         )?;
+        resources.prompts = discover_manifest_resources(
+            root,
+            &entries,
+            &manifest.prompts,
+            PackageResourceKind::Prompt,
+        )?;
+        resources.themes = discover_manifest_resources(
+            root,
+            &entries,
+            &manifest.themes,
+            PackageResourceKind::Theme,
+        )?;
+    } else {
+        resources.extensions =
+            discover_conventional(root, &entries, "extensions", PackageResourceKind::Extension);
         resources.skills =
-            discover_conventional(root, "skills", PackageResourceKind::Skill)?;
+            discover_conventional(root, &entries, "skills", PackageResourceKind::Skill);
         resources.prompts =
-            discover_conventional(root, "prompts", PackageResourceKind::Prompt)?;
+            discover_conventional(root, &entries, "prompts", PackageResourceKind::Prompt);
         resources.themes =
-            discover_conventional(root, "themes", PackageResourceKind::Theme)?;
+            discover_conventional(root, &entries, "themes", PackageResourceKind::Theme);
+    }
+    for resource in resources
+        .extensions
+        .iter_mut()
+        .chain(&mut resources.skills)
+        .chain(&mut resources.prompts)
+        .chain(&mut resources.themes)
+    {
+        resource.managed_root = Some(root.to_path_buf());
     }
     resources.remap_metadata(package_id, scope, trusted);
     Ok(DiscoveredPackage {
@@ -1554,72 +1984,112 @@ fn discover_package(
     })
 }
 
-fn read_package_manifest(root: &Path) -> Result<Option<PackageManifest>> {
-    let path = root.join("package.json");
-    let Some(bytes) = read_optional_bounded(&path, MAX_PACKAGE_MANIFEST_BYTES)? else {
-        return Ok(None);
+fn read_package_manifest(
+    lease: &CapabilityRootLease,
+    root: &Path,
+) -> Result<Option<PackageManifest>> {
+    let bytes = match lease.read_bounded(Path::new("package.json"), MAX_PACKAGE_MANIFEST_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) if fs_error_kind(&error) == Some(std::io::ErrorKind::NotFound) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error).context("reading package manifest"),
     };
+    let path = root.join("package.json");
     let value: Value = serde_json::from_slice(&bytes)
         .with_context(|| format!("parsing package manifest {}", path.display()))?;
-    let object = value
-        .as_object()
-        .ok_or_else(|| anyhow!("package manifest root must be a JSON object: {}", path.display()))?;
+    let object = value.as_object().ok_or_else(|| {
+        anyhow!(
+            "package manifest root must be a JSON object: {}",
+            path.display()
+        )
+    })?;
     let Some(pi) = object.get("pi") else {
         return Ok(None);
     };
-    if !pi.is_object() {
-        bail!("package manifest `pi` field must be an object: {}", path.display());
-    }
     let manifest: PackageManifest = serde_json::from_value(pi.clone())
         .with_context(|| format!("parsing rpi package manifest in {}", path.display()))?;
     manifest.validate()?;
     Ok(Some(manifest))
 }
 
+#[derive(Clone)]
+struct OpenedPackageEntry {
+    relative: PathBuf,
+    kind: EntryKind,
+}
+
+fn collect_package_entries(
+    directory: CapabilityDirectory,
+    relative: PathBuf,
+) -> Result<Vec<OpenedPackageEntry>> {
+    let mut output = Vec::new();
+    let mut entries = directory.read_dir()?;
+    loop {
+        let entry = match entries.next() {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(error) if crate::fs::is_link_blocked(&error) => {
+                eprintln!(
+                    "skipping package content symlink relative={}",
+                    relative.display()
+                );
+                continue;
+            }
+            Err(error) => return Err(error).context("enumerating package entries"),
+        };
+        let name = entry.name().to_os_string();
+        if hidden_or_ignored_name(&name) {
+            continue;
+        }
+        let child_relative = relative.join(&name);
+        match entry.into_entry() {
+            CapabilityEntry::File(_) => output.push(OpenedPackageEntry {
+                relative: child_relative,
+                kind: EntryKind::RegularFile,
+            }),
+            CapabilityEntry::Directory(directory) => {
+                output.push(OpenedPackageEntry {
+                    relative: child_relative.clone(),
+                    kind: EntryKind::Directory,
+                });
+                output.extend(collect_package_entries(directory, child_relative)?);
+            }
+        }
+    }
+    Ok(output)
+}
+
 fn discover_manifest_resources(
     root: &Path,
-    entries: &[String],
+    available: &[OpenedPackageEntry],
+    configured: &[String],
     kind: PackageResourceKind,
 ) -> Result<Vec<PackageResourceSpec>> {
-    let mut positive = Vec::new();
+    let mut inclusions = Vec::new();
     let mut exclusions = Vec::new();
-    for entry in entries {
+    for entry in configured {
         validate_manifest_entry(entry)?;
         if let Some(exclusion) = entry.strip_prefix('!') {
             exclusions.push(compile_manifest_glob(exclusion)?);
         } else {
-            positive.push(entry.as_str());
+            inclusions.push(compile_manifest_glob(entry)?);
         }
     }
-
     let mut paths = BTreeSet::new();
-    for entry in positive {
-        if has_glob_meta(entry) {
-            let matcher = compile_manifest_glob(entry)?;
-            for candidate in walk_package_entries(root) {
-                let candidate = candidate?;
-                let relative = normalized_relative(root, candidate.path())?;
-                if matcher.is_match(&relative) {
-                    collect_resource_path(root, candidate.path(), kind, &mut paths)?;
-                }
-            }
-        } else {
-            let path = safe_manifest_join(root, entry)?;
-            if path.exists() {
-                collect_resource_path(root, &path, kind, &mut paths)?;
-            }
+    for entry in available {
+        if entry.kind != EntryKind::RegularFile || !resource_file_matches(&entry.relative, kind) {
+            continue;
+        }
+        let relative = entry.relative.to_string_lossy().replace('\\', "/");
+        if inclusions.iter().any(|matcher| {
+            matcher.is_match(&relative) || relative_ancestor_matches(&entry.relative, matcher)
+        }) && !exclusions.iter().any(|matcher| {
+            matcher.is_match(&relative) || relative_ancestor_matches(&entry.relative, matcher)
+        }) {
+            paths.insert(root.join(&entry.relative));
         }
     }
-
-    paths.retain(|path| {
-        let Ok(relative) = normalized_relative(root, path) else {
-            return false;
-        };
-        !exclusions.iter().any(|matcher| {
-            matcher.is_match(&relative)
-                || relative_ancestor_matches(Path::new(&relative), matcher)
-        })
-    });
     Ok(paths
         .into_iter()
         .map(|path| empty_resource_spec(kind, path))
@@ -1628,100 +2098,49 @@ fn discover_manifest_resources(
 
 fn discover_conventional(
     root: &Path,
+    available: &[OpenedPackageEntry],
     directory: &str,
     kind: PackageResourceKind,
-) -> Result<Vec<PackageResourceSpec>> {
-    let path = root.join(directory);
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
+) -> Vec<PackageResourceSpec> {
+    let prefix = Path::new(directory);
     let mut paths = BTreeSet::new();
-    collect_resource_path(root, &path, kind, &mut paths)?;
-    Ok(paths
+    for entry in available {
+        if entry.kind == EntryKind::RegularFile
+            && entry.relative.starts_with(prefix)
+            && conventional_resource_file_matches(&entry.relative, kind)
+        {
+            paths.insert(root.join(&entry.relative));
+        }
+    }
+    paths
         .into_iter()
         .map(|path| empty_resource_spec(kind, path))
-        .collect())
+        .collect()
+}
+
+/// Conventional (manifest-less) resource discovery. Skills are discovered only
+/// through their `SKILL.md` entry point; auxiliary nested Markdown
+/// (`skills/<name>/README.md`, `skills/<name>/examples/*.md`, …) is not a
+/// skill and must not surface as one. Prompts and themes keep their
+/// extension-based matching.
+fn conventional_resource_file_matches(path: &Path, kind: PackageResourceKind) -> bool {
+    match kind {
+        PackageResourceKind::Skill => path
+            .file_name()
+            .is_some_and(|name| name == OsStr::new("SKILL.md")),
+        _ => resource_file_matches(path, kind),
+    }
 }
 
 fn empty_resource_spec(kind: PackageResourceKind, path: PathBuf) -> PackageResourceSpec {
     PackageResourceSpec {
         kind,
         path,
+        managed_root: None,
         package_id: String::new(),
         scope: PackageScope::Global,
         trusted: false,
     }
-}
-
-fn collect_resource_path(
-    package_root: &Path,
-    path: &Path,
-    kind: PackageResourceKind,
-    output: &mut BTreeSet<PathBuf>,
-) -> Result<()> {
-    if path.is_file() {
-        if resource_file_matches(path, kind) {
-            output.insert(canonical_resource(path, package_root)?);
-        }
-        return Ok(());
-    }
-    if !path.is_dir() {
-        return Ok(());
-    }
-    if kind == PackageResourceKind::Skill {
-        collect_skills(package_root, path, path, output)?;
-        return Ok(());
-    }
-    for entry in WalkDir::new(path)
-        .sort_by_file_name()
-        .into_iter()
-        .filter_entry(visible_package_entry)
-    {
-        let entry = entry.with_context(|| format!("walking package directory {}", path.display()))?;
-        if entry.file_type().is_file() && resource_file_matches(entry.path(), kind) {
-            output.insert(canonical_resource(entry.path(), package_root)?);
-        }
-    }
-    Ok(())
-}
-
-fn collect_skills(
-    package_root: &Path,
-    root: &Path,
-    directory: &Path,
-    output: &mut BTreeSet<PathBuf>,
-) -> Result<()> {
-    let skill_file = directory.join("SKILL.md");
-    if skill_file.is_file() {
-        output.insert(canonical_resource(&skill_file, package_root)?);
-        return Ok(());
-    }
-    let mut entries = fs::read_dir(directory)
-        .with_context(|| format!("reading skill directory {}", directory.display()))?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| format!("reading skill directory {}", directory.display()))?;
-    entries.sort_by_key(fs::DirEntry::file_name);
-    for entry in entries {
-        let name = entry.file_name();
-        if hidden_or_ignored_name(&name) {
-            continue;
-        }
-        let file_type = entry
-            .file_type()
-            .with_context(|| format!("reading file type for {}", entry.path().display()))?;
-        if file_type.is_symlink() {
-            continue;
-        }
-        if file_type.is_dir() {
-            collect_skills(package_root, root, &entry.path(), output)?;
-        } else if directory == root
-            && file_type.is_file()
-            && entry.path().extension() == Some(OsStr::new("md"))
-        {
-            output.insert(canonical_resource(&entry.path(), package_root)?);
-        }
-    }
-    Ok(())
 }
 
 fn resource_file_matches(path: &Path, kind: PackageResourceKind) -> bool {
@@ -1735,65 +2154,9 @@ fn resource_file_matches(path: &Path, kind: PackageResourceKind) -> bool {
     }
 }
 
-fn visible_package_entry(entry: &DirEntry) -> bool {
-    if entry.depth() == 0 {
-        return true;
-    }
-    !hidden_or_ignored_name(entry.file_name()) && !entry.file_type().is_symlink()
-}
-
 fn hidden_or_ignored_name(name: &OsStr) -> bool {
     let name = name.to_string_lossy();
     name.starts_with('.') || name == "node_modules"
-}
-
-fn walk_package_entries(root: &Path) -> impl Iterator<Item = walkdir::Result<DirEntry>> {
-    WalkDir::new(root)
-        .sort_by_file_name()
-        .into_iter()
-        .filter_entry(visible_package_entry)
-}
-
-fn validate_manifest_entry(entry: &str) -> Result<()> {
-    let path = entry.strip_prefix('!').unwrap_or(entry);
-    if path.is_empty() {
-        bail!("package manifest contains an empty resource path");
-    }
-    if path.starts_with('+') || path.starts_with('-') {
-        bail!("package manifest resource paths may only use `!` exclusions");
-    }
-    let decoded = percent_decode_for_validation(path)?;
-    for candidate in [path, decoded.as_str()] {
-        if candidate.starts_with('/')
-            || candidate.chars().any(|ch| matches!(ch, '\\' | '\0'))
-            || candidate.split('/').any(|part| part == "..")
-            || Path::new(candidate).is_absolute()
-        {
-            bail!("package manifest resource path escapes the package root: {entry}");
-        }
-    }
-    Ok(())
-}
-
-fn safe_manifest_join(root: &Path, entry: &str) -> Result<PathBuf> {
-    validate_manifest_entry(entry)?;
-    let joined = root.join(entry);
-    ensure_lexically_within(root, &joined)?;
-    Ok(joined)
-}
-
-fn canonical_resource(path: &Path, package_root: &Path) -> Result<PathBuf> {
-    let root = fs::canonicalize(package_root)
-        .with_context(|| format!("canonicalizing package root {}", package_root.display()))?;
-    let resource = fs::canonicalize(path)
-        .with_context(|| format!("canonicalizing package resource {}", path.display()))?;
-    if resource != root && !resource.starts_with(&root) {
-        bail!(
-            "package resource escapes package root: {}",
-            path.display()
-        );
-    }
-    Ok(resource)
 }
 
 fn ensure_lexically_within(root: &Path, path: &Path) -> Result<()> {
@@ -1802,6 +2165,13 @@ fn ensure_lexically_within(root: &Path, path: &Path) -> Result<()> {
     if clean_path != clean_root && !clean_path.starts_with(&clean_root) {
         bail!("path escapes package root: {}", path.display());
     }
+    Ok(())
+}
+
+fn validate_manifest_entry(entry: &str) -> Result<()> {
+    let path = entry.strip_prefix('!').unwrap_or(entry);
+    RelativePath::parse(PathBuf::from(path))
+        .with_context(|| format!("invalid package manifest entry {entry:?}"))?;
     Ok(())
 }
 
@@ -1897,8 +2267,17 @@ struct SettingsPackageEntry {
     scope: PackageScope,
 }
 
-fn load_settings_packages(path: &Path, scope: PackageScope) -> Result<Vec<SettingsPackageEntry>> {
-    let Some(bytes) = read_optional_bounded(path, MAX_PACKAGE_METADATA_BYTES)? else {
+fn load_settings_packages(
+    lease: &CapabilityRootLease,
+    path: &Path,
+    scope: PackageScope,
+) -> Result<Vec<SettingsPackageEntry>> {
+    let Some(bytes) = read_optional_bounded(
+        lease,
+        Path::new(SETTINGS_FILE_NAME),
+        MAX_PACKAGE_METADATA_BYTES,
+    )?
+    else {
         return Ok(Vec::new());
     };
     let root = parse_settings(&bytes, path)?;
@@ -2030,7 +2409,9 @@ fn settings_entry_source(entry: &Value) -> Result<&str> {
         .as_object()
         .and_then(|object| object.get("source"))
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("settings package entry must be a string or object with a string `source`"))
+        .ok_or_else(|| {
+            anyhow!("settings package entry must be a string or object with a string `source`")
+        })
 }
 
 fn parse_or_empty_settings(current: Option<&[u8]>, path: &Path) -> Result<Value> {
@@ -2064,12 +2445,16 @@ fn serialize_settings(value: &Value) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn load_state(path: &Path) -> Result<PackageState> {
-    let Some(bytes) = read_optional_bounded(path, MAX_PACKAGE_METADATA_BYTES)? else {
+fn load_state(
+    lease: &CapabilityRootLease,
+    relative: &Path,
+    display_path: &Path,
+) -> Result<PackageState> {
+    let Some(bytes) = read_optional_bounded(lease, relative, MAX_PACKAGE_METADATA_BYTES)? else {
         return Ok(PackageState::default());
     };
     let state: PackageState = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parsing package state {}", path.display()))?;
+        .with_context(|| format!("parsing package state {}", display_path.display()))?;
     state.validate()?;
     Ok(state)
 }
@@ -2082,19 +2467,25 @@ fn serialize_state(state: &PackageState) -> Result<Vec<u8>> {
 }
 
 fn commit_metadata(
-    state_path: &Path,
+    lease: &CapabilityRootLease,
     state: &PackageState,
     state_snapshot: &FileSnapshot,
-    settings_path: &Path,
     next_settings: Option<&[u8]>,
     settings_snapshot: Option<&FileSnapshot>,
 ) -> Result<()> {
-    let state_bytes = serialize_state(state)?;
-    atomic_write(state_path, &state_bytes)
-        .with_context(|| format!("writing package state {}", state_path.display()))?;
+    atomic_write(
+        lease,
+        Path::new(STATE_FILE_NAME),
+        &serialize_state(state)?,
+        state_snapshot.identity,
+    )?;
     if let Some(settings) = next_settings
-        && let Err(error) = atomic_write(settings_path, settings)
-            .with_context(|| format!("writing package settings {}", settings_path.display()))
+        && let Err(error) = atomic_write(
+            lease,
+            Path::new(SETTINGS_FILE_NAME),
+            settings,
+            settings_snapshot.and_then(|snapshot| snapshot.identity),
+        )
     {
         let state_rollback = state_snapshot.restore();
         if let Some(snapshot) = settings_snapshot {
@@ -2110,145 +2501,155 @@ fn commit_metadata(
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Clone)]
 struct FileSnapshot {
-    path: PathBuf,
+    lease: CapabilityRootLease,
+    relative: PathBuf,
+    display_path: PathBuf,
+    identity: Option<FileIdentity>,
     bytes: Option<Vec<u8>>,
 }
 
+fn operator_path_exists(capabilities: &Arc<CapabilityFs>, path: &Path) -> bool {
+    let Ok(absolute) = AbsolutePath::parse(path.to_path_buf()) else {
+        return false;
+    };
+    capabilities
+        .open_root(
+            CapabilityRootPurpose::OperatorImport,
+            absolute.clone(),
+            CapabilityAccess::ReadOnly,
+            RootCreation::Existing,
+        )
+        .is_ok()
+        || capabilities
+            .open_exact_file(CapabilityRootPurpose::OperatorImport, absolute)
+            .is_ok()
+}
+
 impl FileSnapshot {
-    fn capture(path: &Path) -> Result<Self> {
-        let bytes = read_optional_bounded(path, MAX_PACKAGE_METADATA_BYTES)?;
+    fn capture(
+        lease: CapabilityRootLease,
+        relative: PathBuf,
+        display_path: PathBuf,
+    ) -> Result<Self> {
+        let identity = optional_identity(&lease, &relative)?;
+        let bytes = read_optional_bounded(&lease, &relative, MAX_PACKAGE_METADATA_BYTES)?;
         Ok(Self {
-            path: path.to_path_buf(),
+            lease,
+            relative,
+            display_path,
+            identity,
             bytes,
         })
     }
 
     fn restore(&self) -> Result<()> {
         match &self.bytes {
-            Some(bytes) => atomic_write(&self.path, bytes),
-            None => match fs::remove_file(&self.path) {
-                Ok(()) => sync_parent(&self.path),
-                Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(error).with_context(|| format!("removing {}", self.path.display())),
+            Some(bytes) => atomic_write(
+                &self.lease,
+                &self.relative,
+                bytes,
+                optional_identity(&self.lease, &self.relative)?,
+            ),
+            None => match self.lease.remove_file(&self.relative) {
+                Ok(()) => Ok(()),
+                Err(error) if fs_error_kind(&error) == Some(std::io::ErrorKind::NotFound) => Ok(()),
+                Err(error) => {
+                    Err(error).with_context(|| format!("removing {}", self.display_path.display()))
+                }
             },
         }
     }
 }
-fn read_optional_bounded(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> {
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).with_context(|| format!("opening {}", path.display())),
-    };
-    let length = file
-        .metadata()
-        .with_context(|| format!("reading metadata for {}", path.display()))?
-        .len();
-    if length > limit {
-        bail!(
-            "refusing to read {}: file is {} bytes, exceeding the {} byte limit",
-            path.display(),
-            length,
-            limit
-        );
+
+fn read_optional_bounded(
+    lease: &CapabilityRootLease,
+    relative: &Path,
+    limit: u64,
+) -> Result<Option<Vec<u8>>> {
+    match lease.read_bounded_allowing_link(relative, limit) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if fs_error_kind(&error) == Some(std::io::ErrorKind::NotFound) => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("reading {}", relative.display())),
     }
-    let capacity = usize::try_from(length).unwrap_or(0);
-    let mut bytes = Vec::with_capacity(capacity);
-    std::io::Read::by_ref(&mut file)
-        .take(limit.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("reading {}", path.display()))?;
-    if bytes.len() as u64 > limit {
-        bail!(
-            "refusing to read {}: file grew beyond the {} byte limit",
-            path.display(),
-            limit
-        );
-    }
-    Ok(Some(bytes))
 }
 
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("creating directory {}", parent.display()))?;
-    let temporary = unique_sibling(path, "tmp");
-    let mut guard = RemovePathOnDrop::new(temporary.clone());
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temporary)
-        .with_context(|| format!("creating temporary file {}", temporary.display()))?;
-    file.write_all(bytes)
-        .with_context(|| format!("writing temporary file {}", temporary.display()))?;
-    file.sync_all()
-        .with_context(|| format!("syncing temporary file {}", temporary.display()))?;
-    drop(file);
-    fs::rename(&temporary, path)
-        .with_context(|| format!("replacing {} atomically", path.display()))?;
-    guard.disarm();
-    sync_parent(path)
+fn atomic_write(
+    lease: &CapabilityRootLease,
+    relative: &Path,
+    bytes: &[u8],
+    expected: Option<FileIdentity>,
+) -> Result<()> {
+    lease
+        .replace_file(Replacement {
+            relative: relative.to_path_buf(),
+            expected,
+            bytes: bytes.to_vec(),
+            mode: match lease.access() {
+                CapabilityAccess::PrivateReadWrite => FileMode::Private,
+                CapabilityAccess::ReadOnly | CapabilityAccess::ReadWrite => FileMode::Shared,
+            },
+        })
+        .with_context(|| format!("atomically replacing {}", relative.display()))?;
+    Ok(())
 }
 
-fn sync_parent(path: &Path) -> Result<()> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .with_context(|| format!("syncing directory {}", parent.display()))
+fn optional_identity(lease: &CapabilityRootLease, relative: &Path) -> Result<Option<FileIdentity>> {
+    match lease.metadata_allowing_link(relative) {
+        Ok(metadata) => Ok(Some(metadata.identity)),
+        Err(error) if fs_error_kind(&error) == Some(std::io::ErrorKind::NotFound) => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("reading identity for {}", relative.display()))
+        }
+    }
+}
+
+fn fs_error_kind(error: &FsError) -> Option<std::io::ErrorKind> {
+    match error {
+        FsError::System { kind, .. } => Some(*kind),
+        _ => None,
+    }
 }
 
 struct OperationLock<'a> {
     _process: MutexGuard<'a, ()>,
-    path: PathBuf,
+    lease: CapabilityRootLease,
 }
 
 impl<'a> OperationLock<'a> {
-    fn acquire(agent_dir: &Path) -> Result<Self> {
+    fn acquire(lease: &CapabilityRootLease) -> Result<Self> {
         let process = PROCESS_PACKAGE_LOCK.get_or_init(|| Mutex::new(())).lock();
-        fs::create_dir_all(agent_dir)
-            .with_context(|| format!("creating agent directory {}", agent_dir.display()))?;
-        let path = agent_dir.join(OPERATION_LOCK_FILE_NAME);
+        let path = Path::new(OPERATION_LOCK_FILE_NAME);
         let started = Instant::now();
         loop {
-            match OpenOptions::new().create_new(true).write(true).open(&path) {
+            match lease.create_new(path, FileMode::Private) {
                 Ok(mut file) => {
-                    writeln!(file, "{}", std::process::id())
-                        .with_context(|| format!("writing package operation lock {}", path.display()))?;
-                    file.sync_all()
-                        .with_context(|| format!("syncing package operation lock {}", path.display()))?;
+                    file.write_all(format!("{}\n", std::process::id()).as_bytes())?;
+                    file.finish()?;
                     return Ok(Self {
                         _process: process,
-                        path,
+                        lease: lease.clone(),
                     });
                 }
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                    if operation_lock_is_stale(&path) {
-                        match fs::remove_file(&path) {
+                Err(error) if fs_error_kind(&error) == Some(std::io::ErrorKind::AlreadyExists) => {
+                    if operation_lock_is_stale(lease, path) {
+                        match lease.remove_file(path) {
                             Ok(()) => continue,
-                            Err(remove_error) if remove_error.kind() == ErrorKind::NotFound => continue,
+                            Err(error)
+                                if fs_error_kind(&error) == Some(std::io::ErrorKind::NotFound) =>
+                            {
+                                continue;
+                            }
                             Err(_) => {}
                         }
                     }
                     if started.elapsed() >= OPERATION_LOCK_TIMEOUT {
-                        bail!(
-                            "timed out waiting for another package operation to finish (lock: {})",
-                            path.display()
-                        );
+                        bail!("timed out waiting for another package operation to finish");
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("creating package operation lock {}", path.display()));
-                }
+                Err(error) => return Err(error).context("creating package operation lock"),
             }
         }
     }
@@ -2256,59 +2657,57 @@ impl<'a> OperationLock<'a> {
 
 impl Drop for OperationLock<'_> {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let _ = self.lease.remove_file(Path::new(OPERATION_LOCK_FILE_NAME));
     }
 }
 
-fn operation_lock_is_stale(path: &Path) -> bool {
-    let Ok(modified) = fs::metadata(path).and_then(|metadata| metadata.modified()) else {
+fn operation_lock_is_stale(lease: &CapabilityRootLease, path: &Path) -> bool {
+    let Ok(metadata) = lease.metadata(path) else {
         return false;
     };
-    modified
-        .elapsed()
-        .is_ok_and(|age| age >= STALE_OPERATION_LOCK_AGE)
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as i128)
+        .unwrap_or(0);
+    now.saturating_sub(metadata.modified_ns) >= STALE_OPERATION_LOCK_AGE.as_nanos() as i128
 }
 
 struct CheckoutSwap {
+    lease: CapabilityRootLease,
     target: PathBuf,
     backup: Option<PathBuf>,
+    display_target: PathBuf,
     active: bool,
 }
 
 impl CheckoutSwap {
-    fn activate(staging: PathBuf, target: PathBuf) -> Result<Self> {
+    fn activate(
+        lease: CapabilityRootLease,
+        staging: PathBuf,
+        target: PathBuf,
+        display_target: PathBuf,
+    ) -> Result<Self> {
         if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating package directory {}", parent.display()))?;
+            lease.create_dir_all(parent, package_mode(&lease))?;
         }
-        let backup = if target.exists() {
-            let backup = unique_sibling(&target, "backup");
-            fs::rename(&target, &backup).with_context(|| {
-                format!(
-                    "moving previous package checkout {} to {}",
-                    target.display(),
-                    backup.display()
-                )
-            })?;
+        let backup = if lease.metadata(&target).is_ok() {
+            let backup = unique_sibling_relative(&target, "backup");
+            lease.rename(&target, &backup)?;
             Some(backup)
         } else {
             None
         };
-        if let Err(error) = fs::rename(&staging, &target) {
+        if let Err(error) = lease.rename(&staging, &target) {
             if let Some(backup) = &backup {
-                let _ = fs::rename(backup, &target);
+                let _ = lease.rename(backup, &target);
             }
-            return Err(error).with_context(|| {
-                format!(
-                    "activating staged package checkout {} at {}",
-                    staging.display(),
-                    target.display()
-                )
-            });
+            return Err(error).context("activating staged package checkout");
         }
         Ok(Self {
+            lease,
             target,
             backup,
+            display_target,
             active: true,
         })
     }
@@ -2317,48 +2716,41 @@ impl CheckoutSwap {
         if !self.active {
             return Ok(());
         }
-        if self.target.exists() {
-            fs::remove_dir_all(&self.target)
-                .with_context(|| format!("removing failed checkout {}", self.target.display()))?;
+        if self.lease.metadata(&self.target).is_ok() {
+            self.lease.remove_tree(&self.target)?;
         }
         if let Some(backup) = &self.backup {
-            fs::rename(backup, &self.target).with_context(|| {
-                format!(
-                    "restoring previous package checkout {}",
-                    self.target.display()
-                )
-            })?;
+            self.lease.rename(backup, &self.target)?;
         }
         self.active = false;
         Ok(())
     }
 
     fn finalize(mut self) {
-        if let Some(backup) = &self.backup
-            && backup.exists()
-        {
-            let _ = fs::remove_dir_all(backup);
+        if let Some(backup) = &self.backup {
+            let _ = self.lease.remove_tree(backup);
         }
         self.active = false;
     }
 }
 
 struct RemovedCheckout {
+    lease: CapabilityRootLease,
     original: PathBuf,
     removed: PathBuf,
     active: bool,
 }
 
 impl RemovedCheckout {
-    fn activate(original: PathBuf) -> Result<Self> {
-        let removed = unique_sibling(&original, "removed");
-        fs::rename(&original, &removed).with_context(|| {
-            format!(
-                "moving package checkout {} out of service",
-                original.display()
-            )
-        })?;
+    fn activate(
+        lease: CapabilityRootLease,
+        original: PathBuf,
+        _display_original: PathBuf,
+    ) -> Result<Self> {
+        let removed = unique_sibling_relative(&original, "removed");
+        lease.rename(&original, &removed)?;
         Ok(Self {
+            lease,
             original,
             removed,
             active: true,
@@ -2367,33 +2759,31 @@ impl RemovedCheckout {
 
     fn rollback(&mut self) -> Result<()> {
         if self.active {
-            fs::rename(&self.removed, &self.original).with_context(|| {
-                format!(
-                    "restoring removed package checkout {}",
-                    self.original.display()
-                )
-            })?;
+            self.lease.rename(&self.removed, &self.original)?;
             self.active = false;
         }
         Ok(())
     }
 
     fn finalize(mut self) {
-        if self.removed.exists() {
-            let _ = fs::remove_dir_all(&self.removed);
-        }
+        let _ = self.lease.remove_tree(&self.removed);
         self.active = false;
     }
 }
 
 struct RemovePathOnDrop {
+    lease: CapabilityRootLease,
     path: PathBuf,
     armed: bool,
 }
 
 impl RemovePathOnDrop {
-    fn new(path: PathBuf) -> Self {
-        Self { path, armed: true }
+    fn new(lease: CapabilityRootLease, path: PathBuf) -> Self {
+        Self {
+            lease,
+            path,
+            armed: true,
+        }
     }
 
     fn disarm(&mut self) {
@@ -2403,14 +2793,30 @@ impl RemovePathOnDrop {
 
 impl Drop for RemovePathOnDrop {
     fn drop(&mut self) {
-        if !self.armed {
-            return;
+        if self.armed {
+            let _ = self.lease.remove_tree(&self.path);
         }
-        if self.path.is_dir() {
-            let _ = fs::remove_dir_all(&self.path);
-        } else {
-            let _ = fs::remove_file(&self.path);
-        }
+    }
+}
+
+fn unique_sibling_relative(path: &Path, label: &str) -> PathBuf {
+    let counter = UNIQUE_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let name = path.file_name().unwrap_or_else(|| OsStr::new("package"));
+    let mut unique = name.to_os_string();
+    unique.push(format!(
+        ".{label}-{}-{timestamp}-{counter}",
+        std::process::id()
+    ));
+    path.with_file_name(unique)
+}
+
+fn package_mode(lease: &CapabilityRootLease) -> FileMode {
+    match lease.access() {
+        CapabilityAccess::PrivateReadWrite => FileMode::Private,
+        CapabilityAccess::ReadOnly | CapabilityAccess::ReadWrite => FileMode::Shared,
     }
 }
 
@@ -2426,50 +2832,7 @@ fn managed_join(root: &Path, host: &str, repository_path: &str) -> Result<PathBu
     Ok(target)
 }
 
-fn ensure_managed_git_path(root: &Path, path: &Path) -> Result<()> {
-    let canonical_root = fs::canonicalize(root)
-        .with_context(|| format!("resolving managed git root {}", root.display()))?;
-    let canonical_path = fs::canonicalize(path)
-        .with_context(|| format!("resolving managed git package {}", path.display()))?;
-    if canonical_path == canonical_root || !canonical_path.starts_with(&canonical_root) {
-        bail!(
-            "managed git package path escapes its scope root: {}",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-fn unique_sibling(path: &Path, label: &str) -> PathBuf {
-    let counter = UNIQUE_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    let name = path.file_name().unwrap_or_else(|| OsStr::new("package"));
-    let mut unique = name.to_os_string();
-    unique.push(format!(
-        ".{label}-{}-{timestamp}-{counter}",
-        std::process::id()
-    ));
-    path.with_file_name(unique)
-}
-
-fn agent_directory() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("PI_CODING_AGENT_DIR").filter(|path| !path.is_empty()) {
-        return absolute_existing_or_lexical(Path::new(&path));
-    }
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .filter(|path| !path.is_empty())
-        .ok_or_else(|| anyhow!("home directory is unavailable; set PI_CODING_AGENT_DIR"))?;
-    absolute_existing_or_lexical(&Path::new(&home).join(CONFIG_DIR_NAME).join("agent"))
-}
-
 fn absolute_existing_or_lexical(path: &Path) -> Result<PathBuf> {
-    if path.exists() {
-        return fs::canonicalize(path)
-            .with_context(|| format!("canonicalizing {}", path.display()));
-    }
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -2513,5 +2876,145 @@ fn path_to_settings_string(path: &Path) -> String {
         value
     } else {
         format!("./{value}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(relative: &str, kind: EntryKind) -> OpenedPackageEntry {
+        OpenedPackageEntry {
+            relative: PathBuf::from(relative),
+            kind,
+        }
+    }
+
+    #[test]
+    fn conventional_skill_discovery_stops_at_skill_md() {
+        let root = PathBuf::from("/package");
+        let available = vec![
+            entry("skills/alpha/SKILL.md", EntryKind::RegularFile),
+            // Auxiliary nested Markdown is documentation, not a skill.
+            entry("skills/alpha/README.md", EntryKind::RegularFile),
+            entry("skills/alpha/examples/deep.md", EntryKind::RegularFile),
+            entry("skills/alpha/SKILL.md.bak", EntryKind::RegularFile),
+            entry("skills/alpha", EntryKind::Directory),
+        ];
+        let skills = discover_conventional(&root, &available, "skills", PackageResourceKind::Skill);
+        assert_eq!(
+            skills
+                .iter()
+                .map(|spec| spec.path.clone())
+                .collect::<Vec<_>>(),
+            vec![root.join("skills/alpha/SKILL.md")]
+        );
+        assert!(
+            skills
+                .iter()
+                .all(|spec| spec.kind == PackageResourceKind::Skill)
+        );
+    }
+
+    #[test]
+    fn conventional_skill_discovery_keeps_skill_md_at_any_depth() {
+        let root = PathBuf::from("/package");
+        let available = vec![
+            entry("skills/SKILL.md", EntryKind::RegularFile),
+            entry("skills/alpha/SKILL.md", EntryKind::RegularFile),
+            entry(
+                "skills/alpha/nested/deeper/SKILL.md",
+                EntryKind::RegularFile,
+            ),
+            entry("skills/alpha/skills/other/SKILL.md", EntryKind::RegularFile),
+        ];
+        let skills = discover_conventional(&root, &available, "skills", PackageResourceKind::Skill);
+        let paths: Vec<PathBuf> = skills.iter().map(|spec| spec.path.clone()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                root.join("skills/SKILL.md"),
+                root.join("skills/alpha/SKILL.md"),
+                root.join("skills/alpha/nested/deeper/SKILL.md"),
+                root.join("skills/alpha/skills/other/SKILL.md"),
+            ]
+        );
+    }
+
+    #[test]
+    fn conventional_prompt_and_theme_discovery_keep_extension_matching() {
+        let root = PathBuf::from("/package");
+        let available = vec![
+            entry("prompts/plan.md", EntryKind::RegularFile),
+            entry("prompts/plan.txt", EntryKind::RegularFile),
+            entry("prompts/nested/deep.md", EntryKind::RegularFile),
+            entry("themes/light.json", EntryKind::RegularFile),
+            entry("themes/light.txt", EntryKind::RegularFile),
+            entry("extensions/pi-extension.json", EntryKind::RegularFile),
+            entry("extensions/not-a-manifest.json", EntryKind::RegularFile),
+        ];
+        let prompts =
+            discover_conventional(&root, &available, "prompts", PackageResourceKind::Prompt);
+        assert_eq!(
+            prompts
+                .iter()
+                .map(|spec| spec.path.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                root.join("prompts/nested/deep.md"),
+                root.join("prompts/plan.md"),
+            ]
+        );
+        let themes = discover_conventional(&root, &available, "themes", PackageResourceKind::Theme);
+        assert_eq!(
+            themes
+                .iter()
+                .map(|spec| spec.path.clone())
+                .collect::<Vec<_>>(),
+            vec![root.join("themes/light.json")]
+        );
+        let extensions = discover_conventional(
+            &root,
+            &available,
+            "extensions",
+            PackageResourceKind::Extension,
+        );
+        assert_eq!(
+            extensions
+                .iter()
+                .map(|spec| spec.path.clone())
+                .collect::<Vec<_>>(),
+            vec![root.join("extensions/pi-extension.json")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_settings_symlink_is_followed() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().expect("root");
+        let target = root.path().join("real-settings.json");
+        std::fs::write(&target, "{\"theme\":\"dark\"}\n").expect("target");
+        symlink(&target, root.path().join(SETTINGS_FILE_NAME)).expect("settings symlink");
+        let capabilities = CapabilityFs::new().expect("capabilities");
+        let lease = capabilities
+            .open_root(
+                CapabilityRootPurpose::AgentStore,
+                AbsolutePath::parse(root.path().to_path_buf()).expect("root"),
+                CapabilityAccess::ReadOnly,
+                RootCreation::Existing,
+            )
+            .expect("lease");
+        let bytes = read_optional_bounded(
+            &lease,
+            Path::new(SETTINGS_FILE_NAME),
+            MAX_PACKAGE_METADATA_BYTES,
+        )
+        .expect("agent settings.json symlink must be followed");
+        let body = String::from_utf8(bytes.expect("settings body")).expect("utf8");
+        assert!(body.contains("dark"), "followed settings body: {body}");
+        let identity = optional_identity(&lease, Path::new(SETTINGS_FILE_NAME))
+            .expect("followed settings identity");
+        assert!(identity.is_some(), "followed settings identity");
     }
 }

@@ -47,8 +47,8 @@ fn offline_env<'a>(command: &'a mut Command, agent: &Path, cwd: &Path) -> &'a mu
         .env("HOME", agent)
         .env("USERPROFILE", agent)
         .env("PI_CODING_AGENT_DIR", agent)
-        .env("PI_OFFLINE", "1")
-        .env("PI_SKIP_VERSION_CHECK", "1")
+        .env("RPI_OFFLINE", "1")
+        .env("RPI_SKIP_VERSION_CHECK", "1")
         .env_remove("PI_CODING_AGENT_SESSION_DIR")
         .env_remove("PI_PROFILE")
         .env_remove("ANTHROPIC_API_KEY")
@@ -301,9 +301,7 @@ impl RpcSession {
     }
 
     fn child_mut(&mut self) -> &mut Child {
-        self.child
-            .as_mut()
-            .expect("rpi rpc child already finished")
+        self.child.as_mut().expect("rpi rpc child already finished")
     }
 
     fn write_line(&mut self, line: &str) {
@@ -412,9 +410,13 @@ impl RpcSession {
                     if trimmed.is_empty() {
                         continue;
                     }
-                    assert!(!trimmed.contains('\u{1b}'), "RPC stdout must not contain ANSI: {trimmed:?}");
-                    let value = serde_json::from_str::<Value>(trimmed)
-                        .unwrap_or_else(|error| panic!("RPC stdout is not JSON ({error}): {trimmed}"));
+                    assert!(
+                        !trimmed.contains('\u{1b}'),
+                        "RPC stdout must not contain ANSI: {trimmed:?}"
+                    );
+                    let value = serde_json::from_str::<Value>(trimmed).unwrap_or_else(|error| {
+                        panic!("RPC stdout is not JSON ({error}): {trimmed}")
+                    });
                     assert!(value.is_object(), "RPC stdout must be an object: {value}");
                     return Some(value);
                 }
@@ -696,11 +698,11 @@ fn pi_v3_session_jsonl_create_round_trips_through_resume() {
     assert!(path.is_file(), "explicit session id must land at {path:?}");
     let records = read_jsonl_records(&path);
     assert!(
-        records
-            .iter()
-            .any(|record| record.get("type").and_then(Value::as_str) == Some("session")
+        records.iter().any(
+            |record| record.get("type").and_then(Value::as_str) == Some("session")
                 && record.get("version").and_then(Value::as_u64) == Some(3)
-                && record.get("id").and_then(Value::as_str) == Some("v3-roundtrip")),
+                && record.get("id").and_then(Value::as_str) == Some("v3-roundtrip")
+        ),
         "session header must be Pi v3 with the explicit id: {records:?}"
     );
     assert!(
@@ -722,7 +724,10 @@ fn pi_v3_session_jsonl_create_round_trips_through_resume() {
                 .map(|content| content.to_string().contains("remember this branch"))
                 .unwrap_or(false)
     });
-    assert!(user_seen, "user prompt must be on the JSONL branch: {records:?}");
+    assert!(
+        user_seen,
+        "user prompt must be on the JSONL branch: {records:?}"
+    );
 
     let path_arg = path.to_str().expect("utf8 path");
     let (resumed, resume_out, resume_err) = run_rpi(
@@ -739,7 +744,10 @@ fn pi_v3_session_jsonl_create_round_trips_through_resume() {
         ],
         Some("/quit\n"),
     );
-    assert!(resumed, "resume failed: stdout={resume_out} stderr={resume_err}");
+    assert!(
+        resumed,
+        "resume failed: stdout={resume_out} stderr={resume_err}"
+    );
     assert!(
         resume_err.contains("resumed") && resume_err.contains(path_arg),
         "resume must open the created file: {resume_err}"
@@ -774,9 +782,9 @@ fn session_dir_precedence_covers_create_resume_fork_and_new() {
         ),
         "",
     );
-    fs::create_dir_all(cwd.path().join(".pi")).expect("project .pi");
+    fs::create_dir_all(cwd.path().join(".rpi")).expect("project .rpi");
     fs::write(
-        cwd.path().join(".pi/settings.json"),
+        cwd.path().join(".rpi/settings.json"),
         format!(
             r#"{{"sessionDir":{}}}"#,
             serde_json::to_string(&project).expect("project json")
@@ -1056,7 +1064,7 @@ fn resume_short_alias_opens_session_and_rejects_selector_conflicts() {
         .args(["-r", path_arg, "--continue"])
         .env("HOME", agent.path())
         .env("PI_CODING_AGENT_DIR", agent.path())
-        .env("PI_OFFLINE", "1");
+        .env("RPI_OFFLINE", "1");
     let conflict = run_command_bounded(conflict_cmd, None);
     assert!(
         !conflict.status.success(),
@@ -1188,12 +1196,7 @@ fn at_file_expansion_embeds_workspace_text_in_print_mode_session() {
     let user_blob = records
         .iter()
         .filter(|record| record.get("type").and_then(Value::as_str) == Some("message"))
-        .filter(|record| {
-            record
-                .pointer("/message/role")
-                .and_then(Value::as_str)
-                == Some("user")
-        })
+        .filter(|record| record.pointer("/message/role").and_then(Value::as_str) == Some("user"))
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
@@ -1407,8 +1410,7 @@ fn rpc_abort_during_loop_iteration_settles_without_loop_failed() {
     let mut saw_loop_finished = false;
     while !saw_abort || !saw_settled {
         let value = session.read_json_deadline(deadline);
-        if is_response(&value)
-            && value.get("id").and_then(Value::as_str) == Some("abort-loop-live")
+        if is_response(&value) && value.get("id").and_then(Value::as_str) == Some("abort-loop-live")
         {
             assert_success(&value, "abort", "abort-loop-live");
             saw_abort = true;
@@ -1423,7 +1425,10 @@ fn rpc_abort_during_loop_iteration_settles_without_loop_failed() {
     assert!(saw_abort, "abort response missing");
     assert!(saw_settled, "loop iteration abort must emit agent_settled");
     assert!(!saw_loop_failed, "user abort must not emit loop_failed");
-    assert!(!saw_loop_finished, "cancelled iteration must not emit loop_finished");
+    assert!(
+        !saw_loop_finished,
+        "cancelled iteration must not emit loop_finished"
+    );
 
     // A public loop_list request proves the RPC connection is still usable and
     // the task remains scheduled. Inspect every intervening record for a late
@@ -1444,7 +1449,9 @@ fn rpc_abort_during_loop_iteration_settles_without_loop_failed() {
     );
     let tasks = listed["data"].as_array().expect("loop_list array");
     assert!(
-        tasks.iter().any(|task| task["id"].as_str() == Some(task_id.as_str())),
+        tasks
+            .iter()
+            .any(|task| task["id"].as_str() == Some(task_id.as_str())),
         "loop task must remain scheduled after iteration abort: {tasks:?}"
     );
 
@@ -1557,7 +1564,10 @@ fn rpc_switch_emits_runtime_changed_and_new_clears_transcript() {
     let source_count = source_state["data"]["messageCount"]
         .as_u64()
         .expect("source messageCount");
-    assert!(source_count >= 1, "source session should have messages: {source_state}");
+    assert!(
+        source_count >= 1,
+        "source session should have messages: {source_state}"
+    );
 
     // Plant a distinct target session under the same RPC sessionDir but with a
     // different recorded cwd so this exercises runtime-generation cutover.
@@ -1664,7 +1674,9 @@ fn rpc_switch_emits_runtime_changed_and_new_clears_transcript() {
     });
     assert_success(&new_session, "new_session", "new-1");
     assert_eq!(
-        new_session["data"].get("cancelled").and_then(Value::as_bool),
+        new_session["data"]
+            .get("cancelled")
+            .and_then(Value::as_bool),
         Some(false),
         "new_session cancelled flag: {new_session}"
     );
@@ -1755,17 +1767,23 @@ fn startup_warning_stays_on_stderr_and_json_stdout_stays_pure() {
         );
         let value = serde_json::from_str::<Value>(line)
             .unwrap_or_else(|error| panic!("JSON stdout polluted ({error}): {line}"));
-        assert!(value.is_object(), "JSON stdout line must be an object: {line}");
+        assert!(
+            value.is_object(),
+            "JSON stdout line must be an object: {line}"
+        );
         saw_object = true;
     }
-    assert!(saw_object, "JSON mode must emit at least one object on stdout");
+    assert!(
+        saw_object,
+        "JSON mode must emit at least one object on stdout"
+    );
     assert!(
         sessions
             .read_dir()
             .ok()
-            .map(|entries| entries.filter_map(Result::ok).any(|entry| {
-                entry.path().extension().is_some_and(|ext| ext == "jsonl")
-            }))
+            .map(|entries| entries
+                .filter_map(Result::ok)
+                .any(|entry| { entry.path().extension().is_some_and(|ext| ext == "jsonl") }))
             .unwrap_or(false),
         "settings sessionDir must still control create while warnings fire"
     );

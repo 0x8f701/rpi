@@ -25,8 +25,8 @@ fn run(agent_dir: &Path, cwd: &Path, args: &[&str]) -> (bool, String, String) {
         .env("PI_CODING_AGENT_DIR", agent_dir)
         .env("HOME", agent_dir)
         .env("USERPROFILE", agent_dir)
-        .env("PI_SKIP_VERSION_CHECK", "1")
-        .env_remove("PI_OFFLINE")
+        .env("RPI_SKIP_VERSION_CHECK", "1")
+        .env_remove("RPI_OFFLINE")
         .env_remove("PI_PROFILE")
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("OPENAI_API_KEY")
@@ -61,7 +61,10 @@ fn config_list_groups_every_key_and_filters_by_category() {
     let (ok, stdout, stderr) = run(agent.path(), cwd.path(), &["config", "list"]);
     assert!(ok, "config list failed: {stderr}");
     assert!(stdout.contains("Models"), "Models group: {stdout}");
-    assert!(stdout.contains("TrustSecurity"), "TrustSecurity group: {stdout}");
+    assert!(
+        stdout.contains("TrustSecurity"),
+        "TrustSecurity group: {stdout}"
+    );
     assert!(
         stdout.contains("retry.maxRetries") && stdout.contains("[default]"),
         "key + provenance chip: {stdout}"
@@ -79,7 +82,10 @@ fn config_list_groups_every_key_and_filters_by_category() {
             &["config", "list", "--category", category],
         );
         assert!(ok, "config list {category} failed: {stderr}");
-        assert!(stdout.contains("retry.enabled"), "{category} has retry keys: {stdout}");
+        assert!(
+            stdout.contains("retry.enabled"),
+            "{category} has retry keys: {stdout}"
+        );
         assert!(
             !stdout.contains("compaction.enabled"),
             "{category} must exclude other categories: {stdout}"
@@ -91,7 +97,10 @@ fn config_list_groups_every_key_and_filters_by_category() {
         &["config", "list", "--category", "bogus"],
     );
     assert!(!ok, "unknown category must fail");
-    assert!(stderr.contains("no settings match"), "actionable error: {stderr}");
+    assert!(
+        stderr.contains("no settings match"),
+        "actionable error: {stderr}"
+    );
 }
 
 #[test]
@@ -175,13 +184,31 @@ fn config_set_reset_round_trip_persists_and_validates() {
     assert!(stdout.contains("= 7  [global]"), "get after set: {stdout}");
 
     // Enum values validate; a second set replaces the first atomically.
-    let (ok, stdout, stderr) = run(agent.path(), cwd.path(), &["config", "set", "transport", "sse"]);
+    let (ok, stdout, stderr) = run(
+        agent.path(),
+        cwd.path(),
+        &["config", "set", "transport", "sse"],
+    );
     assert!(ok, "enum set failed: {stderr}");
-    assert!(stdout.contains("transport = \"sse\"  [global]"), "enum set: {stdout}");
-    let (ok, _stdout, stderr) = run(agent.path(), cwd.path(), &["config", "set", "transport", "udp"]);
+    assert!(
+        stdout.contains("transport = \"sse\"  [global]"),
+        "enum set: {stdout}"
+    );
+    let (ok, _stdout, stderr) = run(
+        agent.path(),
+        cwd.path(),
+        &["config", "set", "transport", "udp"],
+    );
     assert!(!ok, "invalid enum must fail");
-    assert!(stderr.contains("must be one of"), "enum validation: {stderr}");
-    assert_eq!(settings_file(agent.path())["transport"], "sse", "failed set must not persist");
+    assert!(
+        stderr.contains("must be one of"),
+        "enum validation: {stderr}"
+    );
+    assert_eq!(
+        settings_file(agent.path())["transport"],
+        "sse",
+        "failed set must not persist"
+    );
 
     // Reset clears the scoped layer and falls back to the default.
     let (ok, stdout, stderr) = run(
@@ -194,7 +221,11 @@ fn config_set_reset_round_trip_persists_and_validates() {
         stdout.contains("retry.maxRetries = 3  [default]"),
         "reset falls back to the default: {stdout}"
     );
-    assert_eq!(settings_file(agent.path()).get("retry"), None, "reset clears the layer");
+    assert_eq!(
+        settings_file(agent.path()).get("retry"),
+        None,
+        "reset clears the layer"
+    );
 
     // JSON collections round-trip through the typed settings.
     let (ok, _stdout, stderr) = run(
@@ -203,13 +234,60 @@ fn config_set_reset_round_trip_persists_and_validates() {
         &["config", "set", "extensions", r#"["alpha","beta"]"#],
     );
     assert!(ok, "string-list set failed: {stderr}");
-    assert_eq!(settings_file(agent.path())["extensions"], serde_json::json!(["alpha", "beta"]));
+    assert_eq!(
+        settings_file(agent.path())["extensions"],
+        serde_json::json!(["alpha", "beta"])
+    );
 
     // Secret writes are rejected before any file mutation.
-    let (ok, _stdout, stderr) = run(agent.path(), cwd.path(), &["config", "set", "apiKey", "hunter2"]);
+    let (ok, _stdout, stderr) = run(
+        agent.path(),
+        cwd.path(),
+        &["config", "set", "apiKey", "hunter2"],
+    );
     assert!(!ok, "secret write must fail");
     assert!(stderr.contains("secret material"), "{stderr}");
     assert_eq!(settings_file(agent.path()).get("apiKey"), None);
+}
+
+#[test]
+fn config_exposes_only_approved_sandbox_schema() {
+    let agent = TempDir::new().expect("agent dir");
+    let cwd = TempDir::new().expect("cwd");
+    let (ok, _stdout, stderr) = run(
+        agent.path(),
+        cwd.path(),
+        &["config", "set", "sandbox.mode", "read-only"],
+    );
+    assert!(ok, "approved sandbox mode failed: {stderr}");
+    assert_eq!(settings_file(agent.path())["sandbox"]["mode"], "read-only");
+
+    let (ok, _stdout, stderr) = run(
+        agent.path(),
+        cwd.path(),
+        &[
+            "config",
+            "set",
+            "sandbox.hostHttp",
+            r#"{"destinations":[]}"#,
+        ],
+    );
+    assert!(ok, "explicit hostHttp failed: {stderr}");
+    assert_eq!(
+        settings_file(agent.path())["sandbox"]["hostHttp"],
+        serde_json::json!({"destinations": []})
+    );
+
+    for legacy in [
+        "sandbox.enabled",
+        "sandbox.readOnly",
+        "sandbox.allowedPaths",
+    ] {
+        let (ok, _stdout, stderr) =
+            run(agent.path(), cwd.path(), &["config", "set", legacy, "true"]);
+        assert!(!ok, "legacy key {legacy} must fail");
+        assert!(stderr.contains("unknown setting key"), "{legacy}: {stderr}");
+    }
 }
 
 #[test]
@@ -218,8 +296,8 @@ fn config_project_scope_refuses_untrusted_and_works_approved() {
     let cwd = TempDir::new().expect("cwd");
     // Trust-gated resources make the directory subject to the trust policy:
     // without them the project is implicitly trusted (nothing to gate).
-    fs::create_dir_all(cwd.path().join(".pi")).expect(".pi dir");
-    fs::write(cwd.path().join(".pi/settings.json"), "{}").expect("seed project settings");
+    fs::create_dir_all(cwd.path().join(".rpi")).expect(".rpi dir");
+    fs::write(cwd.path().join(".rpi/settings.json"), "{}").expect("seed project settings");
 
     // Project scope on an untrusted project refuses with an actionable error.
     let (ok, _stdout, stderr) = run(
@@ -233,15 +311,26 @@ fn config_project_scope_refuses_untrusted_and_works_approved() {
         "trust refusal message: {stderr}"
     );
 
-    // --approve trusts the project for this run and persists to .pi.
+    // --approve trusts the project for this run and persists to .rpi.
     let (ok, stdout, stderr) = run(
         agent.path(),
         cwd.path(),
-        &["config", "set", "theme", "dark", "--scope", "project", "--approve"],
+        &[
+            "config",
+            "set",
+            "theme",
+            "dark",
+            "--scope",
+            "project",
+            "--approve",
+        ],
     );
     assert!(ok, "approved project set failed: {stderr}");
-    assert!(stdout.contains("theme = \"dark\"  [project]"), "project set: {stdout}");
-    let project = fs::read_to_string(cwd.path().join(".pi/settings.json")).expect("project file");
+    assert!(
+        stdout.contains("theme = \"dark\"  [project]"),
+        "project set: {stdout}"
+    );
+    let project = fs::read_to_string(cwd.path().join(".rpi/settings.json")).expect("project file");
     let project: Value = serde_json::from_str(&project).expect("project json");
     assert_eq!(project["theme"], "dark");
 
@@ -252,7 +341,7 @@ fn config_project_scope_refuses_untrusted_and_works_approved() {
         &["config", "--local", "reset", "theme", "--approve"],
     );
     assert!(ok, "approved project reset failed: {stderr}");
-    let project = fs::read_to_string(cwd.path().join(".pi/settings.json")).expect("project file");
+    let project = fs::read_to_string(cwd.path().join(".rpi/settings.json")).expect("project file");
     let project: Value = serde_json::from_str(&project).expect("project json");
     assert_eq!(project.get("theme"), None, "project reset clears the layer");
 }
@@ -263,7 +352,7 @@ fn bare_config_keeps_the_package_resource_selector() {
     let cwd = TempDir::new().expect("cwd");
     // Piped stdout selects the headless deterministic-JSON path of the
     // package-resource selector (unchanged contract). A directory with no
-    // `.pi` resources carries no trust-gated config, so it reports trusted.
+    // `.rpi` resources carries no trust-gated config, so it reports trusted.
     let (ok, stdout, stderr) = run(agent.path(), cwd.path(), &["config"]);
     assert!(ok, "bare config failed: {stderr}");
     let parsed: Value = serde_json::from_str(stdout.trim()).expect("headless stdout is JSON");

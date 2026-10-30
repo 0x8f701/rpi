@@ -12,14 +12,15 @@
 //! - a local directory containing `pi-extension.json`;
 //! - a local `.tgz` / `.tar.gz` / `.tar` archive;
 //! - an `http(s)` URL pointing at such an archive;
-//! - a GitHub-style `owner/repo` reference, resolved to the codeload tarball
-//!   (`https://codeload.github.com/<owner>/<repo>/tar.gz/HEAD`);
-//! - a git URL — `git+https://host/owner/repo`, `git+ssh://git@host/owner/
-//!   repo.git`, `https://host/owner/repo.git`, `ssh://git@host/owner/repo.git`,
-//!   or `git@host:owner/repo.git` (scp-like) — cloned shallow (`git clone
-//!   --depth 1`, argv-built so no shell string is ever involved, bounded by a
-//!   hard timeout) into staging, stripped of its `.git` metadata, then
-//!   validated and installed exactly like any other source;
+//! - a GitHub-style `owner/repo` or `owner/repo@ref` reference, resolved to
+//!   the codeload tarball (`…/tar.gz/<ref>` with `HEAD` when unpinned);
+//! - a git URL — `http://host/owner/repo.git`, `https://host/owner/repo.git`,
+//!   `git+https://host/owner/repo`, `git+ssh://git@host/owner/repo.git`,
+//!   `ssh://git@host/owner/repo.git`, or `git@host:owner/repo.git` (scp-like)
+//!   — cloned shallow (`git clone --depth 1`, argv-built so no shell string
+//!   is ever involved, bounded by a hard timeout) into staging, stripped of
+//!   its `.git` metadata, then validated and installed exactly like any other
+//!   source;
 //! - an `npm:<name>` / `npm:<name>@<version>` reference, resolved through the
 //!   npm registry (`https://registry.npmjs.org/<name>` for the latest
 //!   version, `<name>/<version>` for a pinned one) to the package's
@@ -38,11 +39,11 @@
 //! - Archive extraction rejects absolute paths, `..` traversal, non-regular
 //!   entries (symlinks, hardlinks, special files), and enforces byte and
 //!   entry-count caps.
-//! - Loading is gated on a `trusted` marker from the trust store: a plugin
-//!   whose canonical path resolves to anything other than `Trusted` is listed
-//!   but not included in [`marketplace_extension_resources`]. `install`
-//!   records the user's explicit consent as a `Trusted` decision for the
-//!   plugin path; `remove` clears it.
+//! - Loading is gated on an exact-canonical `trusted` marker from the trust
+//!   store: a plugin whose canonical directory has anything other than its own
+//!   `Trusted` decision is listed but not included in
+//!   [`marketplace_extension_resources`]. `install` records the user's explicit
+//!   consent for that plugin directory; `remove` clears only that decision.
 //!
 //! The marketplace index is a JSON list of `{name, repo, version,
 //! description?}` entries fetched from the `pluginMarketplace` setting
@@ -58,15 +59,19 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use futures_util::StreamExt;
+use pi_sandbox::AbsolutePath;
 use serde::{Deserialize, Serialize};
-use walkdir::WalkDir;
 
+use crate::fs::{
+    CapabilityAccess, CapabilityDirectory, CapabilityEntry, CapabilityFs, CapabilityRootLease,
+    CapabilityRootPurpose, EntryKind, FileMode, FsError, RootCreation,
+};
 use crate::packages::{PackageResourceKind, PackageResourceSpec, PackageScope};
+use crate::process::{GovernedProcessContext, GovernedProcessSpec};
 use crate::resources::agent_dir_path;
 use crate::trust::{TrustDecision, TrustStore};
 use crate::{
-    ExtensionManifestRuntime, ProcessExtensionManifest, PROCESS_EXTENSION_MANIFEST_FILE,
+    ExtensionManifestRuntime, PROCESS_EXTENSION_MANIFEST_FILE, ProcessExtensionManifest,
     extension_spec_from_package_resource,
 };
 
@@ -104,9 +109,7 @@ const MAX_NPM_METADATA_BYTES: u64 = 2 * 1024 * 1024;
 /// default; tests hold [`NPM_REGISTRY_TEST_LOCK`] while swapping the base so
 /// parallel npm-source tests never race each other's registry.
 static NPM_REGISTRY_BASE: std::sync::LazyLock<std::sync::Mutex<String>> =
-    std::sync::LazyLock::new(|| {
-        std::sync::Mutex::new(DEFAULT_NPM_REGISTRY_BASE.to_owned())
-    });
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(DEFAULT_NPM_REGISTRY_BASE.to_owned()));
 /// Serializes npm-source tests that swap [`NPM_REGISTRY_BASE`].
 #[cfg(test)]
 static NPM_REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -124,6 +127,39 @@ fn set_npm_registry_base_for_tests(base: impl Into<String>) {
     *NPM_REGISTRY_BASE
         .lock()
         .expect("npm registry base mutex poisoned") = base.into();
+}
+/// Revision-bound HTTP executors for the four distinct plugin network classes.
+///
+/// Keeping them separate ensures marketplace indexes, generic archives, npm
+/// metadata, and npm tarballs cannot widen one another's redirect authority.
+#[derive(Clone)]
+pub struct PluginHttpExecutors {
+    marketplace: pi_ai::SharedHttpExecutor,
+    archive: pi_ai::SharedHttpExecutor,
+    npm_registry: pi_ai::SharedHttpExecutor,
+    npm_tarball: pi_ai::SharedHttpExecutor,
+}
+
+impl PluginHttpExecutors {
+    pub fn new(
+        marketplace: pi_ai::SharedHttpExecutor,
+        archive: pi_ai::SharedHttpExecutor,
+        npm_registry: pi_ai::SharedHttpExecutor,
+        npm_tarball: pi_ai::SharedHttpExecutor,
+    ) -> Self {
+        Self {
+            marketplace,
+            archive,
+            npm_registry,
+            npm_tarball,
+        }
+    }
+}
+
+impl std::fmt::Debug for PluginHttpExecutors {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PluginHttpExecutors([CAPTURED])")
+    }
 }
 
 /// Runtime kind of an installed plugin, for `plugin list`.
@@ -151,7 +187,7 @@ pub struct PluginInfo {
     /// Manifest `version`; `0.0.0` when the manifest carries none.
     pub version: String,
     pub runtime: PluginRuntime,
-    /// Effective trust-store decision at the plugin path. Only trusted
+    /// Exact stored decision for the canonical plugin directory. Only trusted
     /// plugins are loadable extensions.
     pub trusted: bool,
     pub path: PathBuf,
@@ -214,7 +250,10 @@ impl MarketplaceIndex {
                 bail!("marketplace entry {} version exceeds 128 bytes", entry.name);
             }
             if !seen.insert(entry.name.as_str()) {
-                bail!("marketplace index lists plugin {name} twice", name = entry.name);
+                bail!(
+                    "marketplace index lists plugin {name} twice",
+                    name = entry.name
+                );
             }
         }
         Ok(Self { entries })
@@ -237,27 +276,29 @@ impl MarketplaceIndex {
 }
 
 /// Fetch and parse the marketplace index from `source`: an `http(s)` URL or a
-/// local index file path (`file://` prefixes are accepted).
-pub async fn fetch_index(source: &str) -> Result<MarketplaceIndex> {
+/// local index file path (`file://` prefixes are accepted). Remote indexes
+/// require a captured `PluginMarketplace` executor; there is no ambient HTTP
+/// fallback.
+async fn fetch_index_with_executor(
+    cwd: &Path,
+    source: &str,
+    executor: Option<&pi_ai::SharedHttpExecutor>,
+) -> Result<MarketplaceIndex> {
     let trimmed = source.trim();
     if trimmed.is_empty() {
         bail!("marketplace index source must not be empty");
     }
     let bytes = if let Some(url) = parse_http_url(trimmed) {
-        fetch_bytes(url.as_str(), MAX_MARKETPLACE_INDEX_BYTES)
+        let executor =
+            executor.ok_or_else(|| anyhow!("plugin marketplace HTTP generation is unavailable"))?;
+        fetch_bytes(executor, url.as_str(), MAX_MARKETPLACE_INDEX_BYTES)
             .await
             .with_context(|| format!("fetching marketplace index from {url}"))?
     } else {
-        let path = trimmed.strip_prefix("file://").unwrap_or(trimmed);
-        let bytes = fs::read(path)
-            .with_context(|| format!("reading marketplace index {}", Path::new(path).display()))?;
-        if bytes.len() as u64 > MAX_MARKETPLACE_INDEX_BYTES {
-            bail!(
-                "marketplace index {} exceeds {MAX_MARKETPLACE_INDEX_BYTES} bytes",
-                path
-            );
-        }
-        bytes
+        let (parent, name) = open_operator_source(cwd, trimmed)?;
+        parent
+            .read_bounded(Path::new(&name), MAX_MARKETPLACE_INDEX_BYTES)
+            .with_context(|| format!("reading marketplace index {trimmed}"))?
     };
     MarketplaceIndex::parse(&bytes).with_context(|| format!("parsing marketplace index {source}"))
 }
@@ -289,23 +330,95 @@ fn version_parts(value: &str) -> Vec<&str> {
         .filter(|part| !part.is_empty())
         .collect()
 }
-
-/// Plugin marketplace over one agent directory. Installed plugins live in
-/// `<agent_dir>/extensions/<name>/`; trust lives in the agent trust store.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PluginMarketplace {
     agent_dir: PathBuf,
+    /// The operator working directory relative local/file plugin sources and
+    /// local marketplace index files are resolved against. Defaults to the
+    /// process cwd at construction; the CLI overrides it with its `--cwd`
+    /// (or the process cwd) so relative sources always resolve where the
+    /// operator ran the command.
+    cwd: PathBuf,
+    extensions: CapabilityRootLease,
+    process: Option<GovernedProcessContext>,
+    http: Option<PluginHttpExecutors>,
+}
+
+impl std::fmt::Debug for PluginMarketplace {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PluginMarketplace")
+            .field("agent_dir", &self.agent_dir)
+            .field("cwd", &self.cwd)
+            .finish()
+    }
 }
 
 impl PluginMarketplace {
-    pub fn new(agent_dir: impl Into<PathBuf>) -> Self {
-        Self {
-            agent_dir: agent_dir.into(),
-        }
+    pub fn new(agent_dir: impl Into<PathBuf>) -> Result<Self> {
+        let agent_dir = agent_dir.into();
+        let cwd = std::env::current_dir().context("resolving plugin operator working directory")?;
+        let capabilities =
+            CapabilityFs::new().context("creating plugin filesystem capabilities")?;
+        let absolute = AbsolutePath::parse(agent_dir.clone()).map_err(|_| FsError::InvalidPath)?;
+        let agent = capabilities
+            .open_root(
+                CapabilityRootPurpose::AgentStore,
+                absolute,
+                CapabilityAccess::PrivateReadWrite,
+                RootCreation::CreateDirectory,
+            )
+            .context("opening private agent store for plugins")?;
+        let extensions = agent
+            .lease_directory(
+                Path::new("extensions"),
+                CapabilityAccess::PrivateReadWrite,
+                RootCreation::CreateDirectory,
+            )
+            .context("opening private plugin store")?;
+        Ok(Self {
+            agent_dir,
+            cwd,
+            extensions,
+            process: None,
+            http: None,
+        })
     }
 
     #[must_use]
-    pub fn global() -> Self {
+    pub fn with_process_context(mut self, process: GovernedProcessContext) -> Self {
+        self.process = Some(process);
+        self
+    }
+
+    /// Override the operator working directory that relative local/file
+    /// plugin sources and local marketplace index files are resolved against.
+    /// The CLI passes the `--cwd` it already computes for settings; tests use
+    /// it to control resolution without touching the process cwd.
+    #[must_use]
+    pub fn with_operator_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
+        self.cwd = cwd.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_http_executors(mut self, http: PluginHttpExecutors) -> Self {
+        self.http = Some(http);
+        self
+    }
+
+    /// Fetch a local or remote marketplace index using this marketplace's
+    /// captured `PluginMarketplace` HTTP authority.
+    pub async fn fetch_index(&self, source: &str) -> Result<MarketplaceIndex> {
+        fetch_index_with_executor(
+            &self.cwd,
+            source,
+            self.http.as_ref().map(|http| &http.marketplace),
+        )
+        .await
+    }
+
+    pub fn global() -> Result<Self> {
         Self::new(agent_dir_path())
     }
 
@@ -343,58 +456,86 @@ impl PluginMarketplace {
     /// never executes package code. On success the plugin is recorded as
     /// `Trusted` in the trust store, making it loadable.
     pub async fn install(&self, source: &str, trust_store: &TrustStore) -> Result<PluginInfo> {
-        let root = self.extensions_root();
-        fs::create_dir_all(&root)
-            .with_context(|| format!("creating extensions root {}", root.display()))?;
-        let staging = unique_sibling(&root, "plugin-staging");
-        let mut guard = RemovePathOnDrop::new(staging.clone());
-        stage_source(source, &staging)
-            .await
-            .with_context(|| format!("staging plugin source {}", redact_url_credentials(source)))?;
-        let manifest = validate_package(&staging)
-            .with_context(|| format!("invalid plugin package from {}", redact_url_credentials(source)))?;
+        let staging_relative = unique_name("plugin-staging");
+        self.extensions
+            .create_dir_all(&staging_relative, FileMode::Private)
+            .context("creating plugin staging directory")?;
+        let staging = self.extensions.display_root().join(&staging_relative);
+        let mut guard = RemovePathOnDrop::new(self.extensions.clone(), staging_relative.clone());
+        stage_source(
+            &self.extensions,
+            self.process.as_ref(),
+            self.http.as_ref(),
+            &self.cwd,
+            source,
+            &staging_relative,
+        )
+        .await
+        .with_context(|| format!("staging plugin source {}", redact_url_credentials(source)))?;
+        let manifest = validate_package(&staging).with_context(|| {
+            format!(
+                "invalid plugin package from {}",
+                redact_url_credentials(source)
+            )
+        })?;
         let name = manifest.id.clone();
         validate_plugin_name(&name)?;
-        let target = root.join(&name);
-        if target.exists() {
-            bail!(
-                "plugin {name} is already installed at {}; run `rpi plugin update {name}` or `rpi plugin remove {name}` first",
-                target.display()
-            );
+        let target_relative = PathBuf::from(&name);
+        if self.extensions.metadata(&target_relative).is_ok() {
+            bail!("plugin {name} is already installed");
         }
-        fs::rename(&staging, &target)
-            .with_context(|| format!("installing plugin {name} at {}", target.display()))?;
+        self.extensions
+            .rename(&staging_relative, &target_relative)
+            .with_context(|| format!("installing plugin {name}"))?;
+        let target = self.extensions.display_root().join(&target_relative);
+        if let Err(error) = trust_store
+            .set_exact(&target, TrustDecision::Trusted)
+            .with_context(|| format!("recording trust for plugin {name}"))
+        {
+            return match self.extensions.rename(&target_relative, &staging_relative) {
+                Ok(()) => Err(error),
+                Err(restore_error) => Err(error.context(format!(
+                    "restoring staged plugin {name} after trust recording failed: {restore_error}"
+                ))),
+            };
+        }
         guard.disarm();
-        // The install command is the user's explicit consent: record trust so
-        // the plugin becomes loadable.
-        trust_store
-            .set(&target, TrustDecision::Trusted)
-            .with_context(|| format!("recording trust for plugin {name}"))?;
         Ok(plugin_info(&target, &manifest, true))
     }
 
     /// Remove an installed plugin and clear its stored trust decision.
     pub fn remove(&self, name: &str, trust_store: &TrustStore) -> Result<()> {
         validate_plugin_name(name)?;
-        let root = self.extensions_root();
-        let target = root.join(name);
-        if !target.is_dir() {
+        let target_relative = PathBuf::from(name);
+        let metadata = self
+            .extensions
+            .metadata(&target_relative)
+            .map_err(|_| anyhow!("plugin {name} is not installed"))?;
+        if metadata.identity.kind() != EntryKind::Directory {
             bail!("plugin {name} is not installed");
         }
-        let canonical_root = fs::canonicalize(&root)
-            .with_context(|| format!("resolving extensions root {}", root.display()))?;
-        let canonical_target = fs::canonicalize(&target)
-            .with_context(|| format!("resolving plugin {}", target.display()))?;
-        if canonical_target != canonical_root && !canonical_target.starts_with(&canonical_root) {
-            bail!(
-                "refusing to remove path outside the extensions root: {}",
-                target.display()
-            );
+        let target = self.extensions.display_root().join(&target_relative);
+        let removing = unique_name("plugin-removing");
+        self.extensions
+            .rename(&target_relative, &removing)
+            .with_context(|| format!("isolating plugin {name}"))?;
+        let trust_cleanup = (|| {
+            #[cfg(test)]
+            remove_test_hook::before_cleanup()?;
+            trust_store.clear_exact(&target)
+        })()
+        .with_context(|| format!("clearing trust for plugin {name}"));
+        if let Err(error) = trust_cleanup {
+            return match self.extensions.rename(&removing, &target_relative) {
+                Ok(()) => Err(error),
+                Err(restore_error) => Err(error.context(format!(
+                    "restoring plugin {name} after trust cleanup failed: {restore_error}"
+                ))),
+            };
         }
-        fs::remove_dir_all(&target).with_context(|| format!("removing plugin {name}"))?;
-        trust_store
-            .set(&target, TrustDecision::Ask)
-            .with_context(|| format!("clearing trust for plugin {name}"))?;
+        self.extensions
+            .remove_tree(&removing)
+            .with_context(|| format!("removing plugin {name}"))?;
         Ok(())
     }
 
@@ -408,12 +549,13 @@ impl PluginMarketplace {
         trust_store: &TrustStore,
     ) -> Result<PluginInfo> {
         validate_plugin_name(name)?;
-        let root = self.extensions_root();
-        let target = root.join(name);
-        if !target.is_dir() {
-            bail!("plugin {name} is not installed");
-        }
-        let installed = read_plugin_manifest(&target)
+        let target_relative = PathBuf::from(name);
+        let target_directory = self
+            .extensions
+            .open_directory(&target_relative)
+            .map_err(|_| anyhow!("plugin {name} is not installed"))?;
+        let target = target_directory.display_path();
+        let installed = read_plugin_manifest_from(target_directory)
             .with_context(|| format!("reading installed plugin {name}"))?;
         let installed_version = installed.version.as_deref().unwrap_or("0.0.0");
         let entry = index
@@ -425,83 +567,66 @@ impl PluginMarketplace {
                 entry.version
             );
         }
-        let staging = unique_sibling(&root, "plugin-staging");
-        let mut guard = RemovePathOnDrop::new(staging.clone());
-        stage_source(&entry.repo, &staging)
-            .await
-            .with_context(|| {
-                format!(
-                    "staging plugin {name} from {}",
-                    redact_url_credentials(&entry.repo)
-                )
-            })?;
-        let manifest = validate_package(&staging)
-            .with_context(|| {
-                format!(
-                    "invalid plugin package from {}",
-                    redact_url_credentials(&entry.repo)
-                )
-            })?;
+        let staging_relative = unique_name("plugin-staging");
+        self.extensions
+            .create_dir_all(&staging_relative, FileMode::Private)
+            .context("creating plugin staging directory")?;
+        let staging = self.extensions.display_root().join(&staging_relative);
+        let mut guard = RemovePathOnDrop::new(self.extensions.clone(), staging_relative.clone());
+        stage_source(
+            &self.extensions,
+            self.process.as_ref(),
+            self.http.as_ref(),
+            &self.cwd,
+            &entry.repo,
+            &staging_relative,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "staging plugin {name} from {}",
+                redact_url_credentials(&entry.repo)
+            )
+        })?;
+        let manifest = validate_package(&staging).with_context(|| {
+            format!(
+                "invalid plugin package from {}",
+                redact_url_credentials(&entry.repo)
+            )
+        })?;
         if manifest.id != name {
             bail!(
                 "marketplace entry {name} staged a manifest with id {:?}; refusing to replace",
                 manifest.id
             );
         }
-        directory_swap(&staging, &target).with_context(|| format!("replacing plugin {name}"))?;
+        directory_swap(&self.extensions, &staging_relative, &target_relative)
+            .with_context(|| format!("replacing plugin {name}"))?;
         guard.disarm();
         let trusted = self.plugin_trusted(trust_store, &target);
         Ok(plugin_info(&target, &manifest, trusted))
     }
 
-    /// Every installed plugin with a newer version in the index.
-    pub fn available_updates(&self, index: &MarketplaceIndex) -> Result<Vec<PluginUpdate>> {
-        let (installed, _) = self.scan_installed()?;
-        let mut updates = Vec::new();
-        for plugin in installed {
-            let Some(entry) = index.entry(&plugin.name) else {
-                continue;
-            };
-            if compare_versions(&entry.version, &plugin.version) == Ordering::Greater {
-                updates.push(PluginUpdate {
-                    name: plugin.name,
-                    current: plugin.version,
-                    available: entry.version.clone(),
-                    repo: entry.repo.clone(),
-                });
-            }
-        }
-        updates.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(updates)
-    }
-
     fn plugin_trusted(&self, trust_store: &TrustStore, path: &Path) -> bool {
         trust_store
-            .resolve(path)
-            .map(|resolution| resolution.decision == TrustDecision::Trusted)
-            .unwrap_or(false)
+            .resolve_exact(path)
+            .is_ok_and(|decision| decision == TrustDecision::Trusted)
     }
 
     fn scan_installed(&self) -> Result<(Vec<PluginInfo>, Vec<String>)> {
-        let root = self.extensions_root();
         let mut plugins = Vec::new();
         let mut problems = Vec::new();
-        if !root.is_dir() {
-            return Ok((plugins, problems));
-        }
-        let entries = fs::read_dir(&root)
-            .with_context(|| format!("reading extensions root {}", root.display()))?;
-        for entry in entries {
-            let entry = entry.with_context(|| format!("reading {}", root.display()))?;
-            let name = entry.file_name();
+        let mut entries = self.extensions.read_dir(Path::new(""))?;
+        while let Some(entry) = entries.next()? {
+            let name = entry.name().to_os_string();
             if name.to_string_lossy().starts_with('.') {
                 continue;
             }
-            let path = entry.path();
-            if !path.is_dir() || !path.join(PROCESS_EXTENSION_MANIFEST_FILE).is_file() {
+            let CapabilityEntry::Directory(directory) = entry.into_entry() else {
                 continue;
-            }
-            match read_plugin_manifest(&path) {
+            };
+            let path = directory.display_path();
+            match read_plugin_manifest_from(directory) {
                 Ok(manifest) => plugins.push(plugin_info(&path, &manifest, false)),
                 Err(error) => problems.push(format!("{}: {error:#}", path.display())),
             }
@@ -513,9 +638,9 @@ impl PluginMarketplace {
 
 /// Scan `<agent_dir>/extensions` and return loadable extension resources.
 ///
-/// The trust store gates loading: a plugin whose canonical path resolves to
-/// anything other than a stored `Trusted` decision is skipped (it stays
-/// visible in `rpi plugin list` but is not loadable). Each included resource
+/// The trust store gates loading by exact canonical plugin directory: anything
+/// other than that directory's own stored `Trusted` decision is skipped (it
+/// stays visible in `rpi plugin list` but is not loadable). Each included resource
 /// is a `PackageScope::Global` extension root, so the normal
 /// [`crate::extension_spec_from_package_resource`] pipeline re-validates the
 /// manifest and runtime path before launch.
@@ -523,30 +648,29 @@ pub fn marketplace_extension_resources(
     agent_dir: &Path,
     trust_store: &TrustStore,
 ) -> Result<Vec<PackageResourceSpec>> {
-    let root = agent_dir.join("extensions");
+    let marketplace = PluginMarketplace::new(agent_dir)?;
     let mut resources = Vec::new();
-    if !root.is_dir() {
-        return Ok(resources);
-    }
-    let entries = fs::read_dir(&root)
-        .with_context(|| format!("reading extensions root {}", root.display()))?;
-    for entry in entries {
-        let entry = entry.with_context(|| format!("reading {}", root.display()))?;
-        let name = entry.file_name();
+    let mut entries = marketplace.extensions.read_dir(Path::new(""))?;
+    while let Some(entry) = entries.next()? {
+        let name = entry.name().to_os_string();
         if name.to_string_lossy().starts_with('.') {
             continue;
         }
-        let path = entry.path();
-        if !path.is_dir() || !path.join(PROCESS_EXTENSION_MANIFEST_FILE).is_file() {
+        let CapabilityEntry::Directory(directory) = entry.into_entry() else {
+            continue;
+        };
+        let path = directory.display_path();
+        if read_plugin_manifest_from(directory).is_err() {
             continue;
         }
-        let trusted = trust_store.resolve(&path)?.decision == TrustDecision::Trusted;
+        let trusted = trust_store.resolve_exact(&path)? == TrustDecision::Trusted;
         if !trusted {
             continue;
         }
         resources.push(PackageResourceSpec {
             kind: PackageResourceKind::Extension,
             path,
+            managed_root: None,
             package_id: format!("marketplace:{}", name.to_string_lossy()),
             scope: PackageScope::Global,
             trusted,
@@ -566,6 +690,7 @@ fn validate_package(root: &Path) -> Result<ProcessExtensionManifest> {
     let spec = PackageResourceSpec {
         kind: PackageResourceKind::Extension,
         path: root.to_path_buf(),
+        managed_root: None,
         package_id: format!("marketplace:{}", manifest.id),
         scope: PackageScope::Global,
         trusted: true,
@@ -578,21 +703,45 @@ fn validate_package(root: &Path) -> Result<ProcessExtensionManifest> {
 /// Parse + schema-validate the manifest at `root/pi-extension.json` without
 /// resolving the runtime path (listing stays tolerant of a broken runtime).
 fn read_plugin_manifest(root: &Path) -> Result<ProcessExtensionManifest> {
-    let manifest_path = root.join(PROCESS_EXTENSION_MANIFEST_FILE);
-    if !manifest_path.is_file() {
-        bail!(
+    let capabilities = CapabilityFs::new().context("creating plugin source capabilities")?;
+    let absolute = AbsolutePath::parse(root.to_path_buf()).map_err(|_| FsError::InvalidPath)?;
+    let lease = capabilities
+        .open_root(
+            CapabilityRootPurpose::OperatorImport,
+            absolute,
+            CapabilityAccess::ReadOnly,
+            RootCreation::Existing,
+        )
+        .context("opening plugin package")?;
+    read_plugin_manifest_from(lease.open_directory(Path::new(""))?)
+}
+
+fn read_plugin_manifest_from(root: CapabilityDirectory) -> Result<ProcessExtensionManifest> {
+    let manifest_path = root.display_path().join(PROCESS_EXTENSION_MANIFEST_FILE);
+    let mut entries = root.read_dir()?;
+    let mut manifest_file = None;
+    while let Some(entry) = entries.next()? {
+        if entry.name() != PROCESS_EXTENSION_MANIFEST_FILE {
+            continue;
+        }
+        manifest_file = match entry.into_entry() {
+            CapabilityEntry::File(file) => Some(file),
+            CapabilityEntry::Directory(_) => bail!(
+                "plugin manifest path is not a regular file: {}",
+                manifest_path.display()
+            ),
+        };
+        break;
+    }
+    let file = manifest_file.ok_or_else(|| {
+        anyhow!(
             "plugin package must contain a {PROCESS_EXTENSION_MANIFEST_FILE} manifest at its root: {}",
             manifest_path.display()
-        );
-    }
-    let bytes = fs::read(&manifest_path)
+        )
+    })?;
+    let bytes = file
+        .read_bounded(MAX_MANIFEST_BYTES)
         .with_context(|| format!("reading plugin manifest {}", manifest_path.display()))?;
-    if bytes.len() as u64 > MAX_MANIFEST_BYTES {
-        bail!(
-            "plugin manifest {} exceeds {MAX_MANIFEST_BYTES} bytes",
-            manifest_path.display()
-        );
-    }
     let manifest: ProcessExtensionManifest = serde_json::from_slice(&bytes)
         .with_context(|| format!("parsing plugin manifest {}", manifest_path.display()))?;
     manifest
@@ -608,7 +757,10 @@ fn plugin_info(path: &Path, manifest: &ProcessExtensionManifest, trusted: bool) 
     };
     PluginInfo {
         name: manifest.id.clone(),
-        version: manifest.version.clone().unwrap_or_else(|| "0.0.0".to_owned()),
+        version: manifest
+            .version
+            .clone()
+            .unwrap_or_else(|| "0.0.0".to_owned()),
         runtime,
         trusted,
         path: path.to_path_buf(),
@@ -628,10 +780,9 @@ fn validate_plugin_name(name: &str) -> Result<()> {
     if name == "." || name == ".." {
         bail!("plugin name {name:?} is not a valid directory name");
     }
-    if name
-        .chars()
-        .any(|character| !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')))
-    {
+    if name.chars().any(|character| {
+        !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+    }) {
         bail!("plugin name {name:?} contains unsupported characters");
     }
     Ok(())
@@ -642,65 +793,111 @@ fn validate_plugin_name(name: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Materialize `source` into the staging directory as a plugin package root.
-async fn stage_source(source: &str, staging: &Path) -> Result<()> {
+///
+/// Local directory and archive sources are resolved against `cwd` (the
+/// operator working directory) and opened through capability authority, so
+/// relative paths behave exactly like the operator typed them. Git-shaped
+/// sources (`git+`, `ssh`, scp-like, and `file:` URLs whose final segment
+/// ends in `.git`) are resolved by clone *before* the local-open attempt, so
+/// a `file://.../repo.git` that exists on disk is still cloned (bare
+/// repositories have no working tree to copy) instead of copied.
+async fn stage_source(
+    staging_store: &CapabilityRootLease,
+    process: Option<&GovernedProcessContext>,
+    http: Option<&PluginHttpExecutors>,
+    cwd: &Path,
+    source: &str,
+    staging_relative: &Path,
+) -> Result<()> {
+    let staging = staging_store.display_root().join(staging_relative);
     let trimmed = source.trim();
     if trimmed.is_empty() {
         bail!("plugin source must not be empty");
     }
-    // Error messages never echo URL credentials, even when the caller's
-    // `source` embeds them (e.g. `https://user:pass@host/repo.git`).
     let redacted = redact_url_credentials(trimmed);
-    // A local path wins over a same-shaped owner/repo reference.
-    if Path::new(trimmed).exists() {
-        let metadata = fs::metadata(trimmed)
-            .with_context(|| format!("reading plugin source {}", Path::new(trimmed).display()))?;
-        if metadata.is_dir() {
-            return copy_tree(Path::new(trimmed), staging);
-        }
-        if is_archive_path(Path::new(trimmed)) {
-            let bytes = fs::read(trimmed)
-                .with_context(|| format!("reading plugin archive {}", Path::new(trimmed).display()))?;
-            return extract_tar_from_bytes(&bytes, staging)
-                .with_context(|| format!("extracting plugin archive {}", Path::new(trimmed).display()));
-        }
-        bail!(
-            "unsupported plugin source {redacted}: expected a directory, a .tgz/.tar.gz/.tar archive, an http(s) archive URL, an owner/repo GitHub reference, an npm:<name>[@<version>] reference, or a git URL (git+https://host/owner/repo, git+ssh://git@host/owner/repo.git, https://host/owner/repo.git, ssh://git@host/owner/repo.git, git@host:owner/repo.git)"
-        );
-    }
-    // Git URL sources come before the http-archive check so
-    // `https://host/owner/repo.git` is not mistaken for a tarball URL.
     if let Some(clone_url) = parse_git_reference(trimmed) {
-        return stage_git_source(&clone_url, staging).await;
+        return stage_git_source(
+            staging_store,
+            process.ok_or_else(|| anyhow!("plugin process generation is unavailable"))?,
+            &clone_url,
+            staging_relative,
+        )
+        .await;
     }
-    // A git-shaped URL that failed strict parsing gets a git-specific
-    // actionable error instead of the archive-URL or generic source error.
     if looks_like_git_url(trimmed) {
-        bail!(
-            "unsupported plugin git source {redacted}: expected git+https://host/owner/repo, git+ssh://git@host/owner/repo.git, https://host/owner/repo.git, ssh://git@host/owner/repo.git, or git@host:owner/repo.git"
-        );
-    }
-    if let Some(url) = parse_http_url(trimmed) {
-        if !is_archive_path(Path::new(url.path())) {
-            bail!(
-                "unsupported plugin archive URL {redacted}: expected a .tgz/.tar.gz/.tar archive URL"
-            );
-        }
-        let bytes = fetch_bytes(url.as_str(), MAX_PACKAGE_BYTES).await?;
-        return extract_tar_from_bytes(&bytes, staging)
-            .with_context(|| format!("extracting plugin archive {url}"));
-    }
-    if let Some((owner, repo)) = parse_github_reference(trimmed) {
-        let url = format!("https://codeload.github.com/{owner}/{repo}/tar.gz/HEAD");
-        let bytes = fetch_bytes(&url, MAX_PACKAGE_BYTES).await?;
-        return extract_tar_from_bytes(&bytes, staging)
-            .with_context(|| format!("extracting GitHub tarball {url}"));
+        bail!("unsupported plugin git source {redacted}");
     }
     if let Some(reference) = parse_npm_reference(trimmed) {
-        return stage_npm_source(&reference, staging).await;
+        return stage_npm_source(
+            &reference,
+            staging_store,
+            staging_relative,
+            http.ok_or_else(|| anyhow!("plugin npm HTTP generation is unavailable"))?,
+        )
+        .await;
     }
-    bail!(
-        "unsupported plugin source {redacted}: the path does not exist; expected a local directory, a .tgz/.tar.gz/.tar archive, an http(s) archive URL, an owner/repo GitHub reference, an npm:<name>[@<version>] reference, or a git URL (git+https://host/owner/repo, git+ssh://git@host/owner/repo.git, https://host/owner/repo.git, ssh://git@host/owner/repo.git, git@host:owner/repo.git)"
-    );
+    if !trimmed.starts_with("file://") {
+        if let Some(url) = parse_http_url(trimmed) {
+            if !is_archive_path(Path::new(url.path())) {
+                bail!("unsupported plugin archive URL {redacted}");
+            }
+            let executor = http
+                .map(|http| &http.archive)
+                .ok_or_else(|| anyhow!("plugin archive HTTP generation is unavailable"))?;
+            let bytes = fetch_bytes(executor, url.as_str(), MAX_PACKAGE_BYTES).await?;
+            return extract_tar_from_bytes(&bytes, staging_store, staging_relative)
+                .with_context(|| format!("extracting plugin archive {url}"));
+        }
+        if trimmed.contains("://") {
+            bail!("unsupported plugin source {redacted}");
+        }
+    }
+    match open_operator_source(cwd, trimmed) {
+        Ok((source, source_name)) => {
+            match source.metadata(Path::new(&source_name))?.identity.kind() {
+                EntryKind::Directory => {
+                    return copy_tree(
+                        source.open_directory(Path::new(&source_name))?,
+                        staging_store,
+                        staging_relative,
+                    );
+                }
+                EntryKind::RegularFile if is_archive_path(Path::new(trimmed)) => {
+                    let bytes = source.read_bounded(Path::new(&source_name), MAX_PACKAGE_BYTES)?;
+                    return extract_tar_from_bytes(&bytes, staging_store, staging_relative)
+                        .with_context(|| {
+                            format!("extracting plugin archive {}", Path::new(trimmed).display())
+                        });
+                }
+                EntryKind::RegularFile => bail!("unsupported plugin source {redacted}"),
+            }
+        }
+        Err(error) if is_local_source_spelling(trimmed) => {
+            return Err(error).with_context(|| format!("opening local plugin source {redacted}"));
+        }
+        Err(_) => {}
+    }
+    if let Some(reference) = parse_github_reference(trimmed) {
+        let git_ref = reference.git_ref.as_deref().unwrap_or("HEAD");
+        let url = format!(
+            "https://codeload.github.com/{}/{}/tar.gz/{git_ref}",
+            reference.owner, reference.repo
+        );
+        let executor = http
+            .map(|http| &http.archive)
+            .ok_or_else(|| anyhow!("plugin archive HTTP generation is unavailable"))?;
+        let bytes = fetch_bytes(executor, &url, MAX_PACKAGE_BYTES).await?;
+        return extract_tar_from_bytes(&bytes, staging_store, staging_relative)
+            .with_context(|| format!("extracting GitHub tarball {url}"));
+    }
+    bail!("unsupported plugin source {redacted}")
+}
+
+fn is_local_source_spelling(value: &str) -> bool {
+    value.starts_with("file://")
+        || value.starts_with('.')
+        || Path::new(value).is_absolute()
+        || value.starts_with("plugins/")
 }
 
 fn parse_http_url(value: &str) -> Option<url::Url> {
@@ -713,10 +910,9 @@ fn parse_http_url(value: &str) -> Option<url::Url> {
 /// install context, and the unsupported-source messages can all carry the
 /// raw source string).
 pub fn redact_url_credentials(text: &str) -> String {
-    static CREDENTIALS: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| {
-            regex::Regex::new(r"(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+@").expect("valid regex")
-        });
+    static CREDENTIALS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+@").expect("valid regex")
+    });
     CREDENTIALS.replace_all(text, "$1***@").into_owned()
 }
 
@@ -731,21 +927,56 @@ fn is_archive_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Parse a GitHub-style `owner/repo` reference (exactly two segments, both
-/// valid GitHub names). Returns `None` for URLs, paths with more segments,
-/// or names that could never exist on GitHub.
-fn parse_github_reference(value: &str) -> Option<(String, String)> {
+/// Parse a GitHub-style `owner/repo` or `owner/repo@ref` reference (exactly
+/// two path segments, both valid GitHub names). `@ref` pins the codeload
+/// tarball; omitting it selects `HEAD`. Returns `None` for URLs, extra
+/// segments, empty pins, or names that could never exist on GitHub.
+fn parse_github_reference(value: &str) -> Option<GitHubReference> {
     if value.contains("://") || value.starts_with('.') {
         return None;
     }
-    let mut parts = value.split('/');
+    let (spec, git_ref) = match value.rsplit_once('@') {
+        Some((spec, git_ref)) if !spec.is_empty() && !git_ref.is_empty() => {
+            (spec, Some(git_ref))
+        }
+        Some(_) => return None,
+        None => (value, None),
+    };
+    if git_ref.is_some_and(|git_ref| !valid_git_ref(git_ref)) {
+        return None;
+    }
+    let mut parts = spec.split('/');
     let owner = parts.next()?;
     let repo = parts.next()?;
     if parts.next().is_some() || owner.is_empty() || repo.is_empty() {
         return None;
     }
     let repo_name = repo.strip_suffix(".git").unwrap_or(repo);
-    (valid_repo_name(owner) && valid_repo_name(repo_name)).then(|| (owner.to_owned(), repo_name.to_owned()))
+    (valid_repo_name(owner) && valid_repo_name(repo_name)).then(|| GitHubReference {
+        owner: owner.to_owned(),
+        repo: repo_name.to_owned(),
+        git_ref: git_ref.map(str::to_owned),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitHubReference {
+    owner: String,
+    repo: String,
+    git_ref: Option<String>,
+}
+
+/// GitHub codeload ref: tag, branch, or commit-ish. Rejects traversal and
+/// URL-breaking characters.
+fn valid_git_ref(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 200
+        && !value.starts_with('.')
+        && !value.contains("..")
+        && !value.contains("//")
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | '/'))
 }
 
 /// Whether `part` could be a GitHub owner or repository name: ASCII
@@ -756,15 +987,16 @@ fn valid_repo_name(part: &str) -> bool {
         && part.len() <= 100
         && !part.starts_with('.')
         && !part.ends_with('.')
-        && part
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+        && part.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        })
 }
 
 /// A git URL plugin source, normalized to a clone URL. Accepts:
+/// - `http://host/owner/repo.git` / `https://host/owner/repo.git`;
 /// - `git+https://host/owner/repo[.git]` (the `.git` suffix is optional);
+/// - `git+http://host/owner/repo[.git]`;
 /// - `git+ssh://git@host/owner/repo.git`, `ssh://git@host/owner/repo.git`;
-/// - `https://host/owner/repo.git`;
 /// - `git@host:owner/repo.git` (scp-like), normalized to `ssh://git@host/...`;
 /// - `file://.../owner/repo.git` / `git+file://...` for local repositories
 ///   (used by tests and local mirrors).
@@ -786,8 +1018,8 @@ fn parse_git_reference(value: &str) -> Option<String> {
         return None;
     }
     const SHELL_METACHARACTERS: &[char] = &[
-        '"', '\'', '\\', '`', '$', '&', '|', ';', '<', '>', '(', ')', '*',
-        '?', '[', ']', '{', '}', '!', '#',
+        '"', '\'', '\\', '`', '$', '&', '|', ';', '<', '>', '(', ')', '*', '?', '[', ']', '{', '}',
+        '!', '#',
     ];
     if value
         .chars()
@@ -823,7 +1055,7 @@ fn parse_git_reference(value: &str) -> Option<String> {
 /// (`file:///tmp/.../owner/repo.git`); the final segment must still carry the
 /// repository name. Returns the canonical clone URL on success.
 fn valid_git_clone_url(url: &url::Url, bare_repo_allowed: bool) -> Option<String> {
-    if !matches!(url.scheme(), "https" | "ssh" | "file") {
+    if !matches!(url.scheme(), "https" | "http" | "ssh" | "file") {
         return None;
     }
     if url.query().is_some() || url.fragment().is_some() {
@@ -847,7 +1079,7 @@ fn valid_git_clone_url(url: &url::Url, bare_repo_allowed: bool) -> Option<String
         return None;
     }
     if !is_file && segments.len() != 2 {
-        return None; // https/ssh repos are exactly host/owner/repo
+        return None; // http/https/ssh repos are exactly host/owner/repo
     }
     let owner = segments[segments.len() - 2];
     let repo = *segments.last().expect("at least two segments");
@@ -954,9 +1186,11 @@ fn valid_npm_name(name: &str) -> bool {
     [scope, package].into_iter().all(|part| {
         !part.starts_with('.')
             && !part.starts_with('_')
-            && part
-                .chars()
-                .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit() || matches!(character, '-' | '_' | '.'))
+            && part.chars().all(|character| {
+                character.is_ascii_lowercase()
+                    || character.is_ascii_digit()
+                    || matches!(character, '-' | '_' | '.')
+            })
     })
 }
 
@@ -966,75 +1200,64 @@ fn valid_npm_name(name: &str) -> bool {
 /// may be embedded in the source URL never persist in the installed package.
 /// Failures are actionable — missing git binary, repository not found, auth
 /// failure — and never echo URL credentials.
-async fn stage_git_source(clone_url: &str, staging: &Path) -> Result<()> {
-    let mut command = tokio::process::Command::new("git");
-    command
-        .args(["-c", "color.ui=false", "clone", "--depth", "1", clone_url])
-        .arg(staging)
-        // Never prompt interactively: a private or unknown repository fails
-        // fast instead of hanging the install on a terminal prompt.
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            bail!(
-                "git is not installed; install git to install plugins from git URLs (clone URL: {})",
-                redact_url_credentials(clone_url)
-            );
-        }
-        Err(error) => {
-            bail!(
-                "starting git clone failed: {error} (clone URL: {})",
-                redact_url_credentials(clone_url)
-            );
-        }
-    };
-    // Read stderr concurrently with waiting for the exit so a chatty git can
-    // never block on the pipe buffer. `wait` borrows `child` mutably (unlike
-    // `wait_with_output`, which moves it), so the timeout branch can still
-    // kill and reap the child.
-    let mut stderr = child.stderr.take().expect("stderr piped above");
-    let mut stderr_bytes = Vec::new();
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(GIT_CLONE_TIMEOUT_SECONDS),
-        async {
-            tokio::join!(
-                child.wait(),
-                tokio::io::AsyncReadExt::read_to_end(&mut stderr, &mut stderr_bytes)
-            )
-        },
-    )
-    .await;
-    let (wait_result, _read_result) = match result {
-        Ok(pair) => pair,
-        Err(_elapsed) => {
-            // Do not leave a hung clone behind.
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            bail!(
-                "git clone timed out after {GIT_CLONE_TIMEOUT_SECONDS}s (clone URL: {}); check the repository URL and network access",
-                redact_url_credentials(clone_url)
-            );
-        }
-    };
-    let status = wait_result.with_context(|| {
-        format!(
-            "running git clone (clone URL: {})",
-            redact_url_credentials(clone_url)
+async fn stage_git_source(
+    staging_store: &CapabilityRootLease,
+    process: &GovernedProcessContext,
+    clone_url: &str,
+    staging_relative: &Path,
+) -> Result<()> {
+    let staging = staging_store.display_root().join(staging_relative);
+    let output = process
+        .run(
+            pi_sandbox::SpawnFamily::PluginHelper,
+            GovernedProcessSpec {
+                program: process.git_program()?,
+                args: vec![
+                    "-c".into(),
+                    "color.ui=false".into(),
+                    "clone".into(),
+                    "--depth".into(),
+                    "1".into(),
+                    clone_url.into(),
+                    staging.to_string_lossy().into_owned(),
+                ],
+                cwd: staging
+                    .parent()
+                    .ok_or_else(|| anyhow!("plugin staging path has no parent"))?
+                    .to_path_buf(),
+                environment: std::collections::BTreeMap::from([(
+                    "GIT_TERMINAL_PROMPT".to_owned(),
+                    Some("0".to_owned()),
+                )]),
+                timeout: std::time::Duration::from_secs(GIT_CLONE_TIMEOUT_SECONDS),
+                stdout_bytes: 64 * 1024,
+                stderr_bytes: 64 * 1024,
+                #[cfg(unix)]
+                mount_sources: Vec::new(),
+                #[cfg(unix)]
+                retained_executable: None,
+                #[cfg(unix)]
+                retained_working_directory: None,
+            },
         )
-    })?;
-    if !status.success() {
-        let detail = redact_url_credentials(&String::from_utf8_lossy(&stderr_bytes));
+        .await?;
+    let url = redact_url_credentials(clone_url);
+    if output.cancelled {
+        bail!("git clone of {url} was cancelled");
+    }
+    if output.timed_out {
+        bail!(
+            "git clone timed out after {GIT_CLONE_TIMEOUT_SECONDS}s (clone URL: {url}); check the repository URL and network access"
+        );
+    }
+    if output.stdout_capped || output.stderr_capped {
+        bail!("git clone of {url} exceeded its output limit");
+    }
+    if output.status != Some(0) {
+        let detail = redact_url_credentials(&String::from_utf8_lossy(&output.stderr));
         let detail = detail.trim();
-        let url = redact_url_credentials(clone_url);
         if detail.is_empty() {
-            bail!("git clone of {url} failed with status {status}");
-        }
-        if detail.contains("not found") || detail.contains("does not appear to be a git repository") {
-            bail!("git repository {url} was not found or is not accessible: {detail}");
+            bail!("git clone of {url} failed with status {:?}", output.status);
         }
         if detail.contains("authentication failed")
             || detail.contains("Authentication failed")
@@ -1047,40 +1270,35 @@ async fn stage_git_source(clone_url: &str, staging: &Path) -> Result<()> {
         }
         bail!("git clone of {url} failed: {detail}");
     }
-    // Never carry the cloned repository's metadata into the installed
-    // package: `.git/config` records the source URL (including any embedded
-    // credentials), and the metadata is not part of the plugin.
-    remove_git_metadata(staging)?;
+    remove_git_metadata(staging_store, staging_relative)?;
     Ok(())
 }
 
-/// Remove the `.git` metadata directory (or gitfile) inside a freshly cloned
-/// staging root, so the installed package mirrors what the archive sources
-/// produce.
-fn remove_git_metadata(root: &Path) -> Result<()> {
-    let git = root.join(".git");
-    let metadata = match fs::symlink_metadata(&git) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error).with_context(|| format!("inspecting {}", git.display())),
-    };
-    if metadata.is_dir() {
-        fs::remove_dir_all(&git).with_context(|| format!("removing {}", git.display()))
-    } else {
-        fs::remove_file(&git).with_context(|| format!("removing {}", git.display()))
+fn remove_git_metadata(store: &CapabilityRootLease, staging_relative: &Path) -> Result<()> {
+    let git = staging_relative.join(".git");
+    match store.metadata(&git) {
+        Ok(metadata) if metadata.identity.kind() == EntryKind::Directory => store
+            .remove_tree(&git)
+            .context("removing plugin git metadata"),
+        Ok(_) => store
+            .remove_file(&git)
+            .context("removing plugin git metadata"),
+        Err(error) if fs_error_kind(&error) == Some(std::io::ErrorKind::NotFound) => Ok(()),
+        Err(error) => Err(error).context("inspecting plugin git metadata"),
     }
 }
-
-/// Resolve an `npm:` source to a package tarball and stage it: fetch the
-/// registry metadata (latest or pinned version), extract `dist.tarball`,
-/// fetch the tarball (bounded), verify its `dist.integrity` sha512 digest
-/// (authenticating the package content against the registry metadata), and
-/// extract it into `staging` with the same traversal/size guards as every
-/// other archive source. A 404 from the registry surfaces as an actionable
-/// "package not found" error. Tarball URLs must be https (a registry that
-/// serves plain-http tarballs is refused: the integrity check would
-/// authenticate content fetched over an unauthenticated channel).
-async fn stage_npm_source(reference: &NpmReference, staging: &Path) -> Result<()> {
+/// Resolve `npm:<name>[@<version>]` through the npm registry and stage the
+/// published tarball. The registry metadata must carry `dist.tarball` and a
+/// `sha512` `dist.integrity`; the fetched tarball is verified against that
+/// digest before extraction (and an https registry serving plain-http
+/// tarballs is refused: the integrity check would otherwise authenticate
+/// content fetched over an unauthenticated channel).
+async fn stage_npm_source(
+    reference: &NpmReference,
+    staging_store: &CapabilityRootLease,
+    staging_relative: &Path,
+    http: &PluginHttpExecutors,
+) -> Result<()> {
     let registry = npm_registry_base();
     let metadata_url = match &reference.version {
         Some(version) => format!("{registry}/{}/{}", reference.name, version),
@@ -1091,7 +1309,7 @@ async fn stage_npm_source(reference: &NpmReference, staging: &Path) -> Result<()
         .as_ref()
         .map(|version| format!(" and version {version}"))
         .unwrap_or_default();
-    let metadata = fetch_bytes(&metadata_url, MAX_NPM_METADATA_BYTES)
+    let metadata = fetch_bytes(&http.npm_registry, &metadata_url, MAX_NPM_METADATA_BYTES)
         .await
         .map_err(|error| {
             if error.to_string().contains("HTTP 404") {
@@ -1110,8 +1328,12 @@ async fn stage_npm_source(reference: &NpmReference, staging: &Path) -> Result<()
                 reference.name
             )
         })?;
-    let document: serde_json::Value = serde_json::from_slice(&metadata)
-        .with_context(|| format!("parsing npm metadata for {} from {metadata_url}", reference.name))?;
+    let document: serde_json::Value = serde_json::from_slice(&metadata).with_context(|| {
+        format!(
+            "parsing npm metadata for {} from {metadata_url}",
+            reference.name
+        )
+    })?;
     let dist = document
         .get("dist")
         .ok_or_else(|| {
@@ -1163,12 +1385,16 @@ async fn stage_npm_source(reference: &NpmReference, staging: &Path) -> Result<()
             reference.name
         )
     })?;
-    let bytes = fetch_bytes(tarball_url.as_str(), MAX_PACKAGE_BYTES)
+    let bytes = fetch_bytes(&http.npm_tarball, tarball_url.as_str(), MAX_PACKAGE_BYTES)
         .await
         .with_context(|| format!("downloading npm tarball {tarball_url}"))?;
-    verify_npm_integrity(&bytes, &integrity)
-        .with_context(|| format!("npm package {} tarball failed integrity verification", reference.name))?;
-    extract_tar_from_bytes(&bytes, staging)
+    verify_npm_integrity(&bytes, &integrity).with_context(|| {
+        format!(
+            "npm package {} tarball failed integrity verification",
+            reference.name
+        )
+    })?;
+    extract_tar_from_bytes(&bytes, staging_store, staging_relative)
         .with_context(|| format!("extracting npm tarball {tarball_url}"))
 }
 
@@ -1194,71 +1420,63 @@ fn verify_npm_integrity(bytes: &[u8], integrity: &str) -> Result<()> {
     Ok(())
 }
 
-/// Recursively copy a plugin directory. Skips symlinks and hidden/
-/// `node_modules` entries (mirroring package resource discovery) and enforces
-/// the package byte cap.
-fn copy_tree(source: &Path, target: &Path) -> Result<()> {
-    fs::create_dir_all(target)
-        .with_context(|| format!("creating staging directory {}", target.display()))?;
-    let mut copied: u64 = 0;
-    for entry in WalkDir::new(source)
-        .sort_by_file_name()
-        .into_iter()
-        .filter_entry(|entry| entry.depth() == 0 || visible_entry(entry))
-    {
-        let entry = entry.with_context(|| format!("walking {}", source.display()))?;
-        if entry.depth() == 0 {
+/// Recursively copy a plugin directory. Hidden entries and `node_modules` are skipped.
+fn copy_tree(
+    source: CapabilityDirectory,
+    target: &CapabilityRootLease,
+    target_relative: &Path,
+) -> Result<()> {
+    target.create_dir_all(target_relative, FileMode::Private)?;
+    let mut copied = 0_u64;
+    copy_opened_directory(source, target, target_relative, &mut copied)
+}
+
+fn copy_opened_directory(
+    source: CapabilityDirectory,
+    target: &CapabilityRootLease,
+    target_relative: &Path,
+    copied: &mut u64,
+) -> Result<()> {
+    let mut entries = source.read_dir()?;
+    while let Some(entry) = entries.next()? {
+        let name = entry.name().to_os_string();
+        if name.to_string_lossy().starts_with('.') || name == "node_modules" {
             continue;
         }
-        let relative = entry
-            .path()
-            .strip_prefix(source)
-            .with_context(|| format!("{} is outside {}", entry.path().display(), source.display()))?;
-        let destination = target.join(relative);
-        if entry.file_type().is_dir() {
-            fs::create_dir_all(&destination)
-                .with_context(|| format!("creating {}", destination.display()))?;
-        } else {
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("creating {}", parent.display()))?;
+        let destination = target_relative.join(&name);
+        match entry.into_entry() {
+            CapabilityEntry::Directory(directory) => {
+                target.create_dir_all(&destination, FileMode::Private)?;
+                copy_opened_directory(directory, target, &destination, copied)?;
             }
-            let size = entry
-                .metadata()
-                .with_context(|| format!("reading {}", entry.path().display()))?
-                .len();
-            copied = copied
-                .checked_add(size)
-                .ok_or_else(|| anyhow!("plugin package size overflow"))?;
-            if copied > MAX_PACKAGE_BYTES {
-                bail!("plugin package exceeds {MAX_PACKAGE_BYTES} bytes");
+            CapabilityEntry::File(file) => {
+                *copied = copied
+                    .checked_add(file.metadata()?.len)
+                    .ok_or_else(|| anyhow!("plugin package size overflow"))?;
+                if *copied > MAX_PACKAGE_BYTES {
+                    bail!("plugin package exceeds {MAX_PACKAGE_BYTES} bytes");
+                }
+                let bytes = file.read_bounded(MAX_PACKAGE_BYTES)?;
+                let mut output = target.create_new(&destination, FileMode::Private)?;
+                output.write_all(&bytes)?;
+                output.finish()?;
             }
-            fs::copy(entry.path(), &destination)
-                .with_context(|| format!("copying {} to {}", entry.path().display(), destination.display()))?;
         }
     }
     Ok(())
 }
 
-fn visible_entry(entry: &walkdir::DirEntry) -> bool {
-    !entry.file_type().is_symlink()
-        && !entry.file_name().to_string_lossy().starts_with('.')
-        && entry.file_name() != "node_modules"
-}
-
-/// One archive entry staged for extraction, before the top-level directory
-/// decision is applied.
 struct PlannedEntry {
     path: PathBuf,
     is_dir: bool,
     data: Vec<u8>,
 }
 
-/// Extract a `.tgz`/`.tar.gz`/`.tar` archive into `target` with traversal,
-/// entry-kind, and size guards. A single shared top-level directory (as in
-/// GitHub codeload tarballs, `owner-repo-<sha>/...`) is stripped so the
-/// manifest lands at the target root.
-fn extract_tar_from_bytes(bytes: &[u8], target: &Path) -> Result<()> {
+fn extract_tar_from_bytes(
+    bytes: &[u8],
+    target: &CapabilityRootLease,
+    target_relative: &Path,
+) -> Result<()> {
     if bytes.is_empty() {
         bail!("plugin archive is empty");
     }
@@ -1268,10 +1486,11 @@ fn extract_tar_from_bytes(bytes: &[u8], target: &Path) -> Result<()> {
         Box::new(std::io::Cursor::new(bytes))
     };
     let mut archive = tar::Archive::new(reader);
-    let entries = archive.entries().context("reading plugin archive entries")?;
-
-    let mut planned: Vec<PlannedEntry> = Vec::new();
-    let mut total_bytes: u64 = 0;
+    let entries = archive
+        .entries()
+        .context("reading plugin archive entries")?;
+    let mut planned = Vec::new();
+    let mut total_bytes = 0_u64;
     for entry in entries {
         let mut entry = entry.context("reading plugin archive entry")?;
         if planned.len() >= MAX_PACKAGE_ENTRIES {
@@ -1297,14 +1516,13 @@ fn extract_tar_from_bytes(bytes: &[u8], target: &Path) -> Result<()> {
                 path.display()
             );
         }
-        let size = entry.size();
         total_bytes = total_bytes
-            .checked_add(size)
+            .checked_add(entry.size())
             .ok_or_else(|| anyhow!("plugin archive size overflow"))?;
         if total_bytes > MAX_PACKAGE_BYTES {
             bail!("plugin archive exceeds {MAX_PACKAGE_BYTES} bytes");
         }
-        let mut data = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+        let mut data = Vec::with_capacity(usize::try_from(entry.size()).unwrap_or(0));
         entry
             .read_to_end(&mut data)
             .context("reading plugin archive entry contents")?;
@@ -1314,7 +1532,6 @@ fn extract_tar_from_bytes(bytes: &[u8], target: &Path) -> Result<()> {
             data,
         });
     }
-
     let strip_top = shared_top_directory(&planned);
     for entry in &planned {
         let relative: PathBuf = if strip_top {
@@ -1322,17 +1539,19 @@ fn extract_tar_from_bytes(bytes: &[u8], target: &Path) -> Result<()> {
         } else {
             entry.path.clone()
         };
-        let destination = target.join(&relative);
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let destination = target_relative.join(relative);
         if entry.is_dir {
-            fs::create_dir_all(&destination)
-                .with_context(|| format!("creating {}", destination.display()))?;
+            target.create_dir_all(&destination, FileMode::Private)?;
         } else {
             if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("creating {}", parent.display()))?;
+                target.create_dir_all(parent, FileMode::Private)?;
             }
-            fs::write(&destination, &entry.data)
-                .with_context(|| format!("writing {}", destination.display()))?;
+            let mut file = target.create_new(&destination, FileMode::Private)?;
+            file.write_all(&entry.data)?;
+            file.finish()?;
         }
     }
     Ok(())
@@ -1383,95 +1602,231 @@ fn shared_top_directory(entries: &[PlannedEntry]) -> bool {
     nests && !top_level_file
 }
 
-/// Bounded HTTP fetch (follows redirects, enforces a byte cap).
-async fn fetch_bytes(url: &str, max: u64) -> Result<Vec<u8>> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(FETCH_TIMEOUT_SECONDS))
-        .build()
-        .context("building HTTP client")?;
-    let response = client
-        .get(url)
-        .send()
+/// Bounded HTTP fetch through one already-classed, revision-bound executor.
+async fn fetch_bytes(executor: &pi_ai::SharedHttpExecutor, url: &str, max: u64) -> Result<Vec<u8>> {
+    let request = pi_ai::request_from_url(
+        pi_ai::HttpMethod::Get,
+        url,
+        &http::HeaderMap::new(),
+        Vec::new(),
+        &pi_ai::StreamOptions {
+            timeout_ms: Some(FETCH_TIMEOUT_SECONDS * 1_000),
+            ..Default::default()
+        },
+        max,
+    )?;
+    let response = executor
+        .execute(request)
         .await
         .with_context(|| format!("fetching {url}"))?;
     let status = response.status();
     if !status.is_success() {
         bail!("fetching {url} failed: HTTP {status}");
     }
-    if response.content_length().is_some_and(|length| length > max) {
-        bail!("{url} exceeds {max} bytes");
+    pi_ai::collect_response_body(response)
+        .await
+        .with_context(|| format!("reading response from {url}"))
+}
+#[cfg(test)]
+mod remove_test_hook {
+    use std::cell::Cell;
+
+    use anyhow::{Result, bail};
+
+    thread_local! {
+        static FAIL_NEXT_CLEANUP: Cell<bool> = const { Cell::new(false) };
     }
-    let mut bytes = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.with_context(|| format!("reading response from {url}"))?;
-        bytes.extend_from_slice(&chunk);
-        if bytes.len() as u64 > max {
-            bail!("{url} exceeds {max} bytes");
+
+    pub(super) fn fail_next_cleanup() {
+        FAIL_NEXT_CLEANUP.set(true);
+    }
+
+    pub(super) fn before_cleanup() -> Result<()> {
+        if FAIL_NEXT_CLEANUP.replace(false) {
+            bail!("injected trust cleanup failure")
         }
+        Ok(())
     }
-    Ok(bytes)
 }
 
 // ---------------------------------------------------------------------------
 // Filesystem helpers
 // ---------------------------------------------------------------------------
 
-/// A sibling path like `<parent>/.<label>-<pid>-<millis>-<counter>`.
-fn unique_sibling(path: &Path, label: &str) -> PathBuf {
+fn unique_name(label: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let counter = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(0);
-    let name = format!(".{label}-{}-{millis}-{counter}", std::process::id());
-    path.with_file_name(name)
+    PathBuf::from(format!(
+        ".{label}-{}-{millis}-{counter}",
+        std::process::id()
+    ))
 }
 
-/// Remove a directory on drop unless disarmed (used for staging cleanup).
 struct RemovePathOnDrop {
-    path: Option<PathBuf>,
+    store: CapabilityRootLease,
+    relative: Option<PathBuf>,
 }
 
 impl RemovePathOnDrop {
-    fn new(path: PathBuf) -> Self {
-        Self { path: Some(path) }
+    fn new(store: CapabilityRootLease, relative: PathBuf) -> Self {
+        Self {
+            store,
+            relative: Some(relative),
+        }
     }
 
     fn disarm(&mut self) {
-        self.path = None;
+        self.relative = None;
     }
 }
 
 impl Drop for RemovePathOnDrop {
     fn drop(&mut self) {
-        if let Some(path) = &self.path {
-            let _ = fs::remove_dir_all(path);
+        if let Some(relative) = &self.relative {
+            let _ = self.store.remove_tree(relative);
         }
     }
 }
 
-/// Atomically replace `target` with `staged` (both directories): move the old
-/// target aside, move the staged directory in, then remove the backup. On a
-/// failed move-in the original is restored.
-fn directory_swap(staged: &Path, target: &Path) -> Result<()> {
-    let backup = unique_sibling(target, "plugin-backup");
-    fs::rename(target, &backup).with_context(|| format!("moving {} aside", target.display()))?;
-    if let Err(error) = fs::rename(staged, target) {
-        let restore = fs::rename(&backup, target);
-        return Err(error).with_context(|| {
-            format!(
-                "installing replacement at {} (restoring original: {:?})",
-                target.display(),
-                restore.err()
-            )
-        });
+/// Atomically replace the live plugin at `target` with `staged`, preserving
+/// the previous version in a hidden backup until the swap is complete.
+///
+/// The result is always truthful about the live state:
+/// - a failure to move the live plugin aside leaves it untouched at `target`;
+/// - a failure to activate `staged` restores the previous version to
+///   `target`, or — if that restore also fails — reports exactly where the
+///   previous version was preserved;
+/// - a failure to delete the backup *after* activation does not fail the
+///   swap: the new version is live at `target`, so the swap reports success
+///   and warns about the leftover hidden backup instead.
+fn directory_swap(store: &CapabilityRootLease, staged: &Path, target: &Path) -> Result<()> {
+    let backup = unique_name("plugin-backup");
+    store.rename(target, &backup).with_context(|| {
+        format!(
+            "isolating the installed plugin for replacement; the previous version remains in place at {}",
+            store.display_root().join(target).display()
+        )
+    })?;
+    if let Err(error) = store.rename(staged, target) {
+        return match store.rename(&backup, target) {
+            Ok(()) => Err(error)
+                .context("installing the plugin replacement; the previous version was restored"),
+            Err(restore_error) => Err(error).context(format!(
+                "installing the plugin replacement; restoring the previous version also failed \
+                 ({restore_error:#}); the previous version is preserved at {}",
+                store.display_root().join(&backup).display()
+            )),
+        };
     }
-    // Best-effort backup cleanup; a leftover hidden backup is harmless and
-    // must not fail an otherwise complete update.
-    let _ = fs::remove_dir_all(&backup);
+    let cleanup = (|| -> Result<()> {
+        #[cfg(test)]
+        swap_test_hook::before_backup_cleanup()?;
+        Ok(store.remove_tree(&backup)?)
+    })();
+    if let Err(cleanup_error) = cleanup {
+        // The staged version is live at `target` — the swap succeeded. Deleting
+        // the previous version's backup is best-effort cleanup, so surface the
+        // failure as a warning and report the swap truthfully as successful.
+        eprintln!(
+            "plugin: replaced the plugin at {} but could not delete its previous-version \
+             backup at {} ({cleanup_error:#}); the hidden backup is ignored by plugin listing \
+             and can be removed manually",
+            store.display_root().join(target).display(),
+            store.display_root().join(&backup).display(),
+        );
+    }
     Ok(())
+}
+
+/// Test seam: inject a failure into [`directory_swap`]'s post-activation
+/// backup cleanup so tests can pin the truthful "swap succeeded" result.
+#[cfg(test)]
+mod swap_test_hook {
+    use std::cell::Cell;
+
+    use anyhow::{Result, bail};
+
+    thread_local! {
+        static FAIL_NEXT_BACKUP_CLEANUP: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn fail_next_backup_cleanup() {
+        FAIL_NEXT_BACKUP_CLEANUP.set(true);
+    }
+
+    pub(super) fn before_backup_cleanup() -> Result<()> {
+        if FAIL_NEXT_BACKUP_CLEANUP.replace(false) {
+            bail!("injected backup cleanup failure")
+        }
+        Ok(())
+    }
+}
+
+/// Open an operator-supplied local plugin source or marketplace index file
+/// through capability authority. `file://` prefixes are accepted and
+/// stripped; relative paths are resolved against `cwd` (the operator working
+/// directory) and lexically normalized, so `./src`, `plugins/demo`, and
+/// `../mirrors/demo.tgz` all resolve exactly where the operator ran the
+/// command. The returned lease is the source's parent directory and the name
+/// is its final component, so every later read goes through the retained
+/// directory handle rather than a re-parsed path string. Sources that do not
+/// exist (or escape the resolution root) fail here and callers fall through
+/// to their ordinary "source does not exist" handling.
+fn open_operator_source(
+    cwd: &Path,
+    source: &str,
+) -> Result<(CapabilityRootLease, std::ffi::OsString)> {
+    let capabilities = CapabilityFs::new().context("creating plugin import capabilities")?;
+    let raw = Path::new(source.strip_prefix("file://").unwrap_or(source));
+    let absolute = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        cwd.join(raw)
+    };
+    let absolute = lexical_normalize(&absolute).with_context(|| {
+        format!("resolving plugin source {source} against the operator working directory")
+    })?;
+    let absolute = AbsolutePath::parse(absolute).map_err(|_| FsError::InvalidPath)?;
+    capabilities
+        .open_exact_parent(
+            CapabilityRootPurpose::OperatorImport,
+            absolute,
+            CapabilityAccess::ReadOnly,
+            RootCreation::Existing,
+        )
+        .with_context(|| format!("opening plugin source {source}"))
+}
+
+/// Lexically resolve `.` and `..` components in `path` without touching the
+/// filesystem, so the result parses through [`AbsolutePath`] (which rejects
+/// such components). Traversal that would escape the path root fails closed.
+fn lexical_normalize(path: &Path) -> Result<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    bail!("path traversal escapes its root: {}", path.display());
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Ok(normalized)
+}
+
+fn fs_error_kind(error: &FsError) -> Option<std::io::ErrorKind> {
+    match error {
+        FsError::System { kind, .. } => Some(*kind),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1480,8 +1835,122 @@ mod tests {
 
     use super::*;
     use crate::{ExtensionPermissionSet, ExtensionSpec, ResourceManagerOptions};
+    use pi_ai::providers::{FauxProviderOptions, FauxProviderRegistration, register_faux_provider};
     use serde_json::json;
     use tempfile::TempDir;
+
+    struct PluginApplicationFixture {
+        _agent: TempDir,
+        _cwd: TempDir,
+        _sessions: TempDir,
+        _faux: FauxProviderRegistration,
+        application: crate::Application,
+    }
+
+    impl PluginApplicationFixture {
+        fn marketplace(&self, agent: &Path) -> Result<PluginMarketplace> {
+            Ok(PluginMarketplace::new(agent)?
+                .with_process_context(self.application.governed_process_context())
+                .with_http_executors(PluginHttpExecutors::new(
+                    self.application
+                        .http_executor(pi_sandbox::HostHttpClass::PluginMarketplace),
+                    self.application
+                        .http_executor(pi_sandbox::HostHttpClass::PluginArchive),
+                    self.application
+                        .http_executor(pi_sandbox::HostHttpClass::NpmRegistry),
+                    self.application
+                        .http_executor(pi_sandbox::HostHttpClass::NpmTarball),
+                )))
+        }
+    }
+
+    async fn plugin_application(settings: &str) -> Result<PluginApplicationFixture> {
+        let agent = TempDir::new()?;
+        let cwd = TempDir::new()?;
+        let sessions = TempDir::new()?;
+        fs::write(agent.path().join("settings.json"), settings)?;
+        let mut options = ResourceManagerOptions::new(cwd.path());
+        options.agent_dir = agent.path().to_path_buf();
+        options.project_trust_override = Some(true);
+        options.disable_extensions = true;
+        options.disable_skills = true;
+        options.disable_prompt_templates = true;
+        options.disable_themes = true;
+        options.disable_context_files = true;
+        let resources = crate::ResourceManager::new(options)?;
+        let suffix = uuid::Uuid::now_v7();
+        let api = format!("plugin-test-api-{suffix}");
+        let provider = format!("plugin-test-provider-{suffix}");
+        let model = pi_ai::Model {
+            id: format!("plugin-test-model-{suffix}"),
+            name: "Plugin Test Model".to_owned(),
+            api: api.clone(),
+            provider: provider.clone(),
+            ..pi_ai::Model::default()
+        };
+        let faux = register_faux_provider(FauxProviderOptions {
+            api,
+            provider,
+            models: vec![model.clone()],
+            chunk_size: 8,
+        });
+        let workspace = crate::WorkspaceRoots::new(cwd.path(), Vec::<PathBuf>::new())?;
+        let session =
+            crate::Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
+                crate::SessionOptions {
+                    model,
+                    cwd: cwd.path().to_path_buf(),
+                    system_prompt: String::new(),
+                    thinking_level: pi_agent::ThinkingLevel::Off,
+                    api_key: "test".to_owned(),
+                    compaction: None,
+                    stream_options: Default::default(),
+                    tools: Some(Vec::new()),
+                    before_tool_call: None,
+                    after_tool_call: None,
+                    stream_fn: None,
+                    auth_resolver: None,
+                    auth_manager: None,
+                },
+                Vec::new(),
+                crate::ToolSelection::default(),
+                crate::ResourceDiscovery::Disabled,
+                workspace,
+                None,
+            )?;
+        session.set_session_dir(sessions.path().to_path_buf());
+        session.attach_resources(resources).await?;
+        let application = crate::Application::from_runtime_candidate(
+            crate::ApplicationRuntimeCandidate::new(session),
+        )
+        .await?;
+        Ok(PluginApplicationFixture {
+            _agent: agent,
+            _cwd: cwd,
+            _sessions: sessions,
+            _faux: faux,
+            application,
+        })
+    }
+
+    async fn governed_plugin_application() -> Result<PluginApplicationFixture> {
+        plugin_application(r#"{"sandbox":{"mode":"danger-full-access"}}"#).await
+    }
+
+    async fn governed_network_marketplace(
+        agent: &Path,
+    ) -> Result<(
+        PluginApplicationFixture,
+        PluginMarketplace,
+        std::sync::Arc<std::sync::Mutex<Vec<(TestHttpClass, String)>>>,
+    )> {
+        let application = governed_plugin_application().await?;
+        let (http, observed) = test_http_executors(&application.application);
+        let marketplace = PluginMarketplace::new(agent)?
+            .with_process_context(application.application.governed_process_context())
+            .with_http_executors(http);
+        Ok((application, marketplace, observed))
+    }
 
     const QUICKJS_MANIFEST: &str = r#"{
         "schemaVersion": 1,
@@ -1493,6 +1962,7 @@ mod tests {
     }"#;
 
     fn write_quickjs_plugin(root: &Path, id: &str, version: &str) -> Result<()> {
+        fs::create_dir_all(root)?;
         let manifest = json!({
             "schemaVersion": 1,
             "id": id,
@@ -1507,6 +1977,20 @@ mod tests {
         )?;
         fs::write(root.join("index.mjs"), "export default function (pi) {}\n")?;
         Ok(())
+    }
+
+    fn writable_test_root(root: &Path) -> Result<CapabilityRootLease> {
+        let capabilities = CapabilityFs::new().context("creating test filesystem capabilities")?;
+        let absolute = AbsolutePath::parse(root.to_path_buf())
+            .map_err(|_| anyhow!("invalid plugin extraction test root"))?;
+        capabilities
+            .open_root(
+                CapabilityRootPurpose::AgentStore,
+                absolute,
+                CapabilityAccess::PrivateReadWrite,
+                RootCreation::Existing,
+            )
+            .context("opening plugin extraction test root")
     }
 
     /// Skip-guard for git fixture tests: does this machine have a working
@@ -1680,6 +2164,7 @@ mod tests {
         extension_spec_from_package_resource(&PackageResourceSpec {
             kind: PackageResourceKind::Extension,
             path: path.to_path_buf(),
+            managed_root: None,
             package_id: "marketplace:test".to_owned(),
             scope: PackageScope::Global,
             trusted: true,
@@ -1690,15 +2175,190 @@ mod tests {
         marketplace_extension_resources(agent_dir, trust_store).expect("scan resources")
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum TestHttpClass {
+        Marketplace,
+        Archive,
+        NpmRegistry,
+        NpmTarball,
+    }
+
+    #[derive(Clone)]
+    struct TestHttpExecutor {
+        class: TestHttpClass,
+        observed: std::sync::Arc<std::sync::Mutex<Vec<(TestHttpClass, String)>>>,
+        delegate: pi_ai::SharedHttpExecutor,
+    }
+
+    impl pi_ai::HttpExecutor for TestHttpExecutor {
+        fn execute<'a>(
+            &'a self,
+            request: pi_ai::HttpRequest,
+        ) -> futures_util::future::BoxFuture<'a, anyhow::Result<pi_ai::HttpResponse>> {
+            use futures_util::FutureExt as _;
+
+            async move {
+                let parts = request.into_parts();
+                let scheme = match parts.authority.scheme() {
+                    pi_ai::ResolvedHttpScheme::Http => "http",
+                    pi_ai::ResolvedHttpScheme::Https => "https",
+                };
+                let host = match parts.authority.host() {
+                    pi_ai::ResolvedHttpHost::Dns(name) => name.clone(),
+                    pi_ai::ResolvedHttpHost::Ip(address) => address.to_string(),
+                };
+                let url = format!(
+                    "{scheme}://{host}:{}{}",
+                    parts.authority.port(),
+                    parts.path_and_query
+                );
+                self.observed
+                    .lock()
+                    .expect("plugin HTTP observations mutex poisoned")
+                    .push((self.class, url));
+                let request = pi_ai::HttpRequest::new(
+                    parts.method,
+                    parts.authority,
+                    parts.path_and_query,
+                    parts.headers,
+                    parts.body,
+                    parts.timeout_ms,
+                    parts.max_response_bytes.get(),
+                    parts.abort_signal,
+                )?;
+                self.delegate.execute(request).await
+            }
+            .boxed()
+        }
+    }
+
+    fn test_http_executors(
+        application: &crate::Application,
+    ) -> (
+        PluginHttpExecutors,
+        std::sync::Arc<std::sync::Mutex<Vec<(TestHttpClass, String)>>>,
+    ) {
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let executor = |class, host_class| {
+            std::sync::Arc::new(TestHttpExecutor {
+                class,
+                observed: observed.clone(),
+                delegate: application.http_executor(host_class),
+            }) as pi_ai::SharedHttpExecutor
+        };
+        (
+            PluginHttpExecutors::new(
+                executor(
+                    TestHttpClass::Marketplace,
+                    pi_sandbox::HostHttpClass::PluginMarketplace,
+                ),
+                executor(
+                    TestHttpClass::Archive,
+                    pi_sandbox::HostHttpClass::PluginArchive,
+                ),
+                executor(
+                    TestHttpClass::NpmRegistry,
+                    pi_sandbox::HostHttpClass::NpmRegistry,
+                ),
+                executor(
+                    TestHttpClass::NpmTarball,
+                    pi_sandbox::HostHttpClass::NpmTarball,
+                ),
+            ),
+            observed,
+        )
+    }
+
+    #[tokio::test]
+    async fn remote_marketplace_and_archive_use_exact_executors() -> Result<()> {
+        let archive = side_chat_tarball()?;
+        let index = serde_json::to_vec(&[json!({
+            "name": "side-chat",
+            "repo": "owner/side-chat",
+            "version": "1.0.0",
+        })])?;
+        let base = spawn_registry_server(move |_port| {
+            vec![
+                ("/index.json".to_owned(), RouteResponse::Ok(index)),
+                ("/side-chat.tgz".to_owned(), RouteResponse::Ok(archive)),
+            ]
+        })
+        .await;
+        let agent = TempDir::new()?;
+        let (_application, marketplace, observed) =
+            governed_network_marketplace(agent.path()).await?;
+        let fetched = marketplace
+            .fetch_index(&format!("{base}/index.json"))
+            .await?;
+        assert_eq!(
+            fetched
+                .entry("side-chat")
+                .expect("marketplace entry")
+                .version,
+            "1.0.0"
+        );
+        let trust_store = TrustStore::new(agent.path());
+        let installed = marketplace
+            .install(&format!("{base}/side-chat.tgz"), &trust_store)
+            .await?;
+        assert_eq!(installed.name, "side-chat");
+        assert_eq!(
+            *observed
+                .lock()
+                .expect("plugin HTTP observations mutex poisoned"),
+            vec![
+                (TestHttpClass::Marketplace, format!("{base}/index.json")),
+                (TestHttpClass::Archive, format!("{base}/side-chat.tgz")),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_plugin_sources_fail_closed_without_captured_http() -> Result<()> {
+        let agent = TempDir::new()?;
+        let marketplace = PluginMarketplace::new(agent.path())?;
+        let trust_store = TrustStore::new(agent.path());
+        let index_error = marketplace
+            .fetch_index("https://plugins.example/index.json")
+            .await
+            .expect_err("remote index without captured authority must fail");
+        assert!(
+            index_error
+                .to_string()
+                .contains("plugin marketplace HTTP generation is unavailable"),
+            "{index_error:#}"
+        );
+        let archive_error = marketplace
+            .install("https://plugins.example/demo.tgz", &trust_store)
+            .await
+            .expect_err("remote archive without captured authority must fail");
+        assert!(
+            format!("{archive_error:#}").contains("plugin archive HTTP generation is unavailable"),
+            "{archive_error:#}"
+        );
+        let npm_error = marketplace
+            .install("npm:demo", &trust_store)
+            .await
+            .expect_err("npm without captured authority must fail");
+        assert!(
+            format!("{npm_error:#}").contains("plugin npm HTTP generation is unavailable"),
+            "{npm_error:#}"
+        );
+        assert!(marketplace.list(&trust_store)?.0.is_empty());
+        Ok(())
+    }
     #[tokio::test]
     async fn install_from_local_directory_lands_in_root_and_is_loadable() -> Result<()> {
         let agent = TempDir::new()?;
         let source = TempDir::new()?;
         write_quickjs_plugin(source.path(), "demo", "1.0.0")?;
 
-        let marketplace = PluginMarketplace::new(agent.path());
+        let marketplace = PluginMarketplace::new(agent.path())?;
         let trust_store = TrustStore::new(agent.path());
-        let installed = marketplace.install(source.path().to_str().unwrap(), &trust_store).await?;
+        let installed = marketplace
+            .install(source.path().to_str().unwrap(), &trust_store)
+            .await?;
 
         assert_eq!(installed.name, "demo");
         assert_eq!(installed.version, "1.0.0");
@@ -1727,9 +2387,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn install_in_git_worktree_trusts_only_exact_plugin_directory() -> Result<()> {
+        let agent = TempDir::new()?;
+        fs::create_dir_all(agent.path().join(".git"))?;
+        fs::write(agent.path().join(".git/HEAD"), "ref: refs/heads/main\n")?;
+        let source = TempDir::new()?;
+        write_quickjs_plugin(source.path(), "inside", "1.0.0")?;
+        let sibling_source = TempDir::new()?;
+        write_quickjs_plugin(sibling_source.path(), "sibling", "1.0.0")?;
+
+        let marketplace = PluginMarketplace::new(agent.path())?;
+        let trust_store = TrustStore::new(agent.path());
+        marketplace
+            .install(source.path().to_str().unwrap(), &trust_store)
+            .await?;
+
+        let target = agent.path().join("extensions/inside");
+        let sibling = agent.path().join("extensions/sibling");
+        fs::create_dir_all(&sibling)?;
+        fs::copy(
+            sibling_source.path().join(PROCESS_EXTENSION_MANIFEST_FILE),
+            sibling.join(PROCESS_EXTENSION_MANIFEST_FILE),
+        )?;
+        fs::copy(
+            sibling_source.path().join("index.mjs"),
+            sibling.join("index.mjs"),
+        )?;
+
+        assert_eq!(trust_store.resolve_exact(&target)?, TrustDecision::Trusted);
+        assert_eq!(trust_store.resolve_exact(agent.path())?, TrustDecision::Ask);
+        assert_eq!(trust_store.resolve_exact(&sibling)?, TrustDecision::Ask);
+        let project_resolution = trust_store.resolve(&target)?;
+        assert_eq!(project_resolution.decision, TrustDecision::Ask);
+        assert_eq!(
+            project_resolution.project_path,
+            fs::canonicalize(agent.path())?
+        );
+
+        let (plugins, problems) = marketplace.list(&trust_store)?;
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(plugins.len(), 2);
+        assert!(
+            plugins
+                .iter()
+                .any(|plugin| plugin.name == "inside" && plugin.trusted)
+        );
+        assert!(
+            plugins
+                .iter()
+                .any(|plugin| plugin.name == "sibling" && !plugin.trusted)
+        );
+        let resources = resources_for(agent.path(), &trust_store);
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].path, target);
+
+        marketplace.remove("inside", &trust_store)?;
+        assert_eq!(trust_store.resolve_exact(&target)?, TrustDecision::Ask);
+        assert!(sibling.is_dir());
+        assert!(resources_for(agent.path(), &trust_store).is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn install_from_local_tarball_extracts_and_strips_top_directory() -> Result<()> {
         let agent = TempDir::new()?;
         let archive_dir = TempDir::new()?;
+
         let archive = archive_dir.path().join("demo-1.0.0.tgz");
         let manifest = serde_json::to_vec_pretty(&json!({
             "schemaVersion": 1,
@@ -1743,11 +2466,14 @@ mod tests {
             &archive,
             &[
                 ("tar-demo-v2/pi-extension.json", manifest.as_slice()),
-                ("tar-demo-v2/src/index.mjs", b"export default function (pi) {}\n"),
+                (
+                    "tar-demo-v2/src/index.mjs",
+                    b"export default function (pi) {}\n",
+                ),
             ],
         )?;
 
-        let marketplace = PluginMarketplace::new(agent.path());
+        let marketplace = PluginMarketplace::new(agent.path())?;
         let trust_store = TrustStore::new(agent.path());
         let installed = marketplace
             .install(archive.to_str().unwrap(), &trust_store)
@@ -1758,8 +2484,39 @@ mod tests {
         let target = agent.path().join("extensions/tar-demo");
         assert!(target.join("pi-extension.json").is_file());
         assert!(target.join("src/index.mjs").is_file());
-        assert!(!target.join("tar-demo-v2").exists(), "top directory must be stripped");
+        assert!(
+            !target.join("tar-demo-v2").exists(),
+            "top directory must be stripped"
+        );
         assert!(loadable_spec(&target).is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn install_removes_files_when_trust_recording_fails() -> Result<()> {
+        let agent = TempDir::new()?;
+        let source = TempDir::new()?;
+        write_quickjs_plugin(source.path(), "rejected", "1.0.0")?;
+        let marketplace = PluginMarketplace::new(agent.path())?;
+        let trust_store = TrustStore::new(agent.path());
+        fs::write(trust_store.path(), "{invalid trust document")?;
+
+        let error = marketplace
+            .install(source.path().to_str().unwrap(), &trust_store)
+            .await
+            .expect_err("trust write failure must fail installation");
+        assert!(format!("{error:#}").contains("recording trust for plugin rejected"));
+        assert!(!agent.path().join("extensions/rejected").exists());
+        assert!(
+            fs::read_dir(agent.path())?.all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".plugin-staging")
+            }),
+            "failed trust recording must clean the staged package"
+        );
         Ok(())
     }
 
@@ -1783,9 +2540,11 @@ mod tests {
             ],
         )?;
 
-        let marketplace = PluginMarketplace::new(agent.path());
+        let marketplace = PluginMarketplace::new(agent.path())?;
         let trust_store = TrustStore::new(agent.path());
-        let installed = marketplace.install(archive.to_str().unwrap(), &trust_store).await?;
+        let installed = marketplace
+            .install(archive.to_str().unwrap(), &trust_store)
+            .await?;
         assert_eq!(installed.name, "flat");
         // A version-less manifest reports 0.0.0 and remains updatable.
         assert_eq!(installed.version, "0.0.0");
@@ -1809,7 +2568,7 @@ mod tests {
         )?;
         fs::write(source.path().join("index.mjs"), "")?;
 
-        let marketplace = PluginMarketplace::new(agent.path());
+        let marketplace = PluginMarketplace::new(agent.path())?;
         let trust_store = TrustStore::new(agent.path());
         let error = marketplace
             .install(source.path().to_str().unwrap(), &trust_store)
@@ -1860,13 +2619,16 @@ mod tests {
                 "capabilities": [],
             }))?,
         )?;
-        let marketplace = PluginMarketplace::new(agent.path());
+        let marketplace = PluginMarketplace::new(agent.path())?;
         let trust_store = TrustStore::new(agent.path());
         let error = marketplace
             .install(source.path().to_str().unwrap(), &trust_store)
             .await
             .expect_err("traversal must fail install");
-        assert!(format!("{error:#}").contains("must remain inside"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("must remain inside"),
+            "{error:#}"
+        );
         assert!(!agent.path().join("extensions/esc").exists());
 
         // Missing runtime file: not loadable.
@@ -1911,14 +2673,22 @@ mod tests {
             "#!/bin/sh\necho executed > marker.txt\necho should-not-run > \"$(dirname \"$0\")/EXECUTED\"\n",
         )?;
 
-        let marketplace = PluginMarketplace::new(agent.path());
+        let marketplace = PluginMarketplace::new(agent.path())?;
         let trust_store = TrustStore::new(agent.path());
-        let installed = marketplace.install(source.path().to_str().unwrap(), &trust_store).await?;
+        let installed = marketplace
+            .install(source.path().to_str().unwrap(), &trust_store)
+            .await?;
         assert_eq!(installed.name, "payload");
 
         let target = agent.path().join("extensions/payload");
-        assert!(!target.join("marker.txt").exists(), "install must not run payload.sh");
-        assert!(!target.join("EXECUTED").exists(), "install must not run payload.sh");
+        assert!(
+            !target.join("marker.txt").exists(),
+            "install must not run payload.sh"
+        );
+        assert!(
+            !target.join("EXECUTED").exists(),
+            "install must not run payload.sh"
+        );
         // The payload itself is only validated for existence/containment.
         assert!(target.join("payload.sh").is_file());
         Ok(())
@@ -1929,9 +2699,11 @@ mod tests {
         let agent = TempDir::new()?;
         let source = TempDir::new()?;
         write_quickjs_plugin(source.path(), "gone", "1.0.0")?;
-        let marketplace = PluginMarketplace::new(agent.path());
+        let marketplace = PluginMarketplace::new(agent.path())?;
         let trust_store = TrustStore::new(agent.path());
-        marketplace.install(source.path().to_str().unwrap(), &trust_store).await?;
+        marketplace
+            .install(source.path().to_str().unwrap(), &trust_store)
+            .await?;
         let target = agent.path().join("extensions/gone");
         assert!(target.is_dir());
 
@@ -1942,9 +2714,333 @@ mod tests {
             resources_for(agent.path(), &trust_store).is_empty(),
             "removed plugin must not be loadable"
         );
-        // Trust decision was cleared.
-        let resolution = trust_store.resolve(&target)?;
-        assert_eq!(resolution.decision, TrustDecision::Ask);
+        assert_eq!(
+            trust_store.resolve_exact(&target)?,
+            TrustDecision::Ask,
+            "the plugin's exact trust decision must be cleared"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remove_restores_plugin_when_trust_cleanup_fails() -> Result<()> {
+        let agent = TempDir::new()?;
+        let source = TempDir::new()?;
+        write_quickjs_plugin(source.path(), "kept", "1.0.0")?;
+        let marketplace = PluginMarketplace::new(agent.path())?;
+        let trust_store = TrustStore::new(agent.path());
+        marketplace
+            .install(source.path().to_str().unwrap(), &trust_store)
+            .await?;
+        let target = agent.path().join("extensions/kept");
+        remove_test_hook::fail_next_cleanup();
+
+        let error = marketplace
+            .remove("kept", &trust_store)
+            .expect_err("trust cleanup failure must abort removal");
+        assert!(format!("{error:#}").contains("clearing trust for plugin kept"));
+        assert_eq!(trust_store.resolve_exact(&target)?, TrustDecision::Trusted);
+        assert!(target.join(PROCESS_EXTENSION_MANIFEST_FILE).is_file());
+        assert!(target.join("index.mjs").is_file());
+        assert!(
+            fs::read_dir(agent.path())?.all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".plugin-removing")
+            }),
+            "failed trust cleanup must restore the original plugin directory"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn install_from_relative_directory_resolves_against_operator_cwd() -> Result<()> {
+        let agent = TempDir::new()?;
+        let operator = TempDir::new()?;
+        let plugins = operator.path().join("plugins");
+        fs::create_dir_all(&plugins)?;
+        write_quickjs_plugin(&plugins.join("demo"), "demo", "1.0.0")?;
+
+        let marketplace = PluginMarketplace::new(agent.path())?.with_operator_cwd(operator.path());
+        let trust_store = TrustStore::new(agent.path());
+        let target = agent.path().join("extensions/demo");
+
+        // A plain relative directory source resolves against the operator cwd.
+        let installed = marketplace.install("plugins/demo", &trust_store).await?;
+        assert_eq!(installed.name, "demo");
+        assert_eq!(installed.version, "1.0.0");
+        assert!(installed.trusted);
+        assert!(target.join(PROCESS_EXTENSION_MANIFEST_FILE).is_file());
+
+        // An explicit `./`-prefixed spelling resolves to the same directory.
+        marketplace.remove("demo", &trust_store)?;
+        let dot_slash = marketplace.install("./plugins/demo", &trust_store).await?;
+        assert_eq!(dot_slash.name, "demo");
+
+        // A `..`-containing spelling is lexically normalized against the
+        // operator cwd instead of being rejected outright.
+        marketplace.remove("demo", &trust_store)?;
+        let traversing = marketplace
+            .install("plugins/../plugins/demo", &trust_store)
+            .await?;
+        assert_eq!(traversing.name, "demo");
+        let (plugins, problems) = marketplace.list(&trust_store)?;
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].version, "1.0.0");
+        assert!(loadable_spec(&target).is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn install_from_relative_and_file_archive_sources_resolve_against_operator_cwd()
+    -> Result<()> {
+        let agent = TempDir::new()?;
+        let operator = TempDir::new()?;
+        let plugins = operator.path().join("plugins");
+        fs::create_dir_all(&plugins)?;
+        let archive = plugins.join("demo-1.0.0.tgz");
+        let manifest = serde_json::to_vec_pretty(&json!({
+            "schemaVersion": 1,
+            "id": "demo",
+            "version": "1.0.0",
+            "runtime": "quickjs",
+            "entry": "index.mjs",
+            "capabilities": [],
+        }))?;
+        write_tarball(
+            &archive,
+            &[
+                ("demo/pi-extension.json", manifest.as_slice()),
+                ("demo/index.mjs", b"export default function (pi) {}\n"),
+            ],
+        )?;
+
+        let marketplace = PluginMarketplace::new(agent.path())?.with_operator_cwd(operator.path());
+        let trust_store = TrustStore::new(agent.path());
+        let target = agent.path().join("extensions/demo");
+
+        // A relative archive path resolves against the operator cwd, strips the
+        // top directory, and installs.
+        let installed = marketplace
+            .install("plugins/demo-1.0.0.tgz", &trust_store)
+            .await?;
+        assert_eq!(installed.name, "demo");
+        assert_eq!(installed.version, "1.0.0");
+        assert!(
+            !target.join("demo").exists(),
+            "top directory must be stripped"
+        );
+
+        // `file://` sources (absolute and relative) open through the same
+        // capability path; a relative `file:` component resolves against the
+        // operator cwd too.
+        marketplace.remove("demo", &trust_store)?;
+        let absolute_url = format!("file://{}", archive.display());
+        let via_url = marketplace.install(&absolute_url, &trust_store).await?;
+        assert_eq!(via_url.name, "demo");
+        marketplace.remove("demo", &trust_store)?;
+        let relative_url = marketplace
+            .install("file://plugins/demo-1.0.0.tgz", &trust_store)
+            .await?;
+        assert_eq!(relative_url.name, "demo");
+        assert!(loadable_spec(&target).is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_index_resolves_relative_and_file_local_sources_against_operator_cwd()
+    -> Result<()> {
+        let agent = TempDir::new()?;
+        let operator = TempDir::new()?;
+        let market = operator.path().join("market");
+        fs::create_dir_all(&market)?;
+        let index_path = market.join("index.json");
+        fs::write(
+            &index_path,
+            serde_json::to_vec_pretty(&[json!({
+                "name": "demo",
+                "repo": "owner/demo",
+                "version": "1.0.0",
+            })])?,
+        )?;
+
+        let marketplace = PluginMarketplace::new(agent.path())?.with_operator_cwd(operator.path());
+
+        // Plain relative local index path.
+        let index = marketplace.fetch_index("market/index.json").await?;
+        assert_eq!(index.entry("demo").expect("entry").version, "1.0.0");
+
+        // Absolute `file://` local index.
+        let index = marketplace
+            .fetch_index(&format!("file://{}", index_path.display()))
+            .await?;
+        assert_eq!(index.entry("demo").expect("entry").version, "1.0.0");
+
+        // Relative `file://` component resolves against the operator cwd.
+        let index = marketplace.fetch_index("file://market/index.json").await?;
+        assert_eq!(index.entry("demo").expect("entry").version, "1.0.0");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_relative_source_fails_actionably() -> Result<()> {
+        let agent = TempDir::new()?;
+        let operator = TempDir::new()?;
+        let marketplace = PluginMarketplace::new(agent.path())?.with_operator_cwd(operator.path());
+        let trust_store = TrustStore::new(agent.path());
+
+        // A nonexistent relative source is reported as such (after cwd
+        // resolution), never misread as a network or git source.
+        let error = marketplace
+            .install("plugins/ghost", &trust_store)
+            .await
+            .expect_err("missing relative source must fail install");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("opening local plugin source") && message.contains("plugins/ghost"),
+            "{message}"
+        );
+        assert!(marketplace.list(&trust_store)?.0.is_empty());
+
+        // Traversal that would escape the operator cwd fails closed.
+        let escaping = marketplace
+            .install("../../../../../../etc", &trust_store)
+            .await
+            .expect_err("escaping traversal must fail install");
+        assert!(
+            format!("{escaping:#}").contains("path traversal escapes its root"),
+            "{escaping:#}"
+        );
+        assert!(marketplace.list(&trust_store)?.0.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_reports_live_swap_when_backup_cleanup_fails() -> Result<()> {
+        let agent = TempDir::new()?;
+        let source = TempDir::new()?;
+        write_quickjs_plugin(source.path(), "demo", "1.0.0")?;
+        let marketplace = PluginMarketplace::new(agent.path())?;
+        let trust_store = TrustStore::new(agent.path());
+        marketplace
+            .install(source.path().to_str().unwrap(), &trust_store)
+            .await?;
+
+        let next = TempDir::new()?;
+        write_quickjs_plugin(next.path(), "demo", "2.0.0")?;
+        let index_dir = TempDir::new()?;
+        let index_path = index_dir.path().join("index.json");
+        fs::write(
+            &index_path,
+            serde_json::to_vec_pretty(&[json!({
+                "name": "demo",
+                "repo": next.path().to_str().unwrap(),
+                "version": "2.0.0",
+            })])?,
+        )?;
+        let index = marketplace
+            .fetch_index(index_path.to_str().unwrap())
+            .await?;
+
+        // The staged version is already live when backup cleanup runs, so a
+        // cleanup failure must not turn the successful swap into a reported
+        // failure: update succeeds, the new version is installed, and the
+        // hidden backup (still holding the previous version) is left behind.
+        swap_test_hook::fail_next_backup_cleanup();
+        let updated = marketplace.update("demo", &index, &trust_store).await?;
+        assert_eq!(updated.version, "2.0.0", "a live swap must report success");
+
+        let target = agent.path().join("extensions/demo");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(target.join(PROCESS_EXTENSION_MANIFEST_FILE))?)?;
+        assert_eq!(manifest["version"], "2.0.0", "the new version must be live");
+
+        // Listing stays clean: the leftover backup is hidden and ignored, and
+        // trust is preserved for the live directory.
+        let (plugins, problems) = marketplace.list(&trust_store)?;
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].version, "2.0.0");
+        assert!(plugins[0].trusted);
+
+        let backups: Vec<_> = fs::read_dir(agent.path().join("extensions"))?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".plugin-backup")
+            })
+            .collect();
+        assert_eq!(
+            backups.len(),
+            1,
+            "failed backup cleanup must leave the hidden backup behind"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn directory_swap_restores_original_when_activation_fails() -> Result<()> {
+        let root = TempDir::new()?;
+        let target = Path::new("demo");
+        fs::create_dir_all(root.path().join(&target))?;
+        fs::write(root.path().join(target).join("marker.txt"), b"original")?;
+        let store = writable_test_root(root.path())?;
+
+        // The staged directory does not exist, so the activation rename fails
+        // after the original was moved aside: the swap must restore it.
+        let error = directory_swap(&store, Path::new("staged"), target)
+            .expect_err("activation failure must fail the swap");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("previous version was restored"),
+            "{message}"
+        );
+        assert!(
+            root.path().join(target).join("marker.txt").is_file(),
+            "the original must be restored to the live path"
+        );
+        assert!(
+            fs::read_dir(root.path())?.all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".plugin-backup")
+            }),
+            "a restored original must leave no hidden backup behind"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn directory_swap_reports_untouched_original_when_move_aside_fails() -> Result<()> {
+        let root = TempDir::new()?;
+        let store = writable_test_root(root.path())?;
+        // `target` does not exist: the move-aside rename fails before anything
+        // is touched, and the error says the previous (missing) version is
+        // still in place rather than implying a swap happened.
+        let error = directory_swap(&store, Path::new("staged"), Path::new("ghost"))
+            .expect_err("move-aside failure must fail the swap");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("previous version remains in place"),
+            "{message}"
+        );
+        assert!(
+            fs::read_dir(root.path())?.all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".plugin-backup")
+            }),
+            "a failed move-aside must leave no hidden backup behind"
+        );
         Ok(())
     }
 
@@ -1953,9 +3049,11 @@ mod tests {
         let agent = TempDir::new()?;
         let source = TempDir::new()?;
         write_quickjs_plugin(source.path(), "demo", "1.0.0")?;
-        let marketplace = PluginMarketplace::new(agent.path());
+        let marketplace = PluginMarketplace::new(agent.path())?;
         let trust_store = TrustStore::new(agent.path());
-        marketplace.install(source.path().to_str().unwrap(), &trust_store).await?;
+        marketplace
+            .install(source.path().to_str().unwrap(), &trust_store)
+            .await?;
 
         let next = TempDir::new()?;
         write_quickjs_plugin(next.path(), "demo", "2.0.0")?;
@@ -1971,7 +3069,9 @@ mod tests {
             })])?,
         )?;
 
-        let index = fetch_index(index_path.to_str().unwrap()).await?;
+        let index = marketplace
+            .fetch_index(index_path.to_str().unwrap())
+            .await?;
         let updated = marketplace.update("demo", &index, &trust_store).await?;
         assert_eq!(updated.version, "2.0.0");
         assert!(updated.trusted, "update must preserve trust");
@@ -1992,7 +3092,9 @@ mod tests {
         // actionable.
         let loner = TempDir::new()?;
         write_quickjs_plugin(loner.path(), "loner", "1.0.0")?;
-        marketplace.install(loner.path().to_str().unwrap(), &trust_store).await?;
+        marketplace
+            .install(loner.path().to_str().unwrap(), &trust_store)
+            .await?;
         let error = marketplace
             .update("loner", &index, &trust_store)
             .await
@@ -2002,13 +3104,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_updates_reports_available_versions() -> Result<()> {
+    async fn list_and_index_report_available_versions() -> Result<()> {
         let agent = TempDir::new()?;
         let source = TempDir::new()?;
         write_quickjs_plugin(source.path(), "demo", "1.0.0")?;
-        let marketplace = PluginMarketplace::new(agent.path());
+        let marketplace = PluginMarketplace::new(agent.path())?;
         let trust_store = TrustStore::new(agent.path());
-        marketplace.install(source.path().to_str().unwrap(), &trust_store).await?;
+        marketplace
+            .install(source.path().to_str().unwrap(), &trust_store)
+            .await?;
 
         let index_dir = TempDir::new()?;
         let index_path = index_dir.path().join("index.json");
@@ -2019,12 +3123,25 @@ mod tests {
                 json!({ "name": "other", "repo": "owner/other", "version": "9.0.0" }),
             ])?,
         )?;
-        let index = fetch_index(index_path.to_str().unwrap()).await?;
-        let updates = marketplace.available_updates(&index)?;
+        let index = marketplace
+            .fetch_index(index_path.to_str().unwrap())
+            .await?;
+        let (installed, problems) = marketplace.list(&trust_store)?;
+        assert!(problems.is_empty(), "{problems:?}");
+        let updates: Vec<_> = installed
+            .iter()
+            .filter_map(|plugin| {
+                let entry = index.entry(&plugin.name)?;
+                compare_versions(&entry.version, &plugin.version)
+                    .is_gt()
+                    .then_some((plugin, entry))
+            })
+            .collect();
         assert_eq!(updates.len(), 1);
-        assert_eq!(updates[0].name, "demo");
-        assert_eq!(updates[0].current, "1.0.0");
-        assert_eq!(updates[0].available, "1.0.10");
+        let (installed, available) = updates[0];
+        assert_eq!(installed.name, "demo");
+        assert_eq!(installed.version, "1.0.0");
+        assert_eq!(available.version, "1.0.10");
         Ok(())
     }
 
@@ -2039,11 +3156,14 @@ mod tests {
         // verify it is listed but not loadable without a Trusted decision.
         let target = root.join("gated");
         fs::create_dir_all(&target)?;
-        fs::copy(source.path().join("pi-extension.json"), target.join("pi-extension.json"))?;
+        fs::copy(
+            source.path().join("pi-extension.json"),
+            target.join("pi-extension.json"),
+        )?;
         fs::copy(source.path().join("index.mjs"), target.join("index.mjs"))?;
 
         let trust_store = TrustStore::new(agent.path());
-        let marketplace = PluginMarketplace::new(agent.path());
+        let marketplace = PluginMarketplace::new(agent.path())?;
         let (plugins, problems) = marketplace.list(&trust_store)?;
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(plugins.len(), 1);
@@ -2053,15 +3173,15 @@ mod tests {
             "untrusted plugin must not be loadable"
         );
 
-        // Storing a Trusted decision at the plugin path makes it loadable.
-        trust_store.set(&target, TrustDecision::Trusted)?;
+        // Storing a Trusted decision at the exact plugin path makes it loadable.
+        trust_store.set_exact(&target, TrustDecision::Trusted)?;
         assert!(plugins_are_trusted(&marketplace, &trust_store));
         let resources = resources_for(agent.path(), &trust_store);
         assert_eq!(resources.len(), 1);
         assert_eq!(resources[0].path, target);
 
-        // A stored Untrusted decision blocks loading again.
-        trust_store.set(&target, TrustDecision::Untrusted)?;
+        // A stored exact Untrusted decision blocks loading again.
+        trust_store.set_exact(&target, TrustDecision::Untrusted)?;
         assert!(resources_for(agent.path(), &trust_store).is_empty());
         Ok(())
     }
@@ -2081,16 +3201,74 @@ mod tests {
         let cwd = TempDir::new()?;
         let source = TempDir::new()?;
         write_quickjs_plugin(source.path(), "rm-demo", "1.0.0")?;
+        fs::write(
+            agent.path().join("settings.json"),
+            r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+        )?;
 
-        let marketplace = PluginMarketplace::new(agent.path());
+        let marketplace = PluginMarketplace::new(agent.path())?;
         let trust_store = TrustStore::new(agent.path());
-        marketplace.install(source.path().to_str().unwrap(), &trust_store).await?;
+        marketplace
+            .install(source.path().to_str().unwrap(), &trust_store)
+            .await?;
+        let suffix = uuid::Uuid::now_v7();
+        let api = format!("plugin-resource-test-api-{suffix}");
+        let provider = format!("plugin-resource-test-provider-{suffix}");
+        let model = pi_ai::Model {
+            id: format!("plugin-resource-test-model-{suffix}"),
+            name: "Plugin Resource Test Model".to_owned(),
+            api: api.clone(),
+            provider: provider.clone(),
+            ..pi_ai::Model::default()
+        };
+        let _faux = register_faux_provider(FauxProviderOptions {
+            api,
+            provider,
+            models: vec![model.clone()],
+            chunk_size: 8,
+        });
+        let workspace = crate::WorkspaceRoots::new(cwd.path(), Vec::<PathBuf>::new())?;
 
         let mut options = ResourceManagerOptions::new(cwd.path());
         options.agent_dir = agent.path().to_path_buf();
         options.project_trust_override = Some(true);
+        options.disable_skills = true;
+        options.disable_prompt_templates = true;
+        options.disable_themes = true;
+        options.disable_context_files = true;
         options.headless = true;
         let resources = crate::ResourceManager::new(options)?;
+        let sessions = TempDir::new()?;
+        let session =
+            crate::Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
+                crate::SessionOptions {
+                    model,
+                    cwd: cwd.path().to_path_buf(),
+                    system_prompt: String::new(),
+                    thinking_level: pi_agent::ThinkingLevel::Off,
+                    api_key: "test".to_owned(),
+                    compaction: None,
+                    stream_options: Default::default(),
+                    tools: Some(Vec::new()),
+                    before_tool_call: None,
+                    after_tool_call: None,
+                    stream_fn: None,
+                    auth_resolver: None,
+                    auth_manager: None,
+                },
+                Vec::new(),
+                crate::ToolSelection::default(),
+                crate::ResourceDiscovery::Disabled,
+                workspace,
+                None,
+            )?;
+        session.set_session_dir(sessions.path().to_path_buf());
+        session.attach_resources(resources).await?;
+        let application = crate::Application::from_runtime_candidate(
+            crate::ApplicationRuntimeCandidate::new(session),
+        )
+        .await?;
+        let resources = application.capture_generation().resource().clone();
         let specs = resources.extension_specs(&ExtensionPermissionSet::allow_all())?;
         assert!(
             specs.iter().any(|spec| spec.id == "rm-demo"),
@@ -2140,16 +3318,16 @@ mod tests {
     #[test]
     fn archive_traversal_entries_are_rejected() -> Result<()> {
         let target = TempDir::new()?;
-        let error = extract_tar_from_bytes(&raw_tar_entry("../escape.txt", b"evil\n", b'0'), target.path())
-            .expect_err("traversal entry must be rejected");
+        let target_root = writable_test_root(target.path())?;
+        let error = extract_tar_from_bytes(
+            &raw_tar_entry("../escape.txt", b"evil\n", b'0'),
+            &target_root,
+            Path::new(""),
+        )
+        .expect_err("traversal entry must be rejected");
         assert!(format!("{error:#}").contains("unsafe path"), "{error:#}");
         assert!(!target.path().join("escape.txt").exists());
-        assert!(!target
-            .path()
-            .parent()
-            .unwrap()
-            .join("escape.txt")
-            .exists());
+        assert!(!target.path().parent().unwrap().join("escape.txt").exists());
         Ok(())
     }
 
@@ -2160,7 +3338,12 @@ mod tests {
         // it must never escape it (defense in depth: our own is_absolute
         // check would also reject it if the crate ever stopped normalizing).
         let target = TempDir::new()?;
-        match extract_tar_from_bytes(&raw_tar_entry("/etc/evil", b"evil\n", b'0'), target.path()) {
+        let target_root = writable_test_root(target.path())?;
+        match extract_tar_from_bytes(
+            &raw_tar_entry("/etc/evil", b"evil\n", b'0'),
+            &target_root,
+            Path::new(""),
+        ) {
             Ok(()) => {
                 assert!(
                     target.path().join("etc/evil").is_file(),
@@ -2177,9 +3360,17 @@ mod tests {
         );
 
         let symlink = TempDir::new()?;
-        let error = extract_tar_from_bytes(&raw_tar_entry("pkg/evil", b"target", b'2'), symlink.path())
-            .expect_err("symlink entry must be rejected");
-        assert!(format!("{error:#}").contains("not a regular file"), "{error:#}");
+        let symlink_root = writable_test_root(symlink.path())?;
+        let error = extract_tar_from_bytes(
+            &raw_tar_entry("pkg/evil", b"target", b'2'),
+            &symlink_root,
+            Path::new(""),
+        )
+        .expect_err("symlink entry must be rejected");
+        assert!(
+            format!("{error:#}").contains("not a regular file"),
+            "{error:#}"
+        );
         Ok(())
     }
 
@@ -2219,7 +3410,10 @@ mod tests {
         })])?;
         let index = MarketplaceIndex::parse(&bytes)?;
         assert_eq!(index.entries().len(), 1);
-        assert_eq!(index.entry("demo").expect("entry").description.as_deref(), Some("a demo"));
+        assert_eq!(
+            index.entry("demo").expect("entry").description.as_deref(),
+            Some("a demo")
+        );
         assert!(index.entry("missing").is_none());
 
         let duplicates = serde_json::to_vec_pretty(&[
@@ -2229,7 +3423,9 @@ mod tests {
         let error = MarketplaceIndex::parse(&duplicates).expect_err("duplicates rejected");
         assert!(format!("{error:#}").contains("twice"), "{error:#}");
 
-        let empty_repo = serde_json::to_vec_pretty(&[json!({ "name": "demo", "repo": "", "version": "1.0.0" })])?;
+        let empty_repo = serde_json::to_vec_pretty(&[
+            json!({ "name": "demo", "repo": "", "version": "1.0.0" }),
+        ])?;
         let error = MarketplaceIndex::parse(&empty_repo).expect_err("empty repo rejected");
         assert!(format!("{error:#}").contains("empty repo"), "{error:#}");
 
@@ -2247,11 +3443,27 @@ mod tests {
     fn github_reference_parses_only_owner_repo_shapes() {
         assert_eq!(
             parse_github_reference("owner/repo"),
-            Some(("owner".to_owned(), "repo".to_owned()))
+            Some(GitHubReference {
+                owner: "owner".to_owned(),
+                repo: "repo".to_owned(),
+                git_ref: None,
+            })
         );
         assert_eq!(
             parse_github_reference("owner/repo.git"),
-            Some(("owner".to_owned(), "repo".to_owned()))
+            Some(GitHubReference {
+                owner: "owner".to_owned(),
+                repo: "repo".to_owned(),
+                git_ref: None,
+            })
+        );
+        assert_eq!(
+            parse_github_reference("owner/repo@v1.2.3"),
+            Some(GitHubReference {
+                owner: "owner".to_owned(),
+                repo: "repo".to_owned(),
+                git_ref: Some("v1.2.3".to_owned()),
+            })
         );
         assert_eq!(parse_github_reference("a/b/c"), None, "too many segments");
         assert_eq!(parse_github_reference("/repo"), None);
@@ -2260,6 +3472,24 @@ mod tests {
         assert_eq!(parse_github_reference("../relative/path"), None);
         assert_eq!(parse_github_reference(".hidden/repo"), None);
         assert_eq!(parse_github_reference("owner/repo!"), None);
+        assert_eq!(parse_github_reference("owner/repo@"), None, "empty pin");
+        assert_eq!(parse_github_reference("owner/repo@.."), None, "ref traversal");
+    }
+
+    #[test]
+    fn git_http_clone_urls_parse_like_https() {
+        let http = parse_git_reference("http://127.0.0.1:3010/owner/repo.git")
+            .expect("explicit http git URL");
+        assert!(http.starts_with("http://"), "{http}");
+        let git_plus = parse_git_reference("git+http://127.0.0.1:3010/owner/repo")
+            .expect("git+http bare repo");
+        assert!(git_plus.starts_with("http://"), "{git_plus}");
+        assert!(parse_git_reference("https://example.com/owner/repo.git").is_some());
+        assert_eq!(
+            parse_git_reference("https://example.com/owner/repo"),
+            None,
+            "https without .git still requires git+"
+        );
     }
 
     #[test]
@@ -2304,6 +3534,7 @@ mod tests {
         let error = extension_spec_from_package_resource(&PackageResourceSpec {
             kind: PackageResourceKind::Extension,
             path: oversized.path().to_path_buf(),
+            managed_root: None,
             package_id: "test".to_owned(),
             scope: PackageScope::Global,
             trusted: true,
@@ -2318,8 +3549,21 @@ mod tests {
         let long = "x".repeat(200);
         assert!(validate_plugin_name("demo").is_ok());
         assert!(validate_plugin_name("demo.ext-2").is_ok());
-        for bad in ["", ".", "..", "../x", "a/b", "a\\b", "a b", "a\x00b", long.as_str()] {
-            assert!(validate_plugin_name(bad).is_err(), "{bad:?} must be rejected");
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../x",
+            "a/b",
+            "a\\b",
+            "a b",
+            "a\x00b",
+            long.as_str(),
+        ] {
+            assert!(
+                validate_plugin_name(bad).is_err(),
+                "{bad:?} must be rejected"
+            );
         }
     }
 
@@ -2334,11 +3578,13 @@ mod tests {
         )?;
         let source = TempDir::new()?;
         write_quickjs_plugin(source.path(), "fine", "1.0.0")?;
-        let marketplace = PluginMarketplace::new(agent.path());
+        let marketplace = PluginMarketplace::new(agent.path())?;
         let trust_store = TrustStore::new(agent.path());
         // The valid plugin installs normally; listing still surfaces the
         // corrupt directory as a problem instead of failing.
-        marketplace.install(source.path().to_str().unwrap(), &trust_store).await?;
+        marketplace
+            .install(source.path().to_str().unwrap(), &trust_store)
+            .await?;
         let (plugins, problems) = marketplace.list(&trust_store)?;
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "fine");
@@ -2425,12 +3671,28 @@ mod tests {
             ]
         })
         .await;
-        set_npm_registry_base_for_tests(base);
+        set_npm_registry_base_for_tests(base.as_str());
 
         let agent = TempDir::new()?;
-        let marketplace = PluginMarketplace::new(agent.path());
+        let (_application, marketplace, observed) =
+            governed_network_marketplace(agent.path()).await?;
         let trust_store = TrustStore::new(agent.path());
-        let installed = marketplace.install("npm:pi-side-chat", &trust_store).await?;
+        let installed = marketplace
+            .install("npm:pi-side-chat", &trust_store)
+            .await?;
+        assert_eq!(
+            *observed
+                .lock()
+                .expect("plugin HTTP observations mutex poisoned"),
+            vec![
+                (TestHttpClass::NpmRegistry, format!("{base}/pi-side-chat")),
+                (
+                    TestHttpClass::NpmTarball,
+                    format!("{base}/pi-side-chat-1.0.0.tgz"),
+                ),
+            ],
+            "npm metadata and tarball must use their exact captured classes"
+        );
         assert_eq!(installed.name, "side-chat");
         assert_eq!(installed.version, "1.0.0");
         assert!(installed.trusted);
@@ -2441,7 +3703,10 @@ mod tests {
         let target = agent.path().join("extensions/side-chat");
         assert!(target.join("pi-extension.json").is_file());
         assert!(target.join("dist/index.mjs").is_file());
-        assert!(!target.join("package").exists(), "npm top directory must be stripped");
+        assert!(
+            !target.join("package").exists(),
+            "npm top directory must be stripped"
+        );
         assert!(loadable_spec(&target).is_ok());
         assert_eq!(resources_for(agent.path(), &trust_store).len(), 1);
         Ok(())
@@ -2482,7 +3747,7 @@ mod tests {
         set_npm_registry_base_for_tests(base);
 
         let agent = TempDir::new()?;
-        let marketplace = PluginMarketplace::new(agent.path());
+        let (_application, marketplace, _) = governed_network_marketplace(agent.path()).await?;
         let trust_store = TrustStore::new(agent.path());
         let installed = marketplace
             .install("npm:pi-side-chat@1.2.3", &trust_store)
@@ -2527,7 +3792,7 @@ mod tests {
         set_npm_registry_base_for_tests(base);
 
         let agent = TempDir::new()?;
-        let marketplace = PluginMarketplace::new(agent.path());
+        let (_application, marketplace, _) = governed_network_marketplace(agent.path()).await?;
         let trust_store = TrustStore::new(agent.path());
         let error = marketplace
             .install("npm:pi-side-chat", &trust_store)
@@ -2548,16 +3813,13 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let base = spawn_registry_server(|_port| {
-            vec![(
-                "/no-such-package".to_owned(),
-                RouteResponse::Err(404),
-            )]
+            vec![("/no-such-package".to_owned(), RouteResponse::Err(404))]
         })
         .await;
         set_npm_registry_base_for_tests(base);
 
         let agent = TempDir::new()?;
-        let marketplace = PluginMarketplace::new(agent.path());
+        let (_application, marketplace, _) = governed_network_marketplace(agent.path()).await?;
         let trust_store = TrustStore::new(agent.path());
         let error = marketplace
             .install("npm:no-such-package", &trust_store)
@@ -2609,7 +3871,7 @@ mod tests {
         set_npm_registry_base_for_tests(base);
 
         let agent = TempDir::new()?;
-        let marketplace = PluginMarketplace::new(agent.path());
+        let (_application, marketplace, _) = governed_network_marketplace(agent.path()).await?;
         let trust_store = TrustStore::new(agent.path());
         let error = marketplace
             .install("npm:no-manifest", &trust_store)
@@ -2644,7 +3906,7 @@ mod tests {
         set_npm_registry_base_for_tests(base);
 
         let agent = TempDir::new()?;
-        let marketplace = PluginMarketplace::new(agent.path());
+        let (_application, marketplace, _) = governed_network_marketplace(agent.path()).await?;
         let trust_store = TrustStore::new(agent.path());
         let error = marketplace
             .install("npm:metadata-only", &trust_store)
@@ -2684,7 +3946,7 @@ mod tests {
         set_npm_registry_base_for_tests(base);
 
         let agent = TempDir::new()?;
-        let marketplace = PluginMarketplace::new(agent.path());
+        let (_application, marketplace, _) = governed_network_marketplace(agent.path()).await?;
         let trust_store = TrustStore::new(agent.path());
         let error = marketplace
             .install("npm:no-integrity", &trust_store)
@@ -2720,14 +3982,21 @@ mod tests {
         write_git_plugin_repo(&repo_dir, "gitdemo", "1.0.0")?;
         let url = format!("file://{}", repo_dir.display());
 
-        let marketplace = PluginMarketplace::new(agent.path());
+        let application = governed_plugin_application().await?;
+        let marketplace = application.marketplace(agent.path())?;
         let trust_store = TrustStore::new(agent.path());
         let installed = marketplace.install(&url, &trust_store).await?;
         assert_eq!(installed.name, "gitdemo");
 
         let target = agent.path().join("extensions/gitdemo");
-        assert!(target.join("pi-extension.json").is_file(), "manifest must be cloned in");
-        assert!(target.join("index.mjs").is_file(), "entry point must be cloned in");
+        assert!(
+            target.join("pi-extension.json").is_file(),
+            "manifest must be cloned in"
+        );
+        assert!(
+            target.join("index.mjs").is_file(),
+            "entry point must be cloned in"
+        );
         assert!(
             !target.join(".git").exists(),
             "cloned .git metadata must not ship in the installed plugin"
@@ -2759,12 +4028,16 @@ mod tests {
         let repo = TempDir::new()?;
         let repo_dir = repo.path().join("no-manifest-repo");
         fs::create_dir_all(&repo_dir)?;
-        fs::write(repo_dir.join("README.md"), "this repo has no plugin manifest\n")?;
+        fs::write(
+            repo_dir.join("README.md"),
+            "this repo has no plugin manifest\n",
+        )?;
         init_git_repo(&repo_dir)?;
         // The `git+` prefix exercises the bare (`.git`-less) repo path.
         let url = format!("git+file://{}", repo_dir.display());
 
-        let marketplace = PluginMarketplace::new(agent.path());
+        let application = governed_plugin_application().await?;
+        let marketplace = application.marketplace(agent.path())?;
         let trust_store = TrustStore::new(agent.path());
         let error = marketplace
             .install(&url, &trust_store)
@@ -2795,7 +4068,7 @@ mod tests {
     #[tokio::test]
     async fn install_rejects_invalid_git_urls_without_spawning() -> Result<()> {
         let agent = TempDir::new()?;
-        let marketplace = PluginMarketplace::new(agent.path());
+        let marketplace = PluginMarketplace::new(agent.path())?;
         let trust_store = TrustStore::new(agent.path());
         let sources = [
             "git+https://host/owner/repo.git;rm -rf /", // shell metacharacters

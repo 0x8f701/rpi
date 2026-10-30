@@ -15,9 +15,18 @@
 // async completion, UTF-8 validation, fence-injection safety, the code message
 // builder, the image ContentBlock mapping, and skip-summary formatting.
 import {
+  IMAGE_DECODE_TIMEOUT_MS,
   MAX_ATTACHMENTS,
   MAX_COMMAND_ID,
   MAX_FILE_BYTES,
+  MAX_IMAGE_DIMENSION,
+  MAX_IMAGE_HEADER_BYTES,
+  MAX_IMAGE_INPUT_BYTES,
+  MAX_IMAGE_PIXELS,
+  MAX_PDF_BYTES,
+  MAX_PDF_TEXT_BYTES,
+  MAX_PDF_RESPONSE_BYTES,
+  MAX_PROCESSED_IMAGE_BYTES,
   MAX_PROMPT_FRAME_BYTES,
   MAX_TOTAL_WIRE_BYTES,
   MAX_VIDEO_BYTES,
@@ -27,8 +36,11 @@ import {
   MAX_VIDEO_FRAMES,
   MAX_VIDEO_FRAMES_BASE64,
   MAX_VIDEO_FRAMES_RAW_BYTES,
+  MAX_VIDEO_RESPONSE_BYTES,
   MAX_VIDEO_INSTRUCTION_BYTES,
+  PDF_UPLOAD_PATH,
   VIDEO_UPLOAD_PATH,
+  admitBuiltAttachments,
   VIDEO_UPLOAD_TIMEOUT_MS,
   aggregateWire,
   attachmentAccept,
@@ -36,6 +48,8 @@ import {
   base64Length,
   buildCodeMessage,
   buildCodeSegment,
+  buildPdfAttachment,
+  buildPdfMessage,
   buildVideoAttachment,
   buildVideoMessage,
   classifyAttachments,
@@ -46,21 +60,31 @@ import {
   commandFrameBytes,
   decodeUtf8OrReject,
   formatSkipSummary,
+  imageHeaderDecision,
+  imageHeaderDimensions,
+  imageDimensionsAreSafe,
   imageMimeType,
+  boundedImageDimensions,
   IntakeBudgetTracker,
   intakeReservation,
   isImageFile,
+  isPdfFile,
   isStaleIntake,
   isTextFile,
   isVideoFile,
   mergeIntakeResults,
+  parsePdfUploadResponse,
   parseVideoUploadResponse,
+  pdfMarkerText,
+  pdfUploadHeaders,
+  pdfUploadUrl,
   placeholderFor,
   readAttachmentsInOrder,
   reconcileIntakeBudget,
   removeSentAttachments,
   safeFence,
   sanitizeFileName,
+  settlePdfOutcome,
   settleVideoOutcome,
   uploadVideoFile,
   utf8ByteLength,
@@ -108,12 +132,17 @@ check('MAX_TOTAL_WIRE_BYTES < frame (conservative)', MAX_TOTAL_WIRE_BYTES < MAX_
 check('MAX_TOTAL_WIRE_BYTES leaves >= 0.5 MiB reserve', MAX_PROMPT_FRAME_BYTES - MAX_TOTAL_WIRE_BYTES >= 0.5 * 1024 * 1024);
 check('MAX_FILE_BYTES <= MAX_TOTAL_WIRE_BYTES', MAX_FILE_BYTES <= MAX_TOTAL_WIRE_BYTES);
 check('MAX_FILE_BYTES == 2 MiB', MAX_FILE_BYTES === 2 * 1024 * 1024);
+check('MAX_PROCESSED_IMAGE_BYTES == 2 MiB', MAX_PROCESSED_IMAGE_BYTES === 2 * 1024 * 1024);
+check('MAX_IMAGE_INPUT_BYTES == 20 MiB', MAX_IMAGE_INPUT_BYTES === 20 * 1024 * 1024);
+check('MAX_IMAGE_PIXELS == 16 Mi pixels', MAX_IMAGE_PIXELS === 16 * 1024 * 1024);
+check('MAX_IMAGE_DIMENSION == 2000', MAX_IMAGE_DIMENSION === 2000);
+check('large image header read is bounded', MAX_IMAGE_HEADER_BYTES > 24 && MAX_IMAGE_HEADER_BYTES <= 256 * 1024);
+check('image decode timeout is bounded', IMAGE_DECODE_TIMEOUT_MS >= 1_000 && IMAGE_DECODE_TIMEOUT_MS <= 30_000);
 check('MAX_ATTACHMENTS is a modest count cap', MAX_ATTACHMENTS >= 2 && MAX_ATTACHMENTS <= 16);
 check('base64Length 3 raw -> 4', base64Length(3) === 4);
 check('base64Length 1 raw -> 4 (padded)', base64Length(1) === 4);
 check('base64Length 6 raw -> 8', base64Length(6) === 8);
-check('base64Length 0 -> 0', base64Length(0) === 0);
-check('wireFootprint image = base64', wireFootprint('image', 300) === base64Length(300));
+check('wireFootprint image estimates current encoding before exact settle check', wireFootprint('image', 300) === base64Length(300));
 check('wireFootprint code > raw (overhead)', wireFootprint('code', 100) > 100);
 
 // ---- kind classification: image / code / unsupported ----
@@ -126,18 +155,28 @@ check('classifyKind python', classifyKind(f('m.py', '', 10)) === 'code');
 check('classifyKind json', classifyKind(f('p.json', '', 10)) === 'code');
 check('classifyKind markdown', classifyKind(f('r.md', '', 10)) === 'code');
 check('classifyKind txt', classifyKind(f('n.txt', '', 10)) === 'code');
-check('classifyKind pdf by type unsupported', classifyKind(f('a.pdf', 'application/pdf', 10)) === null);
-check('classifyKind pdf by ext unsupported', classifyKind(f('a.pdf', '', 10)) === null);
+check('classifyKind sol', classifyKind(f('Token.sol', '', 10)) === 'code');
+check('classifyKind pdf by type', classifyKind(f('a.pdf', 'application/pdf', 10)) === 'pdf');
+check('classifyKind pdf by ext', classifyKind(f('a.pdf', '', 10)) === 'pdf');
 check('classifyKind zip unsupported', classifyKind(f('a.zip', 'application/zip', 10)) === null);
 check('classifyKind unknown ext + no type unsupported', classifyKind(f('blob.dat', '', 10)) === null);
 check('classifyKind text/* type unknown ext accepted', classifyKind(f('data', 'text/csv', 10)) === 'code');
 check('isImageFile image true', isImageFile(img('a.png')));
 check('isImageFile pdf false', isImageFile(f('a.pdf', 'application/pdf', 10)) === false);
+check('isPdfFile pdf true', isPdfFile(f('a.pdf', 'application/pdf', 10)));
+check('isPdfFile pdf empty type true', isPdfFile(f('report.PDF', '', 10)));
+check('isPdfFile application/pdf without ext false', isPdfFile(f('blob', 'application/pdf', 10)) === false);
 check('isTextFile rust true', isTextFile(f('a.rs', '', 10)) === true);
 check('isTextFile image is NOT text', isTextFile(img('a.png')) === false);
 check('isTextFile pdf false', isTextFile(f('a.pdf', 'application/pdf', 10)) === false);
 check('isTextFile zip false', isTextFile(f('a.zip', 'application/zip', 10)) === false);
 check('isTextFile dockerfile basename true', isTextFile(f('Dockerfile', '', 10)) === true);
+check('isTextFile sol true', isTextFile(f('Token.sol', '', 10)) === true);
+// Regression: the eleven extensions an earlier edit had dropped accept empty MIME.
+const RESTORED_EXTENSIONS = ['pl', 'pm', 'r', 'dart', 'groovy', 'gradle', 'jl', 'nim', 'cr', 'zig', 'v'] as const;
+for (const ext of RESTORED_EXTENSIONS) {
+  check(`isTextFile empty-MIME .${ext}`, isTextFile(f(`x.${ext}`, '', 10)) === true);
+}
 
 // ---- codeLanguage mapping ----
 check('codeLanguage .rs -> rust', codeLanguage('lib.rs') === 'rust');
@@ -146,6 +185,8 @@ check('codeLanguage .tsx -> tsx', codeLanguage('x.tsx') === 'tsx');
 check('codeLanguage .py -> python', codeLanguage('m.py') === 'python');
 check('codeLanguage .unknown -> ""', codeLanguage('x.zzz') === '');
 check('codeLanguage Dockerfile -> dockerfile', codeLanguage('Dockerfile') === 'dockerfile');
+check('codeLanguage .sol -> solidity', codeLanguage('contracts/Token.sol') === 'solidity');
+check('codeLanguage uppercase .SOL -> solidity', codeLanguage('Token.SOL') === 'solidity');
 
 // ---- imageMimeType ----
 check('imageMimeType image/jpeg passthrough', imageMimeType(f('a', 'image/jpeg', 0)) === 'image/jpeg');
@@ -170,21 +211,26 @@ check('imageMimeType unknown ext -> image/png', imageMimeType(f('a.bin', '', 0))
   check('multiple code files accepted in order', plan.accepted.map((x) => x.file.name).join(',') === 'lib.rs,app.ts' && plan.accepted.every((x) => x.kind === 'code'));
 }
 
-// ---- classifyAttachments: PDFs and binaries skipped as unsupported ----
+// ---- classifyAttachments: PDFs accepted; other binaries skipped ----
 {
   const plan = classifyAttachments([img('ok.png'), f('doc.pdf', 'application/pdf', 1024), f('bin.zip', 'application/zip', 10), code('ok.rs')]);
-  check('pdf+binary skipped unsupported', plan.skipped.length === 2 && plan.skipped.every((s) => s.reason === 'unsupported'));
-  check('pdf+binary skips preserve order', plan.skipped.map((s) => s.name).join(',') === 'doc.pdf,bin.zip');
-  check('valid siblings accepted in order', plan.accepted.map((x) => x.file.name).join(',') === 'ok.png,ok.rs');
+  check('zip skipped unsupported', plan.skipped.length === 1 && plan.skipped[0]!.reason === 'unsupported' && plan.skipped[0]!.name === 'bin.zip');
+  check('pdf accepted with image+code', plan.accepted.map((x) => x.file.name).join(',') === 'ok.png,doc.pdf,ok.rs');
+  check('pdf kind preserved', plan.accepted[1]!.kind === 'pdf');
 }
 
-// ---- classifyAttachments: oversize ----
+
+// ---- classifyAttachments: code cap unchanged; large images use raw ceiling ----
 {
-  const plan = classifyAttachments([img('big.png', MAX_FILE_BYTES + 1), code('ok.rs', 500)]);
-  check('oversize skipped', plan.skipped.length === 1 && plan.skipped[0]!.reason === 'oversize');
-  check('oversize does not block valid sibling', plan.accepted.length === 1 && plan.accepted[0]!.file.name === 'ok.rs');
-  check('oversize boundary exactly MAX_FILE_BYTES accepted (image)', classifyAttachments([img('edge.png', MAX_FILE_BYTES)]).accepted.length === 1);
-  check('oversize boundary exactly MAX_FILE_BYTES accepted (code)', classifyAttachments([code('edge.rs', MAX_FILE_BYTES)]).accepted.length === 1);
+  const largeImage = classifyAttachments([img('camera.png', MAX_FILE_BYTES + 1), code('ok.rs', 500)]);
+  check('large image over 2 MiB accepted for preprocessing', largeImage.accepted.length === 2 && largeImage.skipped.length === 0);
+  check('large image reserves processed output, not raw input', wireFootprint('image', 8 * 1024 * 1024) === base64Length(MAX_FILE_BYTES));
+  check('raw image ceiling exactly 20 MiB accepted', classifyAttachments([img('edge.png', MAX_IMAGE_INPUT_BYTES)]).accepted.length === 1);
+  const imageOver = classifyAttachments([img('too-big.png', MAX_IMAGE_INPUT_BYTES + 1)]);
+  check('raw image above 20 MiB rejected visibly', imageOver.accepted.length === 0 && imageOver.skipped[0]!.reason === 'image-oversize');
+  const codeOver = classifyAttachments([code('huge.rs', MAX_FILE_BYTES + 1)]);
+  check('code over 2 MiB remains rejected', codeOver.accepted.length === 0 && codeOver.skipped[0]!.reason === 'oversize');
+  check('code boundary exactly MAX_FILE_BYTES accepted', classifyAttachments([code('edge.rs', MAX_FILE_BYTES)]).accepted.length === 1);
 }
 
 // ---- classifyAttachments: count cap drops extras as too-many ----
@@ -198,13 +244,15 @@ check('imageMimeType unknown ext -> image/png', imageMimeType(f('a.bin', '', 0))
 
 // ---- classifyAttachments: aggregate wire cap drops extras as over-budget ----
 {
-  // Images inflate 4/3. A raw size whose base64 == exactly 1/3 of the wire
-  // budget lets three images land at == budget (allowed, strict >) and a fourth
-  // overflow.
-  const unit = Math.floor(MAX_TOTAL_WIRE_BYTES / 3 / 4) * 3; // raw so base64 == 1/3 budget
-  const plan = classifyAttachments([img('a.png', unit), img('b.png', unit), img('c.png', unit), img('d.png', unit)]);
-  check('aggregate wire cap accepts up to the budget (3 images at 1/3)', plan.accepted.length === 3, `unit=${unit} accepted=${plan.accepted.length}`);
-  check('aggregate wire cap skips the 4th image as over-budget', plan.skipped.length === 1 && plan.skipped[0]!.reason === 'over-budget');
+  // Large image inputs reserve the maximum 2 MiB processed JPEG output, not
+  // their raw camera bytes. One such reservation fits under the 3 MiB wire
+  // budget; a second is rejected.
+  const plan = classifyAttachments([
+    img('a.png', MAX_FILE_BYTES + 1),
+    img('b.png', MAX_FILE_BYTES + 1),
+  ]);
+  check('aggregate wire cap accepts one max-output large image', plan.accepted.length === 1);
+  check('aggregate wire cap skips second max-output large image', plan.skipped.length === 1 && plan.skipped[0]!.reason === 'over-budget');
 }
 {
   // Code files do NOT base64-inflate (only the per-file framing overhead), so
@@ -237,17 +285,18 @@ check('imageMimeType unknown ext -> image/png', imageMimeType(f('a.bin', '', 0))
 {
   const plan = classifyAttachments([
     img('ok.png', 100),
-    f('doc.pdf', 'application/pdf', 100), // unsupported
-    img('big.png', MAX_FILE_BYTES + 1), // oversize
-    code('a.rs', 1_000_000),
-    code('b.rs', 1_000_000),
-    code('over.rs', 1_200_000), // over-budget (ok+a+b consume ~2 MiB, this tips over)
+    f('doc.pdf', 'application/pdf', 100), // accepted PDF
+    img('camera.png', MAX_FILE_BYTES + 1), // accepted for preprocessing
+    img('too-big.png', MAX_IMAGE_INPUT_BYTES + 1), // image raw ceiling
+    code('huge.rs', MAX_FILE_BYTES + 1), // code cap
+    code('over.rs', 500_000), // over-budget after camera's max-output reservation
   ]);
   const reasons = plan.skipped.map((s) => s.reason);
-  check('mixed batch accepts valid in order', plan.accepted.map((x) => x.file.name).join(',') === 'ok.png,a.rs,b.rs');
-  check('mixed batch reports unsupported+oversize+over-budget', reasons.includes('unsupported') && reasons.includes('oversize') && reasons.includes('over-budget'));
-  check('mixed batch skips preserve order', plan.skipped.map((s) => s.name).join(',') === 'doc.pdf,big.png,over.rs');
+  check('mixed batch keeps accepted siblings in order', plan.accepted.map((x) => x.file.name).join(',') === 'ok.png,doc.pdf,camera.png');
+  check('mixed batch reports all image/code/budget reasons', ['image-oversize', 'oversize', 'over-budget'].every((r) => reasons.includes(r as AttachSkip['reason'])));
+  check('mixed batch skips preserve order', plan.skipped.map((s) => s.name).join(',') === 'too-big.png,huge.rs,over.rs');
 }
+
 
 // ---- readAttachmentsInOrder: preserves input order despite shuffled completion ----
 {
@@ -422,6 +471,80 @@ check('classifyKind svg -> code (text), not image', classifyKind(f('a.svg', 'ima
 check('classifyKind bmp -> unsupported', classifyKind(f('a.bmp', 'image/bmp', 10)) === null);
 check('imageMimeType svg ext -> image/png fallback (not image/svg+xml)', imageMimeType(f('a.svg', '', 0)) === 'image/png');
 
+// ---- bounded image header/signature/dimension helpers ----
+{
+  const png = new Uint8Array(24);
+  png.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+  new DataView(png.buffer).setUint32(8, 13);
+  png.set([0x49, 0x48, 0x44, 0x52], 12);
+  new DataView(png.buffer).setUint32(16, 4032);
+  new DataView(png.buffer).setUint32(20, 3024);
+  check('PNG signature + IHDR dimensions accepted', JSON.stringify(imageHeaderDimensions(png, 'image/png')) === JSON.stringify({ width: 4032, height: 3024 }));
+  check('PNG dimension trigger queues preprocessing', imageHeaderDecision(png, 'image/png', 100 * 1024).action === 'preprocess');
+  const smallPng = png.slice();
+  new DataView(smallPng.buffer).setUint32(16, 800);
+  new DataView(smallPng.buffer).setUint32(20, 600);
+  check('small valid PNG passes through', imageHeaderDecision(smallPng, 'image/png', 100 * 1024).action === 'pass-through');
+  const badPng = png.slice();
+  badPng[0] = 0;
+  check('PNG MIME with mismatched signature rejected', imageHeaderDimensions(badPng, 'image/png') === null);
+  check('truncated PNG header rejected', imageHeaderDimensions(png.slice(0, 23), 'image/png') === null);
+
+  const jpeg = new Uint8Array([
+    0xff, 0xd8,
+    0xff, 0xe0, 0x00, 0x04, 0x00, 0x00,
+    0xff, 0xc2, 0x00, 0x11, 0x08,
+    0x0b, 0xd0,
+    0x0f, 0xc0,
+    0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00,
+  ]);
+  check('JPEG signature + SOF dimensions accepted', JSON.stringify(imageHeaderDimensions(jpeg, 'image/jpeg')) === JSON.stringify({ width: 4032, height: 3024 }));
+  check('JPEG MIME with PNG signature rejected', imageHeaderDimensions(png, 'image/jpeg') === null);
+  check('truncated JPEG segment rejected', imageHeaderDimensions(jpeg.slice(0, 16), 'image/jpeg') === null);
+  check('early JPEG EOI rejected', imageHeaderDimensions(new Uint8Array([0xff, 0xd8, 0xff, 0xd9]), 'image/jpeg') === null);
+  check('short JPEG SOF rejected', imageHeaderDimensions(new Uint8Array([0xff, 0xd8, 0xff, 0xc0, 0x00, 0x06, 0x08, 0, 1, 0]), 'image/jpeg') === null);
+  const pixelBombPng = png.slice();
+  new DataView(pixelBombPng.buffer).setUint32(16, 5000);
+  new DataView(pixelBombPng.buffer).setUint32(20, 5000);
+  check('tiny 5000x5000 PNG is rejected before decode', imageHeaderDecision(pixelBombPng, 'image/png', 100 * 1024).action === 'reject');
+  check('1.5 MiB 4032x3024 JPEG queues preprocessing by dimensions', imageHeaderDecision(jpeg, 'image/jpeg', 1.5 * 1024 * 1024).action === 'preprocess');
+  const smallJpeg = jpeg.slice();
+  smallJpeg[13] = 0x02;
+  smallJpeg[14] = 0x58;
+  smallJpeg[15] = 0x03;
+  smallJpeg[16] = 0x20;
+  const smallDecision = imageHeaderDecision(smallJpeg, 'image/jpeg', 100 * 1024);
+  check('100 KiB 800x600 JPEG passes through', smallDecision.action === 'pass-through' && JSON.stringify(smallDecision.dimensions) === JSON.stringify({ width: 800, height: 600 }));
+  check('5 MiB 800x600 JPEG preprocesses by raw size', imageHeaderDecision(smallJpeg, 'image/jpeg', 5 * 1024 * 1024).action === 'preprocess');
+
+  const gif = new Uint8Array([
+    0x47, 0x49, 0x46, 0x38, 0x39, 0x61,
+    0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+    0x2c, 0, 0, 0, 0, 1, 0, 1, 0, 0,
+    0x02, 0x02, 0x4c, 0x01, 0x00, 0x3b,
+  ]);
+  check('bounded static GIF passes through', imageHeaderDecision(gif, 'image/gif', gif.length).action === 'pass-through');
+  const animatedGif = new Uint8Array([...gif.slice(0, -1), ...gif.slice(13)]);
+  check('animated GIF rejected before browser decode', imageHeaderDecision(animatedGif, 'image/gif', animatedGif.length).action === 'reject');
+  const webpPayload = new Uint8Array([0x2f, 0x00, 0x00, 0x00, 0x00]);
+  const webp = new Uint8Array(12 + 8 + webpPayload.length + 1);
+  webp.set([0x52, 0x49, 0x46, 0x46], 0);
+  new DataView(webp.buffer).setUint32(4, webp.length - 8, true);
+  webp.set([0x57, 0x45, 0x42, 0x50, 0x56, 0x50, 0x38, 0x4c], 8);
+  new DataView(webp.buffer).setUint32(16, webpPayload.length, true);
+  webp.set(webpPayload, 20);
+  check('bounded static WebP passes through', imageHeaderDecision(webp, 'image/webp', webp.length).action === 'pass-through');
+  check('GIF/WebP above pass-through cap fail closed', imageHeaderDecision(gif, 'image/gif', MAX_FILE_BYTES + 1).action === 'reject' && imageHeaderDecision(webp, 'image/webp', MAX_FILE_BYTES + 1).action === 'reject');
+
+  check('4000x3000 scales to 2000x1500', JSON.stringify(boundedImageDimensions(4000, 3000)) === JSON.stringify({ width: 2000, height: 1500 }));
+  check('small dimensions are not upscaled', JSON.stringify(boundedImageDimensions(800, 600)) === JSON.stringify({ width: 800, height: 600 }));
+  check('fractional scale rounds deterministically', JSON.stringify(boundedImageDimensions(2500, 1000)) === JSON.stringify({ width: 2000, height: 800 }));
+  check('16 Mi-pixel boundary accepted', imageDimensionsAreSafe(4096, 4096));
+  check('dimensions above 16 Mi pixels rejected', imageDimensionsAreSafe(4097, 4096) === false);
+  check('zero/unsafe dimensions rejected', imageDimensionsAreSafe(0, 1) === false && imageDimensionsAreSafe(Number.MAX_SAFE_INTEGER, 2) === false);
+  check('portrait longest edge scales to 1500x2000', JSON.stringify(boundedImageDimensions(3000, 4000)) === JSON.stringify({ width: 1500, height: 2000 }));
+}
+
 // ---- video kind classification: six containers, extension REQUIRED ----
 check('classifyKind mkv by type', classifyKind(f('clip.mkv', 'video/x-matroska', 10)) === 'video');
 check('classifyKind mp4 empty type', classifyKind(f('clip.mp4', '', 10)) === 'video');
@@ -443,7 +566,7 @@ check('isVideoFile m4v rejected (backend 415 list)', isVideoFile(f('clip.m4v', '
 check('classifyKind video/mpeg w/o ext unsupported', classifyKind(f('clip', 'video/mpeg', 10)) === null);
 check('classifyKind flv unsupported', classifyKind(f('clip.flv', 'video/x-flv', 10)) === null);
 check('classifyKind bmp still unsupported', classifyKind(f('a.bmp', 'image/bmp', 10)) === null);
-check('classifyKind pdf still unsupported', classifyKind(f('a.pdf', 'application/pdf', 10)) === null);
+check('classifyKind pdf accepted', classifyKind(f('a.pdf', 'application/pdf', 10)) === 'pdf');
 check('classifyKind zip still unsupported', classifyKind(f('a.zip', 'application/zip', 10)) === null);
 check('classifyKind image still wins over video-shaped names', classifyKind(f('a.png', 'image/png', 10)) === 'image');
 check('videoContainerOf mkv', videoContainerOf('clip.mkv') === 'mkv');
@@ -544,6 +667,76 @@ check('wireFootprint video == 0 (raw video never rides the prompt wire)', wireFo
   check('reconcileIntakeBudget counts video frame wire exactly', budget.count === 1 && budget.wire === 4, `wire=${budget.wire}`);
 }
 
+// ---- PDF upload limits, classify, prompt mapping ----
+check('MAX_PDF_BYTES == 32 MiB (backend 413 cap)', MAX_PDF_BYTES === 32 * 1024 * 1024);
+check('MAX_PDF_TEXT_BYTES == 2 MiB (extracted text cap)', MAX_PDF_TEXT_BYTES === 2 * 1024 * 1024);
+check('MAX_PDF_RESPONSE_BYTES covers worst-case JSON-escaped 2 MiB text', MAX_PDF_RESPONSE_BYTES === MAX_PDF_TEXT_BYTES * 6 + 256 * 1024);
+{
+  const newlineHeavy = `${'x'.repeat(19)}\n`.repeat(104_000);
+  const encoded = JSON.stringify({ text: newlineHeavy, instruction: 'x'.repeat(800), name: 'report.pdf', attachmentId: 'att', mimeType: 'application/pdf', sizeBytes: 1, textBytes: newlineHeavy.length });
+  check('newline-heavy near-cap JSON fits the response cap', utf8ByteLength(encoded) < MAX_PDF_RESPONSE_BYTES && utf8ByteLength(encoded) > MAX_PDF_TEXT_BYTES + 64 * 1024);
+}
+check('PDF_UPLOAD_PATH == /upload/pdf (backend route)', PDF_UPLOAD_PATH === '/upload/pdf');
+check('wireFootprint pdf == 0 at intake', wireFootprint('pdf', MAX_PDF_BYTES) === 0);
+check('attachmentAccept advertises pdf', attachmentAccept().includes('application/pdf') && attachmentAccept().includes('.pdf'));
+check('pdfUploadUrl http', pdfUploadUrl('http:', '127.0.0.1:8765') === 'http://127.0.0.1:8765/upload/pdf');
+check('pdfUploadHeaders percent-encodes name', pdfUploadHeaders('Certik report.pdf', '')['X-Pdf-Name'] === encodeURIComponent('Certik report.pdf'));
+{
+  const plan = classifyAttachments([f('report.pdf', 'application/pdf', 2048), img('a.png', 100), code('b.rs', 100)]);
+  check('pdf accepted alongside image+code', plan.accepted.map((x) => x.kind).join(',') === 'pdf,image,code');
+}
+{
+  const plan = classifyAttachments([f('big.pdf', 'application/pdf', MAX_PDF_BYTES + 1), code('ok.rs', 100)]);
+  check('pdf over 32 MiB skipped as pdf-oversize', plan.skipped.length === 1 && plan.skipped[0]!.reason === 'pdf-oversize');
+  check('pdf-oversize does not block valid sibling', plan.accepted.length === 1 && plan.accepted[0]!.file.name === 'ok.rs');
+}
+{
+  const placeholder = placeholderFor({ file: { name: 'report.pdf', type: 'application/pdf', size: 12 } as File, kind: 'pdf' }, 'p-pdf');
+  check('pdf placeholder is uploading', placeholder.kind === 'pdf' && placeholder.videoState === 'uploading' && placeholder.id === 'p-pdf');
+  const ready: ComposerAttachment = {
+    id: 'p1',
+    name: 'report.pdf',
+    size: 12,
+    mimeType: 'application/pdf',
+    kind: 'pdf',
+    videoState: 'ready',
+    text: 'Certik findings body',
+    instruction: '[PDF attachment: report.pdf — extracted text layer (21 bytes); analyze the following as the document contents.]',
+  };
+  const marker = pdfMarkerText(ready);
+  check('pdfMarkerText includes instruction and body', marker.includes('[PDF attachment: report.pdf') && marker.includes('Certik findings body'));
+  check('buildPdfMessage uses ready text', buildPdfMessage([ready]).includes('Certik findings body'));
+  const uploading: ComposerAttachment = { ...ready, id: 'p2', videoState: 'uploading', text: undefined };
+  check('buildPdfMessage excludes uploading pdf', buildPdfMessage([ready, uploading]) === buildPdfMessage([ready]));
+  check('aggregateWire pending pdf is 0', aggregateWire([uploading]) === 0);
+  check('aggregateWire ready pdf counts extracted marker', aggregateWire([ready]) === utf8ByteLength(pdfMarkerText(ready)));
+  const parsedOk = parsePdfUploadResponse(200, {
+    attachmentId: 'att-1',
+    name: 'report.pdf',
+    mimeType: 'application/pdf',
+    sizeBytes: 12,
+    textBytes: 21,
+    text: 'Certik findings body',
+    instruction: '[PDF attachment: report.pdf]',
+  });
+  check('parsePdfUploadResponse success', parsedOk.ok === true && parsedOk.ok && parsedOk.data.text === 'Certik findings body');
+  const parsedEmpty = parsePdfUploadResponse(400, { error: 'PDF contains no extractable text (scanned or encrypted)' });
+  check('parsePdfUploadResponse 400 surfaces backend error', !parsedEmpty.ok && parsedEmpty.message.includes('no extractable text'));
+  const built = buildPdfAttachment({ name: 'x.pdf', size: 1, type: 'application/pdf' } as File, {
+    attachmentId: 'att-1',
+    name: 'report.pdf',
+    mimeType: 'application/pdf',
+    sizeBytes: 12,
+    textBytes: 21,
+    text: 'Certik findings body',
+    instruction: '[PDF attachment: report.pdf]',
+  });
+  check('buildPdfAttachment ready kind pdf', built.kind === 'pdf' && built.videoState === 'ready' && built.text === 'Certik findings body');
+  const settled = settlePdfOutcome([placeholder], 'p-pdf', { ok: true, attachment: built });
+  check('settlePdfOutcome patches ready text', settled.next[0]!.videoState === 'ready' && settled.next[0]!.text === 'Certik findings body' && settled.surface === false);
+}
+
+
 // ---- codeBadgeLabel ----
 check('codeBadgeLabel uses extension', codeBadgeLabel('lib.rs') === 'RS');
 check('codeBadgeLabel uses tsx extension', codeBadgeLabel('App.tsx') === 'TSX');
@@ -553,21 +746,28 @@ check('codeBadgeLabel empty -> TXT', codeBadgeLabel('') === 'TXT');
 // ---- formatSkipSummary: null for empty, grouped summary, late reasons ----
 {
   check('formatSkipSummary empty -> null', formatSkipSummary([]) === null);
-  const one = formatSkipSummary([{ name: 'doc.pdf', size: 10, type: 'application/pdf', reason: 'unsupported' }] as AttachSkip[]);
-  check('formatSkipSummary single reason', one === 'Skipped 1 file(s): 1 unsupported (images, videos, or text/code files only) (doc.pdf).', one ?? '');
+  const one = formatSkipSummary([{ name: 'bin.zip', size: 10, type: 'application/zip', reason: 'unsupported' }] as AttachSkip[]);
+  check('formatSkipSummary single reason', one === 'Skipped 1 file(s): 1 unsupported (images, videos, PDFs, or text/code files only) (bin.zip).', one ?? '');
   const mixed = formatSkipSummary([
-    { name: 'a.pdf', size: 10, type: 'application/pdf', reason: 'unsupported' },
-    { name: 'big.png', size: MAX_FILE_BYTES + 1, type: 'image/png', reason: 'oversize' },
-    { name: 'b.pdf', size: 10, type: 'application/pdf', reason: 'unsupported' },
+    { name: 'a.zip', size: 10, type: 'application/zip', reason: 'unsupported' },
+    { name: 'big.rs', size: MAX_FILE_BYTES + 1, type: 'text/plain', reason: 'oversize' },
+    { name: 'b.zip', size: 10, type: 'application/zip', reason: 'unsupported' },
   ] as AttachSkip[]);
-  check('formatSkipSummary groups same reason with sample', mixed != null && mixed.includes('2 unsupported (images, videos, or text/code files only)') && mixed.includes('a.pdf, b.pdf') && mixed.includes('1 over'), mixed ?? '');
+  check('formatSkipSummary groups same reason with sample', mixed != null && mixed.includes('2 unsupported (images, videos, PDFs, or text/code files only)') && mixed.includes('a.zip, b.zip') && mixed.includes('1 over'), mixed ?? '');
   const vidOversize = formatSkipSummary([{ name: 'big.mkv', size: MAX_VIDEO_BYTES + 1, type: 'video/x-matroska', reason: 'video-oversize' }] as AttachSkip[]);
   check('formatSkipSummary reports video-oversize with the video cap', vidOversize != null && vidOversize.includes('video upload cap') && vidOversize.includes('64 MiB'), vidOversize ?? '');
-  const many = formatSkipSummary(Array.from({ length: 4 }, (_, i) => ({ name: `z${i}.pdf`, size: 1, type: 'application/pdf', reason: 'unsupported' as const })) as AttachSkip[]);
+  const pdfOversize = formatSkipSummary([{ name: 'big.pdf', size: MAX_PDF_BYTES + 1, type: 'application/pdf', reason: 'pdf-oversize' }] as AttachSkip[]);
+  check('formatSkipSummary reports pdf-oversize with the PDF cap', pdfOversize != null && pdfOversize.includes('PDF upload cap') && pdfOversize.includes('32 MiB'), pdfOversize ?? '');
+  const many = formatSkipSummary(Array.from({ length: 4 }, (_, i) => ({ name: `z${i}.zip`, size: 1, type: 'application/zip', reason: 'unsupported' as const })) as AttachSkip[]);
   check('formatSkipSummary truncates long name lists', many != null && many.includes('+2 more'), many ?? '');
   const utf8 = formatSkipSummary([{ name: 'bin.dat', size: 10, type: '', reason: 'invalid-utf8' }] as AttachSkip[]);
   check('formatSkipSummary reports invalid-utf8 reason', utf8 != null && utf8.includes('not valid UTF-8 (binary)'), utf8 ?? '');
+  const imageOversize = formatSkipSummary([{ name: 'camera.jpg', size: MAX_IMAGE_INPUT_BYTES + 1, type: 'image/jpeg', reason: 'image-oversize' }] as AttachSkip[]);
+  check('formatSkipSummary reports 20 MiB raw image ceiling', imageOversize != null && imageOversize.includes('20 MiB') && imageOversize.includes('camera.jpg'), imageOversize ?? '');
+  const imageProcessing = formatSkipSummary([{ name: 'broken.jpg', size: MAX_FILE_BYTES + 1, type: 'image/jpeg', reason: 'image-processing' }] as AttachSkip[]);
+  check('formatSkipSummary reports visible image-processing failure', imageProcessing != null && imageProcessing.includes('decoded or resized safely') && imageProcessing.includes('broken.jpg'), imageProcessing ?? '');
 }
+
 
 // ---- ATT-CODE-OVERHEAD-UNDERCOUNT: estimate never undercounts built segment ----
 {
@@ -726,7 +926,7 @@ check('codeBadgeLabel empty -> TXT', codeBadgeLabel('') === 'TXT');
   const success = await uploadVideoFile(file, {
     hostAuthority: 'h:8080',
     token: 'tok',
-    fetchImpl: async () => ({ status: 200, ok: true, json: async () => okBody }),
+    fetchImpl: async () => ({ status: 200, ok: true, text: async () => JSON.stringify(okBody) }),
   });
   check('uploadVideoFile success -> ready video attachment', success.ok && success.attachment.kind === 'video' && success.attachment.videoState === 'ready');
   check('uploadVideoFile success carries frames', success.ok && success.attachment.frames!.length === 2);
@@ -735,9 +935,25 @@ check('codeBadgeLabel empty -> TXT', codeBadgeLabel('') === 'TXT');
   const ffmpeg = await uploadVideoFile(file, {
     hostAuthority: 'h:8080',
     token: '',
-    fetchImpl: async () => ({ status: 503, ok: false, json: async () => ({ error: 'ffmpeg is not installed' }) }),
+    fetchImpl: async () => ({ status: 503, ok: false, text: async () => JSON.stringify({ error: 'ffmpeg is not installed' }) }),
   });
   check('uploadVideoFile 503 -> actionable ffmpeg message', !ffmpeg.ok && ffmpeg.status === 503 && ffmpeg.message.includes('ffmpeg'), ffmpeg.message);
+  let oversizedBodyRead = false;
+  const oversizedResponse = await uploadVideoFile(file, {
+    hostAuthority: 'h:8080',
+    token: '',
+    fetchImpl: async () => ({
+      status: 200,
+      ok: true,
+      headers: { get: () => String(MAX_VIDEO_RESPONSE_BYTES + 1) },
+      text: async () => {
+        oversizedBodyRead = true;
+        return '';
+      },
+    }),
+  });
+  check('uploadVideoFile rejects oversized Content-Length before reading', !oversizedResponse.ok && oversizedResponse.message.includes('unexpected response'));
+  check('oversized Content-Length body was not allocated', oversizedBodyRead === false);
   const net = await uploadVideoFile(file, {
     hostAuthority: 'h:8080',
     token: '',
@@ -972,6 +1188,9 @@ check('codeBadgeLabel empty -> TXT', codeBadgeLabel('') === 'TXT');
   // A normal prompt stays well under the cap.
   const small = commandFrameBytes({ type: 'prompt', message: 'hello', images: [{ type: 'image', data: 'AA', mimeType: 'image/png' }] }, MAX_COMMAND_ID, 's');
   check('normal prompt is far below the 4 MiB cap', small < MAX_PROMPT_FRAME_BYTES / 2, `bytes=${small}`);
+  const jsonSteer = `{"note":"${'n'.repeat(8 * 1024)}"}`;
+  const jsonSteerBytes = commandFrameBytes({ type: 'steer', message: jsonSteer }, MAX_COMMAND_ID, 's');
+  check('multi-KB JSON steer is under the 4 MiB frame cap', jsonSteerBytes < MAX_PROMPT_FRAME_BYTES && jsonSteerBytes > 8 * 1024, `bytes=${jsonSteerBytes}`);
 }
 
 // ---- ATT-WS-SENTINEL: raw video bytes/base64 never enter the command ----
@@ -1070,6 +1289,15 @@ check('codeBadgeLabel empty -> TXT', codeBadgeLabel('') === 'TXT');
   check('reserve then release returns exactly to the start budget', afterRelease.count === start.count && afterRelease.wire === start.wire, `count=${afterRelease.count} wire=${afterRelease.wire}`);
 }
 
+// ---- processed image late budget check ----
+{
+  const queued = [{ id: 'q', name: 'queued.jpg', size: 10, mimeType: 'image/jpeg', kind: 'image', dataBase64: 'x'.repeat(80) }] as ComposerAttachment[];
+  const processed = [{ id: 'p', name: 'processed.jpg', size: 10, mimeType: 'image/jpeg', kind: 'image', dataBase64: 'y'.repeat(30) }] as ComposerAttachment[];
+  const admitted = admitBuiltAttachments(queued, processed, 100);
+  check('processed image exceeding its intake estimate is skipped at settle', admitted.next.length === 1 && admitted.skipped[0]?.reason === 'over-budget');
+  check('processed-image late skip preserves the existing queue', admitted.next[0]?.id === 'q');
+}
+
 // ---- ATT-INTAKE-OVERLAP: settle preserves OTHER in-flight reservations ----
 {
   const tracker = new IntakeBudgetTracker();
@@ -1077,6 +1305,7 @@ check('codeBadgeLabel empty -> TXT', codeBadgeLabel('') === 'TXT');
   // Slow B reserves first, then fast A reserves against B's outstanding
   // footprint. A settles while B is still reading/uploading.
   tracker.reserve('slow-b', { count: 1, wire: 10 });
+  check('outstanding intake blocks submit gate', tracker.hasOutstanding());
   const beforeA = tracker.admission();
   check('fast A admission sees slow B reservation', beforeA.count === 1 && beforeA.wire === 10, `count=${beforeA.count} wire=${beforeA.wire}`);
   tracker.reserve('fast-a', { count: 1, wire: 6 });
@@ -1108,6 +1337,7 @@ check('codeBadgeLabel empty -> TXT', codeBadgeLabel('') === 'TXT');
   check('paste reservation is visible before its updater flushes', duringPaste.count === 3 && duringPaste.wire === 20, `count=${duringPaste.count} wire=${duringPaste.wire}`);
   tracker.setQueued({ count: 3, wire: 20 });
   tracker.release('paste');
+  check('released intake clears submit gate', tracker.hasOutstanding() === false);
   const afterPaste = tracker.admission();
   check('paste updater releases only its key and leaves queued exact', afterPaste.count === 3 && afterPaste.wire === 20, `count=${afterPaste.count} wire=${afterPaste.wire}`);
 

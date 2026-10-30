@@ -9,12 +9,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::args::LlamaCommand;
 
-pub async fn run(command: LlamaCommand) -> Result<()> {
-    let manager = LlamaManager::default();
+pub async fn run(command: LlamaCommand, application: &pi_coding::Application) -> Result<()> {
+    let manager = LlamaManager::global()?;
     match command {
         LlamaCommand::Configure { base_url, api_key } => {
             let models = manager
-                .configure(LlamaRouterSettings::validated(&base_url, api_key)?)
+                .configure(
+                    LlamaRouterSettings::validated(&base_url, api_key)?,
+                    llama_router_executor(application),
+                )
                 .await?;
             let stored = manager
                 .settings()?
@@ -27,7 +30,9 @@ pub async fn run(command: LlamaCommand) -> Result<()> {
                 anyhow!("llama.cpp router is not configured; run `rpi llama configure URL` or set LLAMA_BASE_URL")
             })?;
             println!("router {}", settings.base_url);
-            let models = manager.router_models(reload).await?;
+            let models = manager
+                .router_models(reload, llama_router_executor(application))
+                .await?;
             if models.is_empty() {
                 println!("No router models reported.");
             }
@@ -36,7 +41,9 @@ pub async fn run(command: LlamaCommand) -> Result<()> {
             }
         }
         LlamaCommand::Refresh => {
-            let refreshed = manager.refresh_catalog().await?;
+            let refreshed = manager
+                .refresh_catalog(llama_router_executor(application))
+                .await?;
             match refreshed.source {
                 CatalogSource::Live => println!(
                     "Refreshed llama.cpp catalog from router: {} live model(s)",
@@ -55,24 +62,28 @@ pub async fn run(command: LlamaCommand) -> Result<()> {
             }
         }
         LlamaCommand::Load { model } => {
-            let models = manager.load_model(&model).await?;
+            let models = manager
+                .load_model(&model, llama_router_executor(application))
+                .await?;
             println!("Requested load for {model}");
             println!("Router now exposes {} live model(s)", models.len());
         }
         LlamaCommand::Unload { model } => {
-            let models = manager.unload_model(&model).await?;
+            let models = manager
+                .unload_model(&model, llama_router_executor(application))
+                .await?;
             println!("Requested unload for {model}");
             println!("Router now exposes {} live model(s)", models.len());
         }
         LlamaCommand::Search { query } => {
-            let client = hugging_face_client().await?;
+            let client = hugging_face_client(application).await?;
             let models = client.search(&query).await?;
             for model in models {
                 println!("{}\t{} downloads", model.id, model.downloads);
             }
         }
         LlamaCommand::Details { repository } => {
-            let client = hugging_face_client().await?;
+            let client = hugging_face_client(application).await?;
             let details = client.details(&repository).await?;
             if let Some(gated) = &details.gated {
                 println!("{}\tgated ({gated})", details.id);
@@ -107,7 +118,7 @@ pub async fn run(command: LlamaCommand) -> Result<()> {
             repository,
             quantization,
         } => {
-            let client = hugging_face_client().await?;
+            let client = hugging_face_client(application).await?;
             let details = client.details(&repository).await?;
             let cancel = CancellationToken::new();
             let operation_cancel = cancel.clone();
@@ -115,6 +126,7 @@ pub async fn run(command: LlamaCommand) -> Result<()> {
                 &client,
                 &details,
                 quantization.as_deref(),
+                application.http_executor(pi_coding::HostHttpClass::LlamaGguf),
                 &operation_cancel,
                 print_progress,
             );
@@ -153,16 +165,18 @@ pub async fn run(command: LlamaCommand) -> Result<()> {
     Ok(())
 }
 
-pub async fn run_slash(line: &str) -> Result<String> {
+pub async fn run_slash(line: &str, application: &pi_coding::Application) -> Result<String> {
     let mut parts = line.split_whitespace();
     let action = parts.next().unwrap_or("status");
-    let manager = LlamaManager::default();
+    let manager = LlamaManager::global()?;
     match action {
         "status" => {
             let settings = manager.effective_settings()?.ok_or_else(|| {
                 anyhow!("llama.cpp router is not configured; use `rpi llama configure URL` or set LLAMA_BASE_URL")
             })?;
-            let models = manager.router_models(false).await?;
+            let models = manager
+                .router_models(false, llama_router_executor(application))
+                .await?;
             let lines = models
                 .into_iter()
                 .map(|model| format!("{} {}", model.status.value.as_str(), model.id))
@@ -174,7 +188,9 @@ pub async fn run_slash(line: &str) -> Result<String> {
             })
         }
         "refresh" => {
-            let result = manager.refresh_catalog().await?;
+            let result = manager
+                .refresh_catalog(llama_router_executor(application))
+                .await?;
             Ok(format!(
                 "{} {} llama.cpp model(s)",
                 if result.source == CatalogSource::Live {
@@ -187,12 +203,16 @@ pub async fn run_slash(line: &str) -> Result<String> {
         }
         "load" => {
             let model = required_rest(line, action, "/llama load <model>")?;
-            manager.load_model(model).await?;
+            manager
+                .load_model(model, llama_router_executor(application))
+                .await?;
             Ok(format!("Requested load for {model}"))
         }
         "unload" => {
             let model = required_rest(line, action, "/llama unload <model>")?;
-            manager.unload_model(model).await?;
+            manager
+                .unload_model(model, llama_router_executor(application))
+                .await?;
             Ok(format!("Requested unload for {model}"))
         }
         "configure" => {
@@ -201,7 +221,10 @@ pub async fn run_slash(line: &str) -> Result<String> {
                 .ok_or_else(|| anyhow!("usage: /llama configure <url> [api-key]"))?;
             let key = parts.next().map(ToOwned::to_owned);
             let models = manager
-                .configure(LlamaRouterSettings::validated(url, key)?)
+                .configure(
+                    LlamaRouterSettings::validated(url, key)?,
+                    llama_router_executor(application),
+                )
                 .await?;
             Ok(format!(
                 "Configured llama.cpp · {} live model(s)",
@@ -214,11 +237,16 @@ pub async fn run_slash(line: &str) -> Result<String> {
     }
 }
 
-async fn hugging_face_client() -> Result<HuggingFaceClient> {
+async fn hugging_face_client(application: &pi_coding::Application) -> Result<HuggingFaceClient> {
     HuggingFaceClient::new(
         find_hugging_face_token().await,
         std::env::var("HF_ENDPOINT").ok().as_deref(),
+        application.http_executor(pi_coding::HostHttpClass::LlamaHuggingFace),
     )
+}
+
+fn llama_router_executor(application: &pi_coding::Application) -> pi_ai::SharedHttpExecutor {
+    application.http_executor(pi_coding::HostHttpClass::LlamaRouter)
 }
 
 fn required_rest<'a>(line: &'a str, action: &str, usage: &str) -> Result<&'a str> {

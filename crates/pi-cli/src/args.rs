@@ -67,7 +67,6 @@ pub struct Cli {
     #[arg(short = 'r', long, value_name = "PATH_OR_ID", conflicts_with_all = ["continue_latest", "session", "session_id", "fork", "no_session"])]
     pub resume: Option<String>,
 
-
     /// Open a session by file path, exact id, or unambiguous id prefix.
     #[arg(long, value_name = "PATH_OR_ID", conflicts_with_all = ["continue_latest", "resume", "session_id", "fork", "no_session"])]
     pub session: Option<String>,
@@ -188,11 +187,16 @@ pub struct Cli {
     #[arg(long)]
     pub verbose: bool,
 
-    /// Trust project-local `.pi` settings/resources for this run only.
-    #[arg(short = 'a', long = "approve", conflicts_with = "no_approve", global = true)]
+    /// Trust project-local `.rpi` settings/resources for this run only.
+    #[arg(
+        short = 'a',
+        long = "approve",
+        conflicts_with = "no_approve",
+        global = true
+    )]
     pub approve: bool,
 
-    /// Refuse project-local `.pi` settings/resources for this run only.
+    /// Refuse project-local `.rpi` settings/resources for this run only.
     #[arg(long = "no-approve", conflicts_with = "approve", global = true)]
     pub no_approve: bool,
 
@@ -236,10 +240,23 @@ pub struct Cli {
     #[arg(long, value_name = "URL", requires = "listen")]
     pub listen_advertised_origin: Option<String>,
 
+    /// Display codename for this runner's Web chat presence. Codenames are
+    /// display-only and non-unique — addressing always keys on the runner
+    /// identity — so any grammar-valid value is accepted. Persisted to
+    /// `<agent-dir>/runner.json` at listen start; supplying the flag rewrites
+    /// the stored codename. Requires --listen.
+    #[arg(
+        long,
+        value_name = "NAME",
+        requires = "listen",
+        value_parser = validate_listen_codename
+    )]
+    pub listen_codename: Option<String>,
+
     /// Explicitly disable TLS on --listen and serve plaintext HTTP/WebSocket
     /// instead. Without this flag the listener terminates HTTPS: with a real
     /// certificate pair (--listen-cert/--listen-key) or with a self-signed
-    /// certificate auto-generated and cached under ~/.pi/agent/. Plaintext
+    /// certificate auto-generated and cached under ~/.rpi/. Plaintext
     /// exposes control traffic to network observers; use it only on a
     /// trusted network, ideally with --listen-token-file.
     #[arg(long, requires = "listen", conflicts_with_all = ["listen_cert", "listen_key"])]
@@ -247,7 +264,7 @@ pub struct Cli {
 
     /// TLS certificate file (PEM) for HTTPS. When paired with --listen-key,
     /// the listener uses TLS. When both are absent, a self-signed cert is
-    /// auto-generated and cached under ~/.pi/agent/.
+    /// auto-generated and cached under ~/.rpi/.
     #[arg(long, value_name = "PATH", requires_all = ["listen", "listen_key"])]
     pub listen_cert: Option<PathBuf>,
 
@@ -289,6 +306,22 @@ pub fn validate_profile_name(name: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Validate a `--listen-codename` value against the D2 codename grammar
+/// (`crate::runner_identity::codename_regex`): 1–48 lowercase letters, digits,
+/// and `-`, with an alphanumeric start and end. Consecutive hyphens are
+/// allowed. Invalid values are a hard CLI error — the authority path never
+/// sanitizes. Returns the codename so clap stores it as the parsed value.
+pub fn validate_listen_codename(name: &str) -> Result<String, String> {
+    if crate::runner_identity::is_valid_codename(name) {
+        Ok(name.to_owned())
+    } else {
+        Err(format!(
+            "invalid codename {name:?}: must match {} (1-48 lowercase letters, digits, and '-' with an alphanumeric start and end)",
+            crate::runner_identity::codename_regex()
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -350,6 +383,9 @@ pub enum Command {
         /// this credential over the unscoped default.
         #[arg(long, value_name = "LABEL")]
         scope: Option<String>,
+        /// Exchange authentication prompts and responses as newline-delimited JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Remove the stored credential for one provider.
     Logout {
@@ -659,9 +695,10 @@ pub enum PluginCommand {
         updates: bool,
     },
     /// Install a plugin from a local directory, a local or remote
-    /// .tgz/.tar.gz/.tar archive, an owner/repo GitHub reference, an
-    /// npm:<name>[@<version>] reference, or a git URL (git+https://host/owner/
-    /// repo, git+ssh://git@host/owner/repo.git, https://host/owner/repo.git,
+    /// .tgz/.tar.gz/.tar archive, an owner/repo GitHub reference (optional
+    /// `@ref` pin), an npm:<name>[@<version>] reference, or a git URL
+    /// (http://host/owner/repo.git, https://host/owner/repo.git,
+    /// git+https://host/owner/repo, git+ssh://git@host/owner/repo.git,
     /// ssh://git@host/owner/repo.git, git@host:owner/repo.git).
     Install {
         #[arg(value_name = "SOURCE")]
@@ -776,8 +813,7 @@ impl Cli {
         if let Some(profile) = self.profile.as_deref() {
             let name = profile.trim();
             if !name.is_empty() && name != "default" {
-                validate_profile_name(name)
-                    .map_err(|message| format!("--profile: {message}"))?;
+                validate_profile_name(name).map_err(|message| format!("--profile: {message}"))?;
             }
         }
         if self
@@ -799,10 +835,7 @@ impl Cli {
             let positional_self = package
                 .as_deref()
                 .is_some_and(|source| matches!(source, "self" | "rpi"));
-            if package.is_some()
-                && !positional_self
-                && (*self_update || *extensions || *force)
-            {
+            if package.is_some() && !positional_self && (*self_update || *extensions || *force) {
                 return Err(
                     "a package source cannot be combined with --self, --extensions, or --force"
                         .to_owned(),
@@ -835,13 +868,17 @@ impl Cli {
                     .to_owned(),
             );
         }
-        if self.listen.is_some()
-            && matches!(self.mode, Some(Mode::Json) | Some(Mode::Rpc))
-        {
-            return Err("--listen selects the Web-only service and cannot be combined with JSON/RPC modes".to_owned());
+        if self.listen.is_some() && matches!(self.mode, Some(Mode::Json) | Some(Mode::Rpc)) {
+            return Err(
+                "--listen selects the Web-only service and cannot be combined with JSON/RPC modes"
+                    .to_owned(),
+            );
         }
         if self.listen.is_some() && self.is_print_mode() {
-            return Err("--listen selects the Web-only service and cannot be combined with print mode".to_owned());
+            return Err(
+                "--listen selects the Web-only service and cannot be combined with print mode"
+                    .to_owned(),
+            );
         }
         if self.listen.is_some() && !self.prompt.is_empty() {
             return Err("--listen is Web-only and cannot be combined with positional prompts; submit prompts through /web, /ws, or /rpc".to_owned());
@@ -934,6 +971,62 @@ mod tests {
     }
 
     #[test]
+    fn offline_defaults_to_false() {
+        let cli = Cli::try_parse_from(["rpi"]).expect("parse defaults");
+        assert!(!cli.offline);
+    }
+
+    #[test]
+    fn listen_codename_requires_listen_and_enforces_grammar() {
+        let cli = Cli::try_parse_from(["rpi", "--listen", "127.0.0.1:0", "--listen-codename", "alpha-1"])
+            .expect("parse valid codename");
+        assert_eq!(cli.listen_codename.as_deref(), Some("alpha-1"));
+
+        let double_hyphen =
+            Cli::try_parse_from(["rpi", "--listen", "127.0.0.1:0", "--listen-codename", "a--b"])
+                .expect("consecutive hyphens are grammar-valid");
+        assert_eq!(double_hyphen.listen_codename.as_deref(), Some("a--b"));
+
+        let max_invalid = "a".repeat(49);
+        for invalid in ["", "A", "-abc", "abc-", "a-", "a b", "Bad_Name", "café", max_invalid.as_str()] {
+            assert!(
+                Cli::try_parse_from([
+                    "rpi",
+                    "--listen",
+                    "127.0.0.1:0",
+                    "--listen-codename",
+                    invalid
+                ])
+                .is_err(),
+                "expected hard CLI error for {invalid:?}"
+            );
+        }
+        let clap_err = Cli::try_parse_from([
+            "rpi",
+            "--listen",
+            "127.0.0.1:0",
+            "--listen-codename",
+            "abc-",
+        ])
+        .expect_err("trailing hyphen is a hard CLI error");
+        let clap_msg = clap_err.to_string();
+        assert!(
+            clap_msg.contains(crate::runner_identity::codename_regex()),
+            "CLI error must print the grammar that rejects trailing '-': {clap_msg}"
+        );
+        assert!(clap_msg.contains("abc-"), "{clap_msg}");
+
+        let trailing = validate_listen_codename("abc-").expect_err("trailing hyphen");
+        assert!(
+            trailing.contains(crate::runner_identity::codename_regex()),
+            "CLI error must print the grammar that rejects trailing '-': {trailing}"
+        );
+        assert!(trailing.contains("abc-"), "{trailing}");
+
+        assert!(Cli::try_parse_from(["rpi", "--listen-codename", "alpha-1"]).is_err());
+    }
+
+    #[test]
     fn explicit_print_flag_forces_print_mode() {
         let cli = Cli::try_parse_from(["rpi", "-p"]).expect("parse -p");
         assert!(cli.is_print_mode());
@@ -944,17 +1037,55 @@ mod tests {
     #[test]
     fn parses_core_parity_flags_and_repeats() {
         let cli = Cli::try_parse_from([
-            "rpi", "--provider", "openai", "--model", "gpt-5", "--models",
-            "openai/*,*sonnet*:high", "--system-prompt", "system.txt",
-            "--append-system-prompt", "one", "--append-system-prompt", "two",
-            "--name", "named", "--session-id", "session_1", "--session-dir",
-            "sessions", "--thinking", "high", "--mode", "text", "--offline",
-            "--verbose", "-t", "read,custom", "-xt", "bash,task", "-e", "one-ext",
-            "--extension", "two-ext", "--skill", "skill-a", "--skill", "skill-b",
-            "--prompt-template", "prompt-a", "--prompt-template", "prompt-b",
-            "--theme", "theme-a", "--theme", "theme-b", "--add-dir", "workspace-a",
-
-            "--add-dir", "workspace-b",
+            "rpi",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-5",
+            "--models",
+            "openai/*,*sonnet*:high",
+            "--system-prompt",
+            "system.txt",
+            "--append-system-prompt",
+            "one",
+            "--append-system-prompt",
+            "two",
+            "--name",
+            "named",
+            "--session-id",
+            "session_1",
+            "--session-dir",
+            "sessions",
+            "--thinking",
+            "high",
+            "--mode",
+            "text",
+            "--offline",
+            "--verbose",
+            "-t",
+            "read,custom",
+            "-xt",
+            "bash,task",
+            "-e",
+            "one-ext",
+            "--extension",
+            "two-ext",
+            "--skill",
+            "skill-a",
+            "--skill",
+            "skill-b",
+            "--prompt-template",
+            "prompt-a",
+            "--prompt-template",
+            "prompt-b",
+            "--theme",
+            "theme-a",
+            "--theme",
+            "theme-b",
+            "--add-dir",
+            "workspace-a",
+            "--add-dir",
+            "workspace-b",
         ])
         .expect("parse parity flags");
         assert_eq!(cli.provider.as_deref(), Some("openai"));
@@ -963,7 +1094,10 @@ mod tests {
         assert_eq!(cli.append_system_prompt, ["one", "two"]);
         assert_eq!(cli.name.as_deref(), Some("named"));
         assert_eq!(cli.session_id.as_deref(), Some("session_1"));
-        assert_eq!(cli.session_dir.as_deref(), Some(PathBuf::from("sessions").as_path()));
+        assert_eq!(
+            cli.session_dir.as_deref(),
+            Some(PathBuf::from("sessions").as_path())
+        );
         assert_eq!(cli.think.as_deref(), Some("high"));
         assert_eq!(cli.mode, Some(Mode::Text));
         assert_eq!(cli.tools.as_ref().map(Vec::len), Some(2));
@@ -972,7 +1106,10 @@ mod tests {
         assert_eq!(cli.skills.len(), 2);
         assert_eq!(cli.prompt_templates.len(), 2);
         assert_eq!(cli.themes.len(), 2);
-        assert_eq!(cli.add_dirs, [PathBuf::from("workspace-a"), PathBuf::from("workspace-b")]);
+        assert_eq!(
+            cli.add_dirs,
+            [PathBuf::from("workspace-a"), PathBuf::from("workspace-b")]
+        );
         assert!(cli.offline && cli.verbose);
     }
     #[test]
@@ -992,30 +1129,37 @@ mod tests {
     #[test]
     fn parses_disable_aliases_session_paths_and_optional_model_search() {
         let cli = Cli::try_parse_from([
-            "rpi", "-ne", "-ns", "-np", "--no-themes", "-nc", "-nbt",
-            "--session", "sessions/a.jsonl",
-        ]).expect("disable aliases");
+            "rpi",
+            "-ne",
+            "-ns",
+            "-np",
+            "--no-themes",
+            "-nc",
+            "-nbt",
+            "--session",
+            "sessions/a.jsonl",
+        ])
+        .expect("disable aliases");
         assert!(cli.no_extensions && cli.no_skills && cli.no_prompt_templates);
         assert!(cli.no_themes && cli.no_context_files && cli.no_builtin_tools);
         assert_eq!(cli.session.as_deref(), Some("sessions/a.jsonl"));
         let all = Cli::try_parse_from(["rpi", "--list-models"]).expect("list all");
         assert_eq!(all.list_models.as_deref(), Some(""));
-        let searched = Cli::try_parse_from(["rpi", "--list-models", "sonnet"])
-            .expect("list search");
+        let searched =
+            Cli::try_parse_from(["rpi", "--list-models", "sonnet"]).expect("list search");
         assert_eq!(searched.list_models.as_deref(), Some("sonnet"));
     }
 
     #[test]
     fn parses_unified_resume_and_rejects_removed_codex_flag() {
-        let unified = Cli::try_parse_from(["rpi", "--resume", "grok-prefix"])
-            .expect("unified resume");
+        let unified =
+            Cli::try_parse_from(["rpi", "--resume", "grok-prefix"]).expect("unified resume");
         assert_eq!(unified.resume.as_deref(), Some("grok-prefix"));
         assert!(Cli::try_parse_from(["rpi", "--resume-codex", "codex-id"]).is_err());
     }
     #[test]
     fn resume_short_alias_sets_resume_and_retains_conflicts() {
-        let cli = Cli::try_parse_from(["rpi", "-r", "session-id"])
-            .expect("short resume alias");
+        let cli = Cli::try_parse_from(["rpi", "-r", "session-id"]).expect("short resume alias");
         assert_eq!(cli.resume.as_deref(), Some("session-id"));
         // The short alias participates in the same selector conflicts as --resume.
         assert!(Cli::try_parse_from(["rpi", "-r", "id", "--session", "other"]).is_err());
@@ -1031,7 +1175,10 @@ mod tests {
             ["rpi", "--no-tools", "--no-builtin-tools"].as_slice(),
             ["rpi", "--approve", "--no-approve"].as_slice(),
         ] {
-            assert!(Cli::try_parse_from(args).is_err(), "accepted conflict: {args:?}");
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "accepted conflict: {args:?}"
+            );
         }
         for args in [
             ["rpi", "--name", ""].as_slice(),
@@ -1050,15 +1197,25 @@ mod tests {
         let uninstall = Cli::try_parse_from(["rpi", "uninstall", "package", "--approve"])
             .expect("uninstall alias and trailing trust flag");
         assert!(uninstall.approve);
-        assert!(matches!(uninstall.command, Some(Command::Remove { ref source, .. }) if source == "package"));
+        assert!(
+            matches!(uninstall.command, Some(Command::Remove { ref source, .. }) if source == "package")
+        );
 
-        let no_approve = Cli::try_parse_from(["rpi", "config", "-na"])
-            .expect("no-approve alias after command");
+        let no_approve =
+            Cli::try_parse_from(["rpi", "config", "-na"]).expect("no-approve alias after command");
         assert!(no_approve.no_approve);
 
         // `rpi config` settings-key verbs (OMP `omp config` parity).
-        let get = Cli::try_parse_from(["rpi", "config", "get", "retry.maxRetries", "--scope", "project", "--json"])
-            .expect("config get");
+        let get = Cli::try_parse_from([
+            "rpi",
+            "config",
+            "get",
+            "retry.maxRetries",
+            "--scope",
+            "project",
+            "--json",
+        ])
+        .expect("config get");
         assert!(matches!(
             get.command,
             Some(Command::Config {
@@ -1066,8 +1223,8 @@ mod tests {
                 command: Some(ConfigCommand::Get { ref key, scope: Some(ConfigScopeArg::Project), json: true, .. }),
             }) if key == "retry.maxRetries"
         ));
-        let set = Cli::try_parse_from(["rpi", "config", "set", "transport", "sse"])
-            .expect("config set");
+        let set =
+            Cli::try_parse_from(["rpi", "config", "set", "transport", "sse"]).expect("config set");
         assert!(matches!(
             set.command,
             Some(Command::Config {
@@ -1097,7 +1254,10 @@ mod tests {
         let bare = Cli::try_parse_from(["rpi", "config"]).expect("bare config");
         assert!(matches!(
             bare.command,
-            Some(Command::Config { local: false, command: None })
+            Some(Command::Config {
+                local: false,
+                command: None
+            })
         ));
 
         for args in [
@@ -1112,21 +1272,14 @@ mod tests {
         }
     }
 
-
     #[test]
     fn validates_update_target_combinations() {
-        let all = Cli::try_parse_from(["rpi", "update", "--all", "--force"])
-            .expect("parse all force");
+        let all =
+            Cli::try_parse_from(["rpi", "update", "--all", "--force"]).expect("parse all force");
         all.validate().expect("all includes self");
 
-        let alias = Cli::try_parse_from([
-            "rpi",
-            "update",
-            "self",
-            "--extensions",
-            "--force",
-        ])
-        .expect("parse self alias");
+        let alias = Cli::try_parse_from(["rpi", "update", "self", "--extensions", "--force"])
+            .expect("parse self alias");
         alias.validate().expect("self alias includes self");
 
         let extensions = Cli::try_parse_from(["rpi", "update", "--extensions", "--force"])
@@ -1147,8 +1300,8 @@ mod tests {
             })
         ));
 
-        let updates =
-            Cli::try_parse_from(["rpi", "plugin", "list", "--updates"]).expect("plugin list --updates");
+        let updates = Cli::try_parse_from(["rpi", "plugin", "list", "--updates"])
+            .expect("plugin list --updates");
         assert!(matches!(
             updates.command,
             Some(Command::Plugin {
@@ -1156,8 +1309,8 @@ mod tests {
             })
         ));
 
-        let install = Cli::try_parse_from(["rpi", "plugin", "install", "./ext"])
-            .expect("plugin install");
+        let install =
+            Cli::try_parse_from(["rpi", "plugin", "install", "./ext"]).expect("plugin install");
         assert!(matches!(
             install.command,
             Some(Command::Plugin {
@@ -1165,8 +1318,8 @@ mod tests {
             })
         ));
 
-        let remove = Cli::try_parse_from(["rpi", "plugin", "remove", "ext"])
-            .expect("plugin remove");
+        let remove =
+            Cli::try_parse_from(["rpi", "plugin", "remove", "ext"]).expect("plugin remove");
         assert!(matches!(
             remove.command,
             Some(Command::Plugin {
@@ -1174,8 +1327,8 @@ mod tests {
             })
         ));
 
-        let update = Cli::try_parse_from(["rpi", "plugin", "update", "ext"])
-            .expect("plugin update");
+        let update =
+            Cli::try_parse_from(["rpi", "plugin", "update", "ext"]).expect("plugin update");
         assert!(matches!(
             update.command,
             Some(Command::Plugin {
@@ -1203,7 +1356,9 @@ mod tests {
         // `--mode rpc` before the subcommand is redundant but consistent: allowed.
         let redundant =
             Cli::try_parse_from(["rpi", "--mode", "rpc", "rpc"]).expect("parse redundant mode");
-        redundant.validate().expect("--mode rpc matches the rpc subcommand");
+        redundant
+            .validate()
+            .expect("--mode rpc matches the rpc subcommand");
 
         // A conflicting explicit --mode is rejected: after the subcommand it
         // is an unexpected top-level argument (--mode is not global)...
@@ -1235,10 +1390,7 @@ mod tests {
         let rpc = command
             .find_subcommand("rpc")
             .expect("rpc subcommand exists");
-        let about = rpc
-            .get_about()
-            .expect("rpc subcommand about")
-            .to_string();
+        let about = rpc.get_about().expect("rpc subcommand about").to_string();
         assert!(
             about.contains("rpi headless RPC server"),
             "rpc subcommand help must describe the RPC server: {about}"
@@ -1254,8 +1406,8 @@ mod tests {
                 command: McpCommand::List { local: false }
             })
         ));
-        let list_local = Cli::try_parse_from(["rpi", "mcp", "list", "--local"])
-            .expect("mcp list --local");
+        let list_local =
+            Cli::try_parse_from(["rpi", "mcp", "list", "--local"]).expect("mcp list --local");
         assert!(matches!(
             list_local.command,
             Some(Command::Mcp {
@@ -1327,8 +1479,7 @@ mod tests {
     fn profile_flag_is_global_and_mirrors_session_dir() {
         // `--profile` is a global arg like `--session-dir`: accepted before or
         // after a subcommand.
-        let before =
-            Cli::try_parse_from(["rpi", "--profile", "work", "sessions"]).expect("before");
+        let before = Cli::try_parse_from(["rpi", "--profile", "work", "sessions"]).expect("before");
         assert_eq!(before.profile.as_deref(), Some("work"));
         assert!(matches!(before.command, Some(Command::Sessions)));
 
@@ -1351,7 +1502,14 @@ mod tests {
 
     #[test]
     fn profile_names_validate_to_actionable_errors() {
-        for name in ["work", "my-profile", "my_profile", "work2", "A-Z_09", "default"] {
+        for name in [
+            "work",
+            "my-profile",
+            "my_profile",
+            "work2",
+            "A-Z_09",
+            "default",
+        ] {
             validate_profile_name(name)
                 .unwrap_or_else(|error| panic!("{name:?} must be valid: {error}"));
         }
@@ -1361,8 +1519,8 @@ mod tests {
             "empty-name error must be actionable: {empty}"
         );
         for name in ["a/b", "a b", "a.b", "work:high", "a\\b", "über", "a,b"] {
-            let error = validate_profile_name(name)
-                .expect_err("invalid profile name must be rejected");
+            let error =
+                validate_profile_name(name).expect_err("invalid profile name must be rejected");
             assert!(
                 error.contains("profile name") && error.contains("letters, digits"),
                 "{name:?} error must be actionable: {error}"
@@ -1414,28 +1572,29 @@ mod tests {
         let mut buf = Vec::new();
         write_completion(CompletionShell::Bash, &mut buf);
         let script = String::from_utf8(buf).expect("completion script is valid UTF-8");
-        assert!(script.contains("--profile"), "completion mentions --profile");
+        assert!(
+            script.contains("--profile"),
+            "completion mentions --profile"
+        );
     }
 
     #[test]
     fn listen_flags_parse_and_enforce_remote_opt_in_dependencies() {
-        let cli = Cli::try_parse_from(["rpi", "--listen", "127.0.0.1:0"])
-            .expect("parse listen loopback");
+        let cli =
+            Cli::try_parse_from(["rpi", "--listen", "127.0.0.1:0"]).expect("parse listen loopback");
         assert_eq!(
             cli.listen.as_ref().map(std::net::SocketAddr::to_string),
             Some("127.0.0.1:0".to_owned())
         );
         cli.validate().expect("loopback listener validates");
 
-        let prompt = Cli::try_parse_from([
-            "rpi",
-            "--listen",
-            "127.0.0.1:0",
-            "prompt must use Web RPC",
-        ])
-        .expect("parse listener prompt rejection fixture");
+        let prompt =
+            Cli::try_parse_from(["rpi", "--listen", "127.0.0.1:0", "prompt must use Web RPC"])
+                .expect("parse listener prompt rejection fixture");
         assert_eq!(
-            prompt.validate().expect_err("listener positional prompt must fail"),
+            prompt
+                .validate()
+                .expect_err("listener positional prompt must fail"),
             "--listen is Web-only and cannot be combined with positional prompts; submit prompts through /web, /ws, or /rpc"
         );
         assert!(cli.listen_token_file.is_none());
@@ -1489,7 +1648,9 @@ mod tests {
             .expect("validation must accept tokenless remote opt-in");
         direct.listen = None;
         assert_eq!(
-            direct.validate().expect_err("validation must require listen"),
+            direct
+                .validate()
+                .expect_err("validation must require listen"),
             "--listen-allow-insecure-remote requires --listen"
         );
     }
@@ -1498,25 +1659,19 @@ mod tests {
     fn listen_tls_flags_enforce_pairing_and_plaintext_conflicts() {
         // Default (no TLS flags): HTTPS with an auto-generated self-signed
         // certificate.
-        let cli = Cli::try_parse_from(["rpi", "--listen", "127.0.0.1:0"])
-            .expect("parse listen loopback");
+        let cli =
+            Cli::try_parse_from(["rpi", "--listen", "127.0.0.1:0"]).expect("parse listen loopback");
         assert!(!cli.listen_plaintext);
         assert!(cli.listen_cert.is_none());
         assert!(cli.listen_key.is_none());
         cli.validate().expect("default listener validates");
 
         // --listen-plaintext is the explicit HTTP opt-out.
-        let plaintext = Cli::try_parse_from([
-            "rpi",
-            "--listen",
-            "127.0.0.1:0",
-            "--listen-plaintext",
-        ])
-        .expect("parse plaintext listener");
+        let plaintext =
+            Cli::try_parse_from(["rpi", "--listen", "127.0.0.1:0", "--listen-plaintext"])
+                .expect("parse plaintext listener");
         assert!(plaintext.listen_plaintext);
-        plaintext
-            .validate()
-            .expect("plaintext listener validates");
+        plaintext.validate().expect("plaintext listener validates");
 
         // A certificate pair is consumed as a unit.
         let tls = Cli::try_parse_from([
@@ -1544,7 +1699,14 @@ mod tests {
         // plaintext opt-out with a certificate pair, and the certificate
         // pair requires --listen (these flags only govern the listener).
         for args in [
-            ["rpi", "--listen", "127.0.0.1:0", "--listen-cert", "cert.pem"].as_slice(),
+            [
+                "rpi",
+                "--listen",
+                "127.0.0.1:0",
+                "--listen-cert",
+                "cert.pem",
+            ]
+            .as_slice(),
             ["rpi", "--listen", "127.0.0.1:0", "--listen-key", "key.pem"].as_slice(),
             [
                 "rpi",
@@ -1557,7 +1719,14 @@ mod tests {
                 "key.pem",
             ]
             .as_slice(),
-            ["rpi", "--listen-cert", "cert.pem", "--listen-key", "key.pem"].as_slice(),
+            [
+                "rpi",
+                "--listen-cert",
+                "cert.pem",
+                "--listen-key",
+                "key.pem",
+            ]
+            .as_slice(),
         ] {
             assert!(
                 Cli::try_parse_from(args).is_err(),
@@ -1581,7 +1750,10 @@ mod tests {
             .expect("root-slash origin must validate");
         assert_eq!(
             crate::modes::listen::parse_advertised_origin(
-                with_root.listen_advertised_origin.as_deref().expect("origin")
+                with_root
+                    .listen_advertised_origin
+                    .as_deref()
+                    .expect("origin")
             )
             .expect("normalize root-slash origin"),
             "https://collab.example:8443"
@@ -1652,28 +1824,30 @@ mod tests {
         // Contract: clap's `PathBuf` value parser rejects empty values with
         // `ErrorKind::InvalidValue`, so `--listen-token-file ''` fails at parse
         // time before `validate()` runs (the empty-path guard there is defensive).
-        let error = Cli::try_parse_from([
-            "rpi",
-            "--listen",
-            "127.0.0.1:0",
-            "--listen-token-file",
-            "",
-        ])
-        .expect_err("empty token path should be rejected at parse time");
+        let error =
+            Cli::try_parse_from(["rpi", "--listen", "127.0.0.1:0", "--listen-token-file", ""])
+                .expect_err("empty token path should be rejected at parse time");
         assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
     }
 
     #[test]
     fn completion_parses_supported_shells_and_rejects_others() {
-        for (wire, expected) in [("bash", CompletionShell::Bash), ("zsh", CompletionShell::Zsh), ("fish", CompletionShell::Fish)] {
-            let cli = Cli::try_parse_from(["rpi", "completion", wire])
-                .expect("parse completion {wire}");
+        for (wire, expected) in [
+            ("bash", CompletionShell::Bash),
+            ("zsh", CompletionShell::Zsh),
+            ("fish", CompletionShell::Fish),
+        ] {
+            let cli =
+                Cli::try_parse_from(["rpi", "completion", wire]).expect("parse completion {wire}");
             assert!(
                 matches!(cli.command, Some(Command::Completion { shell }) if shell == expected),
                 "expected parsed shell {wire}"
             );
         }
-        assert!(Cli::try_parse_from(["rpi", "completion"]).is_err(), "missing shell accepted");
+        assert!(
+            Cli::try_parse_from(["rpi", "completion"]).is_err(),
+            "missing shell accepted"
+        );
         assert!(
             Cli::try_parse_from(["rpi", "completion", "powershell"]).is_err(),
             "powershell accepted"
@@ -1686,27 +1860,45 @@ mod tests {
 
     #[test]
     fn completion_generates_non_empty_script_per_shell() {
-        for shell in [CompletionShell::Bash, CompletionShell::Zsh, CompletionShell::Fish] {
+        for shell in [
+            CompletionShell::Bash,
+            CompletionShell::Zsh,
+            CompletionShell::Fish,
+        ] {
             let mut buf = Vec::new();
             write_completion(shell, &mut buf);
             let script = String::from_utf8(buf).expect("completion script is valid UTF-8");
             assert!(!script.is_empty(), "{shell:?} generated empty script");
-            assert!(script.contains("rpi"), "{shell:?} script does not mention rpi");
-            assert!(script.contains("--help"), "{shell:?} script does not mention --help");
+            assert!(
+                script.contains("rpi"),
+                "{shell:?} script does not mention rpi"
+            );
+            assert!(
+                script.contains("--help"),
+                "{shell:?} script does not mention --help"
+            );
         }
     }
 
     #[test]
     fn top_level_export_flag_parses_like_export_subcommand() {
-        let cli = Cli::try_parse_from(["rpi", "--export", "sessions/a.jsonl"])
-            .expect("parse --export");
-        assert!(cli.command.is_none(), "--export must not select a subcommand");
+        let cli =
+            Cli::try_parse_from(["rpi", "--export", "sessions/a.jsonl"]).expect("parse --export");
+        assert!(
+            cli.command.is_none(),
+            "--export must not select a subcommand"
+        );
         assert_eq!(cli.export, Some(PathBuf::from("sessions/a.jsonl")));
         assert!(cli.output.is_none(), "--output must default to none");
         assert!(!cli.jsonl, "--jsonl must default to false");
 
         let cli = Cli::try_parse_from([
-            "rpi", "--export", "sessions/a.jsonl", "-o", "out.html", "--jsonl",
+            "rpi",
+            "--export",
+            "sessions/a.jsonl",
+            "-o",
+            "out.html",
+            "--jsonl",
         ])
         .expect("parse --export with output and jsonl");
         assert_eq!(cli.export, Some(PathBuf::from("sessions/a.jsonl")));
@@ -1736,11 +1928,22 @@ mod tests {
         let login = Cli::try_parse_from(["rpi", "login", "anthropic", "--scope", "work"])
             .expect("parse login with scope");
         match login.command {
-            Some(Command::Login { provider, scope }) => {
+            Some(Command::Login { provider, scope, json }) => {
+                assert!(!json);
                 assert_eq!(provider.as_deref(), Some("anthropic"));
                 assert_eq!(scope.as_deref(), Some("work"));
             }
             other => panic!("expected login command, got {other:?}"),
+        }
+        let json_login = Cli::try_parse_from(["rpi", "login", "--json", "--scope", "synthetic-work"])
+            .expect("parse JSON login without provider");
+        match json_login.command {
+            Some(Command::Login { provider, scope, json }) => {
+                assert!(json);
+                assert_eq!(provider, None);
+                assert_eq!(scope.as_deref(), Some("synthetic-work"));
+            }
+            other => panic!("expected JSON login command, got {other:?}"),
         }
 
         let logout = Cli::try_parse_from(["rpi", "logout", "--scope", "personal", "xai"])
@@ -1755,7 +1958,8 @@ mod tests {
 
         let plain = Cli::try_parse_from(["rpi", "login", "anthropic"]).expect("parse login");
         match plain.command {
-            Some(Command::Login { provider, scope }) => {
+            Some(Command::Login { provider, scope, json }) => {
+                assert!(!json);
                 assert_eq!(provider.as_deref(), Some("anthropic"));
                 assert_eq!(scope, None, "scope must default to none");
             }

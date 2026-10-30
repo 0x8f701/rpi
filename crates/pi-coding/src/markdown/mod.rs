@@ -25,13 +25,13 @@ pub use analysis::{
 pub use inline::{InlineStyle, InlineStyleRange};
 pub use mermaid::{
     DEFAULT_MAX_MERMAID_EDGES, DEFAULT_MAX_MERMAID_NODES, DEFAULT_MAX_MERMAID_OUTPUT_CELLS,
-    FlowDirection, MAX_MERMAID_SOURCE_BYTES, MermaidArt, MermaidDiagnostic,
-    MermaidDiagnosticKind, MermaidDiagramKind, MermaidEdge, MermaidFlowchart, MermaidLimits,
-    MermaidNode, MermaidNodeShape, parse_mermaid, render_mermaid_unicode,
+    FlowDirection, MAX_MERMAID_SOURCE_BYTES, MermaidArt, MermaidDiagnostic, MermaidDiagnosticKind,
+    MermaidDiagramKind, MermaidEdge, MermaidFlowchart, MermaidLimits, MermaidNode,
+    MermaidNodeShape, parse_mermaid, render_mermaid_unicode,
 };
 pub use render::{
     LineRole, MarkdownRenderOptions, MarkdownRenderOutput, NeutralLine, RenderDiagnostic,
     StreamingMarkdownRenderer, render_markdown, render_markdown_streaming,
 };
 pub use table::{TableAlignment, TableBlock, TableLayout, layout_table};
-pub use text::{display_width, fit_text, wrap_verbatim};
+pub use text::{display_width, fit_text, wrap_text, wrap_verbatim};

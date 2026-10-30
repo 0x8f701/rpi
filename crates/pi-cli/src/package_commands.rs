@@ -7,8 +7,13 @@ use pi_coding::packages::{PackageManager, PackageOperation, PackageScope};
 use pi_coding::{SettingsManager, TrustStore, resolve_project_trust};
 
 /// Install a local or git package and persist it to global or project settings.
-pub fn install_package(source: &str, local: bool, cwd: &Path) -> Result<()> {
-    let manager = package_manager(cwd)?;
+pub fn install_package(
+    source: &str,
+    local: bool,
+    cwd: &Path,
+    process: pi_coding::GovernedProcessContext,
+) -> Result<()> {
+    let manager = package_manager(cwd, Some(process))?;
     let scope = scope_for(local);
     let operation = manager
         .install(source, scope)
@@ -19,7 +24,7 @@ pub fn install_package(source: &str, local: bool, cwd: &Path) -> Result<()> {
 
 /// Remove a local or git package from global or project settings.
 pub fn remove_package(source: &str, local: bool, cwd: &Path) -> Result<()> {
-    let manager = package_manager(cwd)?;
+    let manager = package_manager(cwd, None)?;
     let scope = scope_for(local);
     if !manager
         .remove(source, scope)
@@ -33,8 +38,8 @@ pub fn remove_package(source: &str, local: bool, cwd: &Path) -> Result<()> {
 
 /// Print configured packages from settings. Output is intentionally plain so
 /// it remains safe when stdout is captured or piped.
-pub fn list_packages(cwd: &Path) -> Result<()> {
-    let manager = package_manager(cwd)?;
+pub fn list_packages(cwd: &Path, process: pi_coding::GovernedProcessContext) -> Result<()> {
+    let manager = package_manager(cwd, Some(process))?;
     let packages = manager.list()?;
     if packages.is_empty() {
         println!("No packages configured.");
@@ -77,8 +82,8 @@ pub fn list_packages(cwd: &Path) -> Result<()> {
 
 /// Reconcile every configured package. Any configured `npm:` entry fails the
 /// whole update with the backend's deferred error and never mutates state.
-pub fn update_packages(cwd: &Path) -> Result<()> {
-    let operations = package_manager(cwd)?.update_all()?;
+pub fn update_packages(cwd: &Path, process: pi_coding::GovernedProcessContext) -> Result<()> {
+    let operations = package_manager(cwd, Some(process))?.update_all()?;
     if operations.is_empty() {
         println!("No packages to update.");
         return Ok(());
@@ -90,8 +95,12 @@ pub fn update_packages(cwd: &Path) -> Result<()> {
 }
 
 /// Reconcile one configured git or local package by its identity.
-pub fn update_package(source: &str, cwd: &Path) -> Result<()> {
-    let operations = package_manager(cwd)?
+pub fn update_package(
+    source: &str,
+    cwd: &Path,
+    process: pi_coding::GovernedProcessContext,
+) -> Result<()> {
+    let operations = package_manager(cwd, Some(process))?
         .update_one(source)
         .with_context(|| format!("updating package {source}"))?;
     for operation in operations {
@@ -100,7 +109,10 @@ pub fn update_package(source: &str, cwd: &Path) -> Result<()> {
     Ok(())
 }
 
-fn package_manager(cwd: &Path) -> Result<PackageManager> {
+fn package_manager(
+    cwd: &Path,
+    process: Option<pi_coding::GovernedProcessContext>,
+) -> Result<PackageManager> {
     let agent_dir = pi_coding::agent_dir_path();
     let settings = SettingsManager::load_phase_one(cwd, &agent_dir)
         .context("loading global settings for package trust policy")?;
@@ -111,7 +123,11 @@ fn package_manager(cwd: &Path) -> Result<PackageManager> {
     let stored = resolve_project_trust(&TrustStore::new(&agent_dir), cwd, None, default, true)
         .context("resolving project trust for package operations")?;
     let project_trusted = stored.is_trusted();
-    PackageManager::with_agent_dir(cwd, agent_dir, project_trusted)
+    let manager = PackageManager::with_agent_dir(cwd, agent_dir, project_trusted)?;
+    Ok(match process {
+        Some(process) => manager.with_process_context(process),
+        None => manager,
+    })
 }
 
 const fn scope_for(local: bool) -> PackageScope {

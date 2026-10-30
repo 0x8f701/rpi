@@ -110,20 +110,28 @@ fn git(cwd: &Path, args: &[&str]) -> String {
 /// worker turns can do real file work in the owned worktree; every other
 /// harness behavior matches the canonical `workflow_application` fixture.
 fn definition() -> AgentDefinition {
-    AgentDefinition { name: "task".into(),
-    description: "workflow worker".into(),
-    system_prompt: "complete workflow Todo".into(),
-    tools: Some(vec!["bash".to_owned()]),
-    autoload_skills: Vec::new(),
-    model: None,
-    thinking_level: Some(ThinkingLevel::Off),
-    max_turns: None,
-    max_tool_calls: None,
-    timeout_secs: None,
-    disallowed_tools: Vec::new(),
-    capability_ceiling: None,
-    source: AgentDefinitionSource::Bundled,
-    path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None }
+    AgentDefinition {
+        name: "task".into(),
+        description: "workflow worker".into(),
+        system_prompt: "complete workflow Todo".into(),
+        tools: Some(vec!["bash".to_owned()]),
+        autoload_skills: Vec::new(),
+        model: None,
+        thinking_level: Some(ThinkingLevel::Off),
+        max_turns: None,
+        max_tool_calls: None,
+        timeout_secs: None,
+        disallowed_tools: Vec::new(),
+        capability_ceiling: None,
+        source: AgentDefinitionSource::Bundled,
+        path: None,
+        trusted: true,
+        kind: pi_coding::AgentDefinitionKind::Agent,
+        personality: None,
+        soft_budget: None,
+        knowledge_roots: Vec::new(),
+        user_proxy: false,
+    }
 }
 
 /// Per-process isolated native session root for workflow test sessions, so
@@ -131,10 +139,50 @@ fn definition() -> AgentDefinition {
 /// `~/.pi/agent/sessions` tree (the Web sidebar catalog source). Shared
 /// across tests; parallel-safe via `LazyLock`, isolated from HOME.
 fn test_sessions_root() -> PathBuf {
-    static ROOT: std::sync::LazyLock<tempfile::TempDir> = std::sync::LazyLock::new(|| {
-        tempfile::tempdir().expect("test sessions root")
-    });
+    static ROOT: std::sync::LazyLock<tempfile::TempDir> =
+        std::sync::LazyLock::new(|| tempfile::tempdir().expect("test sessions root"));
     ROOT.path().to_path_buf()
+}
+
+/// Attach a hermetic, per-session owned ResourceManager before Application
+/// bootstrap, exactly as the canonical `workflow_application` fixture: an
+/// isolated agent dir scoped to the shared test sessions root, with explicit
+/// `danger-full-access` sandbox trust so the trusted Bubblewrap probe is
+/// accepted (never rejected), and every resource-discovery surface disabled.
+async fn attach_isolated_resources(session: &Session) -> anyhow::Result<()> {
+    let agent_dir = test_sessions_root()
+        .join("agents")
+        .join(uuid::Uuid::now_v7().to_string());
+    fs::create_dir_all(&agent_dir)?;
+    fs::write(
+        agent_dir.join("settings.json"),
+        r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+    )?;
+    let mut options = pi_coding::ResourceManagerOptions::new(session.cwd());
+    options.agent_dir = agent_dir;
+    options.disable_extensions = true;
+    options.disable_skills = true;
+    options.disable_prompt_templates = true;
+    options.disable_themes = true;
+    options.disable_context_files = true;
+    session
+        .attach_resources(pi_coding::ResourceManager::new(options)?)
+        .await
+}
+
+/// Build an Application from a bare parent session with hermetic isolated
+/// resources attached before bootstrap and a HermeticRepositoryExecutor
+/// installed exactly as `workflow_application` does after production
+/// validation.
+async fn application_with_isolated_resources(session: Session) -> Application {
+    attach_isolated_resources(&session)
+        .await
+        .expect("attach isolated resources");
+    let application = Application::new(session).await;
+    application.with_hermetic_repository_executor(
+        pi_coding::process::HermeticRepositoryExecutor::default_executor(),
+    );
+    application
 }
 
 #[derive(Clone)]
@@ -162,8 +210,10 @@ impl ApplicationRuntimeFactory for TestFactory {
             options.cwd = cwd.path().to_path_buf();
             options.tools = None;
             let workspace = WorkspaceRoots::new(cwd.path(), Vec::<PathBuf>::new())?;
-            let artifacts = std::env::temp_dir()
-                .join(format!("pi-workflow-test-artifacts-{}", uuid::Uuid::now_v7()));
+            let artifacts = std::env::temp_dir().join(format!(
+                "pi-workflow-test-artifacts-{}",
+                uuid::Uuid::now_v7()
+            ));
             let mut config =
                 OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition()]), artifacts);
             config.parent_model = snapshot.model.clone();
@@ -174,7 +224,7 @@ impl ApplicationRuntimeFactory for TestFactory {
             // workflow's subagent execution must land files and commits in
             // the worktree the manager auto-integrates.
             let mut worker_snapshot = snapshot.clone();
-            worker_snapshot.cwd = cwd.path().to_path_buf();
+            worker_snapshot.workspace = WorkspaceRoots::new(cwd.path(), Vec::<PathBuf>::new())?;
             let orchestration = OrchestrationRuntime::new(
                 config,
                 OrchestrationRuntime::child_factory_from_snapshot(worker_snapshot),
@@ -184,22 +234,28 @@ impl ApplicationRuntimeFactory for TestFactory {
             // (task delegation + hub IRC), so scripted task-tool calls really
             // spawn faux worker jobs instead of erroring with an unknown tool.
             let additional_tools = orchestration.agent_tools("Main", 0);
-            let session = Session::new_with_todo_additional_tools_filtered_discovery_workspace_and_uri(
-                options,
-                additional_tools,
-                Default::default(),
-                pi_coding::ResourceDiscovery::Disabled,
-                workspace,
-                None,
-            )?;
+            let session =
+                Session::new_with_todo_additional_tools_filtered_discovery_workspace_and_uri(
+                    options,
+                    additional_tools,
+                    Default::default(),
+                    pi_coding::ResourceDiscovery::Disabled,
+                    workspace,
+                    None,
+                    true,
+                )?;
             session.set_session_dir(test_sessions_root());
             session.start_new_recording()?;
+            attach_isolated_resources(&session).await?;
             Ok(ApplicationRuntimeCandidate::new(session).with_orchestration(orchestration))
         })
     }
 }
 
-fn parent_session(repo: &Path, responses: Vec<FauxResponse>) -> (Session, FauxProviderRegistration) {
+fn parent_session(
+    repo: &Path,
+    responses: Vec<FauxResponse>,
+) -> (Session, FauxProviderRegistration) {
     let suffix = uuid::Uuid::now_v7().to_string();
     let model = Model {
         id: format!("workflow-{suffix}"),
@@ -228,6 +284,7 @@ fn parent_session(repo: &Path, responses: Vec<FauxResponse>) -> (Session, FauxPr
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: None,
+        auth_manager: None,
     })
     .expect("session");
     session.set_session_dir(test_sessions_root());
@@ -279,7 +336,7 @@ fn bash_call(id: &str, command: &str) -> FauxResponse {
 ///  1. The planning turn builds the 2-task DAG (todo init) and then settles
 ///     on the plain-text turn — the plan-commit stop hook terminates the
 ///     planning run the moment the model leaves Todo-land, so the workflow
-///     arms DAG execution and moves to Running immediately (P0-2).
+///     arms DAG execution and moves to Running immediately.
 ///  2. The armed DAG spawns one worker job per ready task. Worker A does the
 ///     real work: it writes both feature files and makes the single git
 ///     commit, so the owned worktree is committed and clean by the time the
@@ -317,7 +374,7 @@ async fn app_with_roots(
 ) {
     let (session, registration) = parent_session(&f.repo, responses);
     let snapshot = session.child_session_options_snapshot();
-    let application = Application::new(session).await;
+    let application = application_with_isolated_resources(session).await;
     application
         .attach_runtime_factory(Arc::new(TestFactory { snapshot }))
         .expect("factory");
@@ -379,28 +436,44 @@ async fn full_lifecycle_create_plan_execute_complete_integrate_remove() {
         .await
         .expect("workflow creation must succeed");
     assert_eq!(created.status, WorkflowStatus::Queued);
-    assert!(created.todo.phases.is_empty(), "no plan exists before planning");
+    assert!(
+        created.todo.phases.is_empty(),
+        "no plan exists before planning"
+    );
 
-    // planning + subagent execution + completion: the supervisor's planning
-    // turn builds the 2-task Todo DAG and stops once the plan is committed
-    // (P0-2); the armed DAG then spawns worker jobs per task, the workers do
+    // Planning + subagent execution + completion: the supervisor builds the
+    // two-task Todo DAG, stops after plan commit, then the armed DAG spawns
+    // worker jobs per task; the workers do
     // the real file/commit work, and each settled job makes the supervisor
     // mark its owned task Done.
-    let completed = wait_status(&application, &created.workflow_id, WorkflowStatus::Completed).await;
+    let completed = wait_status(
+        &application,
+        &created.workflow_id,
+        WorkflowStatus::Completed,
+    )
+    .await;
     assert_eq!(completed.todo.phases.len(), 1);
     let tasks = &completed.todo.phases[0].tasks;
-    assert_eq!(tasks.len(), 2, "planning must produce exactly the 2 scripted tasks");
+    assert_eq!(
+        tasks.len(),
+        2,
+        "planning must produce exactly the 2 scripted tasks"
+    );
     assert!(
-        tasks.iter().all(|task| task.status == TodoStatus::Completed),
+        tasks
+            .iter()
+            .all(|task| task.status == TodoStatus::Completed),
         "all planned tasks must be completed, got {:?}",
         tasks
     );
     let path = worktree(&f, completed.workflow_id.as_str());
     assert!(path.exists() && !path.starts_with(&f.repo));
-    assert!(completed
-        .branch
-        .as_deref()
-        .is_some_and(|branch| branch.starts_with("rpi/workflow/")));
+    assert!(
+        completed
+            .branch
+            .as_deref()
+            .is_some_and(|branch| branch.starts_with("rpi/workflow/"))
+    );
 
     // Subagent execution evidence: the DAG-armed execution spawned
     // workflow-scoped worker jobs that settle (bounded wait).
@@ -438,7 +511,10 @@ async fn full_lifecycle_create_plan_execute_complete_integrate_remove() {
         "bye\n"
     );
     let worktree_head = git(&path, &["rev-parse", "HEAD"]);
-    assert_ne!(worktree_head, base_commit, "the feature work must be committed");
+    assert_ne!(
+        worktree_head, base_commit,
+        "the feature work must be committed"
+    );
     assert_eq!(
         git(&path, &["status", "--porcelain"]),
         "",
@@ -505,11 +581,8 @@ async fn full_lifecycle_create_plan_execute_complete_integrate_remove() {
 async fn remove_auto_cancels_non_terminal_leftover() {
     let f = Fixture::new();
     let objective = "leave behind a running workflow";
-    let (application, _factory, _registration) = app(
-        &f,
-        vec![planning(objective), FauxResponse::text("planned")],
-    )
-    .await;
+    let (application, _factory, _registration) =
+        app(&f, vec![planning(objective), FauxResponse::text("planned")]).await;
     let created = application
         .workflow_create(WorkflowCreateRequest {
             name: "auto-cancel".into(),
@@ -541,8 +614,8 @@ async fn resume_same_session_namespace_restores_and_continues() {
     // T43: the session namespace scopes the durable store and managed
     // worktrees. Rebuilding the application with the SAME session id resolves
     // the same namespace, so restore_all finds the persisted workflow.
-    let namespace = pi_coding::workflow_worktree::WorkflowWorktreeManager::new(&f.repo)
-        .session_namespace("resume-session");
+    let namespace =
+        pi_coding::workflow_worktree::session_namespace(None, &f.repo, "resume-session");
     let store_root = shared.path().join("workflows").join(&namespace);
     let managed_root = shared.path().join("worktrees").join(&namespace);
     let objective = "resume after relaunch and continue";
@@ -585,7 +658,10 @@ async fn resume_same_session_namespace_restores_and_continues() {
     let worktree_path = managed_root
         .join(pi_coding::workflow_worktree::WORKTREE_ROOT_DIR_NAME)
         .join(created.workflow_id.as_str());
-    assert!(worktree_path.exists(), "owned worktree must survive teardown");
+    assert!(
+        worktree_path.exists(),
+        "owned worktree must survive teardown"
+    );
 
     first.cleanup().await;
     drop(registration);
@@ -665,7 +741,7 @@ async fn resume_same_session_namespace_restores_and_continues() {
 /// durable record (Queued/Planning, or Running with the open planned task if
 /// the fast faux planner raced past planning) is restored in the SAME session
 /// namespace: a restored Planning/Queued runtime re-runs the bounded planning
-/// flow and commits the plan (P0-2), a restored Running runtime re-arms Todo
+/// flow and commits the plan, while a restored Running runtime re-arms Todo
 /// DAG execution (T26); the armed DAG spawns a worker for the open task whose
 /// settlement the supervisor marks Done (execution-supervision). Either path
 /// lands the workflow in Running or Completed with the planned DAG rebuilt
@@ -674,8 +750,8 @@ async fn resume_same_session_namespace_restores_and_continues() {
 async fn restart_mid_planning_restores_workflow_and_planning_continues() {
     let f = Fixture::new();
     let shared = tempfile::tempdir().expect("shared agent root");
-    let namespace = pi_coding::workflow_worktree::WorkflowWorktreeManager::new(&f.repo)
-        .session_namespace("mid-planning-session");
+    let namespace =
+        pi_coding::workflow_worktree::session_namespace(None, &f.repo, "mid-planning-session");
     let store_root = shared.path().join("workflows").join(&namespace);
     let managed_root = shared.path().join("worktrees").join(&namespace);
     let objective = "survive an exit during planning";
@@ -707,7 +783,11 @@ async fn restart_mid_planning_restores_workflow_and_planning_continues() {
     // is Planning while the turn is in flight (or Queued/Running if the faux
     // planner already raced ahead) — never Completed.
     let mid = wait_status(&first, &created.workflow_id, WorkflowStatus::Planning).await;
-    assert_ne!(mid.status, WorkflowStatus::Completed, "must exit before completion");
+    assert_ne!(
+        mid.status,
+        WorkflowStatus::Completed,
+        "must exit before completion"
+    );
     first.cleanup().await;
     drop(registration);
 
@@ -724,8 +804,8 @@ async fn restart_mid_planning_restores_workflow_and_planning_continues() {
         record_text.contains(objective),
         "workflow record must carry the objective"
     );
-    let exit_status = serde_json::from_str::<serde_json::Value>(&record_text)
-        .expect("record json")["record"]["status"]
+    let exit_status = serde_json::from_str::<serde_json::Value>(&record_text).expect("record json")
+        ["record"]["status"]
         .as_str()
         .expect("record status")
         .to_owned();
@@ -738,7 +818,7 @@ async fn restart_mid_planning_restores_workflow_and_planning_continues() {
     // Second incarnation with the SAME session namespace. A restored
     // Planning/Queued record re-runs the bounded planning flow: the replanning
     // turn builds the DAG (todo-init) and settles on the plain-text turn
-    // (P0-2 plan-commit), then the DAG is armed for execution. A restored
+    // after plan commit, then the DAG is armed for execution. A restored
     // Running record re-arms Todo DAG execution (T26). Either way the armed
     // DAG spawns one worker for the open task, which settles on the plain
     // text reply; the supervisor marks the task Done on settlement.
@@ -762,9 +842,7 @@ async fn restart_mid_planning_restores_workflow_and_planning_continues() {
     // Done and the DAG settles) — both are valid recovery outcomes.
     let outcome = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            let snapshot = second
-                .workflow_get(&created.workflow_id)
-                .expect("workflow");
+            let snapshot = second.workflow_get(&created.workflow_id).expect("workflow");
             if matches!(
                 snapshot.status,
                 WorkflowStatus::Running | WorkflowStatus::Completed
@@ -829,12 +907,10 @@ async fn restart_mid_planning_restores_workflow_and_planning_continues() {
 async fn restart_different_session_namespace_isolates_workflows() {
     let f = Fixture::new();
     let shared = tempfile::tempdir().expect("shared agent root");
-    let namespace_a = pi_coding::workflow_worktree::WorkflowWorktreeManager::new(&f.repo)
-        .session_namespace("session-a");
+    let namespace_a = pi_coding::workflow_worktree::session_namespace(None, &f.repo, "session-a");
     let store_a = shared.path().join("workflows").join(&namespace_a);
     let managed_a = shared.path().join("worktrees").join(&namespace_a);
-    let namespace_b = pi_coding::workflow_worktree::WorkflowWorktreeManager::new(&f.repo)
-        .session_namespace("session-b");
+    let namespace_b = pi_coding::workflow_worktree::session_namespace(None, &f.repo, "session-b");
     let store_b = shared.path().join("workflows").join(&namespace_b);
     let managed_b = shared.path().join("worktrees").join(&namespace_b);
     let objective = "private to session a";
@@ -867,7 +943,10 @@ async fn restart_different_session_namespace_isolates_workflows() {
     let worktree_a = managed_a
         .join(pi_coding::workflow_worktree::WORKTREE_ROOT_DIR_NAME)
         .join(created.workflow_id.as_str());
-    assert!(worktree_a.exists(), "session A worktree must survive teardown");
+    assert!(
+        worktree_a.exists(),
+        "session A worktree must survive teardown"
+    );
 
     // Session B (a DIFFERENT namespace) sees an empty workflow store and
     // cannot resolve session A's workflow at all.
@@ -878,13 +957,25 @@ async fn restart_different_session_namespace_isolates_workflows() {
         "session B must not see session A workflows"
     );
     let missing = second.workflow_get(&created.workflow_id);
-    assert!(missing.is_err(), "session B must not resolve session A workflows");
-    assert!(!store_b.join("records").exists() || fs::read_dir(store_b.join("records")).expect("records b").next().is_none());
+    assert!(
+        missing.is_err(),
+        "session B must not resolve session A workflows"
+    );
+    assert!(
+        !store_b.join("records").exists()
+            || fs::read_dir(store_b.join("records"))
+                .expect("records b")
+                .next()
+                .is_none()
+    );
     second.cleanup().await;
 
     // Session A's data is untouched: still visible from its own namespace.
     let record_text = fs::read_to_string(&record_a).expect("read session A record");
-    assert!(record_text.contains(objective), "session A record must be intact");
+    assert!(
+        record_text.contains(objective),
+        "session A record must be intact"
+    );
     assert!(worktree_a.exists(), "session A worktree must be intact");
 }
 
@@ -896,19 +987,14 @@ async fn restart_different_session_namespace_isolates_workflows() {
 async fn restart_after_integrate_keeps_completed_workflow() {
     let f = Fixture::new();
     let shared = tempfile::tempdir().expect("shared agent root");
-    let namespace = pi_coding::workflow_worktree::WorkflowWorktreeManager::new(&f.repo)
-        .session_namespace("completed-session");
+    let namespace =
+        pi_coding::workflow_worktree::session_namespace(None, &f.repo, "completed-session");
     let store_root = shared.path().join("workflows").join(&namespace);
     let managed_root = shared.path().join("worktrees").join(&namespace);
 
     // First incarnation: the full lifecycle through Completed + integrate.
-    let (first, _factory, registration) = app_with_roots(
-        &f,
-        full_lifecycle_responses(),
-        &store_root,
-        &managed_root,
-    )
-    .await;
+    let (first, _factory, registration) =
+        app_with_roots(&f, full_lifecycle_responses(), &store_root, &managed_root).await;
     let created = first
         .workflow_create(WorkflowCreateRequest {
             name: "shipped".into(),
@@ -943,7 +1029,10 @@ async fn restart_after_integrate_keeps_completed_workflow() {
         .expect("restored completed workflow");
     assert_eq!(restored.status, WorkflowStatus::Completed);
     assert_eq!(restored.todo.phases[0].tasks[0].content, "create hello.txt");
-    assert_eq!(restored.todo.phases[0].tasks[0].status, TodoStatus::Completed);
+    assert_eq!(
+        restored.todo.phases[0].tasks[0].status,
+        TodoStatus::Completed
+    );
     assert!(
         matches!(restored.integration, WorkflowIntegration::Applied { .. }),
         "restored integration must stay applied, got {:?}",

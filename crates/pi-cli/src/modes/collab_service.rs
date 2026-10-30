@@ -17,10 +17,9 @@ use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use base64::Engine as _;
 use pi_coding::collab::{
-    CollabRole, CollabRoomKeys, CollabSecret, EPOCH_LEN, FrameDirection, KEY_LEN,
-    MAX_FRAME_BYTES, ReceiveWindow, SendCounter, capability, capability_eq,
-    derive_connection_key, format_link, generate_room_keys, new_room_id, open_frame,
-    parse_frame_header, public_value, seal_frame,
+    CollabRole, CollabRoomKeys, CollabSecret, EPOCH_LEN, FrameDirection, KEY_LEN, MAX_FRAME_BYTES,
+    ReceiveWindow, SendCounter, capability, capability_eq, derive_connection_key, format_link,
+    generate_room_keys, new_room_id, open_frame, parse_frame_header, public_value, seal_frame,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -102,8 +101,12 @@ enum CollabWritableCommand {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum CollabServerMessage<'a> {
-    Snapshot { snapshot: &'a Value },
-    Event { event: &'a Value },
+    Snapshot {
+        snapshot: &'a Value,
+    },
+    Event {
+        event: &'a Value,
+    },
     Response {
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
@@ -140,7 +143,8 @@ impl CollabRuntime for Arc<SessionRuntimeManager> {
         max_entries: usize,
         max_bytes: usize,
     ) -> Result<(String, Value)> {
-        self.collab_snapshot(session_id, max_entries, max_bytes).await
+        self.collab_snapshot(session_id, max_entries, max_bytes)
+            .await
     }
 
     async fn dispatch(&self, command: RpcCommand, session_id: String) -> RpcResponse {
@@ -180,15 +184,13 @@ impl Room {
     }
 
     fn acquire_participant(self: &Arc<Self>, role: CollabRole) -> Result<ParticipantLease> {
-        let result = self.participants.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |current| (current < MAX_COLLAB_PARTICIPANTS).then_some(current + 1),
-        );
+        let result =
+            self.participants
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    (current < MAX_COLLAB_PARTICIPANTS).then_some(current + 1)
+                });
         if result.is_err() {
-            bail!(
-                "collaboration room participant limit reached ({MAX_COLLAB_PARTICIPANTS})"
-            );
+            bail!("collaboration room participant limit reached ({MAX_COLLAB_PARTICIPANTS})");
         }
         match role {
             CollabRole::Control => self.control_participants.fetch_add(1, Ordering::AcqRel),
@@ -225,7 +227,10 @@ impl Drop for ParticipantLease {
     fn drop(&mut self) {
         self.room.participants.fetch_sub(1, Ordering::AcqRel);
         match self.role {
-            CollabRole::Control => self.room.control_participants.fetch_sub(1, Ordering::AcqRel),
+            CollabRole::Control => self
+                .room
+                .control_participants
+                .fetch_sub(1, Ordering::AcqRel),
             CollabRole::View => self.room.view_participants.fetch_sub(1, Ordering::AcqRel),
         };
     }
@@ -269,7 +274,8 @@ impl CollabService {
             .await
             .map_err(|_| anyhow!("collaboration requires an available recorded session"))?;
         let room_id = new_room_id().map_err(|_| anyhow!("creating collaboration room failed"))?;
-        let keys = generate_room_keys().map_err(|_| anyhow!("creating collaboration room failed"))?;
+        let keys =
+            generate_room_keys().map_err(|_| anyhow!("creating collaboration room failed"))?;
         let control_capability = capability(&keys.control);
         let view_capability = capability(&keys.view);
         let (stopped, _) = watch::channel(false);
@@ -330,7 +336,11 @@ impl CollabService {
     /// Return the current interactive host room, if one is running.
     pub async fn default_status(&self) -> Option<CollabRoomInfo> {
         let room_id = self.default_room.read().await.clone()?;
-        self.rooms.read().await.get(&room_id).map(|room| room_info(room))
+        self.rooms
+            .read()
+            .await
+            .get(&room_id)
+            .map(|room| room_info(room))
     }
 
     /// Stop the current interactive host room.
@@ -356,7 +366,6 @@ impl CollabService {
         }
         *self.default_room.write().await = None;
     }
-
 
     /// Return active rooms, optionally narrowed to one room id.
     pub async fn status(&self, room_id: Option<&str>) -> Vec<CollabRoomInfo> {
@@ -426,18 +435,12 @@ impl CollabService {
         if *stopped.borrow() {
             bail!("collaboration authentication failed");
         }
-        let client_key = derive_connection_key(
-            room.key(role),
-            &epoch,
-            FrameDirection::ClientToServer,
-        )
-        .map_err(|_| anyhow!("creating collaboration connection failed"))?;
-        let server_key = derive_connection_key(
-            room.key(role),
-            &epoch,
-            FrameDirection::ServerToClient,
-        )
-        .map_err(|_| anyhow!("creating collaboration connection failed"))?;
+        let client_key =
+            derive_connection_key(room.key(role), &epoch, FrameDirection::ClientToServer)
+                .map_err(|_| anyhow!("creating collaboration connection failed"))?;
+        let server_key =
+            derive_connection_key(room.key(role), &epoch, FrameDirection::ServerToClient)
+                .map_err(|_| anyhow!("creating collaboration connection failed"))?;
         Ok(CollabConnection {
             room,
             role,
@@ -487,7 +490,9 @@ impl CollabConnection {
 
     pub(crate) fn snapshot_frame(&mut self) -> Result<Vec<u8>> {
         let snapshot = public_value(&self.snapshot);
-        self.seal(&CollabServerMessage::Snapshot { snapshot: &snapshot })
+        self.seal(&CollabServerMessage::Snapshot {
+            snapshot: &snapshot,
+        })
     }
 
     pub(crate) fn event_matches_room(&self, event: &Value) -> bool {
@@ -503,11 +508,9 @@ impl CollabConnection {
         if frame.len() > MAX_FRAME_BYTES {
             bail!("collaboration frame exceeds the size limit");
         }
-        let (_, direction, sequence, _) = parse_frame_header(frame)
-            .ok_or_else(|| anyhow!("invalid collaboration frame"))?;
-        if direction != FrameDirection::ClientToServer
-            || sequence != self.receive.next_expected()
-        {
+        let (_, direction, sequence, _) =
+            parse_frame_header(frame).ok_or_else(|| anyhow!("invalid collaboration frame"))?;
+        if direction != FrameDirection::ClientToServer || sequence != self.receive.next_expected() {
             bail!("invalid collaboration frame sequence");
         }
         let plaintext = open_frame(
@@ -627,12 +630,18 @@ fn start_result(room: &Room, base_url: &str) -> CollabStartResult {
     let control_link = format_link(
         base_url,
         &room.room_id,
-        &CollabSecret { role: CollabRole::Control, key: room.keys.control },
+        &CollabSecret {
+            role: CollabRole::Control,
+            key: room.keys.control,
+        },
     );
     let view_link = format_link(
         base_url,
         &room.room_id,
-        &CollabSecret { role: CollabRole::View, key: room.keys.view },
+        &CollabSecret {
+            role: CollabRole::View,
+            key: room.keys.view,
+        },
     );
     CollabStartResult {
         room_id: room.room_id.clone(),
@@ -641,7 +650,6 @@ fn start_result(room: &Room, base_url: &str) -> CollabStartResult {
         view_link,
     }
 }
-
 
 fn room_info(room: &Room) -> CollabRoomInfo {
     CollabRoomInfo {
@@ -655,11 +663,12 @@ fn room_info(room: &Room) -> CollabRoomInfo {
     }
 }
 
-
 pub(crate) fn capability_from_protocols(headers: &http::HeaderMap) -> Option<(String, [u8; 32])> {
     let mut matched = None;
     for value in headers.get_all(http::header::SEC_WEBSOCKET_PROTOCOL) {
-        let Ok(value) = value.to_str() else { return None };
+        let Ok(value) = value.to_str() else {
+            return None;
+        };
         for offered in value.split(',').map(str::trim) {
             let Some(encoded) = offered.strip_prefix(COLLAB_PROTOCOL_PREFIX) else {
                 continue;
@@ -693,8 +702,8 @@ fn validate_base_url(base_url: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pi_coding::collab::{FrameDirection, parse_link};
     use serde_json::json;
-    use pi_coding::collab::{parse_link, FrameDirection};
     use tokio::sync::{Mutex as AsyncMutex, Notify};
 
     struct FakeRuntime {
@@ -763,7 +772,6 @@ mod tests {
         }
     }
 
-
     #[async_trait]
     impl CollabRuntime for FakeRuntime {
         fn events(&self) -> broadcast::Receiver<Value> {
@@ -780,7 +788,6 @@ mod tests {
         }
 
         async fn dispatch(&self, command: RpcCommand, session_id: String) -> RpcResponse {
-
             let name = command.command_name();
             self.dispatched.lock().await.push((name, session_id));
             RpcResponse::success(None, name, None)
@@ -790,9 +797,18 @@ mod tests {
     async fn default_room_reuses_links_reports_status_and_stops() {
         let runtime = FakeRuntime::new();
         let service = CollabService::with_runtime(runtime);
-        let first = service.start_default("http://127.0.0.1:4321").await.expect("start");
-        let second = service.start_default("http://127.0.0.1:4321").await.expect("reprint");
-        assert_eq!(first, second, "bare /collab must not rotate live capabilities");
+        let first = service
+            .start_default("http://127.0.0.1:4321")
+            .await
+            .expect("start");
+        let second = service
+            .start_default("http://127.0.0.1:4321")
+            .await
+            .expect("reprint");
+        assert_eq!(
+            first, second,
+            "bare /collab must not rotate live capabilities"
+        );
         let status = service.default_status().await.expect("status");
         assert_eq!(status.room_id, first.room_id);
         assert_eq!(status.participants, 0);
@@ -823,12 +839,9 @@ mod tests {
         sequence: u64,
         value: Value,
     ) -> Vec<u8> {
-        let key = derive_connection_key(
-            role_key,
-            &connection.epoch,
-            FrameDirection::ClientToServer,
-        )
-        .expect("client key");
+        let key =
+            derive_connection_key(role_key, &connection.epoch, FrameDirection::ClientToServer)
+                .expect("client key");
         seal_frame(
             &key,
             &connection.room.room_id,
@@ -846,12 +859,9 @@ mod tests {
         sequence: u64,
         frame: &[u8],
     ) -> Value {
-        let key = derive_connection_key(
-            role_key,
-            &connection.epoch,
-            FrameDirection::ServerToClient,
-        )
-        .expect("server key");
+        let key =
+            derive_connection_key(role_key, &connection.epoch, FrameDirection::ServerToClient)
+                .expect("server key");
         let plaintext = open_frame(
             &key,
             &connection.room.room_id,
@@ -870,11 +880,22 @@ mod tests {
         let (service, started) = room(runtime).await;
         let (_, control_cap) = role_capability(&started.control_link);
         let (_, view_cap) = role_capability(&started.view_link);
-        let control = service.authenticate(&started.room_id, &control_cap).await.expect("control");
-        let view = service.authenticate(&started.room_id, &view_cap).await.expect("view");
+        let control = service
+            .authenticate(&started.room_id, &control_cap)
+            .await
+            .expect("control");
+        let view = service
+            .authenticate(&started.room_id, &view_cap)
+            .await
+            .expect("view");
         assert_eq!(control.role, CollabRole::Control);
         assert_eq!(view.role, CollabRole::View);
-        assert!(service.authenticate(&started.room_id, &[9; 32]).await.is_err());
+        assert!(
+            service
+                .authenticate(&started.room_id, &[9; 32])
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -894,7 +915,12 @@ mod tests {
         let (_, cap) = role_capability(&first.view_link);
         let mut participants = Vec::new();
         for _ in 0..MAX_COLLAB_PARTICIPANTS {
-            participants.push(service.authenticate(&first.room_id, &cap).await.expect("participant"));
+            participants.push(
+                service
+                    .authenticate(&first.room_id, &cap)
+                    .await
+                    .expect("participant"),
+            );
         }
         assert!(service.authenticate(&first.room_id, &cap).await.is_err());
         drop(participants.pop());
@@ -906,9 +932,16 @@ mod tests {
         let runtime = FakeRuntime::new();
         let (service, started) = room(runtime).await;
         let (key, cap) = role_capability(&started.control_link);
-        let mut connection = service.authenticate(&started.room_id, &cap).await.expect("auth");
+        let mut connection = service
+            .authenticate(&started.room_id, &cap)
+            .await
+            .expect("auth");
         let frame = connection.snapshot_frame().expect("snapshot frame");
-        assert!(!frame.windows(b"snapshot marker".len()).any(|w| w == b"snapshot marker"));
+        assert!(
+            !frame
+                .windows(b"snapshot marker".len())
+                .any(|w| w == b"snapshot marker")
+        );
         let opened = open_server(&connection, &key, 0, &frame);
         assert_eq!(opened["type"], "snapshot");
         assert_eq!(opened["snapshot"]["sessionId"], "session-1");
@@ -919,17 +952,29 @@ mod tests {
         let runtime = FakeRuntime::new();
         let (service, started) = room(runtime).await;
         let (key, cap) = role_capability(&started.control_link);
-        let mut connection = service.authenticate(&started.room_id, &cap).await.expect("auth");
+        let mut connection = service
+            .authenticate(&started.room_id, &cap)
+            .await
+            .expect("auth");
         let frame = client_frame(
             &connection,
             &key,
             0,
             json!({"type":"command","command":"abort","id":"a"}),
         );
-        connection.handle_client_frame(&frame).await.expect("first accepted");
-        assert!(connection.handle_client_frame(&frame).await.is_err(), "replay rejected");
+        connection
+            .handle_client_frame(&frame)
+            .await
+            .expect("first accepted");
+        assert!(
+            connection.handle_client_frame(&frame).await.is_err(),
+            "replay rejected"
+        );
 
-        let mut connection = service.authenticate(&started.room_id, &cap).await.expect("auth two");
+        let mut connection = service
+            .authenticate(&started.room_id, &cap)
+            .await
+            .expect("auth two");
         let valid = client_frame(
             &connection,
             &key,
@@ -939,7 +984,10 @@ mod tests {
         let mut tampered = valid.clone();
         *tampered.last_mut().expect("ciphertext byte") ^= 1;
         assert!(connection.handle_client_frame(&tampered).await.is_err());
-        connection.handle_client_frame(&valid).await.expect("valid after tamper");
+        connection
+            .handle_client_frame(&valid)
+            .await
+            .expect("valid after tamper");
     }
 
     #[tokio::test]
@@ -947,14 +995,20 @@ mod tests {
         let runtime = FakeRuntime::new();
         let (service, started) = room(runtime.clone()).await;
         let (key, cap) = role_capability(&started.control_link);
-        let mut connection = service.authenticate(&started.room_id, &cap).await.expect("auth");
+        let mut connection = service
+            .authenticate(&started.room_id, &cap)
+            .await
+            .expect("auth");
         let prompt = client_frame(
             &connection,
             &key,
             0,
             json!({"type":"command","command":"prompt","message":"hello"}),
         );
-        connection.handle_client_frame(&prompt).await.expect("prompt");
+        connection
+            .handle_client_frame(&prompt)
+            .await
+            .expect("prompt");
         let abort = client_frame(
             &connection,
             &key,
@@ -964,7 +1018,10 @@ mod tests {
         connection.handle_client_frame(&abort).await.expect("abort");
         assert_eq!(
             *runtime.dispatched.lock().await,
-            vec![("prompt", "session-1".to_owned()), ("abort", "session-1".to_owned())]
+            vec![
+                ("prompt", "session-1".to_owned()),
+                ("abort", "session-1".to_owned())
+            ]
         );
     }
 
@@ -973,14 +1030,20 @@ mod tests {
         let runtime = FakeRuntime::new();
         let (service, started) = room(runtime.clone()).await;
         let (key, cap) = role_capability(&started.view_link);
-        let mut connection = service.authenticate(&started.room_id, &cap).await.expect("auth");
+        let mut connection = service
+            .authenticate(&started.room_id, &cap)
+            .await
+            .expect("auth");
         let prompt = client_frame(
             &connection,
             &key,
             0,
             json!({"type":"command","command":"prompt","message":"blocked","id":"p"}),
         );
-        let response = connection.handle_client_frame(&prompt).await.expect("encrypted denial");
+        let response = connection
+            .handle_client_frame(&prompt)
+            .await
+            .expect("encrypted denial");
         let opened = open_server(&connection, &key, 0, &response);
         assert_eq!(opened["success"], false);
         assert!(runtime.dispatched.lock().await.is_empty());
@@ -990,8 +1053,13 @@ mod tests {
         let runtime = FakeRuntime::new();
         let (service, started) = room(runtime).await;
         let (key, cap) = role_capability(&started.view_link);
-        let mut connection = service.authenticate(&started.room_id, &cap).await.expect("auth");
-        let _snapshot = connection.snapshot_frame().expect("snapshot consumes seq zero");
+        let mut connection = service
+            .authenticate(&started.room_id, &cap)
+            .await
+            .expect("auth");
+        let _snapshot = connection
+            .snapshot_frame()
+            .expect("snapshot consumes seq zero");
         let secret = ["s", "k", "-", "abcdefghijklmnop", "1234567890"].concat();
         let unix_path = ["/", "tmp", "/", "collab-private", "/", "output.log"].concat();
         let event = json!({
@@ -1019,10 +1087,16 @@ mod tests {
         let runtime = FakeRuntime::new();
         let (service, started) = room(runtime).await;
         let (_, cap) = role_capability(&started.control_link);
-        let first = service.authenticate(&started.room_id, &cap).await.expect("first");
+        let first = service
+            .authenticate(&started.room_id, &cap)
+            .await
+            .expect("first");
         let first_epoch = first.epoch;
         drop(first);
-        let second = service.authenticate(&started.room_id, &cap).await.expect("second");
+        let second = service
+            .authenticate(&started.room_id, &cap)
+            .await
+            .expect("second");
         assert_ne!(first_epoch, second.epoch);
     }
 
@@ -1074,8 +1148,14 @@ mod tests {
         let runtime = FakeRuntime::new();
         let (service, started) = room(runtime).await;
         let (_, cap) = role_capability(&started.control_link);
-        let mut connection = service.authenticate(&started.room_id, &cap).await.expect("auth");
-        assert_eq!(service.status(Some(&started.room_id)).await[0].participants, 1);
+        let mut connection = service
+            .authenticate(&started.room_id, &cap)
+            .await
+            .expect("auth");
+        assert_eq!(
+            service.status(Some(&started.room_id)).await[0].participants,
+            1
+        );
         let stopped = service.stop(&started.room_id).await.expect("stop");
         assert_eq!(stopped.participants, 1);
         connection.stopped.changed().await.expect("stop signal");

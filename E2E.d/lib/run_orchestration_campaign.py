@@ -57,8 +57,8 @@ class RpcClient:
             "LANG": os.environ.get("LANG", "C.UTF-8"),
             "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
             "PI_CODING_AGENT_DIR": str(Path(home) / ".pi" / "agent"),
-            "PI_OFFLINE": "1",
-            "PI_SKIP_VERSION_CHECK": "1",
+            "RPI_OFFLINE": "1",
+            "RPI_SKIP_VERSION_CHECK": "1",
             "PI_FAUX_RESPONSE": os.environ.get(
                 "PI_FAUX_RESPONSE", "deterministic-orchestration-reply"
             ),
@@ -165,10 +165,10 @@ def assert_todo_dag(phases: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         raise SystemExit(f"root-b must be ready: {root_b!r}")
     if join.get("ready", False):
         raise SystemExit(f"join must not be ready while roots open: {join!r}")
-    blocked = join.get("blockedBy") or []
-    blocked_ids = {item.get("taskId") for item in blocked}
-    if blocked_ids != {"root-a", "root-b"}:
-        raise SystemExit(f"join blockedBy must be both roots, got {blocked!r}")
+    waiting = join.get("waitingOn") or []
+    waiting_ids = {item.get("taskId") for item in waiting}
+    if waiting_ids != {"root-a", "root-b"}:
+        raise SystemExit(f"join waitingOn must be both roots, got {waiting!r}")
     # Exact stable ids must round-trip (todoTaskId ownership contract surface).
     for task_id, task in tasks.items():
         if task.get("id") != task_id:
@@ -186,18 +186,18 @@ def complete_task_phases(
             if task.get("id") == task_id:
                 task["status"] = "completed"
                 task["ready"] = False
-                task["blockedBy"] = []
+                task["waitingOn"] = []
                 found = True
     if not found:
         raise SystemExit(f"complete_task_phases: missing exact task id {task_id}")
     return cloned
 
 
-def blocked_only_phases() -> list[dict[str, Any]]:
-    """All open tasks blocked — no ready roots (blocked-only / no-spawn surface)."""
+def dependency_waiting_phases() -> list[dict[str, Any]]:
+    """One ready dependency and one open task waiting on it."""
     return [
         {
-            "name": "BlockedOnly",
+            "name": "DependencyWaiting",
             "tasks": [
                 {
                     "id": "gate",
@@ -206,7 +206,7 @@ def blocked_only_phases() -> list[dict[str, Any]]:
                 },
                 {
                     "id": "waiter",
-                    "content": "blocked waiter",
+                    "content": "waiting task",
                     "status": "pending",
                     "dependsOn": ["gate"],
                 },
@@ -307,14 +307,14 @@ def main() -> None:
         )
         phases = (set_todos.get("data") or {}).get("phases") or []
         tasks = assert_todo_dag(phases)
-        summary["checks"].append("todo-ready-roots-and-blocked-join")
+        summary["checks"].append("todo-ready-roots-and-waiting-join")
         summary["checks"].append("todo-exact-task-ids")
         summary["todoInitial"] = {
             "rootAReady": tasks["root-a"].get("ready"),
             "rootBReady": tasks["root-b"].get("ready"),
             "joinReady": tasks["join"].get("ready"),
-            "joinBlockedBy": [
-                item.get("taskId") for item in (tasks["join"].get("blockedBy") or [])
+            "joinWaitingOn": [
+                item.get("taskId") for item in (tasks["join"].get("waitingOn") or [])
             ],
             "exactIds": sorted(tasks.keys()),
         }
@@ -334,7 +334,7 @@ def main() -> None:
         if tasks_a.get("root-b", {}).get("status") == "completed":
             raise SystemExit("completing root-a must not complete root-b")
         if tasks_a["join"].get("ready", False):
-            raise SystemExit("join must stay blocked after only root-a completes")
+            raise SystemExit("join must keep waiting after only root-a completes")
         completed_a = sum(1 for task in tasks_a.values() if task.get("status") == "completed")
         if completed_a != 1:
             raise SystemExit(f"expected 1 completed after root-a, got {completed_a}")
@@ -351,8 +351,8 @@ def main() -> None:
         tasks_b = index_tasks(phases_b)
         if not tasks_b["join"].get("ready", False):
             raise SystemExit(f"join must become ready after both roots: {tasks_b['join']!r}")
-        if tasks_b["join"].get("blockedBy"):
-            raise SystemExit(f"join blockedBy must clear: {tasks_b['join']!r}")
+        if tasks_b["join"].get("waitingOn"):
+            raise SystemExit(f"join waitingOn must clear: {tasks_b['join']!r}")
         completed_b = sum(1 for task in tasks_b.values() if task.get("status") == "completed")
         if completed_b != 2:
             raise SystemExit(f"expected 2 completed after roots, got {completed_b}")
@@ -377,28 +377,28 @@ def main() -> None:
             raise SystemExit("expected open join work after roots complete")
         summary["checks"].append("todo-open-work-remains")
 
-        # Blocked-only projection: one ready gate + blocked waiter (no dual ready roots).
-        blocked_set = client.request(
+        # Dependency-waiting projection: one ready gate and one waiting task.
+        waiting_set = client.request(
             {
                 "type": "set_todos",
-                "id": "todos-blocked-only",
-                "phases": blocked_only_phases(),
+                "id": "todos-dependency-waiting",
+                "phases": dependency_waiting_phases(),
             }
         )
-        blocked_phases = (blocked_set.get("data") or {}).get("phases") or []
-        blocked_tasks = index_tasks(blocked_phases)
-        if "gate" not in blocked_tasks or "waiter" not in blocked_tasks:
-            raise SystemExit(f"blocked-only missing ids: {blocked_tasks!r}")
-        if not blocked_tasks["gate"].get("ready", False):
-            raise SystemExit(f"gate must be ready in blocked-only fixture: {blocked_tasks['gate']!r}")
-        if blocked_tasks["waiter"].get("ready", False):
-            raise SystemExit(f"waiter must not be ready: {blocked_tasks['waiter']!r}")
-        waiter_blocked = {
-            item.get("taskId") for item in (blocked_tasks["waiter"].get("blockedBy") or [])
+        waiting_phases = (waiting_set.get("data") or {}).get("phases") or []
+        waiting_tasks = index_tasks(waiting_phases)
+        if "gate" not in waiting_tasks or "waiter" not in waiting_tasks:
+            raise SystemExit(f"dependency-waiting missing ids: {waiting_tasks!r}")
+        if not waiting_tasks["gate"].get("ready", False):
+            raise SystemExit(f"gate must be ready: {waiting_tasks['gate']!r}")
+        if waiting_tasks["waiter"].get("ready", False):
+            raise SystemExit(f"waiter must not be ready: {waiting_tasks['waiter']!r}")
+        waiter_dependencies = {
+            item.get("taskId") for item in (waiting_tasks["waiter"].get("waitingOn") or [])
         }
-        if "gate" not in waiter_blocked:
-            raise SystemExit(f"waiter must be blocked by gate: {blocked_tasks['waiter']!r}")
-        summary["checks"].append("todo-blocked-only-projection")
+        if "gate" not in waiter_dependencies:
+            raise SystemExit(f"waiter must wait on gate: {waiting_tasks['waiter']!r}")
+        summary["checks"].append("todo-dependency-waiting-projection")
 
         # All-terminal projection: no ready open work (attach-no-spawn surface).
         terminal_set = client.request(

@@ -2,6 +2,93 @@
 
 All notable changes to `rpi` are documented in this file.
 
+## [1.0.0] - 2026-10-30
+
+### Changed
+
+- Canonicalized the public environment namespace for installers and docs:
+  `RPI_HOME`, `RPI_UPDATE_BASE_URL`, `RPI_OFFLINE`, and `RPI_SKIP_VERSION_CHECK`.
+  `install.sh` and `install.ps1` now reject the legacy `PI_HOME` and
+  `PI_UPDATE_BASE_URL` names with an actionable error before any network or
+  filesystem access. Upstream/child `PI_*` names (`PI_CODING_AGENT_DIR`,
+  `PI_CODING_AGENT_SESSION_DIR`, `PI_PACKAGE_DIR`, `PI_PROFILE`, `PI_AUTH_SCOPE`,
+  `PI_CACHE_RETENTION`, `PI_OAUTH_CALLBACK_HOST`, `PI_SHARE_VIEWER_URL`, and
+  the bash-tool child variables) remain unchanged.
+
+- Split session tool ownership: caller-supplied persistent tools stay in the
+  reload foundation, while extension, orchestration (`task`/`hub`), goal, and
+  Todo-child tools are re-provisioned once per application generation instead
+  of persisting in the base tool set, eliminating duplicate-tool failures at
+  bootstrap and reload merges.
+
+### Added
+
+- Code-review gap expand on Web and TUI: unchanged context bands above,
+  between, and below hunks load from the snapshot's pinned blobs in
+  bounded 20-line windows (serialized on Web, selection-driven in the TUI),
+  with hunk identity (`@@` ranges and content hashes) frozen so comments
+  and threads keep resolving.
+- The changed-file tree reuses the code-review status glyphs (`A`/`D`/`M`/`R`)
+  and shared tree indent across the File explorer and Code review panels.
+
+### Changed
+
+- Code-review file identity is served by exact path only. `git stash`
+  entries are no longer merged into HEAD→working-tree snapshots, and
+  single-file `--no-index` untracked producers rebind their capture
+  identity explicitly, so a requested path can never be served another
+  file's hunks.
+- A committed submodule gitlink whose checkout is missing keeps its own
+  parent-repo row; submodule expansion requires the discovered repository
+  to be rooted at the gitlink directory itself, so absent checkouts no
+  longer fabricate phantom child rows, and one broken submodule degrades
+  to its parent row instead of failing the whole change list.
+
+### Fixed
+
+- `SessionSidebar.runSwitch` returns the switch outcome again, so success
+  repaints the active row and the pending-switch marker clears.
+- Persona create/edit reloads the resource catalog off the Tokio worker
+  stack: `Application::reload` and the RPC command future are pinned to the
+  heap, with a 2 MiB worker-stack canary test guarding regressions.
+
+## Sandbox clean cutover - 2026-08-15
+
+### Added
+
+- Generation-bound sandbox authority: absent settings resolve to
+  `danger-full-access`; explicit `read-only` and `workspace-write` complete the
+  mode set. Child networking, exact host HTTP destinations, audience-bound
+  credential grants, and the four fixed resource-limit categories are part of
+  the same validated policy.
+- Real platform proof gates: Linux uses the pinned bubblewrap 0.10.0 upstream
+  commit and FD/native Browser proof; macOS runs real Seatbelt and Browser proof
+  on arm64 and Intel runners; Windows proves confined rejection, explicit danger
+  pipe/PTY execution, Browser rejection, and full 128-bit file identity. All
+  three sandbox release jobs are mandatory dependencies of release publication.
+- Atomic application generations and durable sandbox resume. Reload stages all
+  resources and authority before one pointer swap; persisted workflow and
+  orchestration policy/registry snapshots are revalidated on the current
+  platform before child reconstruction.
+
+### Changed
+
+- Governed processes use captured generation authority, exact-call approval
+  with zero policy delta, and credential outputs that are resolved only for the
+  authorized audience, inserted last, and never persisted in durable sandbox
+  state.
+- Browser control uses governed target FD 3/4 debugging pipes and requires a
+  successful `Browser.getVersion` response within one 15-second launch deadline.
+  Debugging ports, HTTP discovery, CDP WebSockets, and sandbox-disabling switches
+  are not used.
+
+### Removed
+
+- The previous boolean schema, per-call and orchestration selectors,
+  shell-based launcher, live resolver, direct governed spawn/client paths, and
+  translation aliases. Danger is the only raw-host route and is never selected
+  as a fallback from failed confinement.
+
 ## [0.2.11] - 2026-08-13
 
 ### Added
@@ -324,12 +411,10 @@ All notable changes to `rpi` are documented in this file.
   (`repeated failure — stopping; try a different approach or /undo`) instead
   of letting the model retry the failing call forever. Transient
   network/timeout errors never count toward the threshold.
-- Opt-in Linux filesystem sandbox for the `bash` tool (`settings.sandbox` or
-  the per-call `sandboxed` parameter; default off). Commands run inside
-  `unshare` mount/pid/net namespaces confined to `sandbox.allowedPaths`
-  (default: the working directory plus the agent directory), with
-  `sandbox.deniedPaths` hidden and network off unless `sandbox.network` is
-  true. Same-user confinement, not isolation; requires Linux and `unshare`.
+- The release originally introduced an opt-in Linux shell-based sandbox with
+  boolean settings and a per-call selector. That interface was later removed
+  by the sandbox clean cutover documented above; it is historical release
+  context, not a supported schema recommendation.
 - Model Context Protocol (MCP) client: session-scoped stdio servers declared
   under `settings.mcpServers` (Grok-compatible `[mcp_servers.<name>]` shape),
   the `mcp` tool for server discovery and tool calls, and `rpi mcp list` /
@@ -520,7 +605,7 @@ All notable changes to `rpi` are documented in this file.
   Windows) and contain a root-level `rpi` / `rpi.exe` binary plus `LICENSE`.
 - One-line installers (`install.sh`, `install.ps1`) and `rpi update --self`
   download, checksum, smoke-test (`rpi <version>`), and atomically activate
-  those `rpi-*` assets under `PI_HOME` (default `~/.pi-rs`).
+  those `rpi-*` assets under `RPI_HOME` (default `~/.pi-rs`).
 - Workspace package version is `0.2.0`. Manual install from source is
   `cargo install --path crates/pi-cli --locked --bin rpi`.
 - The headless RPC companion binary remains `pi-rpc`. Runtime configuration
@@ -606,6 +691,7 @@ All notable changes to `rpi` are documented in this file.
 - `npm:` package sources are not implemented; attempting to install one fails
   with a clear error.
 
+[1.0.0]: https://github.com/0x8f701/rpi/releases/tag/v1.0.0
 [0.2.11]: https://github.com/0x8f701/rpi/releases/tag/v0.2.11
 [0.2.10]: https://github.com/0x8f701/rpi/releases/tag/v0.2.10
 [0.2.9]: https://github.com/0x8f701/rpi/releases/tag/v0.2.9

@@ -56,19 +56,22 @@ async function main() {
   const browser = await chromium.launch(launchOptions);
   try {
     const page = await browser.newPage();
+    const runtimeErrors = [];
     if (token) {
       await page.addInitScript((t) => { window.localStorage.setItem('rpi-web-token', t); }, token);
     }
     page.on('pageerror', (err) => {
-      console.error(`web-appborder: page error: ${err.message}`);
+      runtimeErrors.push(`pageerror: ${err.message}`);
+    });
+    page.on('console', (message) => {
+      if (message.type() === 'error') runtimeErrors.push(`console: ${message.text()}`);
     });
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await waitFor(page, () => document.title === 'rpi web', 'page title missing');
-    await waitFor(page, () => document.getElementById('conn-state') !== null, 'conn-state missing');
     await waitFor(
       page,
-      () => document.getElementById('conn-state').dataset.state === 'on',
+      () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true,
       'WS did not reach "connected"'
     );
 
@@ -158,10 +161,24 @@ async function main() {
     }
     await page.screenshot({ path: `${evidence}/appborder-rail-collapsed.png`, fullPage: true });
     await page.click('#sidebar-toggle-btn');
+    const todoNavPresence = await page.evaluate(() => ({
+      todo: document.querySelectorAll('#todo-toggle-btn').length,
+      legacyTasks: document.querySelectorAll('#todos-toggle-btn').length,
+      legacyChildren: document.querySelectorAll('#todo-child-toggle-btn').length,
+    }));
+    if (todoNavPresence.todo !== 1 || todoNavPresence.legacyTasks !== 0 || todoNavPresence.legacyChildren !== 0) {
+      fail(`B5: Todo feature-nav presence mismatch: ${JSON.stringify(todoNavPresence)}`);
+    }
 
     // ---- B5: shared ordinary-panel height resizer (desktop) ----
-    await page.click('#todos-toggle-btn');
-    await waitFor(page, () => document.getElementById('todo-panel') !== null, 'B5: todo panel did not open');
+    await page.click('#todo-toggle-btn');
+    await waitFor(page, () => {
+      const panels = document.querySelectorAll('#todo-panel');
+      const panel = panels.length === 1 ? panels[0] : null;
+      return panel !== null
+        && panel.querySelector('.todo-panel__tasks') !== null
+        && panel.querySelector('.todo-child-section') !== null;
+    }, 'B5: unified Todo module did not open with task and child sections');
     await waitFor(
       page,
       () => document.getElementById('panel-drawer-resizer') !== null,
@@ -246,14 +263,19 @@ async function main() {
     await page.screenshot({ path: `${evidence}/appborder-panel-resize.png`, fullPage: true });
 
     await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 });
-    await waitFor(page, () => document.getElementById('conn-state') !== null, 'B5 reload: conn-state missing');
     await waitFor(
       page,
-      () => document.getElementById('conn-state').dataset.state === 'on',
+      () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true,
       'B5 reload: WS did not reach connected'
     );
-    await page.click('#todos-toggle-btn');
-    await waitFor(page, () => document.getElementById('todo-panel') !== null, 'B5 reload: todo panel did not reopen');
+    await page.click('#todo-toggle-btn');
+    await waitFor(page, () => {
+      const panels = document.querySelectorAll('#todo-panel');
+      const panel = panels.length === 1 ? panels[0] : null;
+      return panel !== null
+        && panel.querySelector('.todo-panel__tasks') !== null
+        && panel.querySelector('.todo-child-section') !== null;
+    }, 'B5 reload: unified Todo module did not reopen with task and child sections');
     const afterReload = await page.evaluate((want) => {
       const raw = getComputedStyle(document.documentElement).getPropertyValue('--panel-drawer-height').trim();
       const stored = window.localStorage.getItem('rpi-panel-drawer-size');
@@ -303,6 +325,32 @@ async function main() {
       },
       'B6: #sidebar-collapse-btn did not collapse the desktop rail to the reopen strip'
     );
+    const collapsed = await page.evaluate(() => {
+      const sidebar = document.querySelector('.session-sidebar');
+      const reopen = document.getElementById('rail-reopen-btn');
+      if (!sidebar || !reopen) return null;
+      const visible = Array.from(sidebar.querySelectorAll('*')).filter((element) => {
+        if (element === reopen || reopen.contains(element) || element.contains(reopen)) return false;
+        const style = getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+      }).map((element) => element.id || element.className || element.tagName);
+      const focusable = Array.from(sidebar.querySelectorAll('button, input, select, textarea, a[href], [tabindex]'))
+        .filter((element) => element !== reopen && !reopen.contains(element))
+        .filter((element) => {
+          const style = getComputedStyle(element);
+          const rect = element.getBoundingClientRect();
+          return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0
+            && !(element instanceof HTMLButtonElement || element instanceof HTMLInputElement || element instanceof HTMLSelectElement || element instanceof HTMLTextAreaElement ? element.disabled : false)
+            && element.getAttribute('tabindex') !== '-1';
+        }).map((element) => element.id || element.className || element.tagName);
+      return { visible, focusable, activeInside: sidebar.contains(document.activeElement) && document.activeElement !== reopen };
+    });
+    if (!collapsed) fail('B6: collapsed sidebar DOM missing');
+    if (collapsed.visible.length !== 0) fail(`B6: collapsed rail has visible children besides reopen: ${collapsed.visible.join(', ')}`);
+    if (collapsed.focusable.length !== 0) fail(`B6: collapsed rail has focusable children besides reopen: ${collapsed.focusable.join(', ')}`);
+    if (collapsed.activeInside) fail('B6: collapsed rail retained an active/focus ghost');
+    await page.screenshot({ path: `${evidence}/appborder-sidebar-rail-collapsed.png`, fullPage: true });
     await page.click('#rail-reopen-btn');
     await waitFor(
       page,
@@ -327,6 +375,7 @@ async function main() {
       'B6: header toggle no longer reopens the rail'
     );
     await page.screenshot({ path: `${evidence}/appborder-sidebar-collapse.png`, fullPage: true });
+    if (runtimeErrors.length !== 0) fail(`B6: browser runtime errors: ${runtimeErrors.join(' | ')}`);
 
     // ---- B4: mobile flush edges + zero horizontal overflow + no resizer ----
     await page.setViewportSize({ width: 390, height: 844 });
@@ -344,28 +393,44 @@ async function main() {
       () => document.querySelector('.app-layout--drawer-open') !== null,
       'B4: mobile drawer did not open'
     );
-    // Close any ordinary panel left open so the resizer path is re-exercised
-    // from a clean open (and the drawer nav stays reachable).
     const todoOpen = await page.evaluate(() => document.getElementById('todo-panel') !== null);
     if (todoOpen) {
-      await page.click('#todo-close-btn');
-      await waitFor(page, () => document.getElementById('todo-panel') === null, 'B4: could not close leftover todo panel');
+      await page.evaluate(() => document.getElementById('todo-close-btn')?.click());
+      await waitFor(page, () => document.getElementById('todo-panel') === null,
+        'B4: could not close leftover unified Todo module');
     }
-    await page.click('#todos-toggle-btn');
-    await waitFor(page, () => document.getElementById('todo-panel') !== null, 'B4: mobile todo panel did not open');
+    if (await page.evaluate(() => document.querySelector('.app-layout--drawer-open') === null)) {
+      await page.click('#sidebar-toggle-btn');
+      await waitFor(page, () => document.querySelector('.app-layout--drawer-open') !== null,
+        'B4: mobile drawer did not reopen after Todo cleanup');
+    }
+    await page.click('#todo-toggle-btn');
+    await waitFor(page, () => {
+      const panels = document.querySelectorAll('#todo-panel');
+      const panel = panels.length === 1 ? panels[0] : null;
+      return panel !== null
+        && panel.querySelector('.todo-panel__tasks') !== null
+        && panel.querySelector('.todo-child-section') !== null;
+    }, 'B4: mobile unified Todo module did not open with task and child sections');
     const b4 = await page.evaluate(() => {
       const cs = getComputedStyle(document.querySelector('.app-main'));
       const resizer = document.getElementById('panel-drawer-resizer');
       const resizerDisplay = resizer ? getComputedStyle(resizer).display : 'none';
       const panel = document.getElementById('todo-panel');
-      const panelH = panel ? panel.getBoundingClientRect().height : 0;
+      const box = panel ? panel.getBoundingClientRect() : { height: 0, top: 0 };
+      const root = getComputedStyle(document.documentElement);
+      const headerH = Number.parseFloat(root.getPropertyValue('--app-header-height')) || 0;
+      const footerH = Number.parseFloat(root.getPropertyValue('--app-footer-height')) || 0;
       return {
         borderLeft: cs.borderLeftWidth + ' ' + cs.borderLeftStyle,
         borderRight: cs.borderRightWidth + ' ' + cs.borderRightStyle,
         scrollWidth: document.documentElement.scrollWidth,
         clientWidth: document.documentElement.clientWidth,
         resizerDisplay,
-        panelH,
+        panelH: box.height,
+        panelTop: box.top,
+        headerH,
+        footerH,
         viewH: window.innerHeight,
       };
     });
@@ -377,8 +442,12 @@ async function main() {
     if (b4.resizerDisplay !== 'none') {
       fail(`B4: mobile must hide #panel-drawer-resizer (display="${b4.resizerDisplay}")`);
     }
-    if (Math.abs(b4.panelH - b4.viewH) > 8) {
-      fail(`B4: mobile todo-panel height ${b4.panelH} must fill the viewport (~${b4.viewH})`);
+    const insetH = b4.viewH - b4.headerH - b4.footerH;
+    if (Math.abs(b4.panelH - insetH) > 8) {
+      fail(`B4: mobile todo-panel height ${b4.panelH} must fill the header-to-footer inset (~${insetH}; view ${b4.viewH} header ${b4.headerH} footer ${b4.footerH})`);
+    }
+    if (Math.abs(b4.panelTop - b4.headerH) > 8) {
+      fail(`B4: mobile todo-panel top ${b4.panelTop} must sit under the header (${b4.headerH})`);
     }
     // Mobile Todo overlays the sidebar drawer. Close it and wait for unmount
     // before re-opening/collapsing sidebar controls.
@@ -395,11 +464,11 @@ async function main() {
         'B4: could not re-open mobile drawer for collapse check'
       );
     }
-    await page.click('#sidebar-collapse-btn');
+    await page.click('#sidebar-toggle-btn');
     await waitFor(
       page,
       () => document.querySelector('.app-layout--drawer-open') === null,
-      'B4: mobile #sidebar-collapse-btn did not close the drawer'
+      'B4: mobile hamburger did not close the drawer'
     );
     await page.screenshot({ path: `${evidence}/appborder-mobile.png`, fullPage: true });
 

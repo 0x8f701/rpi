@@ -1,10 +1,13 @@
 use crate::Schema;
-use anyhow::Result;
+use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashMap},
+    fmt,
     future::Future,
+    net::IpAddr,
+    num::{NonZeroU16, NonZeroU64},
     pin::Pin,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -78,8 +81,6 @@ pub enum CacheRetention {
 pub enum Transport {
     #[default]
     Sse,
-    WebSocket,
-    WebSocketCached,
     Auto,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -668,6 +669,297 @@ pub type BeforeProviderHeadersHook =
     Arc<dyn Fn(ProviderHeaders, Model) -> ProviderHookFuture<ProviderHeaders> + Send + Sync>;
 pub type AfterProviderResponseHook =
     Arc<dyn Fn(ProviderResponse, Model) -> ProviderHookFuture<()> + Send + Sync>;
+/// Safe explicit bound on provider request bodies. Provider payloads carry
+/// multimodal content (base64 images) and large reconstructed contexts, so the
+/// bound must cover the full supported vision/large-context scale rather than
+/// cap ordinary text traffic; it mirrors the largest response bound below.
+pub const MAX_HTTP_REQUEST_BODY_BYTES: usize = 256 * 1024 * 1024;
+pub const MAX_HTTP_STREAM_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
+pub const MAX_HTTP_RESPONSE_BODY_BYTES: u64 = 256 * 1024 * 1024;
+/// Upper bound for the time-to-headers attempt timeout, matching the 600s
+/// default (10 minutes). Explicit timeouts up to this documented default
+/// remain valid; the bound keeps millisecond durations safe to materialize.
+pub const MAX_HTTP_ATTEMPT_TIMEOUT_MS: u64 = 600_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum ResolvedHttpScheme {
+    Http,
+    Https,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum ResolvedHttpHost {
+    Dns(String),
+    Ip(IpAddr),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct ResolvedHttpAuthority {
+    scheme: ResolvedHttpScheme,
+    host: ResolvedHttpHost,
+    port: NonZeroU16,
+}
+
+impl ResolvedHttpAuthority {
+    pub fn new(scheme: ResolvedHttpScheme, host: ResolvedHttpHost, port: u16) -> Result<Self> {
+        let port =
+            NonZeroU16::new(port).ok_or_else(|| anyhow!("HTTP authority port must be nonzero"))?;
+        if let ResolvedHttpHost::Dns(name) = &host {
+            validate_resolved_dns_name(name)?;
+        }
+        Ok(Self { scheme, host, port })
+    }
+
+    pub const fn scheme(&self) -> ResolvedHttpScheme {
+        self.scheme
+    }
+
+    pub fn host(&self) -> &ResolvedHttpHost {
+        &self.host
+    }
+
+    pub const fn port(&self) -> u16 {
+        self.port.get()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HttpMethod {
+    Get,
+    Post,
+    Put,
+    Patch,
+    Delete,
+}
+
+pub struct HttpRequest {
+    method: HttpMethod,
+    authority: ResolvedHttpAuthority,
+    path_and_query: String,
+    headers: Vec<(http::HeaderName, http::HeaderValue)>,
+    body: Vec<u8>,
+    timeout_ms: u64,
+    max_response_bytes: NonZeroU64,
+    abort_signal: Option<CancellationToken>,
+}
+
+pub struct HttpRequestParts {
+    pub method: HttpMethod,
+    pub authority: ResolvedHttpAuthority,
+    pub path_and_query: String,
+    pub headers: Vec<(http::HeaderName, http::HeaderValue)>,
+    pub body: Vec<u8>,
+    pub timeout_ms: u64,
+    pub max_response_bytes: NonZeroU64,
+    pub abort_signal: Option<CancellationToken>,
+}
+
+impl HttpRequest {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        method: HttpMethod,
+        authority: ResolvedHttpAuthority,
+        path_and_query: String,
+        mut headers: Vec<(http::HeaderName, http::HeaderValue)>,
+        body: Vec<u8>,
+        timeout_ms: u64,
+        max_response_bytes: u64,
+        abort_signal: Option<CancellationToken>,
+    ) -> Result<Self> {
+        validate_origin_form(&path_and_query)?;
+        if body.len() > MAX_HTTP_REQUEST_BODY_BYTES {
+            bail!("HTTP request body exceeds {MAX_HTTP_REQUEST_BODY_BYTES} bytes");
+        }
+        if !(1..=MAX_HTTP_ATTEMPT_TIMEOUT_MS).contains(&timeout_ms) {
+            bail!("HTTP attempt timeout must be in 1..={MAX_HTTP_ATTEMPT_TIMEOUT_MS} milliseconds");
+        }
+        let max_response_bytes = NonZeroU64::new(max_response_bytes)
+            .filter(|bound| bound.get() <= MAX_HTTP_RESPONSE_BODY_BYTES)
+            .ok_or_else(|| {
+                anyhow!("HTTP response bound must be in 1..={MAX_HTTP_RESPONSE_BODY_BYTES} bytes")
+            })?;
+        validate_request_headers(&mut headers)?;
+        Ok(Self {
+            method,
+            authority,
+            path_and_query,
+            headers,
+            body,
+            timeout_ms,
+            max_response_bytes,
+            abort_signal,
+        })
+    }
+
+    pub fn into_parts(self) -> HttpRequestParts {
+        HttpRequestParts {
+            method: self.method,
+            authority: self.authority,
+            path_and_query: self.path_and_query,
+            headers: self.headers,
+            body: self.body,
+            timeout_ms: self.timeout_ms,
+            max_response_bytes: self.max_response_bytes,
+            abort_signal: self.abort_signal,
+        }
+    }
+}
+
+impl fmt::Debug for HttpRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HttpRequest")
+            .field("method", &self.method)
+            .field("authority", &self.authority)
+            .field("path_and_query", &"[REDACTED]")
+            .field("header_count", &self.headers.len())
+            .field("body_bytes", &self.body.len())
+            .field("timeout_ms", &self.timeout_ms)
+            .field("max_response_bytes", &self.max_response_bytes)
+            .finish()
+    }
+}
+
+impl fmt::Debug for HttpRequestParts {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HttpRequestParts")
+            .field("method", &self.method)
+            .field("authority", &self.authority)
+            .field("path_and_query", &"[REDACTED]")
+            .field("header_count", &self.headers.len())
+            .field("body_bytes", &self.body.len())
+            .field("timeout_ms", &self.timeout_ms)
+            .field("max_response_bytes", &self.max_response_bytes)
+            .finish()
+    }
+}
+
+pub type HttpResponseBody =
+    Pin<Box<dyn futures_util::Stream<Item = Result<Vec<u8>>> + Send + 'static>>;
+
+pub struct HttpResponse {
+    status: http::StatusCode,
+    headers: http::HeaderMap,
+    body: HttpResponseBody,
+}
+
+impl HttpResponse {
+    pub fn new(status: http::StatusCode, headers: http::HeaderMap, body: HttpResponseBody) -> Self {
+        Self {
+            status,
+            headers,
+            body,
+        }
+    }
+
+    pub const fn status(&self) -> http::StatusCode {
+        self.status
+    }
+
+    pub fn headers(&self) -> &http::HeaderMap {
+        &self.headers
+    }
+
+    pub fn into_body(self) -> HttpResponseBody {
+        self.body
+    }
+}
+
+impl fmt::Debug for HttpResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HttpResponse")
+            .field("status", &self.status)
+            .field("header_count", &self.headers.len())
+            .finish_non_exhaustive()
+    }
+}
+
+pub trait HttpExecutor: Send + Sync {
+    fn execute<'a>(
+        &'a self,
+        request: HttpRequest,
+    ) -> futures_util::future::BoxFuture<'a, Result<HttpResponse>>;
+}
+
+pub type SharedHttpExecutor = Arc<dyn HttpExecutor>;
+pub type ResolveHttpAuthoritiesFn = Arc<
+    dyn Fn(&Model, &StreamOptions) -> Result<std::collections::BTreeSet<ResolvedHttpAuthority>>
+        + Send
+        + Sync,
+>;
+
+fn validate_resolved_dns_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 253
+        || name.ends_with('.')
+        || name.parse::<IpAddr>().is_ok()
+        || !name.is_ascii()
+        || name
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_uppercase())
+    {
+        bail!("invalid resolved HTTP DNS authority");
+    }
+    for label in name.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            bail!("invalid resolved HTTP DNS authority");
+        }
+    }
+    Ok(())
+}
+
+fn validate_origin_form(target: &str) -> Result<()> {
+    if !target.starts_with('/')
+        || target.starts_with("//")
+        || target.contains('#')
+        || target
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte == b' ')
+    {
+        bail!("HTTP request target must be bounded origin-form");
+    }
+    Ok(())
+}
+
+fn validate_request_headers(headers: &mut [(http::HeaderName, http::HeaderValue)]) -> Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    for (name, value) in headers {
+        let key = name.as_str();
+        if matches!(
+            key,
+            "host"
+                | "proxy-authorization"
+                | "proxy-connection"
+                | "forwarded"
+                | "x-forwarded-for"
+                | "x-forwarded-host"
+                | "x-forwarded-proto"
+                | "connection"
+                | "keep-alive"
+                | "te"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
+                | "content-length"
+        ) {
+            bail!("HTTP request contains a forbidden transport header");
+        }
+        if !seen.insert(key.to_owned()) {
+            bail!("HTTP request contains a duplicate header");
+        }
+        value.set_sensitive(true);
+    }
+    Ok(())
+}
 #[derive(Clone, Default)]
 pub struct StreamOptions {
     pub temperature: Option<f64>,
@@ -683,12 +975,12 @@ pub struct StreamOptions {
     pub after_provider_response: Option<AfterProviderResponseHook>,
     pub headers: HashMap<String, String>,
     pub timeout_ms: Option<u64>,
-    pub websocket_connect_timeout_ms: Option<u64>,
     pub max_retries: usize,
     pub max_retry_delay_ms: Option<u64>,
     pub metadata: Option<Value>,
     pub env: HashMap<String, String>,
     pub abort_signal: Option<CancellationToken>,
+    pub http_executor: Option<SharedHttpExecutor>,
 }
 impl std::fmt::Debug for StreamOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -699,10 +991,6 @@ impl std::fmt::Debug for StreamOptions {
             .field("cache_retention", &self.cache_retention)
             .field("session_id", &self.session_id)
             .field("timeout_ms", &self.timeout_ms)
-            .field(
-                "websocket_connect_timeout_ms",
-                &self.websocket_connect_timeout_ms,
-            )
             .field("max_retries", &self.max_retries)
             .finish()
     }
@@ -782,6 +1070,7 @@ pub struct ImageGenerationOptions {
     pub max_retry_delay_ms: Option<u64>,
     pub env: HashMap<String, String>,
     pub abort_signal: Option<CancellationToken>,
+    pub http_executor: Option<SharedHttpExecutor>,
 }
 
 impl std::fmt::Debug for ImageGenerationOptions {
@@ -791,7 +1080,10 @@ impl std::fmt::Debug for ImageGenerationOptions {
             .field("n", &self.n)
             .field("size", &self.size)
             .field("base_url", &self.base_url)
-            .field("has_api_key", &self.api_key.as_ref().is_some_and(|k| !k.trim().is_empty()))
+            .field(
+                "has_api_key",
+                &self.api_key.as_ref().is_some_and(|k| !k.trim().is_empty()),
+            )
             .field("header_count", &self.headers.len())
             .field("timeout_ms", &self.timeout_ms)
             .field("max_retries", &self.max_retries)
@@ -1040,16 +1332,28 @@ mod tests {
             "role":"branchSummary", "summary":"legacy", "fromId":"root", "timestamp":1
         }))
         .expect("deserialize legacy branch summary");
-        assert!(matches!(legacy_branch, Message::BranchSummary(BranchSummaryMessage {
-            details: None, usage: None, from_hook: None, ..
-        })));
+        assert!(matches!(
+            legacy_branch,
+            Message::BranchSummary(BranchSummaryMessage {
+                details: None,
+                usage: None,
+                from_hook: None,
+                ..
+            })
+        ));
         let legacy_compaction: Message = serde_json::from_value(serde_json::json!({
             "role":"compactionSummary", "summary":"legacy", "tokensBefore":7, "timestamp":2
         }))
         .expect("deserialize legacy compaction summary");
-        assert!(matches!(legacy_compaction, Message::CompactionSummary(CompactionSummaryMessage {
-            details: None, usage: None, from_hook: None, ..
-        })));
+        assert!(matches!(
+            legacy_compaction,
+            Message::CompactionSummary(CompactionSummaryMessage {
+                details: None,
+                usage: None,
+                from_hook: None,
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -23,6 +23,7 @@
 
 import { chromium } from 'playwright';
 import fs from 'node:fs';
+import { assertSidebarNewActionAbsent, createFreshSessionViaManage } from './lib/session-lifecycle.mjs';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
@@ -48,6 +49,48 @@ async function waitFor(page, fn, label, timeoutMs = 25000, arg) {
     fail(`${label} (timeout ${timeoutMs}ms)`);
   }
 }
+function observePageErrors(page, label, pageErrors, consoleErrors) {
+  page.on('pageerror', (error) => pageErrors.push(`${label}: ${error.message}`));
+  page.on('console', (message) => {
+    if (message.type() === 'error') consoleErrors.push(`${label}: ${message.text()}`);
+  });
+}
+
+function observeTurnFrames(page) {
+  const starts = [];
+  const terminals = new Map();
+  const terminalWaiters = new Map();
+  page.on('websocket', (socket) => {
+    socket.on('framereceived', (frame) => {
+      let event;
+      try { event = JSON.parse(String(frame.payload)); } catch { return; }
+      if (event?.type === 'turn_started' && typeof event.sessionId === 'string' && typeof event.turnId === 'string') {
+        starts.splice(0).forEach((resolve) => resolve({ sessionId: event.sessionId, turnId: event.turnId }));
+      }
+      if (event?.type === 'turn_terminal' && typeof event.sessionId === 'string' && typeof event.turnId === 'string') {
+        const key = `${event.sessionId}:${event.turnId}`;
+        terminals.set(key, event.status);
+        const waiters = terminalWaiters.get(key) || [];
+        terminalWaiters.delete(key);
+        for (const resolve of waiters) resolve(event.status);
+      }
+    });
+  });
+  return {
+    nextStart: () => new Promise((resolve) => starts.push(resolve)),
+    waitForTerminal: (sessionId, turnId, timeoutMs = 30000) => {
+      const key = `${sessionId}:${turnId}`;
+      const existing = terminals.get(key);
+      if (existing !== undefined) return Promise.resolve(existing);
+      return new Promise((resolve, reject) => {
+        const waiters = terminalWaiters.get(key) || [];
+        waiters.push(resolve);
+        terminalWaiters.set(key, waiters);
+        setTimeout(() => reject(new Error(`turn ${turnId} did not settle`)), timeoutMs);
+      });
+    },
+  };
+}
 
 async function lastAssistantText(page) {
   return page.evaluate(() => {
@@ -56,30 +99,211 @@ async function lastAssistantText(page) {
   });
 }
 
+const LIVE_WORKFLOW_STATUSES = new Set(['queued', 'planning', 'running', 'paused', 'integrating']);
+const DELIVERY_OUTCOMES = new Set(['queued', 'woken', 'revived', 'processed', 'failed']);
+
+function rpcClient(page, wsUrl) {
+  let sequence = 0;
+  return {
+    ready: Promise.resolve(),
+    call(command) {
+      const id = `workflow-e2e-${++sequence}`;
+      return page.evaluate(
+        ({ wsUrl: target, token: authToken, command: request, id: requestId }) => new Promise((resolve, reject) => {
+          const sessionId = document.querySelector('.session-sidebar__row--active .session-sidebar__switch')?.dataset.sessionId || '';
+          if (!sessionId) {
+            reject(new Error('active sessionId missing for workflow RPC'));
+            return;
+          }
+          const protocols = authToken ? [`rpi-auth.${authToken}`] : [];
+          const ws = new WebSocket(target, protocols);
+          const timer = window.setTimeout(() => {
+            ws.close();
+            reject(new Error(`rpc timed out: ${request.type}`));
+          }, 30000);
+          ws.addEventListener('open', () => ws.send(JSON.stringify({ ...request, sessionId, id: requestId })));
+          ws.addEventListener('message', (event) => {
+            let frame;
+            try {
+              frame = JSON.parse(String(event.data));
+            } catch {
+              return;
+            }
+            if (frame?.type !== 'response' || frame.id !== requestId) return;
+            window.clearTimeout(timer);
+            ws.close();
+            if (frame.success) resolve(frame.data || {});
+            else reject(new Error(frame.error || 'rpc failed'));
+          });
+          ws.addEventListener('error', () => {
+            window.clearTimeout(timer);
+            reject(new Error(`rpc transport failed: ${request.type}`));
+          });
+        }),
+        { wsUrl, token, command, id }
+      );
+    },
+    close() {},
+  };
+}
+
+function requireWorkflowSnapshot(value, expectedName, label) {
+  if (!value || typeof value !== 'object') fail(`${label}: backend returned no workflow snapshot`);
+  const snapshot = value;
+  if (typeof snapshot.workflowId !== 'string' || snapshot.workflowId === '') fail(`${label}: workflowId missing`);
+  if (snapshot.name !== expectedName) fail(`${label}: expected name ${expectedName}, got ${JSON.stringify(snapshot.name)}`);
+  if (!Number.isSafeInteger(snapshot.generation) || snapshot.generation < 1) fail(`${label}: generation must be a positive integer`);
+  if (typeof snapshot.worktree !== 'string' || snapshot.worktree === '') fail(`${label}: projected worktree label missing`);
+  if (typeof snapshot.branch !== 'string' || snapshot.branch === '') fail(`${label}: projected branch missing`);
+  if (snapshot.worktree.startsWith('/') || snapshot.worktree.startsWith('\\')) fail(`${label}: worktree projection leaked an absolute path`);
+  if (!snapshot.branch.includes(snapshot.workflowId)) fail(`${label}: branch does not carry its workflowId: ${snapshot.branch}`);
+  if (!LIVE_WORKFLOW_STATUSES.has(snapshot.status)) fail(`${label}: workflow is not live: ${snapshot.status}`);
+  return snapshot;
+}
+
+async function waitForWorkflowSnapshot(rpc, workflowId, expectedName, label) {
+  const deadline = Date.now() + 30000;
+  let last = 'snapshot missing';
+  while (Date.now() < deadline) {
+    try {
+      const snapshot = await rpc.call({ type: 'workflow_get', workflowId });
+      if (
+        snapshot?.workflowId === workflowId && snapshot.name === expectedName &&
+        Number.isSafeInteger(snapshot.generation) && snapshot.generation > 0 &&
+        typeof snapshot.worktree === 'string' && snapshot.worktree !== '' &&
+        typeof snapshot.branch === 'string' && snapshot.branch !== '' &&
+        LIVE_WORKFLOW_STATUSES.has(snapshot.status)
+      ) return requireWorkflowSnapshot(snapshot, expectedName, label);
+      last = JSON.stringify(snapshot);
+    } catch (err) {
+      last = err instanceof Error ? err.message : String(err);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+  fail(`${label}: workflow never returned live with worktree evidence: ${last}`);
+}
+
+function requireTypedReceipt(value, snapshot, expectedRecipient, expectedOutcome, label) {
+  if (value?.workflowId !== snapshot.workflowId || value?.generation !== snapshot.generation) {
+    fail(`${label}: receipt envelope identity mismatch: ${JSON.stringify(value)}`);
+  }
+  if (value.recipient !== expectedRecipient || !Array.isArray(value.receipts) || value.receipts.length !== 1) {
+    fail(`${label}: malformed receipt envelope: ${JSON.stringify(value)}`);
+  }
+  const receipt = value.receipts[0];
+  if (typeof receipt.to !== 'string' || !DELIVERY_OUTCOMES.has(receipt.outcome)) {
+    fail(`${label}: receipt is not typed: ${JSON.stringify(receipt)}`);
+  }
+  if (expectedOutcome === 'delivered' && receipt.outcome === 'failed') fail(`${label}: delivery failed: ${JSON.stringify(receipt)}`);
+  if (expectedOutcome === 'failed' && (receipt.outcome !== 'failed' || typeof receipt.error !== 'string' || receipt.error === '')) {
+    fail(`${label}: expected a typed failed receipt with an error: ${JSON.stringify(receipt)}`);
+  }
+  if (typeof receipt.messageId !== 'string' || receipt.messageId === '') fail(`${label}: receipt messageId missing`);
+  return receipt;
+}
+
+async function requireRpcFailure(promise, label) {
+  try {
+    await promise;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (!message.includes('stale') || !message.includes('generation')) {
+      fail(`${label}: wrong error ${JSON.stringify(message)}`);
+    }
+    return;
+  }
+  fail(`${label}: RPC unexpectedly succeeded`);
+}
+
+async function waitForWorkflowDetail(rpc, snapshot, label) {
+  const deadline = Date.now() + 30000;
+  let lastError = 'detail was never returned';
+  while (Date.now() < deadline) {
+    try {
+      const detail = await rpc.call({ type: 'workflow_detail', workflowId: snapshot.workflowId });
+      const todoTasks = Array.isArray(detail.todo)
+        ? detail.todo.flatMap((phase) => Array.isArray(phase?.tasks) ? phase.tasks : [])
+        : [];
+      if (
+        detail.id === snapshot.workflowId &&
+        detail.generation === snapshot.generation &&
+        detail.name === snapshot.name &&
+        detail.objective === snapshot.objective &&
+        LIVE_WORKFLOW_STATUSES.has(detail.status) &&
+        detail.worktree?.label === snapshot.worktree &&
+        detail.worktree?.branch === snapshot.branch &&
+        typeof detail.supervisor?.name === 'string' && detail.supervisor.name !== '' &&
+        Array.isArray(detail.planningActivity) && detail.planningActivity.length > 0 &&
+        todoTasks.length > 0 &&
+        Array.isArray(detail.subagents) && detail.subagents.length > 0 &&
+        Array.isArray(detail.jobs) && detail.jobs.length > 0 &&
+        Array.isArray(detail.activeTasks) && detail.activeTasks.length > 0
+      ) return detail;
+      lastError = JSON.stringify(detail);
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+  fail(`${label}: live supervisor/workers/tasks/planning detail never converged: ${lastError}`);
+}
+
+function requireWorkflowDetailIsolation(alpha, beta, alphaDetail, betaDetail) {
+  const alphaEncoded = JSON.stringify(alphaDetail);
+  const betaEncoded = JSON.stringify(betaDetail);
+  for (const marker of [beta.workflowId, beta.name, beta.objective, beta.worktree, beta.branch]) {
+    if (alphaEncoded.includes(marker)) fail(`workflow alpha detail crossed with beta marker ${marker}`);
+  }
+
+  for (const marker of [alpha.workflowId, alpha.name, alpha.objective, alpha.worktree, alpha.branch]) {
+    if (betaEncoded.includes(marker)) fail(`workflow beta detail crossed with alpha marker ${marker}`);
+  }
+  const alphaIdentity = `${alpha.workflowId}@${alpha.generation}`;
+  const betaIdentity = `${beta.workflowId}@${beta.generation}`;
+  if (alphaIdentity === betaIdentity) fail(`workflow runtime identities collided: ${alphaIdentity}`);
+}
+async function waitForWorkflowIrc(rpc, workflow, text, label) {
+  const deadline = Date.now() + 30000;
+  let last = 'detail missing';
+  while (Date.now() < deadline) {
+    try {
+      const detail = await rpc.call({ type: 'workflow_detail', workflowId: workflow.workflowId });
+      const identityMatches = detail.id === workflow.workflowId && detail.generation === workflow.generation;
+      const messages = Array.isArray(detail.recentIrc) ? detail.recentIrc : [];
+      if (identityMatches && (text === null || messages.some((message) => message.text.includes(text)))) return detail;
+      last = JSON.stringify(detail);
+    } catch (err) {
+      last = err instanceof Error ? err.message : String(err);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+  fail(`${label}: exact workflow IRC detail never appeared: ${last}`);
+}
+
 async function main() {
   if (!url) fail('RPI_URL is required');
   const launchOptions = chromePath
     ? { executablePath: chromePath }
     : {};
   const browser = await chromium.launch(launchOptions);
+  let rpc;
   try {
     const page = await browser.newPage();
     if (token) {
       await page.addInitScript((t) => { window.localStorage.setItem('rpi-web-token', t); }, token);
     }
-    page.on('pageerror', (err) => {
-      console.error(`web: page error: ${err.message}`);
-    });
+    const pageErrors = [];
+    const consoleErrors = [];
+    observePageErrors(page, 'desktop', pageErrors, consoleErrors);
+    const turnFrames = observeTurnFrames(page);
 
     // 1. Page loads: GET /web serves the self-contained client.
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await waitFor(page, () => document.title === 'rpi web', 'page title missing');
-    await waitFor(page, () => document.querySelector('#conn-state') !== null, 'conn-state missing');
-
     // 2. WS connects via boot localStorage token (rpi-auth.<token>).
     await waitFor(
       page,
-      () => document.getElementById('conn-state').dataset.state === 'on',
+      () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true,
       'WS did not reach "connected" (wrong token or listener?)'
     );
 
@@ -89,8 +313,8 @@ async function main() {
     await waitFor(page, (tail) => document.body.textContent.includes(tail), 'full slow reply never streamed into the DOM', 30000, slowTail);
     await waitFor(
       page,
-      () => document.getElementById('stream-badge').hidden === true,
-      'streaming badge did not clear after the reply completed'
+      () => document.getElementById('activity-strip') === null,
+      'activity strip did not unmount after the reply completed'
     );
     await page.screenshot({ path: `${evidence}/roundtrip.png`, fullPage: true });
 
@@ -98,6 +322,11 @@ async function main() {
     await page.fill('#prompt-input', 'again');
     await page.press('#prompt-input', 'Enter');
     await waitFor(page, (reply) => document.body.textContent.includes(reply), 'fast reply never streamed into the DOM', 30000, fastReply);
+    await waitFor(
+      page,
+      () => document.getElementById('send-btn')?.getAttribute('aria-label') === 'Send message',
+      'composer not idle after the fast reply',
+    );
 
     // 4. Unified Stop action aborts the slow stream (request 3) mid-flight.
     await page.fill('#prompt-input', 'stream a long answer');
@@ -111,8 +340,8 @@ async function main() {
     await page.click('#send-btn');
     await waitFor(
       page,
-      () => document.getElementById('stream-badge').hidden === true,
-      'streaming badge did not clear after abort'
+      () => document.getElementById('activity-strip') === null,
+      'activity strip did not unmount after abort'
     );
     const abortedText = await lastAssistantText(page);
     if (abortedText.includes(abortedTail)) {
@@ -142,10 +371,18 @@ async function main() {
       assistantCountBeforeRecovery
     );
 
-    // 5. Todo DAG panel: open it, add a task (todo_op append), complete it
-    //    (todo_op done), reopen it (todo_op start), assert panel state.
-    await page.click('#todos-toggle-btn');
-    await waitFor(page, () => document.getElementById('todo-panel') !== null, 'todo panel did not open');
+    // 5. Unified Todo module: open it, add a task (todo_op append), complete
+    //    it (todo_op done), reopen it (todo_op start), assert panel state.
+    await page.click('#todo-toggle-btn');
+    await waitFor(page, () => {
+      const panels = document.querySelectorAll('#todo-panel');
+      const panel = panels.length === 1 ? panels[0] : null;
+      return panel !== null
+        && panel.querySelector('.todo-panel__tasks') !== null
+        && panel.querySelector('.todo-child-section') !== null;
+    }, 'Unified Todo module did not open with task and child sections');
+    if (await page.$('#todos-toggle-btn')) fail('legacy todos-toggle-btn rendered');
+    if (await page.$('#todo-child-toggle-btn')) fail('legacy todo-child-toggle-btn rendered');
     await page.fill('#todo-add-phase', 'Plan');
     await page.fill('#todo-add-content', 'web e2e task');
     await page.click('#todo-add-btn');
@@ -299,8 +536,9 @@ async function main() {
     if (token) {
       await mobilePage.addInitScript((t) => { window.localStorage.setItem('rpi-web-token', t); }, token);
     }
+    observePageErrors(mobilePage, 'mobile', pageErrors, consoleErrors);
     await mobilePage.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
-    await waitFor(mobilePage, () => document.getElementById('conn-state')?.dataset.state === 'on', 'mobile WS did not connect');
+    await waitFor(mobilePage, () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true, 'mobile WS did not connect');
     // Panel toggles live inside the session-sidebar drawer on phones.
     await mobilePage.click('#sidebar-toggle-btn');
     await waitFor(
@@ -308,8 +546,14 @@ async function main() {
       () => document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open'),
       'mobile sidebar drawer never opened'
     );
-    await mobilePage.click('#todos-toggle-btn');
-    await waitFor(mobilePage, () => document.getElementById('todo-panel') !== null, 'mobile todo panel did not open');
+    await mobilePage.click('#todo-toggle-btn');
+    await waitFor(mobilePage, () => {
+      const panels = document.querySelectorAll('#todo-panel');
+      const panel = panels.length === 1 ? panels[0] : null;
+      return panel !== null
+        && panel.querySelector('.todo-panel__tasks') !== null
+        && panel.querySelector('.todo-child-section') !== null;
+    }, 'mobile unified Todo module did not open with task and child sections');
     const mobileLayout = await mobilePage.evaluate(() => {
       const countsEl = document.getElementById('todo-counts');
       const closeBtn = document.getElementById('todo-close-btn');
@@ -406,7 +650,7 @@ async function main() {
           if (nodes.length <= b) return false;
           if (document.querySelector('table.md-table')) return true; // rich reply rendered
           // A different reply settled (parity/retry fallback): signal retry.
-          return document.getElementById('stream-badge')?.hidden === true;
+          return document.getElementById('activity-strip') === null;
         },
         'rich prompt never produced a reply',
         30000,
@@ -450,50 +694,204 @@ async function main() {
     }
     await page.screenshot({ path: `${evidence}/rich.png`, fullPage: true });
 
-    // 7. Workflow panel: create a workflow, assert it appears with a live
-    //    status, then cancel it and assert the cancelled status in the list.
-    //    Step 5 left the Todo panel open; it overlays the header, so close it
-    //    first (the single `activePanel` state shows one panel at a time).
-    await page.click('#todo-close-btn');
-    await waitFor(page, () => document.getElementById('todo-panel') === null, 'todo panel did not close');
+    // 7. Workflow panel: two real concurrent workflow runtimes must stay live
+    //    together with backend-projected identities, worktrees, and detail.
     await page.click('#workflow-toggle-btn');
-    await waitFor(page, () => document.getElementById('workflow-panel') !== null, 'workflow panel did not open');
-    await page.fill('#workflow-create-name', 'web-e2e-workflow');
-    await page.fill('#workflow-create-objective', 'created from the browser e2e');
-    await page.click('#workflow-create-btn');
+    await waitFor(
+      page,
+      () => document.getElementById('todo-panel') === null && document.getElementById('workflow-panel') !== null,
+      'Todo module did not close when workflow panel opened'
+    );
+    const wsUrl = url.replace(/^http/, 'ws').replace(/\/web\/?$/, '/ws');
+    rpc = rpcClient(page, wsUrl);
+    await rpc.ready;
+    const [alphaCreated, betaCreated] = await Promise.all([
+      rpc.call({ type: 'workflow_create', name: 'web-e2e-workflow-alpha', objective: 'alpha browser workflow objective' }),
+      rpc.call({ type: 'workflow_create', name: 'web-e2e-workflow-beta', objective: 'beta browser workflow objective' }),
+    ]);
+    if (!alphaCreated?.workflowId || !betaCreated?.workflowId) fail('concurrent workflow create response omitted workflowId');
+    const [alpha, beta] = await Promise.all([
+      waitForWorkflowSnapshot(rpc, alphaCreated.workflowId, 'web-e2e-workflow-alpha', 'workflow alpha create'),
+      waitForWorkflowSnapshot(rpc, betaCreated.workflowId, 'web-e2e-workflow-beta', 'workflow beta create'),
+    ]);
+    if (alpha.workflowId === beta.workflowId) fail(`concurrent workflows shared workflowId ${alpha.workflowId}`);
+    if (`${alpha.workflowId}@${alpha.generation}` === `${beta.workflowId}@${beta.generation}`) fail('concurrent workflow identity tuples collided');
+    if (alpha.worktree === beta.worktree) fail(`concurrent workflows shared worktree ${alpha.worktree}`);
+    if (alpha.branch === beta.branch) fail(`concurrent workflows shared branch ${alpha.branch}`);
+
+    await waitFor(
+      page,
+      (names) => names.every((name) => {
+        const row = [...document.querySelectorAll('.workflow-row')].find((candidate) =>
+          (candidate.querySelector('.workflow-row__name')?.textContent || '') === name
+        );
+        return !!row && ['queued', 'planning', 'running', 'paused', 'integrating'].includes(row.dataset.status || '');
+      }),
+      'both concurrent workflows were not simultaneously live in the panel',
+      30000,
+      [alpha.name, beta.name]
+    );
+    const listed = await rpc.call({ type: 'workflow_list' });
+    const listedById = new Map((listed.workflows || []).map((workflow) => [workflow.workflowId, workflow]));
+    for (const workflow of [alpha, beta]) {
+      const row = listedById.get(workflow.workflowId);
+      if (!row || row.generation !== workflow.generation || row.worktree !== workflow.worktree || row.branch !== workflow.branch) {
+        fail(`workflow list lost exact backend identity for ${workflow.name}: ${JSON.stringify(row)}`);
+      }
+      if (!LIVE_WORKFLOW_STATUSES.has(row.status)) fail(`workflow list no longer shows ${workflow.name} live: ${row.status}`);
+    }
+
+    const [alphaDetail, betaDetail] = await Promise.all([
+      waitForWorkflowDetail(rpc, alpha, 'workflow alpha detail'),
+      waitForWorkflowDetail(rpc, beta, 'workflow beta detail'),
+    ]);
+    requireWorkflowDetailIsolation(alpha, beta, alphaDetail, betaDetail);
+    const extractJobIds = (detail, label) => {
+      if (!Array.isArray(detail.jobs)) fail(`${label}: jobs array missing`);
+      const ids = detail.jobs.map((job) => job.jobId);
+      for (const id of ids) {
+        if (typeof id !== 'string' || id.trim() === '') fail(`${label}: extracted job ID is not a non-empty string`);
+      }
+      if (ids.length === 0) fail(`${label}: expected at least one job ID`);
+      if (new Set(ids).size !== ids.length) fail(`${label}: duplicate job IDs ${JSON.stringify(ids)}`);
+      return new Set(ids);
+    };
+    const alphaJobIds = extractJobIds(alphaDetail, 'workflow alpha');
+    const betaJobIds = extractJobIds(betaDetail, 'workflow beta');
+    for (const id of alphaJobIds) {
+      if (betaJobIds.has(id)) fail(`workflow job IDs crossed A/B ownership: ${id}`);
+    }
+
+    await page.evaluate((workflowId) => {
+      const row = document.querySelector(`[data-workflow-id="${workflowId}"]`);
+      if (!row) throw new Error(`workflow row ${workflowId} missing`);
+      row.click();
+    }, alpha.workflowId);
+    await waitFor(
+      page,
+      (identity) => {
+        const meta = document.querySelector('.workflow-detail__meta')?.textContent || '';
+        return meta.includes(identity.workflowId) && meta.includes(`gen ${identity.generation}`)
+          && document.querySelector('[aria-label="Supervisor"] .workflow-actor') !== null
+          && document.querySelector('#workflow-detail-activity .workflow-feed__item') !== null
+          && document.querySelector('#workflow-detail-tasks .workflow-task') !== null
+          && document.querySelector('#workflow-detail-workers .workflow-worker') !== null;
+      },
+      'alpha supervisor/planning/tasks/workers were not visible together',
+      30000,
+      alpha
+    );
+
+    const delivered = await rpc.call({
+      type: 'workflow_hub_send', workflowId: alpha.workflowId, generation: alpha.generation,
+      recipient: alphaDetail.supervisor.name, body: 'alpha ownership receipt',
+    });
+    const alphaAfterIrc = await waitForWorkflowIrc(
+      rpc, alpha, 'alpha ownership receipt', 'workflow alpha detail after IRC'
+    );
+    const betaAfterAlphaIrc = await waitForWorkflowIrc(
+      rpc, beta, null, 'workflow beta detail after alpha IRC'
+    );
+    if (!(alphaAfterIrc.recentIrc || []).some((message) => message.text.includes('alpha ownership receipt'))) {
+      fail('workflow alpha detail omitted its delivered IRC');
+    }
+    if ((betaAfterAlphaIrc.recentIrc || []).some((message) => message.text.includes('alpha ownership receipt'))) {
+      fail('workflow alpha IRC crossed into beta detail');
+    }
+    requireTypedReceipt(delivered, alpha, alphaDetail.supervisor.name, 'delivered', 'workflow alpha delivery');
+    await requireRpcFailure(
+      rpc.call({
+        type: 'workflow_hub_send', workflowId: alpha.workflowId, generation: alpha.generation + 1,
+        recipient: alphaDetail.supervisor.name, body: 'stale generation must fail',
+      }),
+      'workflow stale-generation send'
+    );
+    const failedReceipt = await rpc.call({
+      type: 'workflow_hub_send', workflowId: alpha.workflowId, generation: alpha.generation,
+      recipient: 'missing-workflow-recipient', body: 'must fail visibly',
+    });
+    requireTypedReceipt(failedReceipt, alpha, 'missing-workflow-recipient', 'failed', 'workflow alpha failed delivery');
+    await waitFor(
+      page,
+      (body) => [...document.querySelectorAll('.workflow-irc__item')].some((item) => (item.textContent || '').includes(body)),
+      'workflow IRC history never rendered the sent alpha message',
+      30000,
+      'alpha ownership receipt'
+    );
+    await page.evaluate(() => {
+      const select = document.querySelector('.workflow-irc__recipient');
+      if (!select) throw new Error('workflow recipient select missing');
+      const option = document.createElement('option');
+      option.value = 'missing-workflow-recipient';
+      option.textContent = 'missing-workflow-recipient';
+      select.append(option);
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'value').set;
+      setter.call(select, option.value);
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await page.fill('.workflow-irc__body', 'visible failed workflow receipt');
+    await waitFor(page, () => document.querySelector('.workflow-irc__send')?.disabled === false, 'failed-receipt send button never enabled');
+    await page.click('.workflow-irc__send');
     await waitFor(
       page,
       () => {
-        const rows = [...document.querySelectorAll('.workflow-row')];
-        return rows.some((row) => row.textContent.includes('web-e2e-workflow'));
+        const receipt = document.querySelector('.workflow-irc__receipt--failed');
+        return !!receipt && (receipt.querySelector('.workflow-irc__receipt-error')?.textContent || '').trim() !== '';
       },
-      'created workflow never appeared in the workflow list',
+      'workflow panel never rendered the typed failed receipt and visible error',
       30000
     );
-    const workflowStatus = () =>
-      page.evaluate(() => {
-        const rows = [...document.querySelectorAll('.workflow-row')];
-        const row = rows.find((r) => r.textContent.includes('web-e2e-workflow'));
-        if (!row) return '';
-        return row.getAttribute('data-status') || '';
-      });
-    const createdStatus = await workflowStatus();
-    if (!['queued', 'planning', 'running', 'paused', 'integrating'].includes(createdStatus)) {
-      fail(`created workflow must be live (queued/planning/running/paused/integrating), got "${createdStatus}"`);
-    }
-    // The created workflow is auto-selected; cancel it from the detail pane.
-    await page.click('#workflow-cancel-btn');
     await waitFor(
       page,
-      async () => {
-        const rows = [...document.querySelectorAll('.workflow-row')];
-        const row = rows.find((r) => r.textContent.includes('web-e2e-workflow'));
-        return !!row && row.getAttribute('data-status') === 'cancelled';
+      (state) => {
+        const liveRows = state.names.every((name) => {
+          const row = [...document.querySelectorAll('.workflow-row')].find((candidate) =>
+            (candidate.querySelector('.workflow-row__name')?.textContent || '') === name
+          );
+          return !!row && ['queued', 'planning', 'running', 'paused', 'integrating'].includes(row.dataset.status || '');
+        });
+        const detailMeta = document.querySelector('.workflow-detail__meta')?.textContent || '';
+        return liveRows && detailMeta.includes(state.workflowId)
+          && document.querySelector('#workflow-detail-workers .workflow-worker') !== null
+          && document.querySelector('.workflow-irc__item') !== null
+          && document.querySelector('.workflow-irc__receipt--failed .workflow-irc__receipt-error') !== null;
       },
-      'cancel never applied (status never reached cancelled)',
-      30000
+      'workflow screenshot state lost dual-live detail/worker/IRC evidence',
+      30000,
+      { names: [alpha.name, beta.name], workflowId: alpha.workflowId }
     );
-    await page.screenshot({ path: `${evidence}/workflow.png`, fullPage: true });
+    fs.mkdirSync(evidence, { recursive: true });
+    const workflowEvidenceName = 'workflow-concurrent-live-detail-workers-irc.png';
+    await page.screenshot({ path: `${evidence}/${workflowEvidenceName}`, fullPage: true });
+    console.log(`web: workflow concurrent evidence=${workflowEvidenceName}`);
+
+    await rpc.call({ type: 'workflow_cancel', workflowId: alpha.workflowId });
+    const betaAfterCancel = await waitForWorkflowSnapshot(
+      rpc, beta.workflowId, beta.name, 'workflow beta after alpha cancel'
+    );
+    requireTypedReceipt(
+      await rpc.call({
+        type: 'workflow_hub_send', workflowId: beta.workflowId, generation: beta.generation,
+        recipient: betaDetail.supervisor.name, body: 'beta remains addressable after alpha cancel',
+      }),
+      beta, betaDetail.supervisor.name, 'delivered', 'workflow beta after alpha cancel'
+    );
+    await rpc.call({ type: 'workflow_remove', workflowId: alpha.workflowId });
+    const remaining = await rpc.call({ type: 'workflow_list' });
+    const remainingIds = new Set((remaining.workflows || []).map((workflow) => workflow.workflowId));
+    if (remainingIds.has(alpha.workflowId) || !remainingIds.has(beta.workflowId)) {
+      fail(`removing alpha did not leave beta live: ${JSON.stringify(remaining.workflows)}`);
+    }
+    const betaFinal = await waitForWorkflowSnapshot(
+      rpc, beta.workflowId, beta.name, 'workflow beta after alpha remove'
+    );
+    requireTypedReceipt(
+      await rpc.call({
+        type: 'workflow_hub_send', workflowId: beta.workflowId, generation: beta.generation,
+        recipient: betaDetail.supervisor.name, body: 'beta remains addressable after alpha remove',
+      }),
+      beta, betaDetail.supervisor.name, 'delivered', 'workflow beta after alpha remove'
+    );
 
     // 8. Settings panel: browse by category, secret refusal (live.sttApiKey
     //    renders redacted with no editable control), open a global draft,
@@ -558,8 +956,8 @@ async function main() {
     await page.screenshot({ path: `${evidence}/settings.png`, fullPage: true });
 
     // 9. Session panel: current session info renders, rename round-trips
-    //    into the panel + header, the saved-sessions list is populated, and
-    //    new session switches to a fresh session id.
+    //    into the panel + sidebar row title (the header no longer duplicates
+    //    the session name), the saved-sessions list is populated, and
     // Persistent left sidebar: lists saved sessions with the current one
     // marked active, and New switches to a fresh session.
     await waitFor(page, () => document.getElementById('session-sidebar') !== null, 'session sidebar did not render');
@@ -579,72 +977,54 @@ async function main() {
       () => document.querySelector('[data-testid="session-name-value"]')?.textContent === 'web e2e session',
       'session rename never reflected in the panel'
     );
+    // The header must never render a duplicate `session: <name>` label; the
+    // rename proves itself via the panel value above and the sidebar row
+    // title below.
     await waitFor(
       page,
-      () => (document.getElementById('session-name')?.textContent || '').includes('web e2e session'),
-      'session rename never reflected in the header'
+      () => {
+        const header = document.getElementById('model-select')?.closest('header');
+        return document.getElementById('session-name') === null
+          && header !== null
+          && !header.textContent.includes('session:');
+      },
+      'header still renders a duplicate session label after the rename'
     );
     await waitFor(
       page,
-      () => document.querySelectorAll('.session-row').length >= 1,
-      'no saved sessions listed in the session panel'
+      () =>
+        document.querySelector('.session-sidebar__row--active .session-sidebar__switch .session-sidebar__name')
+          ?.textContent?.trim() === 'web e2e session',
+      'session rename never reflected in the active sidebar row title',
+      25000
     );
-    const sessionIdBefore = await page.evaluate(() => {
-      const dts = [...document.querySelectorAll('#session-panel dl dt')];
-      const idx = dts.findIndex((dt) => dt.textContent === 'Session id');
-      return idx >= 0 ? dts[idx]?.nextElementSibling?.textContent || '' : '';
-    });
-    if (!sessionIdBefore) {
-      fail('current session id never rendered');
-    }
-    // F4 session cutover contract: the transcript must be POPULATED before
-    // the switch (so the clear is observable), the switch to a different
-    // session id must CLEAR it (the server never replays messages over RPC),
-    // and a same-id refresh must keep it.
+    await waitFor(
+      page,
+      () => document.querySelectorAll('.session-sidebar__row').length >= 1,
+      'no saved sessions listed in the session sidebar',
+    );
+    await assertSidebarNewActionAbsent(page, 'session lifecycle: obsolete sidebar New action rendered');
     const msgsBeforeSwitch = await page.$$eval('#transcript .msg', (els) => els.length);
     if (msgsBeforeSwitch === 0) {
       fail('session lifecycle: no transcript messages before the switch — the clear would be unobservable');
     }
-    await page.click('#session-new-btn');
-    const newIdOk = await page
-      .waitForFunction(
-        (b) => {
-          const dts = [...document.querySelectorAll('#session-panel dl dt')];
-          const idx = dts.findIndex((dt) => dt.textContent === 'Session id');
-          const dd = idx >= 0 ? dts[idx].nextElementSibling : null;
-          const id = dd ? dd.textContent || '' : '';
-          return id !== '' && id !== b;
-        },
-        sessionIdBefore,
-        { timeout: 25000 }
-      )
-      .then(() => true)
-      .catch(() => false);
-    if (!newIdOk) {
-      const dump = await page.evaluate((b) => JSON.stringify({
-        sessionId: (() => {
-          const dts = [...document.querySelectorAll('#session-panel dl dt')];
-          const idx = dts.findIndex((dt) => dt.textContent === 'Session id');
-          const dd = idx >= 0 ? dts[idx].nextElementSibling : null;
-          return dd ? dd.textContent || '' : '';
-        })(),
-        before: b,
-        status: document.querySelector('#session-panel .panel__status')?.textContent || '',
-        headerSession: document.getElementById('session-name')?.textContent || '',
-      }), sessionIdBefore);
-      fail(`new session never produced a different session id — ${dump}`);
-    }
+    await createFreshSessionViaManage(page, waitFor, 'session lifecycle', {
+      closePanel: false,
+      timeoutMs: 25000,
+    });
     // F4: a NEW session id must show the EMPTY new-session view — never the
     // previous session's messages under the new header.
     await waitFor(
       page,
-      () =>
-        document.querySelectorAll('#transcript .msg').length === 0 &&
-        document.querySelector('#transcript .empty-hint') !== null,
+      () => {
+        const active = document.querySelector('#transcript .transcript-surface:not([hidden])');
+        if (!active) return false;
+        return active.querySelectorAll('.msg').length === 0 && active.querySelector('.empty-hint') !== null;
+      },
       'session switch never cleared the old transcript (empty new-session view missing)'
     );
     const staleTranscript = await page.evaluate(
-      () => document.getElementById('transcript')?.textContent || ''
+      () => document.querySelector('#transcript .transcript-surface:not([hidden])')?.textContent || ''
     );
     if (staleTranscript.includes('hello from the web e2e')) {
       fail("session switch retained the old session's messages in the transcript");
@@ -892,8 +1272,10 @@ async function main() {
     // shared context + one child. Assert Goal/Constraints/Contract, child
     // name/agent/status, and that raw args JSON is not the default view.
     const taskCardBefore = await page.evaluate(() => document.querySelectorAll('.tool-card--task').length);
+    const taskTurnPromise = turnFrames.nextStart();
     await page.fill('#prompt-input', 'tool-card coverage task spawn');
     await page.press('#prompt-input', 'Enter');
+    const taskTurn = await taskTurnPromise;
     await waitFor(
       page,
       (b) => document.querySelectorAll('.tool-card--task').length > b,
@@ -901,15 +1283,37 @@ async function main() {
       45000,
       taskCardBefore,
     );
+    await waitFor(
+      page,
+      (expected) => {
+        const strip = document.getElementById('activity-strip');
+        if (strip?.dataset.state !== 'child' || !(strip.textContent || '').includes('Waiting for')) return false;
+        const cards = [...document.querySelectorAll('.tool-card--task')];
+        const child = cards.flatMap((card) => [...card.querySelectorAll('.tool-card__child')])
+          .find((candidate) => (candidate.querySelector('.tool-card__child-target')?.textContent || '').includes('audit the release notes'));
+        return strip.dataset.sessionId === expected.sessionId
+          && strip.dataset.turnId === expected.turnId
+          && Boolean(strip.dataset.jobId)
+          && Boolean(strip.dataset.agentId)
+          && child?.getAttribute('data-job-id') === strip.dataset.jobId
+          && child?.getAttribute('data-agent-id') === strip.dataset.agentId;
+      },
+      'activity strip never projected the authoritative waiting child identity',
+      30000,
+      taskTurn,
+    );
+    await page.screenshot({ path: `${evidence}/activity-strip-child-desktop.png`, fullPage: true });
     const taskCard = await page.evaluate(() => {
       const cards = [...document.querySelectorAll('.tool-card--task')];
-      const last = cards[cards.length - 1];
+      const last = cards.find((card) => [...card.querySelectorAll('.tool-card__child-target')]
+        .some((target) => (target.textContent || '').includes('audit the release notes')));
       if (!last) return null;
       const sections = [...last.querySelectorAll('.tool-card__section')].map((s) => ({
         label: s.querySelector('.tool-card__section-label')?.textContent || '',
         body: s.querySelector('.tool-card__section-body')?.textContent || '',
       }));
-      const child = last.querySelector('.tool-card__child');
+      const child = [...last.querySelectorAll('.tool-card__child')]
+        .find((candidate) => (candidate.querySelector('.tool-card__child-target')?.textContent || '').includes('audit the release notes'));
       const argsPre = last.querySelector('.tool-card__args');
       const rawOpen = last.querySelector('details.tool-card__raw[open]');
       return {
@@ -930,17 +1334,28 @@ async function main() {
     if (!goal || !goal.body.includes('Ship the Task card')) fail(`task Goal missing: ${JSON.stringify(taskCard.sections)}`);
     if (!constraints || !constraints.body.includes('Be precise')) fail(`task Constraints missing: ${JSON.stringify(taskCard.sections)}`);
     if (!contract || !contract.body.includes('Keep stable ids')) fail(`task Contract missing: ${JSON.stringify(taskCard.sections)}`);
-    if (taskCard.childName !== 'Alpha') fail(`task child name wrong: ${taskCard.childName}`);
+    if (taskCard.childName !== 'writer') fail(`task child name wrong: ${taskCard.childName}`);
     if (taskCard.childAgent !== 'writer') fail(`task child agent wrong: ${taskCard.childAgent}`);
     if (!taskCard.childTarget.includes('audit the release notes')) fail(`task child target wrong: ${taskCard.childTarget}`);
     if (!taskCard.childStatus) fail('task child status missing');
     if (taskCard.rawVisible || taskCard.rawExpanded) fail('task card dumped raw JSON as the default view');
     if (taskCard.text.includes('"tasks"') && !taskCard.text.includes('Goal')) fail('task card looks like raw JSON dump');
     if (taskCard.text.includes('Goal null')) fail(`task card rendered "Goal null": ${taskCard.text.slice(0, 200)}`);
+    const taskTerminal = await turnFrames.waitForTerminal(taskTurn.sessionId, taskTurn.turnId, 30000).catch((error) => fail(error.message));
+    if (taskTerminal !== 'succeeded') fail(`Task turn ended with ${taskTerminal || 'unknown'} status`);
+    await waitFor(
+      page,
+      () => document.getElementById('activity-strip') === null,
+      'activity strip remained mounted after matching Task turn terminal',
+      30000,
+    );
+    if (pageErrors.length > 0) fail(`page errors: ${JSON.stringify(pageErrors)}`);
+    if (consoleErrors.length > 0) fail(`console errors: ${JSON.stringify(consoleErrors)}`);
     await page.screenshot({ path: `${evidence}/task-card.png`, fullPage: true });
 
-    console.log('web: playwright PASSED (page load, WS connect, prompt round-trip, abort, recovery, todo panel, rich content, workflow create/cancel, settings browse/edit/apply + secret refusal, session info/rename/switch/new, subagents spawn/live/detail-modal/message/output/cancel, task tool card)');
+    console.log('web: playwright PASSED (page load, WS connect, prompt round-trip, abort, recovery, todo panel, rich content, strict concurrent workflows + receipts/isolation/cancel-remove survival, settings browse/edit/apply + secret refusal, session info/rename/switch/new, subagents spawn/live/detail-modal/message/output/cancel, task tool card)');
   } finally {
+    if (rpc) rpc.close();
     await browser.close();
   }
 }

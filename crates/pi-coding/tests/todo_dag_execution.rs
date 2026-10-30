@@ -8,105 +8,306 @@ use pi_agent::{AbortController, ThinkingLevel, ToolCallContext};
 use pi_ai::{ContentBlock, Model, StopReason};
 use pi_coding::{
     AgentCatalog, AgentDefinition, AgentDefinitionSource, Application, ChildSessionFactory,
-    JobStatus, OrchestrationConfig, OrchestrationRuntime, ResourceDiscovery, Session,
-    SessionOptions, TodoDagExecutionStatus, TodoItem, TodoPhase, TodoStatus, ToolSelection,
+    JobStatus, OrchestrationConfig, OrchestrationRuntime, ResourceDiscovery, ResourceManager,
+    ResourceManagerOptions, Session, SessionOptions, TodoDagExecutionStatus, TodoItem, TodoPhase,
+    TodoStatus, ToolSelection,
 };
 use serde_json::{Value, json};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
+fn registered_dag_model() -> (Model, pi_ai::providers::FauxProviderRegistration) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let suffix = NEXT.fetch_add(1, Ordering::Relaxed);
+    let api = format!("todo-dag-execution-{suffix}");
+    let model = Model {
+        id: api.clone(),
+        name: "Todo DAG Execution".to_owned(),
+        api: api.clone(),
+        provider: api,
+        base_url: "http://127.0.0.1:9".to_owned(),
+        ..Model::default()
+    };
+    let registration =
+        pi_ai::providers::register_faux_provider(pi_ai::providers::FauxProviderOptions {
+            api: model.api.clone(),
+            provider: model.provider.clone(),
+            models: vec![model.clone()],
+            chunk_size: 1,
+        });
+    (model, registration)
+}
+
 fn definition() -> AgentDefinition {
-    AgentDefinition { name: "task".to_owned(), description: "execute a Todo DAG item".to_owned(),
-    system_prompt: "complete the assigned Todo item".to_owned(), tools: Some(Vec::new()),
-    autoload_skills: Vec::new(), model: None, thinking_level: Some(ThinkingLevel::Off),
-    max_turns: None, max_tool_calls: None, timeout_secs: None,
-    disallowed_tools: Vec::new(), capability_ceiling: None,
-    source: AgentDefinitionSource::Bundled, path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None }
+    AgentDefinition {
+        name: "task".to_owned(),
+        description: "execute a Todo DAG item".to_owned(),
+        system_prompt: "complete the assigned Todo item".to_owned(),
+        tools: Some(Vec::new()),
+        autoload_skills: Vec::new(),
+        model: None,
+        thinking_level: Some(ThinkingLevel::Off),
+        max_turns: None,
+        max_tool_calls: None,
+        timeout_secs: None,
+        disallowed_tools: Vec::new(),
+        capability_ceiling: None,
+        source: AgentDefinitionSource::Bundled,
+        path: None,
+        trusted: true,
+        kind: pi_coding::AgentDefinitionKind::Agent,
+        personality: None,
+        soft_budget: None,
+        knowledge_roots: Vec::new(),
+        user_proxy: false,
+    }
 }
 
 fn parent_session(cwd: &std::path::Path, model: Model) -> Session {
-    Session::new(SessionOptions { model, cwd: cwd.to_path_buf(), system_prompt: String::new(),
-        thinking_level: ThinkingLevel::Off, api_key: String::new(), compaction: None,
-        stream_options: Default::default(), tools: Some(Vec::new()), before_tool_call: None,
-        after_tool_call: None, stream_fn: None, auth_resolver: None }).expect("parent session")
+    let session = Session::new(SessionOptions {
+        model,
+        cwd: cwd.to_path_buf(),
+        system_prompt: String::new(),
+        thinking_level: ThinkingLevel::Off,
+        api_key: String::new(),
+        compaction: None,
+        stream_options: Default::default(),
+        tools: Some(Vec::new()),
+        before_tool_call: None,
+        after_tool_call: None,
+        stream_fn: None,
+        auth_resolver: None,
+        auth_manager: None,
+    })
+    .expect("parent session");
+    session
+}
+
+/// Keep the parent off the operator's `~/.rpi` settings. Those settings can
+/// disable the Todo tool and reload the live application mid-test.
+async fn isolate_parent(session: &Session, cwd: &std::path::Path) -> tempfile::TempDir {
+    begin_parent_recording(session, cwd);
+    let agent_root = tempfile::tempdir().expect("hermetic agent root");
+    let agent_dir = agent_root.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).expect("hermetic agent dir");
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        r#"{"sandbox":{"mode":"danger-full-access"},"orchestration":{"tasks":true,"todo":true,"maxConcurrency":4}}"#,
+    )
+    .expect("hermetic settings");
+    let mut options = ResourceManagerOptions::new(cwd);
+    options.agent_dir = agent_dir;
+    options.disable_extensions = true;
+    options.disable_skills = true;
+    options.disable_prompt_templates = true;
+    options.disable_themes = true;
+    options.disable_context_files = true;
+    options.project_trust_override = Some(true);
+    session
+        .attach_resources(ResourceManager::new(options).expect("hermetic resources"))
+        .await
+        .expect("attach hermetic resources");
+    agent_root
+}
+
+fn begin_parent_recording(session: &Session, cwd: &std::path::Path) {
+    let sessions = cwd.join("sessions");
+    std::fs::create_dir_all(&sessions).expect("parent session dir");
+    session.set_session_dir(sessions);
+    session
+        .start_new_recording()
+        .expect("parent recording");
 }
 
 struct ControlledDag {
-    runtime: OrchestrationRuntime, started: Arc<Mutex<HashSet<String>>>, started_changed: Arc<Notify>,
-    releases: Arc<Mutex<HashMap<String, CancellationToken>>>, current: Arc<AtomicUsize>, peak: Arc<AtomicUsize>,
+    runtime: OrchestrationRuntime,
+    started: Arc<Mutex<HashSet<String>>>,
+    started_changed: Arc<Notify>,
+    releases: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    current: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
 }
 
 impl ControlledDag {
     async fn wait_started(&self, id: &str) {
-        tokio::time::timeout(Duration::from_secs(2), async { loop { let changed = self.started_changed.notified(); if self.started.lock().contains(id) { break; } changed.await; } })
-            .await.unwrap_or_else(|_| panic!("timed out waiting for {id} to start"));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let changed = self.started_changed.notified();
+                if self.started.lock().contains(id) {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {id} to start"));
     }
-    fn release(&self, id: &str) { self.releases.lock().get(id).unwrap_or_else(|| panic!("missing release gate for {id}")).cancel(); }
+    fn release(&self, id: &str) {
+        self.releases
+            .lock()
+            .get(id)
+            .unwrap_or_else(|| panic!("missing release gate for {id}"))
+            .cancel();
+    }
 }
 
-fn controlled_dag(artifact_dir: &std::path::Path, max_concurrency: usize, failing_ids: HashSet<String>) -> ControlledDag {
-    let started = Arc::new(Mutex::new(HashSet::new())); let started_changed = Arc::new(Notify::new());
+fn controlled_dag(
+    artifact_dir: &std::path::Path,
+    max_concurrency: usize,
+    failing_ids: HashSet<String>,
+) -> ControlledDag {
+    let started = Arc::new(Mutex::new(HashSet::new()));
+    let started_changed = Arc::new(Notify::new());
     let releases = Arc::new(Mutex::new(HashMap::<String, CancellationToken>::new()));
-    let current = Arc::new(AtomicUsize::new(0)); let peak = Arc::new(AtomicUsize::new(0));
-    let factory_started = started.clone(); let factory_started_changed = started_changed.clone();
-    let factory_releases = releases.clone(); let factory_current = current.clone(); let factory_peak = peak.clone();
+    let current = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let factory_started = started.clone();
+    let factory_started_changed = started_changed.clone();
+    let factory_releases = releases.clone();
+    let factory_current = current.clone();
+    let factory_peak = peak.clone();
     let factory: ChildSessionFactory = Arc::new(move |request| {
-        let started = factory_started.clone(); let started_changed = factory_started_changed.clone();
-        let releases = factory_releases.clone(); let current = factory_current.clone(); let peak = factory_peak.clone();
+        let started = factory_started.clone();
+        let started_changed = factory_started_changed.clone();
+        let releases = factory_releases.clone();
+        let current = factory_current.clone();
+        let peak = factory_peak.clone();
         let failing = failing_ids.contains(&request.child_id);
         Box::pin(async move {
-            if failing { anyhow::bail!("planned child failure for {}", request.child_id); }
+            if failing {
+                anyhow::bail!("planned child failure for {}", request.child_id);
+            }
             let child_id = request.child_id.clone();
-            let release = { let mut releases = releases.lock(); releases.entry(child_id.clone()).or_insert_with(CancellationToken::new).clone() };
+            let release = {
+                let mut releases = releases.lock();
+                releases
+                    .entry(child_id.clone())
+                    .or_insert_with(CancellationToken::new)
+                    .clone()
+            };
             let stream_fn: pi_agent::StreamFn = Arc::new(move |model, _context, options| {
-                let child_id = child_id.clone(); let started = started.clone(); let started_changed = started_changed.clone();
-                let release = release.clone(); let current = current.clone(); let peak = peak.clone();
+                let child_id = child_id.clone();
+                let started = started.clone();
+                let started_changed = started_changed.clone();
+                let release = release.clone();
+                let current = current.clone();
+                let peak = peak.clone();
                 Box::pin(async move {
-                    let stream = pi_ai::new_assistant_message_event_stream(); let producer = stream.clone();
+                    let stream = pi_ai::new_assistant_message_event_stream();
+                    let producer = stream.clone();
                     tokio::spawn(async move {
-                        let active = current.fetch_add(1, Ordering::SeqCst) + 1; peak.fetch_max(active, Ordering::SeqCst);
-                        started.lock().insert(child_id); started_changed.notify_waiters();
-                        let abort = options.stream.abort_signal.expect("child stream abort signal");
+                        let active = current.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(active, Ordering::SeqCst);
+                        started.lock().insert(child_id);
+                        started_changed.notify_waiters();
+                        let abort = options
+                            .stream
+                            .abort_signal
+                            .expect("child stream abort signal");
                         let aborted = tokio::select! { () = release.cancelled() => false, () = abort.cancelled() => true };
-                        current.fetch_sub(1, Ordering::SeqCst); let mut message = pi_ai::AssistantMessage::pending(&model);
-                        if aborted { message.stop_reason = StopReason::Aborted; message.error_message = Some("cancelled by test".to_owned()); }
-                        else { message.content.push(ContentBlock::text("completed owned Todo")); message.stop_reason = StopReason::Stop; }
+                        current.fetch_sub(1, Ordering::SeqCst);
+                        let mut message = pi_ai::AssistantMessage::pending(&model);
+                        if aborted {
+                            message.stop_reason = StopReason::Aborted;
+                            message.error_message = Some("cancelled by test".to_owned());
+                        } else {
+                            message
+                                .content
+                                .push(ContentBlock::text("completed owned Todo"));
+                            message.stop_reason = StopReason::Stop;
+                        }
                         producer.end(Some(message)).await;
-                    }); stream
+                    });
+                    stream
                 })
             });
-            Session::new(SessionOptions { model: request.model, cwd: std::env::current_dir().expect("cwd"),
-                system_prompt: request.system_prompt, thinking_level: ThinkingLevel::Off, api_key: String::new(),
-                compaction: None, stream_options: Default::default(), tools: Some(request.orchestration_tools),
-                before_tool_call: None, after_tool_call: None, stream_fn: Some(stream_fn), auth_resolver: None })
+            Session::new(SessionOptions {
+                model: request.model,
+                cwd: std::env::current_dir().expect("cwd"),
+                system_prompt: request.system_prompt,
+                thinking_level: ThinkingLevel::Off,
+                api_key: String::new(),
+                compaction: None,
+                stream_options: Default::default(),
+                tools: Some(request.orchestration_tools),
+                before_tool_call: None,
+                after_tool_call: None,
+                stream_fn: Some(stream_fn),
+                auth_resolver: None,
+                auth_manager: None,
+            })
         })
     });
-    let model = Model { id: "todo-dag-execution".to_owned(), name: "Todo DAG Execution".to_owned(),
-        api: "todo-dag-execution".to_owned(), provider: "todo-dag-execution".to_owned(), ..Model::default() };
-    let mut config = OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition()]), artifact_dir);
-    config.max_concurrency = max_concurrency; config.idle_ttl = None; config.parent_model = model;
-    ControlledDag { runtime: OrchestrationRuntime::new(config, factory).expect("orchestration runtime"),
-        started, started_changed, releases, current, peak }
+    let (model, _dag_provider) = registered_dag_model();
+    let mut config =
+        OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition()]), artifact_dir);
+    config.max_concurrency = max_concurrency;
+    config.idle_ttl = None;
+    config.parent_model = model;
+    ControlledDag {
+        runtime: OrchestrationRuntime::new(config, factory).expect("orchestration runtime"),
+        started,
+        started_changed,
+        releases,
+        current,
+        peak,
+    }
 }
 
 fn task(id: &str, content: &str, depends_on: &[&str]) -> TodoItem {
-    TodoItem { id: id.to_owned(), content: content.to_owned(), status: TodoStatus::Pending,
-        depends_on: depends_on.iter().map(|id| (*id).to_owned()).collect(), ready: false, blocked_by: Vec::new(), agent: None }
+    TodoItem {
+        id: id.to_owned(),
+        content: content.to_owned(),
+        status: TodoStatus::Pending,
+        depends_on: depends_on.iter().map(|id| (*id).to_owned()).collect(),
+        ready: false,
+        waiting_on: Vec::new(),
+        agent: None,
+    }
 }
 
 async fn wait_todo_status(application: &Application, id: &str, expected: TodoStatus) {
-    tokio::time::timeout(Duration::from_secs(2), async { loop {
-        let status = application.todo_state().phases.iter().flat_map(|phase| &phase.tasks)
-            .find(|task| task.id == id).map(|task| task.status);
-        if status == Some(expected) { break; } tokio::task::yield_now().await;
-    }}).await.unwrap_or_else(|_| panic!("timed out waiting for Todo {id} to become {expected:?}"));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let status = application
+                .todo_state()
+                .phases
+                .iter()
+                .flat_map(|phase| &phase.tasks)
+                .find(|task| task.id == id)
+                .map(|task| task.status);
+            if status == Some(expected) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        let reason = application.todo_dag_failure_reason();
+        let phases = application.todo_state().phases;
+        panic!(
+            "timed out waiting for Todo {id} to become {expected:?}; phases={phases:?}; reason={reason:?}"
+        )
+    });
 }
 
-async fn wait_all_settled(runtime: &OrchestrationRuntime, expected: usize) -> Vec<pi_coding::JobSnapshot> {
-    tokio::time::timeout(Duration::from_secs(2), async { loop { let jobs = runtime.jobs(None);
-        if jobs.len() == expected && jobs.iter().all(|job| job.status.is_settled()) { break jobs; }
-        tokio::task::yield_now().await;
-    }}).await.expect("jobs did not all settle")
+async fn wait_all_settled(
+    runtime: &OrchestrationRuntime,
+    expected: usize,
+) -> Vec<pi_coding::JobSnapshot> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let jobs = runtime.jobs(None);
+            if jobs.len() == expected && jobs.iter().all(|job| job.status.is_settled()) {
+                break jobs;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("jobs did not all settle")
 }
 
 /// Tool-call context for driving the real `todo` tool as a normal
@@ -120,6 +321,7 @@ fn todo_tool_ctx(arguments: Value) -> ToolCallContext {
         on_update: Arc::new(|_result: pi_agent::AgentToolResult| {}),
         abort,
         model: None,
+        approval_token: None,
     }
 }
 
@@ -143,19 +345,31 @@ fn task_id_from_details(details: &Value, content: &str) -> String {
 async fn todo_tool_in_normal_session_auto_arms_subagent_jobs() {
     let root = tempfile::tempdir().expect("root");
     let controlled = controlled_dag(root.path(), 2, HashSet::new());
-    let model = Model { id: "todo-dag-execution".to_owned(), name: "Todo DAG Execution".to_owned(),
-        api: "todo-dag-execution".to_owned(), provider: "todo-dag-execution".to_owned(), ..Model::default() };
+    let (model, _dag_provider) = registered_dag_model();
     let session = Session::new_with_todo_and_additional_tools_filtered_and_discovery(
-        SessionOptions { model, cwd: root.path().to_path_buf(), system_prompt: String::new(),
-            thinking_level: ThinkingLevel::Off, api_key: String::new(), compaction: None,
-            stream_options: Default::default(), tools: Some(Vec::new()), before_tool_call: None,
-            after_tool_call: None, stream_fn: None, auth_resolver: None },
+        SessionOptions {
+            model,
+            cwd: root.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+            auth_manager: None,
+        },
         Vec::new(),
         ToolSelection::default(),
         ResourceDiscovery::Disabled,
     )
     .expect("todo session");
-    let application = Application::new_with_orchestration(session.clone(), controlled.runtime.clone()).await;
+    let _agent_home = isolate_parent(&session, root.path()).await;
+    let application =
+        Application::new_with_orchestration(session.clone(), controlled.runtime.clone()).await;
     let todo = session.get_tool_definition("todo").expect("todo tool");
 
     // "create a todo with two tasks and start on the first"
@@ -177,18 +391,36 @@ async fn todo_tool_in_normal_session_auto_arms_subagent_jobs() {
     controlled.wait_started("Todo1").await;
     controlled.wait_started("Todo2").await;
     let jobs = controlled.runtime.jobs(None);
-    assert_eq!(jobs.len(), 2, "ready todo tasks must spawn owner jobs automatically");
-    let linked = jobs.iter().filter_map(|job| job.todo_task_id.as_deref()).collect::<Vec<_>>();
+    assert_eq!(
+        jobs.len(),
+        2,
+        "ready todo tasks must spawn owner jobs automatically"
+    );
+    let linked = jobs
+        .iter()
+        .filter_map(|job| job.todo_task_id.as_deref())
+        .collect::<Vec<_>>();
     assert!(
         linked.contains(&alpha_id.as_str()) && linked.contains(&beta_id.as_str()),
         "spawned jobs must link to their todo tasks: {linked:?}"
     );
-    assert!(jobs.iter().all(|job| !job.description.as_deref().unwrap_or_default().trim().is_empty()));
+    assert!(jobs.iter().all(|job| {
+        !job.description
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+    }));
 
     // "start on the first" surfaced in the model-visible todo state.
     let started = application.todo_state();
     assert_eq!(
-        started.phases.iter().flat_map(|phase| &phase.tasks).find(|task| task.id == alpha_id).map(|task| task.status),
+        started
+            .phases
+            .iter()
+            .flat_map(|phase| &phase.tasks)
+            .find(|task| task.id == alpha_id)
+            .map(|task| task.status),
         Some(TodoStatus::InProgress),
         "started task must be in progress"
     );
@@ -201,48 +433,193 @@ async fn todo_tool_in_normal_session_auto_arms_subagent_jobs() {
         .expect("Todo DAG terminal timeout");
     assert_eq!(terminal, TodoDagExecutionStatus::Settled);
     let done = application.todo_state();
-    assert!(done.phases.iter().flat_map(|phase| &phase.tasks).all(|task| task.status == TodoStatus::Completed));
+    assert!(
+        done.phases
+            .iter()
+            .flat_map(|phase| &phase.tasks)
+            .all(|task| task.status == TodoStatus::Completed)
+    );
     application.cleanup().await;
 }
 
 #[tokio::test]
 async fn two_ready_roots_overlap_and_join_waits_for_both_before_three_of_three() {
-    let root = tempfile::tempdir().expect("root"); let controlled = controlled_dag(root.path(), 2, HashSet::new());
-    let model = Model { id: "todo-dag-execution".to_owned(), name: "Todo DAG Execution".to_owned(), api: "todo-dag-execution".to_owned(), provider: "todo-dag-execution".to_owned(), ..Model::default() };
-    let application = Application::new_with_orchestration(parent_session(root.path(), model), controlled.runtime.clone()).await;
-    application.set_todos(vec![TodoPhase { name: "Roots".to_owned(), tasks: vec![task("root-a", "complete root A", &[]), task("root-b", "complete root B", &[])] },
-        TodoPhase { name: "Join".to_owned(), tasks: vec![task("join", "complete the join", &["root-a", "root-b"])] }]).expect("set Todo DAG");
-    controlled.wait_started("Todo1").await; controlled.wait_started("Todo2").await;
-    assert_eq!(controlled.peak.load(Ordering::SeqCst), 2, "ready roots must overlap"); assert_eq!(controlled.current.load(Ordering::SeqCst), 2);
+    let root = tempfile::tempdir().expect("root");
+    let controlled = controlled_dag(root.path(), 2, HashSet::new());
+    let (model, _dag_provider) = registered_dag_model();
+    let session = parent_session(root.path(), model);
+    let _agent_home = isolate_parent(&session, root.path()).await;
+    let application =
+        Application::new_with_orchestration(session, controlled.runtime.clone()).await;
+    application
+        .set_todos(vec![
+            TodoPhase {
+                name: "Roots".to_owned(),
+                tasks: vec![
+                    task("root-a", "complete root A", &[]),
+                    task("root-b", "complete root B", &[]),
+                ],
+            },
+            TodoPhase {
+                name: "Join".to_owned(),
+                tasks: vec![task("join", "complete the join", &["root-a", "root-b"])],
+            },
+        ])
+        .expect("set Todo DAG");
+    controlled.wait_started("Todo1").await;
+    controlled.wait_started("Todo2").await;
+    assert_eq!(
+        controlled.peak.load(Ordering::SeqCst),
+        2,
+        "ready roots must overlap"
+    );
+    assert_eq!(controlled.current.load(Ordering::SeqCst), 2);
     assert_eq!(controlled.runtime.jobs(None).len(), 2);
-    assert!(controlled.runtime.jobs(None).iter().all(|job| matches!(job.todo_task_id.as_deref(), Some("root-a" | "root-b"))));
-    assert!(controlled.runtime.jobs(None).iter().all(|job| job.todo_task_id.as_deref() != Some("join")));
-    controlled.release("Todo1"); wait_todo_status(&application, "root-a", TodoStatus::Completed).await;
-    assert!(controlled.runtime.jobs(None).iter().all(|job| job.todo_task_id.as_deref() != Some("join")), "join must wait for both roots");
-    controlled.release("Todo2"); controlled.wait_started("Todo3").await; wait_todo_status(&application, "root-b", TodoStatus::Completed).await;
-    let join_job = controlled.runtime.jobs(None).into_iter().find(|job| job.todo_task_id.as_deref() == Some("join")).expect("join owner spawned");
-    assert_eq!(join_job.status, JobStatus::Running); controlled.release("Todo3");
-    let terminal = tokio::time::timeout(Duration::from_secs(2), application.wait_todo_dag()).await.expect("Todo DAG terminal timeout");
-    assert_eq!(terminal, TodoDagExecutionStatus::Settled); let state = application.todo_state();
-    assert_eq!(state.phases.iter().flat_map(|phase| &phase.tasks).filter(|task| task.status == TodoStatus::Completed).count(), 3);
-    assert!(state.phases.iter().flat_map(|phase| &phase.tasks).all(|task| task.status == TodoStatus::Completed)); application.cleanup().await;
+    assert!(
+        controlled
+            .runtime
+            .jobs(None)
+            .iter()
+            .all(|job| matches!(job.todo_task_id.as_deref(), Some("root-a" | "root-b")))
+    );
+    assert!(
+        controlled
+            .runtime
+            .jobs(None)
+            .iter()
+            .all(|job| job.todo_task_id.as_deref() != Some("join"))
+    );
+    controlled.release("Todo1");
+    wait_todo_status(&application, "root-a", TodoStatus::Completed).await;
+    assert!(
+        controlled
+            .runtime
+            .jobs(None)
+            .iter()
+            .all(|job| job.todo_task_id.as_deref() != Some("join")),
+        "join must wait for both roots"
+    );
+    controlled.release("Todo2");
+    controlled.wait_started("Todo3").await;
+    wait_todo_status(&application, "root-b", TodoStatus::Completed).await;
+    let join_job = controlled
+        .runtime
+        .jobs(None)
+        .into_iter()
+        .find(|job| job.todo_task_id.as_deref() == Some("join"))
+        .expect("join owner spawned");
+    assert_eq!(join_job.status, JobStatus::Running);
+    controlled.release("Todo3");
+    let terminal = tokio::time::timeout(Duration::from_secs(2), application.wait_todo_dag())
+        .await
+        .expect("Todo DAG terminal timeout");
+    assert_eq!(terminal, TodoDagExecutionStatus::Settled);
+    let state = application.todo_state();
+    assert_eq!(
+        state
+            .phases
+            .iter()
+            .flat_map(|phase| &phase.tasks)
+            .filter(|task| task.status == TodoStatus::Completed)
+            .count(),
+        3
+    );
+    assert!(
+        state
+            .phases
+            .iter()
+            .flat_map(|phase| &phase.tasks)
+            .all(|task| task.status == TodoStatus::Completed)
+    );
+    application.cleanup().await;
 }
 
 #[tokio::test]
 async fn failed_and_cancelled_owners_stay_open_and_terminal_reconciliation_is_idempotent() {
-    let root = tempfile::tempdir().expect("root"); let controlled = controlled_dag(root.path(), 2, HashSet::from(["Todo1".to_owned()]));
-    let model = Model { id: "todo-dag-execution".to_owned(), name: "Todo DAG Execution".to_owned(), api: "todo-dag-execution".to_owned(), provider: "todo-dag-execution".to_owned(), ..Model::default() };
-    let application = Application::new_with_orchestration(parent_session(root.path(), model), controlled.runtime.clone()).await;
-    application.set_todos(vec![TodoPhase { name: "Failures".to_owned(), tasks: vec![task("fails", "fail this owner", &[]), task("cancels", "cancel this owner", &[]), task("blocked", "remain blocked", &["fails", "cancels"])] }]).expect("set Todo DAG");
-    controlled.wait_started("Todo2").await; let initial = controlled.runtime.jobs(None); assert_eq!(initial.len(), 2);
-    let cancel_job = initial.iter().find(|job| job.todo_task_id.as_deref() == Some("cancels")).expect("cancel owner");
-    assert_eq!(controlled.runtime.cancel_jobs(std::slice::from_ref(&cancel_job.id)), vec![cancel_job.id.clone()]);
-    let settled = wait_all_settled(&controlled.runtime, 2).await; assert!(settled.iter().any(|job| job.status == JobStatus::Failed)); assert!(settled.iter().any(|job| job.status == JobStatus::Cancelled));
-    let terminal = tokio::time::timeout(Duration::from_secs(2), application.wait_todo_dag()).await.expect("blocked Todo DAG timeout"); assert_eq!(terminal, TodoDagExecutionStatus::Blocked);
-    let before = application.todo_state(); assert!(before.phases.iter().flat_map(|phase| &phase.tasks).all(|task| task.status != TodoStatus::Completed)); assert_eq!(controlled.runtime.jobs(None).len(), 2);
-    for _ in 0..2 { let outcome = application.reconcile_todo_dag_if_armed().expect("idempotent reconcile"); assert_eq!(outcome.status, TodoDagExecutionStatus::Blocked); assert!(outcome.spawns.is_empty()); }
-    assert_eq!(application.todo_state(), before); assert_eq!(controlled.runtime.jobs(None).len(), 2, "terminal jobs must not respawn");
-    let retry = application.execute_todo_dag().expect("explicit retry cycle"); assert_eq!(retry.status, TodoDagExecutionStatus::Active); assert_eq!(retry.spawns.len(), 2, "explicit re-arm may retry open failed tasks"); assert_eq!(controlled.runtime.jobs(None).len(), 4);
+    let root = tempfile::tempdir().expect("root");
+    let controlled = controlled_dag(root.path(), 2, HashSet::from(["Todo1".to_owned()]));
+    let (model, _dag_provider) = registered_dag_model();
+    let session = parent_session(root.path(), model);
+    let _agent_home = isolate_parent(&session, root.path()).await;
+    let application =
+        Application::new_with_orchestration(session, controlled.runtime.clone()).await;
+    application
+        .set_todos(vec![TodoPhase {
+            name: "Failures".to_owned(),
+            tasks: vec![
+                task("fails", "fail this owner", &[]),
+                task("cancels", "cancel this owner", &[]),
+                task("waiting", "wait for failed owners", &["fails", "cancels"]),
+            ],
+        }])
+        .expect("set Todo DAG");
+    controlled.wait_started("Todo2").await;
+    let initial = controlled.runtime.jobs(None);
+    assert_eq!(initial.len(), 2);
+    let cancel_job = initial
+        .iter()
+        .find(|job| job.todo_task_id.as_deref() == Some("cancels"))
+        .expect("cancel owner");
+    assert_eq!(
+        controlled
+            .runtime
+            .cancel_jobs(std::slice::from_ref(&cancel_job.id)),
+        vec![cancel_job.id.clone()]
+    );
+    let settled = wait_all_settled(&controlled.runtime, 2).await;
+    assert!(settled.iter().any(|job| job.status == JobStatus::Failed));
+    assert!(settled.iter().any(|job| job.status == JobStatus::Cancelled));
+    let terminal = tokio::time::timeout(Duration::from_secs(2), application.wait_todo_dag())
+        .await
+        .expect("failed Todo DAG timeout");
+    assert_eq!(terminal, TodoDagExecutionStatus::Failed);
+    let reason = application
+        .todo_dag_failure_reason()
+        .expect("typed failure reason");
+    assert!(matches!(
+        reason,
+        pi_coding::TodoDagFailureReason::NoProgress { .. }
+    ));
+    assert!(reason.message().contains("no progress"));
+    let before = application.todo_state();
+    assert!(
+        before
+            .phases
+            .iter()
+            .flat_map(|phase| &phase.tasks)
+            .all(|task| task.status != TodoStatus::Completed)
+    );
+    assert_eq!(controlled.runtime.jobs(None).len(), 2);
+    for _ in 0..2 {
+        let outcome = application
+            .reconcile_todo_dag_if_armed()
+            .expect("idempotent reconcile");
+        assert_eq!(outcome.status, TodoDagExecutionStatus::Failed);
+        assert!(
+            outcome
+                .failure_reason
+                .as_ref()
+                .is_some_and(|reason| reason.message().contains("no progress"))
+        );
+        assert!(outcome.spawns.is_empty());
+    }
+    assert_eq!(application.todo_state(), before);
+    assert_eq!(
+        controlled.runtime.jobs(None).len(),
+        2,
+        "terminal jobs must not respawn"
+    );
+    let retry = application
+        .execute_todo_dag()
+        .expect("explicit retry cycle");
+    assert_eq!(retry.status, TodoDagExecutionStatus::Active);
+    assert!(retry.failure_reason.is_none());
+    assert_eq!(
+        retry.spawns.len(),
+        2,
+        "explicit re-arm may retry open failed tasks"
+    );
+    assert_eq!(controlled.runtime.jobs(None).len(), 4);
     application.cleanup().await;
 }
 
@@ -285,16 +662,11 @@ fn agent_routing_dag(
                 after_tool_call: None,
                 stream_fn: Some(stream_fn),
                 auth_resolver: None,
+                auth_manager: None,
             })
         })
     });
-    let model = Model {
-        id: "todo-dag-execution".to_owned(),
-        name: "Todo DAG Execution".to_owned(),
-        api: "todo-dag-execution".to_owned(),
-        provider: "todo-dag-execution".to_owned(),
-        ..Model::default()
-    };
+    let (model, _dag_provider) = registered_dag_model();
     let mut config = OrchestrationConfig::new(AgentCatalog::from_agents(agents), artifact_dir);
     config.max_concurrency = 4;
     config.idle_ttl = None;
@@ -304,20 +676,28 @@ fn agent_routing_dag(
 }
 
 fn researcher_definition() -> AgentDefinition {
-    AgentDefinition { name: "researcher".to_owned(),
-    description: "Research and study assigned topics".to_owned(),
-    system_prompt: "RESEARCHER_PROMPT".to_owned(),
-    tools: Some(Vec::new()),
-    autoload_skills: Vec::new(),
-    model: None,
-    thinking_level: Some(ThinkingLevel::Off),
-    max_turns: None,
-    max_tool_calls: None,
-    timeout_secs: None,
-    disallowed_tools: Vec::new(),
-    capability_ceiling: None,
-    source: AgentDefinitionSource::User,
-    path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None }
+    AgentDefinition {
+        name: "researcher".to_owned(),
+        description: "Research and study assigned topics".to_owned(),
+        system_prompt: "RESEARCHER_PROMPT".to_owned(),
+        tools: Some(Vec::new()),
+        autoload_skills: Vec::new(),
+        model: None,
+        thinking_level: Some(ThinkingLevel::Off),
+        max_turns: None,
+        max_tool_calls: None,
+        timeout_secs: None,
+        disallowed_tools: Vec::new(),
+        capability_ceiling: None,
+        source: AgentDefinitionSource::User,
+        path: None,
+        trusted: true,
+        kind: pi_coding::AgentDefinitionKind::Agent,
+        personality: None,
+        soft_budget: None,
+        knowledge_roots: Vec::new(),
+        user_proxy: false,
+    }
 }
 
 fn writer_definition() -> AgentDefinition {
@@ -340,16 +720,10 @@ async fn typed_todo_agent_routes_paraphrased_task_to_named_agent() {
         vec![researcher_definition(), writer_definition()],
         prompts.clone(),
     );
-    let model = Model {
-        id: "todo-dag-execution".to_owned(),
-        name: "Todo DAG Execution".to_owned(),
-        api: "todo-dag-execution".to_owned(),
-        provider: "todo-dag-execution".to_owned(),
-        ..Model::default()
-    };
-    let application =
-        Application::new_with_orchestration(parent_session(root.path(), model), runtime.clone())
-            .await;
+    let (model, _dag_provider) = registered_dag_model();
+    let session = parent_session(root.path(), model);
+    let _agent_home = isolate_parent(&session, root.path()).await;
+    let application = Application::new_with_orchestration(session, runtime.clone()).await;
     // The planner paraphrased the objective and DROPPED the `researcher`
     // mention from the content; only the typed field preserves the role.
     // set_todos auto-arms DAG execution, which spawns the typed agent.
@@ -404,7 +778,7 @@ async fn typed_todo_agent_routes_paraphrased_task_to_named_agent() {
     runtime.shutdown().await;
 }
 
-/// Contract (P0-C): a Todo item whose typed agent is missing from the catalog
+/// A Todo item whose typed agent is missing from the catalog
 /// fails actionably — never a silent fallback to the default `task` agent —
 /// and the Todo state is rolled back so the task stays pending.
 #[tokio::test]
@@ -416,16 +790,10 @@ async fn missing_typed_todo_agent_fails_actionably_and_rolls_back() {
         vec![researcher_definition(), writer_definition()],
         prompts.clone(),
     );
-    let model = Model {
-        id: "todo-dag-execution".to_owned(),
-        name: "Todo DAG Execution".to_owned(),
-        api: "todo-dag-execution".to_owned(),
-        provider: "todo-dag-execution".to_owned(),
-        ..Model::default()
-    };
-    let application =
-        Application::new_with_orchestration(parent_session(root.path(), model), runtime.clone())
-            .await;
+    let (model, _dag_provider) = registered_dag_model();
+    let session = parent_session(root.path(), model);
+    let _agent_home = isolate_parent(&session, root.path()).await;
+    let application = Application::new_with_orchestration(session, runtime.clone()).await;
     let mut planned = task("ghost-task", "仔细调研pi-coding-agent", &[]);
     planned.agent = Some("ghost-agent".to_owned());
     application
@@ -436,10 +804,16 @@ async fn missing_typed_todo_agent_fails_actionably_and_rolls_back() {
         .expect("set Todo DAG");
     let before = application.todo_state();
 
-    let error = application
+    let outcome = application
         .execute_todo_dag()
-        .expect_err("a missing explicit agent must fail actionably")
-        .to_string();
+        .expect("typed routing fault becomes a failed DAG outcome");
+    assert_eq!(outcome.status, TodoDagExecutionStatus::Failed);
+    let reason = outcome.failure_reason.expect("spawn failure reason");
+    assert!(matches!(
+        reason,
+        pi_coding::TodoDagFailureReason::Spawn { .. }
+    ));
+    let error = reason.message();
     assert!(error.contains("ghost-agent"), "{error}");
     assert!(error.contains("not defined"), "{error}");
     assert!(error.contains("workflow Todo task"), "{error}");
@@ -462,4 +836,52 @@ async fn missing_typed_todo_agent_fails_actionably_and_rolls_back() {
     assert_eq!(task.agent.as_deref(), Some("ghost-agent"));
     application.cleanup().await;
     runtime.shutdown().await;
+}
+
+/// An operator-set in-progress todo is the LRU busy signal. Auto-arm may
+/// spawn its job, but the task stays in progress until that job finishes.
+#[tokio::test]
+async fn explicit_in_progress_todo_stays_open_while_its_job_runs() {
+    let root = tempfile::tempdir().expect("root");
+    let controlled = controlled_dag(root.path(), 2, HashSet::new());
+    let (model, _dag_provider) = registered_dag_model();
+    let session = parent_session(root.path(), model);
+    let _agent_home = isolate_parent(&session, root.path()).await;
+    let application =
+        Application::new_with_orchestration(session, controlled.runtime.clone()).await;
+    let mut item = task("task-rm-prog", "rm-in-progress-task", &[]);
+    item.status = TodoStatus::InProgress;
+    item.ready = true;
+    application
+        .set_todos(vec![TodoPhase {
+            name: "Plan".to_owned(),
+            tasks: vec![item],
+        }])
+        .expect("set in-progress todo");
+    controlled.wait_started("Todo1").await;
+    let status_while_running = application
+        .todo_state()
+        .phases
+        .iter()
+        .flat_map(|phase| &phase.tasks)
+        .find(|task| task.id == "task-rm-prog")
+        .map(|task| task.status);
+    assert_eq!(
+        status_while_running,
+        Some(TodoStatus::InProgress),
+        "a running todo job must not complete its task early"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let status_still_held = application
+        .todo_state()
+        .phases
+        .iter()
+        .flat_map(|phase| &phase.tasks)
+        .find(|task| task.id == "task-rm-prog")
+        .map(|task| task.status);
+    assert_eq!(status_still_held, Some(TodoStatus::InProgress));
+    controlled.release("Todo1");
+    wait_todo_status(&application, "task-rm-prog", TodoStatus::Completed).await;
+    let _ = application.cleanup().await;
+    let _ = controlled.runtime.shutdown().await;
 }

@@ -55,6 +55,32 @@ impl ScopedModelSelector {
         }
     }
 
+    pub(crate) fn new_positioned(models: Vec<Model>, current: Option<&Model>) -> Self {
+        let mut selector = Self::new(models, None);
+        if let Some(current) = current {
+            selector.position_on(current);
+        }
+        selector
+    }
+
+    fn position_on(&mut self, current: &Model) {
+        let providers = self.providers();
+        let Some(provider_selected) = providers
+            .iter()
+            .position(|provider| *provider == current.provider)
+        else {
+            return;
+        };
+        self.provider_selected = provider_selected;
+        self.model_selected = self
+            .models_for_provider(&current.provider)
+            .iter()
+            .position(|id| id == &model_id(current))
+            .unwrap_or(0);
+        self.column = ModelColumn::Models;
+        self.clamp_selection();
+    }
+
     pub(crate) fn query(&self) -> &str {
         &self.query
     }
@@ -228,6 +254,7 @@ impl ScopedModelSelector {
                 }
                 self.provider_selected =
                     (self.provider_selected as isize + delta).rem_euclid(count as isize) as usize;
+                self.clamp_selection();
             }
             ModelColumn::Models => {
                 let count = self
@@ -598,6 +625,49 @@ mod tests {
         assert_eq!(selector.models_for_provider("beta"), vec!["beta/three"]);
         selector.pop_query();
         assert_eq!(selector.providers(), vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn positioned_selector_uses_provider_and_model_identity() {
+        let current = model("beta", "shared");
+        let mut models = (0..55)
+            .map(|index| model("alpha", &format!("model-{index:02}")))
+            .collect::<Vec<_>>();
+        models.push(model("alpha", "shared"));
+        models.push(current.clone());
+        let selector = ScopedModelSelector::new_positioned(models, Some(&current));
+        assert_eq!(selector.column(), ModelColumn::Models);
+        assert_eq!(selector.current_provider(), Some("beta"));
+        assert_eq!(selector.selected_id(), Some("beta/shared".to_owned()));
+    }
+
+    #[test]
+    fn filtering_and_provider_changes_clamp_both_columns() {
+        let models = vec![
+            model("long", "one"),
+            model("long", "two"),
+            model("long", "three"),
+            model("short", "only"),
+        ];
+        let mut selector = ScopedModelSelector::new(models, None);
+        selector.focus_models();
+        selector.move_selection(-1);
+        assert_eq!(selector.model_selected(), 2);
+        selector.focus_providers();
+        selector.move_selection(1);
+        assert_eq!(selector.model_selected(), 0);
+        selector.focus_models();
+        assert_eq!(selector.model_selected(), 0);
+        for character in "absent".chars() {
+            selector.push_query(character);
+        }
+        assert!(selector.providers().is_empty());
+        assert_eq!(selector.provider_selected(), 0);
+        assert_eq!(selector.model_selected(), 0);
+        while !selector.query().is_empty() {
+            selector.pop_query();
+        }
+        assert_eq!(selector.selected_id(), Some("long/one".to_owned()));
     }
 
     #[test]

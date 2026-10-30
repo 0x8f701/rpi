@@ -234,6 +234,7 @@ fn register_scripted_provider(label: &str) -> ScriptedProvider {
             stream: stream_fn,
             stream_simple: simple,
             generate_image: None,
+            resolve_http_authorities: Arc::new(|_, _| Ok(std::collections::BTreeSet::new())),
         },
         Some(source_id.clone()),
     );
@@ -270,6 +271,7 @@ async fn concurrent_run_print_rejects_second_with_already_processing() {
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: None,
+        auth_manager: None,
     })
     .expect("build session");
 
@@ -345,6 +347,7 @@ async fn abort_settles_terminal_assistant_then_reuse() {
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: None,
+        auth_manager: None,
     })
     .expect("build session");
 
@@ -432,6 +435,7 @@ async fn recorder_persists_messages_to_resumed_temp_session() {
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: None,
+        auth_manager: None,
     })
     .expect("build session");
 
@@ -507,6 +511,7 @@ async fn foreground_bash_finishing_during_run_appends_after_assistant() {
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: None,
+        auth_manager: None,
     })
     .expect("build session");
 
@@ -516,14 +521,26 @@ async fn foreground_bash_finishing_during_run_appends_after_assistant() {
         result = &mut run => panic!("run completed before provider gate: {result:?}"),
         started = provider.take_started() => started.expect("provider started"),
     }
-    let bash = session.execute_bash("printf foreground", false).await.expect("foreground bash");
+    let bash = session
+        .execute_bash("printf foreground", false)
+        .await
+        .expect("foreground bash");
     assert_eq!(bash.output, "foreground");
-    assert!(session.history().iter().all(|message| !matches!(message, pi_ai::Message::BashExecution(_))));
+    assert!(
+        session
+            .history()
+            .iter()
+            .all(|message| !matches!(message, pi_ai::Message::BashExecution(_)))
+    );
     provider.release_one();
     let run = run.await.expect("run result");
     assert_eq!(run.text, "assistant answer");
     let history = session.history();
-    assert!(matches!(history.last(), Some(pi_ai::Message::BashExecution(message)) if message.output == "foreground"));
-    assert!(matches!(history.get(history.len() - 2), Some(pi_ai::Message::Assistant(message)) if message.text() == "assistant answer"));
+    assert!(
+        matches!(history.last(), Some(pi_ai::Message::BashExecution(message)) if message.output == "foreground")
+    );
+    assert!(
+        matches!(history.get(history.len() - 2), Some(pi_ai::Message::Assistant(message)) if message.text() == "assistant answer")
+    );
     provider.unregister();
 }

@@ -110,8 +110,8 @@ impl ReplProbe {
         cmd.env("HOME", home);
         cmd.env("PATH", std::env::var("PATH").unwrap_or_default());
         cmd.env("TERM", "xterm-256color");
-        cmd.env("PI_OFFLINE", "1");
-        cmd.env("PI_SKIP_VERSION_CHECK", "1");
+        cmd.env("RPI_OFFLINE", "1");
+        cmd.env("RPI_SKIP_VERSION_CHECK", "1");
         cmd.env("PI_FAUX_RESPONSE", faux_response);
         cmd.arg("--session-dir");
         cmd.arg(session_dir);
@@ -260,11 +260,7 @@ fn session_file_path(output: &str) -> PathBuf {
         .lines()
         .find(|line| line.contains(" messages"))
         .unwrap_or_else(|| panic!("no /session status line in: {output:?}"));
-    let path = line
-        .split(" · ")
-        .nth(2)
-        .expect("session file token")
-        .trim();
+    let path = line.split(" · ").nth(2).expect("session file token").trim();
     PathBuf::from(path)
 }
 
@@ -332,7 +328,10 @@ fn repl_rewind_lists_truncates_and_archives_sidecar() {
 
     let before = repl.command("/session");
     let before_count = session_message_count(&before);
-    assert!(before_count > count_after_first, "second turn must grow the transcript");
+    assert!(
+        before_count > count_after_first,
+        "second turn must grow the transcript"
+    );
 
     let listed = repl.command("/rewind");
     assert!(listed.contains("rolls back"), "{listed}");
@@ -357,7 +356,11 @@ fn repl_rewind_lists_truncates_and_archives_sidecar() {
 
     let session_file = session_file_path(&after);
     let sidecars = sidecars_for(&session_file, ".rewind-");
-    assert_eq!(sidecars.len(), 1, "exactly one rewind sidecar: {sidecars:?}");
+    assert_eq!(
+        sidecars.len(),
+        1,
+        "exactly one rewind sidecar: {sidecars:?}"
+    );
     let archived = fs::read_to_string(&sidecars[0]).expect("read rewind sidecar");
     assert!(
         archived.contains("second rewind prompt"),
@@ -411,7 +414,11 @@ fn repl_checkpoint_marks_and_rewinds_by_name() {
     );
 
     let sidecars = sidecars_for(&session_file_path(&after), ".rewind-");
-    assert_eq!(sidecars.len(), 1, "checkpoint rewind archives a sidecar: {sidecars:?}");
+    assert_eq!(
+        sidecars.len(),
+        1,
+        "checkpoint rewind archives a sidecar: {sidecars:?}"
+    );
 
     repl.quit();
 }
@@ -448,7 +455,11 @@ fn repl_compact_snap_archives_without_provider_call() {
 
     let session_file = session_file_path(&repl.command("/session"));
     let sidecars = sidecars_for(&session_file, ".snapcompact-");
-    assert_eq!(sidecars.len(), 1, "exactly one snapcompact sidecar: {sidecars:?}");
+    assert_eq!(
+        sidecars.len(),
+        1,
+        "exactly one snapcompact sidecar: {sidecars:?}"
+    );
     let archived = fs::read_to_string(&sidecars[0]).expect("read snapcompact sidecar");
     assert!(
         archived.contains("first snap prompt"),
@@ -522,13 +533,12 @@ fn repl_fresh_starts_new_transcript() {
 
     repl.command("before fresh");
     let before = repl.command("/session");
-    let before_id = before
-        .split(" · ")
-        .next()
-        .expect("session id")
-        .to_owned();
+    let before_id = before.split(" · ").next().expect("session id").to_owned();
     let before_file = session_file_path(&before);
-    assert!(before_file.is_file(), "session file exists: {before_file:?}");
+    assert!(
+        before_file.is_file(),
+        "session file exists: {before_file:?}"
+    );
 
     let fresh = repl.command("/fresh");
     assert!(fresh.contains("started a new transcript"), "{fresh}");
@@ -537,7 +547,10 @@ fn repl_fresh_starts_new_transcript() {
     let after_id = after.split(" · ").next().expect("session id").to_owned();
     let after_file = session_file_path(&after);
     assert_ne!(after_id, before_id, "/fresh must switch session ids");
-    assert_ne!(after_file, before_file, "/fresh must open a new session file");
+    assert_ne!(
+        after_file, before_file,
+        "/fresh must open a new session file"
+    );
     assert!(
         before_file.is_file(),
         "the archived transcript must stay on disk: {before_file:?}"
@@ -581,7 +594,10 @@ fn repl_queue_empty_and_cancel_surfaces() {
         }
         thread::sleep(Duration::from_millis(25));
     }
-    assert!(saw_error, "/queue bogus must fail with the typed action error");
+    assert!(
+        saw_error,
+        "/queue bogus must fail with the typed action error"
+    );
 
     repl.quit();
 }
@@ -610,7 +626,10 @@ fn repl_goal_pin_lists_and_unpins() {
     thread::sleep(Duration::from_secs(2));
 
     let pinned = repl.command("/goal pin keep the checklist in scope");
-    assert!(pinned.contains("active"), "pin keeps the goal active: {pinned}");
+    assert!(
+        pinned.contains("active"),
+        "pin keeps the goal active: {pinned}"
+    );
 
     let pins = repl.command("/goal pins");
     assert!(
@@ -620,10 +639,16 @@ fn repl_goal_pin_lists_and_unpins() {
 
     // `/goal pins` renders 1-based, but the command's index is 0-based.
     let unpinned = repl.command("/goal unpin 0");
-    assert!(unpinned.contains("active"), "unpin keeps the goal active: {unpinned}");
+    assert!(
+        unpinned.contains("active"),
+        "unpin keeps the goal active: {unpinned}"
+    );
 
     let empty = repl.command("/goal pins");
-    assert!(empty.contains("no pins"), "unpin must empty the list: {empty}");
+    assert!(
+        empty.contains("no pins"),
+        "unpin must empty the list: {empty}"
+    );
 
     repl.command("/goal drop");
     repl.quit();

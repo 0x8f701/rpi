@@ -138,7 +138,10 @@ pub fn is_builtin_provider(provider: &str) -> bool {
 /// The ownership lock and catalog write lock cover the complete replacement,
 /// so concurrent instances of the same source replace one exact set rather
 /// than accumulating stale keys, and readers see either the old or new set.
-pub fn replace_dynamic_models(owner: &str, new_models: Vec<Model>) -> Result<Vec<(String, String)>> {
+pub fn replace_dynamic_models(
+    owner: &str,
+    new_models: Vec<Model>,
+) -> Result<Vec<(String, String)>> {
     if owner.trim().is_empty() {
         return Err(anyhow!("dynamic model owner must not be empty"));
     }
@@ -173,7 +176,9 @@ pub fn replace_dynamic_models(owner: &str, new_models: Vec<Model>) -> Result<Vec
     let mut cat = catalog().write().expect("catalog lock");
     for (provider, id) in &keys {
         if !previous_set.contains(&(provider.clone(), id.clone()))
-            && cat.get(provider).is_some_and(|models| models.contains_key(id))
+            && cat
+                .get(provider)
+                .is_some_and(|models| models.contains_key(id))
         {
             return Err(anyhow!(
                 "dynamic model key {provider}/{id} is already installed by another source"
@@ -414,11 +419,14 @@ mod tests {
             provider: provider.into(),
             ..Model::default()
         };
-        replace_dynamic_models("catalog-owner-a", vec![model.clone()])
-            .expect("owner A install");
+        replace_dynamic_models("catalog-owner-a", vec![model.clone()]).expect("owner A install");
         let error = replace_dynamic_models("catalog-owner-b", vec![model])
             .expect_err("owner B must not claim owner A key");
-        assert!(error.to_string().contains("already installed by another source"));
+        assert!(
+            error
+                .to_string()
+                .contains("already installed by another source")
+        );
         assert!(get_model(provider, "shared").is_some());
     }
 }

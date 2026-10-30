@@ -3,33 +3,45 @@
 //
 // Proves the Web-only listener contract for transcript/session parity:
 //   R0  a persisted fixture restores legitimate assistant/IRC content,
-//       hides display:false internal customs, and bounds bash/tool output
+//       paints stored [text, thinking] thinking-first, hides display:false
+//       internal customs, and bounds bash/tool output
 //   R1  a Web prompt round-trips and the new session's sidebar row appears
 //       (the prompt is written to the normal recorder)
 //   R2  switching away/back to a LOADED session restores its prior
 //       transcript from the authoritative backend snapshot
-//   R4  after the listener process is SIGTERM-restarted, the Web
+//   R4  after the listener process is restarted through its SIGTERM restart authority, the Web
 //       auto-reconnects, re-binds to the authoritative primary, and
 //       switching to the recorded session restores its history from disk
-//   R5  after a page reload, the last-activated session — persisted under the
-//       selected listener's key `rpi-web-session:<encodeURIComponent(authority)>`
-//       — is restored as the active row with its transcript, including when
-//       the page origin and listener authority use different host strings
-//       (bootstrap restores the selected listener before its preference)
+//   R5  after a page reload, the fresh load boots the SERVING page authority
+//       (never a persisted host value) and restores the PAGE-authority saved
+//       session `rpi-web-session:<encodeURIComponent(pageAuthority)>` with its
+//       transcript, while the session chosen through a host-switch cutover
+//       stays stored under the connection authority's own key (per-authority
+//       preference isolation; no token or preference crosses authorities).
 //   R6  a saved preference naming a nonexistent session falls back to the
 //       FIRST catalog row, which becomes active with its transcript loaded
 //
-// Every R5.x/R6.x contract records a machine-readable ID; on full success the
-// lane writes $RPI_EVIDENCE/coverage-assertions.json ({ "executed": [...] }),
-// the same executed-assertion evidence convention as the sessions lane, so
-// the assertions enter the existing coverage counting/reporting.
+// Every R4.x/R5.x/R6.x contract records a machine-readable ID (record(id) at
+// the assertion site — never implicitly). This driver STAGES ONLY: every
+// artifact (screenshots, the FULL exact ledger coverage-assertions.json with
+// { "documented": [...], "executed": [...Map insertion order...], "counts":
+// {...} } — the same documented/executed/counts convention as every other
+// coverage producer — and the playwright-assertions.json manifest) is written
+// into the ONE run-scoped staging dir the shell handed over via RPI_STAGING,
+// registered only after its write succeeded. This script NEVER renames the
+// staging set, NEVER writes a run directory, and NEVER touches the current
+// pointer: session_restore.sh validates the exact staged set/ledger and
+// performs the single stage->run rename + pointer commit after the HTTP
+// sanity and listener-close gates pass. A failed run removes ONLY its
+// staging dir; published evidence and the prior pointer are unreachable
+// from here.
 //
 // Environment:
 //   RPI_URL            http://127.0.0.1:<port>/web
 //   RPI_TOKEN          token file content (rpi-auth.<token> subprotocol)
 //   RPI_REPLY          expected instant reply marker (default "sessions-reply:")
-//   RPI_CHROME         executable path of the system Chrome (optional)
-//   RPI_EVIDENCE       evidence dir for screenshots
+//   RPI_STAGING        the run-scoped staging dir handed over by the shell
+//   RPI_LANE_NONCE     this invocation's nonce (must match the shell's)
 //   RPI_WORK           shared dir for the kill/restart handshake:
 //                        test writes kill-server.marker, the lane respawns
 //                        the listener and writes server-up.marker
@@ -40,33 +52,93 @@
 import { chromium } from 'playwright';
 import fs from 'node:fs';
 import path from 'node:path';
+import { assertSidebarNewActionAbsent, createFreshSessionViaManage } from './lib/session-lifecycle.mjs';
 
 const listenerUrl = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
 const replyMarker = process.env.RPI_REPLY || 'sessions-reply:';
 const paritySession = process.env.RPI_PARITY_SESSION || 'web-transcript-parity';
+const baseSession = process.env.RPI_BASE_SESSION || 'web-transcript-a';
 const chromePath = process.env.RPI_CHROME || '';
-const evidence = process.env.RPI_EVIDENCE || '.';
+const stagingDir = process.env.RPI_STAGING || '';
+const laneNonce = process.env.RPI_LANE_NONCE || '';
 const work = process.env.RPI_WORK || '.';
 
 const KILL_MARKER = path.join(work, 'kill-server.marker');
 const UP_MARKER = path.join(work, 'server-up.marker');
-
-// Machine-readable executed-assertion evidence for the coverage suite: every
-// passing R5.x/R6.x contract is recorded here (a Set, so repeated waits under
-// one contract dedupe) and written to $RPI_EVIDENCE/coverage-assertions.json
-// only after the FULL documented matrix below has executed, matching the
-// sessions lane's evidence convention.
-const DOCUMENTED_IDS = ['R5.1', 'R5.2', 'R5.3', 'R6.1', 'R6.2', 'R6.3'];
-const executed = new Set();
+// Documented in the lane's ACTUAL execution order (R5 -> R6 -> R4; within
+// the restart phase every contract completes strictly in ID order
+// R4.1..R4.5 — R4.3 records at its actual contract site, the disk-backed
+// parity history restore), so the Map's insertion order can be compared
+// elementwise against it.
+const DOCUMENTED_IDS = [
+  'R5.1', 'R5.2', 'R5.3',
+  'R6.1', 'R6.2', 'R6.3',
+  'R4.1', 'R4.2', 'R4.3', 'R4.4', 'R4.5',
+];
+// Explicit per-ID execution counts: record(id) is called ONLY at assertion
+// sites, hard-fails on any id outside DOCUMENTED_IDS, and never allows a
+// duplicate — every documented id must land at exactly 1.
+const executedCounts = new Map();
 function record(id) {
-  executed.add(id);
+  if (!DOCUMENTED_IDS.includes(id)) {
+    fail(`record: unexpected assertion id ${JSON.stringify(id)} (not in DOCUMENTED_IDS)`);
+  }
+  const count = (executedCounts.get(id) || 0) + 1;
+  executedCounts.set(id, count);
+  if (count !== 1) {
+    fail(`record: assertion id ${id} recorded ${count}x — every documented id must execute exactly once`);
+  }
   console.log(`[web-session-restore:assert] ${id}`);
 }
 
 function fail(message) {
-  console.error(`web-session-restore: FAIL: ${message}`);
-  process.exit(2);
+  // Throwing (not exiting) keeps every failure on main's single failure
+  // route, which closes the browser before exiting — no leaked Chromium.
+  throw new Error(message);
+}
+
+// Run-scoped STAGING ONLY: every artifact is written into the ONE staging
+// dir the shell claimed for this invocation and REGISTERED only after its
+// write/screenshot succeeded.
+const laneArtifacts = []; // staged artifact names, AFTER their write succeeded
+
+function cleanupStaging() {
+  fs.rmSync(stagingDir, { recursive: true, force: true });
+}
+
+async function laneShot(page, name, opts = {}) {
+  fs.mkdirSync(stagingDir, { recursive: true });
+  await page.screenshot({ path: path.join(stagingDir, name), ...opts });
+  laneArtifacts.push(name);
+  return path.join(stagingDir, name);
+}
+
+// Stage the FULL exact ledger — executed is the Map's actual insertion order
+// and counts the real per-ID ledger, never a reconstruction of
+// DOCUMENTED_IDS — after the close/error gates, plus the manifest carrying
+// the exact registered artifact list the shell's commit gate validates.
+function stageLedgerAndManifest() {
+  const executedOrder = [...executedCounts.keys()];
+  if (executedOrder.length !== DOCUMENTED_IDS.length
+    || executedOrder.some((id, index) => id !== DOCUMENTED_IDS[index])) {
+    fail(`session restore evidence order mismatch: executed ${JSON.stringify(executedOrder)} != documented ${JSON.stringify([...DOCUMENTED_IDS])}`);
+  }
+  fs.mkdirSync(stagingDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(stagingDir, 'coverage-assertions.json'),
+    JSON.stringify({
+      documented: [...DOCUMENTED_IDS],
+      executed: executedOrder,
+      counts: Object.fromEntries(executedCounts),
+    }, null, 2),
+  );
+  laneArtifacts.push('coverage-assertions.json');
+  fs.writeFileSync(path.join(stagingDir, 'playwright-assertions.json'), JSON.stringify({
+    lane: 'web-session-restore',
+    nonce: laneNonce,
+    artifacts: laneArtifacts,
+  }, null, 2));
 }
 
 async function waitFor(page, fn, label, timeoutMs = 30000, arg) {
@@ -87,7 +159,8 @@ async function waitForFile(file, label, timeoutMs = 60000) {
 }
 
 async function activeTranscript(page) {
-  return page.evaluate(() => document.getElementById('transcript')?.textContent || '');
+  return page.evaluate(() =>
+    document.querySelector('#transcript .transcript-surface:not([hidden])')?.textContent || '');
 }
 
 async function rowIds(page) {
@@ -105,6 +178,46 @@ async function activeRowSid(page) {
     const btn = row.querySelector('.session-sidebar__switch');
     return btn?.dataset.sessionId || null;
   });
+}
+
+// Failure diagnostics: dump the exact restore-relevant client state so a
+// failed reload-restore assertion is attributable (which authority booted,
+// what the catalog showed, which keys were saved, what the socket exchanged).
+async function dumpRestoreDiagnostics(page, socketFrames, label) {
+  const snapshot = await page.evaluate(() => ({
+    pageAuthority: window.location.host,
+    activeRow: document.querySelector('.session-sidebar__row--active .session-sidebar__switch')?.dataset.sessionId || null,
+    rows: [...document.querySelectorAll('.session-sidebar__switch')].map((r) => r.dataset.sessionId || ''),
+    sendDisabled: document.getElementById('send-btn')?.hasAttribute('disabled') === true,
+    sendLabel: document.getElementById('send-btn')?.getAttribute('aria-label') || '',
+    switchPending: document.getElementById('transcript')?.dataset.switchPending || '',
+    overlay: document.querySelector('#reconnect-overlay .reconnect-overlay__text')?.textContent || '',
+    toasts: [...document.querySelectorAll('.toast, [role="status"]')].map((node) => (node.textContent || '').slice(0, 160)),
+    storage: Object.fromEntries(Object.keys(window.localStorage)
+      .filter((k) => k.startsWith('rpi-web-'))
+      .map((k) => [k, (window.localStorage.getItem(k) || '').slice(0, 80)])),
+  })).catch((error) => ({ dumpError: String(error) }));
+  console.error(`[diag:${label}]`, JSON.stringify(snapshot));
+  const latestGen = socketFrames.sent.reduce((max, frame) => Math.max(max, frame.gen), 0);
+  const summarize = (frame) => {
+    try {
+      const parsed = JSON.parse(frame.raw);
+      return {
+        gen: frame.gen,
+        type: parsed.type,
+        id: parsed.id,
+        command: parsed.command,
+        sessionId: parsed.sessionId,
+        success: parsed.success,
+      };
+    } catch {
+      return { gen: frame.gen, type: '?' };
+    }
+  };
+  const sent = socketFrames.sent.filter((frame) => frame.gen === latestGen).map(summarize);
+  const received = socketFrames.received.filter((frame) => frame.gen === latestGen).map(summarize);
+  console.error(`[diag:${label}] gen ${latestGen} sent:`, JSON.stringify(sent));
+  console.error(`[diag:${label}] gen ${latestGen} received:`, JSON.stringify(received));
 }
 
 // Click a session row and wait for it to become the active session, so later
@@ -167,6 +280,8 @@ async function assertTranscriptHas(page, needle, label) {
 
 async function main() {
   if (!listenerUrl) fail('RPI_URL is required');
+  if (!stagingDir) fail('RPI_STAGING is required (the shell hands over the run-scoped staging dir)');
+  if (!laneNonce) fail('RPI_LANE_NONCE is required (must match the shell invocation nonce)');
   const connectionUrl = new URL(listenerUrl);
   const pageUrl = new URL(listenerUrl);
   // Exercise the residual production bug: the document is loaded through
@@ -179,16 +294,41 @@ async function main() {
   const launchOptions = chromePath ? { executablePath: chromePath } : {};
   const browser = await chromium.launch(launchOptions);
   try {
-    const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+    // Explicit context so the R5 connection-authority probe can open a second
+    // page in the SAME context (shared localStorage per origin) — a fresh
+    // context would have empty storage and prove nothing.
+    const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+    const page = await context.newPage();
     if (token) {
       await page.addInitScript((t) => { window.localStorage.setItem('rpi-web-token', t); }, token);
     }
-    page.on('pageerror', (err) => console.error(`web-session-restore: page error: ${err.message}`));
+    const browserErrors = [];
+    // Error monitors attached to the CONTEXT (not one page): the primary
+    // page AND the R5 connection-authority probe page — every page this
+    // run ever opens — feed the SAME browserErrors union, so an error on
+    // the probe page can never escape the lane-final gate. The gate itself
+    // evaluates only after every page/context/browser closed.
+    context.on('pageerror', (err) => browserErrors.push(`page: ${err.message}`));
+    context.on('console', (message) => {
+      if (message.type() === 'error') browserErrors.push(`console: ${message.text()}`);
+    });
+    const socketFrames = { nextGen: 0, sent: [], received: [], closes: [], current: null };
+    page.on('websocket', (socket) => {
+      const gen = ++socketFrames.nextGen;
+      socketFrames.current = socket;
+      socket.on('framesent', (frame) => {
+        if (typeof frame.payload === 'string') socketFrames.sent.push({ gen, raw: frame.payload });
+      });
+      socket.on('framereceived', (frame) => {
+        if (typeof frame.payload === 'string') socketFrames.received.push({ gen, raw: frame.payload });
+      });
+      socket.on('close', () => socketFrames.closes.push({ gen, at: Date.now() }));
+    });
 
     /* ---- boot + connect ---- */
     await page.goto(pageUrl.toString(), { waitUntil: 'domcontentloaded', timeout: 20000 });
     await waitFor(page, () => document.title === 'rpi web', 'page title missing');
-    await waitFor(page, () => document.getElementById('conn-state').dataset.state === 'on', 'WS did not connect');
+    await waitFor(page, () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true, 'WS did not connect');
     await waitFor(
       page,
       () =>
@@ -204,9 +344,9 @@ async function main() {
     // preference exists, which may already be the parity fixture. Keep the
     // other fixture as A so the legacy R0/R2 switch-away assertions remain
     // meaningful without assuming which row bootstrap activates.
-    const sessionA = knownIds.find((id) => id !== paritySession);
-    if (!sessionA) fail('could not identify the non-parity primary session');
-    await page.screenshot({ path: `${evidence}/restore-t0-boot.png`, fullPage: true });
+    const sessionA = knownIds.find((id) => id === baseSession);
+    if (!sessionA) fail(`could not identify the durable base session ${baseSession}`);
+    await laneShot(page, 'restore-t0-boot.png', { fullPage: true });
 
     /* ---- R0: restored transcript visibility and output bounding ---- */
     if (activeAtBoot !== paritySession) {
@@ -229,6 +369,17 @@ async function main() {
     for (const forbidden of ['internal parity secret', '<orchestration-message', 'orchestration_message', 'bash-parity-1\n', 'tool-parity-1\n', 'orphan-parity-1\n']) {
       if (parityText.includes(forbidden)) fail(`R0: restored transcript leaked "${forbidden}"`);
     }
+    const thinkOrder = await page.evaluate(() => {
+      const msgs = [...document.querySelectorAll('.msg--assistant')];
+      const hit = msgs.find((node) => (node.textContent || '').includes('system-reminder wording is legitimate assistant text'));
+      if (!hit) return { ok: false, reason: 'assistant missing' };
+      if (!hit.querySelector('.thinking')) return { ok: false, reason: 'thinking fold missing' };
+      const html = hit.innerHTML;
+      const thinkAt = html.indexOf('THINKPROBE_EN restored chain of thought');
+      const answerAt = html.indexOf('system-reminder wording is legitimate assistant text');
+      return { ok: thinkAt >= 0 && answerAt >= 0 && thinkAt < answerAt, thinkAt, answerAt };
+    });
+    if (!thinkOrder.ok) fail(`R0: restored [text, thinking] did not paint thinking first: ${JSON.stringify(thinkOrder)}`);
     const oldIrcNodes = await page.locator('text="IRC · Main → Child"').evaluateAll((nodes) =>
       nodes.map((node) => node.outerHTML),
     );
@@ -289,8 +440,8 @@ async function main() {
     if (!(await incomingBody.textContent() || '').includes('irc-incoming-line-10')) {
       fail('R0: expanded IRC body missing the final line');
     }
-    const bashCard = page.locator('.tool-card[data-tool-id="parity-bash-card"]');
-    if (await bashCard.count() !== 1) fail('R0: restored bash tool card missing or duplicated');
+    const bashCard = page.locator('.tool-card[data-tool-call-id="parity-bash-card"]');
+    if (await bashCard.count() !== 1) fail(`R0: restored bash tool card missing or duplicated (${await bashCard.count()})`);
     if (await bashCard.locator('.tool-card__title').textContent() !== 'Command') fail('R0: restored bash command title mismatch');
     if (!(await bashCard.locator('.tool-card__command-text').textContent() || '').includes('seq 1 15')) fail('R0: restored bash command missing');
     const bashClasses = await bashCard.getAttribute('class') || '';
@@ -300,8 +451,8 @@ async function main() {
       fail(`R0: restored bash result was not bounded to its ten-line tail — got: ${bashResult}`);
     }
 
-    const toolCard = page.locator('.tool-card[data-tool-id="parity-tool"]');
-    if (await toolCard.count() !== 1) fail('R0: restored generic tool card missing or duplicated');
+    const toolCard = page.locator('.tool-card[data-tool-call-id="parity-tool"]');
+    if (await toolCard.count() !== 1) fail(`R0: restored generic tool card missing or duplicated (${await toolCard.count()})`);
     if (await toolCard.locator('.tool-card__title').textContent() !== 'Read') fail('R0: restored read title mismatch');
     if (!(await toolCard.locator('.tool-card__summary-path').textContent() || '').includes('parity.txt')) fail('R0: restored read path missing');
     const toolClasses = await toolCard.getAttribute('class') || '';
@@ -312,42 +463,36 @@ async function main() {
     if (!toolResult.startsWith('… 6 more lines\ntool-parity-7') || !toolResult.endsWith('\ntool-parity-12')) {
       fail(`R0: restored read result was not bounded to its six-line tail — got: ${toolResult}`);
     }
-    await page.screenshot({ path: `${evidence}/restore-r0-transcript-parity.png`, fullPage: true });
+    await laneShot(page, 'restore-r0-transcript-parity.png', { fullPage: true });
     await clickRow(page, sessionA, 'R0: return to primary');
     console.log('web-session-restore: R0 PASS (metadata visibility + bounded restored output)');
 
     /* ---- R1: prompt writes the recorder; B created ---- */
-    await page.click('#sidebar-new-session-btn');
-    const sessionB = await waitForNewRow(page, knownIds, 'R1: B row never appeared');
+    await assertSidebarNewActionAbsent(page, 'R1: obsolete sidebar New action rendered');
+    const { sessionId: sessionB } = await createFreshSessionViaManage(page, waitFor, 'R1', {
+      closePanel: true,
+      timeoutMs: 30000,
+    });
+    await waitForNewRow(page, knownIds, 'R1: B row never appeared');
     knownIds.push(sessionB);
-    await waitFor(
-      page,
-      (s) => {
-        const row = document.querySelector('.session-sidebar__row--active');
-        return row?.querySelector('.session-sidebar__switch')?.dataset.sessionId === s;
-      },
-      'R1: B never became the active session after New',
-      20000,
-      sessionB
-    );
     const bPrompt = 'restore-b-1';
     const bReply = `${replyMarker} ${bPrompt}`;
     await promptAndWait(page, bPrompt, bReply, 'R1: B prompt never round-tripped');
-    await page.screenshot({ path: `${evidence}/restore-r1-b.png`, fullPage: true });
+    await laneShot(page, 'restore-r1-b.png', { fullPage: true });
 
     /* ---- R2: switch away (A) and back (B, LOADED) restores B transcript ---- */
     await clickRow(page, sessionA, 'R2: switch to A');
-    // A is the fresh primary (empty): confirm B's text left the active view.
-    await waitFor(page, (r) => !document.body.textContent.includes(r), 'R2: B reply leaked into A view', 10000, bReply);
+    // A is the fresh primary (empty): confirm B's text left the VISIBLE
+    // transcript surface. Hidden parked surfaces and sidebar previews still
+    // contain B's reply in document.body.
+    await waitFor(page, (r) => !(document.querySelector('#transcript .transcript-surface:not([hidden])')?.textContent || '').includes(r), 'R2: B reply leaked into A view', 10000, bReply);
     await clickRow(page, sessionB, 'R2: switch back to B (loaded)');
     await assertTranscriptHas(page, bReply, 'R2: B transcript not restored from backend (loaded)');
-    await page.screenshot({ path: `${evidence}/restore-r2-loaded.png`, fullPage: true });
+    await laneShot(page, 'restore-r2-loaded.png', { fullPage: true });
     console.log('web-session-restore: R1+R2 PASS (prompt recorded + loaded switch restore)');
 
+
     /* ---- R5: the last-activated session restores after a page reload ---- */
-    // Reconnect through connectionAuthority while the document stays on
-    // pageAuthority. Pre-fix, reload reset the listener to pageAuthority and
-    // therefore could not read the selection saved for connectionAuthority.
     if (connectionAuthority !== pageAuthority) {
       if (token) {
         await page.evaluate(
@@ -355,15 +500,13 @@ async function main() {
           { authority: connectionAuthority, value: token }
         );
       }
-      await page.fill('#host-input', connectionAuthority);
-      await page.press('#host-input', 'Enter');
-      await waitFor(page, () => document.getElementById('conn-state').dataset.state === 'on', 'R5: alternate-authority WS did not connect');
+      // Directly open the connection-authority listener URL in a fresh page.
+      // The page's own authority contract connects the WebSocket to its
+      // serving host (the header host-input was removed).
+      await page.goto(listenerUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      await waitFor(page, () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true, 'R5: alternate-authority WS did not connect');
       await waitFor(page, () => document.querySelectorAll('.session-sidebar__switch').length >= 2, 'R5: catalog missing after alternate-authority reconnect');
     }
-    // Select the parity row by stable session identity. Other valid sessions
-    // can be created during the preceding lifecycle checks, so catalog index
-    // is not a contract; the saved-preference proof is that reload restores
-    // this explicitly selected row instead of whichever row sorts first.
     const catalogIds = await rowIds(page);
     if (catalogIds.length < 2) fail('R5: fewer than two fixture sessions in the catalog');
     if (!catalogIds.includes(paritySession)) {
@@ -380,64 +523,85 @@ async function main() {
       fail(`R5: click did not save under connection authority (got ${savedPreference})`);
     }
     record('R5.1');
-    await page.screenshot({ path: `${evidence}/restore-r5-switched.png`, fullPage: true });
-    await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 });
+    await laneShot(page, 'restore-r5-switched.png', { fullPage: true });
+    // Fresh-load authority contract: navigate BACK to the SERVING page URL
+    // (never a persisted host value — the header host-input is removed). The
+    // page boots on the page authority and restores the PAGE-authority saved
+    // session, while the connection-authority preference stays stored under
+    // its own origin-scoped key (per-authority isolation; no token or
+    // preference value crosses authorities on boot).
+    await page.goto(pageUrl.toString(), { waitUntil: 'domcontentloaded', timeout: 20000 });
     await waitFor(page, () => document.title === 'rpi web', 'R5: page title missing after reload');
-    await waitFor(page, () => document.getElementById('conn-state').dataset.state === 'on', 'R5: WS did not connect after reload');
-    await waitFor(
-      page,
-      (s) => {
-        const row = document.querySelector('.session-sidebar__row--active');
-        const btn = row?.querySelector('.session-sidebar__switch');
-        return btn?.dataset.sessionId === s;
-      },
-      'R5: reload never restored the saved session as active',
-      30000,
-      paritySession
-    );
-    record('R5.2');
-    // The restored view must be the parity session's backend snapshot (the
-    // bootstrap switch_session result was consumed), not an empty transcript.
-    await waitFor(
-      page,
-      (n) => document.getElementById('transcript')?.textContent.includes(n),
-      'R5: reloaded transcript missing the parity seed',
-      30000,
-      'transcript parity seed'
-    );
-    if (!(await activeTranscript(page)).includes('system-reminder wording is legitimate assistant text')) {
-      fail('R5: reloaded parity transcript not restored from the backend snapshot');
+    const bootAuthority = await page.evaluate(() => window.location.host);
+    if (bootAuthority !== pageAuthority) {
+      fail(`R5: fresh load booted authority ${bootAuthority}, expected page authority ${pageAuthority}`);
     }
+    await waitFor(page, () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true, 'R5: WS did not connect after reload');
+    const pagePrefKey = `rpi-web-session:${encodeURIComponent(pageAuthority)}`;
+    const pagePreference = await page.evaluate((key) => window.localStorage.getItem(key), pagePrefKey);
+    if (!pagePreference) fail('R5: page authority lost its saved session preference before reload');
+    try {
+      await page.waitForFunction(
+        (s) => document.querySelector('.session-sidebar__row--active .session-sidebar__switch')?.dataset.sessionId === s,
+        pagePreference,
+        { timeout: 30000 },
+      );
+    } catch (error) {
+      await dumpRestoreDiagnostics(page, socketFrames, 'R5');
+      fail(`R5: reload never restored the page-authority saved session as active (timeout 30000ms): ${error?.message || error}`);
+    }
+    // The connection-authority preference lives in the 127-origin localStorage
+    // (saved during the alternate-authority visit above) — verify it through
+    // a SEPARATE page in the SAME browser context (a fresh context would have
+    // empty storage) so the per-origin isolation is proven, not assumed.
+    const connectionProbe = await context.newPage();
+    try {
+      await connectionProbe.goto(listenerUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      const connectionPreferenceAfterReload = await connectionProbe.evaluate(
+        (key) => window.localStorage.getItem(key),
+        connectionPrefKey
+      );
+      if (connectionPreferenceAfterReload !== paritySession) {
+        fail(`R5: reload clobbered the connection-authority preference (got ${connectionPreferenceAfterReload}, expected ${paritySession})`);
+      }
+    } finally {
+      await connectionProbe.close().catch(() => {});
+    }
+    record('R5.2');
+    await assertTranscriptHas(page, bReply, 'R5: reloaded page-authority session transcript missing from the backend snapshot');
     record('R5.3');
-    await page.screenshot({ path: `${evidence}/restore-r5-restored.png`, fullPage: true });
-    console.log('web-session-restore: R5 PASS (per-authority preference restores the last session after reload)');
+    await laneShot(page, 'restore-r5-restored.png', { fullPage: true });
+    console.log('web-session-restore: R5 PASS (fresh load boots the serving page authority and restores its own saved session)');
 
     /* ---- R6: a missing saved preference falls back to the first catalog row ---- */
-    // Persist a nonexistent session id under the restored listener authority.
-    // Bootstrap must ignore it and activate the first catalog row instead.
-    const prefKey = `rpi-web-session:${encodeURIComponent(connectionAuthority)}`;
+    const prefKey = `rpi-web-session:${encodeURIComponent(pageAuthority)}`;
     await page.evaluate((key) => window.localStorage.setItem(key, `no-such-session-${Date.now()}`), prefKey);
     await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 });
     await waitFor(page, () => document.title === 'rpi web', 'R6: page title missing after reload');
-    await waitFor(page, () => document.getElementById('conn-state').dataset.state === 'on', 'R6: WS did not connect after reload');
+    await waitFor(page, () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true, 'R6: WS did not connect after reload');
+    // The catalog rows arrive via a session_list response AFTER the socket
+    // turns on; read them only once the sidebar has rendered its first row.
+    await waitFor(
+      page,
+      () => document.querySelector('.session-sidebar__switch') !== null,
+      'R6: sidebar catalog never rendered after reload',
+      30000,
+    );
     const firstId = (await rowIds(page))[0];
     if (!firstId) fail('R6: could not read the first catalog row after reload');
     await waitFor(
       page,
-      (s) => {
-        const row = document.querySelector('.session-sidebar__row--active');
-        const btn = row?.querySelector('.session-sidebar__switch');
-        return btn?.dataset.sessionId === s;
-      },
+      (s) => document.querySelector('.session-sidebar__row--active .session-sidebar__switch')?.dataset.sessionId === s,
       'R6: the first catalog row never became active (no fallback for a missing preference)',
       30000,
       firstId
     );
     record('R6.1');
-    // The fallback row's own durable snapshot must load. Which fixture sorts
-    // first is not contractual once earlier lifecycle steps create valid
-    // sessions, so derive the expected marker from its stable identity.
-    const firstTranscriptMarker = firstId === paritySession ? 'transcript parity seed' : bReply;
+    const firstTranscriptMarker = firstId === paritySession
+      ? 'transcript parity seed'
+      : firstId === sessionA
+        ? 'transcript A seed'
+        : bReply;
     await waitFor(
       page,
       (r) => document.getElementById('transcript')?.textContent.includes(r),
@@ -446,60 +610,215 @@ async function main() {
       firstTranscriptMarker
     );
     record('R6.2');
-    // The fallback activation persists the preference under the same restored
-    // listener-authority key.
     const persisted = await page.evaluate((key) => window.localStorage.getItem(key), prefKey);
-    if (persisted !== firstId) fail(`R6: preference persisted under a different listener key (got ${persisted}, expected ${firstId})`);
+    if (persisted !== firstId) fail(`R6: fallback preference persisted under a different listener key (got ${persisted}, expected ${firstId})`);
     record('R6.3');
-    await page.screenshot({ path: `${evidence}/restore-r6-fallback.png`, fullPage: true });
+    await laneShot(page, 'restore-r6-fallback.png', { fullPage: true });
     console.log('web-session-restore: R6 PASS (missing listener preference falls back to the first catalog row)');
-
-    /* ---- R4: restart the listener, reopen, switch to B, history present ---- */
-    let sawReconnecting = false;
-    const pillWatch = setInterval(async () => {
-      try {
-        const state = await page.evaluate(() => document.getElementById('conn-state')?.dataset.state || '');
-        if (state === 'reconnecting') sawReconnecting = true;
-      } catch {
-        /* page mid-close */
-      }
-    }, 100);
+    /* ---- R4: restart the listener, reopen, switch to parity, settle a prompt ---- */
+    // Event-gated: register the current socket's close promise and the
+    // successor-generation waitForEvent BEFORE the kill, so the restart is
+    // observed from the transport lifecycle itself — no polling, no sleeps.
+    const currentSocket = socketFrames.current;
+    if (!currentSocket) fail('R4: no live WebSocket to watch for the restart');
+    let currentSocketClosedResolve;
+    const currentSocketClosed = new Promise((resolve) => { currentSocketClosedResolve = resolve; });
+    currentSocket.once('close', () => currentSocketClosedResolve());
+    const successorOpened = page.waitForEvent('websocket', { timeout: 30000 });
     fs.writeFileSync(KILL_MARKER, 'kill now\n');
+    record('R4.1');
     await waitForFile(UP_MARKER, 'R4: lane never respawned the listener');
-    // The restart handshake is complete once the lane writes the up marker:
-    // stop polling the connection pill so the Node event loop drains and the
-    // process can exit. Without this the lingering setInterval keeps the
-    // process alive after main() resolves, so the lane's `wait $pw_pid`
-    // blocks forever (the test PASSES but the shell never returns).
-    clearInterval(pillWatch);
-    // The durable parity fixture is always catalog-visible and proves that a
-    // restarted listener rebinds disk-backed history. Temporary B can be
-    // hidden by the recoverable view policy when it is no longer loaded.
+    try {
+      await Promise.race([
+        currentSocketClosed,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('killed generation never closed within 30s')), 30000)),
+      ]);
+      await successorOpened;
+    } catch (error) {
+      await dumpRestoreDiagnostics(page, socketFrames, 'R4');
+      fail(`R4: restart transport cycle not observed: ${error?.message || error}`);
+    }
+    record('R4.2');
+    try {
+      await page.waitForFunction(
+        () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true,
+        { timeout: 30000 },
+      );
+    } catch (error) {
+      await dumpRestoreDiagnostics(page, socketFrames, 'R4-connected');
+      fail(`R4: WebSocket never returned to authoritative connected state after listener restart (timeout 30000ms): ${error?.message || error}`);
+    }
+    // Prove a real post-reconnect switch_session on the successor generation:
+    // move to the base session first, then switch back to parity — an
+    // A→parity round trip whose exact command id, response session owner, and
+    // applied active row are all correlated below.
+    await clickRow(page, sessionA, 'R4: post-restart switch away to the base session');
+    const sentBeforeSwitch = socketFrames.sent.length;
+    await page.click(`.session-sidebar__switch[data-session-id="${paritySession}"]`);
+    try {
+      await page.waitForFunction(
+        (s) => document.querySelector('.session-sidebar__row--active .session-sidebar__switch')?.dataset.sessionId === s,
+        paritySession,
+        { timeout: 30000 },
+      );
+    } catch (error) {
+      const sent = socketFrames.sent.slice(sentBeforeSwitch).map(({ gen, raw }) => {
+        try {
+          const frame = JSON.parse(raw);
+          return { gen, type: frame.type, id: frame.id, sessionId: frame.sessionId, sessionPath: frame.sessionPath };
+        } catch {
+          return { gen, invalid: true };
+        }
+      });
+      const switchCommand = sent.find((frame) => frame.type === 'switch_session');
+      const received = socketFrames.received.map(({ gen, raw }) => {
+        try {
+          const frame = JSON.parse(raw);
+          return { gen, type: frame.type, id: frame.id, success: frame.success, sessionId: frame.sessionId, error: frame.error };
+        } catch {
+          return null;
+        }
+      }).filter((frame) => frame && switchCommand && frame.id === switchCommand.id);
+      const diagnostic = await page.evaluate(() => ({
+        sendDisabled: document.getElementById('send-btn')?.hasAttribute('disabled') === true,
+        active: document.querySelector('.session-sidebar__row--active .session-sidebar__switch')?.dataset.sessionId || null,
+        rows: [...document.querySelectorAll('.session-sidebar__switch')].map((row) => ({
+          id: row.dataset.sessionId || '',
+          disabled: row.disabled,
+          text: row.textContent || '',
+        })),
+        toasts: [...document.querySelectorAll('.toast, .error-toast, [role="alert"]')].map((node) => node.textContent || ''),
+      }));
+      await dumpRestoreDiagnostics(page, socketFrames, 'R4-switch');
+      fail(`R4: parity switch failed after restart: ${error?.message || error} ${JSON.stringify({ diagnostic, sent, matchingResponses: received })}`);
+    }
+    // Correlate the post-restart switch on the successor generation: the
+    // exact switch_session command id, its response session owner, and the
+    // applied active row must all name the parity session.
+    const switchCommand = socketFrames.sent.slice(sentBeforeSwitch)
+      .map((frame) => {
+        try {
+          const parsed = JSON.parse(frame.raw);
+          return { gen: frame.gen, ...parsed };
+        } catch {
+          return null;
+        }
+      })
+      .filter((frame) => frame && frame.type === 'switch_session')
+      .pop();
+    if (!switchCommand || (switchCommand.sessionPath && !switchCommand.sessionPath.includes(paritySession))) {
+      fail(`R4: no switch_session command targeting parity on the successor generation: ${JSON.stringify(switchCommand || null)}`);
+    }
+    const switchResponse = [...socketFrames.received]
+      .map((frame) => {
+        try {
+          return { gen: frame.gen, ...JSON.parse(frame.raw) };
+        } catch {
+          return null;
+        }
+      })
+      .filter((frame) => frame && frame.id === switchCommand.id)
+      .pop();
+    // Wire contract (MultiSessionRuntimeManager): the response ENVELOPE
+    // sessionId names the routing owner — the session the command was sent
+    // from (the base session, since the click switch routes to the active
+    // session) — while the snapshot payload `data.sessionId` names the
+    // TARGET. The web client rejects any response whose envelope sessionId
+    // differs from the routed-from session, so both fields are asserted.
+    if (
+      !switchResponse || switchResponse.success !== true
+      || switchResponse.sessionId !== sessionA
+      || switchResponse.data?.sessionId !== paritySession
+    ) {
+      fail(`R4: switch_session response owner mismatch: ${JSON.stringify({
+        envelopeSessionId: switchResponse?.sessionId ?? null,
+        dataSessionId: switchResponse?.data?.sessionId ?? null,
+        success: switchResponse?.success ?? null,
+      })}`);
+    }
+    if (switchCommand.gen !== switchResponse.gen) {
+      fail(`R4: switch command/response crossed socket generations (sent gen ${switchCommand.gen}, response gen ${switchResponse.gen})`);
+    }
     if ((await activeRowSid(page)) !== paritySession) {
-      await clickRow(page, paritySession, 'R4: switch to parity after restart');
+      fail(`R4: active session ${await activeRowSid(page)} does not match the switch response owner ${paritySession}`);
     }
     await assertTranscriptHas(page, 'transcript parity seed', 'R4: parity history not present from disk after restart');
-    await page.screenshot({ path: `${evidence}/restore-r4-restarted.png`, fullPage: true });
-    console.log('web-session-restore: R4 PASS (restart re-bind + disk restore)');
-
-    // The lane may only report PASS (and may only write evidence) once the
-    // FULL documented matrix executed: a renamed/renumbered contract that no
-    // longer records its ID fails the lane instead of silently shrinking the
-    // evidence the coverage suite quantifies.
-    const missing = DOCUMENTED_IDS.filter((id) => !executed.has(id));
-    if (missing.length > 0) {
-      fail(`session-preference evidence incomplete: ${missing.join(', ')} never executed (coverage contract)`);
+    // R4.3's contract site: the post-reconnect switch correlation above plus
+    // the disk-backed parity history restore just proven. The record lands
+    // exactly here — never deferred to phase completion — so the executed
+    // order is the real contract order R4.1..R4.5.
+    record('R4.3');
+    // Cold-cache omission-settle: the parity fixture's recorded Task spawn is
+    // still queued/running in the disk transcript, but the session has no
+    // orchestration runtime, so the authoritative job_list after reconnect is
+    // empty and the historical child MUST be settled (never a stale Running
+    // card). DOM provenance keeps the exact backend jobId.
+    await waitFor(
+      page,
+      () => {
+        const row = document.querySelector('.tool-card__child[data-job-id="job-restore-parity"]');
+        return !!row && row.dataset.status === 'cancelled';
+      },
+      'R4.4: historical running Task child not omission-settled after restart restore (stale Running card)',
+      30000,
+    );
+    record('R4.4');
+    // Post-reconnect event delivery: send ONE unique prompt on the successor
+    // generation and require its assistant reply to settle exactly once in
+    // the transcript DOM (the recorded post-recovery delivery gap).
+    const r4Prompt = `restore-r4-prompt-${Date.now()}`;
+    const r4Reply = `${replyMarker} ${r4Prompt}`;
+    await page.fill('#prompt-input', r4Prompt);
+    await page.press('#prompt-input', 'Enter');
+    try {
+      await page.waitForFunction(
+        (r) => document.getElementById('transcript')?.textContent.includes(r),
+        r4Reply,
+        { timeout: 30000 },
+      );
+    } catch (error) {
+      await dumpRestoreDiagnostics(page, socketFrames, 'R4-prompt');
+      fail(`R4: post-reconnect prompt reply never settled in the transcript DOM: ${error?.message || error}`);
     }
-    fs.mkdirSync(evidence, { recursive: true });
-    fs.writeFileSync(path.join(evidence, 'coverage-assertions.json'), JSON.stringify({ executed: [...executed] }, null, 2));
-
-    console.log(`web-session-restore: PASSED (${executed.size}/${DOCUMENTED_IDS.length} assertions, R0 restored parity, R1 prompt recorded, R2 loaded restore, R4 restart restore, R5 selected-listener preference reload, R6 missing-preference fallback) — evidence at ${path.join(evidence, 'coverage-assertions.json')}`);
+    const replyOccurrences = await page.evaluate(
+      (r) => document.getElementById('transcript').textContent.split(r).length - 1,
+      r4Reply,
+    );
+    if (replyOccurrences !== 1) {
+      fail(`R4: post-reconnect reply settled ${replyOccurrences} times (expected exactly once)`);
+    }
+    record('R4.5');
+    await laneShot(page, 'restore-r4-restarted.png', { fullPage: true });
+    // Close EVERY browser surface (primary page, any residual probe page,
+    // the context, the browser) BEFORE the final error union, so close-time
+    // errors land in the same browserErrors array and the gate evaluates
+    // the complete error set — never a mid-run snapshot.
+    await page.close().catch((error) => browserErrors.push(`page close: ${error?.message || error}`));
+    await context.close().catch((error) => browserErrors.push(`context close: ${error?.message || error}`));
+    await browser.close().catch((error) => browserErrors.push(`browser close: ${error?.message || error}`));
+    // Final error union gate over the context-wide monitor: every
+    // pageerror and console.error from the primary page and the R5
+    // connectionProbe (and any other page) under ONE policy.
+    if (browserErrors.length > 0) {
+      fail(`browser errors observed: ${browserErrors.join(' | ')}`);
+    }
+    console.log(`web-session-restore: all assertions executed (${executedCounts.size}/${DOCUMENTED_IDS.length}) with a zero browser-error union`);
+    // Ledger + manifest stage AFTER the close/error gates: staged artifacts
+    // only — the shell validates the exact set and commits the run dir +
+    // pointer after its own HTTP sanity and listener-close gates pass.
+    stageLedgerAndManifest();
+    console.log(`web-session-restore: STAGED ${stagingDir}`);
   } finally {
     await browser.close().catch(() => {});
   }
 }
 
 main().catch((err) => {
-  console.error(`web-session-restore: playwright crashed: ${err && err.stack ? err.stack : err}`);
+  cleanupStaging();
+  if (fs.existsSync(stagingDir)) {
+    console.error(`web-session-restore: FAIL: staging dir survived failure cleanup: ${stagingDir}`);
+    process.exit(3);
+  }
+  console.error(`web-session-restore: FAIL: ${err && err.stack ? err.stack : err}`);
   process.exit(2);
 });

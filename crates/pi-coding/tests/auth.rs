@@ -39,7 +39,12 @@ async fn api_key_login_and_logout_preserve_other_providers() {
         secret: "new-secret".to_owned(),
     };
     let logged_in = manager
-        .login(Some("test-provider"), Some(AuthType::ApiKey), None, &interaction)
+        .login(
+            Some("test-provider"),
+            Some(AuthType::ApiKey),
+            None,
+            &interaction,
+        )
         .await
         .expect("login with API key");
     assert_eq!(logged_in.provider_id, "test-provider");
@@ -83,7 +88,7 @@ async fn api_key_login_and_logout_preserve_other_providers() {
 async fn stored_api_key_env_overlay_is_resolved_without_persisting_override() {
     let directory = tempfile::tempdir().expect("temporary auth directory");
     let path = directory.path().join("auth.json");
-    let storage = AuthStorage::new(path.clone());
+    let storage = AuthStorage::new(path.clone()).expect("auth storage");
     storage
         .modify("custom", None, |_| async {
             let mut credential = api_key_credential("prefix-${TOKEN}");
@@ -121,7 +126,7 @@ async fn stored_api_key_env_overlay_is_resolved_without_persisting_override() {
 async fn stored_api_key_literal_escapes_match_models_config() {
     let directory = tempfile::tempdir().expect("temporary auth directory");
     let path = directory.path().join("auth.json");
-    let storage = AuthStorage::new(path.clone());
+    let storage = AuthStorage::new(path.clone()).expect("auth storage");
     storage
         .modify("custom", None, |_| async {
             let mut credential = api_key_credential("$$/$!/$TOKEN/${TOKEN}");
@@ -149,7 +154,7 @@ async fn stored_api_key_literal_escapes_match_models_config() {
 async fn stored_api_key_invalid_braced_name_is_left_literal() {
     let directory = tempfile::tempdir().expect("temporary auth directory");
     let path = directory.path().join("auth.json");
-    let storage = AuthStorage::new(path.clone());
+    let storage = AuthStorage::new(path.clone()).expect("auth storage");
     storage
         .modify("custom", None, |_| async {
             Ok(Some(api_key_credential("pre-${1bad}-post")))
@@ -170,7 +175,7 @@ async fn stored_api_key_invalid_braced_name_is_left_literal() {
 async fn stored_api_key_command_value_is_rejected() {
     let directory = tempfile::tempdir().expect("temporary auth directory");
     let path = directory.path().join("auth.json");
-    let storage = AuthStorage::new(path.clone());
+    let storage = AuthStorage::new(path.clone()).expect("auth storage");
     storage
         .modify("custom", None, |_| async {
             Ok(Some(api_key_credential("!echo secret-command-output")))
@@ -198,11 +203,12 @@ async fn stored_api_key_command_value_is_rejected() {
 async fn missing_env_error_is_sanitized_without_secret_values() {
     let directory = tempfile::tempdir().expect("temporary auth directory");
     let path = directory.path().join("auth.json");
-    let storage = AuthStorage::new(path.clone());
+    let storage = AuthStorage::new(path.clone()).expect("auth storage");
     storage
         .modify("custom", None, |_| async {
             // Adjacent literal must never appear in the missing-var error.
-            let mut credential = api_key_credential("prefix-super-secret-token-${MISSING_AUTH_VAR}");
+            let mut credential =
+                api_key_credential("prefix-super-secret-token-${MISSING_AUTH_VAR}");
             match &mut credential {
                 Credential::ApiKey { env, .. } => {
                     env.insert(
@@ -252,7 +258,7 @@ async fn missing_env_error_is_sanitized_without_secret_values() {
 async fn request_env_overrides_credential_env_for_interpolation() {
     let directory = tempfile::tempdir().expect("temporary auth directory");
     let path = directory.path().join("auth.json");
-    let storage = AuthStorage::new(path.clone());
+    let storage = AuthStorage::new(path.clone()).expect("auth storage");
     storage
         .modify("builtin-like", None, |_| async {
             let mut credential = api_key_credential("$A/${B}");
@@ -404,16 +410,20 @@ async fn login_with_scope_writes_scoped_slot_and_preserves_unscoped() {
         secret: "work-secret".to_owned(),
     };
     let logged_in = manager
-        .login(Some("test-provider"), Some(AuthType::ApiKey), Some("work"), &interaction)
+        .login(
+            Some("test-provider"),
+            Some(AuthType::ApiKey),
+            Some("work"),
+            &interaction,
+        )
         .await
         .expect("scoped login");
     assert_eq!(logged_in.provider_id, "test-provider");
     assert_eq!(logged_in.scope.as_deref(), Some("work"));
 
-    let file: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(&path).expect("read auth.json"),
-    )
-    .expect("parse auth.json");
+    let file: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read auth.json"))
+            .expect("parse auth.json");
     let scoped_key = file
         .get("scopes")
         .expect("scopes section")
@@ -441,7 +451,12 @@ async fn login_with_scope_writes_scoped_slot_and_preserves_unscoped() {
         secret: "default-secret".to_owned(),
     };
     manager
-        .login(Some("test-provider"), Some(AuthType::ApiKey), None, &unscoped_interaction)
+        .login(
+            Some("test-provider"),
+            Some(AuthType::ApiKey),
+            None,
+            &unscoped_interaction,
+        )
         .await
         .expect("unscoped login");
     let resolved_default = manager
@@ -462,7 +477,7 @@ async fn login_with_scope_writes_scoped_slot_and_preserves_unscoped() {
 async fn scoped_resolution_prefers_scope_match_then_unscoped_fallback() {
     let directory = tempfile::tempdir().expect("temporary auth directory");
     let path = directory.path().join("auth.json");
-    let storage = AuthStorage::new(path.clone());
+    let storage = AuthStorage::new(path.clone()).expect("auth storage");
     storage
         .modify("custom", None, |_| async {
             Ok(Some(api_key_credential("default-key")))
@@ -506,7 +521,7 @@ async fn scoped_resolution_prefers_scope_match_then_unscoped_fallback() {
 async fn missing_scope_errors_actionably_without_secret_leakage() {
     let directory = tempfile::tempdir().expect("temporary auth directory");
     let path = directory.path().join("auth.json");
-    let storage = AuthStorage::new(path.clone());
+    let storage = AuthStorage::new(path.clone()).expect("auth storage");
     storage
         .modify("custom", Some("work"), |_| async {
             Ok(Some(api_key_credential("super-secret-work-key")))
@@ -521,7 +536,10 @@ async fn missing_scope_errors_actionably_without_secret_leakage() {
         .expect_err("scoped-only provider must fail without an active scope");
     let message = format!("{error:#}");
     assert!(message.contains("custom"), "{message}");
-    assert!(message.contains("\"work\""), "must name the scope: {message}");
+    assert!(
+        message.contains("\"work\""),
+        "must name the scope: {message}"
+    );
     assert!(message.contains("PI_AUTH_SCOPE"), "{message}");
     assert!(
         !message.contains("super-secret-work-key"),
@@ -549,7 +567,7 @@ async fn resolve_stored_with_scope_resolves_through_the_ambient_entry_point() {
     // itself is unit-tested via `pi_coding::resolve_scope_preference`.)
     let directory = tempfile::tempdir().expect("temporary auth directory");
     let path = directory.path().join("auth.json");
-    let storage = AuthStorage::new(path.clone());
+    let storage = AuthStorage::new(path.clone()).expect("auth storage");
     storage
         .modify("custom", None, |_| async {
             Ok(Some(api_key_credential("default-key")))
@@ -582,7 +600,7 @@ async fn resolve_stored_with_scope_resolves_through_the_ambient_entry_point() {
 async fn storage_listing_never_exposes_secrets_or_oauth_values() {
     let directory = tempfile::tempdir().expect("temporary auth directory");
     let path = directory.path().join("auth.json");
-    let storage = AuthStorage::new(path.clone());
+    let storage = AuthStorage::new(path.clone()).expect("auth storage");
     storage
         .modify("custom", Some("work"), |_| async {
             Ok(Some(api_key_credential("list-secret-key")))
@@ -622,7 +640,10 @@ async fn storage_listing_never_exposes_secrets_or_oauth_values() {
         "list-refresh-secret",
         "list-access-secret",
     ] {
-        assert!(!serialized.contains(secret), "{secret} leaked in {serialized}");
+        assert!(
+            !serialized.contains(secret),
+            "{secret} leaked in {serialized}"
+        );
         assert!(!debug.contains(secret), "{secret} leaked in {debug}");
     }
 }
@@ -631,7 +652,7 @@ async fn storage_listing_never_exposes_secrets_or_oauth_values() {
 async fn scoped_logout_removes_only_the_selected_slot() {
     let directory = tempfile::tempdir().expect("temporary auth directory");
     let path = directory.path().join("auth.json");
-    let storage = AuthStorage::new(path.clone());
+    let storage = AuthStorage::new(path.clone()).expect("auth storage");
     storage
         .modify("custom", None, |_| async {
             Ok(Some(api_key_credential("default-key")))

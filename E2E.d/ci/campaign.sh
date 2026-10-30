@@ -20,5 +20,24 @@ import json, sys
 rows=[json.loads(x) for x in open(sys.argv[1]) if x.strip()]
 responses=[x for x in rows if x.get('type')=='response']
 assert responses and all(x.get('success') is True for x in responses), rows
+PRIMARY=[
+    "settings","model","branch","resume","fork","export","dump","handoff",
+    "agents","role","persona","compact","rewind","checkpoint","ps","loop",
+    "goal","workflow","code-review","btw","queue","live","skill",
+    "theme","thinking","todo","tree","trust","jobs",
+    "activity","irc",
+]
+assert len(PRIMARY)==31, PRIMARY
+commands=[r for r in rows if r.get('type')=='response' and r.get('id')=='commands']
+if commands:
+    catalog=commands[-1].get('data',{}).get('commands')
+    assert isinstance(catalog, list), commands[-1].get('data')
+    by_name={}
+    for c in catalog:
+        by_name.setdefault(c.get('name'),[]).append(c.get('source'))
+    for name in PRIMARY:
+        sources=by_name.get(name,[])
+        assert sources==['builtin'], (name, sources)
+    assert by_name.get("todo-child",[])==[], by_name.get("todo-child")
 PY
 printf '%s campaign passed\nevidence=%s\n' "$scenario" "$evidence"

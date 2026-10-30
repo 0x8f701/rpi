@@ -119,10 +119,10 @@ impl AskRuntime {
                 reply: reply_tx,
             });
         }
-        let _ = self
-            .inner
-            .events
-            .send(SessionEvent::AskUser { id: id.clone(), prompt: question });
+        let _ = self.inner.events.send(SessionEvent::AskUser {
+            id: id.clone(),
+            prompt: question,
+        });
         let timeout = *self.inner.timeout.read();
         let outcome = tokio::select! {
             _ = abort.cancelled() => Some(AskReply::Cancelled),
@@ -350,7 +350,10 @@ mod ask_runtime_tests {
             other => panic!("expected AskUser, got {other:?}"),
         };
         assert!(runtime.answer("wrong-id", "nope".to_owned()).is_err());
-        assert_eq!(runtime.pending().as_ref().map(|(pending_id, _)| pending_id), Some(&id));
+        assert_eq!(
+            runtime.pending().as_ref().map(|(pending_id, _)| pending_id),
+            Some(&id)
+        );
         runtime.answer(&id, "ok".to_owned()).expect("answer");
         let result = task.await.expect("join").expect("request succeeds");
         assert_eq!(result.content, vec![pi_ai::ContentBlock::text("ok")]);
@@ -366,7 +369,9 @@ mod ask_runtime_tests {
             serde_json::to_value(&event).expect("serialize"),
             json!({ "type": "ask_user", "id": "ask-1", "prompt": "proceed?" })
         );
-        let resolved = SessionEvent::AskUserResolved { id: "ask-1".to_owned() };
+        let resolved = SessionEvent::AskUserResolved {
+            id: "ask-1".to_owned(),
+        };
         assert_eq!(
             serde_json::to_value(&resolved).expect("serialize"),
             json!({ "type": "ask_user_resolved", "id": "ask-1" })

@@ -1,8 +1,6 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
-use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
 use pi_ai::ContentBlock;
 
 use crate::image_pipeline;
@@ -57,14 +55,19 @@ pub struct ExpandedPrompt {
     pub file_count: usize,
 }
 
-pub fn expand_prompt(prompt: &str, cwd: &Path) -> Result<ExpandedPrompt> {
+pub fn expand_prompt(
+    prompt: &str,
+    cwd: &Path,
+    process: Option<&pi_coding::GovernedProcessContext>,
+) -> Result<ExpandedPrompt> {
     let workspace = pi_coding::WorkspaceRoots::new(cwd, Vec::<PathBuf>::new())?;
-    expand_prompt_in_workspace(prompt, &workspace)
+    expand_prompt_in_workspace(prompt, &workspace, process)
 }
 
 pub fn expand_prompt_in_workspace(
     prompt: &str,
     workspace: &pi_coding::WorkspaceRoots,
+    process: Option<&pi_coding::GovernedProcessContext>,
 ) -> Result<ExpandedPrompt> {
     let arguments = parse_file_arguments(prompt)?;
     if arguments.is_empty() {
@@ -83,19 +86,18 @@ pub fn expand_prompt_in_workspace(
 
     for argument in arguments {
         expanded.push_str(&prompt[cursor..argument.start]);
-        // Resolve containment, then open relative to the selected workspace
-        // root capability without following the final component. The returned
-        // descriptor is the only authority used for metadata, sniffing, and
-        // reading, so path replacement cannot redirect the read outside the
-        // configured roots.
-        let mut file = open_contained_file(workspace, &argument.path)?;
-        let metadata = file
-            .metadata()
-            .with_context(|| format!("could not inspect @{}", argument.path))?;
-        if !metadata.is_file() {
-            bail!("@{} is not a file", argument.path);
-        }
-        if metadata.len() == 0 {
+        // Explicit @file input is authorized beneath the configured workspace
+        // roots and read through one retained OperatorImport handle. The
+        // display path is never canonicalized and reopened.
+        let read = pi_coding::read_operator_file_under_roots(
+            workspace,
+            Path::new(&argument.path),
+            maximum_attachment_read(&argument.path),
+        )
+        .with_context(|| format!("could not securely read @{}", argument.path))?;
+        let metadata_len = read.len;
+        let bytes = read.bytes;
+        if metadata_len == 0 {
             cursor = argument.end;
             continue;
         }
@@ -103,23 +105,26 @@ pub fn expand_prompt_in_workspace(
         // extraction pipeline (TUI/Web parity: the same chronological JPEG
         // ContentBlocks and instruction marker as the Web upload endpoint).
         let is_video = crate::video_extract::sanitize_video_name(&argument.path).is_some();
-        if is_video && metadata.len() > crate::video_extract::MAX_VIDEO_UPLOAD_BYTES as u64 {
+        let is_pdf = crate::pdf_extract::sanitize_pdf_name(&argument.path).is_some();
+        if is_video && metadata_len > crate::video_extract::MAX_VIDEO_UPLOAD_BYTES as u64 {
             bail!(
                 "video @{} exceeds the {} MiB limit",
                 argument.path,
                 crate::video_extract::MAX_VIDEO_UPLOAD_BYTES / 1024 / 1024
             );
         }
-        // Sniff the head, then read the remainder — always from the same
-        // pinned descriptor. The sniff buffer is zero-filled so read_exact
-        // actually fills it (a zero-length Vec would read nothing).
-        use std::io::Read as _;
-        let sniff_length = usize::try_from(metadata.len().min(32)).unwrap_or(32);
-        let mut bytes = vec![0; sniff_length];
-        file.read_exact(&mut bytes)
-            .with_context(|| format!("could not read @{}", argument.path))?;
+        if is_pdf && metadata_len > crate::pdf_extract::MAX_PDF_UPLOAD_BYTES as u64 {
+            bail!(
+                "PDF @{} exceeds the {} MiB limit",
+                argument.path,
+                crate::pdf_extract::MAX_PDF_UPLOAD_BYTES / 1024 / 1024
+            );
+        }
         let sniffed_mime = image_pipeline::supported_mime(&bytes);
-        if !is_video && sniffed_mime.is_some() && metadata.len() > image_pipeline::MAX_IMAGE_BYTES as u64
+        if !is_video
+            && !is_pdf
+            && sniffed_mime.is_some()
+            && metadata_len > image_pipeline::MAX_IMAGE_BYTES as u64
         {
             bail!(
                 "image @{} exceeds the {} MiB limit",
@@ -127,26 +132,31 @@ pub fn expand_prompt_in_workspace(
                 image_pipeline::MAX_IMAGE_BYTES / 1024 / 1024
             );
         }
-        if !is_video && sniffed_mime.is_none() && metadata.len() > MAX_TEXT_BYTES {
+        if !is_video && !is_pdf && sniffed_mime.is_none() && metadata_len > MAX_TEXT_BYTES {
             bail!(
                 "text file @{} exceeds the {} MiB limit",
                 argument.path,
                 MAX_TEXT_BYTES / 1024 / 1024
             );
         }
-        file.read_to_end(&mut bytes)
-            .with_context(|| format!("could not read @{}", argument.path))?;
         let escaped_name = escape_xml_attribute(&argument.path);
 
         if is_video {
+            let process =
+                process.ok_or_else(|| anyhow!("video process generation is unavailable"))?;
             let video = crate::video_extract::extract_video(
-                &crate::video_extract::ffmpeg_program(),
+                process,
+                &crate::video_extract::governed_ffmpeg_program(process)?,
                 crate::video_extract::VideoLimits::default(),
                 bytes,
                 &argument.path,
             )
             .map_err(|error| {
-                anyhow!("could not process video @{}: {}", argument.path, error.message)
+                anyhow!(
+                    "could not process video @{}: {}",
+                    argument.path,
+                    error.message
+                )
             })?;
             let video_name = escape_xml_attribute(&video.name);
             expanded.push_str("<file name=\"");
@@ -156,6 +166,31 @@ pub fn expand_prompt_in_workspace(
             expanded.push_str("\n</file>\n");
             images.extend(video.into_content_blocks());
             video_attachments += 1;
+        } else if is_pdf {
+            let process =
+                process.ok_or_else(|| anyhow!("PDF process generation is unavailable"))?;
+            let pdf = crate::pdf_extract::extract_pdf(
+                process,
+                &crate::pdf_extract::governed_pdftotext_program(process)?,
+                crate::pdf_extract::PdfLimits::default(),
+                bytes,
+                &argument.path,
+            )
+            .map_err(|error| {
+                anyhow!(
+                    "could not process PDF @{}: {}",
+                    argument.path,
+                    error.message
+                )
+            })?;
+            let pdf_name = escape_xml_attribute(&pdf.name);
+            expanded.push_str("<file name=\"");
+            expanded.push_str(&pdf_name);
+            expanded.push_str("\">\n");
+            expanded.push_str(&pdf.instruction);
+            expanded.push('\n');
+            expanded.push_str(&pdf.text);
+            expanded.push_str("\n</file>\n");
         } else {
             let mime_type = sniffed_mime.or_else(|| image_pipeline::supported_mime(&bytes));
             if let Some(mime_type) = mime_type {
@@ -291,38 +326,15 @@ fn parse_unquoted_path(prompt: &str, start: usize) -> (String, usize) {
     (path, index)
 }
 
-fn open_contained_file(
-    workspace: &pi_coding::WorkspaceRoots,
-    input: &str,
-) -> Result<std::fs::File> {
-    if input.contains('\0') {
-        bail!("@file path contains a NUL byte");
-    }
-    let path = Path::new(input);
-    let candidate = if path.is_absolute() {
-        path.to_path_buf()
+fn maximum_attachment_read(path: &str) -> u64 {
+    let limit = if crate::video_extract::sanitize_video_name(path).is_some() {
+        crate::video_extract::MAX_VIDEO_UPLOAD_BYTES as u64
+    } else if crate::pdf_extract::sanitize_pdf_name(path).is_some() {
+        crate::pdf_extract::MAX_PDF_UPLOAD_BYTES as u64
     } else {
-        workspace.cwd().join(path)
+        MAX_TEXT_BYTES.max(image_pipeline::MAX_IMAGE_BYTES as u64)
     };
-    let canonical = candidate
-        .canonicalize()
-        .map_err(|error| anyhow!("@file not found: {} ({error})", input))?;
-    let (root, relative) = workspace
-        .roots()
-        .iter()
-        .find_map(|root| canonical.strip_prefix(root).ok().map(|relative| (root, relative)))
-        .filter(|(_, relative)| !relative.as_os_str().is_empty())
-        .ok_or_else(|| {
-            anyhow!("unsafe @file path {input:?}: path escapes the configured workspace roots")
-        })?;
-    let directory = Dir::open_ambient_dir(root, cap_std::ambient_authority())
-        .with_context(|| format!("could not open workspace root for @{input}"))?;
-    let mut options = CapOpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No);
-    directory
-        .open_with(relative, &options)
-        .map(cap_std::fs::File::into_std)
-        .with_context(|| format!("could not securely open @{input}"))
+    limit.saturating_add(1)
 }
 
 fn is_boundary(prompt: &str, index: usize) -> bool {
@@ -366,6 +378,7 @@ mod tests {
         let expanded = expand_prompt(
             "compare @one.txt with @\"two words.txt\" and @two\\ words.txt",
             cwd.path(),
+            None,
         )
         .expect("expand files");
         assert_eq!(expanded.file_count, 3);
@@ -382,7 +395,7 @@ mod tests {
     fn ignores_email_addresses_and_escaped_literals() {
         let cwd = tempfile::tempdir().expect("tempdir");
         let prompt = "mail user@example.com and literal \\@missing.txt";
-        let expanded = expand_prompt(prompt, cwd.path()).expect("no file arguments");
+        let expanded = expand_prompt(prompt, cwd.path(), None).expect("no file arguments");
         assert_eq!(expanded.prompt, prompt);
         assert_eq!(expanded.file_count, 0);
     }
@@ -390,9 +403,9 @@ mod tests {
     #[test]
     fn rejects_missing_absolute_parent_and_symlink_escape() {
         let cwd = tempfile::tempdir().expect("tempdir");
-        assert!(expand_prompt("@missing.txt", cwd.path()).is_err());
-        assert!(expand_prompt("@/etc/passwd", cwd.path()).is_err());
-        assert!(expand_prompt("@../secret.txt", cwd.path()).is_err());
+        assert!(expand_prompt("@missing.txt", cwd.path(), None).is_err());
+        assert!(expand_prompt("@/etc/passwd", cwd.path(), None).is_err());
+        assert!(expand_prompt("@../secret.txt", cwd.path(), None).is_err());
 
         #[cfg(unix)]
         {
@@ -403,7 +416,7 @@ mod tests {
                 cwd.path().join("link.txt"),
             )
             .expect("symlink");
-            assert!(expand_prompt("@link.txt", cwd.path()).is_err());
+            assert!(expand_prompt("@link.txt", cwd.path(), None).is_err());
         }
     }
 
@@ -413,13 +426,11 @@ mod tests {
         let additional = tempfile::tempdir().expect("additional");
         let file = additional.path().join("shared.txt");
         std::fs::write(&file, "shared").expect("write shared");
-        let workspace = pi_coding::WorkspaceRoots::new(cwd.path(), [additional.path()])
-            .expect("workspace");
-        let expanded = expand_prompt_in_workspace(
-            &format!("inspect @{}", file.display()),
-            &workspace,
-        )
-        .expect("expand additional file");
+        let workspace =
+            pi_coding::WorkspaceRoots::new(cwd.path(), [additional.path()]).expect("workspace");
+        let expanded =
+            expand_prompt_in_workspace(&format!("inspect @{}", file.display()), &workspace, None)
+                .expect("expand additional file");
         assert!(expanded.prompt.contains("shared"));
     }
 
@@ -432,10 +443,10 @@ mod tests {
         std::fs::write(outside.path().join("secret.txt"), "secret").expect("secret");
         let link = additional.path().join("escape.txt");
         std::os::unix::fs::symlink(outside.path().join("secret.txt"), &link).expect("symlink");
-        let workspace = pi_coding::WorkspaceRoots::new(cwd.path(), [additional.path()])
-            .expect("workspace");
+        let workspace =
+            pi_coding::WorkspaceRoots::new(cwd.path(), [additional.path()]).expect("workspace");
         assert!(
-            expand_prompt_in_workspace(&format!("inspect @{}", link.display()), &workspace)
+            expand_prompt_in_workspace(&format!("inspect @{}", link.display()), &workspace, None)
                 .is_err()
         );
     }
@@ -450,7 +461,7 @@ mod tests {
             .expect("encode png");
         std::fs::write(cwd.path().join("shot.png"), &bytes).expect("write png");
 
-        let expanded = expand_prompt("inspect @shot.png", cwd.path()).expect("expand image");
+        let expanded = expand_prompt("inspect @shot.png", cwd.path(), None).expect("expand image");
         assert!(expanded.prompt.contains("<file name=\"shot.png\"></file>"));
         assert_eq!(expanded.images.len(), 1);
         let ContentBlock::Image { data, mime_type } = &expanded.images[0] else {
@@ -469,16 +480,16 @@ mod tests {
     fn one_bad_argument_fails_the_whole_expansion() {
         let cwd = tempfile::tempdir().expect("tempdir");
         std::fs::write(cwd.path().join("good.txt"), "good").expect("write good");
-        let error = expand_prompt("@good.txt @missing.txt", cwd.path())
+        let error = expand_prompt("@good.txt @missing.txt", cwd.path(), None)
             .expect_err("missing file rejects prompt");
-        assert!(error.to_string().contains("not found"));
+        assert!(error.to_string().contains("could not securely read"));
     }
 
     #[test]
     fn xml_attribute_names_are_escaped() {
         let cwd = tempfile::tempdir().expect("tempdir");
         std::fs::write(cwd.path().join("a&b.txt"), "ok").expect("write file");
-        let expanded = expand_prompt("@\"a&b.txt\"", cwd.path()).expect("expand file");
+        let expanded = expand_prompt("@\"a&b.txt\"", cwd.path(), None).expect("expand file");
         assert!(expanded.prompt.contains("name=\"a&amp;b.txt\""));
     }
 
@@ -488,7 +499,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn video_argument_becomes_jpeg_frames_and_marker() {
-        use crate::video_extract::test_support::{fake_ffmpeg, video_bytes};
+        use crate::video_extract::test_support::{
+            fake_ffmpeg, video_bytes, with_governed_video_process,
+        };
         use crate::video_extract::with_ffmpeg_program;
 
         let (_dir, script) = fake_ffmpeg();
@@ -500,10 +513,15 @@ mod tests {
         .expect("write video");
 
         let expanded = with_ffmpeg_program(script, || {
-            expand_prompt("analyze @clip.mkv", cwd.path()).expect("expand video")
+            with_governed_video_process(cwd.path(), |process| {
+                expand_prompt("analyze @clip.mkv", cwd.path(), Some(process)).expect("expand video")
+            })
         });
         assert_eq!(expanded.file_count, 1);
-        assert_eq!(expanded.images.len(), crate::video_extract::MAX_VIDEO_FRAMES);
+        assert_eq!(
+            expanded.images.len(),
+            crate::video_extract::MAX_VIDEO_FRAMES
+        );
         for (index, block) in expanded.images.iter().enumerate() {
             let ContentBlock::Image { data, mime_type } = block else {
                 panic!("expected image block at {index}");
@@ -513,9 +531,11 @@ mod tests {
         }
         // Marker: sanitized name, container, duration, chronological order.
         assert!(expanded.prompt.contains("<file name=\"clip.mkv\">"));
-        assert!(expanded
-            .prompt
-            .contains("[Video attachment: clip.mkv (mkv container, 12.34s)"));
+        assert!(
+            expanded
+                .prompt
+                .contains("[Video attachment: clip.mkv (mkv container, 12.34s)")
+        );
         assert!(expanded.prompt.contains("6 chronological JPEG frames"));
         let zero = expanded.prompt.find("0.00s").expect("first timestamp");
         let later = expanded.prompt.find("2.06s").expect("second timestamp");
@@ -529,26 +549,92 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn corrupt_video_rejects_the_whole_expansion() {
-        use crate::video_extract::test_support::{fake_ffmpeg, video_bytes};
+        use crate::video_extract::test_support::{
+            fake_ffmpeg, video_bytes, with_governed_video_process,
+        };
         use crate::video_extract::with_ffmpeg_program;
 
         let (_dir, script) = fake_ffmpeg();
         let cwd = tempfile::tempdir().expect("tempdir");
-        std::fs::write(cwd.path().join("clip.mkv"), video_bytes("CORRUPT"))
-            .expect("write video");
+        std::fs::write(cwd.path().join("clip.mkv"), video_bytes("CORRUPT")).expect("write video");
         let error = with_ffmpeg_program(script, || {
-            expand_prompt("analyze @clip.mkv", cwd.path()).expect_err("corrupt video rejects")
+            with_governed_video_process(cwd.path(), |process| {
+                expand_prompt("analyze @clip.mkv", cwd.path(), Some(process))
+                    .expect_err("corrupt video rejects")
+            })
         });
         let message = error.to_string();
-        assert!(message.contains("could not process video @clip.mkv"), "{message}");
+        assert!(
+            message.contains("could not process video @clip.mkv"),
+            "{message}"
+        );
         assert!(message.contains("not a decodable video"), "{message}");
         assert!(!message.contains("pi-video-"), "no path leak: {message}");
     }
 
     #[cfg(unix)]
     #[test]
+    fn pdf_argument_becomes_extracted_text_and_marker() {
+        use crate::pdf_extract::test_support::{
+            fake_pdftotext, pdf_bytes,
+        };
+        use crate::pdf_extract::with_pdftotext_program;
+        use crate::video_extract::test_support::with_governed_video_process;
+
+        let (_dir, script) = fake_pdftotext();
+        let cwd = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            cwd.path().join("report.pdf"),
+            pdf_bytes("VALID", "Certik findings body"),
+        )
+        .expect("write pdf");
+
+        let expanded = with_pdftotext_program(script, || {
+            with_governed_video_process(cwd.path(), |process| {
+                expand_prompt("analyze @report.pdf", cwd.path(), Some(process)).expect("expand pdf")
+            })
+        });
+        assert_eq!(expanded.file_count, 1);
+        assert!(expanded.images.is_empty());
+        assert!(expanded.prompt.contains("<file name=\"report.pdf\">"));
+        assert!(expanded.prompt.contains("[PDF attachment: report.pdf"));
+        assert!(expanded.prompt.contains("Certik findings body"));
+        assert!(
+            !expanded.prompt.contains("pi-pdf-"),
+            "marker must not leak the work directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_pdf_text_rejects_the_whole_expansion() {
+        use crate::pdf_extract::test_support::{fake_pdftotext, pdf_bytes};
+        use crate::pdf_extract::with_pdftotext_program;
+        use crate::video_extract::test_support::with_governed_video_process;
+
+        let (_dir, script) = fake_pdftotext();
+        let cwd = tempfile::tempdir().expect("tempdir");
+        std::fs::write(cwd.path().join("scan.pdf"), pdf_bytes("EMPTY", "")).expect("write pdf");
+        let error = with_pdftotext_program(script, || {
+            with_governed_video_process(cwd.path(), |process| {
+                expand_prompt("analyze @scan.pdf", cwd.path(), Some(process))
+                    .expect_err("empty pdf rejects")
+            })
+        });
+        let message = error.to_string();
+        assert!(
+            message.contains("could not process PDF @scan.pdf"),
+            "{message}"
+        );
+        assert!(message.contains("no extractable text"), "{message}");
+        assert!(!message.contains("pi-pdf-"), "no path leak: {message}");
+    }
+
+
+    #[cfg(unix)]
+    #[test]
     fn missing_ffmpeg_fails_video_expansion_actionably() {
-        use crate::video_extract::test_support::video_bytes;
+        use crate::video_extract::test_support::{video_bytes, with_governed_video_process};
         use crate::video_extract::with_ffmpeg_program;
 
         let cwd = tempfile::tempdir().expect("tempdir");
@@ -559,7 +645,10 @@ mod tests {
         .expect("write video");
         let missing = cwd.path().join("no-such-ffmpeg");
         let error = with_ffmpeg_program(missing, || {
-            expand_prompt("analyze @clip.mkv", cwd.path()).expect_err("missing ffmpeg rejects")
+            with_governed_video_process(cwd.path(), |process| {
+                expand_prompt("analyze @clip.mkv", cwd.path(), Some(process))
+                    .expect_err("missing ffmpeg rejects")
+            })
         });
         let message = error.to_string();
         assert!(message.contains("ffmpeg"), "{message}");
@@ -569,7 +658,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn two_videos_reject_the_whole_expansion() {
-        use crate::video_extract::test_support::{fake_ffmpeg, video_bytes};
+        use crate::video_extract::test_support::{
+            fake_ffmpeg, video_bytes, with_governed_video_process,
+        };
         use crate::video_extract::with_ffmpeg_program;
 
         let (_dir, script) = fake_ffmpeg();
@@ -585,8 +676,10 @@ mod tests {
         )
         .expect("write b");
         let error = with_ffmpeg_program(script, || {
-            expand_prompt("analyze @a.mkv and @b.mkv", cwd.path())
-                .expect_err("two videos must reject the whole expansion")
+            with_governed_video_process(cwd.path(), |process| {
+                expand_prompt("analyze @a.mkv and @b.mkv", cwd.path(), Some(process))
+                    .expect_err("two videos must reject the whole expansion")
+            })
         });
         let message = error.to_string();
         assert!(message.contains("too many video attachments"), "{message}");
@@ -603,7 +696,10 @@ mod tests {
         enforce_attachment_budget(&at_cap, 1).expect("at cap fits");
         let too_many = vec![small.clone(); MAX_PROMPT_IMAGES + 1];
         let error = enforce_attachment_budget(&too_many, 1).expect_err("count cap");
-        assert!(error.to_string().contains("too many image attachments"), "{error}");
+        assert!(
+            error.to_string().contains("too many image attachments"),
+            "{error}"
+        );
 
         let big = ContentBlock::Image {
             data: "A".repeat(MAX_PROMPT_IMAGE_BASE64 + 1),
@@ -613,6 +709,9 @@ mod tests {
         assert!(error.to_string().contains("prompt budget"), "{error}");
 
         let error = enforce_attachment_budget(&[], 2).expect_err("video count cap");
-        assert!(error.to_string().contains("too many video attachments"), "{error}");
+        assert!(
+            error.to_string().contains("too many video attachments"),
+            "{error}"
+        );
     }
 }

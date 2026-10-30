@@ -96,28 +96,38 @@ EOF
 chmod 0755 "$NETWORK_MOCK_BIN/uname" "$NETWORK_MOCK_BIN/curl" "$NETWORK_MOCK_BIN/sleep"
 
 RETRY_ROOT="$ROOT/retry"; RETRY_STATE="$ROOT/retry-state"; mkdir -p "$RETRY_STATE"
-TEST_FIXTURES="$FIXTURES" TEST_STATE="$RETRY_STATE" TEST_ARCHIVE_SUCCEEDS_AT=3 HOME="$ROOT/home-retry" PI_HOME="$RETRY_ROOT" PI_UPDATE_BASE_URL='https://example.test/releases' PATH="$NETWORK_MOCK_BIN:$PATH" SHELL=/bin/sh sh "$INSTALLER" >"$ROOT/retry.out" 2>&1
+
+# Legacy environment names are rejected before any network request or install
+# root is created, and the error message tells the user the canonical name.
+LEGACY_HOME="$ROOT/legacy-home"; mkdir -p "$LEGACY_HOME"
+if HOME="$LEGACY_HOME" PI_HOME="$ROOT/legacy-pi-home" PATH="$MOCK_BIN:$PATH" SHELL=/bin/sh sh "$INSTALLER" >"$ROOT/legacy-home.out" 2>&1; then exit 1; fi
+grep -Fq 'legacy PI_HOME is no longer supported; set RPI_HOME instead' "$ROOT/legacy-home.out"
+[ ! -e "$ROOT/legacy-pi-home" ] && [ ! -L "$ROOT/legacy-pi-home" ]
+if HOME="$LEGACY_HOME" PI_UPDATE_BASE_URL='https://example.test/releases' PATH="$MOCK_BIN:$PATH" SHELL=/bin/sh sh "$INSTALLER" >"$ROOT/legacy-url.out" 2>&1; then exit 1; fi
+grep -Fq 'legacy PI_UPDATE_BASE_URL is no longer supported; set RPI_UPDATE_BASE_URL instead' "$ROOT/legacy-url.out"
+
+TEST_FIXTURES="$FIXTURES" TEST_STATE="$RETRY_STATE" TEST_ARCHIVE_SUCCEEDS_AT=3 HOME="$ROOT/home-retry" RPI_HOME="$RETRY_ROOT" RPI_UPDATE_BASE_URL='https://example.test/releases' PATH="$NETWORK_MOCK_BIN:$PATH" SHELL=/bin/sh sh "$INSTALLER" >"$ROOT/retry.out" 2>&1
 [ "$(cat "$RETRY_STATE/archive-attempts")" = 3 ]
 [ -L "$RETRY_ROOT/bin/rpi" ]
 grep -Fq 'Download attempt failed; retrying (2/3)' "$ROOT/retry.out"
 grep -Fq 'Download attempt failed; retrying (3/3)' "$ROOT/retry.out"
 
 FAILED_ROOT="$ROOT/network-failed"; FAILED_STATE="$ROOT/network-failed-state"; mkdir -p "$FAILED_STATE"
-if TEST_FIXTURES="$FIXTURES" TEST_STATE="$FAILED_STATE" TEST_ARCHIVE_SUCCEEDS_AT=4 HOME="$ROOT/home-network-failed" PI_HOME="$FAILED_ROOT" PI_UPDATE_BASE_URL='https://example.test/releases' PATH="$NETWORK_MOCK_BIN:$PATH" SHELL=/bin/sh sh "$INSTALLER" >"$ROOT/network-failed.out" 2>&1; then exit 1; fi
+if TEST_FIXTURES="$FIXTURES" TEST_STATE="$FAILED_STATE" TEST_ARCHIVE_SUCCEEDS_AT=4 HOME="$ROOT/home-network-failed" RPI_HOME="$FAILED_ROOT" RPI_UPDATE_BASE_URL='https://example.test/releases' PATH="$NETWORK_MOCK_BIN:$PATH" SHELL=/bin/sh sh "$INSTALLER" >"$ROOT/network-failed.out" 2>&1; then exit 1; fi
 grep -Fq 'download failed: https://example.test/rpi-0.1.0-x86_64-unknown-linux-gnu.tar.gz' "$ROOT/network-failed.out"
 if grep -Eq 'release_install_lock: (not found|command not found)|command not found.*release_install_lock' "$ROOT/network-failed.out"; then exit 1; fi
 [ ! -e "$FAILED_ROOT/.install.lock" ]
 [ ! -e "$FAILED_ROOT/bin/rpi" ] && [ ! -L "$FAILED_ROOT/bin/rpi" ]
 run_install() {
   install_root="$1"; home_dir="$2"; mkdir -p "$home_dir"
-  TEST_FIXTURES="$FIXTURES" HOME="$home_dir" PI_HOME="$install_root" PI_UPDATE_BASE_URL='https://example.test/releases' PATH="$MOCK_BIN:$PATH" SHELL=/bin/sh sh "$INSTALLER" >/dev/null
+  TEST_FIXTURES="$FIXTURES" HOME="$home_dir" RPI_HOME="$install_root" RPI_UPDATE_BASE_URL='https://example.test/releases' PATH="$MOCK_BIN:$PATH" SHELL=/bin/sh sh "$INSTALLER" >/dev/null
   [ -L "$install_root/bin/rpi" ]
   [ "$("$install_root/bin/rpi" --version)" = 'rpi 0.1.0' ]
   grep -Fq '"installed_asset": "rpi-0.1.0-x86_64-unknown-linux-gnu.tar.gz"' "$install_root/update-state.json"
   grep -Fq '"installed_binary": "rpi-0.1.0-linux-x86_64-sha256-' "$install_root/update-state.json"
 }
 DEFAULT_HOME="$ROOT/home-default"; mkdir -p "$DEFAULT_HOME"
-TEST_FIXTURES="$FIXTURES" HOME="$DEFAULT_HOME" PI_UPDATE_BASE_URL='https://example.test/releases' PATH="$MOCK_BIN:$PATH" SHELL=/bin/sh sh "$INSTALLER" >/dev/null
+TEST_FIXTURES="$FIXTURES" HOME="$DEFAULT_HOME" RPI_UPDATE_BASE_URL='https://example.test/releases' PATH="$MOCK_BIN:$PATH" SHELL=/bin/sh env -u RPI_HOME sh "$INSTALLER" >/dev/null
 [ -L "$DEFAULT_HOME/.rpi/bin/rpi" ]
 [ ! -e "$DEFAULT_HOME/.pi-rs/bin/rpi" ] && [ ! -L "$DEFAULT_HOME/.pi-rs/bin/rpi" ]
 FRESH="$ROOT/fresh"; run_install "$FRESH" "$ROOT/home-fresh"; [ ! -e "$FRESH/bin/pi" ]
@@ -142,7 +152,7 @@ MISMATCH_TARGET="$(readlink "$MISMATCH/bin/rpi")"
 cp "$MISMATCH/update-state.json" "$ROOT/mismatch-state.before"
 set -- "$MISMATCH"/downloads/*
 MISMATCH_DOWNLOAD_COUNT="$#"
-if TEST_FIXTURES="$WRONG_FIXTURES" HOME="$ROOT/home-mismatch" PI_HOME="$MISMATCH" PI_UPDATE_BASE_URL='https://example.test/releases' PATH="$MOCK_BIN:$PATH" SHELL=/bin/sh sh "$INSTALLER" >"$ROOT/mismatch.out" 2>&1; then exit 1; fi
+if TEST_FIXTURES="$WRONG_FIXTURES" HOME="$ROOT/home-mismatch" RPI_HOME="$MISMATCH" RPI_UPDATE_BASE_URL='https://example.test/releases' PATH="$MOCK_BIN:$PATH" SHELL=/bin/sh sh "$INSTALLER" >"$ROOT/mismatch.out" 2>&1; then exit 1; fi
 grep -Fq "downloaded binary reported unexpected identity/version (expected 'rpi 0.1.0'); existing install left untouched" "$ROOT/mismatch.out"
 [ "$(readlink "$MISMATCH/bin/rpi")" = "$MISMATCH_TARGET" ]
 [ "$("$MISMATCH/bin/rpi" --version)" = 'rpi 0.1.0' ]
@@ -152,12 +162,12 @@ set -- "$MISMATCH"/downloads/*
 NEW_DIGEST="$(awk '{print $1}' "$FIXTURES/SHA256SUMS")"
 NEW_BINARY="rpi-0.1.0-linux-x86_64-sha256-$NEW_DIGEST"
 DEST_DIR="$ROOT/dest-directory"; mkdir -p "$DEST_DIR/downloads/$NEW_BINARY" "$ROOT/home-dest-directory"
-if TEST_FIXTURES="$FIXTURES" HOME="$ROOT/home-dest-directory" PI_HOME="$DEST_DIR" PI_UPDATE_BASE_URL='https://example.test/releases' PATH="$MOCK_BIN:$PATH" SHELL=/bin/sh sh "$INSTALLER" >"$ROOT/dest-directory.out" 2>&1; then exit 1; fi
+if TEST_FIXTURES="$FIXTURES" HOME="$ROOT/home-dest-directory" RPI_HOME="$DEST_DIR" RPI_UPDATE_BASE_URL='https://example.test/releases' PATH="$MOCK_BIN:$PATH" SHELL=/bin/sh sh "$INSTALLER" >"$ROOT/dest-directory.out" 2>&1; then exit 1; fi
 grep -Fq 'versioned binary path is not a regular file' "$ROOT/dest-directory.out"
 [ -d "$DEST_DIR/downloads/$NEW_BINARY" ]; [ ! -e "$DEST_DIR/bin/rpi" ] && [ ! -L "$DEST_DIR/bin/rpi" ]; [ ! -e "$DEST_DIR/update-state.json" ]
 ACTIVE_DIR="$ROOT/active-directory"; mkdir -p "$ACTIVE_DIR/bin" "$ACTIVE_DIR/downloads/attacker" "$ROOT/home-active-directory"
 ln -s ../downloads/attacker "$ACTIVE_DIR/bin/rpi"
-if TEST_FIXTURES="$FIXTURES" HOME="$ROOT/home-active-directory" PI_HOME="$ACTIVE_DIR" PI_UPDATE_BASE_URL='https://example.test/releases' PATH="$MOCK_BIN:$PATH" SHELL=/bin/sh sh "$INSTALLER" >"$ROOT/active-directory.out" 2>&1; then exit 1; fi
+if TEST_FIXTURES="$FIXTURES" HOME="$ROOT/home-active-directory" RPI_HOME="$ACTIVE_DIR" RPI_UPDATE_BASE_URL='https://example.test/releases' PATH="$MOCK_BIN:$PATH" SHELL=/bin/sh sh "$INSTALLER" >"$ROOT/active-directory.out" 2>&1; then exit 1; fi
 grep -Fq 'is a symlink to a directory; refusing unsafe activation' "$ROOT/active-directory.out"
 [ "$(readlink "$ACTIVE_DIR/bin/rpi")" = '../downloads/attacker' ]; [ ! -e "$ACTIVE_DIR/update-state.json" ]
 STALE="$ROOT/stale"; mkdir -p "$STALE"; printf '999999999\n' > "$STALE/.install.lock"
@@ -168,7 +178,7 @@ exit 0
 EOF
 chmod 0755 "$MOCK_BIN/sleep"
 CONTENDED="$ROOT/contended"; mkdir -p "$CONTENDED"; printf '%s\n' "$$" > "$CONTENDED/.install.lock"
-if TEST_FIXTURES="$FIXTURES" HOME="$ROOT/home-contended" PI_HOME="$CONTENDED" PI_UPDATE_BASE_URL='https://example.test/releases' PATH="$MOCK_BIN:$PATH" SHELL=/bin/sh sh "$INSTALLER" >"$ROOT/contended.out" 2>&1; then exit 1; fi
+if TEST_FIXTURES="$FIXTURES" HOME="$ROOT/home-contended" RPI_HOME="$CONTENDED" RPI_UPDATE_BASE_URL='https://example.test/releases' PATH="$MOCK_BIN:$PATH" SHELL=/bin/sh sh "$INSTALLER" >"$ROOT/contended.out" 2>&1; then exit 1; fi
 grep -Fq 'timed out after 30s waiting for another rpi install' "$ROOT/contended.out"
 [ ! -e "$CONTENDED/bin/rpi" ] && [ ! -L "$CONTENDED/bin/rpi" ]; [ "$("$UNMANAGED/bin/pi")" = 'user pi' ]
 
@@ -180,7 +190,7 @@ mode_of() {
 }
 UMASK_ROOT="$ROOT/umask"; mkdir -p "$ROOT/home-umask"
 ( umask 000
-  TEST_FIXTURES="$FIXTURES" HOME="$ROOT/home-umask" PI_HOME="$UMASK_ROOT" PI_UPDATE_BASE_URL='https://example.test/releases' PATH="$MOCK_BIN:$PATH" SHELL=/bin/sh sh "$INSTALLER" >/dev/null )
+  TEST_FIXTURES="$FIXTURES" HOME="$ROOT/home-umask" RPI_HOME="$UMASK_ROOT" RPI_UPDATE_BASE_URL='https://example.test/releases' PATH="$MOCK_BIN:$PATH" SHELL=/bin/sh sh "$INSTALLER" >/dev/null )
 [ -L "$UMASK_ROOT/bin/rpi" ]
 [ "$("$UMASK_ROOT/bin/rpi" --version)" = 'rpi 0.1.0' ]
 [ "$(mode_of "$UMASK_ROOT")" = '700' ]
@@ -208,7 +218,7 @@ STATE_COMMIT_LINE="$(grep -n 'Move-Item -LiteralPath $StateTmp -Destination $Sta
 [ "$PRE_SMOKE_LINE" -lt "$STATE_COMMIT_LINE" ]
 
 # PowerShell installer: GITHUB_TOKEN authenticates only the fixed GitHub API
-# endpoint; downloads and custom PI_UPDATE_BASE_URL endpoints never see it.
+# endpoint; downloads and custom RPI_UPDATE_BASE_URL endpoints never see it.
 grep -Fq '#   GITHUB_TOKEN           authenticate the fixed GitHub API endpoint (default:' "$POWERSHELL_INSTALLER"
 grep -Fq '$GitHubApiBase = "https://api.github.com/repos/$Repo/releases"' "$POWERSHELL_INSTALLER"
 grep -Fq 'if ($env:GITHUB_TOKEN -and $ApiBase -eq $GitHubApiBase)' "$POWERSHELL_INSTALLER"
@@ -222,4 +232,4 @@ API_CALL_LINE="$(grep -Fn 'Invoke-RestMethod -Uri $ReleaseUrl -Headers $ApiHeade
 [ -n "$TOKEN_BASE_LINE" ] && [ -n "$AUTH_HEADER_LINE" ] && [ -n "$API_CALL_LINE" ]
 [ "$TOKEN_BASE_LINE" -lt "$AUTH_HEADER_LINE" ]
 [ "$AUTH_HEADER_LINE" -lt "$API_CALL_LINE" ]
-printf 'install.sh focused behavior tests passed (14 install attempts, 1 identity mismatch rejection, 2 bounded network retries, 4 PowerShell identity contracts, 1 umask-hardening install, 6 PowerShell token-scoping contracts)\n'
+printf 'install.sh focused behavior tests passed (16 install attempts, 2 legacy-name rejection checks, 1 identity mismatch rejection, 2 bounded network retries, 4 PowerShell identity contracts, 1 umask-hardening install, 6 PowerShell token-scoping contracts)\n'

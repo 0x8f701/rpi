@@ -262,12 +262,18 @@ mod tests {
         let runs = parse_ansi_runs("\u{1b}[96mnew zk sign circuit\u{1b}[0m");
         assert_eq!(runs.len(), 1, "{runs:?}");
         assert_eq!(runs[0].text, "new zk sign circuit");
-        assert_eq!(run_style(&runs[0]), (Some(Color::LightCyan), None, Modifier::empty()));
+        assert_eq!(
+            run_style(&runs[0]),
+            (Some(Color::LightCyan), None, Modifier::empty())
+        );
 
         let runs = parse_ansi_runs("\u{1b}[94mbuild inner circuit\u{1b}[0m");
         assert_eq!(runs.len(), 1, "{runs:?}");
         assert_eq!(runs[0].text, "build inner circuit");
-        assert_eq!(run_style(&runs[0]), (Some(Color::LightBlue), None, Modifier::empty()));
+        assert_eq!(
+            run_style(&runs[0]),
+            (Some(Color::LightBlue), None, Modifier::empty())
+        );
     }
 
     #[test]
@@ -277,7 +283,11 @@ mod tests {
         assert_eq!(runs[0].text, " 11ms ");
         assert_eq!(
             run_style(&runs[0]),
-            (Some(Color::Indexed(230)), Some(Color::Indexed(34)), Modifier::empty())
+            (
+                Some(Color::Indexed(230)),
+                Some(Color::Indexed(34)),
+                Modifier::empty()
+            )
         );
     }
 
@@ -298,7 +308,9 @@ mod tests {
 
     #[test]
     fn modifiers_apply_and_reset_isolates() {
-        let runs = parse_ansi_runs("\u{1b}[1;3;4;96mbold italic underline cyan\u{1b}[0mplain\u{1b}[31mred");
+        let runs = parse_ansi_runs(
+            "\u{1b}[1;3;4;96mbold italic underline cyan\u{1b}[0mplain\u{1b}[31mred",
+        );
         assert_eq!(runs.len(), 3, "{runs:?}");
         assert_eq!(runs[0].text, "bold italic underline cyan");
         assert_eq!(
@@ -314,7 +326,10 @@ mod tests {
         assert_eq!(run_style(&runs[1]), (None, None, Modifier::empty()));
         // A later color change never leaks into the reset run.
         assert_eq!(runs[2].text, "red");
-        assert_eq!(run_style(&runs[2]), (Some(Color::Red), None, Modifier::empty()));
+        assert_eq!(
+            run_style(&runs[2]),
+            (Some(Color::Red), None, Modifier::empty())
+        );
 
         // 22 clears bold+dim; style carries across a newline until reset.
         let runs = parse_ansi_runs("\u{1b}[1;96mbold cyan\ntext\u{1b}[22mnow plain");
@@ -329,7 +344,9 @@ mod tests {
 
     #[test]
     fn standard_and_bright_backgrounds_map() {
-        let runs = parse_ansi_runs("\u{1b}[31;44mred on blue\u{1b}[0m\u{1b}[90;107mgray on white\u{1b}[0m");
+        let runs = parse_ansi_runs(
+            "\u{1b}[31;44mred on blue\u{1b}[0m\u{1b}[90;107mgray on white\u{1b}[0m",
+        );
         assert_eq!(runs.len(), 2, "{runs:?}");
         assert_eq!(
             run_style(&runs[0]),
@@ -344,19 +361,25 @@ mod tests {
         let runs = parse_ansi_runs("\u{1b}[100mX\u{1b}[0m");
         assert_eq!(runs.len(), 1, "{runs:?}");
         assert_eq!(runs[0].text, "X");
-        assert_eq!(run_style(&runs[0]), (None, Some(Color::DarkGray), Modifier::empty()));
+        assert_eq!(
+            run_style(&runs[0]),
+            (None, Some(Color::DarkGray), Modifier::empty())
+        );
     }
 
     #[test]
     fn osc8_and_cursor_csi_are_stripped() {
         // OSC 8 hyperlink (BEL and ST terminated) and cursor positioning CSI
         // never reach the runs; surrounding text survives.
-        let runs = parse_ansi_runs("go\u{1b}]8;;https://example.com\u{7}link\u{1b}]8;;\u{7}end\u{1b}[2;5Hpost");
+        let runs = parse_ansi_runs(
+            "go\u{1b}]8;;https://example.com\u{7}link\u{1b}]8;;\u{7}end\u{1b}[2;5Hpost",
+        );
         assert_eq!(runs.len(), 1, "{runs:?}");
         assert_eq!(runs[0].text, "golinkendpost");
         assert_eq!(runs[0].fg, None);
 
-        let runs = parse_ansi_runs("go\u{1b}]8;;https://example.com\u{1b}\\link\u{1b}]8;;\u{1b}\\end");
+        let runs =
+            parse_ansi_runs("go\u{1b}]8;;https://example.com\u{1b}\\link\u{1b}]8;;\u{1b}\\end");
         assert_eq!(runs.len(), 1, "{runs:?}");
         assert_eq!(runs[0].text, "golinkend");
 
@@ -421,7 +444,10 @@ mod tests {
             assert_eq!(plain, clean_terminal_text(sample), "sample {sample:?}");
             // Structural invariant: the plain projection is exactly the
             // concatenation of the run texts.
-            let joined: String = parse_ansi_runs(sample).into_iter().map(|run| run.text).collect();
+            let joined: String = parse_ansi_runs(sample)
+                .into_iter()
+                .map(|run| run.text)
+                .collect();
             assert_eq!(joined, plain, "run concatenation for {sample:?}");
         }
     }

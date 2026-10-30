@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use regex::Regex;
 use pi_ai::Model;
+use regex::Regex;
 
 /// The model used when none is specified. The Go port has no settings manager,
 /// so an empty spec resolves to this fixed default.
@@ -45,7 +45,10 @@ static DEFAULT_MODEL_PER_PROVIDER: &[(&str, &str)] = &[
     ("opencode-go", "kimi-k2.6"),
     ("kimi-coding", "kimi-for-coding"),
     ("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.6"),
-    ("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.6"),
+    (
+        "cloudflare-ai-gateway",
+        "workers-ai/@cf/moonshotai/kimi-k2.6",
+    ),
     ("qwen-token-plan", "qwen3.7-max"),
     ("qwen-token-plan-cn", "qwen3.7-max"),
     ("xiaomi", "mimo-v2.5-pro"),
@@ -94,10 +97,17 @@ pub fn resolve_model(spec: &str) -> Result<Model, String> {
 /// with a warning (pi `buildFallbackModel`); a thinking-level suffix is stripped
 /// from the custom id first.
 pub fn resolve_model_pattern(spec: &str) -> Result<ResolvedModel, String> {
-    let spec = if spec.is_empty() { DEFAULT_MODEL_SPEC } else { spec };
+    let spec = if spec.is_empty() {
+        DEFAULT_MODEL_SPEC
+    } else {
+        spec
+    };
     let available = all_catalog_models();
     if available.is_empty() {
-        return Err("No models available. Check your installation or add models to models.json.".to_string());
+        return Err(
+            "No models available. Check your installation or add models to models.json."
+                .to_string(),
+        );
     }
 
     // Canonical provider lookup (case-insensitive).
@@ -126,29 +136,48 @@ pub fn resolve_model_pattern(spec: &str) -> Result<ResolvedModel, String> {
     // model ids that naturally contain slashes).
     if provider.is_empty() {
         if let Some(m) = exact_model_match(spec, &available) {
-            return Ok(ResolvedModel { model: m.clone(), thinking_level: String::new(), warning: String::new() });
+            return Ok(ResolvedModel {
+                model: m.clone(),
+                thinking_level: String::new(),
+                warning: String::new(),
+            });
         }
     }
 
     let candidates: Vec<&Model> = if provider.is_empty() {
         available.iter().collect()
     } else {
-        available.iter().filter(|m| m.provider == provider).collect()
+        available
+            .iter()
+            .filter(|m| m.provider == provider)
+            .collect()
     };
 
     if let Some((m, level, warning)) = parse_model_pattern(pattern, &candidates, false) {
-        return Ok(ResolvedModel { model: m.clone(), thinking_level: level, warning });
+        return Ok(ResolvedModel {
+            model: m.clone(),
+            thinking_level: level,
+            warning,
+        });
     }
 
     // Provider inferred from the slash but nothing matched within it: fall back to
     // matching the full input as a raw model id across all models.
     if inferred_provider {
         if let Some(m) = exact_model_match(spec, &available) {
-            return Ok(ResolvedModel { model: m.clone(), thinking_level: String::new(), warning: String::new() });
+            return Ok(ResolvedModel {
+                model: m.clone(),
+                thinking_level: String::new(),
+                warning: String::new(),
+            });
         }
         let all_refs: Vec<&Model> = available.iter().collect();
         if let Some((m, lvl, warn)) = parse_model_pattern(spec, &all_refs, false) {
-            return Ok(ResolvedModel { model: m.clone(), thinking_level: lvl, warning: warn });
+            return Ok(ResolvedModel {
+                model: m.clone(),
+                thinking_level: lvl,
+                warning: warn,
+            });
         }
     }
 
@@ -251,7 +280,11 @@ fn parse_model_pattern<'a>(
     if is_valid_thinking_level(suffix) {
         let (m, _, warning) = parse_model_pattern(prefix, models, allow_invalid_level_fallback)?;
         // pi: only use the level if the inner recursion was clean.
-        let level = if warning.is_empty() { suffix.to_string() } else { String::new() };
+        let level = if warning.is_empty() {
+            suffix.to_string()
+        } else {
+            String::new()
+        };
         return Some((m, level, warning));
     }
     if !allow_invalid_level_fallback {
@@ -263,7 +296,10 @@ fn parse_model_pattern<'a>(
     Some((
         m,
         String::new(),
-        format!("Invalid thinking level {:?} in pattern {:?}. Using default instead.", suffix, pattern),
+        format!(
+            "Invalid thinking level {:?} in pattern {:?}. Using default instead.",
+            suffix, pattern
+        ),
     ))
 }
 
@@ -306,7 +342,10 @@ fn try_match_model<'a>(pattern: &str, models: &'a [&Model]) -> Option<&'a Model>
 /// Ports pi's `findExactModelReferenceMatch`: a canonical "provider/id" match,
 /// then a provider+id split match, then a bare id match — each only when
 /// unambiguous (a unique match).
-fn find_exact_model_reference_match<'a>(reference: &str, models: &'a [&Model]) -> Option<&'a Model> {
+fn find_exact_model_reference_match<'a>(
+    reference: &str,
+    models: &'a [&Model],
+) -> Option<&'a Model> {
     let trimmed = reference.trim();
     if trimmed.is_empty() {
         return None;
@@ -332,7 +371,10 @@ fn find_exact_model_reference_match<'a>(reference: &str, models: &'a [&Model]) -
             let by_provider: Vec<&Model> = models
                 .iter()
                 .copied()
-                .filter(|m| m.provider.eq_ignore_ascii_case(provider_part) && m.id.eq_ignore_ascii_case(model_id))
+                .filter(|m| {
+                    m.provider.eq_ignore_ascii_case(provider_part)
+                        && m.id.eq_ignore_ascii_case(model_id)
+                })
                 .collect();
             if by_provider.len() == 1 {
                 return Some(by_provider[0]);
@@ -409,14 +451,22 @@ mod tests {
 
     #[test]
     fn default_model_per_provider_qwen_and_radius() {
-        assert_eq!(default_model_per_provider("qwen-token-plan"), Some("qwen3.7-max"));
-        assert_eq!(default_model_per_provider("qwen-token-plan-cn"), Some("qwen3.7-max"));
+        assert_eq!(
+            default_model_per_provider("qwen-token-plan"),
+            Some("qwen3.7-max")
+        );
+        assert_eq!(
+            default_model_per_provider("qwen-token-plan-cn"),
+            Some("qwen3.7-max")
+        );
         assert_eq!(default_model_per_provider("radius"), Some("auto"));
 
         // Lock the consequence: the qwen-token-plan fallback must inherit
         // qwen3.7-max's limits, never MiniMax-M2.5's.
         for provider in ["qwen-token-plan", "qwen-token-plan-cn"] {
-            let Some(id) = default_model_per_provider(provider) else { continue };
+            let Some(id) = default_model_per_provider(provider) else {
+                continue;
+            };
             let Some(tmpl) = pi_ai::get_model(provider, id) else {
                 panic!("{provider}/{id} missing from catalog");
             };
@@ -441,14 +491,20 @@ mod tests {
         assert_eq!(r.model.id, "my-custom-model-id");
         assert_eq!(r.model.name, "my-custom-model-id");
         assert!(r.warning.contains("Model \"my-custom-model-id\" not found for provider \"anthropic\". Using custom model id."), "warning: {}", r.warning);
-        assert_eq!(r.thinking_level, "", "fallback without suffix must not carry a level");
+        assert_eq!(
+            r.thinking_level, "",
+            "fallback without suffix must not carry a level"
+        );
     }
 
     #[test]
     fn resolve_custom_id_fallback_thinking_suffix() {
         let r = resolve_model_pattern("anthropic/my-custom-model-id:high").unwrap();
         assert_eq!(r.model.provider, "anthropic");
-        assert_eq!(r.model.id, "my-custom-model-id", "suffix leaked into custom id");
+        assert_eq!(
+            r.model.id, "my-custom-model-id",
+            "suffix leaked into custom id"
+        );
         assert_eq!(r.thinking_level, "high");
         assert!(r.warning.contains("Model \"my-custom-model-id\" not found for provider \"anthropic\". Using custom model id."), "warning must quote stripped id: {}", r.warning);
     }
@@ -458,7 +514,10 @@ mod tests {
         let r = resolve_model_pattern("mistral/my-custom-model-id:high").unwrap();
         assert_eq!(r.model.id, "my-custom-model-id");
         assert_eq!(r.thinking_level, "high");
-        assert!(r.model.reasoning, "requested thinking level must set reasoning:true on the fallback model");
+        assert!(
+            r.model.reasoning,
+            "requested thinking level must set reasoning:true on the fallback model"
+        );
     }
 
     #[test]
@@ -466,14 +525,21 @@ mod tests {
         let r = resolve_model_pattern("mistral/my-custom-model-id:off").unwrap();
         assert_eq!(r.model.id, "my-custom-model-id");
         assert_eq!(r.thinking_level, "off");
-        assert!(!r.model.reasoning, ":off must not enable reasoning on a non-reasoning fallback template");
+        assert!(
+            !r.model.reasoning,
+            ":off must not enable reasoning on a non-reasoning fallback template"
+        );
     }
 
     #[test]
     fn resolve_custom_id_fallback_all_levels() {
         for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
-            let r = resolve_model_pattern(&format!("anthropic/my-custom-model-id:{level}")).unwrap();
-            assert_eq!(r.model.id, "my-custom-model-id", "level {level}: suffix leaked");
+            let r =
+                resolve_model_pattern(&format!("anthropic/my-custom-model-id:{level}")).unwrap();
+            assert_eq!(
+                r.model.id, "my-custom-model-id",
+                "level {level}: suffix leaked"
+            );
             assert_eq!(r.thinking_level, level, "level {level}: wrong level");
         }
     }
@@ -482,8 +548,14 @@ mod tests {
     fn resolve_custom_id_fallback_invalid_suffix() {
         let r = resolve_model_pattern("anthropic/my-custom-model-id:banana").unwrap();
         assert_eq!(r.model.provider, "anthropic");
-        assert_eq!(r.model.id, "my-custom-model-id:banana", "invalid suffix must stay in the id");
-        assert_eq!(r.thinking_level, "", "invalid suffix must not surface a level");
+        assert_eq!(
+            r.model.id, "my-custom-model-id:banana",
+            "invalid suffix must stay in the id"
+        );
+        assert_eq!(
+            r.thinking_level, "",
+            "invalid suffix must not surface a level"
+        );
         assert!(r.warning.contains("Model \"my-custom-model-id:banana\" not found for provider \"anthropic\". Using custom model id."), "warning: {}", r.warning);
     }
 
@@ -499,7 +571,10 @@ mod tests {
 
         // `:max` is parsed like the other valid thinking levels.
         let r = resolve_model_pattern("anthropic/claude-sonnet-4-5:max").unwrap();
-        assert_eq!(r.model.id, "claude-sonnet-4-5", ":max must not leak into the model id");
+        assert_eq!(
+            r.model.id, "claude-sonnet-4-5",
+            ":max must not leak into the model id"
+        );
         assert_eq!(r.thinking_level, "max");
 
         // No suffix → empty level.

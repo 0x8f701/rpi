@@ -11,19 +11,22 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
+use pi_agent::ThinkingLevel;
+use pi_ai::Model;
 use pi_ai::providers::{
     FauxProviderOptions, FauxProviderRegistration, FauxResponse, register_faux_provider,
 };
-use pi_ai::Model;
-use pi_agent::ThinkingLevel;
 use pi_cli::extension_ui::ExtensionUiAdapter;
 use pi_cli::modes::listen::{ListenConfig, ListenHandle, MAX_CONNECTION_TASKS, start};
 use pi_coding::{
-    Application, ExtensionCancellation, ExtensionInstanceId, ExtensionMode,
-    ExtensionThemeDescriptor, ExtensionUiContext, ExtensionUiHost, ExtensionUiRequest,
-    ExtensionUiResponse, ProcessSpawnSpec, Session, SessionOptions, TodoPhase,
-    collab::{FrameDirection, capability, derive_connection_key, open_frame, parse_link, seal_frame},
+    Application, DurablePolicyState, DurableState, ExtensionCancellation, ExtensionInstanceId,
+    ExtensionMode, ExtensionThemeDescriptor, ExtensionUiContext, ExtensionUiHost,
+    ExtensionUiRequest, ExtensionUiResponse, ProcessSpawnSpec, Session, SessionOptions, TodoPhase,
+    collab::{
+        FrameDirection, capability, derive_connection_key, open_frame, parse_link, seal_frame,
+    },
 };
+use pi_sandbox::{CredentialGrantId, CredentialPolicy, PolicySnapshot, SandboxPolicy};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -42,12 +45,16 @@ async fn listen_tls(application: Application) -> (ListenHandle, String, TempDir)
     let certificate_dir = tempfile::tempdir().expect("certificate dir");
     let certificate_path = certificate_dir.path().join("listen-cert.pem");
     let key_path = certificate_dir.path().join("listen-key.pem");
-    let mut params = CertificateParams::new(vec!["127.0.0.1".to_owned()])
-        .expect("certificate parameters");
+    let mut params =
+        CertificateParams::new(vec!["127.0.0.1".to_owned()]).expect("certificate parameters");
     params.distinguished_name = DistinguishedName::new();
-    params.distinguished_name.push(DnType::CommonName, "rpi-listener-test");
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "rpi-listener-test");
     let signing_key = KeyPair::generate().expect("generate signing key");
-    let certificate = params.self_signed(&signing_key).expect("generate certificate");
+    let certificate = params
+        .self_signed(&signing_key)
+        .expect("generate certificate");
     let certificate_pem = certificate.pem();
     std::fs::write(&certificate_path, &certificate_pem).expect("write certificate");
     std::fs::write(&key_path, signing_key.serialize_pem()).expect("write private key");
@@ -60,6 +67,7 @@ async fn listen_tls(application: Application) -> (ListenHandle, String, TempDir)
             token_file: None,
             allow_insecure_remote: false,
             advertised_origin: None,
+            runner_codename_override: None,
             plaintext: false,
             tls_cert: Some(certificate_path),
             tls_key: Some(key_path),
@@ -100,9 +108,12 @@ async fn http_get_state_returns_exact_rpc_response() {
     assert_eq!(value["type"], "response");
     assert_eq!(value["command"], "get_state");
     assert_eq!(value["id"], "state-1");
-    assert!(value["success"].as_bool().unwrap_or(false), "response: {value}");
+    assert!(
+        value["success"].as_bool().unwrap_or(false),
+        "response: {value}"
+    );
     assert!(value["data"].is_object(), "data: {:?}", value["data"]);
-    handle.stop().await.expect("stop");
+    handle.stop(false).await.expect("stop");
     app.application.cleanup().await;
 }
 
@@ -118,7 +129,7 @@ async fn http_rejects_wrong_path_and_method() {
     assert_eq!(status, 200);
     let (status, _) = http_get(addr, "/rpc", None).await;
     assert_eq!(status, 404);
-    handle.stop().await.expect("stop");
+    handle.stop(false).await.expect("stop");
     app.application.cleanup().await;
 }
 
@@ -131,7 +142,7 @@ async fn http_rejects_missing_content_length() {
         b"POST /rpc HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n";
     let response = http_raw_exchange(addr, request).await;
     assert_eq!(parse_status(&response).unwrap_or(0), 411);
-    handle.stop().await.expect("stop");
+    handle.stop(false).await.expect("stop");
     app.application.cleanup().await;
 }
 
@@ -146,19 +157,26 @@ async fn http_rejects_oversized_body() {
     );
     let response = http_raw_exchange(addr, request.as_bytes()).await;
     assert_eq!(parse_status(&response), Some(413));
-    handle.stop().await.expect("stop");
+    handle.stop(false).await.expect("stop");
     app.application.cleanup().await;
 }
-
 
 #[tokio::test]
 async fn ws_get_state_returns_response_and_application_events() {
     let app = faux_application("listen-ws").await;
     let (handle, _extension_ui) = listen(app.application.clone()).await;
     let addr = handle.local_addr();
+    let session_id = app
+        .application
+        .session()
+        .recorder_info()
+        .expect("session identity")
+        .0;
     let mut ws = ws_connect(addr, None).await;
     ws.send(WsMessage::Text(
-        json!({"type":"get_state","id":"ws-1"}).to_string().into(),
+        json!({"type":"get_state","id":"ws-1","sessionId":session_id})
+            .to_string()
+            .into(),
     ))
     .await
     .expect("send command");
@@ -178,6 +196,22 @@ async fn ws_get_state_returns_response_and_application_events() {
             }
             Ok(Some(Ok(_))) => continue,
             _ => break,
+        }
+    }
+    ws.send(WsMessage::Text(
+        json!({"type":"subscribe","sessionId":session_id,"cursor":0})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .expect("subscribe session");
+    while let Some(frame) = ws.next().await {
+        let WsMessage::Text(text) = frame.expect("subscription frame") else {
+            continue;
+        };
+        let value: Value = serde_json::from_str(&text).expect("subscription JSON");
+        if value["type"] == "subscription_snapshot" || value["type"] == "session_resync" {
+            break;
         }
     }
     assert!(got_response, "ws did not return get_state response");
@@ -207,7 +241,7 @@ async fn ws_get_state_returns_response_and_application_events() {
     }
     assert!(saw_todo_event, "ws never projected application TodoUpdated");
     ws.close(None).await.ok();
-    handle.stop().await.expect("stop");
+    handle.stop(false).await.expect("stop");
     app.application.cleanup().await;
 }
 
@@ -225,7 +259,14 @@ async fn collab_wire_auth_encrypts_snapshot_commands_and_stop_close() {
     let (status, response) = http_post_rpc(addr, body.as_bytes(), None).await;
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&response));
     let response: Value = serde_json::from_slice(&response).expect("start response");
-    let link_text = response["data"]["controlLink"].as_str().expect("control link");
+    assert_eq!(
+        response["sessionId"].as_str(),
+        response["data"]["sessionId"].as_str(),
+        "collaboration start response must carry the bound session owner"
+    );
+    let link_text = response["data"]["controlLink"]
+        .as_str()
+        .expect("control link");
     let link = parse_link(link_text).expect("parse control link");
     let protocol = format!(
         "rpi-collab.{}",
@@ -236,7 +277,10 @@ async fn collab_wire_auth_encrypts_snapshot_commands_and_stop_close() {
         .await
         .expect("collab connect");
     assert_eq!(
-        handshake.headers().get(http::header::SEC_WEBSOCKET_PROTOCOL).and_then(|v| v.to_str().ok()),
+        handshake
+            .headers()
+            .get(http::header::SEC_WEBSOCKET_PROTOCOL)
+            .and_then(|v| v.to_str().ok()),
         Some(protocol.as_str()),
     );
     let hello = match ws.next().await.expect("hello frame").expect("hello") {
@@ -248,10 +292,12 @@ async fn collab_wire_auth_encrypts_snapshot_commands_and_stop_close() {
         .expect("epoch base64")
         .try_into()
         .expect("epoch length");
-    let server_key = derive_connection_key(&link.secret.key, &epoch, FrameDirection::ServerToClient)
-        .expect("server key");
-    let client_key = derive_connection_key(&link.secret.key, &epoch, FrameDirection::ClientToServer)
-        .expect("client key");
+    let server_key =
+        derive_connection_key(&link.secret.key, &epoch, FrameDirection::ServerToClient)
+            .expect("server key");
+    let client_key =
+        derive_connection_key(&link.secret.key, &epoch, FrameDirection::ClientToServer)
+            .expect("client key");
     let snapshot_frame = match ws.next().await.expect("snapshot frame").expect("snapshot") {
         WsMessage::Binary(frame) => frame,
         other => panic!("expected encrypted snapshot, got {other:?}"),
@@ -265,7 +311,11 @@ async fn collab_wire_auth_encrypts_snapshot_commands_and_stop_close() {
         &snapshot_frame,
     )
     .expect("decrypt snapshot");
-    assert!(!snapshot_frame.windows(b"sessionId".len()).any(|w| w == b"sessionId"));
+    assert!(
+        !snapshot_frame
+            .windows(b"sessionId".len())
+            .any(|w| w == b"sessionId")
+    );
     let snapshot: Value = serde_json::from_slice(&snapshot_plain).expect("snapshot json");
     assert_eq!(snapshot["type"], "snapshot");
 
@@ -279,7 +329,9 @@ async fn collab_wire_auth_encrypts_snapshot_commands_and_stop_close() {
         &serde_json::to_vec(&command).expect("command json"),
     )
     .expect("seal command");
-    ws.send(WsMessage::Binary(command_frame.into())).await.expect("send command");
+    ws.send(WsMessage::Binary(command_frame.into()))
+        .await
+        .expect("send command");
     let response_frame = match ws.next().await.expect("response frame").expect("response") {
         WsMessage::Binary(frame) => frame,
         other => panic!("expected encrypted response, got {other:?}"),
@@ -298,10 +350,19 @@ async fn collab_wire_auth_encrypts_snapshot_commands_and_stop_close() {
     assert_eq!(response["command"], "abort");
     assert_eq!(response["success"], true);
 
-    handle.collab_service().stop(&link.room_id).await.expect("stop room");
-    let close = tokio::time::timeout(DEADLINE, ws.next()).await.expect("close timeout");
-    assert!(matches!(close, Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None));
-    handle.stop().await.expect("stop listener");
+    handle
+        .collab_service()
+        .stop(&link.room_id)
+        .await
+        .expect("stop room");
+    let close = tokio::time::timeout(DEADLINE, ws.next())
+        .await
+        .expect("close timeout");
+    assert!(matches!(
+        close,
+        Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None
+    ));
+    handle.stop(false).await.expect("stop listener");
     app.application.cleanup().await;
 }
 
@@ -322,7 +383,7 @@ async fn ws_rejects_binary_messages() {
         ),
         "ws did not close on binary"
     );
-    handle.stop().await.expect("stop");
+    handle.stop(false).await.expect("stop");
     app.application.cleanup().await;
 }
 
@@ -342,7 +403,7 @@ async fn auth_rejects_missing_and_wrong_token_and_accepts_correct() {
     assert_eq!(status, 200);
     let value: Value = serde_json::from_slice(&response).expect("parse response");
     assert!(value["success"].as_bool().unwrap_or(false));
-    handle.stop().await.expect("stop");
+    handle.stop(false).await.expect("stop");
     app.application.cleanup().await;
 }
 
@@ -354,18 +415,14 @@ async fn auth_rejects_ws_without_token() {
     let addr = handle.local_addr();
     let result = tokio::time::timeout(
         DEADLINE,
-        tokio_tungstenite::connect_async(
-            format!("ws://{addr}/ws")
-                .into_client_request()
-                .unwrap(),
-        ),
+        tokio_tungstenite::connect_async(format!("ws://{addr}/ws").into_client_request().unwrap()),
     )
     .await;
     assert!(
         result.is_err() || result.unwrap().is_err(),
         "ws without token should fail"
     );
-    handle.stop().await.expect("stop");
+    handle.stop(false).await.expect("stop");
     app.application.cleanup().await;
 }
 
@@ -390,13 +447,19 @@ async fn http_get_web_serves_self_contained_page_without_auth() {
         "content type: {text}"
     );
     assert!(text.contains("<!doctype html"), "page doctype");
-    assert!(text.contains("<script"), "inline script, no external assets");
+    assert!(
+        text.contains("<script"),
+        "inline script, no external assets"
+    );
     assert!(text.contains("</html>"), "page closing tag");
     assert!(
         !text.contains("src=\"http") && !text.contains("href=\"http"),
         "page must not reference external assets"
     );
-    assert!(text.contains("rpi-auth."), "page must document the subprotocol");
+    assert!(
+        text.contains("rpi-auth."),
+        "page must document the subprotocol"
+    );
 
     // The page itself stays auth-optional even when a token is configured.
     let (status, _) = http_get(addr, "/web", None).await;
@@ -408,7 +471,7 @@ async fn http_get_web_serves_self_contained_page_without_auth() {
     let (status, _) = http_get(addr, "/nope", None).await;
     assert_eq!(status, 404);
 
-    handle.stop().await.expect("stop");
+    handle.stop(false).await.expect("stop");
     app.application.cleanup().await;
 }
 
@@ -439,7 +502,9 @@ async fn ws_subprotocol_token_auth_accepts_and_echoes() {
     );
 
     ws.send(WsMessage::Text(
-        json!({"type":"get_state","id":"subproto-1"}).to_string().into(),
+        json!({"type":"get_state","id":"subproto-1"})
+            .to_string()
+            .into(),
     ))
     .await
     .expect("ws send");
@@ -465,7 +530,9 @@ async fn ws_subprotocol_token_auth_accepts_and_echoes() {
     let mut auth_ws = ws_connect_with_origin(addr, Some("web-token-ok"), None).await;
     auth_ws
         .send(WsMessage::Text(
-            json!({"type":"get_state","id":"header-1"}).to_string().into(),
+            json!({"type":"get_state","id":"header-1"})
+                .to_string()
+                .into(),
         ))
         .await
         .expect("ws send");
@@ -488,7 +555,7 @@ async fn ws_subprotocol_token_auth_accepts_and_echoes() {
 
     ws.close(None).await.ok();
     auth_ws.close(None).await.ok();
-    handle.stop().await.expect("stop");
+    handle.stop(false).await.expect("stop");
     app.application.cleanup().await;
 }
 
@@ -515,8 +582,8 @@ async fn ws_subprotocol_wrong_token_and_missing_token_rejected() {
     );
 
     // Empty candidate after the prefix.
-    let result = ws_connect_with_subprotocol(addr, Some("rpi-auth."), Some("https://app.example"))
-        .await;
+    let result =
+        ws_connect_with_subprotocol(addr, Some("rpi-auth."), Some("https://app.example")).await;
     assert!(
         result.is_err(),
         "empty subprotocol candidate must fail: {result:?}"
@@ -536,7 +603,7 @@ async fn ws_subprotocol_wrong_token_and_missing_token_rejected() {
         "unrelated subprotocol must fail: {result:?}"
     );
 
-    handle.stop().await.expect("stop");
+    handle.stop(false).await.expect("stop");
     app.application.cleanup().await;
 
     // Tokenless loopback: there is no configured token to compare against, so
@@ -561,7 +628,9 @@ async fn ws_subprotocol_wrong_token_and_missing_token_rejected() {
         "no configured token means no subprotocol may be echoed"
     );
     ws.send(WsMessage::Text(
-        json!({"type":"get_state","id":"tokenless-subproto-1"}).to_string().into(),
+        json!({"type":"get_state","id":"tokenless-subproto-1"})
+            .to_string()
+            .into(),
     ))
     .await
     .expect("ws send");
@@ -585,18 +654,14 @@ async fn ws_subprotocol_wrong_token_and_missing_token_rejected() {
 
     // A subprotocol offer on a tokenless listener is never echoed, so the
     // client-side handshake aborts (nothing to authenticate against).
-    let result = ws_connect_with_subprotocol(
-        addr,
-        Some("rpi-auth.web-token-secret"),
-        Some(&origin),
-    )
-    .await;
+    let result =
+        ws_connect_with_subprotocol(addr, Some("rpi-auth.web-token-secret"), Some(&origin)).await;
     assert!(
         result.is_err(),
         "unmatched subprotocol must not be echoed on a tokenless listener"
     );
 
-    handle.stop().await.expect("stop");
+    handle.stop(false).await.expect("stop");
     tokenless.application.cleanup().await;
 }
 
@@ -611,13 +676,8 @@ async fn tokenless_loopback_accepts_same_origin_browser_over_http_and_ws() {
     // A browser-origin /rpc POST whose Origin authority matches the
     // request's Host (the page the user opened) carries no token and is
     // accepted.
-    let (status, response) = http_post_rpc_with_headers(
-        addr,
-        body.as_bytes(),
-        None,
-        &[("origin", &origin)],
-    )
-    .await;
+    let (status, response) =
+        http_post_rpc_with_headers(addr, body.as_bytes(), None, &[("origin", &origin)]).await;
     assert_eq!(
         status,
         200,
@@ -632,7 +692,9 @@ async fn tokenless_loopback_accepts_same_origin_browser_over_http_and_ws() {
         .await
         .expect("ws same-origin browser without token must connect");
     ws.send(WsMessage::Text(
-        json!({"type":"get_state","id":"origin-ws-1"}).to_string().into(),
+        json!({"type":"get_state","id":"origin-ws-1"})
+            .to_string()
+            .into(),
     ))
     .await
     .expect("ws send");
@@ -663,7 +725,10 @@ async fn tokenless_loopback_accepts_same_origin_browser_over_http_and_ws() {
         &[("origin", "https://evil.example")],
     )
     .await;
-    assert_eq!(status, 401, "foreign browser origin without token must be 401");
+    assert_eq!(
+        status, 401,
+        "foreign browser origin without token must be 401"
+    );
     assert!(
         try_ws_connect(addr, None, Some("https://evil.example"))
             .await
@@ -671,7 +736,7 @@ async fn tokenless_loopback_accepts_same_origin_browser_over_http_and_ws() {
         "ws foreign browser origin without token must fail"
     );
 
-    handle.stop().await.expect("stop");
+    handle.stop(false).await.expect("stop");
     app.application.cleanup().await;
 }
 
@@ -701,7 +766,9 @@ async fn token_authenticated_browser_origin_is_accepted() {
     let mut ws =
         ws_connect_with_origin(addr, Some("browser-ok"), Some("https://app.example")).await;
     ws.send(WsMessage::Text(
-        json!({"type":"get_state","id":"ws-origin"}).to_string().into(),
+        json!({"type":"get_state","id":"ws-origin"})
+            .to_string()
+            .into(),
     ))
     .await
     .expect("ws send");
@@ -723,7 +790,7 @@ async fn token_authenticated_browser_origin_is_accepted() {
     }
     assert!(ok, "token+origin ws get_state missing");
     ws.close(None).await.ok();
-    handle.stop().await.expect("stop");
+    handle.stop(false).await.expect("stop");
     app.application.cleanup().await;
 }
 
@@ -737,13 +804,37 @@ async fn non_loopback_policy_requires_explicit_opt_in() {
 
     let cases = [
         ("0.0.0.0:0", None, "IPv4 wildcard without token or opt-in"),
-        ("0.0.0.0:0", Some(token_path.clone()), "IPv4 wildcard without opt-in"),
+        (
+            "0.0.0.0:0",
+            Some(token_path.clone()),
+            "IPv4 wildcard without opt-in",
+        ),
         ("[::]:0", None, "IPv6 wildcard without token or opt-in"),
-        ("[::]:0", Some(token_path.clone()), "IPv6 wildcard without opt-in"),
-        ("198.51.100.7:0", Some(token_path.clone()), "distinct non-loopback IPv4 without opt-in"),
-        ("192.0.2.1:0", Some(token_path.clone()), "documentation IPv4 without opt-in"),
-        ("8.8.8.8:0", Some(token_path.clone()), "public IPv4 without opt-in"),
-        ("[2001:db8::1]:0", Some(token_path.clone()), "documentation IPv6 without opt-in"),
+        (
+            "[::]:0",
+            Some(token_path.clone()),
+            "IPv6 wildcard without opt-in",
+        ),
+        (
+            "198.51.100.7:0",
+            Some(token_path.clone()),
+            "distinct non-loopback IPv4 without opt-in",
+        ),
+        (
+            "192.0.2.1:0",
+            Some(token_path.clone()),
+            "documentation IPv4 without opt-in",
+        ),
+        (
+            "8.8.8.8:0",
+            Some(token_path.clone()),
+            "public IPv4 without opt-in",
+        ),
+        (
+            "[2001:db8::1]:0",
+            Some(token_path.clone()),
+            "documentation IPv6 without opt-in",
+        ),
     ];
     for (address, token_file, label) in cases {
         let error = match start(
@@ -754,6 +845,7 @@ async fn non_loopback_policy_requires_explicit_opt_in() {
                 token_file,
                 allow_insecure_remote: false,
                 advertised_origin: None,
+                runner_codename_override: None,
                 plaintext: true,
                 tls_cert: None,
                 tls_key: None,
@@ -763,7 +855,7 @@ async fn non_loopback_policy_requires_explicit_opt_in() {
         .await
         {
             Ok(handle) => {
-                handle.stop().await.expect("stop unexpected listener");
+                handle.stop(false).await.expect("stop unexpected listener");
                 panic!("{label} must be refused before bind");
             }
             Err(error) => error,
@@ -789,10 +881,19 @@ async fn tls_remote_without_token_is_rejected_pre_bind() {
     let cases: [(std::net::SocketAddr, &str); 6] = [
         ("0.0.0.0:0".parse().unwrap(), "IPv4 wildcard TLS no token"),
         ("[::]:0".parse().unwrap(), "IPv6 wildcard TLS no token"),
-        ("198.51.100.7:0".parse().unwrap(), "distinct non-loopback IPv4 TLS no token"),
-        ("192.0.2.1:0".parse().unwrap(), "documentation IPv4 TLS no token"),
+        (
+            "198.51.100.7:0".parse().unwrap(),
+            "distinct non-loopback IPv4 TLS no token",
+        ),
+        (
+            "192.0.2.1:0".parse().unwrap(),
+            "documentation IPv4 TLS no token",
+        ),
         ("8.8.8.8:0".parse().unwrap(), "public IPv4 TLS no token"),
-        ("[2001:db8::1]:0".parse().unwrap(), "documentation IPv6 TLS no token"),
+        (
+            "[2001:db8::1]:0".parse().unwrap(),
+            "documentation IPv6 TLS no token",
+        ),
     ];
     for (address, label) in cases {
         let error = match start(
@@ -803,6 +904,7 @@ async fn tls_remote_without_token_is_rejected_pre_bind() {
                 token_file: None,
                 allow_insecure_remote: false,
                 advertised_origin: None,
+                runner_codename_override: None,
                 plaintext: false,
                 tls_cert: None,
                 tls_key: None,
@@ -812,7 +914,7 @@ async fn tls_remote_without_token_is_rejected_pre_bind() {
         .await
         {
             Ok(handle) => {
-                let _ = handle.stop().await;
+                let _ = handle.stop(false).await;
                 panic!("{label} must be refused before bind");
             }
             Err(error) => error,
@@ -847,6 +949,7 @@ async fn tokenless_wildcard_opt_in_accepts_same_origin_browser_without_advertise
             token_file: None,
             allow_insecure_remote: true,
             advertised_origin: None,
+            runner_codename_override: None,
             plaintext: true,
             tls_cert: None,
             tls_key: None,
@@ -856,7 +959,10 @@ async fn tokenless_wildcard_opt_in_accepts_same_origin_browser_without_advertise
     .await
     .expect("tokenless wildcard opt-in must bind");
     let wildcard = handle.local_addr();
-    assert!(wildcard.ip().is_unspecified(), "expected wildcard bind: {wildcard}");
+    assert!(
+        wildcard.ip().is_unspecified(),
+        "expected wildcard bind: {wildcard}"
+    );
     let loopback = std::net::SocketAddr::from(([127, 0, 0, 1], wildcard.port()));
     let port = wildcard.port();
 
@@ -902,7 +1008,9 @@ async fn tokenless_wildcard_opt_in_accepts_same_origin_browser_without_advertise
         .await
         .expect("same-origin browser ws must connect");
     ws.send(WsMessage::Text(
-        json!({"type":"get_state","id":"browser-ws-tokenless"}).to_string().into(),
+        json!({"type":"get_state","id":"browser-ws-tokenless"})
+            .to_string()
+            .into(),
     ))
     .await
     .expect("ws send");
@@ -936,9 +1044,21 @@ async fn tokenless_wildcard_opt_in_accepts_same_origin_browser_without_advertise
         )
     };
     for (host, origin, id) in [
-        (format!("rpi.example:{port}"), format!("http://rpi.example:{port}"), "browser-named-host"),
-        (format!("alternate.example:{port}"), format!("http://alternate.example:{port}"), "browser-alternate-host"),
-        (format!("localhost:{port}"), format!("http://localhost:{port}"), "browser-localhost"),
+        (
+            format!("rpi.example:{port}"),
+            format!("http://rpi.example:{port}"),
+            "browser-named-host",
+        ),
+        (
+            format!("alternate.example:{port}"),
+            format!("http://alternate.example:{port}"),
+            "browser-alternate-host",
+        ),
+        (
+            format!("localhost:{port}"),
+            format!("http://localhost:{port}"),
+            "browser-localhost",
+        ),
     ] {
         let response = http_raw_exchange(loopback, post(&host, &origin, &id).as_bytes()).await;
         assert_eq!(
@@ -948,8 +1068,9 @@ async fn tokenless_wildcard_opt_in_accepts_same_origin_browser_without_advertise
         );
     }
 
-    // Ordinary request same-origin: an unrelated cross-origin page is
-    // rejected over both channels even on the tokenless wildcard listener.
+    // Ordinary request same-origin without the insecure-remote opt-in.
+    // With `--listen-allow-insecure-remote`, a tokenless wildcard listener
+    // accepts a valid cross-origin browser so /chat on another host can invite it.
     let (status, _) = http_post_rpc_with_headers(
         loopback,
         br#"{"type":"get_state","id":"browser-mismatch"}"#,
@@ -957,12 +1078,15 @@ async fn tokenless_wildcard_opt_in_accepts_same_origin_browser_without_advertise
         &[("origin", &format!("http://unrelated.example:{port}"))],
     )
     .await;
-    assert_eq!(status, 401, "mismatched browser origin must be 401");
+    assert_eq!(
+        status, 200,
+        "insecure-remote tokenless must accept a valid cross-origin browser"
+    );
     assert!(
         try_ws_connect(loopback, None, Some("https://evil.example"))
             .await
-            .is_err(),
-        "mismatched browser ws origin must fail"
+            .is_ok(),
+        "insecure-remote tokenless must accept a valid cross-origin ws"
     );
     // Duplicate Host headers are rejected like duplicate Origins.
     let body = r#"{"type":"get_state","id":"dup-host"}"#;
@@ -971,9 +1095,13 @@ async fn tokenless_wildcard_opt_in_accepts_same_origin_browser_without_advertise
         body.len()
     );
     let response = http_raw_exchange(loopback, duplicate_host.as_bytes()).await;
-    assert_eq!(parse_status(&response).unwrap_or(0), 401, "duplicate Host must be rejected");
+    assert_eq!(
+        parse_status(&response).unwrap_or(0),
+        401,
+        "duplicate Host must be rejected"
+    );
 
-    handle.stop().await.expect("stop");
+    handle.stop(false).await.expect("stop");
     app.application.cleanup().await;
 }
 
@@ -992,6 +1120,7 @@ async fn wildcard_listener_with_opt_in_enforces_token_over_loopback_connection()
             token_file: Some(token_path),
             allow_insecure_remote: true,
             advertised_origin: None,
+            runner_codename_override: None,
             plaintext: true,
             tls_cert: None,
             tls_key: None,
@@ -1001,11 +1130,18 @@ async fn wildcard_listener_with_opt_in_enforces_token_over_loopback_connection()
     .await
     .expect("authenticated wildcard opt-in must bind");
     let wildcard = handle.local_addr();
-    assert!(wildcard.ip().is_unspecified(), "expected wildcard bind: {wildcard}");
+    assert!(
+        wildcard.ip().is_unspecified(),
+        "expected wildcard bind: {wildcard}"
+    );
     let loopback = std::net::SocketAddr::from(([127, 0, 0, 1], wildcard.port()));
 
-    let (missing_status, _) = http_post_rpc(loopback, br#"{"type":"get_state","id":"missing"}"#, None).await;
-    assert_eq!(missing_status, 401, "wildcard listener accepted unauthenticated RPC");
+    let (missing_status, _) =
+        http_post_rpc(loopback, br#"{"type":"get_state","id":"missing"}"#, None).await;
+    assert_eq!(
+        missing_status, 401,
+        "wildcard listener accepted unauthenticated RPC"
+    );
     let (wrong_status, _) = http_post_rpc(
         loopback,
         br#"{"type":"get_state","id":"wrong"}"#,
@@ -1024,7 +1160,7 @@ async fn wildcard_listener_with_opt_in_enforces_token_over_loopback_connection()
     assert_eq!(response["id"], "authenticated");
     assert_eq!(response["success"], true);
 
-    handle.stop().await.expect("stop");
+    handle.stop(false).await.expect("stop");
     app.application.cleanup().await;
 }
 
@@ -1038,7 +1174,8 @@ async fn loopback_listen_accepts_v4_and_v6_with_and_without_token() {
     std::fs::write(&token_path, "fixture-value").expect("write token");
     for addr in ["127.0.0.1:0", "[::1]:0"] {
         for token_file in [None, Some(token_path.clone())] {
-            let app = faux_application(&format!("listen-loopback-{addr}-{}", token_file.is_some())).await;
+            let app =
+                faux_application(&format!("listen-loopback-{addr}-{}", token_file.is_some())).await;
             let extension_ui = ExtensionUiAdapter::new();
             let handle = start(
                 app.application.clone(),
@@ -1048,6 +1185,7 @@ async fn loopback_listen_accepts_v4_and_v6_with_and_without_token() {
                     token_file: token_file.as_deref().map(std::path::PathBuf::from),
                     allow_insecure_remote: false,
                     advertised_origin: None,
+                    runner_codename_override: None,
                     plaintext: true,
                     tls_cert: None,
                     tls_key: None,
@@ -1057,8 +1195,11 @@ async fn loopback_listen_accepts_v4_and_v6_with_and_without_token() {
             .await
             .expect("loopback must bind");
             let bound = handle.local_addr();
-            assert!(bound.ip().is_loopback(), "{addr} bound non-loopback {bound}");
-            handle.stop().await.expect("stop");
+            assert!(
+                bound.ip().is_loopback(),
+                "{addr} bound non-loopback {bound}"
+            );
+            handle.stop(false).await.expect("stop");
             app.application.cleanup().await;
         }
     }
@@ -1134,6 +1275,7 @@ async fn stop_handle_closes_listener_and_cleanup_still_runs() {
             token_file: None,
             allow_insecure_remote: false,
             advertised_origin: None,
+            runner_codename_override: None,
             plaintext: true,
             tls_cert: None,
             tls_key: None,
@@ -1165,7 +1307,7 @@ async fn stop_handle_closes_listener_and_cleanup_still_runs() {
         "get_state must expose the marker: {value}"
     );
 
-    handle.stop().await.expect("stop");
+    handle.stop(false).await.expect("stop");
     // `stop` is a true barrier: the listener task has completed and its
     // listening socket is closed. The freed address may already be re-bound
     // by a concurrent test (`bind(:0)` on an ephemeral port is fair game
@@ -1271,8 +1413,7 @@ async fn overload_produces_429_when_concurrency_exceeded() {
     }
     let (overflow_status, overflow_body) = overload_response.expect("expected overload rejection");
     assert_eq!(overflow_status, 429);
-    let overflow_json: Value =
-        serde_json::from_slice(&overflow_body).expect("parse overload body");
+    let overflow_json: Value = serde_json::from_slice(&overflow_body).expect("parse overload body");
     assert!(
         overflow_json["error"]
             .as_str()
@@ -1290,12 +1431,14 @@ async fn overload_produces_429_when_concurrency_exceeded() {
     .to_string();
     let (stop_status, stop_body) = http_post_rpc(addr, stop.as_bytes(), None).await;
     assert_ne!(
-        stop_status, 429,
+        stop_status,
+        429,
         "process_stop must bypass saturation: {}",
         String::from_utf8_lossy(&stop_body)
     );
     assert_eq!(
-        stop_status, 200,
+        stop_status,
+        200,
         "process_stop over HTTP while saturated: {}",
         String::from_utf8_lossy(&stop_body)
     );
@@ -1314,7 +1457,7 @@ async fn overload_produces_429_when_concurrency_exceeded() {
             "saturated process_wait must drain after HTTP process_stop"
         );
     }
-    handle.stop().await.expect("stop listener");
+    handle.stop(false).await.expect("stop listener");
     app.application.cleanup().await;
 }
 
@@ -1357,7 +1500,7 @@ async fn listener_shares_live_application_identity() {
         "RPC set_todos must mutate the shared Application todos: {todos:?}"
     );
 
-    handle.stop().await.expect("stop");
+    handle.stop(false).await.expect("stop");
     app.application.cleanup().await;
 }
 
@@ -1432,7 +1575,7 @@ async fn listener_preserves_canonical_tui_extension_queries() {
     let body = json!({"type":"get_state","id":"canonical-rpc"}).to_string();
     assert_eq!(http_post_rpc(addr, body.as_bytes(), None).await.0, 200);
 
-    handle.stop().await.expect("stop");
+    handle.stop(false).await.expect("stop");
     app.application.cleanup().await;
 }
 
@@ -1563,7 +1706,7 @@ async fn tui_interaction_ids_are_not_ws_respondable() {
     ));
 
     ws.close(None).await.ok();
-    handle.stop().await.expect("stop");
+    handle.stop(false).await.expect("stop");
     app.application.cleanup().await;
 }
 
@@ -1676,7 +1819,7 @@ async fn multiple_ws_clients_cannot_resolve_tui_interaction() {
 
     ws_a.close(None).await.ok();
     ws_b.close(None).await.ok();
-    handle.stop().await.expect("stop");
+    handle.stop(false).await.expect("stop");
     app.application.cleanup().await;
 }
 
@@ -1686,7 +1829,9 @@ async fn silent_tls_handshake_does_not_block_following_client() {
     let (handle, certificate_pem, _certificate_dir) = listen_tls(app.application.clone()).await;
     let addr = handle.local_addr();
 
-    let silent = TcpStream::connect(addr).await.expect("connect silent TCP client");
+    let silent = TcpStream::connect(addr)
+        .await
+        .expect("connect silent TCP client");
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let client = tls_http_client(&certificate_pem);
@@ -1708,7 +1853,7 @@ async fn silent_tls_handshake_does_not_block_following_client() {
     assert_eq!(body["success"], true);
 
     drop(silent);
-    handle.stop().await.expect("stop TLS listener");
+    handle.stop(false).await.expect("stop TLS listener");
     app.application.cleanup().await;
 }
 
@@ -1721,7 +1866,11 @@ async fn silent_tls_handshakes_are_capped_as_connection_tasks() {
 
     let mut silent = Vec::with_capacity(MAX_CONNECTION_TASKS);
     for _ in 0..MAX_CONNECTION_TASKS {
-        silent.push(TcpStream::connect(addr).await.expect("connect silent TLS client"));
+        silent.push(
+            TcpStream::connect(addr)
+                .await
+                .expect("connect silent TLS client"),
+        );
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1737,7 +1886,10 @@ async fn silent_tls_handshakes_are_capped_as_connection_tasks() {
     )
     .await
     .expect("TLS connection above task cap must be rejected promptly");
-    assert!(overflow.is_err(), "TLS connection above task cap must not be served");
+    assert!(
+        overflow.is_err(),
+        "TLS connection above task cap must not be served"
+    );
 
     drop(silent.pop());
     let mut recovered = false;
@@ -1754,10 +1906,13 @@ async fn silent_tls_handshakes_are_capped_as_connection_tasks() {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert!(recovered, "TLS request should recover after a handshake task exits");
+    assert!(
+        recovered,
+        "TLS request should recover after a handshake task exits"
+    );
 
     drop(silent);
-    handle.stop().await.expect("stop TLS listener");
+    handle.stop(false).await.expect("stop TLS listener");
     app.application.cleanup().await;
 }
 
@@ -1842,7 +1997,7 @@ async fn preauth_slow_header_connections_are_capped() {
     assert!(value["success"].as_bool().unwrap_or(false));
 
     drop(slow);
-    handle.stop().await.expect("stop");
+    handle.stop(false).await.expect("stop");
     app.application.cleanup().await;
 }
 
@@ -1855,7 +2010,7 @@ async fn listener_stop_error_path_still_allows_application_cleanup() {
         .await
         .expect("spawn");
     let (handle, _extension_ui) = listen(app.application.clone()).await;
-    let stop_result = handle.stop().await;
+    let stop_result = handle.stop(false).await;
     if let Err(error) = &stop_result {
         assert!(!format!("{error:#}").is_empty());
     }
@@ -1895,7 +2050,7 @@ async fn http_rejects_extension_ui_response_command() {
         Some(REMOTE_UI_DISABLED),
         "http body: {value}"
     );
-    handle.stop().await.expect("stop");
+    handle.stop(false).await.expect("stop");
     app.application.cleanup().await;
 }
 
@@ -1905,6 +2060,28 @@ async fn ws_projects_ui_events_but_isolates_host_interactions() {
     let (handle, extension_ui) = listen(app.application.clone()).await;
     let addr = handle.local_addr();
     let mut ws = ws_connect(addr, None).await;
+    let session_id = app
+        .application
+        .session()
+        .recorder_info()
+        .expect("session identity")
+        .0;
+    ws.send(WsMessage::Text(
+        json!({"type":"subscribe","sessionId":session_id,"cursor":0})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .expect("subscribe session");
+    while let Some(frame) = ws.next().await {
+        let WsMessage::Text(text) = frame.expect("subscription frame") else {
+            continue;
+        };
+        let value: Value = serde_json::from_str(&text).expect("subscription JSON");
+        if value["type"] == "subscription_snapshot" || value["type"] == "session_resync" {
+            break;
+        }
+    }
 
     // Non-interactive UI state still projects (notify).
     extension_ui
@@ -2064,7 +2241,7 @@ async fn ws_projects_ui_events_but_isolates_host_interactions() {
     ));
 
     ws.close(None).await.ok();
-    handle.stop().await.expect("stop");
+    handle.stop(false).await.expect("stop");
     app.application.cleanup().await;
 }
 
@@ -2076,9 +2253,7 @@ fn rpi_bin() -> String {
 const PIPE_DIAG_CAP: usize = 64 * 1024;
 
 /// Drain a pipe to EOF on a background thread, retaining at most [`PIPE_DIAG_CAP`] bytes.
-fn spawn_pipe_drain(
-    pipe: impl std::io::Read + Send + 'static,
-) -> std::thread::JoinHandle<Vec<u8>> {
+fn spawn_pipe_drain(pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
         let mut retained = Vec::new();
         let mut reader = pipe;
@@ -2139,12 +2314,7 @@ fn finish_child_bounded(
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(25)),
             Err(error) => {
-                kill_wait_join_panic(
-                    child,
-                    stdout,
-                    stderr,
-                    format!("try_wait {label}: {error}"),
-                );
+                kill_wait_join_panic(child, stdout, stderr, format!("try_wait {label}: {error}"));
             }
         }
     }
@@ -2168,7 +2338,6 @@ fn finish_child_bounded(
     )
 }
 
-
 fn run_rpi_binary(args: &[&str]) -> (i32, String, String) {
     use std::process::{Command, Stdio};
 
@@ -2180,8 +2349,8 @@ fn run_rpi_binary(args: &[&str]) -> (i32, String, String) {
         .env("HOME", home.path())
         .env("USERPROFILE", home.path())
         .env("PI_CODING_AGENT_DIR", home.path().join(".pi"))
-        .env("PI_SKIP_VERSION_CHECK", "1")
-        .env("PI_OFFLINE", "1")
+        .env("RPI_SKIP_VERSION_CHECK", "1")
+        .env("RPI_OFFLINE", "1")
         .env("PI_FAUX_RESPONSE", "listen-cli-should-not-run")
         .env_remove("PI_PROFILE")
         .env_remove("ANTHROPIC_API_KEY")
@@ -2259,9 +2428,18 @@ fn binary_listen_rejects_positional_prompt() {
     ]);
     assert_ne!(code, 0, "stdout={stdout} stderr={stderr}");
     let combined = format!("{stdout}\n{stderr}");
-    assert!(combined.contains("Web-only"), "error must explain listener mode: {combined}");
-    assert!(combined.contains("/web") && combined.contains("/rpc"), "error must name prompt surfaces: {combined}");
-    assert!(!combined.contains("Control plane listening"), "invalid combination must not bind: {combined}");
+    assert!(
+        combined.contains("Web-only"),
+        "error must explain listener mode: {combined}"
+    );
+    assert!(
+        combined.contains("/web") && combined.contains("/rpc"),
+        "error must name prompt surfaces: {combined}"
+    );
+    assert!(
+        !combined.contains("Control plane listening"),
+        "invalid combination must not bind: {combined}"
+    );
 }
 
 #[cfg(unix)]
@@ -2275,7 +2453,13 @@ fn signal_and_collect_listener(
         nix::sys::signal::Signal::SIGTERM,
     )
     .expect("signal listener");
-    finish_child_bounded(child, stdout, stderr, Duration::from_secs(20), "signaled listener")
+    finish_child_bounded(
+        child,
+        stdout,
+        stderr,
+        Duration::from_secs(20),
+        "signaled listener",
+    )
 }
 
 fn http_rpc_binary(address: std::net::SocketAddr, command: &Value) -> Value {
@@ -2288,18 +2472,24 @@ fn http_rpc_binary(address: std::net::SocketAddr, command: &Value) -> Value {
     );
     let mut stream = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(2))
         .expect("connect binary listener RPC");
-    stream.set_read_timeout(Some(Duration::from_secs(30))).expect("RPC read timeout");
-    stream.write_all(request.as_bytes()).expect("write RPC headers");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("RPC read timeout");
+    stream
+        .write_all(request.as_bytes())
+        .expect("write RPC headers");
     stream.write_all(&body).expect("write RPC body");
     let mut response = Vec::new();
-    stream.read_to_end(&mut response).expect("read RPC response");
+    stream
+        .read_to_end(&mut response)
+        .expect("read RPC response");
     let body = parse_body(&response).expect("parse RPC response body");
     serde_json::from_slice(&body).expect("parse RPC JSON")
 }
 
 #[cfg(unix)]
 #[test]
-fn binary_web_prompt_persists_and_restores_after_listener_restart() {
+fn binary_web_prompt_restores_and_switch_degrades_durable_mismatch() {
     use std::process::{Command, Stdio};
     use std::thread;
     use std::time::Instant;
@@ -2307,6 +2497,13 @@ fn binary_web_prompt_persists_and_restores_after_listener_restart() {
     let home = tempfile::tempdir().expect("home");
     let cwd = tempfile::tempdir().expect("cwd");
     let sessions = tempfile::tempdir().expect("sessions");
+    let agent_dir = home.path().join(".pi");
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        r#"{"sandbox":{"mode":"danger-full-access"},"orchestration":{"tasks":true}}"#,
+    )
+    .expect("orchestration settings");
     let port_probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe port");
     let address = port_probe.local_addr().expect("probe address");
     drop(port_probe);
@@ -2330,9 +2527,9 @@ fn binary_web_prompt_persists_and_restores_after_listener_restart() {
             .current_dir(cwd.path())
             .env("HOME", home.path())
             .env("USERPROFILE", home.path())
-            .env("PI_CODING_AGENT_DIR", home.path().join(".pi"))
-            .env("PI_SKIP_VERSION_CHECK", "1")
-            .env("PI_OFFLINE", "1")
+            .env("PI_CODING_AGENT_DIR", &agent_dir)
+            .env("RPI_SKIP_VERSION_CHECK", "1")
+            .env("RPI_OFFLINE", "1")
             .env("PI_FAUX_RESPONSE", "persisted Web assistant reply")
             .env_remove("PI_PROFILE")
             .env_remove("ANTHROPIC_API_KEY")
@@ -2359,7 +2556,10 @@ fn binary_web_prompt_persists_and_restores_after_listener_restart() {
                     break;
                 }
             }
-            assert!(child.try_wait().expect("poll listener").is_none(), "listener exited before ready");
+            assert!(
+                child.try_wait().expect("poll listener").is_none(),
+                "listener exited before ready"
+            );
             assert!(Instant::now() < deadline, "listener did not become ready");
             thread::sleep(Duration::from_millis(50));
         }
@@ -2374,27 +2574,126 @@ fn binary_web_prompt_persists_and_restores_after_listener_restart() {
     );
     assert_eq!(prompted["success"], true, "prompt response: {prompted}");
     let entries_deadline = Instant::now() + Duration::from_secs(30);
+    let mut poll = 0_u64;
     loop {
-        let entries = http_rpc_binary(address, &json!({"type":"get_entries","id":"persist-entries"}));
+        poll = poll.saturating_add(1);
+        let entries = http_rpc_binary(
+            address,
+            &json!({"type":"get_entries","id":format!("persist-entries-{poll}")}),
+        );
         let serialized = entries.to_string();
-        if serialized.contains(prompt_text) && serialized.contains("persisted Web assistant reply") {
+        if serialized.contains(prompt_text) && serialized.contains("persisted Web assistant reply")
+        {
             break;
         }
-        assert!(Instant::now() < entries_deadline, "Web prompt did not reach recorded entries: {entries}");
+        assert!(
+            Instant::now() < entries_deadline,
+            "Web prompt did not reach recorded entries: {entries}"
+        );
         thread::sleep(Duration::from_millis(50));
     }
-    let (first_code, first_out, first_err) = signal_and_collect_listener(first, first_stdout, first_stderr);
-    assert_eq!(first_code, 0, "first shutdown stdout={first_out} stderr={first_err}");
+    let (first_code, first_out, first_err) =
+        signal_and_collect_listener(first, first_stdout, first_stderr);
+    assert_eq!(
+        first_code, 0,
+        "first shutdown stdout={first_out} stderr={first_err}"
+    );
 
     let (mut second, second_stdout, second_stderr) = spawn(true);
     wait_until_ready(&mut second);
-    let restored = http_rpc_binary(address, &json!({"type":"get_entries","id":"restored-entries"}));
+    let restored = http_rpc_binary(
+        address,
+        &json!({"type":"get_entries","id":"restored-entries"}),
+    );
     let serialized = restored.to_string();
-    assert!(serialized.contains(prompt_text), "restored entries missing user prompt: {restored}");
-    assert!(serialized.contains("persisted Web assistant reply"), "restored entries missing assistant reply: {restored}");
+    assert!(
+        serialized.contains(prompt_text),
+        "restored entries missing user prompt: {restored}"
+    );
+    assert!(
+        serialized.contains("persisted Web assistant reply"),
+        "restored entries missing assistant reply: {restored}"
+    );
+    let restored_state =
+        http_rpc_binary(address, &json!({"type":"get_state","id":"restored-state"}));
+    let target_file = std::path::PathBuf::from(
+        restored_state["data"]["sessionFile"]
+            .as_str()
+            .expect("restored session file"),
+    );
+    let target_id = restored_state["data"]["sessionId"]
+        .as_str()
+        .expect("restored session id");
     let (second_code, second_out, second_err) =
         signal_and_collect_listener(second, second_stdout, second_stderr);
-    assert_eq!(second_code, 0, "second shutdown stdout={second_out} stderr={second_err}");
+    assert_eq!(
+        second_code, 0,
+        "second shutdown stdout={second_out} stderr={second_err}"
+    );
+
+    let sidecar = target_file
+        .parent()
+        .expect("session parent")
+        .join("children")
+        .join(target_id)
+        .join("orchestration-state.json");
+    let mut durable: DurableState =
+        serde_json::from_slice(&std::fs::read(&sidecar).expect("read orchestration sidecar"))
+            .expect("decode orchestration sidecar");
+    let captured = durable.durable_policy.clone();
+    let credentials = CredentialPolicy::new(vec![
+        CredentialGrantId::parse("web-switch-drift".to_owned()).expect("credential grant id"),
+    ])
+    .expect("credential policy");
+    durable.durable_policy = DurablePolicyState::new(
+        PolicySnapshot::new(
+            captured.snapshot().revision(),
+            captured.snapshot().created_on(),
+            SandboxPolicy::danger_full_access(credentials).expect("drifted sandbox policy"),
+        )
+        .expect("drifted policy snapshot"),
+        captured.credential_grants().clone(),
+    )
+    .expect("drifted durable policy");
+    std::fs::write(
+        &sidecar,
+        serde_json::to_vec(&durable).expect("serialize drifted orchestration sidecar"),
+    )
+    .expect("write drifted orchestration sidecar");
+
+    let (mut third, third_stdout, third_stderr) = spawn(false);
+    wait_until_ready(&mut third);
+    let switched = http_rpc_binary(
+        address,
+        &json!({
+            "type": "switch_session",
+            "id": "durable-web-switch",
+            "sessionPath": target_file,
+        }),
+    );
+    assert_eq!(switched["success"], true, "switch response: {switched}");
+    let notice = switched["data"]["notice"].as_str().unwrap_or_default();
+    assert!(
+        notice.contains("Orchestration unbound")
+            && notice.contains("durable sidecar does not match current policy"),
+        "typed durable degradation notice required: {switched}"
+    );
+    assert!(
+        !switched
+            .to_string()
+            .contains("process manager publication is already bound"),
+        "failed durable recovery must not poison the Web retry: {switched}"
+    );
+    let (third_code, third_out, third_err) =
+        signal_and_collect_listener(third, third_stdout, third_stderr);
+    assert_eq!(
+        third_code, 0,
+        "third shutdown stdout={third_out} stderr={third_err}"
+    );
+    assert!(
+        !third_err.contains("process manager publication is already bound"),
+        "listener stderr must not contain the poisoned-retry failure: {third_err}"
+    );
 }
 
 /// Real TCP backpressure evicts a client that never reads: the flood must
@@ -2425,12 +2724,36 @@ async fn ws_evicts_slow_reader_without_blocking_fresh_clients() {
     let request = format!("ws://{addr}/ws")
         .into_client_request()
         .expect("build slow-reader WS request");
-    let slow = tokio::time::timeout(DEADLINE, tokio_tungstenite::client_async(request, stream))
-        .await
-        .expect("slow-reader WS handshake timed out")
-        .expect("complete slow-reader WS handshake")
+    let mut slow_ws =
+        tokio::time::timeout(DEADLINE, tokio_tungstenite::client_async(request, stream))
+            .await
+            .expect("slow-reader WS handshake timed out")
+            .expect("complete slow-reader WS handshake")
+            .0;
+    let session_id = app
+        .application
+        .session()
+        .recorder_info()
+        .expect("session identity")
         .0;
-    let mut slow = slow.into_inner();
+    slow_ws
+        .send(WsMessage::Text(
+            json!({"type":"subscribe","sessionId":session_id,"cursor":0})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("subscribe slow reader");
+    while let Some(frame) = slow_ws.next().await {
+        let WsMessage::Text(text) = frame.expect("slow subscription frame") else {
+            continue;
+        };
+        let value: Value = serde_json::from_str(&text).expect("slow subscription JSON");
+        if value["type"] == "subscription_snapshot" || value["type"] == "session_resync" {
+            break;
+        }
+    }
+    let mut slow = slow_ws.into_inner();
 
     // 512 x 128 KiB (64 MiB) guarantees the kernel buffers fill and the
     // writer blocks no matter how the machine sizes its sockets.
@@ -2494,7 +2817,8 @@ async fn ws_evicts_slow_reader_without_blocking_fresh_clients() {
         loop {
             match fresh.next().await {
                 Some(Ok(WsMessage::Text(text))) => {
-                    let value: Value = serde_json::from_str(&text).expect("parse get_state response");
+                    let value: Value =
+                        serde_json::from_str(&text).expect("parse get_state response");
                     if value["type"] == "response" && value["id"] == "after-slow-reader" {
                         return value;
                     }
@@ -2511,7 +2835,7 @@ async fn ws_evicts_slow_reader_without_blocking_fresh_clients() {
     assert_eq!(response["success"], true);
 
     fresh.close(None).await.ok();
-    handle.stop().await.expect("stop");
+    handle.stop(false).await.expect("stop");
     app.application.cleanup().await;
 }
 
@@ -2525,12 +2849,35 @@ async fn ws_forwards_events_while_long_command_runs() {
     let (handle, _extension_ui) = listen(app.application.clone()).await;
     let addr = handle.local_addr();
     let mut ws = ws_connect(addr, None).await;
+    let session_id = app
+        .application
+        .session()
+        .recorder_info()
+        .expect("session identity")
+        .0;
+    ws.send(WsMessage::Text(
+        json!({"type":"subscribe","sessionId":session_id,"cursor":0})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .expect("subscribe session");
+    while let Some(frame) = ws.next().await {
+        let WsMessage::Text(text) = frame.expect("subscription frame") else {
+            continue;
+        };
+        let value: Value = serde_json::from_str(&text).expect("subscription JSON");
+        if value["type"] == "subscription_snapshot" || value["type"] == "session_resync" {
+            break;
+        }
+    }
 
     // process_wait is non-inline: it blocks until the process exits. Spawn a
     // long-lived process and wait on it for far longer than the test deadline.
     let spawn = json!({
         "type": "process_spawn",
         "id": "nb-spawn",
+        "sessionId": session_id,
         "spec": spawn_sleep_spec(app.cwd.path(), 30)
     })
     .to_string();
@@ -2566,6 +2913,7 @@ async fn ws_forwards_events_while_long_command_runs() {
         json!({
             "type": "process_wait",
             "id": "nb-wait",
+            "sessionId": session_id,
             "processId": process_id,
             "timeoutMs": 60_000
         })
@@ -2618,6 +2966,7 @@ async fn ws_forwards_events_while_long_command_runs() {
         json!({
             "type": "process_stop",
             "id": "nb-stop",
+            "sessionId": session_id,
             "processId": process_id
         })
         .to_string()
@@ -2659,11 +3008,14 @@ async fn ws_forwards_events_while_long_command_runs() {
             Err(_) => break,
         }
     }
-    assert!(saw_wait, "process_wait response never arrived after process_stop");
+    assert!(
+        saw_wait,
+        "process_wait response never arrived after process_stop"
+    );
     assert!(saw_stop, "process_stop response never arrived");
 
     ws.close(None).await.ok();
-    handle.stop().await.expect("stop");
+    handle.stop(false).await.expect("stop");
     app.application.cleanup().await;
 }
 
@@ -2678,6 +3030,12 @@ async fn ws_rejects_commands_beyond_concurrency_limit() {
     let (handle, _extension_ui) = listen(app.application.clone()).await;
     let addr = handle.local_addr();
     let mut ws = ws_connect(addr, None).await;
+    let session_id = app
+        .application
+        .session()
+        .recorder_info()
+        .expect("session identity")
+        .0;
 
     // Matches super::rpc::MAX_CONCURRENT_COMMANDS, kept literal here like the
     // existing HTTP overload test.
@@ -2686,6 +3044,7 @@ async fn ws_rejects_commands_beyond_concurrency_limit() {
     let spawn = json!({
         "type": "process_spawn",
         "id": "sat-spawn",
+        "sessionId": session_id,
         "spec": spawn_sleep_spec(app.cwd.path(), 30)
     })
     .to_string();
@@ -2719,6 +3078,7 @@ async fn ws_rejects_commands_beyond_concurrency_limit() {
             json!({
                 "type": "process_wait",
                 "id": format!("sat-wait-{index}"),
+                "sessionId": session_id,
                 "processId": process_id,
                 "timeoutMs": 60_000
             })
@@ -2734,6 +3094,7 @@ async fn ws_rejects_commands_beyond_concurrency_limit() {
         json!({
             "type": "process_wait",
             "id": "sat-overflow",
+            "sessionId": session_id,
             "processId": process_id,
             "timeoutMs": 60_000
         })
@@ -2770,8 +3131,9 @@ async fn ws_rejects_commands_beyond_concurrency_limit() {
     assert_eq!(overflow["command"], "process_wait");
     assert_eq!(overflow["success"], false);
     assert!(
-        overflow["error"].as_str().is_some_and(|error| error
-            .contains("too many concurrent RPC commands (limit")),
+        overflow["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("too many concurrent RPC commands (limit")),
         "overflow body: {overflow}"
     );
 
@@ -2780,6 +3142,7 @@ async fn ws_rejects_commands_beyond_concurrency_limit() {
         json!({
             "type": "process_stop",
             "id": "sat-stop",
+            "sessionId": session_id,
             "processId": process_id
         })
         .to_string()
@@ -2832,45 +3195,51 @@ async fn ws_rejects_commands_beyond_concurrency_limit() {
     );
 
     ws.close(None).await.ok();
-    handle.stop().await.expect("stop");
+    handle.stop(false).await.expect("stop");
     app.application.cleanup().await;
 }
 
-/// Disconnecting mid-command must not strand the pending task or the
-/// connection: the server answers the close handshake promptly (the read loop
-/// is not blocked in the long command), aborts the pending wait without
-/// killing the process, and stays healthy for fresh clients.
+/// Disconnecting after command admission only drops that transport's response
+/// waiter. The resident protocol owner keeps executing; reconnecting with the
+/// same command id joins the accepted operation and later replays its outcome.
 #[tokio::test]
-async fn ws_disconnect_aborts_pending_command_tasks() {
+async fn ws_disconnect_preserves_accepted_command_outcome() {
     let app = faux_application("listen-ws-disconnect").await;
     let (handle, _extension_ui) = listen(app.application.clone()).await;
     let addr = handle.local_addr();
     let mut ws = ws_connect(addr, None).await;
+    let session_id = app
+        .application
+        .session()
+        .recorder_info()
+        .expect("session identity")
+        .0;
 
-    let spawn = json!({
-        "type": "process_spawn",
-        "id": "disc-spawn",
-        "spec": spawn_sleep_spec(app.cwd.path(), 30)
-    })
-    .to_string();
-    ws.send(WsMessage::Text(spawn.into()))
-        .await
-        .expect("send process_spawn");
+    ws.send(WsMessage::Text(
+        json!({
+            "type": "process_spawn",
+            "id": "disc-spawn",
+            "sessionId": session_id,
+            "spec": spawn_sleep_spec(app.cwd.path(), 30)
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send process_spawn");
     let process_id = tokio::time::timeout(DEADLINE, async {
         loop {
-            match ws.next().await {
-                Some(Ok(WsMessage::Text(text))) => {
-                    let value: Value = serde_json::from_str(&text).expect("parse spawn response");
-                    if value["type"] == "response" && value["id"] == "disc-spawn" {
-                        return value["data"]["id"]
-                            .as_str()
-                            .expect("spawn response process id")
-                            .to_owned();
-                    }
-                }
-                Some(Ok(_)) => {}
-                Some(Err(error)) => panic!("WebSocket failed: {error}"),
-                None => panic!("WebSocket closed before process_spawn response"),
+            let frame = ws
+                .next()
+                .await
+                .expect("WebSocket closed")
+                .expect("WebSocket failed");
+            let WsMessage::Text(text) = frame else {
+                continue;
+            };
+            let value: Value = serde_json::from_str(&text).expect("parse spawn response");
+            if value["type"] == "response" && value["id"] == "disc-spawn" {
+                return value["data"]["id"].as_str().expect("process id").to_owned();
             }
         }
     })
@@ -2881,6 +3250,7 @@ async fn ws_disconnect_aborts_pending_command_tasks() {
         json!({
             "type": "process_wait",
             "id": "disc-wait",
+            "sessionId": session_id,
             "processId": process_id,
             "timeoutMs": 60_000
         })
@@ -2890,118 +3260,99 @@ async fn ws_disconnect_aborts_pending_command_tasks() {
     .await
     .expect("send process_wait");
     tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // The close handshake must complete promptly. Before this fix the read
-    // loop was blocked inside process_wait and would not answer the close for
-    // the full 30s the process runs.
     tokio::time::timeout(Duration::from_secs(5), ws.close(None))
         .await
-        .expect("server did not answer the close handshake while a command was pending")
+        .expect("server did not answer close while command was pending")
         .ok();
 
-    // The server aborted the pending wait (not the process) and remains
-    // healthy for fresh clients.
     let mut fresh = ws_connect(addr, None).await;
-    fresh.send(WsMessage::Text(
-        json!({"type":"get_state","id":"after-disconnect"})
+    fresh
+        .send(WsMessage::Text(
+            json!({
+                "type": "process_wait",
+                "id": "disc-wait",
+                "sessionId": session_id,
+                "processId": process_id,
+                "timeoutMs": 60_000
+            })
             .to_string()
             .into(),
-    ))
-    .await
-    .expect("send get_state after disconnect");
-    let response = tokio::time::timeout(DEADLINE, async {
-        loop {
-            match fresh.next().await {
-                Some(Ok(WsMessage::Text(text))) => {
-                    let value: Value = serde_json::from_str(&text).expect("parse get_state response");
-                    if value["type"] == "response" && value["id"] == "after-disconnect" {
-                        return value;
-                    }
-                }
-                Some(Ok(_)) => {}
-                Some(Err(error)) => panic!("fresh WebSocket failed: {error}"),
-                None => panic!("fresh WebSocket closed before get_state response"),
-            }
-        }
-    })
-    .await
-    .expect("fresh WebSocket get_state timed out");
-    assert_eq!(response["command"], "get_state");
-    assert_eq!(response["success"], true);
+        ))
+        .await
+        .expect("rejoin accepted process_wait");
+    fresh
+        .send(WsMessage::Text(
+            json!({
+                "type": "process_stop",
+                "id": "disc-stop",
+                "sessionId": session_id,
+                "processId": process_id
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send process_stop");
 
-    // The aborted wait must not have killed the process: a short wait on the
-    // fresh connection times out with the process still running.
-    fresh.send(WsMessage::Text(
-        json!({
-            "type": "process_wait",
-            "id": "disc-wait-2",
-            "processId": process_id,
-            "timeoutMs": 1
-        })
-        .to_string()
-        .into(),
-    ))
-    .await
-    .expect("send short process_wait");
-    let short_wait = tokio::time::timeout(DEADLINE, async {
-        loop {
-            match fresh.next().await {
-                Some(Ok(WsMessage::Text(text))) => {
-                    let value: Value = serde_json::from_str(&text).expect("parse ws frame");
-                    if value["type"] == "response" && value["id"] == "disc-wait-2" {
-                        return value;
-                    }
-                }
-                Some(Ok(_)) => {}
-                Some(Err(error)) => panic!("fresh WebSocket failed: {error}"),
-                None => panic!("fresh WebSocket closed before process_wait response"),
-            }
-        }
-    })
-    .await
-    .expect("short process_wait response timed out");
-    assert!(
-        short_wait["error"]
-            .as_str()
-            .is_some_and(|error| error.contains("timed out waiting for process")),
-        "expected the short wait to time out with the process still running: {short_wait}"
-    );
-
-    fresh.send(WsMessage::Text(
-        json!({
-            "type": "process_stop",
-            "id": "disc-stop",
-            "processId": process_id
-        })
-        .to_string()
-        .into(),
-    ))
-    .await
-    .expect("send process_stop");
     let deadline = tokio::time::Instant::now() + DEADLINE;
-    let mut saw_stop = false;
-    while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout_at(deadline, fresh.next()).await {
-            Ok(Some(Ok(WsMessage::Text(text)))) => {
-                let value: Value = serde_json::from_str(&text).expect("parse ws frame");
-                if value["type"] == "response" && value["id"] == "disc-stop" {
-                    assert!(
-                        value["success"].as_bool().unwrap_or(false),
-                        "stop failed: {value}"
-                    );
-                    saw_stop = true;
-                    break;
-                }
-            }
-            Ok(Some(Ok(_))) => {}
-            Ok(Some(Err(error))) => panic!("WebSocket failed: {error}"),
-            Ok(None) => break,
-            Err(_) => break,
+    let mut wait_response = None;
+    let mut stop_response = None;
+    while wait_response.is_none() || stop_response.is_none() {
+        let frame = tokio::time::timeout_at(deadline, fresh.next())
+            .await
+            .expect("resident command responses timed out")
+            .expect("fresh WebSocket closed")
+            .expect("fresh WebSocket failed");
+        let WsMessage::Text(text) = frame else {
+            continue;
+        };
+        let value: Value = serde_json::from_str(&text).expect("parse command response");
+        match value.get("id").and_then(Value::as_str) {
+            Some("disc-wait") => wait_response = Some(value),
+            Some("disc-stop") => stop_response = Some(value),
+            _ => {}
         }
     }
-    assert!(saw_stop, "process_stop response never arrived");
+    let wait_response = wait_response.expect("accepted wait outcome");
+    let stop_response = stop_response.expect("stop outcome");
+    assert_eq!(wait_response["success"], true, "{wait_response}");
+    assert_eq!(stop_response["success"], true, "{stop_response}");
+
+    fresh
+        .send(WsMessage::Text(
+            json!({
+                "type": "process_wait",
+                "id": "disc-wait",
+                "sessionId": session_id,
+                "processId": process_id,
+                "timeoutMs": 60_000
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("request accepted outcome replay");
+    let replay = tokio::time::timeout(DEADLINE, async {
+        loop {
+            let frame = fresh
+                .next()
+                .await
+                .expect("fresh WebSocket closed")
+                .expect("fresh WebSocket failed");
+            let WsMessage::Text(text) = frame else {
+                continue;
+            };
+            let value: Value = serde_json::from_str(&text).expect("parse replay response");
+            if value["type"] == "response" && value["id"] == "disc-wait" {
+                return value;
+            }
+        }
+    })
+    .await
+    .expect("accepted outcome replay timed out");
+    assert_eq!(replay, wait_response);
 
     fresh.close(None).await.ok();
-    handle.stop().await.expect("stop");
+    handle.stop(false).await.expect("stop");
     app.application.cleanup().await;
 }

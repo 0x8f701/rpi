@@ -46,8 +46,7 @@ const FAUX_RESPONSE: &str = "e2e-core-path-faux-reply";
 
 /// Small `keepRecentTokens` so a six-turn faux session (~150 tokens) crosses
 /// the compaction budget mid-history and the LLM summarizer is invoked.
-const COMPACT_SETTINGS: &str =
-    r#"{"compaction":{"enabled":true,"reserveTokens":16384,"keepRecentTokens":40,"snapKeepTurns":1}}"#;
+const COMPACT_SETTINGS: &str = r#"{"compaction":{"enabled":true,"reserveTokens":16384,"keepRecentTokens":40,"snapKeepTurns":1}}"#;
 
 fn rpi_bin() -> String {
     env!("CARGO_BIN_EXE_rpi").to_owned()
@@ -98,8 +97,8 @@ impl ReplProbe {
         cmd.env("HOME", home);
         cmd.env("PATH", std::env::var("PATH").unwrap_or_default());
         cmd.env("TERM", "xterm-256color");
-        cmd.env("PI_OFFLINE", "1");
-        cmd.env("PI_SKIP_VERSION_CHECK", "1");
+        cmd.env("RPI_OFFLINE", "1");
+        cmd.env("RPI_SKIP_VERSION_CHECK", "1");
         cmd.env("PI_FAUX_RESPONSE", faux_response);
         cmd.arg("--session-dir");
         cmd.arg(session_dir);
@@ -234,11 +233,7 @@ fn session_file_path(output: &str) -> PathBuf {
         .lines()
         .find(|line| line.contains(" messages"))
         .unwrap_or_else(|| panic!("no /session status line in: {output:?}"));
-    let path = line
-        .split(" · ")
-        .nth(2)
-        .expect("session file token")
-        .trim();
+    let path = line.split(" · ").nth(2).expect("session file token").trim();
     PathBuf::from(path)
 }
 
@@ -364,7 +359,10 @@ fn repl_export_jsonl_round_trips_through_import() {
     let exported_path = producer.command(&format!("/export {}", export.display()));
     assert_eq!(exported_path.trim(), export.display().to_string());
     let exported = fs::read_to_string(&export).expect("read producer export");
-    assert!(exported.contains(marker), "export must carry the transcript: {exported}");
+    assert!(
+        exported.contains(marker),
+        "export must carry the transcript: {exported}"
+    );
     producer.quit();
 
     // Consumer: a fresh process imports the exported file and re-exports it.
@@ -389,6 +387,59 @@ fn repl_export_jsonl_round_trips_through_import() {
         re_exported.contains(marker),
         "re-export after import must keep the transcript: {re_exported}"
     );
+    consumer.quit();
+}
+/// Contract: `/import` treats a missing configured session root as a
+/// directory, creates it through the import capability, and emits the resumed
+/// JSONL as a direct child rather than turning the root path into a file.
+#[test]
+fn repl_import_creates_missing_configured_root() {
+    let home = TempDir::new().expect("home");
+    let cwd = TempDir::new().expect("cwd");
+    let seed_dir = TempDir::new().expect("seed session dir");
+    let missing_session_dir = home.path().join("missing/nested/repl-sessions");
+    assert!(!missing_session_dir.exists());
+
+    let mut producer = ReplProbe::spawn(
+        home.path(),
+        cwd.path(),
+        seed_dir.path(),
+        &["--mode", "text", "--model", "faux/faux-1"],
+        FAUX_RESPONSE,
+    );
+    producer.ready();
+    producer.command("seed import fixture");
+    let export = cwd.path().join("missing-root-import.jsonl");
+    let exported_path = producer.command(&format!("/export {}", export.display()));
+    assert_eq!(exported_path.trim(), export.display().to_string());
+    producer.quit();
+
+    let mut consumer = ReplProbe::spawn(
+        home.path(),
+        cwd.path(),
+        &missing_session_dir,
+        &["--mode", "text", "--model", "faux/faux-1", "--no-session"],
+        FAUX_RESPONSE,
+    );
+    consumer.ready();
+    assert!(!missing_session_dir.exists());
+    let imported = consumer.command(&format!("/import {}", export.display()));
+    assert!(
+        imported.contains("imported and resumed"),
+        "import must resume under missing configured root: {imported}",
+    );
+    assert!(missing_session_dir.is_dir());
+    let emitted = fs::read_dir(&missing_session_dir)
+        .expect("read configured root")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(emitted.len(), 1, "one imported JSONL under configured root");
+    assert_eq!(emitted[0].parent(), Some(missing_session_dir.as_path()));
     consumer.quit();
 }
 
@@ -441,7 +492,10 @@ export default function (pi) {
     repl.ready();
 
     let run = repl.command("/run alpha hello");
-    assert!(run.contains("alpha:hello"), "extension command must run: {run}");
+    assert!(
+        run.contains("alpha:hello"),
+        "extension command must run: {run}"
+    );
 
     let reloaded = repl.command("/reload");
     assert!(

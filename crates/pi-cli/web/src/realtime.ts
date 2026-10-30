@@ -1,26 +1,25 @@
 /**
  * Realtime data-channel pure helpers — session config, live-mode
- * normalization, event-frame classification, and error/transcript extraction.
+ * normalization, event-frame classification, error/transcript extraction,
+ * and captured-session owner binding for create/stop RPCs.
  *
  * Shared by App.tsx's WebRTC realtime flow and the node-runnable regression
  * test (scripts/realtime.test.ts). DELIBERATELY has no DOM/browser/WebSocket
  * dependency so `esbuild --platform=node` can bundle the test in isolation
  * (mirroring src/transcript.ts + scripts/transcript.test.ts).
  *
- * The session object here is the model-bearing V1 "quicksilver" shape sent as
- * the web `session.update` event frame over the `oai-events` RTCDataChannel,
- * with `voice` nested under `audio.output.voice`. It deliberately DIFFERS from
- * the Rust create-call POST session (rpc.rs `realtime_session_payload`), which
- * is a strict subset WITHOUT `model`: Codex realtime rejects `session.model`
- * with 400, so the configured model can only be delivered here, over the data
- * channel.
+ * The session object here is the frameless v3 shape used by both the Rust
+ * create-call POST and the web `session.update` event over the `oai-events`
+ * RTCDataChannel. It carries instructions, output voice, and client
+ * delegation; model selection stays server/proxy-owned.
+ *
+ * Create/stop/cleanup RPCs always stamp the session captured at call start,
+ * never the post-switch current session — switching A→B must not leak A's
+ * call onto B or stop B's runtime.
  */
 
 import { withResolvers } from './withResolvers';
 
-/** PCM input sample rate the V1 session expects (24 kHz mono). A JSON number,
- *  not a string, so it serializes as `24000`. */
-export const REALTIME_AUDIO_SAMPLE_RATE = 24000;
 
 /** First non-empty trimmed string among `values` (empty strings and
  *  non-strings are skipped) — used to read defensive field variants off
@@ -33,37 +32,27 @@ export function firstString(...values: unknown[]): string {
   return '';
 }
 
-/** The V1 "quicksilver" realtime session object sent as the `session.update`
- *  event frame's `session` field over the `oai-events` data channel. `voice`
- *  nests under `audio.output.voice` (the legacy top-level `voice` was silently
- *  ignored by the V1 parser, so the configured voice never took effect).
- *  NOTE: this model-bearing shape is data-channel-only — the Rust create-call
- *  POST session is a strict subset WITHOUT `model`, which Codex realtime
- *  rejects with 400. */
+/** The frameless v3 realtime session object used by both create-call and the
+ *  retained idempotent `session.update` data-channel frame. */
 export interface RealtimeSessionConfig {
-  type: 'quicksilver';
-  model: string;
+  instructions: string;
   audio: {
-    input: { format: { type: 'audio/pcm'; rate: number } };
     output: { voice: string };
+  };
+  delegation: {
+    type: 'client';
   };
 }
 
-/** Build the V1 "quicksilver" session config for the data-channel
- *  `session.update` frame: `{type:'quicksilver', model,
- *  audio:{input:{format:{type:'audio/pcm', rate:24000}}, output:{voice}}}`.
- *  The caller defaults `model`/`voice` before calling, so both are always
- *  non-empty; the object never carries an `id` (the official client strips it
- *  pre-send). This is the ONLY place the configured `model` reaches the
- *  realtime session — the Rust create-call POST session omits it. */
-export function buildRealtimeSessionConfig(model: string, voice: string): RealtimeSessionConfig {
+
+/** Build the frameless realtime session config. Model selection stays
+ *  proxy-owned; the create-call endpoint accepts output voice and client
+ *  delegation but rejects `audio.input` in AVAS session data. */
+export function buildRealtimeSessionConfig(_model: string, voice: string): RealtimeSessionConfig {
   return {
-    type: 'quicksilver',
-    model,
-    audio: {
-      input: { format: { type: 'audio/pcm', rate: REALTIME_AUDIO_SAMPLE_RATE } },
-      output: { voice },
-    },
+    instructions: '',
+    audio: { output: { voice } },
+    delegation: { type: 'client' },
   };
 }
 
@@ -100,33 +89,87 @@ export function realtimeErrorMessage(frame: Record<string, unknown>): string {
   return 'realtime session error';
 }
 
-/** Classify a realtime event type as a USER input transcript delta, final, or
- *  neither. The CLIProxyAPI aliases (`transcript.delta`/`transcript.done`) are
- *  kept for compatibility. Assistant OUTPUT transcript events
- *  (`conversation.output_transcript.*`, `response.output_audio_transcript.*`)
- *  classify as `null` so they can never be committed to the composer as a user
+/** Classify a realtime event type within the USER input-transcription
+ *  category. The CLIProxyAPI aliases (`transcript.delta`/`transcript.done`)
+ *  are kept for compatibility. GA v3 events:
+ *  `conversation.item.input_audio_transcription.delta` (incremental text),
+ *  `.segment` (a full interim segment that SUPERSEDES the running preview),
+ *  `.completed` (the authoritative final), and `.failed` (transcription
+ *  error — surfaces a toast, never commits). The Codex FRAMELESS protocol
+ *  (what CLIProxyAPI relays verbatim over the `oai-events` data channel —
+ *  `internal/client/codex/live/media.go` bridges it byte-for-byte) uses
+ *  `input_transcript.added` (full live text at `item.text`, segment replace) and
+ *  `turn.done` (authoritative final at `turn.transcript`, role-gated).
+ *  Assistant OUTPUT transcript events (`conversation.output_transcript.*`,
+ *  `response.output_audio_transcript.*`, `output_transcript.added`) classify
+ *  as `null` so they can never be committed to the composer as a user
  *  draft. */
-export function classifyInputTranscriptEvent(type: string): 'delta' | 'final' | null {
+export function classifyInputTranscriptEvent(
+  type: string
+): 'delta' | 'segment' | 'final' | 'failed' | null {
   switch (type) {
     case 'transcript.delta':
     case 'conversation.input_transcript.delta':
     case 'conversation.item.input_audio_transcription.delta':
       return 'delta';
+    case 'conversation.item.input_audio_transcription.segment':
+    case 'input_transcript.added':
+      return 'segment';
     case 'transcript.done':
     case 'conversation.input_transcript.done':
     case 'conversation.item.input_audio_transcription.completed':
+    case 'turn.done':
       return 'final';
+    case 'conversation.item.input_audio_transcription.failed':
+    case 'transcription.failed':
+      return 'failed';
     default:
       return null;
   }
 }
 
-/** Extract the finalized user-input transcript text from a V1/alias final
- *  event. Reads the canonical `transcript` field, the nested
- *  `item.transcript` / `item.content`
+/** Extract the interim USER transcript text from a delta event. The
+ *  CLIProxyAPI/GA v3 aliases carry `delta`/`transcript` at the top level;
+ *  the frameless `input_transcript.added` nests the live text under
+ *  `item.text`. The frameless fragment is consumed RAW — each fragment is
+ *  appended verbatim, so trimming here would eat the significant whitespace
+ *  BETWEEN fragments. Returns '' when no text is present. */
+export function inputTranscriptDeltaText(frame: Record<string, unknown>): string {
+  const item = frame.item;
+  const rawItemText = item && typeof item === 'object' ? (item as Record<string, unknown>).text : undefined;
+  if (typeof rawItemText === 'string') return rawItemText;
+  return firstString(frame.delta, frame.transcript);
+}
+
+/** Extract the FULL interim segment text from a supersede-semantics segment
+ *  event (GA `…transcription.segment`; the frameless protocol's
+ *  `input_transcript.added` also carries the full live text of the segment).
+ *  Reads the full-text fields first, falling back to the delta aliases.
+ *  Returns '' when no text is present. */
+export function inputTranscriptSegmentText(frame: Record<string, unknown>): string {
+  const item = frame.item;
+  return firstString(
+    frame.text,
+    frame.transcript,
+    item && typeof item === 'object' ? (item as Record<string, unknown>).text : undefined,
+    frame.delta
+  );
+}
+
+/** Extract the finalized user-input transcript text from a final event. The
+ *  frameless `turn.done` nests `transcript` under `turn` and is ROLE-GATED:
+ *  only a `user` turn is input text — an assistant turn is OUTPUT and must
+ *  never commit to the composer. The V1/alias finals read the canonical
+ *  `transcript` field, the nested `item.transcript` / `item.content`
  *  (`conversation.item.input_audio_transcription.completed`), and the
  *  `text` / `delta` alias fallbacks. Returns '' when no text is present. */
 export function finalTranscriptText(frame: Record<string, unknown>): string {
+  const turn = frame.turn;
+  if (turn && typeof turn === 'object') {
+    const t = turn as Record<string, unknown>;
+    if (t.role !== undefined && t.role !== 'user') return '';
+    return firstString(t.transcript, frame.transcript, frame.text, frame.delta);
+  }
   const item = frame.item;
   const src = item && typeof item === 'object' ? (item as Record<string, unknown>) : {};
   return firstString(frame.transcript, src.transcript, src.content, frame.text, frame.delta);
@@ -144,6 +187,297 @@ export function nextInputTranscriptCommit(finalText: string, lastCommitted: stri
   if (!text) return '';
   if (text === lastCommitted) return '';
   return text;
+}
+
+/** `realtime_create_call` targeted at the session captured when the call
+ *  started. ICE gather is async, so reading the active session at POST time
+ *  would create the call on a session the user switched to mid-setup. */
+export function realtimeCreateCallCommand(
+  owner: string,
+  sdpOffer: string,
+): { type: 'realtime_create_call'; sdpOffer: string; sessionId: string } {
+  return { type: 'realtime_create_call', sdpOffer, sessionId: owner };
+}
+
+/** `realtime_stop` targeted at the session captured when the call started.
+ *  Cleanup after an A→B switch must stop A's runtime, never the current
+ *  session's. */
+export function realtimeStopCommand(owner: string): { type: 'realtime_stop'; sessionId: string } {
+  return { type: 'realtime_stop', sessionId: owner };
+}
+
+/** True when a captured realtime owner may mutate the active composer. A
+ *  late input-transcript final is dropped unless the owner is still the
+ *  current session — switching A→B must never write A's utterance into B. */
+export function shouldCommitRealtimeTranscript(owner: string | null | undefined, current: string | null | undefined): boolean {
+  return typeof owner === 'string' && owner !== '' && owner === current;
+}
+
+/** Plan for one finalized input transcript: the deduped utterance (`commit`,
+ *  empty = drop) and whether it may be written to the owner session's
+ *  composer as a draft. Delivery is owner-gated: switching A→B must never
+ *  write A's utterance into B — the late transcript is dropped entirely. */
+export interface RealtimeFinalPlan {
+  readonly commit: string;
+  readonly deliver: boolean;
+}
+export function planRealtimeFinal(
+  owner: string | null | undefined,
+  current: string | null | undefined,
+  finalText: string,
+  lastCommitted: string,
+): RealtimeFinalPlan {
+  const commit = nextInputTranscriptCommit(finalText, lastCommitted);
+  return { commit, deliver: commit !== '' && shouldCommitRealtimeTranscript(owner, current) };
+}
+
+/** Overlay label for a `delegation.created` frame. No delegation text renders
+ *  a meaningful bounded label — never the meaningless duplication
+ *  'delegation created: Delegation created'. */
+export function realtimeDelegationLabel(text: string | null | undefined): string | null {
+  if (text === null || text === undefined) return null;
+  const trimmed = text.trim();
+  if (trimmed === '') return 'Voice: delegation started (see Activity)';
+  return `delegation created: ${trimmed}`;
+}
+
+/** Extract the spoken command from a `delegation.created` frame. The REAL
+ *  wire shape (Codex frameless-bidi protocol, relayed byte-for-byte by
+ *  CLIProxyAPI over the `oai-events` data channel) carries NO `delegation`
+ *  field — the command rides `item.content[]` entries of type
+ *  `input_text`:
+ *  `{ type: 'delegation.created', item: { id, type: 'delegation',
+ *  target: 'client', content: [{ type: 'input_text', text }] } }`.
+ *  Legacy wrapped shapes (a raw string `delegation`, or
+ *  `delegation.description`/`.task`) are retained defensively. An
+ *  id-only/untextable delegation returns '' — the caller must surface a
+ *  failure instead of silently dropping the utterance. */
+export function delegationCreatedText(frame: Record<string, unknown>): string {
+  const item = frame.item && typeof frame.item === 'object'
+    ? (frame.item as Record<string, unknown>)
+    : null;
+  if (item && Array.isArray(item.content)) {
+    const text = (item.content as unknown[])
+      .filter(
+        (c): c is Record<string, unknown> =>
+          !!c && typeof c === 'object' && (c as Record<string, unknown>).type === 'input_text'
+      )
+      .map((c) => (typeof c.text === 'string' ? c.text : ''))
+      .join('');
+    if (text.trim() !== '') return text.trim();
+  }
+  const d = frame.delegation;
+  return firstString(
+    item ? item.input_transcript : undefined,
+    frame.input_transcript,
+    typeof d === 'string' ? d : undefined,
+    d && typeof d === 'object' ? (d as Record<string, unknown>).description : undefined,
+    d && typeof d === 'object' ? (d as Record<string, unknown>).task : undefined,
+  );
+}
+
+/** Plan for a `delegation.created` voice flow: the delegation text IS the
+ *  user's spoken command, so it delivers to chat exactly like a transcript
+ *  final — owner-gated, deduped by EXACT match against the shared
+ *  lastCommitted text (same-utterance re-fire and the V1 dual-final
+ *  variants of ONE utterance dedup; the caller anchors lastCommitted at the
+ *  delivered text and clears it in the delta/segment branches where every
+ *  new utterance opens). Text resolution order: (1) the extracted delegation
+ *  text (`delegationCreatedText`); (2) the ACCUMULATED transcript preview
+ *  the caller passes — the spoken words streamed into the overlay before
+ *  the delegation arrived; (3) both empty → deliver=false; the caller MUST
+ *  surface a failure toast for (3) — an untextable delegation with no
+ *  preview is a dropped utterance, never silence. */
+export interface RealtimeDelegationPlan {
+  readonly commit: string;
+  readonly deliver: boolean;
+}
+export function planRealtimeDelegation(
+  owner: string | null | undefined,
+  current: string | null | undefined,
+  delegationText: string,
+  lastCommitted: string,
+  previewText: string = '',
+): RealtimeDelegationPlan {
+  const text = (typeof delegationText === 'string' && delegationText.trim() !== ''
+    ? delegationText
+    : typeof previewText === 'string' && previewText.trim() !== ''
+      ? previewText
+      : '').trim();
+  if (text === '') return { commit: '', deliver: false };
+  if (!shouldCommitRealtimeTranscript(owner, current)) return { commit: text, deliver: false };
+  if (text === lastCommitted.trim()) return { commit: text, deliver: false };
+  return { commit: text, deliver: true };
+}
+
+/** Bounded quiescence window (ms) for delegation.created voice delivery: the
+ *  delegation can arrive BEFORE/WHILE the input-transcript deltas stream, so
+ *  delivery waits this long for the preview to catch up, then delivers the
+ *  RICHER of (delegation text, preview). A transcript final arriving first
+ *  delivers through the normal path and cancels the pending delegation. */
+export const REALTIME_DELEGATION_QUIESCENCE_MS = 1500;
+
+export type RealtimeVoiceAction =
+  | { kind: 'noop' }
+  | { kind: 'overlay'; text: string }
+  | { kind: 'failed'; message: string }
+  | { kind: 'deliver'; text: string; cancelPending: boolean }
+  | { kind: 'consume-final' }
+  | { kind: 'park'; owner: string; text: string }
+  | { kind: 'error'; message: string }
+  | { kind: 'unhandled'; type: string }
+  | { kind: 'empty-handoff' };
+
+export interface RealtimeVoiceContext {
+  owner: string | null | undefined;
+  current: string | null | undefined;
+  overlay: string;
+  lastCommitted: string;
+  pendingText: string;
+}
+
+export function isRealtimeHandoffType(type: string): boolean {
+  return type === 'delegation.created' || type === 'conversation.handoff.requested';
+}
+
+export function isIgnorableTranscriptFinal(frame: Record<string, unknown>): boolean {
+  const type = typeof frame.type === 'string' ? frame.type : '';
+  if (type !== 'turn.done') return false;
+  const turn = frame.turn;
+  if (!turn || typeof turn !== 'object') return false;
+  const role = (turn as Record<string, unknown>).role;
+  return typeof role === 'string' && role !== 'user';
+}
+
+export function userFinalUtterance(frame: Record<string, unknown>, preview: string): string {
+  const fromFrame = finalTranscriptText(frame);
+  if (fromFrame) return fromFrame;
+  return typeof preview === 'string' ? preview.trim() : '';
+}
+
+function deliverUtterance(
+  owner: string | null | undefined,
+  current: string | null | undefined,
+  text: string,
+  lastCommitted: string,
+): RealtimeVoiceAction {
+  const plan = planRealtimeFinal(owner, current, text, lastCommitted);
+  if (plan.deliver) return { kind: 'deliver', text: plan.commit, cancelPending: true };
+  return { kind: 'consume-final' };
+}
+
+export function reduceRealtimeVoiceFrame(
+  frame: Record<string, unknown>,
+  ctx: RealtimeVoiceContext,
+): RealtimeVoiceAction {
+  if (!shouldCommitRealtimeTranscript(ctx.owner, ctx.current)) return { kind: 'noop' };
+  const type = typeof frame.type === 'string' ? frame.type : '';
+  const cls = classifyInputTranscriptEvent(type);
+  if (cls === 'delta') {
+    const delta = inputTranscriptDeltaText(frame);
+    if (!delta) return { kind: 'noop' };
+    return { kind: 'overlay', text: `${ctx.overlay}${delta}` };
+  }
+  if (cls === 'segment') {
+    const segment = inputTranscriptSegmentText(frame);
+    if (!segment) return { kind: 'noop' };
+    return { kind: 'overlay', text: segment };
+  }
+  if (cls === 'failed') {
+    return { kind: 'failed', message: realtimeErrorMessage(frame) };
+  }
+  if (cls === 'final') {
+    if (isIgnorableTranscriptFinal(frame)) {
+      const fallback = ctx.overlay.trim() || ctx.pendingText.trim();
+      if (!fallback) return { kind: 'noop' };
+      return deliverUtterance(ctx.owner, ctx.current, fallback, ctx.lastCommitted);
+    }
+    const text = userFinalUtterance(frame, ctx.overlay);
+    if (!text) return { kind: 'noop' };
+    return deliverUtterance(ctx.owner, ctx.current, text, ctx.lastCommitted);
+  }
+  if (isRealtimeHandoffType(type)) {
+    return { kind: 'park', owner: ctx.owner ?? '', text: delegationCreatedText(frame) };
+  }
+  if (type === 'error') {
+    return { kind: 'error', message: realtimeErrorMessage(frame) };
+  }
+  if (type === 'output_audio.delta') return { kind: 'noop' };
+  return { kind: 'unhandled', type };
+}
+
+export function reducePendingVoiceFlush(
+  pending: { owner: string; text: string } | null,
+  overlay: string,
+  current: string | null | undefined,
+  lastCommitted: string,
+): RealtimeVoiceAction {
+  if (!pending) return { kind: 'noop' };
+  const richer = overlay.trim().length > pending.text.trim().length ? overlay : pending.text;
+  if (richer.trim() === '') return { kind: 'empty-handoff' };
+  const plan = planRealtimeDelegation(pending.owner, current, richer, lastCommitted);
+  if (!plan.deliver) return { kind: 'noop' };
+  return { kind: 'deliver', text: plan.commit, cancelPending: false };
+}
+
+export function unwrapRealtimeFrame(raw: unknown): Record<string, unknown> | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const frame = raw as Record<string, unknown>;
+  const nested = frame.event;
+  if (nested && typeof nested === 'object' && !Array.isArray(nested)) {
+    const inner = nested as Record<string, unknown>;
+    if (typeof inner.type === 'string' && inner.type !== '') {
+      const outerType = typeof frame.type === 'string' ? frame.type : '';
+      if (outerType === '' || outerType === 'event' || outerType === 'server_event') {
+        return inner;
+      }
+    }
+  }
+  return frame;
+}
+
+export function decodeRealtimeChannelData(data: unknown): string | null {
+  if (typeof data === 'string') return data;
+  if (data instanceof ArrayBuffer) return new TextDecoder().decode(data);
+  if (ArrayBuffer.isView(data)) {
+    const view = data as ArrayBufferView;
+    return new TextDecoder().decode(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
+  }
+  return null;
+}
+
+export function parseRealtimeChannelFrames(data: unknown): Record<string, unknown>[] {
+  const text = decodeRealtimeChannelData(data);
+  if (text == null || text.trim() === '') return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return [];
+  }
+  const items = Array.isArray(parsed) ? parsed : [parsed];
+  const frames: Record<string, unknown>[] = [];
+  for (const item of items) {
+    const frame = unwrapRealtimeFrame(item);
+    if (frame) frames.push(frame);
+  }
+  return frames;
+}
+
+/** A realtime call is stopped when its owning session is replaced by another
+ * active session. This single-owner semantic prevents every late delta,
+ * delegation, connection state, and toast from projecting onto the new page. */
+export function shouldStopRealtimeOnSessionSwitch(
+  owner: string | null | undefined,
+  previous: string | null | undefined,
+  next: string | null | undefined,
+): boolean {
+  return typeof owner === 'string'
+    && owner !== ''
+    && owner === previous
+    && typeof next === 'string'
+    && next !== ''
+    && next !== previous;
 }
 
 /** The OpenAI Realtime WebRTC event data channel label. Created on the

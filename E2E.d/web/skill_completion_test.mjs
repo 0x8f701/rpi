@@ -146,10 +146,9 @@ async function main() {
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await waitFor(page, () => document.title === 'rpi web', 'S1: page title missing');
-    await waitFor(page, () => document.getElementById('conn-state') !== null, 'S1: conn-state missing');
     await waitFor(
       page,
-      () => document.getElementById('conn-state').dataset.state === 'on',
+      () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true,
       'S1: WS did not reach "connected"'
     );
 

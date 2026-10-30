@@ -85,8 +85,8 @@ pub fn import_servers(
 ) -> Result<()> {
     let manager = settings_manager(cwd)?;
     let (format, path) = resolve_import_source(cwd, source, file)?;
-    let contents = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let contents =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let entries = match format {
         McpImportFormat::Claude => parse_claude_config(&contents),
         McpImportFormat::Cursor => parse_cursor_config(&contents),
@@ -184,9 +184,7 @@ fn print_import_report(
         println!("  replaced {name} (--force)");
     }
     for name in &outcome.skipped {
-        println!(
-            "  kept existing {name} (use --force to replace it)",
-        );
+        println!("  kept existing {name} (use --force to replace it)",);
     }
     for name in &outcome.disabled {
         println!("  disabled {name}");

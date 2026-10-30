@@ -40,9 +40,9 @@ fn run_with_env(
         .env("PI_CODING_AGENT_DIR", agent_dir)
         .env("HOME", agent_dir)
         .env("USERPROFILE", agent_dir)
-        .env("PI_SKIP_VERSION_CHECK", "1")
+        .env("RPI_SKIP_VERSION_CHECK", "1")
         .env("PI_FAUX_RESPONSE", "toml-settings-reply")
-        .env_remove("PI_OFFLINE")
+        .env_remove("RPI_OFFLINE")
         .env_remove("PI_PROFILE")
         .env_remove("PI_CODING_AGENT_SESSION_DIR")
         .env_remove("ANTHROPIC_API_KEY")
@@ -82,10 +82,23 @@ fn toml_settings_session_dir_with_env_expansion_is_honored() {
     let (created, _, create_err) = run_with_env(
         agent.path(),
         cwd.path(),
-        &["--offline", "--model", "faux/faux-1", "--session-id", "toml-a", "created"],
-        &[("E2E_TOML_SESSIONS", sessions_a.path().to_str().expect("path a"))],
+        &[
+            "--offline",
+            "--model",
+            "faux/faux-1",
+            "--session-id",
+            "toml-a",
+            "created",
+        ],
+        &[(
+            "E2E_TOML_SESSIONS",
+            sessions_a.path().to_str().expect("path a"),
+        )],
     );
-    assert!(created, "creation through TOML settings failed: {create_err}");
+    assert!(
+        created,
+        "creation through TOML settings failed: {create_err}"
+    );
     assert!(
         sessions_a.path().join("toml-a.jsonl").is_file(),
         "session must land in the env-expanded root A"
@@ -95,10 +108,16 @@ fn toml_settings_session_dir_with_env_expansion_is_honored() {
         agent.path(),
         cwd.path(),
         &["sessions"],
-        &[("E2E_TOML_SESSIONS", sessions_a.path().to_str().expect("path a"))],
+        &[(
+            "E2E_TOML_SESSIONS",
+            sessions_a.path().to_str().expect("path a"),
+        )],
     );
     assert!(listed_a, "listing with root A failed: {list_err}");
-    assert!(out_a.contains("toml-a"), "listing with root A missed the session: {out_a}");
+    assert!(
+        out_a.contains("toml-a"),
+        "listing with root A missed the session: {out_a}"
+    );
 
     // The same literal setting with a different env value must resolve to a
     // different root — proof the `$E2E_TOML_SESSIONS` reference was expanded
@@ -107,7 +126,10 @@ fn toml_settings_session_dir_with_env_expansion_is_honored() {
         agent.path(),
         cwd.path(),
         &["sessions"],
-        &[("E2E_TOML_SESSIONS", sessions_b.path().to_str().expect("path b"))],
+        &[(
+            "E2E_TOML_SESSIONS",
+            sessions_b.path().to_str().expect("path b"),
+        )],
     );
     assert!(listed_b, "listing with root B failed: {list_err_b}");
     assert!(
@@ -139,10 +161,23 @@ fn toml_settings_wins_over_json_sibling() {
     let (created, _, create_err) = run_with_env(
         agent.path(),
         cwd.path(),
-        &["--offline", "--model", "faux/faux-1", "--session-id", "toml-wins", "created"],
-        &[("E2E_TOML_SESSIONS", toml_sessions.path().to_str().expect("path"))],
+        &[
+            "--offline",
+            "--model",
+            "faux/faux-1",
+            "--session-id",
+            "toml-wins",
+            "created",
+        ],
+        &[(
+            "E2E_TOML_SESSIONS",
+            toml_sessions.path().to_str().expect("path"),
+        )],
     );
-    assert!(created, "creation through TOML settings failed: {create_err}");
+    assert!(
+        created,
+        "creation through TOML settings failed: {create_err}"
+    );
     assert!(
         toml_sessions.path().join("toml-wins.jsonl").is_file(),
         "TOML root must receive the session"
@@ -176,5 +211,28 @@ fn toml_settings_default_model_with_env_expansion_drives_startup() {
     assert!(
         out.contains("rpi · faux/faux-1"),
         "startup must resolve the env-expanded TOML model: {out}"
+    );
+}
+
+#[test]
+fn toml_sandbox_schema_preserves_explicit_empty_host_http() {
+    let agent = TempDir::new().expect("agent");
+    let cwd = TempDir::new().expect("cwd");
+    fs::create_dir_all(agent.path()).expect("agent dir");
+    fs::write(
+        agent.path().join("settings.toml"),
+        "[sandbox]\nmode = \"workspace-write\"\n\n[sandbox.hostHttp]\ndestinations = []\n",
+    )
+    .expect("settings.toml");
+    let settings = pi_coding::SettingsManager::load_phase_one(cwd.path(), agent.path())
+        .expect("approved TOML sandbox schema");
+    let sandbox = settings.settings().sandbox.expect("sandbox");
+    assert_eq!(
+        sandbox.resolved_mode(),
+        pi_coding::resolved_sandbox_mode(Some(&sandbox))
+    );
+    assert_eq!(
+        sandbox.host_http,
+        Some(pi_coding::HostHttpPolicySettings::default())
     );
 }

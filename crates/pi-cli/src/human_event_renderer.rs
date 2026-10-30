@@ -6,16 +6,15 @@ use std::io::{self, IsTerminal, Write};
 use anyhow::{Context, Result, anyhow, bail};
 use pi_agent::AgentEvent;
 use pi_ai::{AssistantMessageEvent, Message};
-use pi_coding::{Application, ApplicationEvent, SessionEvent};
-use pi_coding::redact::redact_secrets;
 use pi_coding::markdown::{
-    MarkdownRenderOptions, StreamingMarkdownRenderer, render_markdown,
-    render_markdown_streaming,
+    MarkdownRenderOptions, StreamingMarkdownRenderer, render_markdown, render_markdown_streaming,
 };
+use pi_coding::redact::redact_secrets;
+use pi_coding::{Application, ApplicationEvent, SessionEvent};
 
+use crate::orchestration_message::orchestration_irc_view;
 use crate::output::{DIM, RED, RESET};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-use crate::orchestration_message::orchestration_irc_view;
 
 /// Stateful renderer for the human-facing `ApplicationEvent` stream.
 ///
@@ -79,9 +78,15 @@ impl<'a, W: Write> HumanEventRenderer<'a, W> {
     /// Render one event in the order it was published by the application.
     pub fn render(&mut self, event: &ApplicationEvent) -> io::Result<()> {
         match event {
-            ApplicationEvent::Agent(event) => self.render_agent(event),
+            ApplicationEvent::Agent(event) | ApplicationEvent::AgentPublished { event, .. } => {
+                self.render_agent(event)
+            }
             ApplicationEvent::Session(event) => self.render_session(event),
             ApplicationEvent::RunFailed { message } => self.render_failure(message),
+            ApplicationEvent::TodoChildRouted { receipt } => self.write_styled_line(
+                DIM,
+                &format!("Routed to Todo · {}", receipt.child_session_id),
+            ),
             _ => Ok(()),
         }
     }
@@ -249,6 +254,17 @@ impl<'a, W: Write> HumanEventRenderer<'a, W> {
                 } else {
                     Ok(())
                 }
+            }
+            SessionEvent::RetryFallbackApplied { from, to, role } => {
+                self.ensure_line_boundary()?;
+                self.write_styled_line(
+                    DIM,
+                    &format!("fallback: {role} {from} -> {to} for the next attempt"),
+                )
+            }
+            SessionEvent::RetryFallbackSucceeded { model, role } => {
+                self.ensure_line_boundary()?;
+                self.write_styled_line(DIM, &format!("fallback ok: {role} now on {model}"))
             }
             SessionEvent::CompactionStart { reason } => {
                 self.ensure_line_boundary()?;
@@ -441,11 +457,7 @@ fn sanitize_terminal_text(text: &str) -> String {
     sanitized
 }
 
-fn sanitize_terminal_chunk(
-    text: &str,
-    state: &mut TerminalControlState,
-    sanitized: &mut String,
-) {
+fn sanitize_terminal_chunk(text: &str, state: &mut TerminalControlState, sanitized: &mut String) {
     for character in text.chars() {
         *state = match *state {
             TerminalControlState::Ground => match character {
@@ -532,14 +544,8 @@ pub async fn render_until_settled<W: Write>(
     writer: &mut W,
     ansi: bool,
 ) -> Result<()> {
-    render_until_settled_with_interrupt(
-        application,
-        events,
-        writer,
-        ansi,
-        tokio::signal::ctrl_c(),
-    )
-    .await
+    render_until_settled_with_interrupt(application, events, writer, ansi, tokio::signal::ctrl_c())
+        .await
 }
 
 async fn render_until_settled_with_interrupt<W, F>(
@@ -568,14 +574,23 @@ where
                 }
                 if let ApplicationEvent::Agent(AgentEvent::MessageEnd {
                     message: Message::Assistant(message),
-                }) = &event
+                })
+                | ApplicationEvent::AgentPublished {
+                    event: AgentEvent::MessageEnd {
+                        message: Message::Assistant(message),
+                    },
+                    ..
+                } = &event
                     && matches!(message.stop_reason, pi_ai::StopReason::Error | pi_ai::StopReason::Aborted)
                 {
                     terminal_failure = Some(message.error_message.clone().unwrap_or_else(|| {
                         format!("Request {:?}", message.stop_reason).to_ascii_lowercase()
                     }));
                 }
-                let settled = matches!(event, ApplicationEvent::AgentSettled);
+                let settled = matches!(
+                    event,
+                    ApplicationEvent::AgentSettled | ApplicationEvent::TodoChildRouted { .. }
+                );
                 if let Err(error) = renderer.render(&event) {
                     application.abort().await;
                     application.abort_bash();
@@ -596,7 +611,9 @@ where
     }
 
     application.wait_for_idle().await;
-    renderer.finish_turn().context("finishing human turn output")?;
+    renderer
+        .finish_turn()
+        .context("finishing human turn output")?;
     if interrupted {
         return Ok(());
     }
@@ -625,7 +642,12 @@ where
     }
 
     let session = application.session();
-    let expanded = crate::file_args::expand_prompt_in_workspace(prompt, session.workspace_roots())?;
+    let process = application.governed_process_context();
+    let expanded = crate::file_args::expand_prompt_in_workspace(
+        prompt,
+        session.workspace_roots(),
+        Some(&process),
+    )?;
     let events = application.subscribe();
     application
         .prompt(expanded.prompt, expanded.images, None)
@@ -644,10 +666,8 @@ pub async fn run_human_bash_to<W: Write>(
     ansi: bool,
 ) -> Result<()> {
     let mut events = application.subscribe();
-    let mut operation = Box::pin(application.execute_bash(
-        command.to_owned(),
-        exclude_from_context,
-    ));
+    let mut operation =
+        Box::pin(application.execute_bash(command.to_owned(), exclude_from_context));
     let mut interrupt = Box::pin(tokio::signal::ctrl_c());
     let mut interrupted = false;
     let mut renderer = HumanEventRenderer::new(writer, ansi);
@@ -715,8 +735,11 @@ mod tests {
     use pi_ai::{
         AssistantMessage, BashExecutionMessage, ContentBlock, Context, Model, StopReason, Usage,
         new_assistant_message_event_stream,
+        providers::{FauxProviderOptions, register_faux_provider},
     };
-    use pi_coding::{Session, SessionOptions};
+    use pi_coding::{
+        ResourceDiscovery, ResourceManager, ResourceManagerOptions, Session, SessionOptions,
+    };
     use serde_json::json;
     use tokio::sync::Notify;
 
@@ -746,31 +769,119 @@ mod tests {
         }
     }
 
-    async fn application_with_stream(stream_fn: StreamFn) -> (Application, tempfile::TempDir) {
-        let cwd = tempfile::tempdir().expect("tempdir");
+    struct RendererApplicationFixture {
+        application: Application,
+        _root: tempfile::TempDir,
+        _resources: ResourceManager,
+        _registration: pi_ai::providers::FauxProviderRegistration,
+    }
+
+    impl std::ops::Deref for RendererApplicationFixture {
+        type Target = Application;
+
+        fn deref(&self) -> &Self::Target {
+            &self.application
+        }
+    }
+
+    async fn application_with_stream(stream_fn: StreamFn) -> RendererApplicationFixture {
+        let root = tempfile::tempdir().expect("test root");
+        let agent_dir = root.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+        )
+        .expect("sandbox settings");
+        let cwd = root.path().join("project");
+        std::fs::create_dir_all(&cwd).expect("project dir");
+        let suffix = uuid::Uuid::now_v7().simple().to_string();
         let model = Model {
             id: "human-renderer".into(),
             name: "Human Renderer".into(),
-            api: "human-renderer".into(),
-            provider: "test".into(),
+            api: format!("human-renderer-api-{suffix}"),
+            provider: format!("human-renderer-provider-{suffix}"),
+            base_url: "http://localhost:0".into(),
             ..Model::default()
         };
-        let session = Session::new(SessionOptions {
-            model,
-            cwd: cwd.path().to_path_buf(),
-            system_prompt: String::new(),
-            thinking_level: ThinkingLevel::Off,
-            api_key: "test".into(),
-            compaction: None,
-            stream_options: Default::default(),
-            tools: Some(Vec::new()),
-            before_tool_call: None,
-            after_tool_call: None,
-            stream_fn: Some(stream_fn),
-            auth_resolver: None,
-        })
+        let registration = register_faux_provider(FauxProviderOptions {
+            api: model.api.clone(),
+            provider: model.provider.clone(),
+            models: vec![model.clone()],
+            chunk_size: 1,
+        });
+        let mut resource_options = ResourceManagerOptions::new(&cwd);
+        resource_options.agent_dir = agent_dir;
+        resource_options.project_trust_override = Some(true);
+        resource_options.disable_extensions = true;
+        resource_options.disable_skills = true;
+        resource_options.disable_prompt_templates = true;
+        resource_options.disable_themes = true;
+        resource_options.disable_context_files = true;
+        let resources = ResourceManager::new(resource_options).expect("renderer test resources");
+        let session = Session::new_with_additional_tools_filtered_and_discovery(
+            SessionOptions {
+                model,
+                cwd,
+                system_prompt: String::new(),
+                thinking_level: ThinkingLevel::Off,
+                api_key: "test".into(),
+                compaction: None,
+                stream_options: Default::default(),
+                tools: Some(Vec::new()),
+                before_tool_call: None,
+                after_tool_call: None,
+                stream_fn: Some(stream_fn),
+                auth_resolver: None,
+                auth_manager: None,
+            },
+            Vec::new(),
+            Default::default(),
+            ResourceDiscovery::Disabled,
+        )
         .expect("session");
-        (Application::new(session).await, cwd)
+        let session_dir = root.path().join("sessions");
+        std::fs::create_dir_all(&session_dir).expect("session dir");
+        session.set_session_dir(session_dir);
+        session
+            .attach_resources(resources.clone())
+            .await
+            .expect("attach renderer test resources");
+        let application = Application::new(session).await;
+        assert_eq!(
+            application.resource_generation(),
+            Some(resources.generation())
+        );
+        RendererApplicationFixture {
+            application,
+            _root: root,
+            _resources: resources,
+            _registration: registration,
+        }
+    }
+
+    #[test]
+    fn durable_todo_route_renders_typed_child_identity() {
+        let mut output = Vec::new();
+        let mut renderer = HumanEventRenderer::new(&mut output, false);
+        renderer
+            .render(&ApplicationEvent::TodoChildRouted {
+                receipt: pi_coding::TodoChildReceipt {
+                    id: "receipt".to_owned(),
+                    parent_session_id: "parent".to_owned(),
+                    child_session_id: "child".to_owned(),
+                    message_id: "message".to_owned(),
+                    accepted_at: 1,
+                    status: pi_coding::TodoChildReceiptStatus::Queued,
+                    summary: None,
+                },
+            })
+            .expect("render Todo route");
+        drop(renderer);
+        assert_eq!(
+            String::from_utf8(output).expect("utf8"),
+            "Routed to Todo · child\n"
+        );
     }
 
     #[test]
@@ -923,7 +1034,6 @@ mod tests {
         assert!(!output.contains(&secret), "{output}");
         assert!(output.contains("▏ "), "{output}");
     }
-
 
     #[test]
     fn orchestration_irc_body_forging_reply_text_stays_quoted_body() {
@@ -1106,10 +1216,12 @@ mod tests {
     fn preserves_foreground_bash_terminal_bytes() {
         let mut output = Vec::new();
         HumanEventRenderer::new(&mut output, false)
-            .render(&ApplicationEvent::Session(SessionEvent::BashExecutionUpdate {
-                id: None,
-                delta: "\u{1b}[31muser-red\u{1b}[0m".into(),
-            }))
+            .render(&ApplicationEvent::Session(
+                SessionEvent::BashExecutionUpdate {
+                    id: None,
+                    delta: "\u{1b}[31muser-red\u{1b}[0m".into(),
+                },
+            ))
             .expect("render bash bytes");
         assert_eq!(output, b"\x1b[31muser-red\x1b[0m");
     }
@@ -1145,7 +1257,10 @@ mod tests {
         drop(renderer);
         let text = String::from_utf8(output).expect("utf8");
         for leaked in [ghp.as_str(), "abc123", "xyz789", sk.as_str()] {
-            assert!(!text.contains(leaked), "{leaked:?} leaked into print mode: {text}");
+            assert!(
+                !text.contains(leaked),
+                "{leaked:?} leaked into print mode: {text}"
+            );
         }
         assert_eq!(text.matches("[REDACTED]").count(), 4);
     }
@@ -1266,6 +1381,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn renders_fallback_lifecycle_events_bounded_and_redacted() {
+        let mut output = Vec::new();
+        let mut renderer = HumanEventRenderer::new(&mut output, false);
+        renderer
+            .render(&ApplicationEvent::Session(
+                SessionEvent::RetryFallbackApplied {
+                    from: "provider-a/model-a".into(),
+                    to: "provider-b/model-b".into(),
+                    role: "supervisor".into(),
+                },
+            ))
+            .expect("render applied");
+        renderer
+            .render(&ApplicationEvent::Session(
+                SessionEvent::RetryFallbackSucceeded {
+                    model: "provider-b/model-b".into(),
+                    role: "supervisor".into(),
+                },
+            ))
+            .expect("render succeeded");
+        drop(renderer);
+        assert_eq!(
+            String::from_utf8(output).expect("utf8"),
+            "fallback: supervisor provider-a/model-a -> provider-b/model-b for the next attempt\nfallback ok: supervisor now on provider-b/model-b\n"
+        );
+    }
 
     #[test]
     fn renders_bash_retry_and_compaction_events_without_ansi() {
@@ -1338,7 +1480,7 @@ mod tests {
                 stream
             })
         });
-        let (application, _cwd) = application_with_stream(stream_fn).await;
+        let application = application_with_stream(stream_fn).await;
         let mut output = Vec::new();
 
         let text = run_human_turn_to_with_interrupt(
@@ -1392,7 +1534,7 @@ mod tests {
                 stream
             })
         });
-        let (application, _cwd) = application_with_stream(stream_fn).await;
+        let application = application_with_stream(stream_fn).await;
         let interrupt = async move {
             started.notified().await;
             Ok(())

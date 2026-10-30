@@ -97,15 +97,18 @@ async function main() {
       console.error(`collab-view: page error: ${sanitizeDetails(err.message)}`);
     });
     await page.exposeFunction('recordCollabStreamSeen', () => {
-      // The view guest records the streaming badge render (live stream path).
+      // The view guest records the streaming render-path mount (live stream).
       globalThis.__collabViewStreamSeen = true;
     });
     await page.addInitScript(() => {
       let streamReported = false;
+      // The production streaming render path mounts `.assistant-text` with
+      // `data-stream-key` (App.tsx StreamingAssistant, reused by the guest
+      // view) and removes it on finalize — an exact live selector, also valid
+      // for view guests that have no composer.
       const checkStream = () => {
         if (streamReported) return;
-        const badge = document.getElementById('stream-badge');
-        if (badge && !badge.hidden) {
+        if (document.querySelector('.assistant-text[data-stream-key]')) {
           globalThis.__collabViewStreamSeen = true;
           streamReported = true;
           window.recordCollabStreamSeen();
@@ -191,7 +194,7 @@ async function main() {
       assert('VG-07', 'live stream renders every expected control-prompt marker', true);
       await page.waitForTimeout(400);
       const streamSeen = await page.evaluate(() => globalThis.__collabViewStreamSeen === true);
-      assert('VG-07b', 'streaming badge became visible during the live run', streamSeen);
+      assert('VG-07b', 'streaming render path mounted during the live run', streamSeen);
     }
 
     await page.screenshot({ path: path.join(evidence, 'view-live.png'), fullPage: true });

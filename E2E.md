@@ -1,15 +1,15 @@
 # rpi End-to-End Verification
 
-This handbook defines the release verification contract for `rpi` 0.2.11. It uses repository-relative paths and isolated temporary homes. Do not record local absolute paths, private endpoints, credential filenames, or credential values in committed evidence.
+This handbook defines the release verification contract for `rpi` 1.0.0. It uses repository-relative paths and isolated temporary homes. Do not record local absolute paths, private endpoints, credential filenames, or credential values in committed evidence.
 
 All prose, fixtures, agent definitions, skill bodies, and faux responses used by deterministic campaigns are English-only.
 
 ## Product contract
 
 - Primary executable: `rpi` (JSONL RPC control plane via the `rpi rpc` subcommand).
-- Managed install root: `~/.rpi` by default, overridden by `PI_HOME`.
+- Managed install root: `~/.rpi` by default, overridden by `RPI_HOME`.
 - Active executable: `~/.rpi/bin/rpi` on Unix and `%USERPROFILE%\.rpi\bin\rpi.exe` on Windows.
-- Runtime configuration remains compatible with the upstream Pi layout: `~/.pi/agent`, project `.pi/`, and `PI_*` environment variables.
+- Runtime configuration remains compatible with the upstream Pi layout: `~/.pi/agent`, project `.pi/`, and preserved `PI_*` environment variables (e.g. `PI_CODING_AGENT_DIR`). The installer/updater canonical controls are the `RPI_*` names.
 - Native sessions use append-only Pi v3 JSONL.
 - Release assets use `rpi-<version>-<target-triple>.tar.gz`, or `.zip` for Windows.
 - The five release targets are:
@@ -26,7 +26,7 @@ Every deterministic lane MUST:
 - Build or point at a release-dist binary: `target/release-dist/rpi` (override with `RPI_BIN`).
 - Use isolated homes and workspaces under `$WORK_ROOT/<scenario>/{home,workspace}` (defaults via `E2E.d/lib/common.sh`).
 - Evidence under `$EVIDENCE_ROOT/<scenario>/` (default `${TMPDIR:-/tmp}/rpi-e2e-evidence/<run-id>`).
-- Run offline faux: `PI_OFFLINE=1`, `PI_SKIP_VERSION_CHECK=1`, `--offline --model faux/faux-1`.
+- Run offline faux: `RPI_OFFLINE=1`, `RPI_SKIP_VERSION_CHECK=1`, `--offline --model faux/faux-1`.
 - Bound wall clocks with `timeout` (see per-lane tables). Hard-fail on timeout.
 - Avoid credentials, private endpoints, and local absolute paths in committed content.
 - Clean up via `cleanup_e2e` trap: kill registered tmux sessions and PIDs; remove `$WORK_ROOT`.
@@ -66,7 +66,7 @@ This lane uses isolated homes, the faux provider, recorded fixtures, and bounded
 - `rpi --version`
 - JSON lifecycle output
 - LF-delimited RPC commands and responses
-- command discovery with exactly 22 primary slash commands, including `/workflow`
+- command discovery with exactly 31 primary slash commands, including `/workflow`
 - foreground bash
 - process supervision and `/ps`
 - loop scheduling
@@ -114,7 +114,7 @@ RPI_BIN=target/release-dist/rpi bash E2E.d/release/archive-fixture-smoke.sh run
 The archive gate verifies:
 
 - exactly five platform archives
-- exact `rpi-0.2.11-<target-triple>` names
+- exact `rpi-1.0.0-<target-triple>` names
 - a single root-level `rpi` or `rpi.exe`
 - a root-level `LICENSE`
 - a complete and valid `SHA256SUMS`
@@ -151,9 +151,9 @@ RPI_LIVE_API_KEY_ENV='<credential-environment-variable-name>' \
 bash E2E.d/nightly.sh run
 ```
 
-The environment variable named by `RPI_LIVE_API_KEY_ENV` must already be set by the operator. The scripts must never print or persist its value.
+The environment variable named by `RPI_LIVE_API_KEY_ENV` must already be set by the operator. The scripts must never print or persist its value. Every live scenario invokes the actual application with `--model "$RPI_LIVE_MODEL"` under an isolated `HOME`; the application retains its normal model/auth resolution.
 
-Live scenarios cover architecture research, a build-and-fix task, running-child steering, and compaction overflow. Live results are evidence, not substitutes for deterministic release gates.
+Live scenarios cover architecture research, a build-and-fix task, running-child steering, compaction overflow, typed Hub/IRC delivery, project-skill discovery/load/execute plus an actionable unknown route, and two overlapping isolated Workflows. Live results are evidence, not substitutes for deterministic release gates.
 
 ## Focused Rust gates
 
@@ -185,7 +185,7 @@ Orchestration-focused cargo gates are also driven by `bash E2E.d/ci/orchestratio
 | --- | --- | --- | --- | --- |
 | `campaign.version` | `bash E2E.d/ci/campaigns.sh run` (or internal `run_version`) | 30s | `$EVIDENCE_ROOT/version/version.log` | `rpi --version` succeeds under isolated home |
 | `campaign.faux-json` | same umbrella | 30s | `$EVIDENCE_ROOT/faux-json/{events.jsonl,stderr.log}` | JSON lifecycle contains `deterministic-e2e-reply` |
-| `campaign.rpc-state` | same umbrella | 40s | `$EVIDENCE_ROOT/rpc-state/{output.jsonl,stderr.log}` | RPC responses succeed for models, commands, bash, todos, todo-state, goal, goal-get, loop, loops, spawn, process-list, state, name, tree; goal objective `deterministic release readiness`; todo task blockedBy inventory; ≥1 process |
+| `campaign.rpc-state` | same umbrella | 40s | `$EVIDENCE_ROOT/rpc-state/{output.jsonl,stderr.log}` | RPC responses succeed for models, commands, bash, todos, todo-state, goal, goal-get, loop, loops, spawn, process-list, state, name, tree; goal objective `deterministic release readiness`; todo task waitingOn inventory; ≥1 process |
 | `campaign.orchestration` | `bash E2E.d/ci/campaigns.sh orchestration` or umbrella `run` | see orchestration | nested under orchestration evidence | `todo_dag_execution` + NL/IRC both ways + hard compact-agent tmux + TUI Todo refresh gate; rpc+rust always; tmux when available |
 | `campaign.bash-tui` | `bash E2E.d/ci/campaigns.sh bash-tui` or umbrella `run` | 90s | `$EVIDENCE_ROOT/bash-tui/{tui.txt,assertions.json}` | foreground Bash sees EOF, unattended prompt/pager environment reaches the child, the tool turn completes, and an unsent composer sentinel remains editable |
 | `campaign.workflow` | `bash E2E.d/ci/campaigns.sh workflow` (dev umbrella) or `bash E2E.d/ci/workflow.sh release` (**hard release gate**, tmux required; **opt-in**, not default `ci.sh`) | see workflow | nested under workflow evidence | Multi-workflow RPC and tmux contracts below; pass requires `workflow.rpc`, `workflow.tmux`, and `workflow.goal-tmux` execution statuses all `passed` (`RPI_BIN=target/release-dist/rpi bash E2E.d/ci/workflow.sh release`, exit 0, evidence under `$EVIDENCE_ROOT`); `workflow campaigns passed` is printed only then |
@@ -205,7 +205,7 @@ bash E2E.d/ci/campaign.sh process|loop|goal|todo|tools|session
 | `campaign.process` | `$EVIDENCE_ROOT/campaign-process/output.jsonl` | supervised process spawn/list through RPC succeeds |
 | `campaign.loop` | `$EVIDENCE_ROOT/campaign-loop/output.jsonl` | scheduled loop create/list succeeds |
 | `campaign.goal` | `$EVIDENCE_ROOT/campaign-goal/output.jsonl` | goal create/get succeeds |
-| `campaign.todo` | `$EVIDENCE_ROOT/campaign-todo/output.jsonl` | dependency-blocked todo projection succeeds |
+| `campaign.todo` | `$EVIDENCE_ROOT/campaign-todo/output.jsonl` | dependency-waiting todo projection succeeds |
 | `campaign.tools` | `$EVIDENCE_ROOT/campaign-tools/output.jsonl` | command catalog + deterministic foreground bash |
 | `campaign.session` | `$EVIDENCE_ROOT/campaign-session/output.jsonl` | name/state/tree session lifecycle succeeds |
 
@@ -247,13 +247,13 @@ Driver: `E2E.d/lib/run_orchestration_campaign.py`. **Projection only** — coord
 | Check ID | Observable contract |
 | --- | --- |
 | `goal-details` | `goal_get.current.objective == "deterministic orchestration readiness"`; `lifecycle == "active"`; `usage.tokensUsed == 42`; `usage.activeTimeSeconds == 7`; `tokenBudget == 1000` |
-| `todo-ready-roots-and-blocked-join` | After `set_todos` with phases Roots(`root-a`,`root-b`) + Join(`join` depends on both): `root-a.ready` and `root-b.ready` are true; `join.ready` is false; `join.blockedBy` taskIds are exactly `{root-a, root-b}` |
+| `todo-ready-roots-and-waiting-join` | After `set_todos` with phases Roots(`root-a`,`root-b`) + Join(`join` depends on both): `root-a.ready` and `root-b.ready` are true; `join.ready` is false; `join.waitingOn` taskIds are exactly `{root-a, root-b}` |
 | `todo-exact-task-ids` | Projected task ids are exactly `{join, root-a, root-b}` (`summary.todoInitial.exactIds`) |
 | `todo-exact-task-id-completion` | Completing only `root-a` yields completed count 1; join still not ready (exact task-id ownership surface) |
-| `todo-dependent-after-roots` | Completing `root-b` makes `join.ready == true`, clears `blockedBy`, completed count 2; `joinStatus` must **not** be `completed` yet |
+| `todo-dependent-after-roots` | Completing `root-b` makes `join.ready == true`, clears `waitingOn`, completed count 2; `joinStatus` must **not** be `completed` yet |
 | `todo-open-work-remains-after-partial` | After roots complete, join remains open work (not spuriously settled) |
 | `todo-open-work-remains` | At least one task remains `pending` or `in_progress` after partial completion |
-| `todo-blocked-only-projection` | Alternate graph: one ready `gate` + blocked `waiter`; waiter blockedBy gate only (no dual ready roots) |
+| `todo-dependency-waiting-projection` | Alternate graph: one ready `gate` + open `waiter`; waiter waits on gate only (no dual ready roots) |
 | `todo-all-terminal-no-ready` | All-terminal projection (`done-a`,`done-b`) has no ready open tasks (`summary.todoTerminal.ids`) — attach-no-spawn surface |
 | `process-list-contains-supervised` | `process_spawn` of `sh -c "printf 'orchestration-server-ready\\n'; sleep 120"` yields an id present in `process_list` |
 | `process-stopped-and-cleaned` | After `process_stop`, that id is not still `running`/`starting`/`alive`/`active` |
@@ -271,7 +271,7 @@ All invoked from `run_orchestration_rust` with **`cargo +1.88.0` only** (never b
 | --- | --- |
 | `cargo +1.88.0 test -p pi-cli --test nl_exact_agent_spawn --locked -- --nocapture` | Exact NL `Have researcher study this` → AgentUpdated + JobUpdated with human name `researcher` and job status in `{Queued, Running, Completed}`; Subagents job cards non-empty with researcher display name. Skill-only `Use research for this` does **not** increase job count |
 | `cargo +1.88.0 test -p pi-coding --test routing_contracts --locked -- --nocapture` | Exact agent mention wins over overlapping skill; skill-only / ambiguous / untrusted skill failures stay actionable |
-| `cargo +1.88.0 test -p pi-coding --test todo_dag_lifecycle --locked -- --nocapture` | Todo tool DAG add/update/dependency/readiness/complete/remove; model-visible ready/blocked fields; on-disk `todo_snapshot` restore |
+| `cargo +1.88.0 test -p pi-coding --test todo_dag_lifecycle --locked -- --nocapture` | Todo tool DAG add/update/dependency/readiness/complete/remove; model-visible ready/waitingOn fields; on-disk `todo_snapshot` restore |
 | `cargo +1.88.0 test -p pi-coding --test todo_dag_execution --locked -- --nocapture` | **Full coordinator suite first** (additions never silently dropped) |
 | `cargo +1.88.0 test -p pi-coding --test todo_dag_execution two_ready_roots_overlap_and_join_waits_for_both_before_three_of_three --locked -- --nocapture` | Ready roots overlap; exact `todoTaskId` ownership; join waits for both; 3/3 complete |
 | `cargo +1.88.0 test -p pi-coding --test todo_dag_execution failed_and_cancelled_owners_stay_open_and_terminal_reconciliation_is_idempotent --locked -- --nocapture` | Failed/cancelled owners leave tasks open; Blocked status; terminal reconciliation idempotent |
@@ -413,16 +413,23 @@ Cleanup: `tmux kill-session` for the unique session name; outer `cleanup_e2e` re
 | `live.zig-build-fix` | `bash E2E.d/manual.sh zig-build-fix` | `$EVIDENCE_ROOT/zig-build-fix/...` |
 | `live.subagent-steering` | `bash E2E.d/manual.sh subagent-steering` | child steered to write `NEW` in `steering.txt` |
 | `live.compact-overflow` | `bash E2E.d/manual.sh compact-overflow` | compaction event under soak |
+| `live.typed-irc` | `bash E2E.d/manual.sh typed-irc` | exact Main → IrcAlpha → IrcBeta → IrcAlpha → Main typed bodies, `replyTo` correlation, successful Hub send/wait records, settled children |
+| `live.skill-routing` | `bash E2E.d/manual.sh skill-routing` | hermetic `.rpi/skills/route-stamp`, exact artifact, successful `read skill://route-stamp`, actionable failed `read skill://missing-route-6f21` |
+| `live.parallel-workflow` | `bash E2E.d/manual.sh parallel-workflow` | two durable workflow IDs/generations, distinct branches/worktrees/supervisor jobs, composite Todo ownership, strictly overlapping child intervals, isolated runtime artifacts |
 
-Default live timeout: `LIVE_TIMEOUT_SECONDS` (900s unless overridden).
+Default live timeout: `LIVE_TIMEOUT_SECONDS` (900s unless overridden; the parallel Workflow scenario defaults to 1800s). Selectors are also accepted directly by `E2E.d/live/campaign.sh`; `run` retains the existing four scenarios and then runs these three.
 
 ## Regression matrix
 
 Every user-reported regression maps to an executable lane. Lanes claim **observable behavior**, not source text.
 
-### 1. Command discovery (22 primary slash commands)
+### 1. Command discovery (31 visible primary slash commands)
 
-**Lane:** RPC + unit/integration + executed workflow RPC/tmux campaign. `/workflow` is one of the 22 primary commands and owns the multi-workflow product surface.
+**Lane:** RPC + unit/integration + executed workflow RPC/tmux campaign. `/help`
+and slash completion expose the 31 primary commands. RPC `get_commands` exposes
+the collision-free executable superset (built-ins plus eligible prompts,
+skills, and extensions) and must contain every primary command. `/workflow` is
+one of the 31 primaries and owns the multi-workflow product surface.
 
 **Commands:**
 
@@ -434,17 +441,21 @@ cargo +1.88.0 test -p pi-cli --test slash_command_dispatch --locked
 cargo +1.88.0 test -p pi-cli --test rpc_binary --locked
 ```
 
-**Expected visible / structured set (exactly these primary names):**
+**Expected visible primary set (exactly these names):**
 
-`settings`, `model`, `branch`, `resume`, `fork`, `export`, `dump`, `handoff`, `agents`, `role`, `persona`, `compact`, `rewind`, `checkpoint`, `ps`, `loop`, `goal`, `workflow`, `code-review`, `btw`, `queue`, `live`
+`settings`, `model`, `branch`, `resume`, `fork`, `export`, `dump`, `handoff`, `agents`, `role`, `persona`, `compact`, `rewind`, `checkpoint`, `ps`, `loop`, `goal`, `workflow`, `code-review`, `btw`, `queue`, `live`, `skill`, `theme`, `thinking`, `todo`, `tree`, `trust`, `jobs`, `activity`, `irc`
 
 TUI slash discovery MUST surface exactly:
 
-`/settings`, `/model`, `/branch`, `/resume`, `/fork`, `/export`, `/dump`, `/handoff`, `/agents`, `/role`, `/persona`, `/compact`, `/rewind`, `/checkpoint`, `/ps`, `/loop`, `/goal`, `/workflow`, `/code-review`, `/btw`, `/queue`, `/live`
+`/settings`, `/model`, `/branch`, `/resume`, `/fork`, `/export`, `/dump`, `/handoff`, `/agents`, `/role`, `/persona`, `/compact`, `/rewind`, `/checkpoint`, `/ps`, `/loop`, `/goal`, `/workflow`, `/code-review`, `/btw`, `/queue`, `/live`, `/skill`, `/theme`, `/thinking`, `/todo`, `/tree`, `/trust`, `/jobs`, `/activity`, `/irc`
 
-**Evidence:** `$EVIDENCE_ROOT/campaign-tools/output.jsonl` or `$EVIDENCE_ROOT/rpc-state/output.jsonl` (`commands` response).
+`/todo` is the sole public Todo command. Its grammar covers both the Todo DAG
+and embedded durable child sessions:
+`/todo [list|new [label]|select <id>|send [id] <message>|add <id> [options] <task>|status [id]|pause [id]|resume [id]|stop [id]|cancel [id]|archive <id>|start <task>|done <task>|drop <task>|clear|<markdown>]`.
 
-**Failure:** missing or extra primary command name; RPC success false.
+**Evidence:** `$EVIDENCE_ROOT/campaign-tools/output.jsonl` or `$EVIDENCE_ROOT/rpc-state/output.jsonl` (`get_commands` response). The RPC response may include hidden or dynamic executable commands; every listed primary must be present exactly once with source `builtin`.
+
+**Failure:** missing or duplicate primary command name; a primary has a source other than `builtin`; RPC success false. Extra valid executable commands in `get_commands` are not a failure.
 
 
 ### 2. Subagents status / list
@@ -501,7 +512,7 @@ bash E2E.d/ci/orchestration.sh rpc   # issues both prompts over RPC
 
 **Lane split:**
 
-- **Readiness projection:** `orchestration.rpc` (`set_todos` waves + exact ids + blocked-only + all-terminal) + `todo_dag_lifecycle` rust + tmux todo panel (**separate** capture after the compact-agent-only assertion).
+- **Readiness projection:** `orchestration.rpc` (`set_todos` waves + exact ids + waiting-only + all-terminal) + `todo_dag_lifecycle` rust + tmux todo panel (**separate** capture after the compact-agent-only assertion).
 - **Coordinator execution (authoritative, post-FF0F):** `orchestration.rust` → full `todo_dag_execution` suite **plus** fail-closed filters `two_ready_roots_overlap_and_join_waits_for_both_before_three_of_three` and `failed_and_cancelled_owners_stay_open_and_terminal_reconciliation_is_idempotent` only.
 
 **Commands:**
@@ -518,11 +529,11 @@ bash E2E.d/ci/campaign.sh todo
 ```
 initial:  exactIds={join,root-a,root-b}
           root-a ready=true, root-b ready=true, join ready=false
-          join.blockedBy = {root-a, root-b}
+          join.waitingOn = {root-a, root-b}
 after A:  completed=1 (exact task-id completion), join still not ready
-after B:  completed=2, join ready=true, blockedBy cleared, joinStatus != completed
+after B:  completed=2, join ready=true, waitingOn cleared, joinStatus != completed
 open:     join remains pending|in_progress (todo-open-work-remains / after-partial)
-blocked:  gate ready + waiter blockedBy={gate} (todo-blocked-only-projection)
+waiting:  gate ready + waiter waitingOn={gate} (todo-dependency-waiting-projection)
 terminal: ids={done-a,done-b}, no ready open (todo-all-terminal-no-ready)
 ```
 
@@ -531,19 +542,19 @@ terminal: ids={done-a,done-b}, no ready open (todo-all-terminal-no-ready)
 | Filter | Observable |
 | --- | --- |
 | `two_ready_roots_overlap_and_join_waits_for_both_before_three_of_three` | Ready roots overlap; exact todoTaskId; join waits; 3/3 complete |
-| `failed_and_cancelled_owners_stay_open_and_terminal_reconciliation_is_idempotent` | Failed/cancelled stay open; Blocked; reconcile idempotent |
+| `failed_and_cancelled_owners_stay_open_and_terminal_reconciliation_is_idempotent` | Failed/cancelled stay open; executor status Failed with actionable reason; reconcile idempotent |
 
 Tmux panel after hierarchical `/todo` paste (post-Subagents) MUST show task text among: `fetch inventory`, `compile crate`, `ship release`, and chrome `Todos ·` or phase `Roots`.
 
 **Evidence:** `$EVIDENCE_ROOT/orchestration-rpc/summary.json` keys `todoInitial`, `todoAfterRoots`, `todoTerminal` + projection checks; `todo-panel.txt`; `cargo.log` needles `todo_dag_execution`, both filter names, `todo_dag_lifecycle`, `replace_transcript_refreshes_todo_phases`.
 
-**Failure:** join ready while a root open; wrong exact ids; join completed early; blocked/terminal projection wrong; tmux missing task markers; rust missing fail-closed needles; stale Todo after `replace_transcript`.
+**Failure:** join ready while a root open; wrong exact ids; join completed early; waiting/terminal projection wrong; tmux missing task markers; rust missing fail-closed needles; stale Todo after `replace_transcript`.
 
 ### 5. Auto-continuation / open-work readiness
 
 **Lane (partial):**
 
-- RPC: `todo-open-work-remains`, `todo-open-work-remains-after-partial`, `todo-all-terminal-no-ready`, `todo-blocked-only-projection` (projection surfaces only).
+- RPC: `todo-open-work-remains`, `todo-open-work-remains-after-partial`, `todo-all-terminal-no-ready`, `todo-dependency-waiting-projection` (projection surfaces only).
 - Rust: `todo_dag_execution` 3/3 complete + failed/cancelled stay open (idempotent reconcile).
 
 **Contract claimed by this handbook:**
@@ -743,7 +754,7 @@ Use the checked-in PTY tests for terminal lifecycle and command behavior. Manual
 work='<isolated-workspace>'
 home='<isolated-home>'
 tmux new-session -d -s rpi-e2e -x 120 -y 31 -c "$work" \
-  "env HOME='$home' USERPROFILE='$home' PI_CODING_AGENT_DIR='$home/.pi/agent' PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 TERM=xterm-256color target/release-dist/rpi --offline --model faux/faux-1"
+  "env HOME='$home' USERPROFILE='$home' PI_CODING_AGENT_DIR='$home/.pi/agent' RPI_OFFLINE=1 RPI_SKIP_VERSION_CHECK=1 TERM=xterm-256color target/release-dist/rpi --offline --model faux/faux-1"
 ```
 
 Prefer the scripted lane when asserting orchestration chrome:
@@ -822,7 +833,7 @@ Scheduled and goal system reminders are model-only data. Human TUI, print output
 | --- | --- | --- |
 | version / faux-json | 30s | non-zero exit; missing reply marker |
 | rpc-state / campaign.\* RPC | 40s | any `success != true`; assert script exit |
-| orchestration.rpc | 90s / client 35s | missing check ids (incl. exact-ids / blocked-only / all-terminal); field mismatch; join completed early |
+| orchestration.rpc | 90s / client 35s | missing check ids (incl. exact-ids / waiting-only / all-terminal); field mismatch; join completed early |
 | orchestration.rust | 300–360s per `cargo +1.88.0` test | any cargo failure; missing fail-closed needles (`todo_dag_execution`, `two_ready_roots_overlap_and_join_waits_for_both_before_three_of_three`, `failed_and_cancelled_owners_stay_open_and_terminal_reconciliation_is_idempotent`, `nl_exact_agent_spawn`, IRC needles, `replace_transcript_refreshes_todo_phases`) |
 | orchestration.tmux | wait ≤20s boot; ≤25s compact agents; fixed sleeps | missing HARD `Task N agents`/researcher needles; `Todos ·` during agent-only capture; `/goall`; skill-only flood; `/ps` empty; raw `<orchestration-message` |
 | workflow.rpc | 120s / client 45s | missing product APIs; missing check ids; worktree/ownership/conflict contract fail |
@@ -849,17 +860,17 @@ Any `timeout` kill is a hard failure. Evidence directories MUST remain for diagn
 | Full Todo auto-continuation Ready-guard (composer never Ready with ready open work) | RPC open-work/terminal projections + two coordinator filters documented under matrix §4–5. Dedicated product auto-continue Ready-guard path still stabilizing — keep gap until a verified driver exists. |
 | Restore auto-spawn / all-terminal attach no-spawn | **Not gated post-FF0F.** Former filters `attach_orchestration_to_restored_ready_todo_auto_spawns_owner` and `attach_orchestration_to_all_terminal_restore_does_not_spawn` removed from rust fail-closed list until product re-adds tests. RPC still projects `todo-all-terminal-no-ready` only. |
 | Abort-suppress / transition-Ready mutation block | **Not gated post-FF0F.** Former filters `transition_active_rejects_direct_mutations_and_explicit_execute`, `no_orchestration_session_transition_still_rejects_direct_todo_mutation`, `navigate_tree_begin_drain_error_clears_transition_active`, `late_terminal_from_invalidated_generation_ignores_same_stable_todo_id` removed until product re-adds tests. |
-| Live Goal↔subagent IRC body text inside tmux | Rust IRC gates (both directions) authoritative; tmux asserts absence of raw XML + `irc-meta.txt` only. |
+| Live Goal↔subagent IRC body text inside tmux | The public-model `live.typed-irc` campaign now hard-asserts exact typed Hub bodies, direction, reply correlation, tool results, and settled children; the deterministic Rust gates remain authoritative for renderer details. |
 | Clipboard image in tmux | Optional/best-effort; rust fixture authoritative. |
 | Sparse palette / code highlighting / user no-indent | Covered by focused `cargo +1.88.0` tests, not `orchestration.sh`. |
-| Skills loading beyond routing | Resource/selector cargo tests; not a separate E2E.d shell scenario. |
-| Multi-workflow campaign (`E2E.d/ci/workflow.sh release`) | Hard gate: requires tmux; `workflow campaigns passed` only after `workflow.rpc`, `workflow.tmux`, and `workflow.goal-tmux` all record `execution_status=passed`; absence or failure of any lane fails. Passed for 0.2.7 (all three statuses `passed`). Default `E2E.d/ci.sh` includes the user-perspective workflow TUI scenario on tmux hosts; the authoritative RPC/tmux/goal lanes run separately (and are gated by the hosted Test workflow). |
+| Live skill discovery/load/execute and unknown route | Covered by `live.skill-routing` with a hermetic project skill, exact artifact, successful `skill://` read, and actionable failed unknown-skill read. |
+| Multi-workflow campaign (`E2E.d/ci/workflow.sh release`) | Hard deterministic gate: requires tmux; `workflow campaigns passed` only after `workflow.rpc`, `workflow.tmux`, and `workflow.goal-tmux` all record `execution_status=passed`. The public-model `live.parallel-workflow` campaign separately requires two natural-language-created Workflows with isolated branches/artifacts and timestamp-proven child overlap. |
 
 ## Release checklist
 
-1. Workspace version and lockfile workspace packages are `0.2.11`.
+1. Workspace version and lockfile workspace packages are `1.0.0`.
 2. `bash E2E.d/release/build-release.sh +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked` succeeds.
-3. `target/release-dist/rpi --version` prints `rpi 0.2.11`.
+3. `target/release-dist/rpi --version` prints `rpi 1.0.0`.
 4. Complete library suites pass, including `cargo +1.88.0 test -p pi-ai --test codex_transport --locked` (Codex WS/SSE loopback contracts).
 5. `bash E2E.d/ci.sh` passes (includes orchestration umbrella after core campaigns).
 6. `bash E2E.d/ci/orchestration.sh run` passes on a tmux-capable host (or rpc+rust with explicit tmux skip log).
@@ -868,9 +879,9 @@ Any `timeout` kill is a hard failure. Evidence directories MUST remain for diagn
 9. `bash E2E.d/web/run.sh` passes with the final release binary.
 10. `bash E2E.d/web/coverage.sh` passes the Web coverage thresholds.
 11. The release commit contains no credentials, local paths, build artifacts, exported sessions, or generated diagrams.
-12. Tag `v0.2.11` points exactly at the verified release commit.
+12. Tag `v1.0.0` points exactly at the verified release commit.
     — Tagging is performed only after the release commit's hosted Test workflow passes.
-13. Push the release commit, wait for its hosted Test workflow, then push `v0.2.11` to the GitHub remote.
+13. Push the release commit, wait for its hosted Test workflow, then push `v1.0.0` to the GitHub remote.
 14. Confirm every hosted build and the GitHub Release publication job succeeds.
     — Depends on step 13, which is not performed locally.
 15. Confirm regression matrix rows 1–12 either passed or are explicitly listed under Known gaps for this tag.

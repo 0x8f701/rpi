@@ -124,11 +124,8 @@ fn tool_call_ids(message: &AssistantMessage) -> Vec<String> {
         .collect()
 }
 fn is_synthesized_tool_call_id(id: &str) -> bool {
-    id.len() == 9
-        && id.starts_with('p')
-        && id.chars().all(|ch| ch.is_ascii_alphanumeric())
+    id.len() == 9 && id.starts_with('p') && id.chars().all(|ch| ch.is_ascii_alphanumeric())
 }
-
 
 #[tokio::test]
 async fn no_tool_turn_has_complete_lifecycle() {
@@ -291,7 +288,9 @@ async fn tool_context_receives_prepare_next_turn_model_updates() {
     let tool = AgentTool::new("inspect", "inspect", Schema::default(), move |context| {
         let observed = observed.clone();
         async move {
-            observed.lock().push(context.model.expect("active model").id);
+            observed
+                .lock()
+                .push(context.model.expect("active model").id);
             Ok(AgentToolResult::text("ok"))
         }
     });
@@ -344,6 +343,7 @@ async fn blocked_unknown_failing_and_panicking_tools_become_errors() {
                 block: context.tool_call.name == "blocked",
                 reason: Some("denied".into()),
                 arguments: None,
+                approval_token: None,
             })
         })
     }));
@@ -497,7 +497,9 @@ async fn steering_landing_in_final_turn_window_is_processed_before_run_returns()
         let injected = follow_up_injected.clone();
         Box::pin(async move {
             if !injected.swap(true, Ordering::SeqCst) {
-                queue.lock().push_back(Message::user_text("final-window", pi_ai::now_millis()));
+                queue
+                    .lock()
+                    .push_back(Message::user_text("final-window", pi_ai::now_millis()));
             }
             Vec::new()
         })
@@ -572,9 +574,32 @@ async fn queue_modes_and_pending_count_follow_mutations() {
     agent.clear_steering_queue().await;
     assert_eq!(agent.pending_message_count().await, 1);
     agent.reset().await;
-    assert_eq!(agent.pending_message_count().await, 0);
+    // Reset drains and restores: acknowledged queued messages are never
+    // silently consumed by a reset (steering-loss invariant).
+    assert_eq!(agent.pending_message_count().await, 1);
+    let (_, follow_up) = agent.queued_messages().await;
+    assert_eq!(follow_up, [Message::user_text("follow", 4)]);
     assert_eq!(agent.steering_mode().await, QueueMode::All);
     assert_eq!(agent.follow_up_mode().await, QueueMode::All);
+}
+
+#[tokio::test]
+async fn drain_steering_leaves_follow_up_and_remove_at_is_indexed() {
+    let agent = Agent::new(options(scripted(Vec::new()), vec![]));
+    agent.steer(Message::user_text("one", 1)).await;
+    agent.steer(Message::user_text("two", 2)).await;
+    agent.follow_up(Message::user_text("later", 3)).await;
+    let removed = agent.remove_steering_at(0).await.expect("remove first");
+    assert_eq!(removed, Message::user_text("one", 1));
+    assert!(
+        agent.remove_steering_at(4).await.is_none(),
+        "out of range is absence, not an error"
+    );
+    let drained = agent.drain_steering_messages().await;
+    assert_eq!(drained, [Message::user_text("two", 2)]);
+    let (steering, follow_up) = agent.queued_messages().await;
+    assert!(steering.is_empty(), "steering drained");
+    assert_eq!(follow_up, [Message::user_text("later", 3)]);
 }
 
 #[tokio::test]
@@ -623,18 +648,18 @@ async fn ergonomic_stream_options_forward_to_the_canonical_snapshot() {
             ..ThinkingBudgets::default()
         }))
         .await;
-    agent.set_transport(Transport::WebSocketCached).await;
+    agent.set_transport(Transport::Sse).await;
     agent.set_max_retry_delay(Some(12_345)).await;
 
     assert_eq!(agent.session_id().await.as_deref(), Some("session-42"));
     assert_eq!(agent.thinking_budgets().await.unwrap().high, Some(8_192));
-    assert_eq!(agent.transport().await, Transport::WebSocketCached);
+    assert_eq!(agent.transport().await, Transport::Sse);
     assert_eq!(agent.max_retry_delay().await, Some(12_345));
 
     let snapshot = agent.stream_options().await;
     assert_eq!(snapshot.stream.session_id.as_deref(), Some("session-42"));
     assert_eq!(snapshot.thinking_budgets.unwrap().high, Some(8_192));
-    assert_eq!(snapshot.stream.transport, Transport::WebSocketCached);
+    assert_eq!(snapshot.stream.transport, Transport::Sse);
     assert_eq!(snapshot.stream.max_retry_delay_ms, Some(12_345));
 
     let mut replacement = SimpleStreamOptions::default();

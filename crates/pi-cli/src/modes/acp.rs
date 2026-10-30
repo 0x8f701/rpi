@@ -10,6 +10,9 @@
 //! - `authenticate` — acknowledge rpi's configured-credential auth method.
 //! - `session/new` — create a session rooted at a client-supplied `cwd`;
 //!   returns a `sessionId` used by all later calls.
+//! - `todo_child_*` — dispatch durable Todo child operations against the
+//!   parent [`Application`] selected by `sessionId`, preserving the RPC wire
+//!   contracts for parent/child identity, revisions, and typed receipts.
 //! - `session/prompt` — run a turn; the assistant response streams back as
 //!   `session/update` notifications and the request resolves with a
 //!   `stopReason` when the turn ends.
@@ -73,10 +76,12 @@ use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
 use pi_agent::{
     AgentEvent, ApprovalMode, BeforeToolCallContext, BeforeToolCallFn, BeforeToolCallResult,
-    ToolCapability, compose_before_tool_call,
+    ToolCapability,
 };
 use pi_ai::{AssistantMessageEvent, ContentBlock, Message};
-use pi_coding::{Application, ApplicationEvent, ExtensionMode, ResourceManagerOptions};
+use pi_coding::{
+    Application, ApplicationEvent, ExtensionMode, ResourceManagerOptions, TodoChildService,
+};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -85,19 +90,20 @@ use tokio::task::JoinSet;
 use tokio_tungstenite::{
     accept_hdr_async_with_config,
     tungstenite::{
-        Message as WsMessage,
+        Error as WsError, Message as WsMessage,
         handshake::server::{ErrorResponse, Request, Response},
         protocol::WebSocketConfig,
     },
 };
 use uuid::Uuid;
 
+use crate::approval::compose_final_approval;
 use crate::args::Cli;
 use crate::session_run_blueprint::{RunSessionBlueprint, RunSessionCandidate};
 
+use super::rpc::RpcCommand;
 use super::ws_auth::{
-    ListenAddressPolicy, MAX_CONNECTION_TASKS, authorized, load_auth_token,
-    websocket_subprotocol,
+    ListenAddressPolicy, MAX_CONNECTION_TASKS, authorized, load_auth_token, websocket_subprotocol,
 };
 
 /// The ACP major protocol version rpi speaks (agentclientprotocol.com v1).
@@ -133,10 +139,16 @@ struct AcpError {
 
 impl AcpError {
     fn invalid_params(message: impl Into<String>) -> Self {
-        Self { code: INVALID_PARAMS, message: message.into() }
+        Self {
+            code: INVALID_PARAMS,
+            message: message.into(),
+        }
     }
     fn internal(message: impl Into<String>) -> Self {
-        Self { code: INTERNAL_ERROR, message: message.into() }
+        Self {
+            code: INTERNAL_ERROR,
+            message: message.into(),
+        }
     }
 }
 
@@ -154,7 +166,10 @@ fn rpc_notification(method: &str, params: Value) -> Value {
 
 /// One `session/update` notification carrying an `update` payload.
 fn session_update(session_id: &str, update: Value) -> Value {
-    rpc_notification("session/update", json!({ "sessionId": session_id, "update": update }))
+    rpc_notification(
+        "session/update",
+        json!({ "sessionId": session_id, "update": update }),
+    )
 }
 
 fn session_update_payload(session_update: &str) -> Value {
@@ -177,7 +192,13 @@ fn strip_absolute_paths(message: &str) -> String {
     }
     message
         .split_whitespace()
-        .map(|token| if is_absolute_path(token) { "<path>".to_owned() } else { token.to_owned() })
+        .map(|token| {
+            if is_absolute_path(token) {
+                "<path>".to_owned()
+            } else {
+                token.to_owned()
+            }
+        })
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -193,29 +214,54 @@ fn wire_internal_error(context: &str, error: &anyhow::Error) -> String {
 /// A JSON-RPC `INTERNAL_ERROR` response whose message is path-free; the full
 /// error chain is logged server-side.
 fn internal_error_response(id: &Value, context: &str, error: &anyhow::Error) -> Option<Value> {
-    Some(rpc_error(id, INTERNAL_ERROR, wire_internal_error(context, error)))
+    Some(rpc_error(
+        id,
+        INTERNAL_ERROR,
+        wire_internal_error(context, error),
+    ))
 }
 
 /// A decoded client message: a request, a notification, or a response to one
 /// of our reverse requests.
 enum Incoming {
-    Request { id: Value, method: String, params: Value },
-    Notification { method: String, params: Value },
-    Response { id: Value, result: Option<Value>, error: Option<Value> },
+    Request {
+        id: Value,
+        method: String,
+        params: Value,
+    },
+    Notification {
+        method: String,
+        params: Value,
+    },
+    Response {
+        id: Value,
+        result: Option<Value>,
+        error: Option<Value>,
+    },
 }
 
 fn parse_incoming(message: &Value) -> std::result::Result<Incoming, AcpError> {
     if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-        return Err(AcpError { code: INVALID_REQUEST, message: "jsonrpc must be \"2.0\"".into() });
+        return Err(AcpError {
+            code: INVALID_REQUEST,
+            message: "jsonrpc must be \"2.0\"".into(),
+        });
     }
     let id = message.get("id").cloned();
-    let method = message.get("method").and_then(Value::as_str).map(ToOwned::to_owned);
+    let method = message
+        .get("method")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
     let has_result = message.get("result").is_some() || message.get("error").is_some();
     match (method, has_result) {
         (Some(method), false) => {
             let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
             if id.is_some() {
-                Ok(Incoming::Request { id: id.expect("checked above"), method, params })
+                Ok(Incoming::Request {
+                    id: id.expect("checked above"),
+                    method,
+                    params,
+                })
             } else {
                 Ok(Incoming::Notification { method, params })
             }
@@ -273,7 +319,12 @@ impl AcpApprovalFactory {
         pending: Arc<StdMutex<HashMap<String, PendingRequest>>>,
         timeout: Duration,
     ) -> Self {
-        Self { outbound: outbound.clone(), pending, session_id: Arc::new(StdMutex::new(None)), timeout }
+        Self {
+            outbound: outbound.clone(),
+            pending,
+            session_id: Arc::new(StdMutex::new(None)),
+            timeout,
+        }
     }
 
     /// Bind this bridge to one ACP session id (called before the session's
@@ -313,12 +364,18 @@ impl AcpApprovalFactory {
             },
         });
         let (tx, rx) = oneshot::channel();
-        self.pending
-            .lock()
-            .expect("acp pending registry")
-            .insert(request_id.clone(), PendingRequest { session_id: session_id.clone(), tx });
+        self.pending.lock().expect("acp pending registry").insert(
+            request_id.clone(),
+            PendingRequest {
+                session_id: session_id.clone(),
+                tx,
+            },
+        );
         if self.outbound.send(request).await.is_err() {
-            self.pending.lock().expect("acp pending registry").remove(&request_id);
+            self.pending
+                .lock()
+                .expect("acp pending registry")
+                .remove(&request_id);
             return PermissionDecision::Error(
                 "ACP client disconnected while requesting permission".into(),
             );
@@ -326,9 +383,7 @@ impl AcpApprovalFactory {
         let response = match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(response)) => response,
             Ok(Err(_)) => {
-                return PermissionDecision::Error(
-                    "ACP permission response channel closed".into(),
-                );
+                return PermissionDecision::Error("ACP permission response channel closed".into());
             }
             Err(_) => {
                 return PermissionDecision::Error(format!(
@@ -347,16 +402,16 @@ impl AcpApprovalFactory {
         let outcome = &response["result"]["outcome"];
         match outcome.get("outcome").and_then(Value::as_str) {
             Some("selected") => match outcome.get("optionId").and_then(Value::as_str) {
-                Some("allow-once" | "allow-always") => PermissionDecision::Allow,
-                Some("reject-once" | "reject-always") => {
+                Some("allow-once") => PermissionDecision::Allow,
+                Some("reject-once") => {
                     PermissionDecision::Deny("tool execution rejected by the client".into())
                 }
-                Some(other) => {
-                    PermissionDecision::Error(format!("unknown permission option selected: {other}"))
+                Some(other) => PermissionDecision::Error(format!(
+                    "unknown permission option selected: {other}"
+                )),
+                None => {
+                    PermissionDecision::Error("ACP permission response is missing optionId".into())
                 }
-                None => PermissionDecision::Error(
-                    "ACP permission response is missing optionId".into(),
-                ),
             },
             Some("cancelled") => {
                 PermissionDecision::Cancelled("tool execution cancelled by the client".into())
@@ -414,7 +469,256 @@ pub(crate) fn acp_approval_before_tool_call(
             }
         })
     });
-    compose_before_tool_call(Some(approval), existing).expect("ACP approval hook is always present")
+    compose_final_approval(approval, existing)
+}
+
+#[cfg(test)]
+mod approval_tests {
+    use pi_agent::{
+        AgentContext, AgentTool, AgentToolResult, ToolApprovalDigest, ToolApprovalId,
+        ToolApprovalRequest, ToolApprovalSummary, ToolCallApprovalToken,
+    };
+    use pi_ai::{AssistantMessage, Model, Schema, ToolCall};
+    use pi_coding::PermissionRule;
+
+    use super::*;
+
+    fn approval_context(request: ToolApprovalRequest, arguments: Value) -> BeforeToolCallContext {
+        let tool = AgentTool::new("read", "test", Schema::default(), |_| async {
+            Ok(AgentToolResult::text("ok"))
+        })
+        .with_capability(ToolCapability::Exec);
+        BeforeToolCallContext {
+            assistant_message: AssistantMessage::pending(&Model::default()),
+            tool_call: ToolCall {
+                id: "call-browser".to_owned(),
+                name: "read".to_owned(),
+                arguments: arguments.clone(),
+                thought_signature: None,
+            },
+            arguments,
+            context: AgentContext {
+                system_prompt: String::new(),
+                messages: Vec::new(),
+                tools: vec![tool],
+            },
+            approval_request: Some(request),
+        }
+    }
+
+    fn approval_token() -> ToolCallApprovalToken {
+        let mut bytes = [0_u8; 16];
+        bytes[6] = 0x70;
+        bytes[8] = 0x80;
+        ToolCallApprovalToken::new(
+            ToolApprovalId::from_uuid_v7_bytes(bytes).expect("uuid v7"),
+            ToolApprovalDigest::from_sha256([9_u8; 32]),
+        )
+    }
+
+    fn approval_request() -> ToolApprovalRequest {
+        let token = approval_token();
+        ToolApprovalRequest::new(
+            ToolApprovalSummary {
+                family: "browser".to_owned(),
+                executable: "governed browser executable".to_owned(),
+                argument_count: 0,
+                working_directory: "captured workspace".to_owned(),
+                credential_audience: Some("browser".to_owned()),
+                requested_credential_count: 0,
+                target_fds: Vec::new(),
+            },
+            Box::new(move || Box::pin(async move { Ok(token) })),
+        )
+    }
+
+    fn factory() -> AcpApprovalFactory {
+        let (outbound, _receiver) = mpsc::channel(1);
+        AcpApprovalFactory::new(
+            &outbound,
+            Arc::new(StdMutex::new(HashMap::new())),
+            Duration::from_secs(1),
+        )
+    }
+
+    fn rules_source(rules: Vec<PermissionRule>) -> crate::approval::PermissionRulesSource {
+        Arc::new(move || rules.clone())
+    }
+
+    #[tokio::test]
+    async fn acp_yolo_issues_prepared_browser_token_without_reverse_request() {
+        let request = approval_request();
+        let hook = acp_approval_before_tool_call(
+            ApprovalMode::Yolo,
+            factory(),
+            None,
+            PathBuf::new(),
+            crate::approval::empty_permission_rules(),
+        );
+
+        let outcome = hook(approval_context(request.clone(), json!({})))
+            .await
+            .unwrap();
+
+        assert!(!outcome.block);
+        assert_eq!(outcome.approval_token, Some(approval_token()));
+        assert!(
+            request.issue().await.is_err(),
+            "token must be issued exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_allow_rule_issues_prepared_browser_token_without_reverse_request() {
+        let request = approval_request();
+        let hook = acp_approval_before_tool_call(
+            ApprovalMode::Ask,
+            factory(),
+            None,
+            PathBuf::from("/"),
+            rules_source(vec![PermissionRule {
+                action: pi_coding::PermissionRuleAction::Allow,
+                path: "/safe".to_owned(),
+                tools: Some(vec![pi_coding::PermissionTool::Read]),
+                extra: Default::default(),
+            }]),
+        );
+
+        let outcome = hook(approval_context(
+            request.clone(),
+            json!({"path": "/safe/page.html"}),
+        ))
+        .await
+        .unwrap();
+
+        assert!(!outcome.block);
+        assert_eq!(outcome.approval_token, Some(approval_token()));
+        assert!(
+            request.issue().await.is_err(),
+            "token must be issued exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_interactive_allow_issues_prepared_browser_token() {
+        let (outbound, mut requests) = mpsc::channel(1);
+        let pending = Arc::new(StdMutex::new(HashMap::new()));
+        let factory = AcpApprovalFactory::new(&outbound, pending.clone(), Duration::from_secs(1));
+        factory.set_session_id("session-browser".to_owned());
+        let request = approval_request();
+        let hook = acp_approval_before_tool_call(
+            ApprovalMode::Ask,
+            factory,
+            None,
+            PathBuf::new(),
+            crate::approval::empty_permission_rules(),
+        );
+        let responder = tokio::spawn(async move {
+            let permission = requests.recv().await.expect("permission request");
+            let request_id = permission["id"].as_str().expect("request id").to_owned();
+            let entry = pending
+                .lock()
+                .expect("pending registry")
+                .remove(&request_id)
+                .expect("pending request");
+            entry
+                .tx
+                .send(json!({
+                    "result": {
+                        "outcome": {"outcome": "selected", "optionId": "allow-once"}
+                    }
+                }))
+                .expect("permission response delivered");
+        });
+
+        let outcome = hook(approval_context(request.clone(), json!({})))
+            .await
+            .unwrap();
+        responder.await.unwrap();
+
+        assert!(!outcome.block);
+        assert_eq!(outcome.approval_token, Some(approval_token()));
+        assert!(
+            request.issue().await.is_err(),
+            "token must be issued exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_interactive_denial_leaves_prepared_browser_request_unissued() {
+        let (outbound, mut requests) = mpsc::channel(1);
+        let pending = Arc::new(StdMutex::new(HashMap::new()));
+        let factory = AcpApprovalFactory::new(&outbound, pending.clone(), Duration::from_secs(1));
+        factory.set_session_id("session-browser".to_owned());
+        let request = approval_request();
+        let hook = acp_approval_before_tool_call(
+            ApprovalMode::Ask,
+            factory,
+            None,
+            PathBuf::new(),
+            crate::approval::empty_permission_rules(),
+        );
+        let responder = tokio::spawn(async move {
+            let permission = requests.recv().await.expect("permission request");
+            let request_id = permission["id"].as_str().expect("request id").to_owned();
+            let entry = pending
+                .lock()
+                .expect("pending registry")
+                .remove(&request_id)
+                .expect("pending request");
+            entry
+                .tx
+                .send(json!({
+                    "result": {
+                        "outcome": {"outcome": "selected", "optionId": "reject-once"}
+                    }
+                }))
+                .expect("permission response delivered");
+        });
+
+        let outcome = hook(approval_context(request.clone(), json!({})))
+            .await
+            .unwrap();
+        responder.await.unwrap();
+
+        assert!(outcome.block);
+        assert!(outcome.approval_token.is_none());
+        assert_eq!(request.issue().await.unwrap(), approval_token());
+    }
+
+    #[tokio::test]
+    async fn acp_downstream_denial_leaves_prepared_browser_request_unissued() {
+        let downstream: BeforeToolCallFn = Arc::new(|context| {
+            assert!(
+                context.approval_request.is_none(),
+                "only the final issuance boundary may receive the prepared request"
+            );
+            Box::pin(async {
+                Ok(BeforeToolCallResult {
+                    block: true,
+                    reason: Some("downstream denied".to_owned()),
+                    ..BeforeToolCallResult::default()
+                })
+            })
+        });
+        let request = approval_request();
+        let hook = acp_approval_before_tool_call(
+            ApprovalMode::Yolo,
+            factory(),
+            Some(downstream),
+            PathBuf::new(),
+            crate::approval::empty_permission_rules(),
+        );
+
+        let outcome = hook(approval_context(request.clone(), json!({})))
+            .await
+            .unwrap();
+
+        assert!(outcome.block);
+        assert_eq!(outcome.reason.as_deref(), Some("downstream denied"));
+        assert!(outcome.approval_token.is_none());
+        assert_eq!(request.issue().await.unwrap(), approval_token());
+    }
 }
 
 fn tool_capability(context: &BeforeToolCallContext) -> ToolCapability {
@@ -431,14 +735,15 @@ fn blocked(reason: impl Into<String>) -> BeforeToolCallResult {
         block: true,
         reason: Some(reason.into()),
         arguments: None,
+        approval_token: None,
     }
 }
 
 /// Map a tool name to an ACP `ToolKind` for client icons.
 fn tool_kind(name: &str) -> &'static str {
     match name {
-        "read" | "inspect_image" | "glob" | "ls" | "browser" | "doc_convert" | "mcp"
-        | "debug" | "memory" | "github" => "read",
+        "read" | "inspect_image" | "glob" | "ls" | "browser" | "doc_convert" | "mcp" | "debug"
+        | "memory" | "github" => "read",
         "edit" | "write" | "imageresize" | "ast_edit" | "lsp" => "edit",
         "bash" | "process" | "web_search" | "eval" | "notebook" => "execute",
         "grep" | "find" | "ast_grep" => "search",
@@ -458,21 +763,64 @@ struct TurnState {
     cancelled: Arc<AtomicBool>,
 }
 
+/// Process-owned ACP runtime state. Every connection receives a clone of this
+/// host so parent applications and durable Todo children share the exact same
+/// runtime-factory [`Arc`]. Connections clean their own applications but never
+/// shut down the shared Todo service; the process owner does that after all
+/// connection work has joined.
+#[derive(Clone)]
+pub(crate) struct AcpHost {
+    blueprint: RunSessionBlueprint,
+    todo_child_service: Arc<TodoChildService>,
+    runtime_factory: Arc<dyn pi_coding::ApplicationRuntimeFactory>,
+}
+
+impl AcpHost {
+    fn new(blueprint: RunSessionBlueprint) -> Result<Self> {
+        let todo_child_service = TodoChildService::new();
+        let runtime_factory =
+            Arc::new(blueprint.clone()) as Arc<dyn pi_coding::ApplicationRuntimeFactory>;
+        todo_child_service.configure_factory(runtime_factory.clone())?;
+        Ok(Self {
+            blueprint,
+            todo_child_service,
+            runtime_factory,
+        })
+    }
+
+    async fn shutdown(&self) -> Result<()> {
+        self.todo_child_service
+            .shutdown()
+            .await
+            .context("shutting down Todo child service")
+    }
+}
+
 struct AcpServer {
     blueprint: RunSessionBlueprint,
     cli: Cli,
     approval: AcpApprovalFactory,
     sessions: HashMap<String, AcpSession>,
     turns: HashMap<String, TurnState>,
+    todo_child_service: Arc<TodoChildService>,
+    runtime_factory: Arc<dyn pi_coding::ApplicationRuntimeFactory>,
+    #[cfg(test)]
+    stream_fn: Option<pi_agent::StreamFn>,
 }
 
 impl AcpServer {
-    fn new(
-        blueprint: RunSessionBlueprint,
-        cli: Cli,
-        approval: AcpApprovalFactory,
-    ) -> Self {
-        Self { blueprint, cli, approval, sessions: HashMap::new(), turns: HashMap::new() }
+    fn new(cli: Cli, approval: AcpApprovalFactory, host: AcpHost) -> Self {
+        Self {
+            blueprint: host.blueprint,
+            cli,
+            approval,
+            sessions: HashMap::new(),
+            turns: HashMap::new(),
+            todo_child_service: host.todo_child_service,
+            runtime_factory: host.runtime_factory,
+            #[cfg(test)]
+            stream_fn: None,
+        }
     }
 
     /// Handle one incoming client message. Returns `Some(response)` when the
@@ -496,9 +844,19 @@ impl AcpServer {
                     Ok(Some(rpc_result(&id, json!({}))))
                 }
                 "session/new" => self.handle_session_new(&id, &params).await,
-                "session/prompt" => {
-                    self.handle_prompt(&id, &params, outbound, tasks).await
+                method @ ("todo_child_create"
+                | "todo_child_list"
+                | "todo_child_status"
+                | "todo_child_select"
+                | "todo_child_add_task"
+                | "todo_child_send"
+                | "todo_child_hub_send"
+                | "todo_child_stop"
+                | "todo_child_archive"
+                | "todo_child_remove") => {
+                    Ok(Some(self.handle_todo_child(&id, method, &params).await))
                 }
+                "session/prompt" => self.handle_prompt(&id, &params, outbound, tasks).await,
                 "session/cancel" => Ok(self.handle_cancel(Some(&id), &params).await),
                 "session/close" => self.handle_session_close(&id, &params).await,
                 other => Ok(Some(rpc_error(
@@ -523,11 +881,7 @@ impl AcpServer {
         }
     }
 
-    async fn handle_authenticate(
-        &mut self,
-        id: &Value,
-        params: &Value,
-    ) -> Result<Option<Value>> {
+    async fn handle_authenticate(&mut self, id: &Value, params: &Value) -> Result<Option<Value>> {
         let method_id = params.get("methodId").and_then(Value::as_str);
         let Some(method_id) = method_id else {
             return Ok(Some(rpc_error(
@@ -557,7 +911,11 @@ impl AcpServer {
         let cwd = match params.get("cwd").and_then(Value::as_str) {
             Some(cwd) => PathBuf::from(cwd),
             None => {
-                return Ok(Some(rpc_error(id, INVALID_PARAMS, "session/new requires a cwd")));
+                return Ok(Some(rpc_error(
+                    id,
+                    INVALID_PARAMS,
+                    "session/new requires a cwd",
+                )));
             }
         };
         if !cwd.is_absolute() {
@@ -567,13 +925,16 @@ impl AcpServer {
                 "session/new cwd must be an absolute path",
             )));
         }
-        if !cwd.is_dir() {
-            return Ok(Some(rpc_error(
-                id,
-                RESOURCE_NOT_FOUND,
-                format!("session/new cwd is not a directory: {}", cwd.display()),
-            )));
-        }
+        let cwd = match pi_coding::inspect_operator_directory(&cwd) {
+            Ok(cwd) => cwd,
+            Err(_) => {
+                return Ok(Some(rpc_error(
+                    id,
+                    RESOURCE_NOT_FOUND,
+                    format!("session/new cwd is not a directory: {}", cwd.display()),
+                )));
+            }
+        };
         if let Some(servers) = params.get("mcpServers")
             && !servers.is_array()
         {
@@ -590,11 +951,19 @@ impl AcpServer {
             Ok(options) => match pi_coding::ResourceManager::new(options) {
                 Ok(resources) => resources,
                 Err(error) => {
-                    return Ok(internal_error_response(id, "loading settings and resources", &error));
+                    return Ok(internal_error_response(
+                        id,
+                        "loading settings and resources",
+                        &error,
+                    ));
                 }
             },
             Err(error) => {
-                return Ok(internal_error_response(id, "loading settings and resources", &error));
+                return Ok(internal_error_response(
+                    id,
+                    "loading settings and resources",
+                    &error,
+                ));
             }
         };
         let settings = preview.snapshot().settings.clone();
@@ -616,7 +985,9 @@ impl AcpServer {
             &parsed_think,
             None,
             false,
-            settings.default_thinking_level.map(crate::output::thinking_level_str),
+            settings
+                .default_thinking_level
+                .map(crate::output::thinking_level_str),
         );
         let session_dir = match crate::session_run::effective_session_dir(
             &cwd,
@@ -625,7 +996,11 @@ impl AcpServer {
         ) {
             Ok(session_dir) => session_dir,
             Err(error) => {
-                return Ok(internal_error_response(id, "resolving the session directory", &error));
+                return Ok(internal_error_response(
+                    id,
+                    "resolving the session directory",
+                    &error,
+                ));
             }
         };
 
@@ -642,9 +1017,30 @@ impl AcpServer {
         );
         factory.set_session_id(session_id.clone());
         let mut blueprint = self.blueprint.clone();
-        blueprint.set_session_dir(session_dir.clone());
+        blueprint.set_session_storage(crate::session_run::SessionStorage::ExplicitRoot(
+            session_dir.clone(),
+        ));
         blueprint.set_acp_approval(factory);
 
+        let auth_manager = match self.blueprint.resource_options_for_startup(&cwd) {
+            Ok(options) => match pi_coding::AuthManager::new(options.agent_dir.join("auth.json")) {
+                Ok(manager) => Arc::new(manager),
+                Err(error) => {
+                    return Ok(internal_error_response(
+                        id,
+                        "opening session authentication",
+                        &error,
+                    ));
+                }
+            },
+            Err(error) => {
+                return Ok(internal_error_response(
+                    id,
+                    "resolving session authentication",
+                    &error,
+                ));
+            }
+        };
         let options = pi_coding::SessionOptions {
             model: model.clone(),
             cwd: cwd.clone(),
@@ -656,8 +1052,18 @@ impl AcpServer {
             tools: None,
             before_tool_call: None,
             after_tool_call: None,
-            stream_fn: None,
+            stream_fn: {
+                #[cfg(test)]
+                {
+                    self.stream_fn.clone()
+                }
+                #[cfg(not(test))]
+                {
+                    None
+                }
+            },
             auth_resolver: None,
+            auth_manager: Some(auth_manager),
         };
         let candidate = match blueprint.build(&cwd, options).await {
             Ok(candidate) => candidate,
@@ -671,8 +1077,8 @@ impl AcpServer {
             extension_permissions: permissions,
             orchestration,
             goal_tool,
+            todo_child_tool,
         } = candidate;
-        session.set_session_dir(session_dir.clone());
         if !self.cli.no_session {
             match pi_coding::start_session_in(
                 &cwd,
@@ -699,28 +1105,84 @@ impl AcpServer {
         if let Some(name) = self.cli.name.as_deref() {
             let _ = session.set_session_name(name);
         }
-        let application = Application::new_with_extensions(session, runtime, permissions).await;
-        if let Err(error) = application.attach_runtime_factory(Arc::new(blueprint.clone())) {
-            application.cleanup().await;
-            return Ok(internal_error_response(id, "attaching the extension runtime", &error));
+        let candidate = RunSessionCandidate {
+            session,
+            extension_runtime: runtime,
+            extension_permissions: permissions,
+            orchestration,
+            goal_tool,
+            todo_child_tool,
+        };
+        let (application, orchestration_warning) =
+            match crate::session_run::application_from_session_candidate(candidate).await {
+                Ok((application, warning)) => (application, warning),
+                Err(error) => {
+                    return Ok(internal_error_response(
+                        id,
+                        "building the application",
+                        &error,
+                    ));
+                }
+            };
+        if let Some(warning) = orchestration_warning {
+            // ACP `session/new` always starts a fresh recorder (no resume), so
+            // a durable sidecar mismatch is not expected here; surface the
+            // out-of-band warning on stderr for completeness.
+            eprintln!("ACP orchestration warning: {warning}");
         }
-        if let Some(binding) = goal_tool
-            && let Err(error) = application.attach_goal_tool(binding)
+        #[cfg(test)]
+        if self.stream_fn.is_some() {
+            let session = application.session();
+            session.set_before_tool_call(pi_agent::compose_before_tool_call(
+                session.raw_before_tool_call(),
+                session.approve_tool_call(),
+            ));
+        }
+        if let Err(error) = application.attach_runtime_factory(self.runtime_factory.clone()) {
+            application.cleanup().await;
+            return Ok(internal_error_response(
+                id,
+                "attaching the extension runtime",
+                &error,
+            ));
+        }
+        if let Err(error) = application.attach_todo_child_client(self.todo_child_service.client()) {
+            application.cleanup().await;
+            return Ok(internal_error_response(
+                id,
+                "attaching the Todo child client",
+                &error,
+            ));
+        }
+        if let Err(error) =
+            crate::session_run::refresh_radius_catalog(&application, self.cli.verbose).await
         {
             application.cleanup().await;
-            return Ok(internal_error_response(id, "attaching the goal tool", &error));
+            return Ok(internal_error_response(
+                id,
+                "refreshing Radius catalog",
+                &error,
+            ));
         }
-        if let Some(orchestration) = orchestration
-            && let Err(error) = application.attach_orchestration(orchestration).await
+        if let Err(error) =
+            crate::session_run::refresh_llama_catalog(&application, self.cli.verbose).await
         {
             application.cleanup().await;
-            return Ok(internal_error_response(id, "attaching orchestration", &error));
+            return Ok(internal_error_response(
+                id,
+                "refreshing llama.cpp catalog",
+                &error,
+            ));
         }
         let agent_dir = match self.blueprint.resource_options_for_startup(&cwd) {
             Ok(options) => options.agent_dir,
             Err(error) => {
                 application.cleanup().await;
-                return Ok(internal_error_response(id, "loading agent resources", &error));
+                return Ok(internal_error_response(
+                    id,
+                    "loading agent resources",
+                    &error,
+                ));
             }
         };
         let session_identity = application
@@ -737,11 +1199,140 @@ impl AcpServer {
             application.cleanup().await;
             return Ok(internal_error_response(id, "setting up workflows", &error));
         }
-        self.sessions.insert(
-            session_id.clone(),
-            AcpSession { application, cwd },
-        );
+        self.sessions
+            .insert(session_id.clone(), AcpSession { application, cwd });
         Ok(Some(rpc_result(id, json!({ "sessionId": session_id }))))
+    }
+
+    /// Dispatch the Todo child RPC subset exposed over ACP. `sessionId`
+    /// selects this connection's parent [`Application`]; the remaining
+    /// parameters are decoded with the existing [`RpcCommand`] wire schema so
+    /// ACP and RPC preserve identical parent/child identity, revision, and
+    /// receipt contracts while sharing the same Application authority.
+    async fn handle_todo_child(&self, id: &Value, method: &str, params: &Value) -> Value {
+        let Some(session_id) = params.get("sessionId").and_then(Value::as_str) else {
+            return rpc_error(id, INVALID_PARAMS, format!("{method} requires a sessionId"));
+        };
+        let Some(session) = self.sessions.get(session_id) else {
+            return rpc_error(
+                id,
+                RESOURCE_NOT_FOUND,
+                format!("unknown session: {session_id}"),
+            );
+        };
+        let Value::Object(mut command) = params.clone() else {
+            return rpc_error(
+                id,
+                INVALID_PARAMS,
+                format!("{method} params must be an object"),
+            );
+        };
+        command.remove("sessionId");
+        command.insert("type".to_owned(), Value::String(method.to_owned()));
+        let command = match serde_json::from_value::<RpcCommand>(Value::Object(command)) {
+            Ok(command) => command,
+            Err(error) => {
+                return rpc_error(
+                    id,
+                    INVALID_PARAMS,
+                    format!("invalid {method} params: {error}"),
+                );
+            }
+        };
+        let application = &session.application;
+        let result: Result<Value> = match command {
+            RpcCommand::TodoChildCreate { request, .. } => application
+                .todo_child_create(request)
+                .await
+                .and_then(|value| serde_json::to_value(value).map_err(Into::into)),
+            RpcCommand::TodoChildList {
+                parent_session_id, ..
+            } => application
+                .todo_child_list(Some(&parent_session_id))
+                .await
+                .and_then(|value| serde_json::to_value(value).map_err(Into::into)),
+            RpcCommand::TodoChildStatus {
+                parent_session_id,
+                child_session_id,
+                ..
+            } => application
+                .todo_child_status(Some(&parent_session_id), child_session_id.as_deref())
+                .await
+                .and_then(|value| serde_json::to_value(value).map_err(Into::into)),
+            RpcCommand::TodoChildSelect {
+                parent_session_id,
+                child_session_id,
+                ..
+            } => application
+                .todo_child_select(Some(&parent_session_id), &child_session_id)
+                .await
+                .map(|()| json!({})),
+            RpcCommand::TodoChildAddTask {
+                parent_session_id,
+                child_session_id,
+                request,
+                ..
+            } => application
+                .todo_child_add_task(Some(&parent_session_id), &child_session_id, request)
+                .await
+                .and_then(|value| serde_json::to_value(value).map_err(Into::into)),
+            RpcCommand::TodoChildSend {
+                parent_session_id,
+                child_session_id,
+                message,
+                ..
+            } => application
+                .todo_child_send(
+                    Some(&parent_session_id),
+                    child_session_id.as_deref(),
+                    message,
+                )
+                .await
+                .and_then(|value| serde_json::to_value(value).map_err(Into::into)),
+            RpcCommand::TodoChildHubSend {
+                parent_session_id,
+                child_session_id,
+                to,
+                body,
+                reply_to,
+                ..
+            } => application
+                .todo_child_hub_send(&parent_session_id, &child_session_id, &to, &body, reply_to)
+                .await
+                .and_then(|value| serde_json::to_value(value).map_err(Into::into)),
+            RpcCommand::TodoChildStop {
+                parent_session_id,
+                child_session_id,
+                ..
+            } => application
+                .todo_child_stop(Some(&parent_session_id), child_session_id.as_deref())
+                .await
+                .and_then(|value| serde_json::to_value(value).map_err(Into::into)),
+            RpcCommand::TodoChildArchive {
+                parent_session_id,
+                child_session_id,
+                ..
+            } => application
+                .todo_child_archive(Some(&parent_session_id), &child_session_id)
+                .await
+                .map(|()| json!({})),
+            RpcCommand::TodoChildRemove {
+                parent_session_id,
+                child_session_id,
+                ..
+            } => application
+                .todo_child_remove(Some(&parent_session_id), &child_session_id)
+                .await
+                .map(|()| json!({})),
+            _ => unreachable!("ACP Todo dispatch admits only the matched Todo child RPC subset"),
+        };
+        match result {
+            Ok(result) => rpc_result(id, result),
+            Err(error) => {
+                eprintln!("ACP {method} rejected: {error:#}");
+                rpc_error(id, INVALID_PARAMS, strip_absolute_paths(&error.to_string()))
+            }
+        }
     }
 
     /// Start a prompt turn. The turn task streams `session/update`
@@ -776,7 +1367,11 @@ impl AcpServer {
                 "session is already processing a prompt",
             )));
         }
-        let (text, images) = match parse_prompt_blocks(params) {
+        let (text, images) = match parse_prompt_blocks(params, |path, max_bytes| {
+            session
+                .application
+                .read_generation_file_bounded(path, max_bytes)
+        }) {
             Ok(parsed) => parsed,
             Err(error) => return Ok(Some(rpc_error(id, error.code, error.message))),
         };
@@ -786,7 +1381,9 @@ impl AcpServer {
         let cancelled = Arc::new(AtomicBool::new(false));
         self.turns.insert(
             session_id.clone(),
-            TurnState { cancelled: cancelled.clone() },
+            TurnState {
+                cancelled: cancelled.clone(),
+            },
         );
         tasks.spawn(run_prompt_turn(
             application,
@@ -806,9 +1403,8 @@ impl AcpServer {
     /// it as a notification, so this is `None` for notifications).
     async fn handle_cancel(&mut self, id: Option<&Value>, params: &Value) -> Option<Value> {
         let Some(session_id) = params.get("sessionId").and_then(Value::as_str) else {
-            return id.map(|id| {
-                rpc_error(id, INVALID_PARAMS, "session/cancel requires a sessionId")
-            });
+            return id
+                .map(|id| rpc_error(id, INVALID_PARAMS, "session/cancel requires a sessionId"));
         };
         if let Some(state) = self.turns.get(session_id) {
             state.cancelled.store(true, Ordering::Release);
@@ -847,7 +1443,12 @@ impl AcpServer {
         let Some(key) = id.as_str().map(ToOwned::to_owned) else {
             return;
         };
-        let entry = self.approval.pending.lock().expect("acp pending registry").remove(&key);
+        let entry = self
+            .approval
+            .pending
+            .lock()
+            .expect("acp pending registry")
+            .remove(&key);
         if let Some(entry) = entry {
             let payload = if let Some(error) = error {
                 json!({ "error": error })
@@ -875,20 +1476,41 @@ impl AcpServer {
         }
     }
 
-    /// Abort all active turns, wait for them to settle, and clean up every
-    /// session's application so recorded sessions flush.
-    async fn shutdown(&mut self) {
+    /// Make cancellation observable before connection teardown waits for
+    /// prompt tasks. Pending approvals must resolve before the join, or a
+    /// disconnected client can hold teardown for the permission timeout.
+    async fn cancel_active_turns(&self) {
         for state in self.turns.values() {
             state.cancelled.store(true, Ordering::Release);
+        }
+        for session_id in self.sessions.keys() {
+            self.resolve_pending_for_session(session_id);
         }
         for session in self.sessions.values() {
             session.application.abort().await;
         }
+    }
+
+    /// Clean connection-owned parent applications after prompt tasks have
+    /// observed cancellation. The process-owned host shuts down the shared
+    /// Todo service only after its connection work has joined.
+    async fn finalize(&mut self) {
         for session in self.sessions.values_mut() {
             session.application.cleanup().await;
         }
         self.sessions.clear();
         self.turns.clear();
+    }
+
+    fn combine_results(result: Result<()>, cleanup: Result<()>) -> Result<()> {
+        match (result, cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Err(error), Err(cleanup_error)) => Err(error.context(format!(
+                "ACP connection cleanup also failed: {cleanup_error:#}"
+            ))),
+        }
     }
 }
 
@@ -926,7 +1548,10 @@ fn initialize_result(params: &Value) -> Value {
 /// Convert an ACP `session/prompt` `ContentBlock[]` into the rpi prompt text
 /// and image blocks. Baseline support: `text` and `resource_link`; `image`
 /// and `resource` are enabled by the advertised prompt capabilities.
-fn parse_prompt_blocks(params: &Value) -> std::result::Result<(String, Vec<ContentBlock>), AcpError> {
+fn parse_prompt_blocks(
+    params: &Value,
+    read_resource: impl Fn(&Path, u64) -> Result<Vec<u8>>,
+) -> std::result::Result<(String, Vec<ContentBlock>), AcpError> {
     let blocks = params
         .get("prompt")
         .and_then(Value::as_array)
@@ -936,23 +1561,24 @@ fn parse_prompt_blocks(params: &Value) -> std::result::Result<(String, Vec<Conte
     for block in blocks {
         match block.get("type").and_then(Value::as_str) {
             Some("text") => {
-                let text = block
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| AcpError::invalid_params("text content block is missing text"))?;
+                let text = block.get("text").and_then(Value::as_str).ok_or_else(|| {
+                    AcpError::invalid_params("text content block is missing text")
+                })?;
                 text_parts.push(text.to_owned());
             }
             Some("image") => {
-                let data = block
-                    .get("data")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| AcpError::invalid_params("image content block is missing data"))?;
+                let data = block.get("data").and_then(Value::as_str).ok_or_else(|| {
+                    AcpError::invalid_params("image content block is missing data")
+                })?;
                 let mime_type = block
                     .get("mimeType")
                     .and_then(Value::as_str)
                     .unwrap_or("image/png")
                     .to_owned();
-                images.push(ContentBlock::Image { data: data.to_owned(), mime_type });
+                images.push(ContentBlock::Image {
+                    data: data.to_owned(),
+                    mime_type,
+                });
             }
             Some("resource") => {
                 // Embedded context: prefer the text form; decode image blobs
@@ -986,30 +1612,31 @@ fn parse_prompt_blocks(params: &Value) -> std::result::Result<(String, Vec<Conte
                 }
             }
             Some("resource_link") => {
-                // Baseline support: read `file://` links and embed them.
-                let uri = block
-                    .get("uri")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        AcpError::invalid_params("resource_link content block is missing uri")
-                    })?;
+                // Read local links through the session's captured generation.
+                // The URI path remains display input; retained PolicyFs
+                // authority performs the handle-relative bounded read.
+                let uri = block.get("uri").and_then(Value::as_str).ok_or_else(|| {
+                    AcpError::invalid_params("resource_link content block is missing uri")
+                })?;
                 match file_uri_to_path(uri) {
-                    Some(path) => match std::fs::read(&path) {
-                        Ok(bytes) if bytes.len() <= MAX_EMBEDDED_RESOURCE_BYTES => {
-                            let text = String::from_utf8_lossy(&bytes);
-                            text_parts.push(format!("=== {uri} ===\n{text}\n=== end {uri} ==="));
-                        }
-                        Ok(_) => {
-                            text_parts.push(format!(
+                    Some(path) => {
+                        match read_resource(&path, MAX_EMBEDDED_RESOURCE_BYTES as u64 + 1) {
+                            Ok(bytes) if bytes.len() <= MAX_EMBEDDED_RESOURCE_BYTES => {
+                                let text = String::from_utf8_lossy(&bytes);
+                                text_parts
+                                    .push(format!("=== {uri} ===\n{text}\n=== end {uri} ==="));
+                            }
+                            Ok(_) => {
+                                text_parts.push(format!(
                                 "[resource {uri} exceeds the {MAX_EMBEDDED_RESOURCE_BYTES}-byte embed limit and was skipped]"
                             ));
+                            }
+                            Err(error) => {
+                                text_parts
+                                    .push(format!("[resource {uri} could not be read: {error}]"));
+                            }
                         }
-                        Err(error) => {
-                            text_parts.push(format!(
-                                "[resource {uri} could not be read: {error}]"
-                            ));
-                        }
-                    },
+                    }
                     None => {
                         text_parts.push(format!(
                             "[resource link {uri} is not a local file and was skipped]"
@@ -1036,7 +1663,9 @@ fn parse_prompt_blocks(params: &Value) -> std::result::Result<(String, Vec<Conte
     }
     let text = text_parts.join("\n\n");
     if text.is_empty() && images.is_empty() {
-        return Err(AcpError::invalid_params("session/prompt contains no usable content"));
+        return Err(AcpError::invalid_params(
+            "session/prompt contains no usable content",
+        ));
     }
     Ok((text, images))
 }
@@ -1119,10 +1748,26 @@ async fn run_prompt_turn(
                 failed = Some("application event stream lagged; the turn may be incomplete".into());
                 break;
             }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                failed = Some("application event stream closed before the turn settled".into());
+                break;
+            }
         };
         match event {
             ApplicationEvent::AgentSettled => break,
+            ApplicationEvent::TodoChildRouted { receipt } => {
+                let notification = session_update(
+                    &session_id,
+                    json!({
+                        "sessionUpdate": "todo_child_routed",
+                        "receipt": receipt,
+                    }),
+                );
+                if outbound.send(notification).await.is_err() {
+                    return session_id;
+                }
+                break;
+            }
             ApplicationEvent::RunFailed { message } => {
                 failed = Some(strip_absolute_paths(&message));
                 break;
@@ -1178,7 +1823,9 @@ async fn run_prompt_turn(
 /// id). `message_id` tracks the current assistant message across chunks.
 fn project_event(event: ApplicationEvent, message_id: &mut Option<String>) -> Vec<Value> {
     match event {
-        ApplicationEvent::Agent(AgentEvent::MessageStart { message: Message::Assistant(_) }) => {
+        ApplicationEvent::Agent(AgentEvent::MessageStart {
+            message: Message::Assistant(_),
+        }) => {
             *message_id = Some(Uuid::now_v7().to_string());
             Vec::new()
         }
@@ -1242,10 +1889,17 @@ fn project_event(event: ApplicationEvent, message_id: &mut Option<String>) -> Ve
                 "type": "content",
                 "content": { "type": "text", "text": text },
             }]);
-            if !result.details.is_object() || !result.details.as_object().is_some_and(|d| d.is_empty()) {
+            if !result.details.is_object()
+                || !result.details.as_object().is_some_and(|d| d.is_empty())
+            {
                 update["rawOutput"] = result.details.clone();
             }
             vec![update]
+        }
+        // Sequenced publication projects identically to the synthetic
+        // `Agent` variant; only the transport-internal barrier differs.
+        ApplicationEvent::AgentPublished { event, .. } => {
+            project_event(ApplicationEvent::Agent(event), message_id)
         }
         _ => Vec::new(),
     }
@@ -1261,49 +1915,82 @@ fn tool_result_text(result: &pi_agent::AgentToolResult) -> String {
     parts.join("\n")
 }
 
+#[cfg(test)]
+pub(crate) async fn serve_connection_with_stream(
+    host: AcpHost,
+    cli: Cli,
+    inbound: mpsc::Receiver<Value>,
+    outbound: mpsc::Sender<Value>,
+    stream_fn: pi_agent::StreamFn,
+) -> Result<()> {
+    run_connection_loop(host, cli, inbound, outbound, Some(stream_fn)).await
+}
+
 /// Core connection loop shared by the stdio and WebSocket transports. Reads
 /// parsed JSON-RPC messages from `inbound`, responds through `outbound`, and
 /// spawns prompt turns. Returns when the client closes `inbound` (EOF / WS
-/// close), after aborting and cleaning up every session.
+/// close), after aborting and cleaning up every session of THIS connection.
+/// Host Todo child shutdown is owned by [`run_stdio`] (stdio) or the
+/// process-level serve host (WebSocket); a connection EOF never shuts the
+/// shared service.
 pub(crate) async fn serve_connection(
-    blueprint: RunSessionBlueprint,
+    host: AcpHost,
+    cli: Cli,
+    inbound: mpsc::Receiver<Value>,
+    outbound: mpsc::Sender<Value>,
+) -> Result<()> {
+    run_connection_loop(host, cli, inbound, outbound, None).await
+}
+
+async fn run_connection_loop(
+    host: AcpHost,
     cli: Cli,
     mut inbound: mpsc::Receiver<Value>,
     outbound: mpsc::Sender<Value>,
+    #[allow(unused_variables)] stream_fn: Option<pi_agent::StreamFn>,
 ) -> Result<()> {
     let pending = Arc::new(StdMutex::new(HashMap::new()));
     let approval = AcpApprovalFactory::new(&outbound, pending, PERMISSION_REQUEST_TIMEOUT);
-    let mut server = AcpServer::new(blueprint, cli, approval);
+    let mut server = AcpServer::new(cli, approval, host);
+    #[cfg(test)]
+    {
+        server.stream_fn = stream_fn;
+    }
     let mut tasks: JoinSet<String> = JoinSet::new();
-    loop {
-        tokio::select! {
-            incoming = inbound.recv() => match incoming {
-                Some(message) => {
-                    if let Some(response) = server.handle_message(&message, &outbound, &mut tasks).await? {
-                        outbound.send(response).await.context("sending ACP response")?;
+    let result = async {
+        loop {
+            tokio::select! {
+                incoming = inbound.recv() => match incoming {
+                    Some(message) => {
+                        if let Some(response) = server.handle_message(&message, &outbound, &mut tasks).await? {
+                            outbound.send(response).await.context("sending ACP response")?;
+                        }
                     }
-                }
-                None => break,
-            },
-            completed = tasks.join_next(), if !tasks.is_empty() => {
-                match completed {
-                    Some(Ok(session_id)) => {
-                        // The turn settled (success, failure, or cancel): its
-                        // response was already sent, so release the session's
-                        // in-flight slot and accept the next prompt.
-                        server.turns.remove(&session_id);
+                    None => break,
+                },
+                completed = tasks.join_next(), if !tasks.is_empty() => {
+                    match completed {
+                        Some(Ok(session_id)) => {
+                            // The turn settled (success, failure, or cancel): its
+                            // response was already sent, so release the session's
+                            // in-flight slot and accept the next prompt.
+                            server.turns.remove(&session_id);
+                        }
+                        Some(Err(error)) => {
+                            return Err(anyhow!(error).context("ACP prompt task failed"));
+                        }
+                        None => {}
                     }
-                    Some(Err(error)) => {
-                        return Err(anyhow!(error).context("ACP prompt task failed"));
-                    }
-                    None => {}
                 }
             }
         }
+        Ok(())
     }
-    server.shutdown().await;
+    .await;
+    server.cancel_active_turns().await;
     while tasks.join_next().await.is_some() {}
-    Ok(())
+    server.finalize().await;
+    result
 }
 
 /// Build the shared session blueprint for the ACP mode: catalogs loaded,
@@ -1318,8 +2005,10 @@ async fn acp_blueprint(cli: &Cli) -> Result<RunSessionBlueprint> {
 }
 
 /// `rpi agent stdio`: ACP over Content-Length framed JSON-RPC on stdin/stdout.
+/// This process is the host owner of the Todo child service; connection
+/// teardown only cleans parent sessions, then this host shuts the service.
 pub async fn run_stdio(cli: Cli) -> Result<()> {
-    let blueprint = acp_blueprint(&cli).await?;
+    let host = AcpHost::new(acp_blueprint(&cli).await?)?;
     let (outbound, outbound_rx) = mpsc::channel::<Value>(OUTBOUND_CHANNEL_CAPACITY);
     let (inbound_tx, inbound_rx) = mpsc::channel::<Value>(INBOUND_CHANNEL_CAPACITY);
     let reader = tokio::spawn(read_stdio_frames(
@@ -1327,20 +2016,28 @@ pub async fn run_stdio(cli: Cli) -> Result<()> {
         inbound_tx,
         outbound.clone(),
     ));
-    let server = tokio::spawn(serve_connection(blueprint, cli, inbound_rx, outbound));
+    let server = tokio::spawn(serve_connection(host.clone(), cli, inbound_rx, outbound));
     let pump = tokio::spawn(pump_stdout(outbound_rx, tokio::io::stdout()));
-    // A client closing stdin ends the connection; the reader's framing error
-    // (peer EOF) is the expected shutdown signal and is not an error here.
-    let _ = reader.await;
-    match server.await {
-        Ok(result) => result?,
-        Err(error) => return Err(anyhow!(error).context("joining ACP stdio server")),
+    // A client closing stdin ends the connection; framing EOF is normalized
+    // by `read_stdio_frames`, while a reader task panic/cancellation remains
+    // observable and is combined with the server and writer outcomes.
+    let reader_result = joined_task_result(reader.await, "joining ACP stdio reader");
+    let server_result = joined_task_result(server.await, "joining ACP stdio server");
+    let pump_result = joined_task_result(pump.await, "joining ACP stdio writer");
+    let result = AcpServer::combine_results(reader_result, server_result);
+    let result = AcpServer::combine_results(result, pump_result);
+    let shutdown = host.shutdown().await;
+    AcpServer::combine_results(result, shutdown)
+}
+
+fn joined_task_result(
+    joined: std::result::Result<Result<()>, tokio::task::JoinError>,
+    context: &'static str,
+) -> Result<()> {
+    match joined {
+        Ok(result) => result,
+        Err(error) => Err(anyhow!(error).context(context)),
     }
-    match pump.await {
-        Ok(result) => result?,
-        Err(error) => return Err(anyhow!(error).context("joining ACP stdio writer")),
-    }
-    Ok(())
 }
 
 /// Read Content-Length framed JSON-RPC messages from the client. Parse errors
@@ -1358,8 +2055,7 @@ where
 {
     let mut reader = BufReader::new(input);
     loop {
-        match pi_coding::tools::framing::read_message("ACP", &mut reader, MAX_WS_FRAME_BYTES)
-            .await
+        match pi_coding::tools::framing::read_message("ACP", &mut reader, MAX_WS_FRAME_BYTES).await
         {
             Ok(message) => {
                 if tx.send(message).await.is_err() {
@@ -1396,7 +2092,10 @@ where
 {
     while let Some(message) = outbound.recv().await {
         let frame = pi_coding::tools::framing::encode_message(&message)?;
-        stdout.write_all(&frame).await.context("writing ACP frame to stdout")?;
+        stdout
+            .write_all(&frame)
+            .await
+            .context("writing ACP frame to stdout")?;
         stdout.flush().await.context("flushing ACP stdout")?;
     }
     Ok(())
@@ -1426,18 +2125,26 @@ pub async fn run_serve(
         "agent serve",
         ListenAddressPolicy::LoopbackOnly,
     )?;
-    let blueprint = acp_blueprint(&cli).await?;
+    let host = AcpHost::new(acp_blueprint(&cli).await?)?;
     let listener = TcpListener::bind(address)
         .await
         .with_context(|| format!("binding ACP WebSocket server to {address}"))?;
-    let address = listener.local_addr().context("reading ACP WebSocket server address")?;
+    let address = listener
+        .local_addr()
+        .context("reading ACP WebSocket server address")?;
     eprintln!("ACP WebSocket server listening on ws://{address}");
     if token.is_some() {
-        eprintln!("ACP WebSocket connections require the token from {token_file:?} (rpi-auth.<token> subprotocol)");
+        eprintln!(
+            "ACP WebSocket connections require the token from {token_file:?} (rpi-auth.<token> subprotocol)"
+        );
     } else {
-        eprintln!("ACP WebSocket accepts only loopback native clients (no token configured; browsers are rejected)");
+        eprintln!(
+            "ACP WebSocket accepts only loopback native clients (no token configured; browsers are rejected)"
+        );
     }
-    serve_ws(listener, blueprint, cli, token.map(Arc::from)).await
+    let result = serve_ws(listener, host.clone(), cli, token.map(Arc::from)).await;
+    let shutdown = host.shutdown().await;
+    AcpServer::combine_results(result, shutdown)
 }
 
 /// Accept loop for `rpi agent serve`: spawns one task per WebSocket
@@ -1446,7 +2153,7 @@ pub async fn run_serve(
 /// flood of clients cannot exhaust the runtime.
 async fn serve_ws(
     listener: TcpListener,
-    blueprint: RunSessionBlueprint,
+    host: AcpHost,
     cli: Cli,
     token: Option<Arc<[u8]>>,
 ) -> Result<()> {
@@ -1455,11 +2162,13 @@ async fn serve_ws(
         tokio::select! {
             accepted = listener.accept(), if connections.len() < MAX_CONNECTION_TASKS => {
                 let (stream, _) = accepted.context("accepting ACP WebSocket connection")?;
-                let blueprint = blueprint.clone();
+                let host = host.clone();
                 let cli = cli.clone();
                 let token = token.clone();
                 connections.spawn(async move {
-                    if let Err(error) = handle_ws_connection(stream, blueprint, cli, token).await {
+                    if let Err(error) =
+                        handle_ws_connection(stream, host, cli, token).await
+                    {
                         eprintln!("ACP WebSocket connection error: {error:#}");
                     }
                 });
@@ -1483,7 +2192,7 @@ async fn serve_ws(
 /// framing.
 async fn handle_ws_connection(
     stream: TcpStream,
-    blueprint: RunSessionBlueprint,
+    host: AcpHost,
     cli: Cli,
     token: Option<Arc<[u8]>>,
 ) -> Result<()> {
@@ -1492,7 +2201,9 @@ async fn handle_ws_connection(
         .max_frame_size(Some(MAX_WS_FRAME_BYTES));
     let websocket = accept_hdr_async_with_config(
         stream,
-        move |request: &Request, mut response: Response| -> std::result::Result<Response, ErrorResponse> {
+        move |request: &Request,
+              mut response: Response|
+              -> std::result::Result<Response, ErrorResponse> {
             if request.uri().path() != "/" {
                 let mut error = ErrorResponse::new(Some("not found".into()));
                 *error.status_mut() = http::StatusCode::NOT_FOUND;
@@ -1528,7 +2239,7 @@ async fn handle_ws_connection(
     let (mut write, mut read) = websocket.split();
     let (outbound, mut outbound_rx) = mpsc::channel::<Value>(OUTBOUND_CHANNEL_CAPACITY);
     let (inbound_tx, inbound_rx) = mpsc::channel::<Value>(INBOUND_CHANNEL_CAPACITY);
-    let server = tokio::spawn(serve_connection(blueprint, cli, inbound_rx, outbound));
+    let server = tokio::spawn(run_connection_loop(host, cli, inbound_rx, outbound, None));
     let reader = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -1546,27 +2257,34 @@ async fn handle_ws_connection(
                                     PARSE_ERROR,
                                     format!("invalid JSON in ACP message: {error}"),
                                 );
-                                if write
-                                    .send(WsMessage::Text(
-                                        serde_json::to_string(&response)?.into(),
-                                    ))
-                                    .await
-                                    .is_err()
-                                {
+                                if !websocket_transport_result(
+                                    write
+                                        .send(WsMessage::Text(
+                                            serde_json::to_string(&response)?.into(),
+                                        ))
+                                        .await,
+                                    "sending ACP WebSocket parse-error response",
+                                )? {
                                     break;
                                 }
                             }
                         }
                     }
                     Some(Ok(WsMessage::Ping(payload))) => {
-                        if write.send(WsMessage::Pong(payload)).await.is_err() {
+                        if !websocket_transport_result(
+                            write.send(WsMessage::Pong(payload)).await,
+                            "sending ACP WebSocket pong",
+                        )? {
                             break;
                         }
                     }
                     Some(Ok(WsMessage::Close(_))) | Some(Ok(WsMessage::Binary(_))) | None => break,
                     Some(Ok(_)) => {}
                     Some(Err(error)) => {
-                        eprintln!("ACP WebSocket read error: {error}");
+                        websocket_transport_result(
+                            Err(error),
+                            "reading ACP WebSocket",
+                        )?;
                         break;
                     }
                 },
@@ -1574,7 +2292,10 @@ async fn handle_ws_connection(
                     Some(message) => {
                         let text: tokio_tungstenite::tungstenite::protocol::frame::Utf8Bytes =
                             serde_json::to_string(&message)?.into();
-                        if write.send(WsMessage::Text(text)).await.is_err() {
+                        if !websocket_transport_result(
+                            write.send(WsMessage::Text(text)).await,
+                            "sending ACP WebSocket message",
+                        )? {
                             break;
                         }
                     }
@@ -1583,19 +2304,34 @@ async fn handle_ws_connection(
             }
         }
         // The reader owns the write half: close the WebSocket cleanly once
-        // the connection loop (or the server) is done.
-        let _ = write.close().await;
+        // the connection loop (or the server) is done. A peer that already
+        // disconnected is normal; every other close failure remains visible.
+        websocket_transport_result(write.close().await, "closing ACP WebSocket")?;
         Ok::<(), anyhow::Error>(())
     });
-    match reader.await {
-        Ok(result) => result?,
-        Err(error) => return Err(anyhow!(error).context("joining ACP WebSocket reader")),
+    let reader_result = joined_task_result(reader.await, "joining ACP WebSocket reader");
+    let server_result = joined_task_result(server.await, "joining ACP WebSocket server");
+    match (reader_result, server_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(server_error)) => Err(error.context(format!(
+            "ACP WebSocket server also failed: {server_error:#}"
+        ))),
     }
-    match server.await {
-        Ok(result) => result?,
-        Err(error) => return Err(anyhow!(error).context("joining ACP WebSocket server")),
+}
+
+/// Classify one WebSocket transport operation. `false` means the peer has
+/// already disconnected and the connection loop should end normally.
+fn websocket_transport_result(
+    result: std::result::Result<(), WsError>,
+    context: &'static str,
+) -> Result<bool> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(WsError::ConnectionClosed | WsError::AlreadyClosed) => Ok(false),
+        Err(error) => Err(anyhow!(error).context(context)),
     }
-    Ok(())
 }
 
 #[cfg(test)]

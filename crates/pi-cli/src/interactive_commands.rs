@@ -31,12 +31,17 @@ pub struct InteractiveCommand {
     pub description: String,
     pub source: CommandSource,
 }
+/// Removed public names stay reserved so loaded resources cannot recreate a
+/// compatibility alias through the executable catalog.
+const REJECTED_PUBLIC_COMMAND_NAMES: &[&str] = &[concat!("todo", "-child")];
 
 /// Build the full collision-free executable catalog for dispatch and source resolution.
 ///
 /// Help and slash completion use [`visible_catalog`] / [`is_primary_command`] instead.
 #[must_use]
-pub fn executable_catalog(application: &pi_coding::Application) -> (Vec<InteractiveCommand>, Vec<String>) {
+pub fn executable_catalog(
+    application: &pi_coding::Application,
+) -> (Vec<InteractiveCommand>, Vec<String>) {
     let mut commands = BUILTIN_COMMANDS
         .iter()
         .map(|command| InteractiveCommand {
@@ -45,15 +50,18 @@ pub fn executable_catalog(application: &pi_coding::Application) -> (Vec<Interact
             source: CommandSource::Builtin,
         })
         .collect::<Vec<_>>();
-    let builtin_names = BUILTIN_COMMANDS
+    let reserved_names = BUILTIN_COMMANDS
         .iter()
         .map(|command| command.name)
+        .chain(REJECTED_PUBLIC_COMMAND_NAMES.iter().copied())
         .collect::<std::collections::HashSet<_>>();
     let mut dynamic_names = std::collections::HashSet::new();
     let mut diagnostics = Vec::new();
     if let Some(resources) = application.resource_snapshot() {
         for prompt in &resources.prompts {
-            if builtin_names.contains(prompt.name.as_str()) || !dynamic_names.insert(prompt.name.clone()) {
+            if reserved_names.contains(prompt.name.as_str())
+                || !dynamic_names.insert(prompt.name.clone())
+            {
                 diagnostics.push(format!("Prompt command '/{}' conflicts with another command and was excluded from autocomplete", prompt.name));
                 continue;
             }
@@ -69,26 +77,32 @@ pub fn executable_catalog(application: &pi_coding::Application) -> (Vec<Interact
             .filter(|command| command.source == "skill")
         {
             let name = command.name;
-            if builtin_names.contains(name.as_str()) || !dynamic_names.insert(name.clone()) {
+            if reserved_names.contains(name.as_str()) || !dynamic_names.insert(name.clone()) {
                 diagnostics.push(format!("Skill command '/{name}' conflicts with another command and was excluded from autocomplete"));
                 continue;
             }
             commands.push(InteractiveCommand {
                 name,
-                description: command.description.unwrap_or_else(|| "Installed skill".to_owned()),
+                description: command
+                    .description
+                    .unwrap_or_else(|| "Installed skill".to_owned()),
                 source: CommandSource::Skill,
             });
         }
     }
     if let Some(runtime) = application.extension_runtime() {
         for command in runtime.commands() {
-            if builtin_names.contains(command.name.as_str()) || !dynamic_names.insert(command.name.clone()) {
+            if reserved_names.contains(command.name.as_str())
+                || !dynamic_names.insert(command.name.clone())
+            {
                 diagnostics.push(format!("Extension command '/{}' conflicts with another command and was excluded from autocomplete", command.name));
                 continue;
             }
             commands.push(InteractiveCommand {
                 name: command.name,
-                description: command.description.unwrap_or_else(|| "Extension command".to_owned()),
+                description: command
+                    .description
+                    .unwrap_or_else(|| "Extension command".to_owned()),
                 source: CommandSource::Extension,
             });
         }
@@ -96,7 +110,9 @@ pub fn executable_catalog(application: &pi_coding::Application) -> (Vec<Interact
     commands.sort_by(|left, right| {
         let left_builtin = left.source == CommandSource::Builtin;
         let right_builtin = right.source == CommandSource::Builtin;
-        right_builtin.cmp(&left_builtin).then_with(|| left.name.cmp(&right.name))
+        right_builtin
+            .cmp(&left_builtin)
+            .then_with(|| left.name.cmp(&right.name))
     });
     (commands, diagnostics)
 }
@@ -107,6 +123,7 @@ pub const PRIMARY_COMMAND_NAMES: &[&str] = &[
     "model",
     "branch",
     "resume",
+    "move",
     "fork",
     "export",
     "dump",
@@ -121,11 +138,20 @@ pub const PRIMARY_COMMAND_NAMES: &[&str] = &[
     "loop",
     "goal",
     "workflow",
+    "commit",
     "code-review",
     "btw",
     "queue",
     "live",
     "skill",
+    "theme",
+    "thinking",
+    "todo",
+    "tree",
+    "trust",
+    "jobs",
+    "activity",
+    "irc",
 ];
 
 /// True when `name` is part of the visible primary slash surface.
@@ -147,6 +173,39 @@ pub fn visible_catalog() -> Vec<InteractiveCommand> {
             })
         })
         .collect()
+}
+
+/// Parsed `/commit` operands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommitInspectInvocation {
+    /// Bare `/commit` — open the recent-commit chooser (fullscreen TUI).
+    Picker,
+    /// `/commit <ref>` — review that ref; the core loader resolves it once
+    /// and pins the returned scope to the immutable commit id.
+    Commit { reference: String },
+}
+
+/// Usage line for a malformed `/commit` invocation.
+pub const COMMIT_INSPECT_USAGE: &str = "Usage: /commit [<ref>]";
+
+/// Parse `/commit` arguments. Bare opens the recent-commit picker, one
+/// whitespace-delimited ref reviews that commit, and any additional operand
+/// is a usage error. Inspection only: nothing here stages, checks out, or
+/// commits.
+#[must_use]
+pub fn parse_commit_inspect_invocation(
+    argument: Option<&str>,
+) -> Result<CommitInspectInvocation, String> {
+    let Some(argument) = argument.map(str::trim).filter(|argument| !argument.is_empty()) else {
+        return Ok(CommitInspectInvocation::Picker);
+    };
+    let mut operands = argument.split_whitespace();
+    match (operands.next(), operands.next()) {
+        (Some(reference), None) => Ok(CommitInspectInvocation::Commit {
+            reference: reference.to_owned(),
+        }),
+        _ => Err(COMMIT_INSPECT_USAGE.to_owned()),
+    }
 }
 
 /// Expand a prompt-template or skill command into the user prompt it executes.
@@ -185,7 +244,7 @@ pub fn skill_frontmatter_summary(
 
 /// Interactive `/role` actions.
 ///
-/// Roles are the loaded agent definitions (project `<cwd>/.pi/agents/`, user
+/// Roles are the loaded agent definitions (project `<cwd>/.rpi/agents/`, user
 /// `<agent_dir>/agents/`, and the bundled `task`); there is no separate
 /// `roles/` directory convention, so the command surface maps 1:1 onto
 /// definitions. Personas are also roles and appear here; use `/persona` for
@@ -221,7 +280,7 @@ pub enum InteractivePersonaCommand {
     Current,
     /// `/persona run <name> <assignment>`.
     Run { name: String, assignment: String },
-    /// `/persona reset <name> --yes` — clear memory and sessions, keep persona.md.
+    /// `/persona reset <name> --yes` — clear memory, sessions, and learned skills, keep persona.md.
     Reset { name: String },
     /// `/persona remove <name> --yes` — delete persona.md, keep state.
     Remove { name: String },
@@ -236,7 +295,9 @@ pub enum InteractivePersonaCommand {
 }
 
 /// Parse `/role` arguments into an [`InteractiveRoleCommand`].
-pub fn parse_interactive_role_command(argument: Option<&str>) -> anyhow::Result<InteractiveRoleCommand> {
+pub fn parse_interactive_role_command(
+    argument: Option<&str>,
+) -> anyhow::Result<InteractiveRoleCommand> {
     let Some(argument) = argument else {
         return Ok(InteractiveRoleCommand::List);
     };
@@ -254,19 +315,27 @@ pub fn parse_interactive_role_command(argument: Option<&str>) -> anyhow::Result<
         if name.is_empty() {
             anyhow::bail!("usage: /role <name> --select | /role --select <name>");
         }
-        return Ok(InteractiveRoleCommand::Select { name: name.to_owned() });
+        return Ok(InteractiveRoleCommand::Select {
+            name: name.to_owned(),
+        });
     }
     if let Some(name) = argument.strip_suffix(" --select") {
         let name = name.trim();
         if name.is_empty() {
             anyhow::bail!("usage: /role <name> --select | /role --select <name>");
         }
-        return Ok(InteractiveRoleCommand::Select { name: name.to_owned() });
+        return Ok(InteractiveRoleCommand::Select {
+            name: name.to_owned(),
+        });
     }
     if argument.starts_with("--") {
-        anyhow::bail!("unknown /role flag {argument:?}; use /role [<name>] [--select|--clear|--current]");
+        anyhow::bail!(
+            "unknown /role flag {argument:?}; use /role [<name>] [--select|--clear|--current]"
+        );
     }
-    Ok(InteractiveRoleCommand::Show { name: argument.to_owned() })
+    Ok(InteractiveRoleCommand::Show {
+        name: argument.to_owned(),
+    })
 }
 
 /// Parse `/persona` arguments into an [`InteractivePersonaCommand`].
@@ -369,7 +438,11 @@ fn parse_persona_destructive(
         PersonaDestructiveKind::Reset | PersonaDestructiveKind::Remove => &["--yes"],
         PersonaDestructiveKind::Purge => &["--yes", "--purge"],
     };
-    for flag in tokens.iter().copied().filter(|token| token.starts_with("--")) {
+    for flag in tokens
+        .iter()
+        .copied()
+        .filter(|token| token.starts_with("--"))
+    {
         if !allowed_flags.contains(&flag) {
             anyhow::bail!("unknown flag {flag:?}; {}", persona_destructive_usage(kind));
         }
@@ -471,14 +544,18 @@ pub fn execute_interactive_role_command(
             let definition = definitions
                 .iter()
                 .find(|definition| definition.name == name)
-                .ok_or_else(|| anyhow::anyhow!("unknown role {name:?}; /role lists available roles"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("unknown role {name:?}; /role lists available roles")
+                })?;
             Ok(format_role_details(definition))
         }
         InteractiveRoleCommand::Select { name } => {
             let definition = definitions
                 .iter()
                 .find(|definition| definition.name == name)
-                .ok_or_else(|| anyhow::anyhow!("unknown role {name:?}; /role lists available roles"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("unknown role {name:?}; /role lists available roles")
+                })?;
             validate_selectable_definition(definition, &snapshot, "role")?;
             apply_preferred_agent(application, Some(&name))?;
             Ok(format!(
@@ -533,17 +610,17 @@ pub async fn execute_interactive_persona_command(
             Some(name) if personas.iter().any(|definition| definition.name == name) => {
                 format!("Selected persona: {name}")
             }
-            Some(name) => format!(
-                "Selected role: {name} (not a persona; /persona lists personas only)"
-            ),
+            Some(name) => {
+                format!("Selected role: {name} (not a persona; /persona lists personas only)")
+            }
             None => "No persona selected (ranked/default agent selection)".to_owned(),
         }),
         InteractivePersonaCommand::Run { name, assignment } => {
             let definition = find_persona(&personas, &name)?;
             validate_selectable_definition(definition, &snapshot, "persona")?;
-            let runtime = application.orchestration_runtime().ok_or_else(|| {
-                anyhow::anyhow!("orchestration is not available in this session")
-            })?;
+            let runtime = application
+                .orchestration_runtime()
+                .ok_or_else(|| anyhow::anyhow!("orchestration is not available in this session"))?;
             let spawns = runtime.spawn_tasks(
                 "Main",
                 0,
@@ -574,7 +651,7 @@ pub async fn execute_interactive_persona_command(
                 .transpose()?;
             reset_persona_state(&root, &name)?;
             Ok(format!(
-                "Persona {name:?} reset: memory and sessions cleared; persona.md kept"
+                "Persona {name:?} reset: memory, sessions, and learned skills cleared; persona.md kept"
             ))
         }
         InteractivePersonaCommand::Remove { name } => {
@@ -600,7 +677,7 @@ pub async fn execute_interactive_persona_command(
                 );
             }
             Ok(format!(
-                "Persona {name:?} removed: persona.md deleted; memory and sessions kept under the persona root"
+                "Persona {name:?} removed: persona.md deleted; memory, sessions, and learned skills kept under the persona root"
             ))
         }
         InteractivePersonaCommand::Purge { name } => {
@@ -620,9 +697,7 @@ pub async fn execute_interactive_persona_command(
                     "persona {name:?} was purged, but resource reload failed; the persona remains blocked in this session until reload or restart (see the server log for details)"
                 );
             }
-            Ok(format!(
-                "Persona {name:?} purged: persona root deleted"
-            ))
+            Ok(format!("Persona {name:?} purged: persona root deleted"))
         }
         InteractivePersonaCommand::New { name } => {
             anyhow::bail!(
@@ -644,7 +719,9 @@ fn find_persona<'a>(
     personas
         .iter()
         .find(|definition| definition.name == name)
-        .ok_or_else(|| anyhow::anyhow!("unknown persona {name:?}; /persona lists available personas"))
+        .ok_or_else(|| {
+            anyhow::anyhow!("unknown persona {name:?}; /persona lists available personas")
+        })
 }
 
 pub(crate) fn current_preferred_agent(application: &pi_coding::Application) -> Option<String> {
@@ -654,16 +731,13 @@ pub(crate) fn current_preferred_agent(application: &pi_coding::Application) -> O
     {
         return Some(name);
     }
-    application
-        .settings_manager()
-        .ok()
-        .and_then(|manager| {
-            manager
-                .settings()
-                .orchestration
-                .as_ref()
-                .and_then(|orchestration| orchestration.preferred_agent.clone())
-        })
+    application.settings_manager().ok().and_then(|manager| {
+        manager
+            .settings()
+            .orchestration
+            .as_ref()
+            .and_then(|orchestration| orchestration.preferred_agent.clone())
+    })
 }
 
 fn validate_selectable_definition(
@@ -672,7 +746,10 @@ fn validate_selectable_definition(
     kind: &str,
 ) -> anyhow::Result<()> {
     if !definition.trusted {
-        anyhow::bail!("{kind} {:?} is not trusted and cannot be selected", definition.name);
+        anyhow::bail!(
+            "{kind} {:?} is not trusted and cannot be selected",
+            definition.name
+        );
     }
     if !snapshot.settings.is_agent_enabled(&definition.name) {
         anyhow::bail!(
@@ -693,9 +770,9 @@ fn apply_preferred_agent(
     } else if name.is_some() {
         anyhow::bail!("orchestration is not available in this session");
     }
-    let manager = application.settings_manager().with_context(|| {
-        "settings manager is unavailable; cannot persist preferred agent selection"
-    })?;
+    let manager = application.settings_manager().with_context(
+        || "settings manager is unavailable; cannot persist preferred agent selection",
+    )?;
     manager
         .update_global(|settings| {
             let orchestration = settings
@@ -739,17 +816,26 @@ fn resolve_persona_root(
         .ok_or_else(|| anyhow::anyhow!("cannot resolve agent directory from settings paths"))?;
     let scopes = [
         agent_dir.join("personas"),
-        resources.cwd.join(".pi").join("personas"),
+        resources.cwd.join(".rpi").join("personas"),
     ];
     ensure_persona_root_contained(&root, &scopes, &definition.name)
 }
 
 /// Ensure `root` is a real directory strictly inside one of the allowed persona
-/// scope roots, rejecting symlink escapes and path aliases. Returns the
-/// canonical persona root on success. User-visible error contexts name the
-/// persona only — never filesystem paths (they would leak absolute paths to
-/// Web clients on failure).
-fn ensure_persona_root_contained(root: &Path, scopes: &[PathBuf], persona: &str) -> anyhow::Result<PathBuf> {
+/// scope roots, rejecting symlink escapes and path aliases. Scope directories
+/// may themselves be symlinks — discovery follows them via
+/// `open_directory_allowing_link`, so the persona root is canonicalized
+/// against each canonicalized scope (the resolved real path is the
+/// containment boundary) instead of bailing on the link. A symlinked persona
+/// root is still refused: it is not what discovery exposes, and canonicalizing
+/// it would let a link redirect the containment comparison. User-visible
+/// error contexts name the persona only — never filesystem paths (they would
+/// leak absolute paths to Web clients on failure).
+fn ensure_persona_root_contained(
+    root: &Path,
+    scopes: &[PathBuf],
+    persona: &str,
+) -> anyhow::Result<PathBuf> {
     let meta = std::fs::symlink_metadata(root)
         .with_context(|| format!("reading persona root for {persona:?}"))?;
     if meta.file_type().is_symlink() {
@@ -758,27 +844,13 @@ fn ensure_persona_root_contained(root: &Path, scopes: &[PathBuf], persona: &str)
     if !meta.is_dir() {
         anyhow::bail!("persona root is not a directory");
     }
-    // Reject symlink parents (scope path itself must not be a link).
-    if let Some(parent) = root.parent() {
-        let parent_meta = std::fs::symlink_metadata(parent)
-            .with_context(|| format!("reading persona scope for {persona:?}"))?;
-        if parent_meta.file_type().is_symlink() {
-            anyhow::bail!("persona scope path must not contain symlinks");
-        }
-    }
     let canonical_root = std::fs::canonicalize(root)
         .with_context(|| format!("canonicalizing persona root for {persona:?}"))?;
-    let mut allowed = false;
     for scope in scopes {
-        // Materialize the scope directory when absent so canonicalize can
-        // establish the containment boundary without following links.
+        // `exists` follows the scope link: a dangling scope link is treated
+        // as absent and the next scope is tried (fail-closed).
         if !scope.exists() {
             continue;
-        }
-        let scope_meta = std::fs::symlink_metadata(scope)
-            .with_context(|| format!("reading persona scope for {persona:?}"))?;
-        if scope_meta.file_type().is_symlink() {
-            anyhow::bail!("persona scope path must not contain symlinks");
         }
         let Ok(canonical_scope) = std::fs::canonicalize(scope) else {
             continue;
@@ -794,26 +866,37 @@ fn ensure_persona_root_contained(root: &Path, scopes: &[PathBuf], persona: &str)
                             .all(|component| matches!(component, std::path::Component::Normal(_)))
                 })
         {
-            allowed = true;
-            break;
+            return Ok(canonical_root);
         }
     }
-    if !allowed {
-        anyhow::bail!("persona root escapes the allowed persona directories");
-    }
-    Ok(canonical_root)
+    anyhow::bail!("persona root escapes the allowed persona directories")
 }
 
 fn reset_persona_state(root: &Path, persona: &str) -> anyhow::Result<()> {
-    let memory = root.join("memory");
-    let sessions = root.join("sessions");
-    if memory.exists() {
-        std::fs::remove_dir_all(&memory)
-            .with_context(|| format!("removing persona memory for {persona:?}"))?;
+    let mut present: Vec<(&str, PathBuf)> = Vec::new();
+    for name in ["memory", "sessions", "skills"] {
+        let path = root.join(name);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading persona {name} for {persona:?}"));
+            }
+        };
+        // Symlinked or non-directory state is rejected before any removal so
+        // reset can neither delete outside the persona root nor leave a
+        // partial reset behind.
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!("refusing to remove symlinked persona {name} for {persona:?}");
+        }
+        if !metadata.is_dir() {
+            anyhow::bail!("persona {name} for {persona:?} is not a directory");
+        }
+        present.push((name, path));
     }
-    if sessions.exists() {
-        std::fs::remove_dir_all(&sessions)
-            .with_context(|| format!("removing persona sessions for {persona:?}"))?;
+    for (name, path) in present {
+        std::fs::remove_dir_all(&path)
+            .with_context(|| format!("removing persona {name} for {persona:?}"))?;
     }
     Ok(())
 }
@@ -864,14 +947,17 @@ pub async fn commit_persona_definition(
     let (root, source, trusted) = match kind {
         PersonaEditKind::New => {
             if let Some(existing) = snapshot.agents.iter().find(|d| d.name == name) {
-                let existing_kind = if existing.is_persona() { "persona" } else { "agent" };
+                let existing_kind = if existing.is_persona() {
+                    "persona"
+                } else {
+                    "agent"
+                };
                 anyhow::bail!(
                     "name {name:?} is already in use by a {existing_kind}; use /persona edit {name} or pick another name"
                 );
             }
             validate_persona_content(content, name, pi_coding::AgentDefinitionSource::User, true)?;
-            let (root, source, trusted) =
-                resolve_new_persona_root(application, &snapshot, name)?;
+            let (root, source, trusted) = resolve_new_persona_root(application, &snapshot, name)?;
             let persona_md = root.join("persona.md");
             if persona_md.exists() {
                 anyhow::bail!("persona {name:?} already exists; use /persona edit {name}");
@@ -902,7 +988,10 @@ pub async fn commit_persona_definition(
         // fixed and path-free. The write already landed, but the catalog is
         // stale: report a REAL failure so the Web editor keeps the draft and
         // the modal instead of pretending the persona is live.
-        eprintln!("persona reload failed after {} for {name:?}: {error:#}", persona_kind_verb(kind));
+        eprintln!(
+            "persona reload failed after {} for {name:?}: {error:#}",
+            persona_kind_verb(kind)
+        );
         anyhow::bail!(
             "persona {name:?} was {}, but resource reload failed; reload or restart required",
             persona_kind_verb(kind)
@@ -915,6 +1004,35 @@ pub async fn commit_persona_definition(
     ))
 }
 
+/// Coding tools declared by the `/persona new` seed (and the matching Web
+/// create template). The seed writes an explicit bounded list so a default
+/// persona does not inherit the full factory set (`tools: (all)`). An omitted
+/// `tools` field inherits that full set and is exempt from the cap; an
+/// explicit list still fail-closes when it exceeds `max_tools_per_agent`.
+/// Kept at or below [`pi_coding::DEFAULT_MAX_TOOLS_PER_AGENT`] so the seed
+/// itself never trips the explicit-list cap.
+const DEFAULT_PERSONA_CODING_TOOLS: &[&str] = &[
+    "read",
+    "grep",
+    "find",
+    "ls",
+    "glob",
+    "bash",
+    "edit",
+    "write",
+    "web_search",
+    "browser",
+];
+
+fn default_persona_tools_frontmatter() -> String {
+    format!("tools: [{}]", DEFAULT_PERSONA_CODING_TOOLS.join(", "))
+}
+
+#[cfg(test)]
+pub(crate) fn default_persona_tools_frontmatter_for_tests() -> String {
+    default_persona_tools_frontmatter()
+}
+
 /// Build the editor seed content for `/persona new` (a template) or
 /// `/persona edit` (the current `persona.md` contents). Performs no write.
 pub fn persona_editor_seed(
@@ -925,9 +1043,11 @@ pub fn persona_editor_seed(
     persona_name_path_safe(name)?;
     match kind {
         PersonaEditKind::New => Ok(format!(
-            "---\nname: {name}\ndescription: {name} persona\n---\n\
+            "---\nname: {name}\ndescription: {name} persona\n{}\n---\n\
              Describe {name}'s behavior, personality, and contract here.\n\
-             Optional frontmatter: personality, softBudget, maxTurns, timeoutSecs, tools.\n"
+             Optional frontmatter: personality, softBudget, maxTurns, timeoutSecs.\n\
+             Raise orchestration.maxToolsPerAgent before expanding tools past the cap.\n",
+            default_persona_tools_frontmatter()
         )),
         PersonaEditKind::Edit => {
             let (root, _definition) = resolve_existing_persona(application, name)?;
@@ -952,9 +1072,9 @@ pub fn persona_editor_command(application: &pi_coding::Application) -> String {
     let configured = application
         .session()
         .resource_manager()
-        .and_then(|resources| {
-            resources
-                .settings_manager()
+        .and_then(|resources| resources.settings_manager().ok())
+        .and_then(|manager| {
+            manager
                 .settings()
                 .extra
                 .get("externalEditor")
@@ -963,8 +1083,16 @@ pub fn persona_editor_command(application: &pi_coding::Application) -> String {
         });
     configured
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| std::env::var("VISUAL").ok().filter(|v| !v.trim().is_empty()))
-        .or_else(|| std::env::var("EDITOR").ok().filter(|v| !v.trim().is_empty()))
+        .or_else(|| {
+            std::env::var("VISUAL")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
+        .or_else(|| {
+            std::env::var("EDITOR")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
         .unwrap_or_else(|| {
             if cfg!(windows) {
                 "notepad".to_owned()
@@ -984,6 +1112,7 @@ pub async fn spawn_editor_on(command: &str, path: &Path) -> anyhow::Result<()> {
     let status = tokio::process::Command::new(program)
         .args(parts)
         .arg(path)
+        .kill_on_drop(true)
         .status()
         .await
         .with_context(|| format!("launching editor {command:?}"))?;
@@ -1006,7 +1135,9 @@ fn resolve_existing_persona(
         .agents
         .iter()
         .find(|definition| definition.is_persona() && definition.name == name)
-        .ok_or_else(|| anyhow::anyhow!("unknown persona {name:?}; /persona lists available personas"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!("unknown persona {name:?}; /persona lists available personas")
+        })?
         .clone();
     if matches!(definition.source, pi_coding::AgentDefinitionSource::Project)
         && !snapshot.trust.allows_project_resources(true)
@@ -1037,7 +1168,7 @@ fn resolve_new_persona_root(
         .map(Path::to_path_buf)
         .ok_or_else(|| anyhow::anyhow!("cannot resolve agent directory from settings paths"))?;
     let user_scope = agent_dir.join("personas");
-    let project_scope = snapshot.cwd.join(".pi").join("personas");
+    let project_scope = snapshot.cwd.join(".rpi").join("personas");
     match std::fs::symlink_metadata(&user_scope) {
         Ok(meta) if meta.file_type().is_symlink() => {
             anyhow::bail!("persona scope path must not contain symlinks");
@@ -1051,8 +1182,7 @@ fn resolve_new_persona_root(
                 .with_context(|| format!("creating persona user scope for {name:?}"))?;
         }
         Err(error) => {
-            return Err(error)
-                .with_context(|| format!("reading persona user scope for {name:?}"));
+            return Err(error).with_context(|| format!("reading persona user scope for {name:?}"));
         }
     }
     let root = user_scope.join(name);
@@ -1111,7 +1241,8 @@ fn atomic_write_persona(
         if let Err(cleanup) = std::fs::remove_file(&tmp) {
             eprintln!("persona temp cleanup failed after install error for {persona:?}: {cleanup}");
         }
-        return Err(error).with_context(|| format!("installing persona definition for {persona:?}"));
+        return Err(error)
+            .with_context(|| format!("installing persona definition for {persona:?}"));
     }
     // New: persona.md is now a hard link to the temp; drop the temp name so no
     // leftover temp file stays behind. For Edit, rename already consumed it.
@@ -1143,8 +1274,7 @@ fn write_persona_temp(root: &Path, content: &str, persona: &str) -> anyhow::Resu
         .with_context(|| format!("creating persona temp file for {persona:?}"))?;
     if let Err(error) = file.write_all(content.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(error)
-            .with_context(|| format!("writing persona temp file for {persona:?}"));
+        return Err(error).with_context(|| format!("writing persona temp file for {persona:?}"));
     }
     if let Err(error) = file.flush() {
         let _ = std::fs::remove_file(&tmp);
@@ -1266,7 +1396,11 @@ fn format_definition_details(
     if definition.is_persona() {
         lines.push(format!(
             "personality: {}",
-            if definition.personality.as_ref().is_some_and(|value| !value.is_empty()) {
+            if definition
+                .personality
+                .as_ref()
+                .is_some_and(|value| !value.is_empty())
+            {
                 "present"
             } else {
                 "absent"
@@ -1416,7 +1550,11 @@ pub async fn invoke_extension_command(
     let runtime = application
         .extension_runtime()
         .ok_or_else(|| anyhow::anyhow!("extension runtime is not loaded"))?;
-    if !runtime.commands().iter().any(|command| command.name == name) {
+    if !runtime
+        .commands()
+        .iter()
+        .any(|command| command.name == name)
+    {
         anyhow::bail!(
             "unknown or untrusted extension command {name:?}; only commands registered by installed trusted extensions can run"
         );
@@ -1436,7 +1574,6 @@ pub async fn invoke_extension_chain(
     }
     Ok(outputs)
 }
-
 
 /// Commands implemented by both full-screen and line-oriented interactive modes.
 pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
@@ -1543,6 +1680,20 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         requires_arguments: false,
     },
     BuiltinCommand {
+        name: "team",
+        description: "Manage agent teams that gather runners into one project",
+        argument_hint: Some(
+            "[list|status [name]|create <name> [project-label [cwd]]|join <name> <origin> [label]|leave <team> <runner>|run <team> <runner> <json>|broadcast <team> <json>|remove <name>]",
+        ),
+        requires_arguments: false,
+    },
+    BuiltinCommand {
+        name: "thinking",
+        description: "Show or set the model thinking level",
+        argument_hint: Some("[off|minimal|low|medium|high|xhigh|max]"),
+        requires_arguments: false,
+    },
+    BuiltinCommand {
         name: "branch",
         description: "Create a new branch from a previous message",
         argument_hint: None,
@@ -1581,7 +1732,9 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     BuiltinCommand {
         name: "loop",
         description: "Run a prompt on a recurring interval",
-        argument_hint: Some("[list|cancel <id>|delete <id>|update <id> [interval] [prompt]|create <interval> <prompt>|<interval> <prompt>]"),
+        argument_hint: Some(
+            "[list|cancel <id>|delete <id>|update <id> [interval] [prompt]|create <interval> <prompt>|<interval> <prompt>]",
+        ),
         requires_arguments: true,
     },
     BuiltinCommand {
@@ -1611,7 +1764,9 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     BuiltinCommand {
         name: "goal",
         description: "Create, inspect, pin, pause, resume, complete, or drop the session goal",
-        argument_hint: Some("[show|inspect|create [--tokens N] <objective>|pin <text>|pins|unpin <index>|pause|resume|complete|drop]"),
+        argument_hint: Some(
+            "[show|inspect|create [--tokens N] <objective>|pin <text>|pins|unpin <index>|pause|resume|complete|drop]",
+        ),
         requires_arguments: false,
     },
     BuiltinCommand {
@@ -1623,9 +1778,15 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         requires_arguments: false,
     },
     BuiltinCommand {
+        name: "commit",
+        description: "Review one commit's diff in a fullscreen panel, or pick from recent commits",
+        argument_hint: Some("[<ref>]"),
+        requires_arguments: false,
+    },
+    BuiltinCommand {
         name: "code-review",
-        description: "Browse a working-tree or two-revision Git diff in a fullscreen panel",
-        argument_hint: Some("[<from> <to>]"),
+        description: "Browse a working-tree, base-to-working-tree, or two-revision Git diff in a fullscreen panel",
+        argument_hint: Some("[<base> | <from> <to>]"),
         requires_arguments: false,
     },
     BuiltinCommand {
@@ -1640,11 +1801,12 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         argument_hint: Some("<id>"),
         requires_arguments: true,
     },
-
     BuiltinCommand {
         name: "todo",
-        description: "Show the Todo DAG panel, set the plan with markdown, or start/done/drop/clear tasks by exact text",
-        argument_hint: Some("[list|start <task>|done <task>|drop <task>|clear|<markdown>]"),
+        description: "Show and manage the session Todo DAG and durable child sessions",
+        argument_hint: Some(
+            "[list|new [label]|select <id>|send [id] <message>|add <id> [options] <task>|status [id]|pause [id]|resume [id]|stop [id]|cancel [id]|archive <id>|start <task>|done <task>|drop <task>|clear|<markdown>]",
+        ),
         requires_arguments: false,
     },
     BuiltinCommand {
@@ -1685,8 +1847,26 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "queue",
-        description: "Show pending steering/follow-up prompts (cancel clears them)",
-        argument_hint: Some("[cancel]"),
+        description: "Show pending steering/follow-up prompts (send injects steering now, cancel clears them)",
+        argument_hint: Some("[send|cancel]"),
+        requires_arguments: false,
+    },
+    BuiltinCommand {
+        name: "jobs",
+        description: "Show live orchestration jobs (id, agent, status, activity)",
+        argument_hint: None,
+        requires_arguments: false,
+    },
+    BuiltinCommand {
+        name: "activity",
+        description: "Show independent main-session orchestration activity",
+        argument_hint: None,
+        requires_arguments: false,
+    },
+    BuiltinCommand {
+        name: "irc",
+        description: "Show the hub mailbox timeline (from, to, body, reply correlation)",
+        argument_hint: None,
         requires_arguments: false,
     },
     BuiltinCommand {
@@ -1706,6 +1886,12 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Resume a native or foreign session",
         argument_hint: Some("[path|id|prefix]"),
         requires_arguments: false,
+    },
+    BuiltinCommand {
+        name: "move",
+        description: "Move this saved session to another checkout directory and resume it there",
+        argument_hint: Some("<absolute-existing-directory>"),
+        requires_arguments: true,
     },
     BuiltinCommand {
         name: "ps",
@@ -1734,7 +1920,9 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     BuiltinCommand {
         name: "persona",
         description: "List, show, select, create, edit, run, reset, or remove persistent personas",
-        argument_hint: Some("[<name>] [--select|--clear|--current] | new <name> | edit <name> | run <name> <assignment> | reset <name> --yes | remove <name> [--purge] --yes"),
+        argument_hint: Some(
+            "[<name>] [--select|--clear|--current] | new <name> | edit <name> | run <name> <assignment> | reset <name> --yes | remove <name> [--purge] --yes",
+        ),
         requires_arguments: false,
     },
     BuiltinCommand {
@@ -1773,7 +1961,6 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         argument_hint: None,
         requires_arguments: false,
     },
-
     BuiltinCommand {
         name: "live",
         description: "Toggle hold-to-talk voice mode (press Ctrl+Space to talk; transcript lands in the composer for review before Enter)",
@@ -1868,13 +2055,35 @@ pub fn parse_join_invocation(arguments: &str) -> anyhow::Result<pi_coding::colla
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum InteractiveSettingsCommand {
-    Inspect { scope: pi_coding::SettingsScope },
-    Search { scope: pi_coding::SettingsScope, query: String },
-    Set { scope: pi_coding::SettingsScope, key: String, value: serde_json::Value },
-    Reset { scope: pi_coding::SettingsScope, key: String },
-    Validate { scope: pi_coding::SettingsScope, key: Option<String>, value: Option<serde_json::Value> },
-    Apply { scope: pi_coding::SettingsScope, key: String, value: serde_json::Value },
-    Cancel { scope: pi_coding::SettingsScope },
+    Inspect {
+        scope: pi_coding::SettingsScope,
+    },
+    Search {
+        scope: pi_coding::SettingsScope,
+        query: String,
+    },
+    Set {
+        scope: pi_coding::SettingsScope,
+        key: String,
+        value: serde_json::Value,
+    },
+    Reset {
+        scope: pi_coding::SettingsScope,
+        key: String,
+    },
+    Validate {
+        scope: pi_coding::SettingsScope,
+        key: Option<String>,
+        value: Option<serde_json::Value>,
+    },
+    Apply {
+        scope: pi_coding::SettingsScope,
+        key: String,
+        value: serde_json::Value,
+    },
+    Cancel {
+        scope: pi_coding::SettingsScope,
+    },
 }
 
 pub fn parse_interactive_settings_command(
@@ -1908,12 +2117,15 @@ pub fn parse_interactive_settings_command(
             if rest.is_empty() {
                 anyhow::bail!("usage: /settings search [--global|--project] <query>");
             }
-            InteractiveSettingsCommand::Search { scope, query: rest.join(" ") }
+            InteractiveSettingsCommand::Search {
+                scope,
+                query: rest.join(" "),
+            }
         }
         "set" => {
-            let key = rest.first().cloned().ok_or_else(|| anyhow::anyhow!(
-                "usage: /settings set [--global|--project] <key> <json-value>"
-            ))?;
+            let key = rest.first().cloned().ok_or_else(|| {
+                anyhow::anyhow!("usage: /settings set [--global|--project] <key> <json-value>")
+            })?;
             if rest.len() != 2 {
                 anyhow::bail!("usage: /settings set [--global|--project] <key> <json-value>");
             }
@@ -1925,19 +2137,25 @@ pub fn parse_interactive_settings_command(
             if rest.len() != 1 {
                 anyhow::bail!("usage: /settings reset [--global|--project] <key>");
             }
-            InteractiveSettingsCommand::Reset { scope, key: rest.remove(0) }
+            InteractiveSettingsCommand::Reset {
+                scope,
+                key: rest.remove(0),
+            }
         }
         "validate" => {
-            let (key, value) = match rest.as_slice() {
-                [] => (None, None),
-                [key, value] => (
-                    Some(key.clone()),
-                    Some(serde_json::from_str(value).map_err(|error| {
-                        anyhow::anyhow!("invalid JSON setting value: {error}")
-                    })?),
-                ),
-                _ => anyhow::bail!("usage: /settings validate [--global|--project] [<key> <json-value>]"),
-            };
+            let (key, value) =
+                match rest.as_slice() {
+                    [] => (None, None),
+                    [key, value] => (
+                        Some(key.clone()),
+                        Some(serde_json::from_str(value).map_err(|error| {
+                            anyhow::anyhow!("invalid JSON setting value: {error}")
+                        })?),
+                    ),
+                    _ => anyhow::bail!(
+                        "usage: /settings validate [--global|--project] [<key> <json-value>]"
+                    ),
+                };
             InteractiveSettingsCommand::Validate { scope, key, value }
         }
         "apply" => {
@@ -2175,10 +2393,7 @@ fn format_rewind_list(application: &pi_coding::Application) -> anyhow::Result<St
     ];
     for preview in previews {
         if let Some(name) = preview.checkpoint_name.as_deref() {
-            let target = preview
-                .checkpoint_target_id
-                .as_deref()
-                .unwrap_or("?");
+            let target = preview.checkpoint_target_id.as_deref().unwrap_or("?");
             lines.push(format!(
                 "{:>3}  [checkpoint {name} -> {target}]",
                 preview.index
@@ -2268,7 +2483,9 @@ pub async fn execute_encrypted_share(
     application: &pi_coding::Application,
     passphrase: &str,
 ) -> anyhow::Result<String> {
-    let result = application.share_session_encrypted(passphrase, None).await?;
+    let result = application
+        .share_session_encrypted(passphrase, None)
+        .await?;
     let mut message = format!(
         "Wrote encrypted session share to {}\n{}",
         result.ciphertext_path.display(),
@@ -2309,6 +2526,118 @@ fn edit_distance(left: &str, right: &str) -> usize {
 mod tests {
     use super::*;
 
+    struct TestApplicationFixture {
+        application: pi_coding::Application,
+        _resources: pi_coding::ResourceManager,
+        _faux: pi_ai::providers::FauxProviderRegistration,
+        _owned_dirs: Vec<tempfile::TempDir>,
+    }
+
+    impl std::ops::Deref for TestApplicationFixture {
+        type Target = pi_coding::Application;
+
+        fn deref(&self) -> &Self::Target {
+            &self.application
+        }
+    }
+
+    fn faux_model(label: &str) -> (pi_ai::Model, pi_ai::providers::FauxProviderRegistration) {
+        let suffix = uuid::Uuid::now_v7().simple().to_string();
+        let model = pi_ai::Model {
+            id: format!("{label}-{suffix}"),
+            name: label.to_owned(),
+            api: format!("{label}-api-{suffix}"),
+            provider: format!("faux-{label}-{suffix}"),
+            base_url: "http://localhost:0".to_owned(),
+            ..pi_ai::Model::default()
+        };
+        let registration =
+            pi_ai::providers::register_faux_provider(pi_ai::providers::FauxProviderOptions {
+                api: model.api.clone(),
+                provider: model.provider.clone(),
+                models: vec![model.clone()],
+                chunk_size: 4,
+            });
+        (model, registration)
+    }
+
+    fn disabled_session(model: pi_ai::Model, cwd: &std::path::Path) -> pi_coding::Session {
+        let session = pi_coding::Session::new_with_additional_tools_filtered_and_discovery(
+            pi_coding::SessionOptions {
+                model,
+                cwd: cwd.to_path_buf(),
+                system_prompt: String::new(),
+                thinking_level: pi_agent::ThinkingLevel::Off,
+                api_key: "faux".to_owned(),
+                compaction: None,
+                stream_options: Default::default(),
+                tools: Some(Vec::new()),
+                before_tool_call: None,
+                after_tool_call: None,
+                stream_fn: None,
+                auth_resolver: None,
+                auth_manager: None,
+            },
+            Vec::new(),
+            pi_coding::ToolSelection::default(),
+            pi_coding::ResourceDiscovery::Disabled,
+        )
+        .expect("hermetic session");
+        let session_dir = cwd.join(".pi-test-sessions");
+        std::fs::create_dir_all(&session_dir).expect("isolated session directory");
+        session.set_session_dir(session_dir);
+        session
+    }
+
+    fn isolated_resource_options(
+        cwd: &std::path::Path,
+        agent_dir: &std::path::Path,
+        trust_project: bool,
+    ) -> pi_coding::ResourceManagerOptions {
+        std::fs::create_dir_all(agent_dir).expect("isolated agent directory");
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+        )
+        .expect("isolated sandbox settings");
+        let mut options = pi_coding::ResourceManagerOptions::new(cwd);
+        options.agent_dir = agent_dir.to_path_buf();
+        options.project_trust_override = Some(trust_project);
+        options.disable_extensions = true;
+        options.disable_skills = true;
+        options.disable_prompt_templates = true;
+        options.disable_themes = true;
+        options.disable_context_files = true;
+        options
+    }
+
+    async fn application_fixture(
+        session: pi_coding::Session,
+        resources: pi_coding::ResourceManager,
+        faux: pi_ai::providers::FauxProviderRegistration,
+        owned_dirs: Vec<tempfile::TempDir>,
+    ) -> TestApplicationFixture {
+        session
+            .attach_resources(resources.clone())
+            .await
+            .expect("attach isolated resources");
+        let application = pi_coding::Application::new(session).await;
+        assert_eq!(
+            resources.generation(),
+            application
+                .resource_snapshot()
+                .expect("published resource snapshot")
+                .generation,
+            "application fixture must publish its resource generation",
+        );
+        TestApplicationFixture {
+            application,
+            _resources: resources,
+            _faux: faux,
+            _owned_dirs: owned_dirs,
+        }
+    }
+
     #[test]
     fn command_registry_has_unique_names_and_usage() {
         let mut names = BUILTIN_COMMANDS
@@ -2340,14 +2669,24 @@ mod tests {
         );
         assert_eq!(
             usage(builtin("todo").expect("todo command")),
-            "/todo [list|start <task>|done <task>|drop <task>|clear|<markdown>]"
+            "/todo [list|new [label]|select <id>|send [id] <message>|add <id> [options] <task>|status [id]|pause [id]|resume [id]|stop [id]|cancel [id]|archive <id>|start <task>|done <task>|drop <task>|clear|<markdown>]"
         );
         assert_eq!(
             usage(builtin("code-review").expect("code review command")),
-            "/code-review [<from> <to>]"
+            "/code-review [<base> | <from> <to>]",
         );
-        assert_eq!(usage(builtin("process").expect("process command")), "/process <start|describe|logs|send|resize|signal|stop|wait> ...");
-        assert_eq!(usage(builtin("settings").expect("settings command")), "/settings [list|search|set|reset|validate|apply|cancel] ...");
+        assert_eq!(
+            usage(builtin("commit").expect("commit command")),
+            "/commit [<ref>]",
+        );
+        assert_eq!(
+            usage(builtin("process").expect("process command")),
+            "/process <start|describe|logs|send|resize|signal|stop|wait> ..."
+        );
+        assert_eq!(
+            usage(builtin("settings").expect("settings command")),
+            "/settings [list|search|set|reset|validate|apply|cancel] ..."
+        );
         assert_eq!(
             usage(builtin("resume").expect("resume command")),
             "/resume [path|id|prefix]"
@@ -2355,7 +2694,7 @@ mod tests {
         assert_eq!(usage(builtin("fresh").expect("fresh command")), "/fresh");
         assert_eq!(
             usage(builtin("queue").expect("queue command")),
-            "/queue [cancel]"
+            "/queue [send|cancel]"
         );
         assert_eq!(
             usage(builtin("compact").expect("compact command")),
@@ -2377,23 +2716,58 @@ mod tests {
             usage(builtin("share").expect("share command")),
             "/share [--encrypt [passphrase]]"
         );
-        assert!(!requires_arguments(builtin("fresh").expect("fresh command")));
+        assert!(!requires_arguments(
+            builtin("fresh").expect("fresh command")
+        ));
         assert!(!requires_arguments(builtin("dump").expect("dump command")));
-        assert!(!requires_arguments(builtin("share").expect("share command")));
+        assert!(!requires_arguments(
+            builtin("share").expect("share command")
+        ));
         assert!(builtin("resume-codex").is_none());
+    }
+
+    #[test]
+    fn move_command_is_typed_required_arg_primary_surface() {
+        let command = builtin("move").expect("move command");
+        assert_eq!(command.name, "move");
+        assert!(
+            !command.description.is_empty(),
+            "move must advertise a description"
+        );
+        assert_eq!(
+            usage(command),
+            "/move <absolute-existing-directory>"
+        );
+        assert!(
+            requires_arguments(command),
+            "bare /move must be rejected with usage"
+        );
+        assert!(
+            is_primary_command("move"),
+            "move is visible in the slash picker and /help"
+        );
     }
 
     #[test]
     fn parses_compact_arguments() {
         assert_eq!(parse_compact_arguments(""), (false, None));
         assert_eq!(parse_compact_arguments("   "), (false, None));
-        assert_eq!(parse_compact_arguments("keep my recent work"), (false, Some("keep my recent work")));
+        assert_eq!(
+            parse_compact_arguments("keep my recent work"),
+            (false, Some("keep my recent work"))
+        );
         assert_eq!(parse_compact_arguments("--snap"), (true, None));
         assert_eq!(parse_compact_arguments("  --snap  "), (true, None));
         // Trailing text after --snap is ignored by the deterministic path.
-        assert_eq!(parse_compact_arguments("--snap preserve everything"), (true, None));
+        assert_eq!(
+            parse_compact_arguments("--snap preserve everything"),
+            (true, None)
+        );
         // A non-flag prefix stays instructions.
-        assert_eq!(parse_compact_arguments("--snapshot the plan"), (false, Some("--snapshot the plan")));
+        assert_eq!(
+            parse_compact_arguments("--snapshot the plan"),
+            (false, Some("--snapshot the plan"))
+        );
     }
 
     #[test]
@@ -2413,6 +2787,7 @@ mod tests {
                 "loop-delete",
                 "loop-cancel",
                 "overlay",
+                "move",
                 "process",
                 "run",
                 "chain",
@@ -2429,7 +2804,9 @@ mod tests {
             !requires_arguments(builtin("rewind").expect("rewind command")),
             "bare /rewind must list rewind targets"
         );
-        assert!(requires_arguments(builtin("import").expect("import command")));
+        assert!(requires_arguments(
+            builtin("import").expect("import command")
+        ));
         assert!(
             requires_arguments(builtin("checkpoint").expect("checkpoint command")),
             "bare /checkpoint must be rejected with usage"
@@ -2470,6 +2847,42 @@ mod tests {
     }
 
     #[test]
+    fn commit_inspect_invocation_parses_picker_and_single_ref() {
+        assert_eq!(
+            parse_commit_inspect_invocation(None),
+            Ok(CommitInspectInvocation::Picker)
+        );
+        assert_eq!(
+            parse_commit_inspect_invocation(Some("")),
+            Ok(CommitInspectInvocation::Picker)
+        );
+        assert_eq!(
+            parse_commit_inspect_invocation(Some("   ")),
+            Ok(CommitInspectInvocation::Picker)
+        );
+        assert_eq!(
+            parse_commit_inspect_invocation(Some("HEAD")),
+            Ok(CommitInspectInvocation::Commit {
+                reference: "HEAD".to_owned()
+            })
+        );
+        assert_eq!(
+            parse_commit_inspect_invocation(Some("  abc123  ")),
+            Ok(CommitInspectInvocation::Commit {
+                reference: "abc123".to_owned()
+            })
+        );
+        // More than one operand is never a revision range here: the picker
+        // and the single-commit review are the only surfaces.
+        for extra in ["a b", "HEAD~1 HEAD", "  x y z "] {
+            assert_eq!(
+                parse_commit_inspect_invocation(Some(extra)),
+                Err(COMMIT_INSPECT_USAGE.to_owned())
+            );
+        }
+    }
+
+    #[test]
     fn handoff_parses_prose_flag_and_rejects_unknown_arguments() {
         assert_eq!(
             parse_handoff_invocation("").expect("bare handoff"),
@@ -2488,8 +2901,8 @@ mod tests {
             HandoffInvocation::Prose
         );
         for bogus in ["--bogus", "-prose", "--PROSE", "--prose extra", "prose"] {
-            let error = parse_handoff_invocation(bogus)
-                .expect_err(&format!("{bogus:?} must be rejected"));
+            let error =
+                parse_handoff_invocation(bogus).expect_err(&format!("{bogus:?} must be rejected"));
             assert!(
                 error.to_string().contains("/handoff [--prose]"),
                 "{bogus:?} must surface usage: {error}"
@@ -2506,6 +2919,7 @@ mod tests {
                 "model",
                 "branch",
                 "resume",
+                "move",
                 "fork",
                 "export",
                 "dump",
@@ -2520,14 +2934,23 @@ mod tests {
                 "loop",
                 "goal",
                 "workflow",
+                "commit",
                 "code-review",
                 "btw",
                 "queue",
                 "live",
                 "skill",
+                "theme",
+                "thinking",
+                "todo",
+                "tree",
+                "trust",
+                "jobs",
+                "activity",
+                "irc",
             ]
         );
-        assert_eq!(PRIMARY_COMMAND_NAMES.len(), 23);
+        assert_eq!(PRIMARY_COMMAND_NAMES.len(), 33);
         let visible = visible_catalog()
             .into_iter()
             .map(|command| command.name)
@@ -2539,11 +2962,19 @@ mod tests {
         assert!(is_primary_command("checkpoint"));
         assert!(is_primary_command("live"));
         assert!(is_primary_command("persona"));
+        assert!(is_primary_command("move"));
+        assert!(is_primary_command("commit"));
+        assert!(!is_primary_command(concat!("todo", "-child")));
+        assert!(builtin(concat!("todo", "-child")).is_none());
+        assert!(is_primary_command("activity"));
         assert!(!is_primary_command("help"));
         assert!(!is_primary_command("import"));
         assert!(!is_primary_command("workfloww"));
         assert!(!is_primary_command("skill:release"));
-        assert!(builtin("import").is_some(), "hidden commands remain executable");
+        assert!(
+            builtin("import").is_some(),
+            "hidden commands remain executable"
+        );
         assert_eq!(
             usage(builtin("workflow").expect("workflow command")),
             "/workflow [list|show [id|name]|create <objective>|create <name> <objective>|pause|resume|cancel|integrate|remove]"
@@ -2568,93 +2999,73 @@ mod tests {
             parse_interactive_settings_command("settings", Some("apply --global compaction.enabled false")).unwrap(),
             Some(InteractiveSettingsCommand::Apply { scope: pi_coding::SettingsScope::Global, key, value }) if key == "compaction.enabled" && value == serde_json::json!(false)
         ));
-        assert!(parse_interactive_settings_command("settings", Some("apply compaction.enabled")).is_err());
-        assert!(parse_interactive_settings_command("settings", Some("set theme not-json")).is_err());
+        assert!(
+            parse_interactive_settings_command("settings", Some("apply compaction.enabled"))
+                .is_err()
+        );
+        assert!(
+            parse_interactive_settings_command("settings", Some("set theme not-json")).is_err()
+        );
     }
 
     #[tokio::test]
     async fn executable_catalog_excludes_dynamic_builtin_collisions() {
         let cwd = tempfile::tempdir().expect("tempdir");
-        let prompt_dir = cwd.path().join(".pi/prompts");
+        let agent_dir = tempfile::tempdir().expect("agent dir");
+        let prompt_dir = agent_dir.path().join("fixture-prompts");
         std::fs::create_dir_all(&prompt_dir).expect("prompt directory");
+        let prompt_path = prompt_dir.join("help.md");
         std::fs::write(
-            prompt_dir.join("help.md"),
+            &prompt_path,
             "---\ndescription: Conflicting help\n---\nreplacement",
         )
         .expect("prompt template");
-        let model = pi_ai::Model {
-            id: "catalog-test".into(),
-            name: "Catalog Test".into(),
-            api: "catalog-test".into(),
-            provider: "test".into(),
-            ..pi_ai::Model::default()
-        };
-        let session = pi_coding::Session::new(pi_coding::SessionOptions {
-            model,
-            cwd: cwd.path().to_path_buf(),
-            system_prompt: String::new(),
-            thinking_level: pi_agent::ThinkingLevel::Off,
-            api_key: "test".into(),
-            compaction: None,
-            stream_options: Default::default(),
-            tools: Some(Vec::new()),
-            before_tool_call: None,
-            after_tool_call: None,
-            stream_fn: None,
-            auth_resolver: None,
-        })
-        .expect("session");
-        let mut resource_options = pi_coding::ResourceManagerOptions::new(cwd.path());
-        resource_options.project_trust_override = Some(true);
-        let resources = pi_coding::ResourceManager::new(resource_options).expect("resources");
-        session.attach_resources(resources).await.expect("attach resources");
-        let application = pi_coding::Application::new(session).await;
+        let (model, faux) = faux_model("catalog-test");
+        let session = disabled_session(model, cwd.path());
+        let mut resource_options = isolated_resource_options(cwd.path(), agent_dir.path(), false);
+        resource_options.explicit_prompt_paths = vec![prompt_path];
+        let resources =
+            pi_coding::ResourceManager::new(resource_options).expect("catalog resources");
+        let application = application_fixture(session, resources, faux, Vec::new()).await;
         let (commands, diagnostics) = executable_catalog(&application);
-        assert_eq!(commands.iter().filter(|command| command.name == "help").count(), 1);
         assert_eq!(
-            commands.iter().find(|command| command.name == "help").map(|command| command.source),
+            commands
+                .iter()
+                .filter(|command| command.name == "help")
+                .count(),
+            1
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .find(|command| command.name == "help")
+                .map(|command| command.source),
             Some(CommandSource::Builtin)
         );
-        assert!(diagnostics.iter().any(|diagnostic| diagnostic.contains("Prompt command '/help' conflicts")));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("Prompt command '/help' conflicts"))
+        );
     }
 
     #[tokio::test]
     async fn skill_frontmatter_summary_shows_loaded_skill_fields_and_rejects_unknown() {
         let cwd = tempfile::tempdir().expect("tempdir");
-        let skill_dir = cwd.path().join(".pi/skills/research");
+        let agent_dir = tempfile::tempdir().expect("agent dir");
+        let skill_dir = agent_dir.path().join("fixture-skills/research");
         std::fs::create_dir_all(&skill_dir).expect("skill directory");
         std::fs::write(
             skill_dir.join("SKILL.md"),
             "---\nname: research\ndescription: Deep-dive codebase researcher.\nglobs: [\"**/*.rs\", \"Cargo.toml\"]\nalwaysApply: true\n---\n# Research\n\nBody.",
         )
         .expect("skill file");
-        let model = pi_ai::Model {
-            id: "skill-test".into(),
-            name: "Skill Test".into(),
-            api: "skill-test".into(),
-            provider: "test".into(),
-            ..pi_ai::Model::default()
-        };
-        let session = pi_coding::Session::new(pi_coding::SessionOptions {
-            model,
-            cwd: cwd.path().to_path_buf(),
-            system_prompt: String::new(),
-            thinking_level: pi_agent::ThinkingLevel::Off,
-            api_key: "test".into(),
-            compaction: None,
-            stream_options: Default::default(),
-            tools: Some(Vec::new()),
-            before_tool_call: None,
-            after_tool_call: None,
-            stream_fn: None,
-            auth_resolver: None,
-        })
-        .expect("session");
-        let mut resource_options = pi_coding::ResourceManagerOptions::new(cwd.path());
-        resource_options.project_trust_override = Some(true);
-        let resources = pi_coding::ResourceManager::new(resource_options).expect("resources");
-        session.attach_resources(resources).await.expect("attach resources");
-        let application = pi_coding::Application::new(session).await;
+        let (model, faux) = faux_model("skill-test");
+        let session = disabled_session(model, cwd.path());
+        let mut resource_options = isolated_resource_options(cwd.path(), agent_dir.path(), false);
+        resource_options.explicit_skill_paths = vec![skill_dir];
+        let resources = pi_coding::ResourceManager::new(resource_options).expect("skill resources");
+        let application = application_fixture(session, resources, faux, Vec::new()).await;
 
         let summary =
             skill_frontmatter_summary(&application, "research").expect("loaded skill summary");
@@ -2679,46 +3090,33 @@ mod tests {
     #[tokio::test]
     async fn skill_frontmatter_summary_omits_unset_globs_and_always_apply() {
         let cwd = tempfile::tempdir().expect("tempdir");
-        let skill_dir = cwd.path().join(".pi/skills/bare");
+        let agent_dir = tempfile::tempdir().expect("agent dir");
+        let skill_dir = agent_dir.path().join("fixture-skills/bare");
         std::fs::create_dir_all(&skill_dir).expect("skill directory");
         std::fs::write(
             skill_dir.join("SKILL.md"),
             "---\nname: bare\ndescription: No patterns.\n---\nBody.",
         )
         .expect("skill file");
-        let model = pi_ai::Model {
-            id: "skill-bare".into(),
-            name: "Skill Bare".into(),
-            api: "skill-bare".into(),
-            provider: "test".into(),
-            ..pi_ai::Model::default()
-        };
-        let session = pi_coding::Session::new(pi_coding::SessionOptions {
-            model,
-            cwd: cwd.path().to_path_buf(),
-            system_prompt: String::new(),
-            thinking_level: pi_agent::ThinkingLevel::Off,
-            api_key: "test".into(),
-            compaction: None,
-            stream_options: Default::default(),
-            tools: Some(Vec::new()),
-            before_tool_call: None,
-            after_tool_call: None,
-            stream_fn: None,
-            auth_resolver: None,
-        })
-        .expect("session");
-        let mut resource_options = pi_coding::ResourceManagerOptions::new(cwd.path());
-        resource_options.project_trust_override = Some(true);
-        let resources = pi_coding::ResourceManager::new(resource_options).expect("resources");
-        session.attach_resources(resources).await.expect("attach resources");
-        let application = pi_coding::Application::new(session).await;
+        let (model, faux) = faux_model("skill-bare");
+        let session = disabled_session(model, cwd.path());
+        let mut resource_options = isolated_resource_options(cwd.path(), agent_dir.path(), false);
+        resource_options.explicit_skill_paths = vec![skill_dir];
+        let resources =
+            pi_coding::ResourceManager::new(resource_options).expect("bare skill resources");
+        let application = application_fixture(session, resources, faux, Vec::new()).await;
 
         let summary = skill_frontmatter_summary(&application, "bare").expect("bare skill summary");
         assert!(summary.contains("name: bare"), "{summary}");
         assert!(summary.contains("description: No patterns."), "{summary}");
-        assert!(!summary.contains("globs:"), "globs must be omitted when unset: {summary}");
-        assert!(!summary.contains("alwaysApply:"), "alwaysApply must be omitted when unset: {summary}");
+        assert!(
+            !summary.contains("globs:"),
+            "globs must be omitted when unset: {summary}"
+        );
+        assert!(
+            !summary.contains("alwaysApply:"),
+            "alwaysApply must be omitted when unset: {summary}"
+        );
     }
 
     #[test]
@@ -2755,11 +3153,17 @@ mod tests {
     fn dump_invocation_parses_flags_paths_and_extensions() {
         assert_eq!(
             parse_dump_invocation(""),
-            DumpRequest { format: DumpFormat::Html, output: None }
+            DumpRequest {
+                format: DumpFormat::Html,
+                output: None
+            }
         );
         assert_eq!(
             parse_dump_invocation("--jsonl"),
-            DumpRequest { format: DumpFormat::Jsonl, output: None }
+            DumpRequest {
+                format: DumpFormat::Jsonl,
+                output: None
+            }
         );
         assert_eq!(
             parse_dump_invocation("--jsonl out.jsonl"),
@@ -2805,15 +3209,24 @@ mod tests {
     fn share_invocation_parses_encrypt_and_passphrase() {
         assert_eq!(
             parse_share_invocation("").unwrap(),
-            ShareRequest { encrypt: false, passphrase: None }
+            ShareRequest {
+                encrypt: false,
+                passphrase: None
+            }
         );
         assert_eq!(
             parse_share_invocation("--encrypt").unwrap(),
-            ShareRequest { encrypt: true, passphrase: None }
+            ShareRequest {
+                encrypt: true,
+                passphrase: None
+            }
         );
         assert_eq!(
             parse_share_invocation("--encrypt hunter2").unwrap(),
-            ShareRequest { encrypt: true, passphrase: Some("hunter2".to_owned()) }
+            ShareRequest {
+                encrypt: true,
+                passphrase: Some("hunter2".to_owned())
+            }
         );
         assert_eq!(
             parse_share_invocation("--encrypt  a b c ").unwrap(),
@@ -2828,10 +3241,22 @@ mod tests {
 
     #[test]
     fn collab_invocation_parses_start_status_stop() {
-        assert_eq!(parse_collab_invocation("").unwrap(), CollabInvocation::Start);
-        assert_eq!(parse_collab_invocation("  ").unwrap(), CollabInvocation::Start);
-        assert_eq!(parse_collab_invocation("status").unwrap(), CollabInvocation::Status);
-        assert_eq!(parse_collab_invocation(" stop ").unwrap(), CollabInvocation::Stop);
+        assert_eq!(
+            parse_collab_invocation("").unwrap(),
+            CollabInvocation::Start
+        );
+        assert_eq!(
+            parse_collab_invocation("  ").unwrap(),
+            CollabInvocation::Start
+        );
+        assert_eq!(
+            parse_collab_invocation("status").unwrap(),
+            CollabInvocation::Status
+        );
+        assert_eq!(
+            parse_collab_invocation(" stop ").unwrap(),
+            CollabInvocation::Stop
+        );
         // Typos are rejected, never silently treated as a start.
         assert!(parse_collab_invocation("statuss").is_err());
         assert!(parse_collab_invocation("stpo").is_err());
@@ -2865,41 +3290,52 @@ mod tests {
         // problem, not the key bytes.
         let broken = format!("{link}#c=not-base64!!");
         let error = parse_join_invocation(&broken).expect_err("broken fragment");
-        assert!(!error.to_string().contains("not-base64"), "errors must be secret-free");
+        assert!(
+            !error.to_string().contains("not-base64"),
+            "errors must be secret-free"
+        );
     }
 
-    async fn recorded_application(cwd: &std::path::Path, sessions: &std::path::Path, id: &str) -> pi_coding::Application {
-        let recorder = pi_coding::start_session_in(
-            cwd,
-            None,
-            Some("off"),
-            Some(sessions),
-            Some(id),
-            None,
-        )
-        .expect("start recorder");
+    async fn recorded_application(
+        cwd: &std::path::Path,
+        sessions: &std::path::Path,
+        id: &str,
+    ) -> TestApplicationFixture {
+        let recorder =
+            pi_coding::start_session_in(cwd, None, Some("off"), Some(sessions), Some(id), None)
+                .expect("start recorder");
         recorder
             .record_message(&pi_ai::Message::user_text("fresh dump fixture", 0))
             .expect("record message");
         recorder.persist_now().expect("persist session");
-        let session = pi_coding::Session::new(pi_coding::SessionOptions {
-            model: pi_ai::Model::default(),
-            cwd: cwd.to_path_buf(),
-            system_prompt: String::new(),
-            thinking_level: pi_agent::ThinkingLevel::Off,
-            api_key: String::new(),
-            compaction: None,
-            stream_options: Default::default(),
-            tools: Some(Vec::new()),
-            before_tool_call: None,
-            after_tool_call: None,
-            stream_fn: None,
-            auth_resolver: None,
-        })
-        .expect("session");
+        let agent_dir = tempfile::tempdir().expect("agent dir");
+        let (model, faux) = faux_model("recorded-session");
+        let session = disabled_session(model, cwd);
         session.set_session_dir(sessions.to_path_buf());
         session.record(recorder).expect("attach recorder");
-        pi_coding::Application::new(session).await
+        let resources = pi_coding::ResourceManager::new(isolated_resource_options(
+            cwd,
+            agent_dir.path(),
+            false,
+        ))
+        .expect("recorded session resources");
+        let application = application_fixture(session, resources, faux, vec![agent_dir]).await;
+        application
+            .session()
+            .send_custom_message(
+                pi_ai::CustomMessage {
+                    custom_type: "dump_fixture".to_owned(),
+                    content: "fresh dump fixture".into(),
+                    display: true,
+                    details: None,
+                    timestamp: 0,
+                },
+                pi_coding::MessageDelivery::FollowUp,
+                false,
+            )
+            .await
+            .expect("append dump fixture branch message");
+        application
     }
 
     #[tokio::test]
@@ -2912,11 +3348,16 @@ mod tests {
         assert!(before.session_file.is_some());
 
         assert!(
-            execute_fresh(&application).await.expect("fresh must complete"),
+            execute_fresh(&application)
+                .await
+                .expect("fresh must complete"),
             "fresh must not be cancelled in this flow"
         );
         let after = application.state().await;
-        assert_ne!(after.session_id, before.session_id, "/fresh must switch to a new recorder");
+        assert_ne!(
+            after.session_id, before.session_id,
+            "/fresh must switch to a new recorder"
+        );
         let old_file = sessions.path().join("fresh-source.jsonl");
         assert!(
             old_file.exists(),
@@ -2939,7 +3380,10 @@ mod tests {
         // HTML default derives from the session file path.
         let html_path = execute_dump(
             &application,
-            DumpRequest { format: DumpFormat::Html, output: None },
+            DumpRequest {
+                format: DumpFormat::Html,
+                output: None,
+            },
         )
         .await
         .expect("html dump");
@@ -2951,14 +3395,17 @@ mod tests {
         // JSONL default lands in the session cwd under the session stem.
         let jsonl_path = execute_dump(
             &application,
-            DumpRequest { format: DumpFormat::Jsonl, output: None },
+            DumpRequest {
+                format: DumpFormat::Jsonl,
+                output: None,
+            },
         )
         .await
         .expect("jsonl dump");
         assert_eq!(jsonl_path, cwd.path().join("dump-source.jsonl"));
         let jsonl = std::fs::read_to_string(&jsonl_path).expect("read jsonl");
         assert!(!jsonl.is_empty());
-        assert!(jsonl.contains("fresh dump fixture"));
+        assert!(jsonl.contains("fresh dump fixture"), "{jsonl}");
         application.cleanup().await;
     }
 
@@ -3007,7 +3454,7 @@ mod tests {
     async fn role_application(
         cwd: &std::path::Path,
         agent_dir: &std::path::Path,
-    ) -> pi_coding::Application {
+    ) -> TestApplicationFixture {
         let agents_dir = agent_dir.join("agents");
         std::fs::create_dir_all(&agents_dir).expect("agents directory");
         std::fs::write(
@@ -3021,39 +3468,26 @@ mod tests {
              Review every change carefully.",
         )
         .expect("role definition");
-        let model = pi_ai::Model {
-            id: "role-test".into(),
-            name: "Role Test".into(),
-            api: "role-test".into(),
-            provider: "test".into(),
-            ..pi_ai::Model::default()
-        };
-        let session = pi_coding::Session::new(pi_coding::SessionOptions {
-            model,
-            cwd: cwd.to_path_buf(),
-            system_prompt: String::new(),
-            thinking_level: pi_agent::ThinkingLevel::Off,
-            api_key: "test".into(),
-            compaction: None,
-            stream_options: Default::default(),
-            tools: Some(Vec::new()),
-            before_tool_call: None,
-            after_tool_call: None,
-            stream_fn: None,
-            auth_resolver: None,
-        })
-        .expect("session");
-        let mut resource_options = pi_coding::ResourceManagerOptions::new(cwd);
-        resource_options.agent_dir = agent_dir.to_path_buf();
-        let resources = pi_coding::ResourceManager::new(resource_options).expect("resources");
+        let (model, faux) = faux_model("role-test");
+        let session = disabled_session(model, cwd);
+        let session_dir = cwd.join("role-parent-sessions");
+        std::fs::create_dir_all(&session_dir).expect("role parent session directory");
+        let recorder = pi_coding::start_session_in(
+            cwd,
+            None,
+            None,
+            Some(&session_dir),
+            Some("role-parent"),
+            None,
+        )
+        .expect("role parent recorder");
         session
-            .attach_resources(resources)
-            .await
-            .expect("attach resources");
-        let snapshot = session
-            .resource_manager()
-            .expect("resource manager")
-            .snapshot();
+            .record(recorder)
+            .expect("attach role parent recorder");
+        let resources =
+            pi_coding::ResourceManager::new(isolated_resource_options(cwd, agent_dir, false))
+                .expect("role resources");
+        let snapshot = resources.snapshot();
         let artifacts = tempfile::tempdir().expect("artifacts");
         let mut config = pi_coding::OrchestrationConfig::new(
             pi_coding::AgentCatalog::from_agents(snapshot.agents.clone()),
@@ -3065,7 +3499,24 @@ mod tests {
         });
         let runtime =
             pi_coding::OrchestrationRuntime::new(config, factory).expect("orchestration runtime");
-        pi_coding::Application::new_with_orchestration(session, runtime).await
+        session
+            .attach_resources(resources.clone())
+            .await
+            .expect("attach role resources");
+        let application = pi_coding::Application::new_with_orchestration(session, runtime).await;
+        assert_eq!(
+            resources.generation(),
+            application
+                .resource_snapshot()
+                .expect("published role resources")
+                .generation,
+        );
+        TestApplicationFixture {
+            application,
+            _resources: resources,
+            _faux: faux,
+            _owned_dirs: vec![artifacts],
+        }
     }
 
     #[tokio::test]
@@ -3081,7 +3532,10 @@ mod tests {
         .expect("role list");
         assert!(output.contains("reviewer"), "{output}");
         assert!(output.contains("Deep code reviewer"), "{output}");
-        assert!(output.contains("task"), "bundled task role must be listed: {output}");
+        assert!(
+            output.contains("task"),
+            "bundled task role must be listed: {output}"
+        );
 
         application.cleanup().await;
     }
@@ -3104,7 +3558,10 @@ mod tests {
             output.contains("capabilityCeiling: read=true write=true exec=false"),
             "{output}"
         );
-        assert!(output.contains("system prompt: Review every change carefully."), "{output}");
+        assert!(
+            output.contains("system prompt: Review every change carefully."),
+            "{output}"
+        );
 
         let error = execute_interactive_role_command(
             &application,
@@ -3256,16 +3713,10 @@ mod tests {
         // Destructive ops without --yes are refused.
         let reset_err = parse_interactive_persona_command(Some("reset mentor"))
             .expect_err("reset without --yes");
-        assert!(
-            reset_err.to_string().contains("--yes"),
-            "{reset_err:#}"
-        );
+        assert!(reset_err.to_string().contains("--yes"), "{reset_err:#}");
         let remove_err = parse_interactive_persona_command(Some("remove mentor"))
             .expect_err("remove without --yes");
-        assert!(
-            remove_err.to_string().contains("--yes"),
-            "{remove_err:#}"
-        );
+        assert!(remove_err.to_string().contains("--yes"), "{remove_err:#}");
         let purge_err = parse_interactive_persona_command(Some("remove mentor --purge"))
             .expect_err("purge without --yes");
         assert!(purge_err.to_string().contains("--yes"), "{purge_err:#}");
@@ -3297,10 +3748,12 @@ mod tests {
                  name: {name}\n\
                  description: {name} persona\n\
                  personality: steady mentor\n\
+                 {}\n\
                  softBudget:\n\
                    maxRequests: 4\n\
                  ---\n\
-                 {body}"
+                 {body}",
+                super::default_persona_tools_frontmatter()
             ),
         )
         .expect("persona.md");
@@ -3313,7 +3766,7 @@ mod tests {
     async fn persona_application(
         cwd: &std::path::Path,
         agent_dir: &std::path::Path,
-    ) -> pi_coding::Application {
+    ) -> TestApplicationFixture {
         // Ordinary agent still present so /role lists both and /persona filters.
         let agents_dir = agent_dir.join("agents");
         std::fs::create_dir_all(&agents_dir).expect("agents directory");
@@ -3322,30 +3775,17 @@ mod tests {
             "---\nname: reviewer\ndescription: Ordinary agent\n---\nReview code.",
         )
         .expect("agent definition");
-        write_user_persona(agent_dir, "mentor", "Guide the user patiently.");
+        if !agent_dir
+            .join("personas")
+            .join("mentor")
+            .join("persona.md")
+            .is_file()
+        {
+            write_user_persona(agent_dir, "mentor", "Guide the user patiently.");
+        }
 
-        let model = pi_ai::Model {
-            id: "persona-test".into(),
-            name: "Persona Test".into(),
-            api: "persona-test".into(),
-            provider: "test".into(),
-            ..pi_ai::Model::default()
-        };
-        let session = pi_coding::Session::new(pi_coding::SessionOptions {
-            model,
-            cwd: cwd.to_path_buf(),
-            system_prompt: String::new(),
-            thinking_level: pi_agent::ThinkingLevel::Off,
-            api_key: "test".into(),
-            compaction: None,
-            stream_options: Default::default(),
-            tools: Some(Vec::new()),
-            before_tool_call: None,
-            after_tool_call: None,
-            stream_fn: None,
-            auth_resolver: None,
-        })
-        .expect("session");
+        let (model, faux) = faux_model("persona-test");
+        let session = disabled_session(model, cwd);
         let session_dir = cwd.join("parent-sessions");
         std::fs::create_dir_all(&session_dir).expect("parent session directory");
         let recorder = pi_coding::start_session_in(
@@ -3358,17 +3798,10 @@ mod tests {
         )
         .expect("parent recorder");
         session.record(recorder).expect("attach parent recorder");
-        let mut resource_options = pi_coding::ResourceManagerOptions::new(cwd);
-        resource_options.agent_dir = agent_dir.to_path_buf();
-        let resources = pi_coding::ResourceManager::new(resource_options).expect("resources");
-        session
-            .attach_resources(resources)
-            .await
-            .expect("attach resources");
-        let snapshot = session
-            .resource_manager()
-            .expect("resource manager")
-            .snapshot();
+        let resources =
+            pi_coding::ResourceManager::new(isolated_resource_options(cwd, agent_dir, false))
+                .expect("persona resources");
+        let snapshot = resources.snapshot();
         let artifacts = cwd.join("artifacts");
         std::fs::create_dir_all(&artifacts).expect("artifacts");
         let mut config = pi_coding::OrchestrationConfig::new(
@@ -3376,15 +3809,28 @@ mod tests {
             &artifacts,
         );
         config.idle_ttl = None;
-        let factory: pi_coding::ChildSessionFactory = std::sync::Arc::new(|_| {
-            Box::pin(std::future::pending())
-        });
+        let factory: pi_coding::ChildSessionFactory =
+            std::sync::Arc::new(|_| Box::pin(std::future::pending()));
         let runtime =
             pi_coding::OrchestrationRuntime::new(config, factory).expect("orchestration runtime");
-        runtime
-            .bind_and_recover(&session)
-            .expect("bind persona runtime");
-        pi_coding::Application::new_with_orchestration(session, runtime).await
+        session
+            .attach_resources(resources.clone())
+            .await
+            .expect("attach persona resources");
+        let application = pi_coding::Application::new_with_orchestration(session, runtime).await;
+        assert_eq!(
+            resources.generation(),
+            application
+                .resource_snapshot()
+                .expect("published persona resources")
+                .generation,
+        );
+        TestApplicationFixture {
+            application,
+            _resources: resources,
+            _faux: faux,
+            _owned_dirs: Vec::new(),
+        }
     }
 
     #[tokio::test]
@@ -3417,12 +3863,18 @@ mod tests {
             parse_interactive_role_command(None).expect("bare /role"),
         )
         .expect("role list");
-        assert!(role_list.contains("mentor"), "role list includes personas: {role_list}");
+        assert!(
+            role_list.contains("mentor"),
+            "role list includes personas: {role_list}"
+        );
         assert!(
             role_list.contains("reviewer"),
             "role list includes ordinary agents: {role_list}"
         );
-        assert!(role_list.contains("task"), "role list includes bundled: {role_list}");
+        assert!(
+            role_list.contains("task"),
+            "role list includes bundled: {role_list}"
+        );
 
         application.cleanup().await;
     }
@@ -3440,10 +3892,7 @@ mod tests {
         .await
         .expect("select persona");
 
-        let settings = application
-            .settings_manager()
-            .expect("settings")
-            .settings();
+        let settings = application.settings_manager().expect("settings").settings();
         assert_eq!(
             settings
                 .orchestration
@@ -3461,11 +3910,8 @@ mod tests {
             provider: "test".into(),
             ..pi_ai::Model::default()
         };
-        let config = crate::session_run_blueprint::test_orchestration_config(
-            &snapshot,
-            &settings,
-            &model,
-        );
+        let config =
+            crate::session_run_blueprint::test_orchestration_config(&snapshot, &settings, &model);
         assert_eq!(config.preferred_agent.as_deref(), Some("mentor"));
 
         application.cleanup().await;
@@ -3487,6 +3933,17 @@ mod tests {
         assert!(output.contains("personality: present"), "{output}");
         assert!(output.contains("scope: user"), "{output}");
         assert!(output.contains("softBudget:"), "{output}");
+        assert!(
+            output.contains(&format!(
+                "tools: {}",
+                super::DEFAULT_PERSONA_CODING_TOOLS.join(", ")
+            )),
+            "default persona must declare the bounded tool set, not tools:(all): {output}"
+        );
+        assert!(
+            !output.contains("tools: (all)"),
+            "default persona seed must declare an explicit list, not inherit tools:(all): {output}"
+        );
         assert!(
             !output.contains(agent_dir.path().to_string_lossy().as_ref()),
             "details must not leak absolute agent_dir paths: {output}"
@@ -3519,6 +3976,97 @@ mod tests {
         application.cleanup().await;
     }
 
+    #[tokio::test]
+    async fn persona_run_with_omitted_tools_inherits_full_set() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let agent_dir = tempfile::tempdir().expect("agent dir");
+        let root = agent_dir.path().join("personas").join("mentor");
+        std::fs::create_dir_all(&root).expect("persona root");
+        std::fs::write(
+            root.join("persona.md"),
+            "---\nname: mentor\ndescription: mentor persona\n---\nGuide the user patiently.",
+        )
+        .expect("persona.md without tools");
+        let application = persona_application(cwd.path(), agent_dir.path()).await;
+
+        let output = execute_interactive_persona_command(
+            &application,
+            parse_interactive_persona_command(Some("run mentor draft the plan"))
+                .expect("run parse"),
+        )
+        .await
+        .expect("omitted tools inherit the full factory set and must spawn");
+        assert!(output.contains("Persona mentor started"), "{output}");
+        assert!(output.contains("job:"), "{output}");
+        assert!(output.contains("agent:"), "{output}");
+
+        application.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn persona_run_rejects_explicit_too_low_cap() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let agent_dir = tempfile::tempdir().expect("agent dir");
+        write_user_persona(agent_dir.path(), "mentor", "Guide the user patiently.");
+
+        let (model, faux) = faux_model("persona-low-cap");
+        let session = disabled_session(model, cwd.path());
+        let session_dir = cwd.path().join("parent-sessions");
+        std::fs::create_dir_all(&session_dir).expect("parent session directory");
+        let recorder = pi_coding::start_session_in(
+            cwd.path(),
+            None,
+            None,
+            Some(&session_dir),
+            Some("persona-low-cap"),
+            None,
+        )
+        .expect("parent recorder");
+        session.record(recorder).expect("attach parent recorder");
+        let resources = pi_coding::ResourceManager::new(isolated_resource_options(
+            cwd.path(),
+            agent_dir.path(),
+            false,
+        ))
+        .expect("persona resources");
+        let snapshot = resources.snapshot();
+        let artifacts = cwd.path().join("artifacts");
+        std::fs::create_dir_all(&artifacts).expect("artifacts");
+        let mut config = pi_coding::OrchestrationConfig::new(
+            pi_coding::AgentCatalog::from_agents(snapshot.agents.clone()),
+            &artifacts,
+        );
+        config.idle_ttl = None;
+        config.max_tools_per_agent = 1;
+        let factory: pi_coding::ChildSessionFactory =
+            std::sync::Arc::new(|_| Box::pin(std::future::pending()));
+        let runtime =
+            pi_coding::OrchestrationRuntime::new(config, factory).expect("orchestration runtime");
+        session
+            .attach_resources(resources.clone())
+            .await
+            .expect("attach persona resources");
+        let application = pi_coding::Application::new_with_orchestration(session, runtime).await;
+
+        let error = execute_interactive_persona_command(
+            &application,
+            parse_interactive_persona_command(Some("run mentor draft the plan"))
+                .expect("run parse"),
+        )
+        .await
+        .expect_err("explicit too-low cap must still reject");
+        let message = error.to_string();
+        assert!(message.contains("cap 1"), "{message}");
+        assert!(message.contains("resolves to"), "{message}");
+        assert!(
+            message.contains("orchestration.maxToolsPerAgent"),
+            "{message}"
+        );
+
+        application.cleanup().await;
+        drop(faux);
+    }
+
     #[test]
     fn persona_root_containment_rejects_symlink_escape() {
         let base = tempfile::tempdir().expect("base");
@@ -3535,16 +4083,90 @@ mod tests {
             let _ = link;
             return;
         }
-        let err = ensure_persona_root_contained(&link, &[scope], "escaped")
-            .expect_err("symlink escape");
+        let err =
+            ensure_persona_root_contained(&link, &[scope], "escaped").expect_err("symlink escape");
         assert!(
             err.to_string().contains("symlink") || err.to_string().contains("escapes"),
             "{err:#}"
         );
         assert!(
-            !err.to_string().contains(base.path().to_string_lossy().as_ref()),
+            !err.to_string()
+                .contains(base.path().to_string_lossy().as_ref()),
             "containment errors must not embed absolute paths: {err:#}"
         );
+    }
+
+    #[test]
+    fn persona_root_containment_follows_symlinked_scope() {
+        #[cfg(not(unix))]
+        return;
+        let base = tempfile::tempdir().expect("base");
+        let real = base.path().join("real-personas");
+        std::fs::create_dir_all(real.join("cj")).expect("persona under real scope");
+        let scope = base.path().join("personas");
+        std::os::unix::fs::symlink(&real, &scope).expect("scope symlink");
+        let root = scope.join("cj");
+        let canonical =
+            ensure_persona_root_contained(&root, &[scope], "cj").expect("symlinked scope");
+        assert_eq!(
+            canonical,
+            std::fs::canonicalize(&real).expect("real scope").join("cj"),
+            "must return the canonical root under the resolved scope"
+        );
+    }
+
+    #[test]
+    fn persona_root_containment_skips_dangling_scope_link() {
+        #[cfg(not(unix))]
+        return;
+        let base = tempfile::tempdir().expect("base");
+        // A dangling scope symlink (target removed) is treated as absent and
+        // skipped; the next valid scope still contains the root.
+        let dangling = base.path().join("dangling-personas");
+        std::os::unix::fs::symlink(base.path().join("gone"), &dangling).expect("dangling symlink");
+        let valid = base.path().join("valid-personas");
+        std::fs::create_dir_all(valid.join("cj")).expect("persona under valid scope");
+        let root = valid.join("cj");
+        let canonical = ensure_persona_root_contained(&root, &[dangling.clone(), valid.clone()], "cj")
+            .expect("dangling scope must be skipped");
+        assert_eq!(
+            canonical,
+            std::fs::canonicalize(&valid).expect("valid scope").join("cj"),
+            "the valid scope must contain the root after the dangling link is skipped"
+        );
+
+        // With only the dangling scope, containment fails closed.
+        let err = ensure_persona_root_contained(&root, &[dangling], "cj")
+            .expect_err("dangling-only must fail closed");
+        assert!(err.to_string().contains("escapes"), "{err:#}");
+    }
+
+    #[test]
+    fn persona_root_containment_rejects_nested_root_under_symlinked_scope() {
+        #[cfg(not(unix))]
+        return;
+        let base = tempfile::tempdir().expect("base");
+        let real = base.path().join("real-personas");
+        std::fs::create_dir_all(real.join("nested").join("cj")).expect("nested persona");
+        let scope = base.path().join("personas");
+        std::os::unix::fs::symlink(&real, &scope).expect("scope symlink");
+        let root = scope.join("nested").join("cj");
+        let err =
+            ensure_persona_root_contained(&root, &[scope], "cj").expect_err("nested root");
+        assert!(err.to_string().contains("escapes"), "{err:#}");
+        assert!(
+            !err.to_string()
+                .contains(base.path().to_string_lossy().as_ref()),
+            "containment errors must not embed absolute paths: {err:#}"
+        );
+    }
+
+    fn seed_persona_state_dirs(root: &Path) {
+        for name in ["memory", "sessions", "skills"] {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).expect("state dir");
+            std::fs::write(dir.join("state.txt"), "state").expect("state file");
+        }
     }
 
     #[tokio::test]
@@ -3552,6 +4174,7 @@ mod tests {
         let cwd = tempfile::tempdir().expect("cwd");
         let agent_dir = tempfile::tempdir().expect("agent dir");
         let root = write_user_persona(agent_dir.path(), "mentor", "Guide the user patiently.");
+        seed_persona_state_dirs(&root);
         let application = persona_application(cwd.path(), agent_dir.path()).await;
 
         execute_interactive_persona_command(
@@ -3562,8 +4185,76 @@ mod tests {
         .expect("reset persona");
 
         assert!(root.join("persona.md").is_file(), "persona.md must remain");
-        assert!(!root.join("memory").exists(), "memory must be cleared");
-        assert!(!root.join("sessions").exists(), "sessions must be cleared");
+        for name in ["memory", "sessions", "skills"] {
+            assert!(!root.join(name).exists(), "{name} must be cleared");
+        }
+
+        application.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn persona_reset_rejects_symlinked_state_before_removing_anything() {
+        #[cfg(unix)]
+        {
+            let cwd = tempfile::tempdir().expect("cwd");
+            let agent_dir = tempfile::tempdir().expect("agent dir");
+            let outside = tempfile::tempdir().expect("outside");
+            let root = write_user_persona(agent_dir.path(), "mentor", "Guide the user patiently.");
+            seed_persona_state_dirs(&root);
+            std::fs::write(outside.path().join("keep.txt"), "keep").expect("outside file");
+            std::fs::remove_dir_all(root.join("skills")).expect("clear seeded skills");
+            std::os::unix::fs::symlink(outside.path(), root.join("skills")).expect("symlink state");
+            let application = persona_application(cwd.path(), agent_dir.path()).await;
+
+            let error = execute_interactive_persona_command(
+                &application,
+                parse_interactive_persona_command(Some("reset mentor --yes")).expect("reset"),
+            )
+            .await
+            .expect_err("symlinked persona state must fail closed");
+            assert!(error.to_string().contains("symlink"), "{error}");
+            assert!(
+                outside.path().join("keep.txt").is_file(),
+                "state outside the persona root must survive"
+            );
+            assert!(
+                root.join("memory").exists() && root.join("sessions").exists(),
+                "a rejected reset must not partially clear persona state"
+            );
+
+            application.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn persona_reset_rejects_non_directory_state_before_removing_anything() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let agent_dir = tempfile::tempdir().expect("agent dir");
+        let root = write_user_persona(agent_dir.path(), "mentor", "Guide the user patiently.");
+        seed_persona_state_dirs(&root);
+        std::fs::remove_dir_all(root.join("skills")).expect("clear seeded skills");
+        std::fs::write(root.join("skills"), "not a directory").expect("regular file skills");
+        let application = persona_application(cwd.path(), agent_dir.path()).await;
+
+        let error = execute_interactive_persona_command(
+            &application,
+            parse_interactive_persona_command(Some("reset mentor --yes")).expect("reset"),
+        )
+        .await
+        .expect_err("non-directory persona state must fail closed");
+        assert!(
+            error.to_string().contains("not a directory"),
+            "{error}"
+        );
+        assert!(root.join("persona.md").is_file(), "persona.md must remain");
+        assert!(
+            root.join("memory").is_dir() && root.join("sessions").is_dir(),
+            "a rejected reset must not partially clear persona state"
+        );
+        assert!(
+            root.join("skills").is_file(),
+            "the non-directory skills entry must survive"
+        );
 
         application.cleanup().await;
     }
@@ -3573,6 +4264,7 @@ mod tests {
         let cwd = tempfile::tempdir().expect("cwd");
         let agent_dir = tempfile::tempdir().expect("agent dir");
         let root = write_user_persona(agent_dir.path(), "mentor", "Guide the user patiently.");
+        seed_persona_state_dirs(&root);
         let application = persona_application(cwd.path(), agent_dir.path()).await;
 
         execute_interactive_persona_command(
@@ -3582,9 +4274,13 @@ mod tests {
         .await
         .expect("remove persona");
 
-        assert!(!root.join("persona.md").exists(), "persona.md must be deleted");
-        assert!(root.join("memory").exists(), "memory must remain");
-        assert!(root.join("sessions").exists(), "sessions must remain");
+        assert!(
+            !root.join("persona.md").exists(),
+            "persona.md must be deleted"
+        );
+        for name in ["memory", "sessions", "skills"] {
+            assert!(root.join(name).exists(), "{name} must remain");
+        }
         assert!(root.is_dir(), "persona root must remain");
 
         application.cleanup().await;
@@ -3643,7 +4339,10 @@ mod tests {
             )
             .await
             .expect_err("active persona must reject destructive command");
-            assert!(error.to_string().contains("active orchestration job"), "{error:#}");
+            assert!(
+                error.to_string().contains("active orchestration job"),
+                "{error:#}"
+            );
             assert!(root.join("persona.md").is_file(), "definition must remain");
             assert!(root.join("memory").is_dir(), "memory must remain");
             assert!(root.join("sessions").is_dir(), "sessions must remain");
@@ -3673,10 +4372,13 @@ mod tests {
         // Trailing tokens are rejected so flags can never become a name.
         let trailing = parse_interactive_persona_command(Some("new mentor --foo"))
             .expect_err("trailing token");
-        assert!(trailing.to_string().contains("unexpected argument"), "{trailing}");
+        assert!(
+            trailing.to_string().contains("unexpected argument"),
+            "{trailing}"
+        );
         // Path-unsafe names are rejected before any path is constructed.
-        let traversal = parse_interactive_persona_command(Some("new ../escape"))
-            .expect_err("traversal name");
+        let traversal =
+            parse_interactive_persona_command(Some("new ../escape")).expect_err("traversal name");
         assert!(
             traversal.to_string().contains("ASCII") || traversal.to_string().contains("letters"),
             "{traversal}"
@@ -3701,7 +4403,10 @@ mod tests {
         let application = persona_application(cwd.path(), agent_dir.path()).await;
 
         let root = agent_dir.path().join("personas").join("scout");
-        assert!(!root.join("persona.md").exists(), "scout must not pre-exist");
+        assert!(
+            !root.join("persona.md").exists(),
+            "scout must not pre-exist"
+        );
 
         let message = commit_persona_definition(
             &application,
@@ -3738,7 +4443,10 @@ mod tests {
         )
         .await
         .expect("persona list");
-        assert!(list.contains("scout"), "scout discovered after reload: {list}");
+        assert!(
+            list.contains("scout"),
+            "scout discovered after reload: {list}"
+        );
 
         application.cleanup().await;
     }
@@ -3757,7 +4465,10 @@ mod tests {
         )
         .await
         .expect_err("duplicate persona");
-        assert!(mentor_err.to_string().contains("already in use"), "{mentor_err}");
+        assert!(
+            mentor_err.to_string().contains("already in use"),
+            "{mentor_err}"
+        );
 
         let reviewer_err = commit_persona_definition(
             &application,
@@ -3767,7 +4478,10 @@ mod tests {
         )
         .await
         .expect_err("duplicate agent");
-        assert!(reviewer_err.to_string().contains("already in use"), "{reviewer_err}");
+        assert!(
+            reviewer_err.to_string().contains("already in use"),
+            "{reviewer_err}"
+        );
 
         application.cleanup().await;
     }
@@ -3788,10 +4502,14 @@ mod tests {
         .expect_err("name mismatch");
         assert!(mismatch.to_string().contains("must match"), "{mismatch}");
 
-        let traversal =
-            commit_persona_definition(&application, "../x", &valid_persona_content("x"), PersonaEditKind::New)
-                .await
-                .expect_err("traversal name");
+        let traversal = commit_persona_definition(
+            &application,
+            "../x",
+            &valid_persona_content("x"),
+            PersonaEditKind::New,
+        )
+        .await
+        .expect_err("traversal name");
         assert!(
             traversal.to_string().contains("ASCII") || traversal.to_string().contains("letters"),
             "{traversal}"
@@ -3841,9 +4559,10 @@ mod tests {
         .expect("select mentor");
 
         let edited = "---\nname: mentor\ndescription: sharper mentor\npersonality: sharper\nsoftBudget:\n  maxRequests: 8\n---\nGuide sharply.\n";
-        let message = commit_persona_definition(&application, "mentor", edited, PersonaEditKind::Edit)
-            .await
-            .expect("edit persona");
+        let message =
+            commit_persona_definition(&application, "mentor", edited, PersonaEditKind::Edit)
+                .await
+                .expect("edit persona");
         assert!(message.contains("edited"), "{message}");
 
         let on_disk = std::fs::read_to_string(root.join("persona.md")).expect("read persona.md");
@@ -3876,23 +4595,41 @@ mod tests {
         let root = write_user_persona(agent_dir.path(), "mentor", "Guide the user patiently.");
         let application = persona_application(cwd.path(), agent_dir.path()).await;
 
-        let missing = commit_persona_definition(&application, "ghost", &valid_persona_content("ghost"), PersonaEditKind::Edit)
-            .await
-            .expect_err("missing persona");
+        let missing = commit_persona_definition(
+            &application,
+            "ghost",
+            &valid_persona_content("ghost"),
+            PersonaEditKind::Edit,
+        )
+        .await
+        .expect_err("missing persona");
         assert!(missing.to_string().contains("unknown persona"), "{missing}");
 
-        let mismatch = commit_persona_definition(&application, "mentor", &valid_persona_content("renamed"), PersonaEditKind::Edit)
-            .await
-            .expect_err("edit name mismatch");
+        let mismatch = commit_persona_definition(
+            &application,
+            "mentor",
+            &valid_persona_content("renamed"),
+            PersonaEditKind::Edit,
+        )
+        .await
+        .expect_err("edit name mismatch");
         assert!(mismatch.to_string().contains("must match"), "{mismatch}");
 
         // Non-regular persona.md (a directory in its place).
         std::fs::remove_file(root.join("persona.md")).expect("remove persona.md");
         std::fs::create_dir(root.join("persona.md")).expect("dir in its place");
-        let nonregular = commit_persona_definition(&application, "mentor", &valid_persona_content("mentor"), PersonaEditKind::Edit)
-            .await
-            .expect_err("non-regular persona.md");
-        assert!(nonregular.to_string().contains("not a regular file"), "{nonregular}");
+        let nonregular = commit_persona_definition(
+            &application,
+            "mentor",
+            &valid_persona_content("mentor"),
+            PersonaEditKind::Edit,
+        )
+        .await
+        .expect_err("non-regular persona.md");
+        assert!(
+            nonregular.to_string().contains("not a regular file"),
+            "{nonregular}"
+        );
 
         application.cleanup().await;
     }
@@ -3908,10 +4645,16 @@ mod tests {
             let target = agent_dir.path().join("elsewhere.md");
             std::fs::write(&target, "x").expect("target");
             std::fs::remove_file(root.join("persona.md")).expect("remove persona.md");
-            std::os::unix::fs::symlink(&target, root.join("persona.md")).expect("symlink persona.md");
-            let err = commit_persona_definition(&application, "mentor", &valid_persona_content("mentor"), PersonaEditKind::Edit)
-                .await
-                .expect_err("symlinked persona.md");
+            std::os::unix::fs::symlink(&target, root.join("persona.md"))
+                .expect("symlink persona.md");
+            let err = commit_persona_definition(
+                &application,
+                "mentor",
+                &valid_persona_content("mentor"),
+                PersonaEditKind::Edit,
+            )
+            .await
+            .expect_err("symlinked persona.md");
             assert!(err.to_string().contains("symlink"), "{err}");
         }
         application.cleanup().await;
@@ -3924,16 +4667,70 @@ mod tests {
         let _root = write_user_persona(agent_dir.path(), "mentor", "Guide the user patiently.");
         let application = persona_application(cwd.path(), agent_dir.path()).await;
 
-        let seed = persona_editor_seed(&application, "scout", PersonaEditKind::New).expect("new seed");
+        let seed =
+            persona_editor_seed(&application, "scout", PersonaEditKind::New).expect("new seed");
         assert!(seed.contains("name: scout"), "{seed}");
         assert!(seed.contains("Describe"), "{seed}");
+        assert!(
+            seed.contains(&super::default_persona_tools_frontmatter()),
+            "new-persona seed must declare the bounded tool set: {seed}"
+        );
+        assert!(
+            super::DEFAULT_PERSONA_CODING_TOOLS.len() <= pi_coding::DEFAULT_MAX_TOOLS_PER_AGENT,
+            "default persona seed must stay within the explicit-list cap"
+        );
 
-        let edit_seed = persona_editor_seed(&application, "mentor", PersonaEditKind::Edit).expect("edit seed");
+        let edit_seed =
+            persona_editor_seed(&application, "mentor", PersonaEditKind::Edit).expect("edit seed");
         assert!(edit_seed.contains("name: mentor"), "{edit_seed}");
-        assert!(edit_seed.contains("Guide the user patiently"), "{edit_seed}");
+        assert!(
+            edit_seed.contains("Guide the user patiently"),
+            "{edit_seed}"
+        );
 
-        let missing = persona_editor_seed(&application, "ghost", PersonaEditKind::Edit).expect_err("missing seed");
+        let missing = persona_editor_seed(&application, "ghost", PersonaEditKind::Edit)
+            .expect_err("missing seed");
         assert!(missing.to_string().contains("unknown persona"), "{missing}");
+
+        application.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn persona_editor_seed_reads_persona_under_symlinked_scope() {
+        #[cfg(not(unix))]
+        return;
+        let cwd = tempfile::tempdir().expect("cwd");
+        let base = tempfile::tempdir().expect("base");
+        let real_personas = base.path().join("real-personas");
+        std::fs::create_dir_all(&real_personas).expect("real personas");
+        let agent_dir = tempfile::tempdir().expect("agent dir");
+        // The user persona scope itself is a symlink (e.g. a synced
+        // ~/.rpi/personas); discovery tolerates this via
+        // open_directory_allowing_link, and the view/edit resolver must too.
+        std::os::unix::fs::symlink(
+            &real_personas,
+            agent_dir.path().join("personas"),
+        )
+        .expect("scope symlink");
+        let application = persona_application(cwd.path(), agent_dir.path()).await;
+        let snapshot = application.resource_snapshot().expect("persona catalog");
+        assert!(
+            snapshot
+                .agents
+                .iter()
+                .any(|definition| definition.is_persona() && definition.name == "mentor"),
+            "discovery must tolerate the symlinked scope"
+        );
+
+        // Web `persona_get` (RpcCommand::PersonaGet) reads definitions through
+        // this exact seed path; it must not bail on the scope link.
+        let edit_seed =
+            persona_editor_seed(&application, "mentor", PersonaEditKind::Edit)
+                .expect("edit seed under symlinked scope");
+        assert!(
+            edit_seed.contains("Guide the user patiently"),
+            "{edit_seed}"
+        );
 
         application.cleanup().await;
     }

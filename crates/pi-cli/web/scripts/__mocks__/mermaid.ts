@@ -71,9 +71,11 @@ function mermaidTempWrapper(id: string): FakeNode {
   return div;
 }
 
+const initState: { config: unknown } = { config: undefined };
+
 export default {
-  initialize(): void {
-    // no-op: the real module configures theme/securityLevel, irrelevant here
+  initialize(config?: unknown): void {
+    initState.config = config;
   },
   async render(id: string, source: string): Promise<{ svg: string }> {
     // Only the repeated-failure regression installs fakeDocument as
@@ -93,4 +95,4 @@ export default {
   },
 };
 
-export { fakeDocument, tempWrappers };
+export { fakeDocument, tempWrappers, initState };

@@ -1,53 +1,37 @@
 /**
  * Per-command timeout classes and the pending-command registry for the Web RPC
- * lifecycle — pure and node-testable (no DOM/browser dependency), mirroring
- * ./socket.ts's relationship with App.tsx: the registry owns the id -> pending
- * map and the (injectable) timeout timers; App owns the socket, the response
- * routing, and the optimistic-bubble side effects.
+ * lifecycle. Command latency is independent from WebSocket liveness: every
+ * command remains bounded, but a command timeout rejects only that command.
+ * The App heartbeat's ping/pong/silence window is the sole authority allowed
+ * to classify an otherwise-open transport as unresponsive and reconnect it.
  *
- * Server ack contract this encodes (evidence: crates/pi-cli/src/modes/rpc.rs
- * dispatch arms):
- * - MOST commands are fast acks: the arm responds as soon as it completes
- *   (get_state, session_list, task_spawn, code_review_open/snapshot/refresh —
- *   snapshot/fork only, no LLM, code_review.rs, settings_*, workflow_*,
- *   skill, side_chat_prompt, prompt/steer/follow_up, ...). 30s is the default
- *   bound. prompt responds before the model turn: the turn is `tokio::spawn`'ed
- *   and streamed as events. Its default pre-spawn classifier is disabled and
- *   configured for a 4s provider deadline. Explicit settings can lengthen
- *   server work, but unknown and fast-ack commands deliberately retain this
- *   strict client bound rather than masking a stalled acceptance path.
- * - `compact` / `snapcompact` arms AWAIT the whole compaction before
- *   responding with the report: `app.compact()` is `wait_for_idle()` (waits
- *   for the in-flight turn to END — unbounded) plus provider summarization
- *   (`session.compact`, COMPACTION_SUMMARIZE_TIMEOUT-bounded per call). A
- *   legit compaction takes minutes, so the old fixed 30s timed out real
- *   `/compact` uses and the late report was dropped. LONG_OP class.
- *
- * Every class stays BOUNDED (nothing waits forever): a dead server still
- * surfaces as a timeout that names the command and the elapsed seconds, while
- * a dropped connection rejects pending for the CONNECTION reason (never
- * "timed out"). A CURRENT-generation fast-ack timeout is treated as an
- * unresponsive transport, not a command stall: the socket is OPEN but the
- * server swallowed the outbound frame, so the 30s pending timer fired before
- * the 60s liveness timer. The registry fires onTransportStale so the App
- * closes/replaces the socket and reconnects through the existing onclose
- * path, and rejects with a truthful connection-unresponsive error. A
- * stale-generation fast-ack timeout never closes the current socket, and a
- * long-op timeout never eagerly reconnects — both stay plain bounded
- * timeouts.
+ * Most RPCs acknowledge within 30 seconds. Commands whose response includes
+ * bounded git acquisition, application forking, full compaction, or a full
+ * durable transcript (`get_messages`) use the explicit long-operation class.
+ * A dropped connection still drains pending entries immediately with the
+ * connection reason, and late responses after a timeout remain no-ops because
+ * timeout settlement deletes the entry.
  */
+
+import type { RpcErrorCode } from './types';
 
 /** Fast-ack commands: the server replies within this window or it is stuck. */
 export const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
 
-/** compact/snapcompact: the response IS the full compaction report, which is
- *  legitimately minutes behind (wait_for_idle + summarization). */
+/** Long operations remain bounded without inheriting transport authority. */
 export const LONG_OP_TIMEOUT_MS = 10 * 60_000;
 
-/** Commands whose server response is the full long-running result. */
+/** Commands whose server response includes legitimately long bounded work. */
 const LONG_OP_TYPES: Record<string, true> = {
   compact: true,
   snapcompact: true,
+  get_messages: true,
+  code_review_open: true,
+  code_review_refresh: true,
+  code_review_file_diff: true,
+  code_review_auto_review: true,
+  code_review_highlight: true,
+  code_review_stop: true,
 };
 
 /** The bounded timeout class for a command type. Unknown types (and any
@@ -59,28 +43,144 @@ export function commandTimeoutMs(type: string): number {
   return DEFAULT_COMMAND_TIMEOUT_MS;
 }
 
-/** User-facing timeout message: names the command and the elapsed seconds so
- *  "command timed out" stops hiding which command stalled and for how long.
- *  Used for the PLAIN bounded timeout path: long-op commands (compact/
- *  snapcompact, legitimately minutes behind) and stale-generation fast-ack
- *  commands whose socket was already replaced/closed — neither of which
- *  should close the current transport (see onTransportStale for the
- *  current-generation fast-ack path that does). */
+
+/** User-facing timeout message: names the command and elapsed seconds. */
 export function timeoutErrorMessage(type: string, sentAt: number, now: number): string {
   const elapsed = Math.max(0, Math.round((now - sentAt) / 1000));
   return `${type} timed out after ${elapsed}s (no response from server)`;
 }
 
-/** User-facing message for a transport-stale fast-ack timeout: the socket is
- *  OPEN but the server swallowed the outbound frame (no ack within the
- *  fast-ack window), so the 30s pending timer fired before the 60s liveness
- *  timer could. Truthful about the failure mode (unresponsive transport) and
- *  the recovery (reconnecting), instead of the misleading "command timed out"
- *  that hides a dead-but-OPEN connection behind a per-command timeout. */
-export function transportStaleMessage(type: string, sentAt: number, now: number): string {
-  const elapsed = Math.max(0, Math.round((now - sentAt) / 1000));
-  return `connection unresponsive after ${elapsed}s (no ack for ${type}); reconnecting`;
+/** Code Review panel-owned RPCs: background loads only (snapshot polls,
+ *  per-file paging/context). Every other code_review_* command is a USER
+ *  action whose failures belong to the shared App toast. */
+const PANEL_OWNED_CODE_REVIEW_TYPES: Readonly<Record<string, true>> = {
+  code_review_snapshot: true,
+  code_review_file_diff: true,
+  code_review_file_context: true,
+};
+
+/** Panel-owned RPCs surface their own errors; App must not duplicate a toast. */
+export function isPanelOwnedRpc(type: string): boolean {
+  return PANEL_OWNED_CODE_REVIEW_TYPES[type] === true
+    || type.startsWith('todo_child_')
+    || type.startsWith('file_explorer_')
+    // Every workflow_* command is owned by the Workflow panel: list failures
+    // land in the list error row, detail failures in the detail pane, action
+    // (cancel/remove/…) failures in the detail error row, IRC send failures
+    // in the IRC composer. The App layer must never duplicate them as a
+    // global toast — in particular a stale `workflow_detail` "workflow was
+    // not found" after an authoritative remove stays fully silent.
+    || type.startsWith('workflow_')
+    // Path completion is owned by the PathAutocomplete input: its promise
+    // rejects into the component's quiet-failure catch (menu hides, manual
+    // entry unaffected); the App must never duplicate a global toast.
+    || type === 'path_complete'
+    || type === 'job_list'
+    || type === 'task_spawn'
+    || type === 'job_cancel'
+    || type === 'hub_send'
+    || type === 'job_output'
+    || type === 'agent_history';
 }
+
+/** Lifecycle commands whose SUCCESS envelope is TARGET-owned: the backend
+ *  tags the response with the target runtime's sessionId (the caller routes
+ *  an immediate follow-up fork by it), while failures stay request-source-
+ *  owned. App.onResponse accepts the target-owned envelope ONLY when the
+ *  envelope sessionId equals the payload sessionId (nonempty); any forged
+ *  mismatch rejects exactly once. */
+const TARGET_OWNED_LIFECYCLE_TYPES: Readonly<Record<string, true>> = {
+  new_session: true,
+  fork: true,
+  clone: true,
+  session_fork_latest: true,
+};
+
+/** Whether a command type's successful response envelope is target-owned. */
+export function isTargetOwnedLifecycle(type: string): boolean {
+  return TARGET_OWNED_LIFECYCLE_TYPES[type] === true;
+}
+
+/** Whether onResponse should toast an RPC failure. Auxiliary pending entries
+ *  (context-meter `get_session_stats`) and panel-owned commands stay silent
+ *  at the App layer; the promise still rejects for the caller. */
+export function rpcFailureToastOwned(opts: {
+  type: string;
+  boot: boolean;
+  sessionId?: string;
+  activeSessionId?: string | null;
+  auxiliary?: boolean;
+}): boolean {
+  // switch_session failures are App-switch-owned: requestSessionSwitch rolls
+  // the transaction back and emits the single user toast itself (bootstrap
+  // stays silent). The global RPC layer must never double-toast it.
+  if (opts.type === 'switch_session') return false;
+  if (opts.boot || opts.auxiliary === true) return false;
+  if ((opts.type === 'stt_transcribe'
+    || opts.type === 'realtime_create_call'
+    || opts.type === 'realtime_stop')
+    && opts.sessionId !== opts.activeSessionId) {
+    return false;
+  }
+  if (isPanelOwnedRpc(opts.type)) return false;
+  return true;
+}
+
+/** A wire response frame relevant to the ownership decision. */
+export interface RpcResponseOwnershipFrame {
+  command?: string;
+  sessionId?: string;
+  success?: boolean;
+  data?: unknown;
+}
+
+export type ResponseOwnershipVerdict =
+  | 'accept'
+  | 'command-mismatch'
+  | 'source-ownership-mismatch'
+  | 'target-ownership-mismatch';
+
+/** Exact rejection message per non-accept verdict (App + test simulator
+ *  share the map so the wire-visible text stays in lockstep). */
+export const RESPONSE_OWNERSHIP_REJECTIONS: Readonly<
+  Record<Exclude<ResponseOwnershipVerdict, 'accept'>, string>
+> = {
+  'command-mismatch': 'rpc response command ownership mismatch',
+  'source-ownership-mismatch': 'rpc response session ownership mismatch',
+  'target-ownership-mismatch': 'rpc response target ownership mismatch',
+};
+
+/** Ownership gate App.onResponse applies BEFORE settling a pending entry.
+ *  Command identity is checked first: a frame that does not NAME the pending
+ *  command can never own it. The target-owned exemption exists only for a
+ *  SUCCESS envelope of a lifecycle command (verified against the payload
+ *  sessionId); everything else — ordinary commands AND lifecycle failures,
+ *  which the backend tags with the request source — is request-source-owned. */
+export function classifyResponseOwnership(
+  frame: RpcResponseOwnershipFrame,
+  pending: Pick<PendingEntry, 'type' | 'sessionId'>,
+): ResponseOwnershipVerdict {
+  if (frame.command !== pending.type) return 'command-mismatch';
+  const data: unknown = frame.data;
+  const payloadSessionId = data !== null && typeof data === 'object' && 'sessionId' in data
+    && typeof data.sessionId === 'string'
+    ? data.sessionId
+    : '';
+  if (frame.success === true && isTargetOwnedLifecycle(pending.type)) {
+    // The envelope is accepted ONLY when it equals the payload sessionId
+    // (nonempty); a forged mismatch rejects exactly once with nothing
+    // mutated — no activation, no overlay, no catalog bump.
+    if (payloadSessionId === '' || frame.sessionId !== payloadSessionId) {
+      return 'target-ownership-mismatch';
+    }
+    return 'accept';
+  }
+  if (pending.sessionId && frame.sessionId !== pending.sessionId) {
+    return 'source-ownership-mismatch';
+  }
+  return 'accept';
+}
+
 
 /** Injectable timer/clock so the node test drives time deterministically and
  *  the browser build uses window.setTimeout/Date.now. */
@@ -95,6 +195,8 @@ export interface PendingEntry {
   resolve: (value: unknown) => void;
   reject: (reason: Error) => void;
   bubbleId?: string;
+  sessionId?: string;
+  turnId?: string;
   /** Socket generation this command was sent on; the App settles it only when
    *  it matches the CURRENT generation (see ./socket.ts isCurrentPending). */
   gen: number;
@@ -104,43 +206,36 @@ export interface PendingEntry {
   sentAt: number;
   timeoutMs: number;
   timer: unknown;
+  /** True for background auxiliary RPCs whose failures must reject quietly. */
+  auxiliary?: boolean;
+
 }
 
 export interface PendingRegistryOptions {
   scheduler: PendingScheduler;
-  /** Whether a pending entry's generation is the CURRENT socket generation at
-   *  timeout time. A CURRENT-generation fast-ack timeout is treated as an
-   *  unresponsive transport (the socket is OPEN but the server swallowed the
-   *  outbound frame; the 30s pending timer fired before the 60s liveness
-   *  timer): onTransportStale fires and the promise rejects with a truthful
-   *  connection-unresponsive error so the App can close/replace the socket and
-   *  schedule a reconnect through the existing onclose path. A STALE-gen
-   *  timeout (the socket was already replaced/closed) must NEVER close the
-   *  current socket — it rejects as a plain timeout and the newer socket is
-   *  untouched. Defaults to "always current" so a test that does not model
-   *  generations still observes transport-stale on a fast-ack timeout when
-   *  onTransportStale is provided; the real App passes the live predicate. */
-  isCurrentGen?: (gen: number) => boolean;
-  /** Called right before a PLAIN timed-out entry (a long-op command, or a
-   *  stale-generation fast-ack whose socket was already replaced/closed) is
-   *  rejected. The App removes the optimistic bubble here: a plain timeout
-   *  means the server never answered AND the transport is not being closed,
-   *  so the bubble must not linger as if the message were accepted. Drain/
-   *  replace paths do NOT call this — the frame may already have been
-   *  delivered, and the bubble stays for reconnect/retry semantics. */
-  onTimeout?: (entry: PendingEntry) => void;
-  /** Called INSTEAD of onTimeout when a CURRENT-generation fast-ack command
-   *  times out — the socket is OPEN but unresponsive (the 30s pending timer
-   *  beat the 60s liveness timer; the server swallowed the frame). The App
-   *  closes the socket here so the existing onclose path drains remaining
-   *  pending and schedules a reconnect; the timed-out command's promise then
-   *  rejects with a connection-unresponsive error (NOT a generic command
-   *  timeout). Bubbles are NOT removed here (close/retry semantics — the
-   *  frame may yet have been delivered, and the reconnect path owns retry),
-   *  matching the onclose drain. Long-op timeouts and stale-gen timeouts
-   *  never fire this — they stay plain bounded timeouts so a legitimately
-   *  long compaction cannot trigger an eager reconnect. */
-  onTransportStale?: (entry: PendingEntry) => void;
+  /** Called before a timed-out entry is rejected with the exact timeout
+   * message the registry computed; the returned boolean (`undefined` =
+   * unowned) stamps the rejected error's `toastOwned`. Drains never invoke
+   * it (the frame may already have been delivered). */
+  onTimeout?: (entry: PendingEntry, timeoutErrorMessage: string) => boolean | void;
+}
+
+export interface PendingCommandError extends Error {
+  rpc?: boolean;
+  toastOwned?: boolean;
+  rpcCode?: RpcErrorCode;
+}
+
+function pendingCommandError(message: string, rpc = false, toastOwned = false): PendingCommandError {
+  const error: PendingCommandError = new Error(message);
+  if (rpc) error.rpc = true;
+  if (toastOwned) error.toastOwned = true;
+  return error;
+}
+
+/** True only when the error is structurally stamped `toastOwned: true` (the App already surfaced it). */
+export function isToastOwnedRpcError(error: unknown): boolean {
+  return (error as { toastOwned?: unknown } | null | undefined)?.toastOwned === true;
 }
 
 /**
@@ -172,56 +267,11 @@ export class PendingRegistry {
       timer: 0,
     };
     full.timer = this.options.scheduler.setTimeout(() => {
-      // Already settled/drained before the deadline: the timeout must not
-      // double-reject (e.g. a drained command on a replaced socket).
       if (this.entries.get(id) !== full) return;
       this.entries.delete(id);
-      const now = this.options.scheduler.now();
-      // Fail closed on a dead-but-OPEN socket. A CURRENT-generation fast-ack
-      // timeout means the server swallowed the outbound frame: the 30s
-      // pending timer fired while the socket stayed OPEN and before the 60s
-      // liveness timer. Treat it as an unresponsive transport — fire
-      // onTransportStale so the App closes/replaces the socket and schedules a
-      // reconnect through the existing onclose path, and reject with a
-      // truthful connection-unresponsive error instead of a generic command
-      // timeout. A STALE generation (the socket was already replaced/closed)
-      // must NEVER close the current socket: it falls through to the plain
-      // timeout path and the newer socket is untouched. A long-op command
-      // (compact/snapcompact) is legitimately minutes behind and must NOT
-      // eagerly reconnect just because it ran long: it stays a plain bounded
-      // timeout. onTransportStale absent (e.g. a primitive registry test) also
-      // falls through, preserving the plain-timeout contract.
-      const isCurrent = this.options.isCurrentGen ? this.options.isCurrentGen(full.gen) : true;
-      const fastAck = full.timeoutMs !== LONG_OP_TIMEOUT_MS;
-      if (fastAck && isCurrent && this.options.onTransportStale) {
-        // Transport stale: this socket is OPEN but unresponsive (the 30s
-        // pending timer beat the 60s liveness timer; the server swallowed the
-        // frame). Fire onTransportStale ONCE so the App closes/replaces the
-        // socket and reconnects through the existing onclose path, and reject
-        // with a truthful connection-unresponsive error. Then eagerly settle
-        // every OTHER current-generation fast-ack pending on the same dead
-        // socket: they would fire their own onTransportStale moments later
-        // (duplicate close/toast) or sit unbounded until the async onclose
-        // drain. Each is deleted + timer-cleared + rejected with the same
-        // truthful message — bounded, truthful, no double settlement, and
-        // onTransportStale fires exactly once per generation. Long-op entries
-        // on the same socket are LEFT for the onclose drain (their 10-minute
-        // bound is a legitimately long class; the imminent close drains them
-        // with the connection reason, bubbles kept). Stale-gen entries belong
-        // to a replaced socket and stay out of this loop.
-        this.options.onTransportStale(full);
-        full.reject(new Error(transportStaleMessage(full.type, full.sentAt, now)));
-        for (const [otherId, other] of this.entries) {
-          if (other.gen !== full.gen) continue;
-          if (other.timeoutMs === LONG_OP_TIMEOUT_MS) continue; // long-op: onclose drains it
-          this.entries.delete(otherId);
-          this.options.scheduler.clearTimeout(other.timer);
-          other.reject(new Error(transportStaleMessage(other.type, other.sentAt, now)));
-        }
-        return;
-      }
-      this.options.onTimeout?.(full);
-      full.reject(new Error(timeoutErrorMessage(full.type, full.sentAt, now)));
+      const message = timeoutErrorMessage(full.type, full.sentAt, this.options.scheduler.now());
+      const toastOwned = this.options.onTimeout?.(full, message) === true;
+      full.reject(pendingCommandError(message, false, toastOwned));
     }, full.timeoutMs);
     this.entries.set(id, full);
   }
@@ -238,29 +288,24 @@ export class PendingRegistry {
     return entry;
   }
 
-  /** Reject + delete every entry NOT on keepGen — the socket replace/drop
-   *  drain. Bubbles are intentionally NOT removed (no onTimeout): the frame
-   *  may already have been delivered, and the reconnect path owns retry
-   *  semantics. */
-  drainExcept(keepGen: number, reason: string, rpc = false): void {
+  /** Reject + delete every entry NOT on keepGen. `toastOwned` is true only
+   *  when the caller already surfaced `reason`; consumers can then suppress
+   *  their local duplicate while unowned immediate failures still render. */
+  drainExcept(keepGen: number, reason: string, rpc = false, toastOwned = false): void {
     for (const [id, entry] of this.entries) {
       if (entry.gen === keepGen) continue;
       this.entries.delete(id);
       this.options.scheduler.clearTimeout(entry.timer);
-      const error = new Error(reason);
-      if (rpc) (error as Error & { rpc?: boolean }).rpc = true;
-      entry.reject(error);
+      entry.reject(pendingCommandError(reason, rpc, toastOwned));
     }
   }
 
-  /** Reject + delete EVERY entry (host switch / full app reset). */
-  drainAll(reason: string, rpc = false): void {
+  /** Reject every entry, optionally marking an already-surfaced error. */
+  drainAll(reason: string, rpc = false, toastOwned = false): void {
     for (const [id, entry] of this.entries) {
       this.entries.delete(id);
       this.options.scheduler.clearTimeout(entry.timer);
-      const error = new Error(reason);
-      if (rpc) (error as Error & { rpc?: boolean }).rpc = true;
-      entry.reject(error);
+      entry.reject(pendingCommandError(reason, rpc, toastOwned));
     }
   }
 }

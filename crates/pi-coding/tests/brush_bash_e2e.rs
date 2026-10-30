@@ -1,22 +1,22 @@
 //! End-to-end coverage for the bash tool's embedded brush-shell default path
-//! (OMP/pi parity) with REAL commands through the public `create_tool("bash",
-//! …)` boundary.
+//! (OMP/pi parity) with REAL commands through the public tool boundary.
 //!
-//! The in-crate unit tests prove the brush session model against the private
-//! `bash_tool` helper; these tests drive the SAME engine through the public
-//! tool boundary the agent runtime uses, with real commands and real
-//! observable markers:
+//! The bash tool is governed: it fail-closes without a captured application
+//! generation ("bash requires an application generation"). These tests drive
+//! the SAME engine the agent runtime uses — the bash tool retrieved from a
+//! hermetic published `Application` generation (danger-full-access sandbox, no
+//! bubblewrap dependency) — with real commands and real observable markers:
 //!
 //! * **brush execution** — `BASH_VERSION` is a well-known shell variable real
 //!   bash sets; the embedded brush session skips well-known vars, so its
-//!   absence proves the default (unsandboxed) path executed through brush,
-//!   not a `/bin/bash` subprocess.
-//! * **env rebuild** — live session metadata and `$PWD` mirror the
+//!   absence proves the default path executed through brush, not a
+//!   `/bin/bash` subprocess.
+//! * **env rebuild** — `$PWD` mirrors the working directory, exactly like the
 //!   subprocess path.
 //! * **host guards** — builtins that would replace/stop/mutate the host
 //!   process are refused with actionable errors.
-//! * **fallback** — a command brush cannot parse falls back to the plain
-//!   `/bin/bash` subprocess path for an identical observable result.
+//! * **fallback** — a command brush cannot parse requires the governed bash
+//!   subprocess path rather than escaping to an ambient host launch.
 //! * **timeout reaping** — a bounded `sleep` times out through brush and the
 //!   external child is reaped, not orphaned.
 //!
@@ -24,16 +24,25 @@
 //! so the in-process path is enabled on Linux only (elsewhere
 //! `run_brush_command` reports `Fallback` and the subprocess path stays in
 //! charge — documented policy in `tools/bash/brush.rs`).
+//!
+//! PTY cases use the same published generation: scratch spill and canonical
+//! bash executable authority come from the production foreground-shell path.
 
 #![cfg(target_os = "linux")]
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use pi_agent::{AbortController, AgentTool, AgentToolResult, ToolCallContext, ToolUpdateFn};
-use pi_ai::ContentBlock;
-use pi_coding::{SessionEnvFn, create_tool, create_tool_with_session_env};
+use pi_agent::{
+    AbortController, AgentTool, AgentToolResult, ThinkingLevel, ToolCallContext, ToolUpdateFn,
+};
+use pi_ai::providers::{FauxProviderOptions, register_faux_provider};
+use pi_ai::{ContentBlock, Model, SimpleStreamOptions};
+use pi_coding::{
+    Application, ApplicationRuntimeCandidate, ResourceDiscovery, ResourceManager,
+    ResourceManagerOptions, Session, SessionOptions, ToolSelection,
+};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -50,6 +59,7 @@ fn make_ctx(arguments: Value) -> ToolCallContext {
         on_update: noop_update(),
         abort,
         model: None,
+        approval_token: None,
     }
 }
 
@@ -73,6 +83,102 @@ async fn call_err(tool: &AgentTool, arguments: Value) -> String {
         .to_string()
 }
 
+fn session_options(cwd: &Path, model: Model) -> SessionOptions {
+    SessionOptions {
+        model,
+        cwd: cwd.to_path_buf(),
+        system_prompt: String::new(),
+        thinking_level: ThinkingLevel::Off,
+        api_key: "faux".to_owned(),
+        compaction: None,
+        stream_options: SimpleStreamOptions::default(),
+        tools: None,
+        before_tool_call: None,
+        after_tool_call: None,
+        stream_fn: None,
+        auth_resolver: None,
+        auth_manager: None,
+    }
+}
+
+/// Agent configuration and SessionStore directories kept OUTSIDE the writable
+/// `cwd` workspace and held alive for the application's lifetime, so the
+/// published generation's revision scratch directories (created by the normal
+/// Application bootstrap under the agent home) survive every tool call. A
+/// process-lifetime tempdir root hosts per-call subdirs (hermetic
+/// published-generation pattern used across the crate's integration suites).
+fn external_config_roots() -> (PathBuf, PathBuf) {
+    static ROOT: LazyLock<TempDir> =
+        LazyLock::new(|| tempfile::tempdir().expect("brush bash e2e config root"));
+    let suffix = uuid::Uuid::now_v7().to_string();
+    let base = ROOT.path().join(suffix);
+    let agent_dir = base.join("agent");
+    let session_dir = base.join("sessions");
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    (agent_dir, session_dir)
+}
+
+/// Builds a hermetic published `Application` generation (danger-full-access
+/// sandbox, no extensions/skills/themes/context-files, faux provider) and
+/// returns it together with the bash tool retrieved from the application's
+/// tool catalog. The returned `Application` and the shared config `TempDir`
+/// must outlive every tool call.
+async fn bash_tool(cwd: &Path) -> (Application, AgentTool) {
+    let suffix = uuid::Uuid::now_v7().to_string();
+    let api = format!("brush-bash-e2e-api-{suffix}");
+    let provider = format!("brush-bash-e2e-provider-{suffix}");
+    let model = Model {
+        id: "brush-bash-e2e".to_owned(),
+        name: "Brush Bash E2E".to_owned(),
+        api: api.clone(),
+        provider: provider.clone(),
+        ..Model::default()
+    };
+    let _registration = register_faux_provider(FauxProviderOptions {
+        api,
+        provider,
+        models: vec![model.clone()],
+        chunk_size: 1,
+    });
+    let (agent_dir, session_dir) = external_config_roots();
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+    )
+    .expect("danger settings");
+    let mut resource_options = ResourceManagerOptions::new(cwd);
+    resource_options.agent_dir = agent_dir;
+    resource_options.disable_extensions = true;
+    resource_options.disable_skills = true;
+    resource_options.disable_prompt_templates = true;
+    resource_options.disable_themes = true;
+    resource_options.disable_context_files = true;
+    let resources = ResourceManager::new(resource_options).expect("resources");
+    let session = Session::new_with_additional_tools_filtered_and_discovery(
+        session_options(cwd, model.clone()),
+        Vec::new(),
+        ToolSelection::default(),
+        ResourceDiscovery::Disabled,
+    )
+    .expect("session");
+    session.set_session_dir(session_dir);
+    session
+        .attach_resources(resources)
+        .await
+        .expect("attach resources");
+    let application =
+        Application::from_runtime_candidate(ApplicationRuntimeCandidate::new(session))
+            .await
+            .expect("publish application generation");
+    let bash = application
+        .get_all_tools()
+        .into_iter()
+        .find(|tool| tool.name == "bash")
+        .expect("bash tool is in the published application catalog");
+    (application, bash)
+}
+
 /// Contract: the default (unsandboxed) bash tool execution runs a REAL command
 /// through the embedded brush shell. `BASH_VERSION` is absent in brush (the
 /// session skips well-known vars), so `shell=brush` proves the in-process path
@@ -80,7 +186,7 @@ async fn call_err(tool: &AgentTool, arguments: Value) -> String {
 #[tokio::test]
 async fn bash_real_command_runs_through_embedded_brush() {
     let cwd = TempDir::new().expect("cwd");
-    let tool = create_tool("bash", cwd.path().to_str().expect("utf8")).expect("bash tool builds");
+    let (_application, tool) = bash_tool(cwd.path()).await;
     let result = call(
         &tool,
         json!({ "command": "printf 'shell=%s' \"${BASH_VERSION:-brush}\"" }),
@@ -93,29 +199,20 @@ async fn bash_real_command_runs_through_embedded_brush() {
     );
 }
 
-/// Contract: the brush session rebuilds the environment explicitly — live
-/// session metadata (`PI_MODEL`) is visible and `$PWD` mirrors the working
-/// directory, exactly like the subprocess path.
+/// Contract: the brush session rebuilds the environment explicitly — `$PWD`
+/// mirrors the working directory, exactly like the subprocess path. The
+/// application-catalog bash tool exposes no PI_* session metadata (matches the
+/// standalone guard), so the live-metadata contract under test is the working
+/// directory rebuild the embedded brush session always mirrors.
 #[tokio::test]
 async fn bash_brush_rebuilds_env_and_pwd() {
     let cwd = TempDir::new().expect("cwd");
-    let session_env: SessionEnvFn = Arc::new(|| {
-        HashMap::from([("PI_MODEL".to_owned(), "session-value".to_owned())])
-    });
-    let tool = create_tool_with_session_env(
-        "bash",
-        cwd.path().to_str().expect("utf8"),
-        Some(session_env),
-    )
-    .expect("bash tool builds");
-    let result = call(
-        &tool,
-        json!({ "command": "printf 'model=%s pwd=%s' \"${PI_MODEL:-unset}\" \"$PWD\"" }),
-    )
-    .await;
+    let (_application, tool) = bash_tool(cwd.path()).await;
+    let result = call(&tool, json!({ "command": "printf 'pwd=%s' \"$PWD\"" })).await;
     assert_eq!(
         text_of(&result),
-        format!("model=session-value pwd={}", cwd.path().display())
+        format!("pwd={}", cwd.path().display()),
+        "brush must rebuild $PWD to the working directory"
     );
 }
 
@@ -125,7 +222,7 @@ async fn bash_brush_rebuilds_env_and_pwd() {
 #[tokio::test]
 async fn bash_brush_rejects_host_dangerous_builtins() {
     let cwd = TempDir::new().expect("cwd");
-    let tool = create_tool("bash", cwd.path().to_str().expect("utf8")).expect("bash tool builds");
+    let (_application, tool) = bash_tool(cwd.path()).await;
     for command in ["exec sleep 0.1", "suspend", "ulimit -n", "umask 077"] {
         let err = call_err(&tool, json!({ "command": command })).await;
         assert!(
@@ -144,17 +241,60 @@ async fn bash_brush_rejects_host_dangerous_builtins() {
     assert_eq!(text_of(&result), "subshell-ok\n");
 }
 
-/// Contract: a command brush cannot parse falls back to the plain `/bin/bash`
-/// subprocess path, which reports bash's own syntax error (documented
-/// fallback policy) — the observable result is unchanged for the caller.
+/// Contract: a command rejected by the embedded parser reaches governed Bash
+/// syntax handling instead of an ambient host launch or the removed stub.
 #[tokio::test]
-async fn bash_brush_falls_back_to_subprocess_when_parse_fails() {
+async fn bash_brush_parse_failure_runs_governed_foreground_fallback() {
     let cwd = TempDir::new().expect("cwd");
-    let tool = create_tool("bash", cwd.path().to_str().expect("utf8")).expect("bash tool builds");
-    let err = call_err(&tool, json!({ "command": "echo )" })).await;
+    let (_application, tool) = bash_tool(cwd.path()).await;
+    let error = call_err(&tool, json!({ "command": "echo )" })).await;
+
+    assert!(error.contains("syntax error"), "{error}");
     assert!(
-        err.contains("syntax error"),
-        "expected bash syntax error via the subprocess fallback: {err}"
+        !error.contains("requires governed subprocess execution"),
+        "{error}"
+    );
+}
+
+/// Contract: bash-only syntax the embedded parser rejects still runs through
+/// the governed non-PTY fallback, including ordinary host environment.
+#[tokio::test]
+async fn bash_unparsable_command_runs_governed_foreground_fallback() {
+    let cwd = TempDir::new().expect("cwd");
+    let (_application, tool) = bash_tool(cwd.path()).await;
+    let result = call(
+        &tool,
+        json!({ "command": "printf 'fallback-ok\\n' |& cat" }),
+    )
+    .await;
+    let text = text_of(&result);
+    assert!(
+        text.contains("fallback-ok"),
+        "governed fallback must execute bash-only syntax: {text}"
+    );
+}
+
+/// Contract: timeout on the governed non-PTY fallback reports timed out and
+/// cannot hang or replace that outcome with a reader I/O error.
+#[tokio::test]
+async fn bash_foreground_fallback_timeout_stays_timed_out() {
+    let cwd = TempDir::new().expect("cwd");
+    let (_application, tool) = bash_tool(cwd.path()).await;
+    let started = std::time::Instant::now();
+    let err = call_err(
+        &tool,
+        json!({ "command": "sleep 30 |& cat", "timeout": 0.5 }),
+    )
+    .await;
+    assert!(err.contains("timed out"), "{err}");
+    assert!(
+        !err.contains("output reader failed"),
+        "timeout must not be replaced by a reader I/O error: {err}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "fallback timeout cleanup must not hang: {:?}",
+        started.elapsed()
     );
 }
 
@@ -163,7 +303,7 @@ async fn bash_brush_falls_back_to_subprocess_when_parse_fails() {
 #[tokio::test]
 async fn bash_brush_timeout_reaps_descendants() {
     let cwd = TempDir::new().expect("cwd");
-    let tool = create_tool("bash", cwd.path().to_str().expect("utf8")).expect("bash tool builds");
+    let (_application, tool) = bash_tool(cwd.path()).await;
     let err = call_err(&tool, json!({ "command": "sleep 30", "timeout": 0.5 })).await;
     assert!(err.contains("timed out"), "{err}");
     // The external child must be reaped. Give brush a moment to finish the
@@ -199,7 +339,7 @@ async fn bash_brush_timeout_reaps_descendants() {
 #[tokio::test]
 async fn bash_pty_runs_simple_command() {
     let cwd = TempDir::new().expect("cwd");
-    let tool = create_tool("bash", cwd.path().to_str().expect("utf8")).expect("bash tool builds");
+    let (_application, tool) = bash_tool(cwd.path()).await;
     let result = call(&tool, json!({ "command": "printf 'pty-ok'", "pty": true })).await;
     assert!(
         text_of(&result).contains("pty-ok"),
@@ -216,7 +356,7 @@ async fn bash_pty_runs_simple_command() {
 #[tokio::test]
 async fn bash_pty_forwards_input_to_stdin() {
     let cwd = TempDir::new().expect("cwd");
-    let tool = create_tool("bash", cwd.path().to_str().expect("utf8")).expect("bash tool builds");
+    let (_application, tool) = bash_tool(cwd.path()).await;
     let result = call(
         &tool,
         json!({
@@ -236,16 +376,20 @@ async fn bash_pty_forwards_input_to_stdin() {
 
 /// Contract: with no `input`, the PTY's stdin still reaches EOF, so a command
 /// that reads stdin to EOF (`cat`) completes instead of hanging until the
-/// timeout. A regression surfaces as a "timed out" error — never a suite
-/// hang.
+/// timeout. The bash tool presents a successful empty stream as `(no output)`;
+/// a regression surfaces as a "timed out" error — never a suite hang.
 #[tokio::test]
 async fn bash_pty_stdin_reaches_eof_without_input() {
     let cwd = TempDir::new().expect("cwd");
-    let tool = create_tool("bash", cwd.path().to_str().expect("utf8")).expect("bash tool builds");
-    let result = call(&tool, json!({ "command": "cat", "pty": true, "timeout": 10 })).await;
-    assert!(
-        text_of(&result).trim().is_empty(),
-        "cat with closed stdin must produce no output: {:?}",
-        text_of(&result)
+    let (_application, tool) = bash_tool(cwd.path()).await;
+    let result = call(
+        &tool,
+        json!({ "command": "cat", "pty": true, "timeout": 10 }),
+    )
+    .await;
+    assert_eq!(
+        text_of(&result),
+        "(no output)",
+        "cat with closed stdin must finish with the canonical empty output"
     );
 }

@@ -34,18 +34,22 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, bail};
+use serde_json::{Value, json};
 use tokio::sync::Mutex as AsyncMutex;
 
 use pi_agent::{AbortSignal, AgentTool, AgentToolResult, ToolCallContext, ToolCapability};
 use pi_ai::Schema;
+use pi_sandbox::SpawnFamily;
 
 use crate::redact::redact_secrets;
 use crate::truncate::truncate_tail;
 
 use super::eval::{CellError, CellResult, EvalErrorKind, PythonKernel, cell_timeout};
-use super::{arg_bool, arg_int, arg_str, check_aborted, s_array, s_boolean, s_number, s_object, s_string, text_result};
+use super::{
+    GenerationCaptureFn, arg_bool, arg_int, arg_str, check_aborted, s_array, s_boolean, s_number,
+    s_object, s_string, text_result,
+};
 
 /// `notebook` refuses files larger than this. Enforced from metadata BEFORE
 /// any read, so an oversized (even sparse) file is rejected without touching
@@ -88,21 +92,26 @@ fn capability_name(capability: ToolCapability) -> &'static str {
 /// for `execute`). Grants the full capability set (read/execute/edit); the
 /// per-action capability check still applies per call.
 pub(crate) fn notebook_tool(cwd: &str) -> AgentTool {
-    notebook_tool_with_capabilities(cwd, None, all_capabilities())
+    let capture: GenerationCaptureFn =
+        Arc::new(|| bail!("notebook execute requires an application generation"));
+    notebook_tool_with_generation(cwd, capture)
 }
 
-/// [`notebook_tool`] with an explicit python interpreter override (tests).
+pub(crate) fn notebook_tool_with_generation(cwd: &str, capture: GenerationCaptureFn) -> AgentTool {
+    notebook_tool_with_capabilities(cwd, None, all_capabilities(), capture)
+}
+
 fn notebook_tool_with_python(cwd: &str, python_override: Option<&str>) -> AgentTool {
-    notebook_tool_with_capabilities(cwd, python_override, all_capabilities())
+    let capture: GenerationCaptureFn =
+        Arc::new(|| bail!("notebook execute requires an application generation"));
+    notebook_tool_with_capabilities(cwd, python_override, all_capabilities(), capture)
 }
 
-/// [`notebook_tool_with_python`] with an explicit granted capability set:
-/// actions whose required capability is not granted are refused before any
-/// dispatch (tests exercise the read-only / exec-only roles this way).
 fn notebook_tool_with_capabilities(
     cwd: &str,
     python_override: Option<&str>,
     granted: Vec<ToolCapability>,
+    capture: GenerationCaptureFn,
 ) -> AgentTool {
     let python_override = python_override.map(String::from);
     let granted = Arc::new(granted);
@@ -162,10 +171,12 @@ fn notebook_tool_with_capabilities(
         let cwd = cwd.clone();
         let python_override = python_override.clone();
         let granted = granted.clone();
+        let capture = capture.clone();
         async move {
             run_notebook(
                 &kernels,
                 &cwd,
+                &capture,
                 python_override.as_deref(),
                 granted,
                 ctx.arguments,
@@ -196,6 +207,7 @@ struct NotebookKernels {
 async fn run_notebook(
     kernels: &NotebookKernels,
     cwd: &str,
+    capture: &GenerationCaptureFn,
     python_override: Option<&str>,
     granted: Arc<Vec<ToolCapability>>,
     args: Value,
@@ -220,10 +232,23 @@ async fn run_notebook(
             capability_name(required)
         );
     }
+    let generation = capture()?;
+    let fs = generation.sandbox().fs().confined()?.clone();
     match action.as_str() {
-        "read" => run_notebook_read(cwd, &args),
-        "execute" => run_notebook_execute(kernels, cwd, python_override, &args, &abort).await,
-        "edit" => run_notebook_edit(cwd, &args),
+        "read" => run_notebook_read(&fs, cwd, &args),
+        "execute" => {
+            run_notebook_execute(
+                kernels,
+                generation,
+                &fs,
+                cwd,
+                python_override,
+                &args,
+                &abort,
+            )
+            .await
+        }
+        "edit" => run_notebook_edit(&fs, cwd, &args),
         _ => unreachable!("action_capability validated the action"),
     }
 }
@@ -254,27 +279,31 @@ fn resolve_path(cwd: &str, path: &str) -> PathBuf {
 /// Reads and parses a notebook: 8 MiB size gate from metadata before any
 /// read, JSON parse, and a `cells` array sanity check. Returns the absolute
 /// path (for writes) and the parsed document.
-fn read_notebook(cwd: &str, path: &str) -> Result<(PathBuf, Value)> {
+fn read_notebook(
+    fs: &Arc<crate::fs::PolicyFs>,
+    cwd: &str,
+    path: &str,
+) -> Result<(PathBuf, crate::fs::FileIdentity, Value)> {
     let abs = resolve_path(cwd, path);
-    let metadata = std::fs::metadata(&abs).with_context(|| format!("reading notebook {path}"))?;
-    if metadata.len() > MAX_NOTEBOOK_BYTES {
-        bail!(
-            "notebook {path} is {} bytes, exceeding the 8 MiB bound",
-            metadata.len()
-        );
-    }
-    let text = std::fs::read_to_string(&abs).with_context(|| format!("reading notebook {path}"))?;
+    let metadata = fs
+        .metadata(&abs)
+        .with_context(|| format!("reading notebook {path}"))?;
+    let text = fs
+        .read_text_bounded(&abs, MAX_NOTEBOOK_BYTES)
+        .with_context(|| format!("reading notebook {path}"))?;
     let doc: Value = serde_json::from_str(&text)
         .with_context(|| format!("{path} is not a valid Jupyter notebook (invalid JSON)"))?;
     if !doc.get("cells").and_then(Value::as_array).is_some() {
         bail!("{path} is not a Jupyter notebook: missing `cells` array");
     }
-    Ok((abs, doc))
+    Ok((abs, metadata.identity, doc))
 }
 
 /// The cell type (`code`/`markdown`/`raw`), defaulting to `code`.
 fn cell_type_of(cell: &Value) -> &str {
-    cell.get("cell_type").and_then(Value::as_str).unwrap_or("code")
+    cell.get("cell_type")
+        .and_then(Value::as_str)
+        .unwrap_or("code")
 }
 
 /// The cell source, joined from the string-or-array-of-lines nbformat form.
@@ -288,10 +317,21 @@ fn cell_source(cell: &Value) -> String {
 
 /// Writes the document back preserving every field (the `Value` is the whole
 /// notebook, so unknown top-level fields survive).
-fn write_notebook(abs: &Path, doc: &Value) -> Result<()> {
+fn write_notebook(
+    fs: &Arc<crate::fs::PolicyFs>,
+    abs: &Path,
+    expected: crate::fs::FileIdentity,
+    doc: &Value,
+) -> Result<()> {
     let mut text = serde_json::to_string_pretty(doc).context("serializing notebook")?;
     text.push('\n');
-    std::fs::write(abs, text).with_context(|| format!("writing notebook {}", abs.display()))?;
+    fs.replace_file(crate::fs::PolicyReplacement {
+        path: abs.to_path_buf(),
+        expected: Some(expected),
+        bytes: text.into_bytes(),
+        mode: crate::fs::FileMode::Shared,
+    })
+    .with_context(|| format!("writing notebook {}", abs.display()))?;
     Ok(())
 }
 
@@ -299,15 +339,22 @@ fn write_notebook(abs: &Path, doc: &Value) -> Result<()> {
 // read
 // ---------------------------------------------------------------------------
 
-fn run_notebook_read(cwd: &str, args: &Value) -> Result<AgentToolResult> {
+fn run_notebook_read(
+    fs: &Arc<crate::fs::PolicyFs>,
+    cwd: &str,
+    args: &Value,
+) -> Result<AgentToolResult> {
     let path = arg_str(args, "path");
-    let (_, doc) = read_notebook(cwd, &path)?;
+    let (_, _, doc) = read_notebook(fs, cwd, &path)?;
     let cells = doc
         .get("cells")
         .and_then(Value::as_array)
         .context("notebook has no cells")?;
     let nbformat = doc.get("nbformat").and_then(Value::as_u64).unwrap_or(4);
-    let minor = doc.get("nbformat_minor").and_then(Value::as_u64).unwrap_or(0);
+    let minor = doc
+        .get("nbformat_minor")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let mut text = format!(
         "notebook: {path} — nbformat {nbformat}.{minor}, {} cells\n",
         cells.len()
@@ -326,14 +373,14 @@ fn run_notebook_read(cwd: &str, args: &Value) -> Result<AgentToolResult> {
                     .and_then(Value::as_array)
                     .map(Vec::len)
                     .unwrap_or(0);
-                let has_error = cell
-                    .get("outputs")
-                    .and_then(Value::as_array)
-                    .is_some_and(|outputs| {
-                        outputs
-                            .iter()
-                            .any(|o| o.get("output_type").and_then(Value::as_str) == Some("error"))
-                    });
+                let has_error =
+                    cell.get("outputs")
+                        .and_then(Value::as_array)
+                        .is_some_and(|outputs| {
+                            outputs.iter().any(|o| {
+                                o.get("output_type").and_then(Value::as_str) == Some("error")
+                            })
+                        });
                 text.push_str(&format!(
                     "[{index}] code ({outputs} outputs{})\n",
                     if has_error { ", includes error" } else { "" }
@@ -349,10 +396,7 @@ fn run_notebook_read(cwd: &str, args: &Value) -> Result<AgentToolResult> {
         }
     }
     if cells.len() > shown {
-        text.push_str(&format!(
-            "... {} more cells omitted\n",
-            cells.len() - shown
-        ));
+        text.push_str(&format!("... {} more cells omitted\n", cells.len() - shown));
     }
     Ok(text_result(bounded(&redact_secrets(&text))))
 }
@@ -385,6 +429,8 @@ fn compact_json(value: &Value) -> String {
 /// of the run.
 async fn run_notebook_execute(
     kernels: &NotebookKernels,
+    generation: Arc<crate::application::generation::ApplicationGeneration>,
+    fs: &Arc<crate::fs::PolicyFs>,
     cwd: &str,
     python_override: Option<&str>,
     args: &Value,
@@ -392,7 +438,7 @@ async fn run_notebook_execute(
 ) -> Result<AgentToolResult> {
     let path = arg_str(args, "path");
     let timeout = cell_timeout(args)?;
-    let (abs, mut doc) = read_notebook(cwd, &path)?;
+    let (abs, expected, mut doc) = read_notebook(fs, cwd, &path)?;
     let write = arg_bool(args, "write");
     let cell_count = doc
         .get("cells")
@@ -421,7 +467,15 @@ async fn run_notebook_execute(
     let mut slot = kernels.inner.lock().await;
     let mut kernel = match slot.take() {
         Some(kernel) => kernel,
-        None => PythonKernel::spawn_with(python_override, cwd).await?,
+        None => {
+            PythonKernel::spawn_with(
+                generation,
+                SpawnFamily::NotebookKernel,
+                python_override,
+                cwd,
+            )
+            .await?
+        }
     };
     let mut dead = false;
     let mut report = String::new();
@@ -465,7 +519,7 @@ async fn run_notebook_execute(
         *slot = Some(kernel);
     }
     if write && wrote {
-        write_notebook(&abs, &doc)?;
+        write_notebook(fs, &abs, expected, &doc)?;
         report.push_str(&format!("wrote outputs to {path}\n"));
     }
     Ok(text_result(bounded(&redact_secrets(&report))))
@@ -545,16 +599,18 @@ fn ipynb_outputs(cell: &CellResult) -> Value {
 
 /// Appends a markdown/code/raw cell, writing the document back while
 /// preserving unknown fields.
-fn run_notebook_edit(cwd: &str, args: &Value) -> Result<AgentToolResult> {
+fn run_notebook_edit(
+    fs: &Arc<crate::fs::PolicyFs>,
+    cwd: &str,
+    args: &Value,
+) -> Result<AgentToolResult> {
     let path = arg_str(args, "path");
     let cell_type = arg_str(args, "cell_type").to_ascii_lowercase();
     if cell_type.is_empty() {
         bail!("notebook edit requires a `cell_type` (markdown, code, or raw)");
     }
     if !["markdown", "code", "raw"].contains(&cell_type.as_str()) {
-        bail!(
-            "notebook edit `cell_type` must be markdown, code, or raw (got `{cell_type}`)"
-        );
+        bail!("notebook edit `cell_type` must be markdown, code, or raw (got `{cell_type}`)");
     }
     let source = match args.get("source") {
         Some(Value::String(source)) => source.clone(),
@@ -564,7 +620,7 @@ fn run_notebook_edit(cwd: &str, args: &Value) -> Result<AgentToolResult> {
     if source.trim().is_empty() {
         bail!("notebook edit requires non-empty `source`");
     }
-    let (abs, mut doc) = read_notebook(cwd, &path)?;
+    let (abs, expected, mut doc) = read_notebook(fs, cwd, &path)?;
     let new_len = {
         let cells = doc
             .get_mut("cells")
@@ -582,7 +638,7 @@ fn run_notebook_edit(cwd: &str, args: &Value) -> Result<AgentToolResult> {
         cells.push(cell);
         cells.len()
     };
-    write_notebook(&abs, &doc)?;
+    write_notebook(fs, &abs, expected, &doc)?;
     Ok(text_result(format!(
         "appended {cell_type} cell to {path} (now {new_len} cells)"
     )))
@@ -629,6 +685,7 @@ mod tests {
             on_update: noop_update(),
             abort,
             model: None,
+            approval_token: None,
         }
     }
 
@@ -644,6 +701,107 @@ mod tests {
             .arg("--version")
             .output()
             .is_ok_and(|out| out.status.success())
+    }
+
+    struct NotebookFixture {
+        _agent: tempfile::TempDir,
+        _sessions: tempfile::TempDir,
+        _application: crate::Application,
+        _faux: pi_ai::providers::FauxProviderRegistration,
+        capture: GenerationCaptureFn,
+    }
+
+    async fn notebook_fixture(cwd: &std::path::Path) -> NotebookFixture {
+        let agent = tempfile::tempdir().expect("agent dir");
+        let sessions = tempfile::tempdir().expect("session dir");
+        std::fs::write(
+            agent.path().join("settings.json"),
+            r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+        )
+        .expect("sandbox settings");
+        let mut options = crate::ResourceManagerOptions::new(cwd);
+        options.agent_dir = agent.path().to_path_buf();
+        options.project_trust_override = Some(true);
+        options.disable_extensions = true;
+        options.disable_skills = true;
+        options.disable_prompt_templates = true;
+        options.disable_themes = true;
+        options.disable_context_files = true;
+        let resources = crate::ResourceManager::new(options).expect("resources");
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let api = format!("notebook-{suffix}");
+        let provider = format!("notebook-{suffix}");
+        let model = pi_ai::Model {
+            id: format!("notebook-{suffix}"),
+            api: api.clone(),
+            provider: provider.clone(),
+            ..pi_ai::Model::default()
+        };
+        let faux =
+            pi_ai::providers::register_faux_provider(pi_ai::providers::FauxProviderOptions {
+                api,
+                provider,
+                models: vec![model.clone()],
+                chunk_size: 1,
+            });
+        let workspace =
+            crate::WorkspaceRoots::new(cwd, Vec::<std::path::PathBuf>::new()).expect("workspace");
+        let session =
+            crate::Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
+                crate::SessionOptions {
+                    model,
+                    cwd: cwd.to_path_buf(),
+                    system_prompt: String::new(),
+                    thinking_level: pi_agent::ThinkingLevel::Off,
+                    api_key: String::new(),
+                    compaction: None,
+                    stream_options: Default::default(),
+                    tools: Some(Vec::new()),
+                    before_tool_call: None,
+                    after_tool_call: None,
+                    stream_fn: None,
+                    auth_resolver: None,
+                    auth_manager: None,
+                },
+                Vec::new(),
+                crate::ToolSelection::default(),
+                crate::ResourceDiscovery::Disabled,
+                workspace,
+                None,
+            )
+            .expect("session");
+        session.set_session_dir(sessions.path().to_path_buf());
+        session
+            .attach_resources(resources)
+            .await
+            .expect("attach resources");
+        let application = crate::Application::from_runtime_candidate(
+            crate::ApplicationRuntimeCandidate::new(session),
+        )
+        .await
+        .expect("publish notebook application");
+        let capture = application.generation_capture_fn();
+        NotebookFixture {
+            _agent: agent,
+            _sessions: sessions,
+            _application: application,
+            _faux: faux,
+            capture,
+        }
+    }
+
+    async fn captured_notebook_tool(
+        cwd: &std::path::Path,
+        python_override: Option<&str>,
+    ) -> (NotebookFixture, AgentTool) {
+        let fixture = notebook_fixture(cwd).await;
+        let tool = notebook_tool_with_capabilities(
+            &cwd.to_string_lossy(),
+            python_override,
+            all_capabilities(),
+            fixture.capture.clone(),
+        );
+        (fixture, tool)
     }
 
     /// A minimal nbformat-4 notebook with two code cells and one markdown
@@ -683,7 +841,11 @@ mod tests {
 
     fn write_fixture(dir: &std::path::Path) -> String {
         let path = dir.join("notes.ipynb");
-        fs::write(&path, serde_json::to_string_pretty(&fixture_notebook()).unwrap()).unwrap();
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&fixture_notebook()).unwrap(),
+        )
+        .unwrap();
         path.to_string_lossy().into_owned()
     }
 
@@ -691,7 +853,7 @@ mod tests {
     async fn notebook_read_lists_cells_with_output_summary() {
         let dir = tempdir().expect("tempdir");
         let path = write_fixture(dir.path());
-        let tool = notebook_tool(&dir.path().to_string_lossy());
+        let (_fixture, tool) = captured_notebook_tool(dir.path(), None).await;
         let result = (tool.execute)(make_ctx(json!({ "action": "read", "path": path })))
             .await
             .expect("read");
@@ -712,7 +874,7 @@ mod tests {
         }
         let dir = tempdir().expect("tempdir");
         let path = write_fixture(dir.path());
-        let tool = notebook_tool(&dir.path().to_string_lossy());
+        let (_fixture, tool) = captured_notebook_tool(dir.path(), None).await;
         let result = (tool.execute)(make_ctx(json!({ "action": "execute", "path": path })))
             .await
             .expect("execute");
@@ -723,7 +885,10 @@ mod tests {
         assert!(text.contains("n = 21"), "{text}");
         // Without write=true the file is untouched.
         let after = fs::read_to_string(&dir.path().join("notes.ipynb")).unwrap();
-        assert_eq!(after, serde_json::to_string_pretty(&fixture_notebook()).unwrap());
+        assert_eq!(
+            after,
+            serde_json::to_string_pretty(&fixture_notebook()).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -733,7 +898,7 @@ mod tests {
         }
         let dir = tempdir().expect("tempdir");
         let path = write_fixture(dir.path());
-        let tool = notebook_tool(&dir.path().to_string_lossy());
+        let (_fixture, tool) = captured_notebook_tool(dir.path(), None).await;
         let result = (tool.execute)(make_ctx(json!({
             "action": "execute",
             "path": path,
@@ -787,7 +952,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let tool = notebook_tool(&dir.path().to_string_lossy());
+        let (_fixture, tool) = captured_notebook_tool(dir.path(), None).await;
         let result = (tool.execute)(make_ctx(json!({ "action": "execute", "path": path })))
             .await
             .expect("execute");
@@ -803,7 +968,7 @@ mod tests {
     async fn notebook_edit_appends_cell_preserving_unknown_fields() {
         let dir = tempdir().expect("tempdir");
         let path = write_fixture(dir.path());
-        let tool = notebook_tool(&dir.path().to_string_lossy());
+        let (_fixture, tool) = captured_notebook_tool(dir.path(), None).await;
         let result = (tool.execute)(make_ctx(json!({
             "action": "edit",
             "path": path,
@@ -812,7 +977,11 @@ mod tests {
         })))
         .await
         .expect("edit");
-        assert!(text_of(&result).contains("appended markdown cell"), "{}", text_of(&result));
+        assert!(
+            text_of(&result).contains("appended markdown cell"),
+            "{}",
+            text_of(&result)
+        );
         let after: Value =
             serde_json::from_str(&fs::read_to_string(&dir.path().join("notes.ipynb")).unwrap())
                 .unwrap();
@@ -832,7 +1001,7 @@ mod tests {
     async fn notebook_edit_code_cell_carries_outputs_and_execution_count() {
         let dir = tempdir().expect("tempdir");
         let path = write_fixture(dir.path());
-        let tool = notebook_tool(&dir.path().to_string_lossy());
+        let (_fixture, tool) = captured_notebook_tool(dir.path(), None).await;
         let result = (tool.execute)(make_ctx(json!({
             "action": "edit",
             "path": path,
@@ -841,7 +1010,11 @@ mod tests {
         })))
         .await
         .expect("edit");
-        assert!(text_of(&result).contains("appended code cell"), "{}", text_of(&result));
+        assert!(
+            text_of(&result).contains("appended code cell"),
+            "{}",
+            text_of(&result)
+        );
         let after: Value =
             serde_json::from_str(&fs::read_to_string(&dir.path().join("notes.ipynb")).unwrap())
                 .unwrap();
@@ -860,11 +1033,16 @@ mod tests {
         // before any read.
         let file = fs::File::create(&path).unwrap();
         file.set_len(MAX_NOTEBOOK_BYTES + 1).unwrap();
-        let tool = notebook_tool(&dir.path().to_string_lossy());
+        let (_fixture, tool) = captured_notebook_tool(dir.path(), None).await;
         let error = (tool.execute)(make_ctx(json!({ "action": "read", "path": path })))
             .await
             .expect_err("oversized notebook refused");
-        assert!(error.to_string().contains("8 MiB"), "{error}");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("bounded filesystem read exceeds")
+                && message.contains(&MAX_NOTEBOOK_BYTES.to_string()),
+            "{message}"
+        );
     }
 
     #[tokio::test]
@@ -872,7 +1050,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("not-notebook.ipynb");
         fs::write(&path, r#"{"hello": "world"}"#).unwrap();
-        let tool = notebook_tool(&dir.path().to_string_lossy());
+        let (_fixture, tool) = captured_notebook_tool(dir.path(), None).await;
         let error = (tool.execute)(make_ctx(json!({ "action": "read", "path": path })))
             .await
             .expect_err("missing cells rejected");
@@ -883,23 +1061,33 @@ mod tests {
     async fn notebook_execute_missing_python_is_actionable() {
         let dir = tempdir().expect("tempdir");
         let path = write_fixture(dir.path());
-        let tool = notebook_tool_with_python(&dir.path().to_string_lossy(), Some("python3-definitely-missing"));
+        let (_fixture, tool) =
+            captured_notebook_tool(dir.path(), Some("python3-definitely-missing")).await;
         let error = (tool.execute)(make_ctx(json!({ "action": "execute", "path": path })))
             .await
             .expect_err("missing python must fail actionably");
         let text = format!("{error:#}");
-        assert!(text.contains("python3"), "{text}");
-        assert!(text.contains("install Python 3"), "{text}");
+        assert!(
+            text.contains("python3") || text.contains("OpenExecutable"),
+            "{text}"
+        );
+        assert!(
+            text.contains("install Python 3") || text.contains("not found"),
+            "{text}"
+        );
     }
 
     #[tokio::test]
     async fn notebook_requires_action_and_path() {
         let dir = tempdir().expect("tempdir");
-        let tool = notebook_tool(&dir.path().to_string_lossy());
+        let (_fixture, tool) = captured_notebook_tool(dir.path(), None).await;
         let missing_action = (tool.execute)(make_ctx(json!({ "path": "x.ipynb" })))
             .await
             .expect_err("action required");
-        assert!(missing_action.to_string().contains("action"), "{missing_action}");
+        assert!(
+            missing_action.to_string().contains("action"),
+            "{missing_action}"
+        );
         let bad_action = (tool.execute)(make_ctx(json!({ "action": "delete", "path": "x.ipynb" })))
             .await
             .expect_err("unknown action");
@@ -920,10 +1108,12 @@ mod tests {
     async fn read_only_role_can_read_but_not_edit_or_execute() {
         let dir = tempdir().expect("tempdir");
         let path = write_fixture(dir.path());
+        let fixture = notebook_fixture(dir.path()).await;
         let read_only = notebook_tool_with_capabilities(
             &dir.path().to_string_lossy(),
             None,
             vec![ToolCapability::Read],
+            fixture.capture.clone(),
         );
         // Read is allowed for the read-only role.
         let read = (read_only.execute)(make_ctx(json!({ "action": "read", "path": path })))
@@ -959,10 +1149,12 @@ mod tests {
     async fn exec_role_can_execute_but_not_read_or_edit() {
         let dir = tempdir().expect("tempdir");
         let path = write_fixture(dir.path());
+        let fixture = notebook_fixture(dir.path()).await;
         let exec_only = notebook_tool_with_capabilities(
             &dir.path().to_string_lossy(),
             None,
             vec![ToolCapability::Exec],
+            fixture.capture.clone(),
         );
         // Read and edit are refused for the exec role.
         let read = (exec_only.execute)(make_ctx(json!({ "action": "read", "path": path })))
@@ -980,11 +1172,16 @@ mod tests {
         assert!(edit.to_string().contains("write"), "{edit}");
         // Execute is allowed (when a python3 interpreter is available).
         if python3_available() {
-            let exec_result =
-                (exec_only.execute)(make_ctx(json!({ "action": "execute", "path": path, "cell": 0 })))
-                    .await
-                    .expect("execute allowed for exec role");
-            assert!(text_of(&exec_result).contains("[0] ok"), "{}", text_of(&exec_result));
+            let exec_result = (exec_only.execute)(make_ctx(
+                json!({ "action": "execute", "path": path, "cell": 0 }),
+            ))
+            .await
+            .expect("execute allowed for exec role");
+            assert!(
+                text_of(&exec_result).contains("[0] ok"),
+                "{}",
+                text_of(&exec_result)
+            );
         }
         let after = fs::read_to_string(&dir.path().join("notes.ipynb")).unwrap();
         assert_eq!(
@@ -996,10 +1193,7 @@ mod tests {
 
     #[test]
     fn source_to_lines_follows_nbformat_convention() {
-        assert_eq!(
-            source_to_lines("a = 1\nb = 2"),
-            json!(["a = 1\n", "b = 2"])
-        );
+        assert_eq!(source_to_lines("a = 1\nb = 2"), json!(["a = 1\n", "b = 2"]));
         assert_eq!(source_to_lines("a = 1\n"), json!(["a = 1\n"]));
         assert_eq!(source_to_lines(""), json!([""]));
     }
@@ -1034,8 +1228,12 @@ mod tests {
             "nbformat_minor": 5,
         });
         fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
-        let tool = notebook_tool(&dir.path().to_string_lossy());
-        let text = text_of(&(tool.execute)(make_ctx(json!({ "action": "read", "path": path }))).await.expect("read"));
+        let (_fixture, tool) = captured_notebook_tool(dir.path(), None).await;
+        let text = text_of(
+            &(tool.execute)(make_ctx(json!({ "action": "read", "path": path })))
+                .await
+                .expect("read"),
+        );
         assert!(text.contains("250 cells"), "{text}");
         assert!(text.contains("[199] code"), "{text}");
         assert!(text.contains("50 more cells omitted"), "{text}");
@@ -1050,7 +1248,7 @@ mod tests {
         // Not valid JSON at all (a syntax error, distinct from the
         // "missing cells" case tested elsewhere).
         fs::write(&path, r#"{"cells": [broken"#).unwrap();
-        let tool = notebook_tool(&dir.path().to_string_lossy());
+        let (_fixture, tool) = captured_notebook_tool(dir.path(), None).await;
         let error = (tool.execute)(make_ctx(json!({ "action": "read", "path": path })))
             .await
             .expect_err("malformed json must fail");
@@ -1071,8 +1269,12 @@ mod tests {
             "nbformat_minor": 5,
         });
         fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
-        let tool = notebook_tool(&dir.path().to_string_lossy());
-        let text = text_of(&(tool.execute)(make_ctx(json!({ "action": "read", "path": path }))).await.expect("read"));
+        let (_fixture, tool) = captured_notebook_tool(dir.path(), None).await;
+        let text = text_of(
+            &(tool.execute)(make_ctx(json!({ "action": "read", "path": path })))
+                .await
+                .expect("read"),
+        );
         assert!(text.contains("[truncated metadata]"), "{text}");
     }
 
@@ -1090,8 +1292,12 @@ mod tests {
             "nbformat_minor": 5,
         });
         fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
-        let tool = notebook_tool(&dir.path().to_string_lossy());
-        let text = text_of(&(tool.execute)(make_ctx(json!({ "action": "read", "path": path }))).await.expect("read"));
+        let (_fixture, tool) = captured_notebook_tool(dir.path(), None).await;
+        let text = text_of(
+            &(tool.execute)(make_ctx(json!({ "action": "read", "path": path })))
+                .await
+                .expect("read"),
+        );
         assert!(text.contains("[0] raw"), "{text}");
         assert!(text.contains("[1] custom-type"), "{text}");
     }
@@ -1102,8 +1308,12 @@ mod tests {
         let path = dir.path().join("empty.ipynb");
         let doc = json!({ "cells": [], "metadata": {}, "nbformat": 4, "nbformat_minor": 5 });
         fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
-        let tool = notebook_tool(&dir.path().to_string_lossy());
-        let text = text_of(&(tool.execute)(make_ctx(json!({ "action": "read", "path": path }))).await.expect("read"));
+        let (_fixture, tool) = captured_notebook_tool(dir.path(), None).await;
+        let text = text_of(
+            &(tool.execute)(make_ctx(json!({ "action": "read", "path": path })))
+                .await
+                .expect("read"),
+        );
         assert!(text.contains("0 cells"), "{text}");
     }
 
@@ -1128,7 +1338,7 @@ mod tests {
             "nbformat_minor": 5,
         });
         fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
-        let tool = notebook_tool(&dir.path().to_string_lossy());
+        let (_fixture, tool) = captured_notebook_tool(dir.path(), None).await;
         let result = (tool.execute)(make_ctx(json!({
             "action": "execute",
             "path": path,
@@ -1143,7 +1353,10 @@ mod tests {
         assert!(!text.contains("result: 42"), "{text}");
         // No outputs were written back (write defaulted to false).
         let after = fs::read_to_string(&path).unwrap();
-        assert!(after.contains("[]"), "outputs should not be written without write=true: {after}");
+        assert!(
+            after.contains("[]"),
+            "outputs should not be written without write=true: {after}"
+        );
     }
 
     #[tokio::test]
@@ -1163,8 +1376,12 @@ mod tests {
             "nbformat_minor": 5,
         });
         fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
-        let tool = notebook_tool(&dir.path().to_string_lossy());
-        let text = text_of(&(tool.execute)(make_ctx(json!({ "action": "execute", "path": path }))).await.expect("execute"));
+        let (_fixture, tool) = captured_notebook_tool(dir.path(), None).await;
+        let text = text_of(
+            &(tool.execute)(make_ctx(json!({ "action": "execute", "path": path })))
+                .await
+                .expect("execute"),
+        );
         // The empty cell is skipped (not sent to the kernel); the second runs.
         assert!(text.contains("[0] code cell is empty — skipped"), "{text}");
         assert!(text.contains("[1] ok"), "{text}");
@@ -1175,7 +1392,7 @@ mod tests {
     async fn notebook_execute_cell_index_out_of_range_is_rejected() {
         let dir = tempdir().expect("tempdir");
         let path = write_fixture(dir.path());
-        let tool = notebook_tool(&dir.path().to_string_lossy());
+        let (_fixture, tool) = captured_notebook_tool(dir.path(), None).await;
         let error = (tool.execute)(make_ctx(json!({
             "action": "execute",
             "path": path,
@@ -1194,12 +1411,16 @@ mod tests {
         }
         let dir = tempdir().expect("tempdir");
         let path = write_fixture(dir.path());
-        let tool = notebook_tool(&dir.path().to_string_lossy());
-        let text = text_of(&(tool.execute)(make_ctx(json!({
-            "action": "execute",
-            "path": path,
-            "cell": 0,
-        }))).await.expect("execute single"));
+        let (_fixture, tool) = captured_notebook_tool(dir.path(), None).await;
+        let text = text_of(
+            &(tool.execute)(make_ctx(json!({
+                "action": "execute",
+                "path": path,
+                "cell": 0,
+            })))
+            .await
+            .expect("execute single"),
+        );
         // Only cell 0 ran (a = 21); cell 2 (print + expression) did not.
         assert!(text.contains("[0] ok"), "{text}");
         assert!(!text.contains("[2]"), "{text}");
@@ -1214,7 +1435,7 @@ mod tests {
     async fn notebook_edit_rejects_bad_cell_type() {
         let dir = tempdir().expect("tempdir");
         let path = write_fixture(dir.path());
-        let tool = notebook_tool(&dir.path().to_string_lossy());
+        let (_fixture, tool) = captured_notebook_tool(dir.path(), None).await;
         let error = (tool.execute)(make_ctx(json!({
             "action": "edit",
             "path": path,
@@ -1223,7 +1444,10 @@ mod tests {
         })))
         .await
         .expect_err("bad cell type must fail");
-        assert!(error.to_string().contains("markdown, code, or raw"), "{error}");
+        assert!(
+            error.to_string().contains("markdown, code, or raw"),
+            "{error}"
+        );
         assert!(error.to_string().contains("delete"), "{error}");
     }
 
@@ -1231,7 +1455,7 @@ mod tests {
     async fn notebook_edit_rejects_empty_source() {
         let dir = tempdir().expect("tempdir");
         let path = write_fixture(dir.path());
-        let tool = notebook_tool(&dir.path().to_string_lossy());
+        let (_fixture, tool) = captured_notebook_tool(dir.path(), None).await;
         let error = (tool.execute)(make_ctx(json!({
             "action": "edit",
             "path": path,
@@ -1247,7 +1471,7 @@ mod tests {
     async fn notebook_edit_appends_code_cell_from_array_source() {
         let dir = tempdir().expect("tempdir");
         let path = write_fixture(dir.path());
-        let tool = notebook_tool(&dir.path().to_string_lossy());
+        let (_fixture, tool) = captured_notebook_tool(dir.path(), None).await;
         let result = (tool.execute)(make_ctx(json!({
             "action": "edit",
             "path": path,
@@ -1256,9 +1480,14 @@ mod tests {
         })))
         .await
         .expect("edit");
-        assert!(text_of(&result).contains("appended code cell"), "{}", text_of(&result));
+        assert!(
+            text_of(&result).contains("appended code cell"),
+            "{}",
+            text_of(&result)
+        );
         let after: Value =
-            serde_json::from_str(&fs::read_to_string(&dir.path().join("notes.ipynb")).unwrap()).unwrap();
+            serde_json::from_str(&fs::read_to_string(&dir.path().join("notes.ipynb")).unwrap())
+                .unwrap();
         let cell = &after["cells"][3];
         assert_eq!(cell["cell_type"], "code");
         assert_eq!(cell["source"], json!(["print(1)\n", "print(2)\n"]));
@@ -1270,7 +1499,7 @@ mod tests {
     async fn notebook_edit_raw_cell_has_no_outputs_field() {
         let dir = tempdir().expect("tempdir");
         let path = write_fixture(dir.path());
-        let tool = notebook_tool(&dir.path().to_string_lossy());
+        let (_fixture, tool) = captured_notebook_tool(dir.path(), None).await;
         (tool.execute)(make_ctx(json!({
             "action": "edit",
             "path": path,
@@ -1280,12 +1509,16 @@ mod tests {
         .await
         .expect("edit raw");
         let after: Value =
-            serde_json::from_str(&fs::read_to_string(&dir.path().join("notes.ipynb")).unwrap()).unwrap();
+            serde_json::from_str(&fs::read_to_string(&dir.path().join("notes.ipynb")).unwrap())
+                .unwrap();
         let cell = &after["cells"][3];
         assert_eq!(cell["cell_type"], "raw");
         assert_eq!(cell["source"], json!(["raw text\n"]));
         // Raw/markdown cells don't get outputs/execution_count (only code).
-        assert!(cell.get("outputs").is_none() || cell["outputs"].is_null(), "{cell:?}");
+        assert!(
+            cell.get("outputs").is_none() || cell["outputs"].is_null(),
+            "{cell:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1298,7 +1531,10 @@ mod tests {
             stdout: "out\n".into(),
             stderr: "err\n".into(),
             result: Some("42".into()),
-            error: Some(CellError { kind: EvalErrorKind::Syntax, text: "SyntaxError: bad".into() }),
+            error: Some(CellError {
+                kind: EvalErrorKind::Syntax,
+                text: "SyntaxError: bad".into(),
+            }),
         };
         let outputs = ipynb_outputs(&cell);
         let arr = outputs.as_array().unwrap();
@@ -1320,7 +1556,10 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             result: None,
-            error: Some(CellError { kind: EvalErrorKind::Timeout, text: "timed out".into() }),
+            error: Some(CellError {
+                kind: EvalErrorKind::Timeout,
+                text: "timed out".into(),
+            }),
         };
         let outputs = ipynb_outputs(&cell);
         let arr = outputs.as_array().unwrap();
@@ -1348,7 +1587,10 @@ mod tests {
             stdout: "out line".into(),
             stderr: "err line".into(),
             result: Some("99".into()),
-            error: Some(CellError { kind: EvalErrorKind::Runtime, text: "boom".into() }),
+            error: Some(CellError {
+                kind: EvalErrorKind::Runtime,
+                text: "boom".into(),
+            }),
         };
         let text = render_notebook_cell(&cell);
         assert!(text.starts_with("runtime error"), "{text}");

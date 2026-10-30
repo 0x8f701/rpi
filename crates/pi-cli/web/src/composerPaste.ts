@@ -3,12 +3,16 @@ import { MAX_FILE_BYTES, utf8ByteLength } from './attachments';
 import { nextId } from './transcript';
 
 /** Large pasted text is stored as a text attachment instead of materializing
- * millions of glyphs in the textarea. Chromium otherwise lays out the entire
- * textarea value to compute editing geometry, blocking the main thread even
- * though the composer is visually capped at three lines. */
-export const LARGE_TEXT_PASTE_THRESHOLD = 256 * 1024;
+ * the glyphs in the textarea. Chromium otherwise lays out the entire value
+ * to compute editing geometry. Short composer drafts — including slash
+ * commands such as `/code-review <from> <to>` pasted with a newline — stay
+ * native. Synthesized Enter keydowns from a paste are blocked by
+ * COMPOSER_PASTE_ENTER_GUARD_MS, not by this line threshold. */
+export const LARGE_TEXT_PASTE_THRESHOLD = 8 * 1024;
+export const LARGE_TEXT_PASTE_LINE_THRESHOLD = 32;
 export const PASTED_TEXT_ATTACHMENT_NAME = 'pasted-text.txt';
 export const LARGE_TEXT_PREVIEW_CHARS = 8 * 1024;
+export const COMPOSER_PASTE_ENTER_GUARD_MS = 250;
 
 export interface LargeTextDisplay {
   characters: number;
@@ -58,8 +62,34 @@ export type LargeTextPastePlan =
   | { type: 'oversize'; size: number }
   | { type: 'attachment'; attachment: ComposerAttachment };
 
+export function logicalLineBreaks(text: string): number {
+  let breaks = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code === 13) {
+      breaks += 1;
+      if (text.charCodeAt(index + 1) === 10) index += 1;
+      continue;
+    }
+    if (code === 10) breaks += 1;
+  }
+  return breaks;
+}
+
+export function logicalLineCount(text: string): number {
+  if (text.length === 0) return 0;
+  return logicalLineBreaks(text) + 1;
+}
+
+function isMultilineOrLargePaste(text: string): number | null {
+  if (logicalLineCount(text) >= LARGE_TEXT_PASTE_LINE_THRESHOLD) {
+    return utf8ByteLength(text);
+  }
+  return largeTextBytes(text);
+}
+
 export function planLargeTextPaste(text: string): LargeTextPastePlan {
-  const size = largeTextBytes(text);
+  const size = isMultilineOrLargePaste(text);
   if (size === null) return { type: 'native' };
   if (size > MAX_FILE_BYTES) return { type: 'oversize', size };
 
@@ -75,4 +105,69 @@ export function planLargeTextPaste(text: string): LargeTextPastePlan {
       language: 'text',
     },
   };
+}
+
+export function nextPasteEnterGuard(now: number): number {
+  return now + COMPOSER_PASTE_ENTER_GUARD_MS;
+}
+
+export function nativeEventShiftKey(event: Event): boolean {
+  return Boolean((event as { shiftKey?: boolean }).shiftKey);
+}
+
+export function isComposerEnterKey(options: {
+  key: string;
+  keyCode?: number;
+  which?: number;
+}): boolean {
+  if (options.key === 'Enter' || options.key === 'NumpadEnter') return true;
+  if (options.key !== '' && options.key !== 'Unidentified') return false;
+  const code = options.keyCode ?? options.which;
+  return code === 13;
+}
+
+export type ComposerEnterDecision = {
+  key: string;
+  shiftKey: boolean;
+  isComposing?: boolean;
+  keyCode?: number;
+  which?: number;
+  compositionActive?: boolean;
+  now: number;
+  pasteGuardUntil: number;
+};
+
+function composerEnterIsCandidate(options: ComposerEnterDecision): boolean {
+  if (options.shiftKey) return false;
+  const code = options.keyCode ?? options.which;
+  if (code === 229) return false;
+  if (options.compositionActive === true) return false;
+  if (options.compositionActive !== false && options.isComposing) return false;
+  return isComposerEnterKey(options);
+}
+
+export function composerEnterShouldPreventDefault(options: ComposerEnterDecision): boolean {
+  return composerEnterIsCandidate(options);
+}
+
+export function composerEnterShouldSubmit(options: ComposerEnterDecision): boolean {
+  if (!composerEnterIsCandidate(options)) return false;
+  if (options.now < options.pasteGuardUntil) return false;
+  return true;
+}
+
+export function composerBeforeInputShouldSubmit(options: {
+  inputType: string;
+  shiftKey: boolean;
+  compositionActive?: boolean;
+  keydownHandled?: boolean;
+  now: number;
+  pasteGuardUntil: number;
+}): boolean {
+  if (options.shiftKey) return false;
+  if (options.compositionActive === true) return false;
+  if (options.keydownHandled === true) return false;
+  if (options.inputType !== 'insertLineBreak' && options.inputType !== 'insertParagraph') return false;
+  if (options.now < options.pasteGuardUntil) return false;
+  return true;
 }

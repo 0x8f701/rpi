@@ -3,7 +3,6 @@
 // Environment:
 //   RPI_URL         http://127.0.0.1:<port>/web
 //   RPI_TOKEN       token file content (served via rpi-auth.<token> subprotocol)
-//   RPI_CHROME      executable path of the system Chrome (optional)
 //   RPI_EVIDENCE    evidence dir for screenshots
 //
 // Asserts:
@@ -13,8 +12,9 @@
 //      lifecycle, budget + usage) and appends a `created` journal entry
 //   4. pinning through the panel form shows the pin and a `pins_updated` entry
 //   5. a goal_pause issued by a SECOND WS client (raw `ws`, live event
-//      stream) flips the panel to `paused` without any page interaction —
-//      proving goal events refresh the panel live
+//      stream, stamped with the page's bound sessionId) flips the panel
+//      to `paused` without any page interaction — proving goal events
+//      refresh the panel live
 //   6. Resume via the panel button returns to `active`; journal replays the
 //      full history (created → pins_updated → paused → resumed)
 
@@ -104,11 +104,33 @@ async function main() {
     });
 
     // 1. Page loads; WS connects via the rpi-auth.<token> subprotocol (Settings panel).
+    // Capture the page's BOUND sessionId the same way the UI does: listen.rs
+    // grants each connection exactly one sessionId-less get_state (bootstrap),
+    // and the response's `sessionId` is the source App.tsx `applyState` uses
+    // for its cold bind. After bootstrap every command must carry sessionId
+    // ("sessionId is required after WebSocket bootstrap"), so the raw
+    // goal_pause below is stamped with this captured value.
+    let pageSessionId = '';
+    page.on('websocket', (ws) => {
+      ws.on('framereceived', (frame) => {
+        try {
+          const msg = JSON.parse(String(frame.payload));
+          if (!msg || msg.type !== 'response' || msg.success === false) return;
+          const data = msg.data || {};
+          const sid = typeof data.sessionId === 'string' && data.sessionId !== ''
+            ? data.sessionId
+            : (data.state && typeof data.state.sessionId === 'string' ? data.state.sessionId : '');
+          if (sid) pageSessionId = sid;
+        } catch {
+          /* non-JSON frame (ping/pong or binary): not a state snapshot */
+        }
+      });
+    });
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await waitFor(page, () => document.title === 'rpi web', 'page title missing');
     await waitFor(
       page,
-      () => document.getElementById('conn-state').dataset.state === 'on',
+      () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true,
       'WS did not reach "connected"'
     );
 
@@ -180,7 +202,10 @@ async function main() {
     // 5. Live update: a SECOND WS client pauses the goal. The panel must
     //    reflect the paused state purely from the pushed goal_updated event.
     const rpc = rpcClient(wsUrl);
-    const paused = await rpc.call({ type: 'goal_pause' });
+    if (pageSessionId === '') {
+      fail('page sessionId is missing after WebSocket bootstrap; cannot stamp goal_pause');
+    }
+    const paused = await rpc.call({ type: 'goal_pause', sessionId: pageSessionId });
     if (!paused || paused.lifecycle !== 'paused') {
       fail(`raw goal_pause returned ${JSON.stringify(paused)}`);
     }

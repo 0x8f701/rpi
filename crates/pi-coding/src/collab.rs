@@ -285,9 +285,11 @@ pub fn derive_connection_key(
 /// key is used for many messages with fresh nonces (the standard AEAD usage
 /// pattern) and never for handshake-derived keys.
 fn aead_key(key: &[u8; KEY_LEN]) -> Result<LessSafeKey> {
-    UnboundKey::new(&AES_256_GCM, key).map(LessSafeKey::new).map_err(|_| {
-        anyhow!("AES-256-GCM rejected a collab room key (key must be exactly {KEY_LEN} bytes)")
-    })
+    UnboundKey::new(&AES_256_GCM, key)
+        .map(LessSafeKey::new)
+        .map_err(|_| {
+            anyhow!("AES-256-GCM rejected a collab room key (key must be exactly {KEY_LEN} bytes)")
+        })
 }
 
 /// Parse the plaintext frame header: returns `(epoch, direction, seq, body)`.
@@ -296,9 +298,7 @@ fn aead_key(key: &[u8; KEY_LEN]) -> Result<LessSafeKey> {
 /// shorter than the header, over the size cap, or carrying an unknown
 /// direction tag.
 #[must_use]
-pub fn parse_frame_header(
-    frame: &[u8],
-) -> Option<([u8; EPOCH_LEN], FrameDirection, u64, &[u8])> {
+pub fn parse_frame_header(frame: &[u8]) -> Option<([u8; EPOCH_LEN], FrameDirection, u64, &[u8])> {
     if frame.len() < FRAME_HEADER_LEN || frame.len() > MAX_FRAME_BYTES {
         return None;
     }
@@ -400,7 +400,10 @@ impl Default for SendCounter {
 impl SendCounter {
     #[must_use]
     pub const fn new() -> Self {
-        Self { next: 0, exhausted: false }
+        Self {
+            next: 0,
+            exhausted: false,
+        }
     }
 
     /// The next sequence value, advancing the counter; `None` once the u64
@@ -516,7 +519,6 @@ pub fn parse_link(link: &str) -> Result<CollabLink> {
         .fragment()
         .ok_or_else(|| anyhow!("collab link is missing its key fragment (#c=... or #v=...)"))?;
     let (role, encoded) = if let Some(encoded) = fragment.strip_prefix("c=") {
-
         (CollabRole::Control, encoded)
     } else if let Some(encoded) = fragment.strip_prefix("v=") {
         (CollabRole::View, encoded)
@@ -599,8 +601,14 @@ fn public_text(text: &str) -> String {
     let path_free = ABSOLUTE_PATH.replace_all(&redacted, |captures: &regex::Captures<'_>| {
         let boundary = captures.get(1).map_or("", |matched| matched.as_str());
         match captures.name("label").map(|matched| matched.as_str()) {
-            Some(label) if label.eq_ignore_ascii_case("http") || label.eq_ignore_ascii_case("https") => {
-                captures.get(0).expect("whole path match").as_str().to_owned()
+            Some(label)
+                if label.eq_ignore_ascii_case("http") || label.eq_ignore_ascii_case("https") =>
+            {
+                captures
+                    .get(0)
+                    .expect("whole path match")
+                    .as_str()
+                    .to_owned()
             }
             Some(label) => format!("{boundary}{label}:[PATH]"),
             None => format!("{boundary}[PATH]"),
@@ -665,7 +673,10 @@ mod tests {
     use super::*;
 
     fn test_room() -> (String, CollabRoomKeys) {
-        (new_room_id().expect("room id"), generate_room_keys().expect("keys"))
+        (
+            new_room_id().expect("room id"),
+            generate_room_keys().expect("keys"),
+        )
     }
 
     fn epoch(n: u8) -> [u8; EPOCH_LEN] {
@@ -689,9 +700,11 @@ mod tests {
         let second = new_room_id().expect("room id");
         assert_eq!(first.len(), 22, "16 bytes -> 22 base64url chars");
         assert_ne!(first, second);
-        assert!(first
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+        assert!(
+            first
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        );
         // Room ids must survive URL round trips inside the path.
         let url = url::Url::parse(&format!("http://h/collab/ws/{first}")).expect("url");
         assert_eq!(url.path(), format!("/collab/ws/{first}"));
@@ -754,13 +767,20 @@ mod tests {
         let control_cap = capability(&keys.control);
         let view_cap = capability(&keys.view);
         assert_eq!(capability(&keys.control), control_cap, "deterministic");
-        assert_ne!(control_cap, view_cap, "distinct keys -> distinct capabilities");
+        assert_ne!(
+            control_cap, view_cap,
+            "distinct keys -> distinct capabilities"
+        );
         assert!(capability_eq(&control_cap, &control_cap));
         assert!(!capability_eq(&control_cap, &view_cap));
         // A capability never leaks the key: it must not contain key bytes.
         let key_blob = keys.control.to_vec();
         let cap_blob = control_cap.to_vec();
-        assert!(!cap_blob.windows(4).any(|w| key_blob.windows(4).any(|k| k == w)));
+        assert!(
+            !cap_blob
+                .windows(4)
+                .any(|w| key_blob.windows(4).any(|k| k == w))
+        );
     }
 
     #[test]
@@ -796,8 +816,15 @@ mod tests {
             derive_connection_key(&keys.control, &epoch(7), FrameDirection::ServerToClient)
                 .expect("conn key");
         let plaintext = b"top secret collab payload with known marker";
-        let frame = seal_frame(&conn_key, &room, FrameDirection::ServerToClient, &epoch(7), 0, plaintext)
-            .expect("seal");
+        let frame = seal_frame(
+            &conn_key,
+            &room,
+            FrameDirection::ServerToClient,
+            &epoch(7),
+            0,
+            plaintext,
+        )
+        .expect("seal");
         assert!(frame.len() > plaintext.len() + FRAME_HEADER_LEN);
         // Ciphertext contains no known plaintext.
         assert!(
@@ -815,8 +842,15 @@ mod tests {
         assert_eq!(direction, FrameDirection::ServerToClient);
         assert_eq!(seq, 0);
         assert_eq!(body.len() + FRAME_HEADER_LEN, frame.len());
-        let opened = open_frame(&conn_key, &room, FrameDirection::ServerToClient, &epoch(7), seq, &frame)
-            .expect("open");
+        let opened = open_frame(
+            &conn_key,
+            &room,
+            FrameDirection::ServerToClient,
+            &epoch(7),
+            seq,
+            &frame,
+        )
+        .expect("open");
         assert_eq!(opened, plaintext);
     }
 
@@ -827,28 +861,64 @@ mod tests {
         let s2c_a = derive_connection_key(&keys.control, &epoch(9), FrameDirection::ServerToClient)
             .expect("s2c a");
         // Different seq -> different nonce -> different ciphertext.
-        let a = seal_frame(&s2c_a, &room, FrameDirection::ServerToClient, &epoch(9), 0, payload)
-            .expect("a");
-        let b = seal_frame(&s2c_a, &room, FrameDirection::ServerToClient, &epoch(9), 1, payload)
-            .expect("b");
+        let a = seal_frame(
+            &s2c_a,
+            &room,
+            FrameDirection::ServerToClient,
+            &epoch(9),
+            0,
+            payload,
+        )
+        .expect("a");
+        let b = seal_frame(
+            &s2c_a,
+            &room,
+            FrameDirection::ServerToClient,
+            &epoch(9),
+            1,
+            payload,
+        )
+        .expect("b");
         assert_ne!(a, b);
         // Different epoch -> different key -> different ciphertext.
-        let s2c_b = derive_connection_key(&keys.control, &epoch(10), FrameDirection::ServerToClient)
-            .expect("s2c b");
-        let c = seal_frame(&s2c_b, &room, FrameDirection::ServerToClient, &epoch(10), 0, payload)
-            .expect("c");
+        let s2c_b =
+            derive_connection_key(&keys.control, &epoch(10), FrameDirection::ServerToClient)
+                .expect("s2c b");
+        let c = seal_frame(
+            &s2c_b,
+            &room,
+            FrameDirection::ServerToClient,
+            &epoch(10),
+            0,
+            payload,
+        )
+        .expect("c");
         assert_ne!(a, c);
         // Different direction -> different key -> different ciphertext.
         let c2s_a = derive_connection_key(&keys.control, &epoch(9), FrameDirection::ClientToServer)
             .expect("c2s a");
-        let d = seal_frame(&c2s_a, &room, FrameDirection::ClientToServer, &epoch(9), 0, payload)
-            .expect("d");
+        let d = seal_frame(
+            &c2s_a,
+            &room,
+            FrameDirection::ClientToServer,
+            &epoch(9),
+            0,
+            payload,
+        )
+        .expect("d");
         assert_ne!(a, d);
         // Different role key -> different key -> different ciphertext.
         let view_s2c = derive_connection_key(&keys.view, &epoch(9), FrameDirection::ServerToClient)
             .expect("view s2c");
-        let e = seal_frame(&view_s2c, &room, FrameDirection::ServerToClient, &epoch(9), 0, payload)
-            .expect("e");
+        let e = seal_frame(
+            &view_s2c,
+            &room,
+            FrameDirection::ServerToClient,
+            &epoch(9),
+            0,
+            payload,
+        )
+        .expect("e");
         assert_ne!(a, e);
     }
 
@@ -858,12 +928,26 @@ mod tests {
         let conn_key =
             derive_connection_key(&keys.control, &epoch(3), FrameDirection::ServerToClient)
                 .expect("conn key");
-        let frame = seal_frame(&conn_key, &room, FrameDirection::ServerToClient, &epoch(3), 5, b"integrity protected")
-            .expect("seal");
+        let frame = seal_frame(
+            &conn_key,
+            &room,
+            FrameDirection::ServerToClient,
+            &epoch(3),
+            5,
+            b"integrity protected",
+        )
+        .expect("seal");
         for index in 0..frame.len() {
             let mut tampered = frame.clone();
             tampered[index] ^= 0x01;
-            let result = open_frame(&conn_key, &room, FrameDirection::ServerToClient, &epoch(3), 5, &tampered);
+            let result = open_frame(
+                &conn_key,
+                &room,
+                FrameDirection::ServerToClient,
+                &epoch(3),
+                5,
+                &tampered,
+            );
             assert!(result.is_err(), "byte flip at {index} must fail");
         }
     }
@@ -874,12 +958,26 @@ mod tests {
         let conn_key =
             derive_connection_key(&keys.control, &epoch(3), FrameDirection::ServerToClient)
                 .expect("conn key");
-        let frame = seal_frame(&conn_key, &room, FrameDirection::ServerToClient, &epoch(3), 0, b"payload")
-            .expect("seal");
+        let frame = seal_frame(
+            &conn_key,
+            &room,
+            FrameDirection::ServerToClient,
+            &epoch(3),
+            0,
+            b"payload",
+        )
+        .expect("seal");
         for cut in 0..frame.len() {
             assert!(
-                open_frame(&conn_key, &room, FrameDirection::ServerToClient, &epoch(3), 0, &frame[..cut])
-                    .is_err(),
+                open_frame(
+                    &conn_key,
+                    &room,
+                    FrameDirection::ServerToClient,
+                    &epoch(3),
+                    0,
+                    &frame[..cut]
+                )
+                .is_err(),
                 "truncation to {cut} bytes must fail"
             );
         }
@@ -893,12 +991,26 @@ mod tests {
         let conn_key =
             derive_connection_key(&keys_a.control, &epoch(1), FrameDirection::ServerToClient)
                 .expect("conn key");
-        let frame = seal_frame(&conn_key, &room_a, FrameDirection::ServerToClient, &epoch(1), 0, b"room A payload")
-            .expect("seal");
+        let frame = seal_frame(
+            &conn_key,
+            &room_a,
+            FrameDirection::ServerToClient,
+            &epoch(1),
+            0,
+            b"room A payload",
+        )
+        .expect("seal");
         // Same keys, different room: AAD mismatch must fail.
         assert!(
-            open_frame(&conn_key, &room_b, FrameDirection::ServerToClient, &epoch(1), 0, &frame)
-                .is_err(),
+            open_frame(
+                &conn_key,
+                &room_b,
+                FrameDirection::ServerToClient,
+                &epoch(1),
+                0,
+                &frame
+            )
+            .is_err(),
             "cross-room replay must be rejected"
         );
     }
@@ -909,14 +1021,28 @@ mod tests {
         let control_s2c =
             derive_connection_key(&keys.control, &epoch(2), FrameDirection::ServerToClient)
                 .expect("control s2c");
-        let frame = seal_frame(&control_s2c, &room, FrameDirection::ServerToClient, &epoch(2), 0, b"control payload")
-            .expect("seal");
+        let frame = seal_frame(
+            &control_s2c,
+            &room,
+            FrameDirection::ServerToClient,
+            &epoch(2),
+            0,
+            b"control payload",
+        )
+        .expect("seal");
         // Same room, view key instead of control key.
         let view_s2c = derive_connection_key(&keys.view, &epoch(2), FrameDirection::ServerToClient)
             .expect("view s2c");
         assert!(
-            open_frame(&view_s2c, &room, FrameDirection::ServerToClient, &epoch(2), 0, &frame)
-                .is_err(),
+            open_frame(
+                &view_s2c,
+                &room,
+                FrameDirection::ServerToClient,
+                &epoch(2),
+                0,
+                &frame
+            )
+            .is_err(),
             "cross-role decryption must fail"
         );
         // Same control key, opposite direction.
@@ -924,8 +1050,15 @@ mod tests {
             derive_connection_key(&keys.control, &epoch(2), FrameDirection::ClientToServer)
                 .expect("control c2s");
         assert!(
-            open_frame(&control_c2s, &room, FrameDirection::ClientToServer, &epoch(2), 0, &frame)
-                .is_err(),
+            open_frame(
+                &control_c2s,
+                &room,
+                FrameDirection::ClientToServer,
+                &epoch(2),
+                0,
+                &frame
+            )
+            .is_err(),
             "direction flip must fail"
         );
     }
@@ -936,21 +1069,42 @@ mod tests {
         let conn_key =
             derive_connection_key(&keys.control, &epoch(4), FrameDirection::ServerToClient)
                 .expect("conn key");
-        let frame = seal_frame(&conn_key, &room, FrameDirection::ServerToClient, &epoch(4), 7, b"payload")
-            .expect("seal");
+        let frame = seal_frame(
+            &conn_key,
+            &room,
+            FrameDirection::ServerToClient,
+            &epoch(4),
+            7,
+            b"payload",
+        )
+        .expect("seal");
         // A captured frame replayed under a different (new) epoch fails
         // because the connection key differs.
         let reconnected_key =
             derive_connection_key(&keys.control, &epoch(5), FrameDirection::ServerToClient)
                 .expect("reconnected key");
         assert!(
-            open_frame(&reconnected_key, &room, FrameDirection::ServerToClient, &epoch(5), 0, &frame)
-                .is_err(),
+            open_frame(
+                &reconnected_key,
+                &room,
+                FrameDirection::ServerToClient,
+                &epoch(5),
+                0,
+                &frame
+            )
+            .is_err(),
             "replayed frame from another epoch must fail"
         );
         assert!(
-            open_frame(&conn_key, &room, FrameDirection::ServerToClient, &epoch(4), 8, &frame)
-                .is_err(),
+            open_frame(
+                &conn_key,
+                &room,
+                FrameDirection::ServerToClient,
+                &epoch(4),
+                8,
+                &frame
+            )
+            .is_err(),
             "wrong sequence must fail"
         );
     }
@@ -989,7 +1143,10 @@ mod tests {
         assert_eq!(counter.next(), Some(2));
         // The final value is handed out once, then the counter is exhausted
         // instead of wrapping (a wrap would reuse nonces).
-        let mut saturated = SendCounter { next: u64::MAX - 1, exhausted: false };
+        let mut saturated = SendCounter {
+            next: u64::MAX - 1,
+            exhausted: false,
+        };
         assert_eq!(saturated.next(), Some(u64::MAX - 1));
         assert_eq!(saturated.next(), Some(u64::MAX));
         assert_eq!(saturated.next(), None);
@@ -1003,14 +1160,28 @@ mod tests {
                 .expect("conn key");
         let oversized = vec![0u8; MAX_FRAME_BYTES];
         assert!(
-            seal_frame(&conn_key, &room, FrameDirection::ServerToClient, &epoch(6), 0, &oversized)
-                .is_err(),
+            seal_frame(
+                &conn_key,
+                &room,
+                FrameDirection::ServerToClient,
+                &epoch(6),
+                0,
+                &oversized
+            )
+            .is_err(),
             "payload that cannot fit under the frame cap must be refused"
         );
         // The cap boundary itself fits.
         let boundary = vec![0u8; MAX_FRAME_BYTES - FRAME_HEADER_LEN - TAG_LEN];
-        let frame = seal_frame(&conn_key, &room, FrameDirection::ServerToClient, &epoch(6), 0, &boundary)
-            .expect("boundary payload fits exactly");
+        let frame = seal_frame(
+            &conn_key,
+            &room,
+            FrameDirection::ServerToClient,
+            &epoch(6),
+            0,
+            &boundary,
+        )
+        .expect("boundary payload fits exactly");
         assert_eq!(frame.len(), MAX_FRAME_BYTES);
         assert!(parse_frame_header(&frame).is_some());
     }
@@ -1027,12 +1198,21 @@ mod tests {
         }
     }
 
-    fn recorded_tree(cwd: &std::path::Path, sessions: &std::path::Path, id: &str, turns: usize) -> crate::SessionTree {
-        let recorder = crate::start_session_in(cwd, None, Some("off"), Some(sessions), Some(id), None)
-            .expect("start recorder");
+    fn recorded_tree(
+        cwd: &std::path::Path,
+        sessions: &std::path::Path,
+        id: &str,
+        turns: usize,
+    ) -> crate::SessionTree {
+        let recorder =
+            crate::start_session_in(cwd, None, Some("off"), Some(sessions), Some(id), None)
+                .expect("start recorder");
         for turn in 0..turns {
             recorder
-                .record_message(&pi_ai::Message::user_text(format!("prompt {turn}"), turn as i64))
+                .record_message(&pi_ai::Message::user_text(
+                    format!("prompt {turn}"),
+                    turn as i64,
+                ))
                 .expect("record prompt");
         }
         recorder.persist_now().expect("persist");
@@ -1079,7 +1259,10 @@ mod tests {
             !rendered.contains(cwd.path().to_str().expect("utf8 cwd")),
             "snapshot must exclude the host cwd"
         );
-        assert!(!rendered.contains("cwd"), "snapshot must not carry cwd keys");
+        assert!(
+            !rendered.contains("cwd"),
+            "snapshot must not carry cwd keys"
+        );
     }
 
     #[test]
@@ -1106,10 +1289,7 @@ mod tests {
             .sum();
         let by_bytes = public_snapshot(&tree, 100, tail_two_bytes + 1).expect("snapshot");
         assert_eq!(by_bytes["truncated"], true);
-        assert_eq!(
-            message_texts(&by_bytes),
-            ["prompt 3", "prompt 4"]
-        );
+        assert_eq!(message_texts(&by_bytes), ["prompt 3", "prompt 4"]);
         // Zero cap yields an empty bounded list.
 
         let empty = public_snapshot(&tree, 0, 1024).expect("snapshot");
@@ -1144,14 +1324,30 @@ mod tests {
             "long": "x".repeat(MAX_PUBLIC_STRING_CHARS + 50),
         }));
         let encoded = serde_json::to_string(&projected).expect("encode public value");
-        assert!(!encoded.contains(&secret), "secret must be redacted: {encoded}");
-        assert!(!encoded.contains(&unix_path), "Unix path must be removed: {encoded}");
-        assert!(!encoded.contains("Users\\\\alice"), "Windows path must be removed: {encoded}");
+        assert!(
+            !encoded.contains(&secret),
+            "secret must be redacted: {encoded}"
+        );
+        assert!(
+            !encoded.contains(&unix_path),
+            "Unix path must be removed: {encoded}"
+        );
+        assert!(
+            !encoded.contains("Users\\\\alice"),
+            "Windows path must be removed: {encoded}"
+        );
         assert!(!encoded.contains("fullOutputPath"));
         assert!(!encoded.contains("details"));
         assert!(!encoded.contains("data"));
         assert!(encoded.contains("[REDACTED]"));
         assert!(encoded.contains("[PATH]"));
-        assert!(projected["long"].as_str().expect("long string").chars().count() <= MAX_PUBLIC_STRING_CHARS);
+        assert!(
+            projected["long"]
+                .as_str()
+                .expect("long string")
+                .chars()
+                .count()
+                <= MAX_PUBLIC_STRING_CHARS
+        );
     }
 }

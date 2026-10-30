@@ -9,10 +9,15 @@
  * Supported surface (matches WEB_SUPPORTED_COMMANDS):
  *   /compact [--snap | instructions…]
  *   /skill <name>
- *   /code-review [from to]
+ *   /code-review [<base> | <from> <to>]
+ *   /commit [<ref>] — bare opens the recent-commit chooser, one ref reviews
+ *   that pinned commit (usage line mirrors interactive_commands.rs)
  *   /loop [list|cancel <id>|delete <id>|update <id> [interval] [prompt]|create <interval> <prompt>|<interval> <prompt>]
  *   /goal [show|inspect|create [--tokens N] <objective>|pause|resume|complete|drop|pin <text>|pins|unpin <index>]
  *   /ps (bare only)
+ *   /jobs (bare only)
+ *   /irc (bare only)
+ *   /todo [list|new [label]|select <id>|send [id] <message>|add <id> [options] <task>|status [id]|pause [id]|resume [id]|stop [id]|cancel [id]|archive <id>|start <task>|done <task>|drop <task>|clear|<markdown>]
  */
 
 import { parseCodeReviewArgs } from './codeReview';
@@ -42,14 +47,40 @@ export type GoalAction =
   | { op: 'pins' }
   | { op: 'unpin'; index: number };
 
+/** One parsed `/todo` invocation. Child operations retain the frozen
+ * `todo_child_*` wire surface; ordinary DAG operations retain `todo_op`. */
+export type TodoAction =
+  | { op: 'open' }
+  | { op: 'new'; label?: string }
+  | { op: 'select'; childSessionId: string }
+  | { op: 'send'; childSessionId?: string; message: string }
+  | {
+      op: 'add';
+      childSessionId: string;
+      content: string;
+      dependsOn?: string[];
+      agent?: string;
+      role?: string;
+      expectedRevision?: number;
+    }
+  | { op: 'status' | 'pause' | 'resume' | 'stop' | 'cancel'; childSessionId?: string }
+  | { op: 'archive'; childSessionId: string }
+  | { op: 'remove'; childSessionId: string }
+  | { op: 'start' | 'done' | 'drop'; task: string }
+  | { op: 'clear' };
+
 export type SlashAction =
   | { type: 'compact'; mode: 'snap' }
   | { type: 'compact'; mode: 'llm'; customInstructions: string }
   | { type: 'skill'; name: string }
-  | { type: 'code-review'; from?: string; to?: string }
+  | { type: 'code-review'; from?: string; to?: string; includeWorkingTree?: true }
+  | { type: 'commit'; ref?: string }
   | { type: 'loop'; action: LoopAction }
   | { type: 'goal'; action: GoalAction }
   | { type: 'ps' }
+  | { type: 'jobs' }
+  | { type: 'irc' }
+  | { type: 'todo'; action: TodoAction }
   | { type: 'error'; message: string };
 
 /** TUI-equivalent usage lines (match loop_commands.rs / goal_commands.rs
@@ -60,6 +91,16 @@ const LOOP_UPDATE_USAGE = 'usage: /loop update <id> [interval] [prompt]';
 const LOOP_ID_USAGE = (verb: 'cancel' | 'delete') => `usage: /loop ${verb} <id>`;
 const GOAL_USAGE =
   'usage: /goal [show|inspect|create [--tokens N] <objective>|pause|resume|complete|drop|pin <text>|pins|unpin <index>]';
+const TODO_USAGE =
+  'usage: /todo [list|new [label]|select <id>|send [id] <message>|add <id> [options] <task>|status [id]|pause [id]|resume [id]|stop [id]|cancel [id]|archive <id>|remove <id>|start <task>|done <task>|drop <task>|clear|<markdown>]';
+const TODO_ADD_USAGE =
+  'usage: /todo add <id> [--revision N] [--depends id,id] [--agent name] [--role role] <task>';
+const TODO_START_USAGE = 'usage: /todo start <task>';
+const TODO_DONE_USAGE = 'usage: /todo done <task>';
+const TODO_DROP_USAGE = 'usage: /todo drop <task>';
+const TODO_CLEAR_USAGE = 'usage: /todo clear';
+const TODO_MARKDOWN_UNAVAILABLE =
+  'Todo Markdown input is unavailable in Web; use the Todo panel controls instead';
 
 /**
  * True when `value` is a valid loop interval token: a bare positive integer
@@ -249,6 +290,175 @@ function parseGoalCreate(argument: string): { ok: true; action: GoalAction } | {
   };
 }
 
+/** Parse the sole public Todo grammar. Known child verbs take precedence over
+ * ordinary DAG verbs. Web has no existing Todo-Markdown parser, so Markdown
+ * input is rejected locally instead of falling through as a model prompt. */
+export function parseTodoArgs(
+  args: string,
+): { ok: true; action: TodoAction } | { ok: false; message: string } {
+  const argument = args.trim();
+  if (!argument) return { ok: true, action: { op: 'open' } };
+  const match = argument.match(/^(\S+)(?:\s+([\s\S]*))?$/);
+  const operation = (match?.[1] ?? argument).toLowerCase();
+  const rest = (match?.[2] ?? '').trim();
+  switch (operation) {
+    case 'list':
+      return rest
+        ? { ok: false, message: 'usage: /todo list' }
+        : { ok: true, action: { op: 'open' } };
+    case 'new':
+      return { ok: true, action: { op: 'new', ...(rest ? { label: rest } : {}) } };
+    case 'select': {
+      const parsed = parseTodoChildId(rest, 'usage: /todo select <id>', true);
+      return parsed.ok
+        ? { ok: true, action: { op: 'select', childSessionId: parsed.childSessionId } }
+        : parsed;
+    }
+    case 'send':
+      return parseTodoSend(rest);
+    case 'add':
+      return parseTodoAdd(rest);
+    case 'status':
+    case 'pause':
+    case 'resume':
+    case 'stop':
+    case 'cancel': {
+      const parsed = parseTodoChildId(rest, `usage: /todo ${operation} [id]`, false);
+      return parsed.ok
+        ? {
+            ok: true,
+            action: { op: operation, ...(parsed.childSessionId ? { childSessionId: parsed.childSessionId } : {}) },
+          }
+        : parsed;
+    }
+    case 'archive': {
+      const parsed = parseTodoChildId(rest, 'usage: /todo archive <id>', true);
+      return parsed.ok
+        ? { ok: true, action: { op: 'archive', childSessionId: parsed.childSessionId } }
+        : parsed;
+    }
+    case 'remove': {
+      const parsed = parseTodoChildId(rest, 'usage: /todo remove <id>', true);
+      return parsed.ok
+        ? { ok: true, action: { op: 'remove', childSessionId: parsed.childSessionId } }
+        : parsed;
+    }
+    case 'start':
+      return rest
+        ? { ok: true, action: { op: 'start', task: rest } }
+        : { ok: false, message: TODO_START_USAGE };
+    case 'done':
+      return rest
+        ? { ok: true, action: { op: 'done', task: rest } }
+        : { ok: false, message: TODO_DONE_USAGE };
+    case 'drop':
+      return rest
+        ? { ok: true, action: { op: 'drop', task: rest } }
+        : { ok: false, message: TODO_DROP_USAGE };
+    case 'clear':
+      return rest
+        ? { ok: false, message: TODO_CLEAR_USAGE }
+        : { ok: true, action: { op: 'clear' } };
+    default: {
+      const first = argument.split('\n').find((line) => line.trim() !== '')?.trimStart() ?? '';
+      const isMarkdown = first.startsWith('#')
+        || first.startsWith('- ')
+        || first.startsWith('* ')
+        || first.startsWith('+ ');
+      return isMarkdown
+        ? { ok: false, message: TODO_MARKDOWN_UNAVAILABLE }
+        : { ok: false, message: TODO_USAGE };
+    }
+  }
+}
+
+
+function parseTodoChildId(
+  argument: string,
+  usage: string,
+  isRequired: true,
+): { ok: true; childSessionId: string } | { ok: false; message: string };
+function parseTodoChildId(
+  argument: string,
+  usage: string,
+  isRequired: false,
+): { ok: true; childSessionId?: string } | { ok: false; message: string };
+function parseTodoChildId(
+  argument: string,
+  usage: string,
+  isRequired: boolean,
+): { ok: true; childSessionId?: string } | { ok: false; message: string } {
+  const tokens = argument.split(/\s+/).filter(Boolean);
+  if (tokens.length > 1 || (isRequired && tokens.length === 0)) {
+    return { ok: false, message: usage };
+  }
+  const childSessionId = tokens[0];
+  return { ok: true, ...(childSessionId ? { childSessionId } : {}) };
+}
+
+function parseTodoSend(
+  argument: string,
+): { ok: true; action: TodoAction } | { ok: false; message: string } {
+  if (!argument) return { ok: false, message: 'usage: /todo send [id] <message>' };
+  const match = argument.match(/^(\S+)\s+([\s\S]+)$/);
+  if (match && match[1].length === 36 && [...match[1]].filter((character) => character === '-').length === 4) {
+    const message = match[2].trim();
+    if (!message) return { ok: false, message: 'usage: /todo send [id] <message>' };
+    return { ok: true, action: { op: 'send', childSessionId: match[1], message } };
+  }
+  return { ok: true, action: { op: 'send', message: argument } };
+}
+
+function parseTodoAdd(
+  argument: string,
+): { ok: true; action: TodoAction } | { ok: false; message: string } {
+  const tokens = argument.split(/\s+/).filter(Boolean);
+  const childSessionId = tokens[0];
+  if (!childSessionId) return { ok: false, message: TODO_ADD_USAGE };
+  let expectedRevision: number | undefined;
+  let dependsOn: string[] | undefined;
+  let agent: string | undefined;
+  let role: string | undefined;
+  const content: string[] = [];
+  for (let index = 1; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token === '--revision' || token === '--rev') {
+      const raw = tokens[++index];
+      if (raw === undefined) return { ok: false, message: TODO_ADD_USAGE };
+      if (!/^[0-9]+$/.test(raw)) return { ok: false, message: 'revision must be an integer' };
+      const value = Number(raw);
+      if (!Number.isSafeInteger(value)) return { ok: false, message: 'revision must be an integer' };
+      expectedRevision = value;
+    } else if (token === '--depends') {
+      const raw = tokens[++index];
+      if (raw === undefined) return { ok: false, message: TODO_ADD_USAGE };
+      dependsOn = raw.split(',').filter(Boolean);
+    } else if (token === '--agent') {
+      agent = tokens[++index];
+      if (agent === undefined) return { ok: false, message: TODO_ADD_USAGE };
+    } else if (token === '--role') {
+      role = tokens[++index];
+      if (role === undefined) return { ok: false, message: TODO_ADD_USAGE };
+    } else {
+      content.push(token);
+    }
+  }
+  if (content.length === 0) return { ok: false, message: TODO_ADD_USAGE };
+  return {
+    ok: true,
+    action: {
+      op: 'add',
+      childSessionId,
+      content: content.join(' '),
+      ...(dependsOn ? { dependsOn } : {}),
+      ...(agent ? { agent } : {}),
+      ...(role ? { role } : {}),
+      ...(expectedRevision !== undefined ? { expectedRevision } : {}),
+    },
+  };
+}
+
+
 /**
  * True when `/compact` arguments select the deterministic snap path.
  * Mirrors the TUI rule: `--snap` alone or as a leading flag; any trailing
@@ -297,7 +507,24 @@ export function resolveSlashAction(name: string, args: string): SlashAction {
       if (parsed.from && parsed.to) {
         return { type: 'code-review', from: parsed.from, to: parsed.to };
       }
+      if (parsed.from && parsed.includeWorkingTree) {
+        return { type: 'code-review', from: parsed.from, includeWorkingTree: true };
+      }
       return { type: 'code-review' };
+    }
+    case 'commit': {
+      // Mirrors parse_commit_inspect_invocation (interactive_commands.rs):
+      // bare opens the recent-commit chooser, one whitespace-delimited ref
+      // reviews that pinned commit, any additional operand is the usage
+      // error. Inspection only — no staging/checkout/commit here.
+      const parts = args.trim().split(/\s+/).filter(Boolean);
+      if (parts.length === 0) {
+        return { type: 'commit' };
+      }
+      if (parts.length === 1) {
+        return { type: 'commit', ref: parts[0] };
+      }
+      return { type: 'error', message: 'Usage: /commit [<ref>]' };
     }
     case 'loop': {
       const parsed = parseLoopArgs(args);
@@ -314,17 +541,85 @@ export function resolveSlashAction(name: string, args: string): SlashAction {
       return { type: 'goal', action: parsed.action };
     }
     case 'ps': {
-      // `/ps` is a bare-only surface: the backend builtin takes no arguments
-      // (the TUI's ps parser ignores any tail), but the Web composer rejects
-      // an argument tail LOCALLY so a typo never dispatches a process_list
-      // the user did not intend. The draft is preserved (error path).
       if (args.trim()) {
         return { type: 'error', message: 'usage: /ps' };
       }
       return { type: 'ps' };
     }
+    case 'jobs': {
+      if (args.trim()) {
+        return { type: 'error', message: 'usage: /jobs' };
+      }
+      return { type: 'jobs' };
+    }
+    case 'irc': {
+      if (args.trim()) {
+        return { type: 'error', message: 'usage: /irc' };
+      }
+      return { type: 'irc' };
+    }
+    case 'todo': {
+      const parsed = parseTodoArgs(args);
+      if (!parsed.ok) {
+        return { type: 'error', message: parsed.message };
+      }
+      return { type: 'todo', action: parsed.action };
+    }
     default:
       return { type: 'error', message: `unsupported command: /${name}` };
+  }
+}
+
+/** Map a parsed Todo operation onto the existing RPC wire shapes. The
+ * `todo_child_*` names and parent identity field stay frozen; DAG mutations
+ * continue to use the flattened `todo_op` command. Bare/list has no wire. */
+export function todoWire(action: TodoAction, parentSessionId: string): Record<string, unknown> | null {
+  const childCommand = (type: string, extra: Record<string, unknown> = {}) => ({
+    ...extra,
+    type,
+    parentSessionId,
+  });
+  switch (action.op) {
+    case 'open':
+      return null;
+    case 'new':
+      return childCommand('todo_child_create', action.label ? { label: action.label } : {});
+    case 'select':
+      return childCommand('todo_child_select', { childSessionId: action.childSessionId });
+    case 'send':
+      return childCommand('todo_child_send', {
+        ...(action.childSessionId ? { childSessionId: action.childSessionId } : {}),
+        message: action.message,
+      });
+    case 'add':
+      return childCommand('todo_child_add_task', {
+        childSessionId: action.childSessionId,
+        content: action.content,
+        ...(action.dependsOn ? { dependsOn: action.dependsOn } : {}),
+        ...(action.agent ? { agent: action.agent } : {}),
+        ...(action.role ? { role: action.role } : {}),
+        ...(action.expectedRevision !== undefined ? { expectedRevision: action.expectedRevision } : {}),
+      });
+    case 'status':
+    case 'pause':
+    case 'resume':
+    case 'stop':
+    case 'cancel':
+      return childCommand(`todo_child_${action.op}`, {
+        ...(action.childSessionId ? { childSessionId: action.childSessionId } : {}),
+      });
+    case 'archive':
+      return childCommand('todo_child_archive', { childSessionId: action.childSessionId });
+    case 'remove':
+      return childCommand('todo_child_remove', { childSessionId: action.childSessionId });
+    case 'start':
+      return { type: 'todo_op', op: 'start', task: action.task };
+    case 'done':
+      return { type: 'todo_op', op: 'done', task: action.task };
+    case 'drop':
+      return { type: 'todo_op', op: 'drop', task: action.task };
+    case 'clear':
+      return { type: 'todo_op', op: 'rm', cascade: true };
   }
 }
 

@@ -112,7 +112,6 @@ impl ProcessLog {
         (self.start_cursor, self.cursor)
     }
 
-
     pub(super) fn read(&self, requested_cursor: u64, max_bytes: usize, eof: bool) -> ProcessLogs {
         let lost_bytes = self.start_cursor.saturating_sub(requested_cursor);
         let effective_cursor = requested_cursor.max(self.start_cursor).min(self.cursor);

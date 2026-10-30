@@ -16,7 +16,7 @@
 //                    (async decode) — tail marker "scroll-final-md-done"
 //   "scroll-narrow"  short stream (8 chunks, 0.3s, tail marker
 //                    "scroll-narrow-done") for the narrow/mobile viewport
-//                    phase (header badge / Abort button / composer reflow)
+//                    phase (Send/Stop action flip / composer reflow)
 //   "scroll-echo"    instant echo for the second session's round-trip
 //
 // Why the OLD logic fails this lane (root cause, from v0.2.9 history):
@@ -28,10 +28,8 @@
 //      SVG hydration, image decode — changes scrollHeight with no delta and
 //      no activeItems change, so nothing ever re-pins (S5 fails: remaining
 //      jumps by the async growth and never comes back).
-//   2. NO forcePin on session activation: switching to a session whose
-//      nearBottomRef is stale-false (user scrolled away earlier) restores
-//      the transcript mid-content instead of pinning to the bottom (S7
-//      fails: the activated session inherits the previous scroll state).
+//   2. Session activation must restore that session's saved viewport rather
+//      than inherit another session's follow state or force an unpinned view down.
 //   A third contract every phase enforces: the DOCUMENT must never scroll
 //   (window.scrollY / document.scrollingElement.scrollTop === 0) — the app
 //   owns scrolling entirely inside #transcript (no window/body double
@@ -40,7 +38,7 @@
 //
 // Method: a page-level sampler (addInitScript) records a continuous trace —
 //   every rAF frame (scrollTop/scrollHeight/clientHeight/remaining + window
-//   scroll metrics + header/footer heights + badge/abort presence) plus
+//   scroll metrics + header/footer heights + Send/Stop action state) plus
 //   classified events (text-delta / react-commit / mermaid / resize) and
 //   scroll events. Assertions run over the trace segments per phase, so a
 //   single missed pin surfaces as the FIRST frame where remaining exceeded
@@ -66,32 +64,31 @@
 //   S5.2 the final render's async growth (mermaid svg swap / resize) was
 //        observed AND absorbed: scrollTop advanced tracking scrollHeight
 //   S6.1 narrow/mobile pinned stream: header/footer/composer layout changes
-//        (badge, Abort button, textarea growth) never break the pin —
-//        every frame bounded, layout change actually measured
+//        (unified action Send↔Stop toggle, textarea growth) never break the
+//        pin — every frame bounded, layout change actually measured
 //   S6.2 narrow/mobile unpinned stream: viewport EXACTLY frozen while the
 //        layout changes and content keeps growing
 //   S6.3 narrow transcript keeps growing while unpinned
 //   S7.1 pre-switch unpin registered (session A is genuinely unpinned)
 //   S7.2 a new session activates with its own empty view + echo round-trip
-//   S7.3 switching back force-pins the activated transcript (every frame
-//        bounded; never inherits the previous scroll position or pin state)
+//   S7.3 switching back restores the saved unpinned viewport without bottom pinning
 
 import { chromium } from 'playwright';
 import fs from 'node:fs';
+import { createFreshSessionViaManage } from './lib/session-lifecycle.mjs';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
 const chromePath = process.env.RPI_CHROME || '';
 const evidence = process.env.RPI_EVIDENCE || '.';
 
-// The app's own pin tolerance is 80px (PIN_TOLERANCE_PX in scrollPin.ts);
-// assertions allow a little more so a frame-boundary race (a delta between
-// the app's synchronous pin and the measurement) cannot false-fail, while
+// Remaining 0 is pinned; remaining 1 is a scroll-away (PIN_TOLERANCE_PX=1).
+// Measurement slack is 2px so a frame-boundary race cannot false-fail, while
 // any real mid-transcript jump (a missed delta, async mermaid/image growth,
-// a lost forcePin) fails hard.
-const PIN_MAX_REMAINING = 120;
+// a lost pinIfPinned) fails hard.
+const PIN_MAX_REMAINING = 2;
 // Where "scroll away" lands: 200px above the bottom, comfortably beyond the
-// app's pin tolerance and never at the very top of a long transcript.
+// 1px pin and never at the very top of a long transcript.
 const SCROLL_AWAY_OFFSET = 200;
 // Multiline draft typed into the composer mid-stream (narrow phase): the
 // textarea autoResize grows the footer ~2 lines with NO item change — a
@@ -116,7 +113,7 @@ const PROBE_SCRIPT = `
     const scroller = document.scrollingElement || document.documentElement;
     const header = document.querySelector('header');
     const footer = document.querySelector('.app-main > footer');
-    const badge = document.getElementById('stream-badge');
+    const action = document.getElementById('send-btn');
     return {
       st: el.scrollTop,
       ch: el.clientHeight,
@@ -126,7 +123,7 @@ const PROBE_SCRIPT = `
       docTop: scroller.scrollTop,
       headerH: header ? header.getBoundingClientRect().height : -1,
       footerH: footer ? footer.getBoundingClientRect().height : -1,
-      badge: badge ? !badge.hidden : false,
+      stop: action?.getAttribute('aria-label') === 'Stop generating',
     };
   }
 
@@ -256,21 +253,26 @@ const PROBE_SCRIPT = `
 })();
 `;
 
+// The documented contract this lane must execute EXACTLY once — IN THE
+// ACTUAL ASSERTION-SITE (runtime) ORDER (the matrix requires the published
+// executed array to equal the documented array in order). S3.3 (unpinned
+// viewport frozen) is recorded before S3.2, and S6.3 before S6.2, exactly
+// as the assertion sites execute.
 const DOCUMENTED_IDS = [
   'S0.1', 'S0.2', 'S0.3',
   'S1.1',
   'S2.1', 'S2.2', 'S2.3',
-  'S3.1', 'S3.2', 'S3.3',
+  'S3.1', 'S3.3', 'S3.2',
   'S4.1',
   'S5.1', 'S5.2',
-  'S6.1', 'S6.2', 'S6.3',
+  'S6.1', 'S6.3', 'S6.2',
   'S7.1', 'S7.2', 'S7.3',
 ];
-const executed = new Set();
+const executed = new Map(); // id -> exact execution count (per-ID ledger, no Set erasure)
 const assertionsLog = [];
 
 function record(id) {
-  executed.add(id);
+  executed.set(id, (executed.get(id) || 0) + 1);
   assertionsLog.push({ id, ok: true });
   console.log(`[web-scroll:assert] ${id}`);
 }
@@ -425,8 +427,8 @@ function summaryOf(seg) {
     footerH: nums(fs),
     maxWinY: frames.reduce((m, f) => Math.max(m, f.winY), 0),
     maxDocTop: frames.reduce((m, f) => Math.max(m, f.docTop), 0),
-    badgeShown: frames.some((f) => f.badge),
-    badgeHidden: frames.some((f) => !f.badge),
+    stopShown: frames.some((f) => f.stop),
+    stopCleared: frames.some((f) => !f.stop),
     textDeltaEvents: events.filter((e) => e.cls === 'text-delta').length,
     commitEvents: events.filter((e) => e.cls === 'commit').length,
     mermaidEvents: events.filter((e) => e.cls === 'mermaid').length,
@@ -447,7 +449,7 @@ async function main() {
     // so the pin assertions exercise real scrolling, not a content-fit no-op.
     const page = await browser.newPage({ viewport: { width: 1280, height: 600 } });
     if (token) {
-      await page.addInitScript((t) => { window.localStorage.setItem('rpi-web-token', t); }, token);
+      await page.addInitScript((t) => { window.localStorage.setItem(`rpi-web-token:${encodeURIComponent(location.host)}`, t); }, token);
     }
     await page.addInitScript(PROBE_SCRIPT);
     page.on('pageerror', (err) => {
@@ -464,14 +466,14 @@ async function main() {
     /* ---------------- S0: boot + connect ---------------- */
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await waitFor(page, () => document.title === 'rpi web', 'S0.1: page title missing');
-    await waitFor(page, () => document.getElementById('conn-state') !== null, 'S0.1: conn-state missing');
     await waitFor(
       page,
-      () => document.getElementById('conn-state').dataset.state === 'on',
+      () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true,
       'S0.2: WS did not reach "connected"'
     );
     record('S0.1');
     record('S0.2');
+    await waitFor(page, () => document.querySelector('.session-sidebar__row--active .session-sidebar__switch') !== null, 'primary catalog bootstrap did not settle');
     const sessionA = await page.evaluate(() => {
       const rows = [...document.querySelectorAll('.session-sidebar__switch')];
       return rows.length ? rows[0].dataset.sessionId || '' : '';
@@ -704,8 +706,8 @@ async function main() {
     const seg6a = segment(trace6a, 'S6-narrow-pinned');
     if (!seg6a) fail('S6: trace segment "S6-narrow-pinned" missing');
     const s6a = summaryOf(seg6a);
-    // Non-vacuous: the layout really changed (badge/abort toggles + composer
-    // growth) and the transcript viewport resized with it.
+    // Non-vacuous: the layout really changed (Send/Stop action toggles +
+    // composer growth) and the transcript viewport resized with it.
     const layoutSpan = (a) => (a ? a.max - a.min : 0);
     const chromeDelta = layoutSpan(s6a.headerH) + layoutSpan(s6a.footerH);
     if (chromeDelta < 2) {
@@ -714,8 +716,8 @@ async function main() {
     if (layoutSpan(s6a.clientHeight) < 2) {
       fail(`S6.1: transcript clientHeight never changed (${JSON.stringify(s6a.clientHeight)}) — narrow phase vacuous`);
     }
-    if (!s6a.badgeShown || !s6a.badgeHidden) {
-      fail('S6.1: streaming badge never toggled during the narrow stream');
+    if (!s6a.stopShown || !s6a.stopCleared) {
+      fail('S6.1: unified action never toggled Stop/Send during the narrow stream');
     }
     viol = pinnedViolation(seg6a);
     if (viol) failViolation('S6.1', `narrow pinned stream violated across layout changes: ${viol.what}`, seg6a, viol);
@@ -764,7 +766,7 @@ async function main() {
     record('S6.2');
     await page.screenshot({ path: `${evidence}/scroll-s6-narrow-unpinned.png`, fullPage: true });
 
-    /* ---------------- S7: session switch force-pins the activated session ---------------- */
+    /* ---------------- S7: session switch restores the saved viewport ---------------- */
     // Gap segment: resize back to the desktop layout, settle, and unpin A.
     await markPhase('S7-gap');
     await page.setViewportSize({ width: 1280, height: 600 });
@@ -789,8 +791,11 @@ async function main() {
     }
     record('S7.1');
     await markPhase('S7-switch');
+    if (await page.locator('#sidebar-toggle-btn').getAttribute('aria-pressed') !== 'true') {
+      await page.click('#sidebar-toggle-btn');
+    }
 
-    await page.click('#sidebar-new-session-btn');
+    await createFreshSessionViaManage(page, waitFor, 'S7.2', { closePanel: true });
     await waitFor(
       page,
       () => document.querySelector('#transcript .empty-hint') !== null,
@@ -807,8 +812,7 @@ async function main() {
     record('S7.2');
     await page.screenshot({ path: `${evidence}/scroll-s7-new-session.png`, fullPage: true });
 
-    // Switch back to A: its long transcript must be pinned to the bottom
-    // even though A was unpinned before the switch (forcePin on activation).
+    // Switch back to A without stealing its saved unpinned viewport.
     await waitFor(
       page,
       (s) => {
@@ -842,35 +846,29 @@ async function main() {
       'S7.3: session A transcript never restored',
       30000
     );
-    // forcePin lands via a passive effect (a frame or two after the commit);
-    // wait for the pin, then gate every frame of the settled window.
     await waitFor(
       page,
-      (limit) => {
-        const el = document.getElementById('transcript');
-        return el.scrollHeight - el.scrollTop - el.clientHeight <= limit;
-      },
-      'S7.3: session switch did not pin the activated transcript to the bottom',
+      (top) => Math.abs(document.getElementById('transcript').scrollTop - top) <= 2,
+      'S7.3: session switch did not restore the saved viewport',
       15000,
-      PIN_MAX_REMAINING
+      preSwitch.scrollTop
     );
     await markPhase('S7-switch-back');
     await page.waitForTimeout(600);
     const restored = await transcriptMetrics(page);
     if (!restored) fail('S7.3: transcript metrics unavailable');
-    if (restored.remaining > PIN_MAX_REMAINING) {
-      fail(`S7.3: activated transcript resumed mid-transcript (remaining ${restored.remaining}px > ${PIN_MAX_REMAINING}px)`);
+    if (restored.remaining <= PIN_MAX_REMAINING || Math.abs(restored.scrollTop - preSwitch.scrollTop) > 2) {
+      fail(`S7.3: activated transcript lost its saved unpinned viewport: ${JSON.stringify({ preSwitch, restored })}`);
     }
     const trace7 = await probeDump();
     const seg7 = segment(trace7, 'S7-switch-back');
     if (!seg7) fail('S7: trace segment "S7-switch-back" missing');
-    viol = pinnedViolation(seg7);
-    if (viol) failViolation('S7.3', `activated session not force-pinned: ${viol.what}`, seg7, viol);
-    // Prove the pre-switch state was genuinely unpinned (the force-pin had
-    // to OVERRIDE it — old logic inherits the stale false and fails here).
+    if (seg7.frames.some((frame) => frame.rem <= PIN_MAX_REMAINING)) {
+      fail('S7.3: restored unpinned viewport was stolen by bottom pinning');
+    }
     const seg7pre = segment(trace7, 'S7-switch');
     if (!seg7pre || !seg7pre.frames.some((f) => f.rem >= SCROLL_AWAY_OFFSET)) {
-      fail('S7.3: pre-switch unpinned state not visible in the trace — force-pin test invalid');
+      fail('S7.3: pre-switch unpinned state not visible in the trace — restore test invalid');
     }
     record('S7.3');
     await page.screenshot({ path: `${evidence}/scroll-s7-switched-back.png`, fullPage: true });
@@ -879,6 +877,14 @@ async function main() {
     const missing = DOCUMENTED_IDS.filter((id) => !executed.has(id));
     if (missing.length > 0) {
       fail(`documented assertions never executed: ${missing.join(', ')}`);
+    }
+    const overExecuted = [...executed.keys()].filter((id) => !DOCUMENTED_IDS.includes(id));
+    if (overExecuted.length > 0) {
+      fail(`executed-but-undocumented assertion ids: ${overExecuted.join(', ')}`);
+    }
+    const repeatedIds = [...executed].filter(([, count]) => count !== 1).map(([id]) => id);
+    if (repeatedIds.length > 0) {
+      fail(`exact-once violation (duplicate execution): ${repeatedIds.join(', ')}`);
     }
     const trace = await probeDump();
     traceHandle.value = trace;
@@ -900,10 +906,19 @@ async function main() {
     fs.writeFileSync(`${evidence}/scroll-metrics.json`, JSON.stringify(metrics));
     fs.writeFileSync(
       `${evidence}/coverage-assertions.json`,
-      JSON.stringify({ executed: [...executed].sort() }, null, 2)
+      // The REAL ledger: executed is the Map's insertion order (actual
+      // execution order — never a reconstruction of DOCUMENTED_IDS); counts
+      // the real per-ID ledger. The gates above proved documented == executed
+      // as exact-once sets; the matrix's ordered gate additionally proves
+      // the runtime order matches the documented order.
+      JSON.stringify({
+        documented: [...DOCUMENTED_IDS],
+        executed: [...executed.keys()],
+        counts: Object.fromEntries(executed),
+      }, null, 2)
     );
     didPass = true;
-    console.log('web-scroll: PASSED (per-frame bounded pin, synchronous delta advance, exact unpinned freeze, re-pin on return, async final-markdown/mermaid/image pin, narrow-layout pin, activated-session force-pin)');
+    console.log('web-scroll: PASSED (per-frame bounded pin, synchronous delta advance, exact unpinned freeze, re-pin on return, async final-markdown/mermaid/image pin, narrow-layout pin, per-session viewport restore)');
   } finally {
     // On failure, still write the metrics + a screenshot so the failure is
     // diagnosable (first jump before/after + triggering event).

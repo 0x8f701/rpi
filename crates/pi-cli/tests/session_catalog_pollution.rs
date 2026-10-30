@@ -17,12 +17,10 @@
 //!      unfiltered by design and every row is `temporary: false`.
 //!   2. `web_all_projects_keeps_temp_rows_and_marks_them_temporary`: runs
 //!      the exact AllProjects backend + view partition
-//!      (`load_resume_catalog` -> `coalesce_web_import_rows` ->
+//!      (`load_resume_catalog` ->
 //!      `filter_web_noise_rows` -> `partition_web_noise_rows`) over the
-//!      seeded catalog and asserts the backend hides only the empty row while
-//!      the temp-workspace harness row SURVIVES the backend and lands in the
-//!      temporary bucket (recoverable), and the legal user rows (named or in
-//!      a real workspace) are never temporary.
+//!      seeded catalog and asserts the backend hides only the empty row;
+//!      the legal user rows (named or in a real workspace) are never temporary.
 //!   3. `historical_fixture_rows_covered_by_temp_rule_others_need_user_cleanup`:
 //!      replicates the historical producer shapes and records exactly which
 //!      rows the temporary rule covers (temp-workspace, unnamed, small native
@@ -92,9 +90,18 @@ impl RpcSession {
             .env("HOME", home.path())
             .env("USERPROFILE", home.path())
             .env("SESSIONS_HOME", home.path())
+            .env(
+                "PI_CODING_AGENT_SESSION_DIR",
+                home.path()
+                    .join(".rpi")
+                    .join("sessions")
+                    .join(encoded_cwd(cwd)),
+            )
+            .env_remove("RPI_HOME")
+            .env_remove("PI_PROFILE")
             .env_remove("PI_CODING_AGENT_DIR")
-            .env("PI_OFFLINE", "1")
-            .env("PI_SKIP_VERSION_CHECK", "1")
+            .env("RPI_OFFLINE", "1")
+            .env("RPI_SKIP_VERSION_CHECK", "1")
             .env("PI_FAUX_RESPONSE", "session-catalog-pollution-faux")
             .current_dir(cwd)
             .stdin(Stdio::piped())
@@ -114,9 +121,7 @@ impl RpcSession {
 
     fn write_line(&mut self, line: &str) {
         let stdin = self.child.stdin.as_mut().expect("stdin pipe");
-        stdin
-            .write_all(line.as_bytes())
-            .expect("write rpc stdin");
+        stdin.write_all(line.as_bytes()).expect("write rpc stdin");
         if !line.ends_with('\n') {
             stdin.write_all(b"\n").expect("write rpc LF");
         }
@@ -140,8 +145,9 @@ impl RpcSession {
                         !trimmed.contains('\u{1b}'),
                         "stdout must not contain ANSI escapes: {trimmed:?}"
                     );
-                    return serde_json::from_str(trimmed)
-                        .unwrap_or_else(|error| panic!("stdout line is not JSON ({error}): {trimmed}"));
+                    return serde_json::from_str(trimmed).unwrap_or_else(|error| {
+                        panic!("stdout line is not JSON ({error}): {trimmed}")
+                    });
                 }
                 Ok(RpcLine::Eof) => panic!("rpi rpc stdout closed before the next JSONL record"),
                 Ok(RpcLine::Error(error)) => panic!("reading rpi rpc stdout: {error}"),
@@ -202,11 +208,7 @@ fn encoded_cwd(cwd: &Path) -> String {
 }
 
 fn seed_session(home: &Path, cwd: &Path, id: &str, records: &[Value]) -> PathBuf {
-    let dir = home
-        .join(".pi")
-        .join("agent")
-        .join("sessions")
-        .join(encoded_cwd(cwd));
+    let dir = home.join(".rpi").join("sessions").join(encoded_cwd(cwd));
     fs_create_dir_all(&dir);
     let target = dir.join(format!("2026-01-01T00:00:00Z_{id}.jsonl"));
     let mut content = String::new();
@@ -308,7 +310,11 @@ fn seed_fixtures(home: &Path, cwd: &Path) {
         home,
         cwd,
         "user-short",
-        &[header("user-short", cwd), user_message("m1", "hi"), assistant_message("m2", "hello")],
+        &[
+            header("user-short", cwd),
+            user_message("m1", "hi"),
+            assistant_message("m2", "hello"),
+        ],
     );
     // Image-only (user image block, tiny) — legal and preserved. Carries a
     // session name so the catalog's source+cwd+summary dedupe never collapses
@@ -363,7 +369,11 @@ fn seed_all_projects_fixtures(home: &Path) {
         home,
         &project,
         "user-short",
-        &[header("user-short", &project), user_message("m1", "hi"), assistant_message("m2", "hello")],
+        &[
+            header("user-short", &project),
+            user_message("m1", "hi"),
+            assistant_message("m2", "hello"),
+        ],
     );
     // Image-only (user image block, tiny) — legal and preserved. Carries a
     // session name so the catalog's source+cwd+summary dedupe never collapses
@@ -390,7 +400,12 @@ fn seed_all_projects_fixtures(home: &Path) {
         ],
     );
     // Empty row: header only, no messages, small — hidden by the zero-message rule.
-    seed_session(home, &project, "noise-empty", &[header("noise-empty", &project)]);
+    seed_session(
+        home,
+        &project,
+        "noise-empty",
+        &[header("noise-empty", &project)],
+    );
     // Historical harness shape: unnamed, tiny, cwd under the OS temp root,
     // with real messages — survives the backend, marked temporary.
     let tmp = tmp_workspace_cwd();
@@ -425,8 +440,14 @@ fn isolated_home_session_list_reports_user_fixtures() {
         line.get("type").and_then(Value::as_str) == Some("response")
             && line.get("id").and_then(Value::as_str) == Some("list1")
     });
-    assert_eq!(response["success"], true, "session_list must succeed: {response}");
-    assert_eq!(response["command"], "session_list", "command field: {response}");
+    assert_eq!(
+        response["success"], true,
+        "session_list must succeed: {response}"
+    );
+    assert_eq!(
+        response["command"], "session_list",
+        "command field: {response}"
+    );
     let rows = response["data"]["sessions"]
         .as_array()
         .expect("sessions array")
@@ -436,7 +457,7 @@ fn isolated_home_session_list_reports_user_fixtures() {
 
     // Legal short single-turn is preserved in the real catalog.
     let short = by_id("user-short").unwrap_or_else(|| panic!("user-short missing: {rows:?}"));
-    assert_eq!(short["source"], "pi", "native source label: {short}");
+    assert_eq!(short["source"], "rpi", "native source label: {short}");
     assert!(
         short["messageCount"].as_u64().unwrap_or(0) >= 1,
         "short single-turn must carry >=1 message: {short}"
@@ -491,7 +512,7 @@ fn isolated_home_session_list_reports_user_fixtures() {
     // that flags it — and Current scope must NOT flag it: Current scope
     // never applies the AllProjects partition (rows are temporary: false).
     let harness = by_id("noise-tmp").unwrap_or_else(|| panic!("noise-tmp missing: {rows:?}"));
-    assert_eq!(harness["source"], "pi", "native source label: {harness}");
+    assert_eq!(harness["source"], "rpi", "native source label: {harness}");
     assert!(
         harness["messageCount"].as_u64().unwrap_or(0) >= 1,
         "temp harness row must carry >=1 message: {harness}"
@@ -510,16 +531,17 @@ fn isolated_home_session_list_reports_user_fixtures() {
 
 // ---------------------------------------------------------------------------
 // Contract 2: the exact Web AllProjects sidebar pipeline
-// (load_resume_catalog -> coalesce_web_import_rows -> filter_web_noise_rows
-// -> partition_web_noise_rows) keeps user fixtures, hides ONLY the empty
-// sub-10KiB row, and marks the temp-workspace harness row temporary.
+// (load_resume_catalog -> filter_web_noise_rows -> partition_web_noise_rows;
+// imported foreign rows STAY VISIBLE next to their native copy — no
+// coalescing drop) keeps user fixtures, hides ONLY the empty sub-10KiB row,
+// and marks the temp-workspace harness row temporary.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn web_all_projects_keeps_temp_rows_and_marks_them_temporary() {
     use pi_cli::resume_catalog::{
-        coalesce_web_import_rows, filter_web_noise_rows, load_resume_catalog,
-        partition_web_noise_rows, ResumeCatalogRequest,
+        ResumeCatalogRequest, filter_web_noise_rows, load_resume_catalog,
+        partition_web_noise_rows,
     };
     use pi_coding::{CatalogSort, SessionCatalog, SessionSourceKind};
 
@@ -550,26 +572,11 @@ fn web_all_projects_keeps_temp_rows_and_marks_them_temporary() {
     .rows;
     assert_eq!(rows.len(), 5, "catalog must see all five seeds: {rows:?}");
 
-    // Backend: coalesce imported duplicates, then the zero-message filter.
-    // The temp-workspace harness row carries real messages, so it SURVIVES
-    // the backend (it is only partitioned as temporary, never deleted).
-    let backend_rows = filter_web_noise_rows(coalesce_web_import_rows(rows));
-    let mut backend_ids: Vec<&str> = backend_rows
-        .iter()
-        .map(|row| row.session_id.as_str())
-        .collect();
-    backend_ids.sort_unstable();
-    assert_eq!(
-        backend_ids,
-        vec!["noise-tmp", "user-image", "user-normal", "user-short"],
-        "backend must keep the temp harness row (it has real messages) and hide only the empty row"
-    );
-    assert!(
-        !backend_rows
-            .iter()
-            .any(|row| row.session_id == "noise-empty"),
-        "empty sub-10KiB row must be hidden by filter_web_noise_rows"
-    );
+    // Backend: the zero-message filter only. Imported foreign rows stay
+    // listed next to their native copy (no coalescing drop). The
+    // temp-workspace harness row carries real messages, so it SURVIVES the
+    // backend (it is only partitioned as temporary, never deleted).
+    let backend_rows = filter_web_noise_rows(rows);
 
     // View partition: the temp-workspace harness row lands in the temporary
     // bucket (recoverable — searchable / active / loaded); the legal user
@@ -577,7 +584,10 @@ fn web_all_projects_keeps_temp_rows_and_marks_them_temporary() {
     let (regular, temporary) = partition_web_noise_rows(backend_rows);
     let mut regular_ids: Vec<&str> = regular.iter().map(|row| row.session_id.as_str()).collect();
     regular_ids.sort_unstable();
-    let temp_ids: Vec<&str> = temporary.iter().map(|row| row.session_id.as_str()).collect();
+    let temp_ids: Vec<&str> = temporary
+        .iter()
+        .map(|row| row.session_id.as_str())
+        .collect();
     assert_eq!(
         regular_ids,
         vec!["user-image", "user-normal", "user-short"],
@@ -606,13 +616,15 @@ fn web_all_projects_keeps_temp_rows_and_marks_them_temporary() {
 #[test]
 fn historical_fixture_rows_covered_by_temp_rule_others_need_user_cleanup() {
     use pi_cli::resume_catalog::{
-        coalesce_web_import_rows, filter_web_noise_rows, load_resume_catalog,
-        partition_web_noise_rows, ResumeCatalogRequest,
+        ResumeCatalogRequest, filter_web_noise_rows, load_resume_catalog,
+        partition_web_noise_rows,
     };
     use pi_coding::{CatalogSort, SessionCatalog, SessionSourceKind};
 
     let home = tempfile::tempdir().expect("isolated HOME");
-    let worktree = tmp_workspace_cwd().join("workflow-worktrees").join("wf-0001");
+    let worktree = tmp_workspace_cwd()
+        .join("workflow-worktrees")
+        .join("wf-0001");
     let user_cwd = project_cwd();
     fs_create_dir_all(&worktree);
     fs_create_dir_all(&user_cwd);
@@ -650,10 +662,24 @@ fn historical_fixture_rows_covered_by_temp_rule_others_need_user_cleanup() {
         &[
             header_with("fx-workflow-supervisor", &worktree, None),
             model_change("workflow-pollution-provider-abc", "workflow-pollution-abc"),
-            user_message("m1", "You plan workflow 019ff1bf-... Objective: ship the feature"),
-            tool_call("t1", "todo", json!({"op":"init","items":["create hello.txt"]})),
-            tool_result("t1", "Remaining items (1):\n  - create hello.txt [in_progress]"),
-            tool_call("t2", "bash", json!({"command":"printf 'hello' > hello.txt && git commit -m x"})),
+            user_message(
+                "m1",
+                "You plan workflow 019ff1bf-... Objective: ship the feature",
+            ),
+            tool_call(
+                "t1",
+                "todo",
+                json!({"op":"init","items":["create hello.txt"]}),
+            ),
+            tool_result(
+                "t1",
+                "Remaining items (1):\n  - create hello.txt [in_progress]",
+            ),
+            tool_call(
+                "t2",
+                "bash",
+                json!({"command":"printf 'hello' > hello.txt && git commit -m x"}),
+            ),
             tool_result("t2", "ok"),
             assistant_message("m2", "worker one done"),
         ],
@@ -665,7 +691,11 @@ fn historical_fixture_rows_covered_by_temp_rule_others_need_user_cleanup() {
         &worktree,
         "fx-workflow-child",
         &[
-            header_with("fx-workflow-child", &worktree, Some("fx-workflow-supervisor")),
+            header_with(
+                "fx-workflow-child",
+                &worktree,
+                Some("fx-workflow-supervisor"),
+            ),
             model_change("workflow-pollution-provider-abc", "workflow-pollution-abc"),
             user_message("m1", "complete workflow Todo"),
             assistant_message("m2", "done"),
@@ -806,7 +836,7 @@ fn historical_fixture_rows_covered_by_temp_rule_others_need_user_cleanup() {
 
     // The backend filter (zero-message only) hides NOTHING here — every row
     // carries messages, so everything survives to the view partition.
-    let backend = filter_web_noise_rows(coalesce_web_import_rows(rows));
+    let backend = filter_web_noise_rows(rows);
     assert_eq!(
         backend.len(),
         10,
@@ -814,7 +844,10 @@ fn historical_fixture_rows_covered_by_temp_rule_others_need_user_cleanup() {
     );
 
     let (regular, temporary) = partition_web_noise_rows(backend);
-    let temp_ids: Vec<&str> = temporary.iter().map(|row| row.session_id.as_str()).collect();
+    let temp_ids: Vec<&str> = temporary
+        .iter()
+        .map(|row| row.session_id.as_str())
+        .collect();
     let regular_ids: Vec<&str> = regular.iter().map(|row| row.session_id.as_str()).collect();
 
     // The temporary rule covers exactly the unnamed, tiny, native rows whose
@@ -887,6 +920,12 @@ fn historical_fixture_rows_covered_by_temp_rule_others_need_user_cleanup() {
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
     let evidence_path = evidence_dir.join("historical-fixture-filter-eval.json");
-    fs_write(&evidence_path, serde_json::to_string_pretty(&evidence).expect("serialize evidence"));
-    eprintln!("historical-fixture-filter-eval evidence: {}", evidence_path.display());
+    fs_write(
+        &evidence_path,
+        serde_json::to_string_pretty(&evidence).expect("serialize evidence"),
+    );
+    eprintln!(
+        "historical-fixture-filter-eval evidence: {}",
+        evidence_path.display()
+    );
 }

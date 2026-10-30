@@ -50,6 +50,99 @@ export function shouldScheduleReconnect(err: unknown, alive: boolean): boolean {
   return true;
 }
 
+/** Cadence for the application `{type:"ping"}` probe. */
+export const HEARTBEAT_PING_INTERVAL_MS = 5_000;
+/** Maximum wait for a pong when no inbound frame has arrived after the ping. */
+export const HEARTBEAT_PONG_DEADLINE_MS = 10_000;
+/** Maximum age of the most recent inbound frame before the socket is stale. */
+export const HEARTBEAT_TIMEOUT_MS = 60_000;
+
+export const HEARTBEAT_PING_FRAME = '{"type":"ping"}';
+
+/** Application heartbeat may retire a socket only while the page is visible.
+ *  Hidden-tab timer throttling freezes lastMessageAt and can age an
+ *  outstanding ping past the pong deadline while the browser still
+ *  auto-pongs server RFC6455 pings. Death while hidden is not a liveness
+ *  signal — wake probes an OPEN socket and reconnects only if it is gone. */
+export function heartbeatMayRetire(pageVisible: boolean): boolean {
+  return pageVisible;
+}
+
+/** Only frame silence, not command latency, may classify an open socket dead. */
+export function shouldCloseForSilence(lastMessageAtMs: number, nowMs: number): boolean {
+  return nowMs - lastMessageAtMs >= HEARTBEAT_TIMEOUT_MS;
+}
+
+/** An outstanding ping dies only when no inbound frame arrives before the deadline. */
+export function shouldCloseForMissedPong(
+  pingSentAtMs: number | null,
+  nowMs: number,
+  lastMessageAtMs: number,
+): boolean {
+  if (pingSentAtMs === null) return false;
+  if (lastMessageAtMs >= pingSentAtMs) return false;
+  return nowMs - pingSentAtMs >= HEARTBEAT_PONG_DEADLINE_MS;
+}
+
+export const TRANSPORT_READY_CONNECTING = 0;
+export const TRANSPORT_READY_OPEN = 1;
+export const TRANSPORT_READY_CLOSING = 2;
+export const TRANSPORT_READY_CLOSED = 3;
+
+export type HeartbeatPingAction = 'idle' | 'send' | 'retire';
+
+export function heartbeatPingAction(readyState: number | null): HeartbeatPingAction {
+  if (readyState === null) return 'idle';
+  if (readyState === TRANSPORT_READY_OPEN) return 'send';
+  if (readyState === TRANSPORT_READY_CLOSING || readyState === TRANSPORT_READY_CLOSED) {
+    return 'retire';
+  }
+  return 'idle';
+}
+
+export type HeartbeatPingPlan = 'idle' | 'send' | 'retire' | 'wait-pong';
+
+export function planHeartbeatPing(
+  readyState: number | null,
+  pingSentAtMs: number | null,
+  nowMs: number,
+  lastMessageAtMs = 0,
+): HeartbeatPingPlan {
+  const ping = heartbeatPingAction(readyState);
+  if (ping === 'idle') return 'idle';
+  if (ping === 'retire') return 'retire';
+  if (pingSentAtMs !== null) {
+    if (lastMessageAtMs >= pingSentAtMs) return 'send';
+    if (shouldCloseForMissedPong(pingSentAtMs, nowMs, lastMessageAtMs)) return 'retire';
+    return 'wait-pong';
+  }
+  return 'send';
+}
+
+export const TRANSPORT_HANDSHAKE_DEADLINE_MS = 10_000;
+
+export function shouldRetireHandshake(
+  readyState: number | null,
+  startedAtMs: number | null,
+  nowMs: number,
+): boolean {
+  if (readyState === null || startedAtMs === null) return false;
+  if (readyState === TRANSPORT_READY_OPEN) return false;
+  return nowMs - startedAtMs >= TRANSPORT_HANDSHAKE_DEADLINE_MS;
+}
+
+/** `{type:"pong"}` is one inbound live signal; any post-ping frame is equivalent. */
+export function isPongFrame(raw: string): boolean {
+  if (raw === '{"type":"pong"}') return true;
+  try {
+    const frame = JSON.parse(raw) as { type?: unknown };
+    return frame != null && frame.type === 'pong';
+  } catch {
+    return false;
+  }
+}
+
+
 /** The four event-handler slots a transport (WebSocket / RTCDataChannel)
  *  exposes. Generic so the helper has no DOM type dependency and the node test
  *  can pass a plain mock. */
@@ -77,30 +170,24 @@ export function detachTransportHandlers<T extends TransportHandlers>(t: T): void
  * Bounded ready gate (mount-before-WebSocket-OPEN fix)
  * ------------------------------------------------------------------ */
 
-/** Bounded wait for an auto/background load that fires before the socket has
- *  reached OPEN — the sidebar and session panel both `load()` on mount, so on
- *  a fresh page the effect runs while `connect()` is still in CONNECTING and
- *  `sendCommand` would reject with `not connected`, surfacing a persistent
- *  `load failed: not connected` error. The gate lets that auto-load WAIT for
- *  the current socket's open (bounded, so a long outage never hangs) instead
- *  of failing immediately.
+/** Bounded wait for an auto/background load that fires before the connection
+ *  has completed its authoritative bootstrap. The sidebar and session panel
+ *  both `load()` on mount; raw WebSocket OPEN is too early because the server
+ *  grants one sessionId-less `get_state` bootstrap command, then requires a
+ *  sessionId. App therefore calls `markReady` only after state/messages bind
+ *  `sessionIdRef`, preventing a racing session_list from surfacing a persistent
+ *  `sessionId is required after WebSocket bootstrap` error.
  *
- *  Generation safety: `notifyOpen` is only ever called from the App's `onOpen`
- *  handler, which `connect()`/unmount detach from any superseded socket first
- *  (detachTransportHandlers), so a STALE socket's open can never resolve a
- *  waiter. A waiter resolved on the newer socket's open proceeds to
- *  `sendCommand`, which re-checks `wsRef.readyState === OPEN` at send time, so
- *  even a defensive late open cannot trigger a load on a stale transport. The
- *  gate itself is therefore generation-agnostic — the invariant is enforced by
- *  the existing detach + readyState guards, not by tracking a gen per waiter.
+ *  Generation safety: App calls `markNotReady` before replacing a transport,
+ *  and only the current socket's successful bootstrap continuation calls
+ *  `markReady`. Superseded continuations fail their `alive()` checks, so a
+ *  stale socket cannot release a waiter. `sendCommand` still re-checks the
+ *  live transport at send time.
  *
  *  Bounded: each waiter arms a `READY_GATE_TIMEOUT_MS` timer so a permanently
- *  dead transport rejects (and the auto-load's catch swallows it silently —
- *  the next poll/reconnect re-arms). No unbounded wait, no permanent error.
- *
- *  Active actions (sidebar New / Switch, panel rename) do NOT use the gate —
- *  they call `sendCommand` directly and fail fast with `not connected` while
- *  disconnected, exactly as before. */
+ *  dead transport/bootstrap rejects; auto-load callers swallow that transient
+ *  error and retry on the next poll/reconnect. Active actions bypass the gate
+ *  and fail fast while disconnected. */
 export const READY_GATE_TIMEOUT_MS = 15000;
 
 /** A scheduled timer handle as returned by the injected scheduler (the App
@@ -116,9 +203,11 @@ export interface ReadyGateScheduler {
 }
 
 /** Bounded, generation-safe ready gate for auto/background `sendCommand` loads.
- *  No DOM/WebSocket dependency — the App wires the real scheduler; the node
- *  test passes a fake. See `READY_GATE_TIMEOUT_MS` doc for the full contract. */
+ *  The gate itself owns authoritative-bootstrap readiness: raw transport OPEN
+ *  never makes `wait()` succeed. No DOM/WebSocket dependency — the App wires
+ *  the real scheduler; the node test passes a fake. */
 export class ReadyGate {
+  private isReady = false;
   private waiters: Array<{
     resolve: () => void;
     reject: (err: Error) => void;
@@ -132,11 +221,10 @@ export class ReadyGate {
     return this.waiters.length;
   }
 
-  /** Register a bounded waiter. The caller MUST first check `ws.readyState ===
-   *  OPEN` and only call `wait()` when the socket is NOT open; an already-open
-   *  socket never registers a waiter. Resolves on the next `notifyOpen`, or
-   *  rejects with `not connected` after `READY_GATE_TIMEOUT_MS`. */
+  /** Resolve immediately only after authoritative bootstrap; otherwise
+   *  register a bounded waiter for the current or replacement connection. */
   wait(): Promise<void> {
+    if (this.isReady) return Promise.resolve();
     const { promise, resolve, reject } = withResolvers<void>();
     const entry = { resolve, reject, timer: null as ReadyGateTimer };
     entry.timer = this.scheduler.setTimeout(() => {
@@ -147,10 +235,15 @@ export class ReadyGate {
     return promise;
   }
 
-  /** Resolve every pending waiter. Called from the App's `onOpen` (the current
-   *  socket's open only — superseded sockets' `onopen` is detached first, so a
-   *  stale socket can never trigger a load through the gate). */
-  notifyOpen(): void {
+  /** Mark the transport not authoritative-ready without dropping waiters that
+   *  may migrate to the replacement connection's successful bootstrap. */
+  markNotReady(): void {
+    this.isReady = false;
+  }
+
+  /** Mark the current connection authoritative-ready and resolve every waiter. */
+  markReady(): void {
+    this.isReady = true;
     const pending = this.waiters;
     this.waiters = [];
     for (const w of pending) {
@@ -159,10 +252,10 @@ export class ReadyGate {
     }
   }
 
-  /** Reject every pending waiter with `reason` and clear their timers. Called
-   *  on unmount so a torn-down app does not leak waiter timers or settle a
-   *  promise into an unmounted component. */
+  /** Reject every pending waiter with `reason`, clear their timers, and reset
+   *  readiness. Called on unmount so a torn-down app cannot settle later. */
   clear(reason = 'not connected'): void {
+    this.isReady = false;
     const pending = this.waiters;
     this.waiters = [];
     for (const w of pending) {

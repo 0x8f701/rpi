@@ -54,8 +54,8 @@ spawn_rpi() {
     env -i \
         HOME="$root/home" USERPROFILE="$root/home" \
         PATH="${PATH:-/usr/bin:/bin}" LANG="${LANG:-C.UTF-8}" LC_ALL="${LC_ALL:-C.UTF-8}" \
-        PI_CODING_AGENT_DIR="$root/home/.pi/agent" \
-        PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 \
+        RPI_HOME="$root/home/.rpi" \
+        RPI_OFFLINE=1 RPI_SKIP_VERSION_CHECK=1 \
         RPI_WEB_DEV_DIR="${RPI_WEB_DEV_DIR:-}" \
         "$RPI_BIN" --offline \
         --listen 127.0.0.1:0 \
@@ -157,7 +157,7 @@ main() {
     printf '%s\n' "$TOKEN" >"$root/token"
 
     port="$(start_mock "$root" "$evidence")"
-    cat >"$root/home/.pi/agent/models.json" <<EOF
+    cat >"$root/home/.rpi/models.json" <<EOF
 {
   "providers": {
     "user-steering": {

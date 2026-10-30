@@ -1,50 +1,49 @@
 // Pure (React-free) composer attachment intake helpers: classification,
 // frame-derived limits, order-preserving read planning, UTF-8 validation, the
-// wire mapping, and the backend video upload client. Shared by the three
+// wire mapping, and the backend video/PDF upload clients. Shared by the three
 // intake paths — textarea onPaste, footer drag/drop, and the hidden file
 // input — so they enforce one consistent contract.
 //
-// THREE ATTACHMENT KINDS, sent over the existing prompt command wire:
+// FOUR ATTACHMENT KINDS, sent over the existing prompt command wire:
 //  * image  -> pi_ai::ContentBlock::Image in the `images` array
 //              (`{type:"image",data,mimeType}`, crates/pi-cli/src/modes/rpc.rs
 //              `RpcCommand::Prompt`). Only ContentBlock::Image exists — there
-//              is no PDF/binary variant, so non-image binaries cannot ride this
+//              is no PDF/binary variant, so raw PDF bytes cannot ride this
 //              path as content.
 //  * video  -> raw bytes NEVER ride the prompt frame. The file is POSTed to
 //              the backend's authenticated `POST /upload/video` endpoint (raw
-//              body + `X-Video-Name` header; crates/pi-cli/src/modes/
-//              video_upload.rs + listen.rs), which validates the container,
-//              probes duration, and deterministically extracts bounded
-//              chronological JPEG frames via ffmpeg. The returned frames are
-//              fed back through the EXISTING `images` array as plain image
-//              ContentBlocks, and the backend-generated bounded instruction
-//              text (per-frame `Frame at <timestamp>` order) is prepended to
-//              the prompt `message` as the explicit chronological-video
-//              marker. Backend processing failures (unsupported container,
-//              not a video, ffmpeg absent, timeouts) surface as an
-//              error-state chip with an actionable message — never a silently
-//              dropped attachment.
+//              body + `X-Video-Name` header; crates/pi-cli/src/video_extract.rs
+//              + listen.rs), which validates the container, probes duration,
+//              and deterministically extracts bounded chronological JPEG
+//              frames via ffmpeg. The returned frames are fed back through
+//              the EXISTING `images` array as plain image ContentBlocks, and
+//              the backend-generated bounded instruction text is prepended to
+//              the prompt `message`. Backend processing failures surface as
+//              an error-state chip — never a silently dropped attachment.
+//  * pdf    -> raw bytes NEVER ride the prompt frame. The file is POSTed to
+//              `POST /upload/pdf` (raw body + `X-Pdf-Name`; crates/pi-cli/src/
+//              pdf_extract.rs + listen.rs), which validates `%PDF-` magic and
+//              extracts a bounded UTF-8 text layer via pdftotext. The returned
+//              text + instruction prepend the prompt `message` like a code
+//              attachment. Failures (missing poppler, encrypted/scanned,
+//              timeout) surface as an error-state chip.
 //  * code   -> the file's UTF-8 text, sent as part of the prompt `message` as a
 //              filename header + language-fenced code block. Reuses the
 //              existing text wire (no new RPC field).
 //
-// REJECTED at intake with a visible, specific reason: PDFs (no content wire and
-//  no Web-side text extraction — the old `[Attached PDF: name, size]` note was
-//  misleading: it sent only a filename, not content), other binaries, and
-//  files that fail UTF-8 validation.
+// REJECTED at intake with a visible, specific reason: other binaries, and
+//  files that fail UTF-8 validation. PDFs are no longer rejected at classify.
 //
 // LIMITS are derived from the backend Web control-plane WebSocket frame cap
 // (crates/pi-cli/src/modes/rpc.rs: `MAX_RPC_MESSAGE_BYTES = 4 MiB`): the entire
-// `prompt` command JSON — message text (incl. code fences) + every image's
-// base64 + the envelope — must fit one frame. We track a combined WIRE
-// footprint: image base64 (ceil(raw/3)*4, ~4/3 inflation) + code text bytes +
-// extracted video frame base64 (the backend bounds one video's frames to
-// ~2.7 MiB base64; the settle-time and submit-time checks enforce the
-// aggregate), and cap it conservatively below the frame so the user's own
-// typed text + envelope still fit. The backend still rejects an oversized
+// `prompt` command JSON — message text (incl. code fences + extracted PDF
+// text) + every image's base64 + the envelope — must fit one frame. We track
+// a combined WIRE footprint: image base64 + code text bytes + extracted video
+// frame base64 + extracted PDF text. The backend still rejects an oversized
 // frame with PAYLOAD_TOO_LARGE as the hard backstop.
 
 import { nextId } from './transcript';
+import { withResolvers } from './withResolvers';
 
 /** Mirrors `MAX_RPC_MESSAGE_BYTES` (crates/pi-cli/src/modes/rpc.rs). The whole
  *  prompt command frame must fit under this — the derivation anchor for the
@@ -60,10 +59,33 @@ const WIRE_RESERVE = 1 * 1024 * 1024;
  *  text). Conservative under the 4 MiB frame (frame minus the reserve above). */
 export const MAX_TOTAL_WIRE_BYTES = MAX_PROMPT_FRAME_BYTES - WIRE_RESERVE;
 
-/** Per-file raw-byte cap. Applies to both image raw bytes and code text length:
- *  2 MiB raw image -> ~2.67 MiB base64 (fits the frame); 2 MiB of code text is
- *  already far beyond a sane single-file send. */
+/** Per-code-file raw-byte cap. Image preprocessing has its own explicit output
+ *  cap below, kept equal today so existing aggregate/frame math is unchanged. */
 export const MAX_FILE_BYTES = 2 * 1024 * 1024;
+
+/** Maximum processed JPEG bytes placed on the attachment wire. */
+export const MAX_PROCESSED_IMAGE_BYTES = 2 * 1024 * 1024;
+
+/** Raw camera-photo input cap, aligned with the native image pipeline. */
+export const MAX_IMAGE_INPUT_BYTES = 20 * 1024 * 1024;
+
+/** Decoded-image safety bound: 16 Mi pixels under the native pipeline's
+ *  128 MiB decoded-memory allowance. */
+export const MAX_IMAGE_PIXELS = 16 * 1024 * 1024;
+
+/** Longest processed-image edge, aligned with the native image pipeline. */
+export const MAX_IMAGE_DIMENSION = 2_000;
+/** Maximum generated JPEG header prefix re-read for output verification. Input
+ * JPEGs are scanned segment-by-segment without materializing metadata bodies. */
+export const MAX_IMAGE_HEADER_BYTES = 256 * 1024;
+
+/** CPU bound for hostile JPEGs made from millions of tiny marker segments. */
+const MAX_JPEG_MARKERS = 4_096;
+const MAX_JPEG_MARKER_FILL_BYTES = 64;
+
+/** Browser image-decode deadline. A corrupt decoder input must release its
+ *  object URL and the serialized decode slot instead of wedging later files. */
+export const IMAGE_DECODE_TIMEOUT_MS = 15_000;
 
 /** Modest sanity cap on attachment count (the wire budget is the real bound;
  *  this keeps a pathological many-tiny-file batch off the wire). */
@@ -110,6 +132,9 @@ export const MAX_VIDEO_INSTRUCTION_BYTES = 2048;
 /** Defensive cap on the backend's error string (path-scrubbed there; bounded
  *  here again so a hostile body can never flood the chip/toast). */
 const MAX_VIDEO_ERROR_CHARS = 300;
+/** Maximum JSON response bytes read from the video upload endpoint before
+ * parsing. Covers the bounded frame payload plus metadata/error headroom. */
+export const MAX_VIDEO_RESPONSE_BYTES = MAX_VIDEO_FRAMES_BASE64 + 64 * 1024;
 
 /** Authenticated backend upload endpoint (same listener as the WebSocket). */
 export const VIDEO_UPLOAD_PATH = '/upload/video';
@@ -118,6 +143,30 @@ export const VIDEO_UPLOAD_PATH = '/upload/video';
  *  extract 60 s + transport slack). The fetch is aborted past this and
  *  surfaces an actionable timeout on the chip. */
 export const VIDEO_UPLOAD_TIMEOUT_MS = 90_000;
+
+/* ---------------- PDF upload limits (mirror the backend) ---------------- */
+
+/** Raw-byte cap for a PDF upload, mirroring the backend's 32 MiB 413 bound
+ *  (crates/pi-cli/src/pdf_extract.rs). Raw PDF bytes NEVER ride the prompt
+ *  frame — only the extracted UTF-8 text does. */
+export const MAX_PDF_BYTES = 32 * 1024 * 1024;
+
+/** Extracted UTF-8 text cap that rides the prompt `message`. */
+export const MAX_PDF_TEXT_BYTES = 2 * 1024 * 1024;
+
+/** Defensive cap on the backend-generated PDF instruction. */
+export const MAX_PDF_INSTRUCTION_BYTES = 2048;
+
+/** Maximum JSON response bytes read from the PDF upload endpoint.
+ *  Backend caps decoded UTF-8 text at MAX_PDF_TEXT_BYTES; JSON can expand
+ *  each byte to a 6-byte `\uXXXX` escape, plus bounded metadata. */
+export const MAX_PDF_RESPONSE_BYTES = MAX_PDF_TEXT_BYTES * 6 + 256 * 1024;
+
+/** Authenticated backend PDF upload endpoint. */
+export const PDF_UPLOAD_PATH = '/upload/pdf';
+
+/** Bounded upload+extract round-trip budget (backend 30 s + transport slack). */
+export const PDF_UPLOAD_TIMEOUT_MS = 45_000;
 
 /** Max length of a sanitized filename in the `File:` header. */
 const MAX_FILENAME_LEN = 128;
@@ -139,14 +188,14 @@ const MAX_LANG_LEN = 14;
  *  backstop. */
 const CODE_WIRE_OVERHEAD = 6 + 3 * MAX_FILENAME_LEN + 3 + 2 * 3 + MAX_LANG_LEN;
 
-export type AttachmentKind = 'image' | 'video' | 'code';
+export type AttachmentKind = 'image' | 'video' | 'code' | 'pdf';
 
-/** Video attachment lifecycle. `uploading` = the POST /upload/video round-trip
- *  (upload + container validation + ffmpeg probe + frame extraction) is in
- *  flight; `ready` = frames are available and the video can be submitted;
- *  `error` = the backend rejected or failed to process the video (the chip
- *  shows `videoError`; submit is blocked until the chip is removed). */
+/** Video/PDF attachment lifecycle. `uploading` = the POST /upload/{video,pdf}
+ *  round-trip is in flight; `ready` = extracted payload is available and the
+ *  attachment can be submitted; `error` = the backend rejected or failed to
+ *  process it (the chip shows the error; submit is blocked until removed). */
 export type VideoAttachmentState = 'uploading' | 'ready' | 'error';
+
 
 /** One extracted frame from the backend's video preprocessing response
  *  (`crates/pi-cli/src/modes/video_upload.rs`). `data` is raw base64 JPEG
@@ -169,6 +218,9 @@ export interface VideoUploadFrame {
  *    The frames ride the prompt `images` array and the instruction prepends
  *    the prompt `message`. `previewUrl` is a data URL of the FIRST frame for
  *    the chip thumbnail. `videoState`/`videoError` drive the chip lifecycle.
+ *  - pdf: raw bytes never ride the prompt frame; the backend returns
+ *    extracted UTF-8 `text` + `instruction`. Both prepend the prompt
+ *    `message`. `videoState`/`videoError` drive the same chip lifecycle.
  *  - code:  `text` (validated UTF-8) + `language` (fence language hint); sent as
  *    a filename + fenced block inside the prompt `message`. */
 export interface ComposerAttachment {
@@ -181,11 +233,11 @@ export interface ComposerAttachment {
   previewUrl?: string;
   text?: string;
   language?: string;
-  /** Video only: lifecycle state (see VideoAttachmentState). */
+  /** Video/PDF: lifecycle state (see VideoAttachmentState). */
   videoState?: VideoAttachmentState;
-  /** Video only: actionable, bounded, path-scrubbed failure reason. */
+  /** Video/PDF: actionable, bounded, path-scrubbed failure reason. */
   videoError?: string;
-  /** Video only: opaque backend attachment id (keying/dedupe only). */
+  /** Video/PDF: opaque backend attachment id (keying/dedupe only). */
   attachmentId?: string;
   /** Video only: detected container (mkv|mp4|webm|mov|avi|ogg). */
   container?: string;
@@ -193,7 +245,7 @@ export interface ComposerAttachment {
   durationSeconds?: number;
   /** Video only: extracted chronological JPEG frames. */
   frames?: VideoUploadFrame[];
-  /** Video only: bounded chronological-frame instruction from the backend. */
+  /** Video/PDF: bounded instruction from the backend. */
   instruction?: string;
 }
 
@@ -208,13 +260,17 @@ export interface ImageContentBlock {
 }
 
 export type AttachSkipReason =
-  | 'unsupported' // not an image, video, or recognized text/code file (PDFs, binaries)
-  | 'oversize' // image/code exceeds MAX_FILE_BYTES
+  | 'unsupported' // not an image, video, PDF, or recognized text/code file
+  | 'oversize' // code exceeds MAX_FILE_BYTES
+  | 'image-oversize' // image input exceeds MAX_IMAGE_INPUT_BYTES
+  | 'image-processing' // image could not be decoded/resized safely under the output cap
   | 'video-oversize' // video exceeds MAX_VIDEO_BYTES (upload cap)
+  | 'pdf-oversize' // PDF exceeds MAX_PDF_BYTES (upload cap)
   | 'too-many' // exceeds MAX_ATTACHMENTS
   | 'over-budget' // would exceed MAX_TOTAL_WIRE_BYTES
   | 'invalid-utf8' // late: code file failed UTF-8 validation (binary garbage)
   | 'unreadable'; // late: FileReader error
+
 
 export interface AttachSkip {
   name: string;
@@ -238,6 +294,8 @@ export interface AttachPlan {
 export interface ClassifyOptions {
   maxFileBytes?: number;
   maxVideoBytes?: number;
+  maxPdfBytes?: number;
+  maxImageInputBytes?: number;
   maxTotalWireBytes?: number;
   maxCount?: number;
   /** Already-queued attachment count (intake while composing). */
@@ -253,23 +311,22 @@ export interface ReadResult {
   skip?: AttachSkip;
 }
 
-/** base64 length of `rawBytes` raw bytes, per RFC 4648 (4/3, padded).
- *  Deterministic and allocation-free; used to estimate an image's wire footprint
- *  before it is read. */
+/** base64 length of `rawBytes` raw bytes, per RFC 4648 (4/3, padded). */
 export function base64Length(rawBytes: number): number {
   if (rawBytes <= 0) return 0;
   return Math.ceil(rawBytes / 3) * 4;
 }
 
-/** Estimated wire footprint of one attachment of `kind` with `size` raw bytes,
- *  used by the aggregate budget check at intake (before reading). A video
- *  reserves ZERO wire here: raw video bytes never ride the prompt frame, and
- *  the extracted frames' footprint is unknown until the backend returns them —
- *  it is added exactly when the upload settles (and the settle-time check
- *  enforces the aggregate cap then). */
-export function wireFootprint(kind: AttachmentKind, size: number): number {
-  if (kind === 'image') return base64Length(size);
-  if (kind === 'video') return 0;
+/** Intake estimate. Images larger than the processed cap reserve that cap;
+ * smaller images reserve their current encoding and are rechecked exactly
+ * after dimension-triggered normalization completes. */
+export function wireFootprint(
+  kind: AttachmentKind,
+  size: number,
+  maxImageOutputBytes = MAX_PROCESSED_IMAGE_BYTES,
+): number {
+  if (kind === 'image') return base64Length(Math.min(size, maxImageOutputBytes));
+  if (kind === 'video' || kind === 'pdf') return 0;
   return size + CODE_WIRE_OVERHEAD;
 }
 
@@ -300,7 +357,7 @@ const TEXT_EXTENSIONS = new Set([
   'c', 'cc', 'cpp', 'cxx', 'h', 'hh', 'hpp', 'hxx', 'cs', 'rb', 'php', 'swift',
   'scala', 'clj', 'cljs', 'ex', 'exs', 'erl', 'hs', 'ml', 'fs', 'fsx', 'lua',
   'pl', 'pm', 'r', 'dart', 'groovy', 'gradle', 'jl', 'nim', 'cr', 'zig', 'v',
-  'sv', 'elm', 'purs', 'sql', 'sh', 'bash', 'zsh', 'fish', 'ps1', 'bat', 'cmd',
+  'sv', 'sol', 'elm', 'purs', 'sql', 'sh', 'bash', 'zsh', 'fish', 'ps1', 'bat', 'cmd',
   'html', 'htm', 'css', 'scss', 'sass', 'less', 'xml', 'svg', 'vue', 'svelte',
   'astro', 'json', 'json5', 'jsonc', 'yaml', 'yml', 'toml', 'ini', 'cfg', 'conf',
   'env', 'properties', 'gitignore', 'editorconfig', 'lock', 'log', 'csv', 'tsv',
@@ -356,6 +413,7 @@ export function codeLanguage(name: string): string {
     case 'zig': return 'zig';
     case 'v': return 'verilog';
     case 'sv': return 'systemverilog';
+    case 'sol': return 'solidity';
     case 'elm': return 'elm';
     case 'purs': return 'purescript';
     case 'sql': return 'sql';
@@ -483,14 +541,21 @@ export function isVideoFile(file: { type: string; name: string }): boolean {
   return videoContainerOf(file.name) !== null;
 }
 
-/** Classify the kind of a file (image / video / code / null=unsupported).
- *  Image wins over video (no overlap); video wins over text so a video
- *  container name is never misread as code — the backend is the authority on
- *  actual content, and a non-video file named `*.mkv` fails there with an
- *  actionable error chip instead of a misleading code attachment. */
+/** True if `file` is a PDF the backend upload endpoint can process. The
+ *  `.pdf` extension is required — matching the backend `sanitize_pdf_name`
+ *  gate — so a browser `application/pdf` MIME on a non-.pdf name cannot
+ *  broaden intake past what the upload accepts. */
+export function isPdfFile(file: { type: string; name: string }): boolean {
+  return extOf(file.name) === 'pdf';
+}
+
+/** Classify the kind of a file (image / video / pdf / code / null=unsupported).
+ *  Image wins over video (no overlap); video wins over PDF; PDF wins over
+ *  text so a `.pdf` name is never misread as code. */
 export function classifyKind(file: { type: string; name: string }): AttachmentKind | null {
   if (isImageFile(file)) return 'image';
   if (isVideoFile(file)) return 'video';
+  if (isPdfFile(file)) return 'pdf';
   if (isTextFile(file)) return 'code';
   return null;
 }
@@ -504,7 +569,9 @@ export function classifyAttachments(
   opts: ClassifyOptions = {},
 ): AttachPlan {
   const maxFileBytes = opts.maxFileBytes ?? MAX_FILE_BYTES;
+  const maxImageInputBytes = opts.maxImageInputBytes ?? MAX_IMAGE_INPUT_BYTES;
   const maxVideoBytes = opts.maxVideoBytes ?? MAX_VIDEO_BYTES;
+  const maxPdfBytes = opts.maxPdfBytes ?? MAX_PDF_BYTES;
   const maxTotalWireBytes = opts.maxTotalWireBytes ?? MAX_TOTAL_WIRE_BYTES;
   const maxCount = opts.maxCount ?? MAX_ATTACHMENTS;
   let count = opts.currentCount ?? 0;
@@ -518,23 +585,29 @@ export function classifyAttachments(
       skipped.push({ name: file.name, size: file.size, type: file.type, reason: 'unsupported' });
       continue;
     }
-    // Kind-specific raw-byte cap: the 2 MiB image/code bound vs the 64 MiB
-    // video upload bound (raw video never rides the prompt wire).
-    const sizeCap = kind === 'video' ? maxVideoBytes : maxFileBytes;
+    const sizeCap = kind === 'video'
+      ? maxVideoBytes
+      : kind === 'pdf'
+        ? maxPdfBytes
+        : kind === 'image'
+          ? maxImageInputBytes
+          : maxFileBytes;
     if (file.size > sizeCap) {
-      skipped.push({
-        name: file.name,
-        size: file.size,
-        type: file.type,
-        reason: kind === 'video' ? 'video-oversize' : 'oversize',
-      });
+      const reason = kind === 'video'
+        ? 'video-oversize'
+        : kind === 'pdf'
+          ? 'pdf-oversize'
+          : kind === 'image'
+            ? 'image-oversize'
+            : 'oversize';
+      skipped.push({ name: file.name, size: file.size, type: file.type, reason });
       continue;
     }
     if (count >= maxCount) {
       skipped.push({ name: file.name, size: file.size, type: file.type, reason: 'too-many' });
       continue;
     }
-    const next = budget + wireFootprint(kind, file.size);
+    const next = budget + wireFootprint(kind, file.size, maxFileBytes);
     if (next > maxTotalWireBytes) {
       skipped.push({ name: file.name, size: file.size, type: file.type, reason: 'over-budget' });
       continue;
@@ -544,6 +617,24 @@ export function classifyAttachments(
     accepted.push({ file: file as File, kind });
   }
   return { accepted, skipped };
+}
+
+export function classifyImageAttachments(
+  files: readonly { type: string; name: string; size: number }[],
+  opts: ClassifyOptions = {},
+): AttachPlan {
+  const images: { type: string; name: string; size: number }[] = [];
+  const skipped: AttachSkip[] = [];
+  for (const file of files) {
+    if (isImageFile(file)) {
+      images.push(file);
+      continue;
+    }
+    skipped.push({ name: file.name, size: file.size, type: file.type, reason: 'unsupported' });
+  }
+  const plan = classifyAttachments(images, opts);
+  if (skipped.length === 0) return plan;
+  return { accepted: plan.accepted, skipped: [...skipped, ...plan.skipped] };
 }
 
 /** Validate bytes as UTF-8. Returns `{ok,text}` for valid UTF-8, else
@@ -629,6 +720,30 @@ export function buildVideoMessage(attachments: readonly ComposerAttachment[]): s
     .join('\n\n');
 }
 
+/** Bounded marker + extracted text for ONE ready PDF attachment. Empty when
+ *  the PDF has no extracted text (defensive). Uploading/error PDFs contribute
+ *  nothing (submit blocks on them before this can matter). */
+export function pdfMarkerText(a: ComposerAttachment): string {
+  const text = a.text?.trim() ?? '';
+  if (text === '') return '';
+  const instruction = a.instruction?.trim() ?? '';
+  const header = instruction !== '' && utf8ByteLength(instruction) <= MAX_PDF_INSTRUCTION_BYTES
+    ? instruction
+    : `[PDF attachment: ${sanitizeFileName(a.name)} — extracted text layer; analyze the following as the document contents.]`;
+  return `${header}\n${text}`;
+}
+
+/** Build the prompt `message` contribution of all READY PDF attachments, in
+ *  queue order, separated by blank lines. Pure. */
+export function buildPdfMessage(attachments: readonly ComposerAttachment[]): string {
+  return attachments
+    .filter((a) => a.kind === 'pdf' && a.videoState === 'ready')
+    .map(pdfMarkerText)
+    .filter((m) => m !== '')
+    .join('\n\n');
+}
+
+
 /** Short chip meta line for a ready video: "6 frames · 12.3 s" (or just the
  *  frame count when the duration is unknown). Pure + testable. */
 export function videoMetaLabel(a: ComposerAttachment): string {
@@ -661,31 +776,500 @@ export async function readAttachmentsInOrder<TFile, T>(
   return Promise.all(files.map((file, index) => read(file, index)));
 }
 
-/** Read one image file into a composer attachment via FileReader. Browser-only
- *  (FileReader); the pure ordering/classification logic is tested separately. */
-export function buildImageAttachment(file: File): Promise<ReadResult> {
-  return new Promise((resolve) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const dataUrl = typeof reader.result === 'string' ? reader.result : '';
-      const comma = dataUrl.indexOf(',');
-      const dataBase64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
-      resolve({
-        attachment: {
-          id: nextId('a'),
-          name: file.name,
-          size: file.size,
-          mimeType: imageMimeType(file),
-          kind: 'image',
-          dataBase64,
-          previewUrl: dataUrl,
-        },
-      });
-    };
-    reader.onerror = () =>
-      resolve({ skip: { name: file.name, size: file.size, type: file.type, reason: 'unreadable' } });
-    reader.readAsDataURL(file);
-  });
+const IMAGE_JPEG_QUALITIES = [0.8, 0.85, 0.7, 0.55, 0.4] as const;
+const IMAGE_RESIZE_FACTOR = 0.75;
+const MAX_IMAGE_RESIZE_PASSES = 8;
+let imagePreprocessQueue: Promise<void> = Promise.resolve();
+
+function imageSkip(
+  file: File,
+  reason: 'image-oversize' | 'image-processing' | 'unreadable',
+): ReadResult {
+  return { skip: { name: file.name, size: file.size, type: file.type, reason } };
+}
+
+function readBlobAsDataUrl(blob: Blob): Promise<string | null> {
+  const { promise, resolve } = withResolvers<string | null>();
+  const reader = new FileReader();
+  reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : null);
+  reader.onerror = () => resolve(null);
+  reader.readAsDataURL(blob);
+  return promise;
+}
+
+async function loadImage(file: File): Promise<{ image: HTMLImageElement; objectUrl: string } | null> {
+  const objectUrl = URL.createObjectURL(file);
+  const image = new Image();
+  image.decoding = 'async';
+  image.src = objectUrl;
+  const timeoutGate = withResolvers<never>();
+  const timeout = window.setTimeout(
+    () => timeoutGate.reject(new Error('image decode timed out')),
+    IMAGE_DECODE_TIMEOUT_MS,
+  );
+  try {
+    await Promise.race([image.decode(), timeoutGate.promise]);
+    if (image.naturalWidth <= 0 || image.naturalHeight <= 0) throw new Error('image has no dimensions');
+    return { image, objectUrl };
+  } catch {
+    image.src = '';
+    URL.revokeObjectURL(objectUrl);
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function encodeJpeg(canvas: HTMLCanvasElement, quality: number): Promise<Blob | null> {
+  const { promise, resolve } = withResolvers<Blob | null>();
+  canvas.toBlob(resolve, 'image/jpeg', quality);
+  return promise;
+}
+
+type ImageDimensions = { width: number; height: number };
+
+function isJpegStartOfFrame(marker: number): boolean {
+  return (
+    (marker >= 0xc0 && marker <= 0xc3) ||
+    (marker >= 0xc5 && marker <= 0xc7) ||
+    (marker >= 0xc9 && marker <= 0xcb) ||
+    (marker >= 0xcd && marker <= 0xcf)
+  );
+}
+
+function jpegDimensions(bytes: Uint8Array): ImageDimensions | null {
+  if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return null;
+  let offset = 2;
+  let markers = 0;
+  while (offset + 1 < bytes.length && markers < MAX_JPEG_MARKERS) {
+    if (bytes[offset] !== 0xff) return null;
+    let fillBytes = 0;
+    while (offset < bytes.length && bytes[offset] === 0xff) {
+      offset += 1;
+      fillBytes += 1;
+      if (fillBytes > MAX_JPEG_MARKER_FILL_BYTES) return null;
+    }
+    if (offset >= bytes.length) return null;
+    const marker = bytes[offset]!;
+    offset += 1;
+    markers += 1;
+    if (marker === 0xd9 || marker === 0xda || marker === 0x00) return null;
+    if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+    if (offset + 1 >= bytes.length) return null;
+    const segmentLength = (bytes[offset]! << 8) | bytes[offset + 1]!;
+    if (segmentLength < 2 || offset + segmentLength > bytes.length) return null;
+    if (isJpegStartOfFrame(marker)) {
+      if (segmentLength < 7) return null;
+      const height = (bytes[offset + 3]! << 8) | bytes[offset + 4]!;
+      const width = (bytes[offset + 5]! << 8) | bytes[offset + 6]!;
+      return width > 0 && height > 0 ? { width, height } : null;
+    }
+    offset += segmentLength;
+  }
+  return null;
+}
+
+async function jpegDimensionsFromBlob(blob: Blob): Promise<ImageDimensions | null> {
+  const read = async (offset: number, length: number): Promise<Uint8Array> =>
+    new Uint8Array(await blob.slice(offset, Math.min(blob.size, offset + length)).arrayBuffer());
+  const signature = await read(0, 2);
+  if (signature.length !== 2 || signature[0] !== 0xff || signature[1] !== 0xd8) return null;
+
+  let offset = 2;
+  for (let markers = 0; markers < MAX_JPEG_MARKERS && offset < blob.size; markers += 1) {
+    const markerBytes = await read(offset, MAX_JPEG_MARKER_FILL_BYTES + 2);
+    if (markerBytes.length < 2 || markerBytes[0] !== 0xff) return null;
+    let markerOffset = 0;
+    while (markerOffset < markerBytes.length && markerBytes[markerOffset] === 0xff) {
+      markerOffset += 1;
+      if (markerOffset > MAX_JPEG_MARKER_FILL_BYTES) return null;
+    }
+    if (markerOffset >= markerBytes.length) return null;
+    const marker = markerBytes[markerOffset]!;
+    offset += markerOffset + 1;
+    if (marker === 0xd9 || marker === 0xda || marker === 0x00) return null;
+    if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+
+    const segmentHeader = await read(offset, isJpegStartOfFrame(marker) ? 7 : 2);
+    if (segmentHeader.length < 2) return null;
+    const segmentLength = (segmentHeader[0]! << 8) | segmentHeader[1]!;
+    if (segmentLength < 2 || offset + segmentLength > blob.size) return null;
+    if (isJpegStartOfFrame(marker)) {
+      if (segmentLength < 7 || segmentHeader.length < 7) return null;
+      const height = (segmentHeader[3]! << 8) | segmentHeader[4]!;
+      const width = (segmentHeader[5]! << 8) | segmentHeader[6]!;
+      return width > 0 && height > 0 ? { width, height } : null;
+    }
+    offset += segmentLength;
+  }
+  return null;
+}
+
+function pngDimensions(bytes: Uint8Array): ImageDimensions | null {
+  const signature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+  if (bytes.length < 24 || signature.some((value, index) => bytes[index] !== value)) return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (
+    view.getUint32(8) !== 13 ||
+    bytes[12] !== 0x49 ||
+    bytes[13] !== 0x48 ||
+    bytes[14] !== 0x44 ||
+    bytes[15] !== 0x52
+  ) return null;
+  const width = view.getUint32(16);
+  const height = view.getUint32(20);
+  return width > 0 && height > 0 ? { width, height } : null;
+}
+
+function skipGifSubBlocks(bytes: Uint8Array, start: number): number | null {
+  let offset = start;
+  while (offset < bytes.length) {
+    const blockSize = bytes[offset]!;
+    offset += 1;
+    if (blockSize === 0) return offset;
+    if (offset + blockSize > bytes.length) return null;
+    offset += blockSize;
+  }
+  return null;
+}
+
+function gifDimensions(bytes: Uint8Array): ImageDimensions | null {
+  if (bytes.length < 13) return null;
+  const signature = String.fromCharCode(...bytes.subarray(0, 6));
+  if (signature !== 'GIF87a' && signature !== 'GIF89a') return null;
+  const width = bytes[6]! | (bytes[7]! << 8);
+  const height = bytes[8]! | (bytes[9]! << 8);
+  if (width === 0 || height === 0) return null;
+  let offset = 13;
+  if ((bytes[10]! & 0x80) !== 0) offset += 3 * (1 << ((bytes[10]! & 0x07) + 1));
+  if (offset > bytes.length) return null;
+
+  let frames = 0;
+  while (offset < bytes.length) {
+    const introducer = bytes[offset]!;
+    offset += 1;
+    if (introducer === 0x3b) return frames === 1 ? { width, height } : null;
+    if (introducer === 0x21) {
+      if (offset >= bytes.length) return null;
+      offset += 1;
+      const next = skipGifSubBlocks(bytes, offset);
+      if (next === null) return null;
+      offset = next;
+      continue;
+    }
+    if (introducer !== 0x2c || offset + 9 > bytes.length) return null;
+    const left = bytes[offset]! | (bytes[offset + 1]! << 8);
+    const top = bytes[offset + 2]! | (bytes[offset + 3]! << 8);
+    const frameWidth = bytes[offset + 4]! | (bytes[offset + 5]! << 8);
+    const frameHeight = bytes[offset + 6]! | (bytes[offset + 7]! << 8);
+    const packed = bytes[offset + 8]!;
+    if (
+      frameWidth === 0 ||
+      frameHeight === 0 ||
+      left + frameWidth > width ||
+      top + frameHeight > height
+    ) return null;
+    frames += 1;
+    if (frames > 1) return null;
+    offset += 9;
+    if ((packed & 0x80) !== 0) offset += 3 * (1 << ((packed & 0x07) + 1));
+    if (offset >= bytes.length) return null;
+    offset += 1;
+    const next = skipGifSubBlocks(bytes, offset);
+    if (next === null) return null;
+    offset = next;
+  }
+  return null;
+}
+
+function readUint24Le(bytes: Uint8Array, offset: number): number {
+  return bytes[offset]! | (bytes[offset + 1]! << 8) | (bytes[offset + 2]! << 16);
+}
+
+function webpDimensions(bytes: Uint8Array): ImageDimensions | null {
+  if (
+    bytes.length < 20 ||
+    String.fromCharCode(...bytes.subarray(0, 4)) !== 'RIFF' ||
+    String.fromCharCode(...bytes.subarray(8, 12)) !== 'WEBP'
+  ) return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (view.getUint32(4, true) + 8 !== bytes.length) return null;
+  let offset = 12;
+  let dimensions: ImageDimensions | null = null;
+  let hasImagePayload = false;
+  while (offset + 8 <= bytes.length) {
+    const chunkType = String.fromCharCode(...bytes.subarray(offset, offset + 4));
+    const chunkSize = view.getUint32(offset + 4, true);
+    const payload = offset + 8;
+    const end = payload + chunkSize;
+    if (end > bytes.length) return null;
+    if (chunkType === 'ANIM' || chunkType === 'ANMF') return null;
+    if (chunkType === 'VP8X') {
+      if (chunkSize < 10 || (bytes[payload]! & 0x02) !== 0) return null;
+      dimensions = {
+        width: readUint24Le(bytes, payload + 4) + 1,
+        height: readUint24Le(bytes, payload + 7) + 1,
+      };
+    } else if (chunkType === 'VP8 ') {
+      if (
+        hasImagePayload ||
+        chunkSize < 10 ||
+        bytes[payload + 3] !== 0x9d ||
+        bytes[payload + 4] !== 0x01 ||
+        bytes[payload + 5] !== 0x2a
+      ) return null;
+      const frameDimensions = {
+        width: (bytes[payload + 6]! | (bytes[payload + 7]! << 8)) & 0x3fff,
+        height: (bytes[payload + 8]! | (bytes[payload + 9]! << 8)) & 0x3fff,
+      };
+      if (
+        frameDimensions.width === 0 ||
+        frameDimensions.height === 0 ||
+        (dimensions !== null &&
+          (dimensions.width !== frameDimensions.width || dimensions.height !== frameDimensions.height))
+      ) return null;
+      dimensions = frameDimensions;
+      hasImagePayload = true;
+    } else if (chunkType === 'VP8L') {
+      if (hasImagePayload || chunkSize < 5 || bytes[payload] !== 0x2f) return null;
+      const frameDimensions = {
+        width: 1 + bytes[payload + 1]! + ((bytes[payload + 2]! & 0x3f) << 8),
+        height: 1 + (bytes[payload + 2]! >> 6) + (bytes[payload + 3]! << 2) + ((bytes[payload + 4]! & 0x0f) << 10),
+      };
+      if (
+        dimensions !== null &&
+        (dimensions.width !== frameDimensions.width || dimensions.height !== frameDimensions.height)
+      ) return null;
+      dimensions = frameDimensions;
+      hasImagePayload = true;
+    }
+    offset = end + (chunkSize & 1);
+  }
+  return offset === bytes.length && hasImagePayload ? dimensions : null;
+}
+
+export type ImageHeaderDecision =
+  | { action: 'pass-through'; dimensions: ImageDimensions }
+  | { action: 'preprocess'; dimensions: ImageDimensions }
+  | { action: 'reject' };
+
+export function imageHeaderDimensions(bytes: Uint8Array, mimeType: string): ImageDimensions | null {
+  if (mimeType === 'image/jpeg') return jpegDimensions(bytes);
+  if (mimeType === 'image/png') return pngDimensions(bytes);
+  if (mimeType === 'image/gif') return gifDimensions(bytes);
+  if (mimeType === 'image/webp') return webpDimensions(bytes);
+  return null;
+}
+
+export function boundedImageDimensions(width: number, height: number): ImageDimensions {
+  const scale = Math.min(1, MAX_IMAGE_DIMENSION / width, MAX_IMAGE_DIMENSION / height);
+  return {
+    width: Math.max(1, Math.round(width * scale)),
+    height: Math.max(1, Math.round(height * scale)),
+  };
+}
+
+export function imageDimensionsAreSafe(width: number, height: number): boolean {
+  const pixels = width * height;
+  return width > 0 && height > 0 && Number.isSafeInteger(pixels) && pixels <= MAX_IMAGE_PIXELS;
+}
+
+export function imageHeaderDecision(bytes: Uint8Array, mimeType: string, rawBytes: number): ImageHeaderDecision {
+  const dimensions = imageHeaderDimensions(bytes, mimeType);
+  if (!dimensions || !imageDimensionsAreSafe(dimensions.width, dimensions.height)) return { action: 'reject' };
+  if (mimeType === 'image/gif' || mimeType === 'image/webp') {
+    return rawBytes <= MAX_FILE_BYTES ? { action: 'pass-through', dimensions } : { action: 'reject' };
+  }
+  if (rawBytes > MAX_FILE_BYTES || Math.max(dimensions.width, dimensions.height) > MAX_IMAGE_DIMENSION) {
+    return { action: 'preprocess', dimensions };
+  }
+  return { action: 'pass-through', dimensions };
+}
+
+export async function readImageHeaderDecision(blob: Blob, mimeType: string): Promise<ImageHeaderDecision> {
+  if (mimeType === 'image/jpeg') {
+    const dimensions = await jpegDimensionsFromBlob(blob);
+    if (!dimensions || !imageDimensionsAreSafe(dimensions.width, dimensions.height)) return { action: 'reject' };
+    if (blob.size > MAX_FILE_BYTES || Math.max(dimensions.width, dimensions.height) > MAX_IMAGE_DIMENSION) {
+      return { action: 'preprocess', dimensions };
+    }
+    return { action: 'pass-through', dimensions };
+  }
+  const bytesToRead = mimeType === 'image/png' ? 24 : Math.min(blob.size, MAX_FILE_BYTES);
+  const bytes = new Uint8Array(await blob.slice(0, bytesToRead).arrayBuffer());
+  return imageHeaderDecision(bytes, mimeType, blob.size);
+}
+
+async function preprocessImage(
+  file: File,
+  headerDimensions: { width: number; height: number },
+): Promise<ReadResult> {
+
+  const loaded = await loadImage(file);
+  if (!loaded) return imageSkip(file, 'image-processing');
+
+  const { image, objectUrl } = loaded;
+  let canvas: HTMLCanvasElement | null = null;
+  try {
+    const originalWidth = image.naturalWidth;
+    const originalHeight = image.naturalHeight;
+    // Browsers apply native EXIF orientation. Accept either the header's
+    // direct dimensions or their swapped orientation; reject every other
+    // decode/header disagreement.
+    const matchesHeader =
+      (originalWidth === headerDimensions.width && originalHeight === headerDimensions.height) ||
+      (originalWidth === headerDimensions.height && originalHeight === headerDimensions.width);
+    if (!matchesHeader || !imageDimensionsAreSafe(originalWidth, originalHeight)) {
+      return imageSkip(file, 'image-processing');
+    }
+
+    canvas = document.createElement('canvas');
+    const context = canvas.getContext('2d');
+    if (!context) return imageSkip(file, 'image-processing');
+
+    let { width, height } = boundedImageDimensions(originalWidth, originalHeight);
+    for (let pass = 0; pass < MAX_IMAGE_RESIZE_PASSES; pass += 1) {
+      // Setting either canvas dimension resets the entire 2D context state.
+      // Reapply smoothing after EVERY resize, before the draw.
+      canvas.width = width;
+      canvas.height = height;
+      context.imageSmoothingEnabled = true;
+      context.imageSmoothingQuality = 'high';
+      context.fillStyle = '#ffffff';
+      context.fillRect(0, 0, width, height);
+      context.drawImage(image, 0, 0, width, height);
+
+      for (const quality of IMAGE_JPEG_QUALITIES) {
+        const blob = await encodeJpeg(canvas, quality);
+        if (!blob || blob.type !== 'image/jpeg' || blob.size === 0 || blob.size > MAX_PROCESSED_IMAGE_BYTES) continue;
+        const dataUrl = await readBlobAsDataUrl(blob);
+        if (dataUrl === null) return imageSkip(file, 'unreadable');
+        const prefix = 'data:image/jpeg;base64,';
+        if (!dataUrl.startsWith(prefix)) continue;
+        const dataBase64 = dataUrl.slice(prefix.length);
+        if (dataBase64.length > base64Length(MAX_PROCESSED_IMAGE_BYTES)) continue;
+        let processedDimensions: ImageDimensions | null;
+        try {
+          processedDimensions = await jpegDimensionsFromBlob(blob);
+        } catch {
+          return imageSkip(file, 'unreadable');
+        }
+        if (
+          !processedDimensions ||
+          processedDimensions.width !== width ||
+          processedDimensions.height !== height ||
+          Math.max(processedDimensions.width, processedDimensions.height) > MAX_IMAGE_DIMENSION
+        ) continue;
+        return {
+          attachment: {
+            id: nextId('a'),
+            name: file.name,
+            size: blob.size,
+            mimeType: 'image/jpeg',
+            kind: 'image',
+            dataBase64,
+            previewUrl: dataUrl,
+          },
+        };
+      }
+
+      const nextWidth = Math.max(1, Math.floor(width * IMAGE_RESIZE_FACTOR));
+      const nextHeight = Math.max(1, Math.floor(height * IMAGE_RESIZE_FACTOR));
+      if (nextWidth === width && nextHeight === height) break;
+      width = nextWidth;
+      height = nextHeight;
+    }
+    return imageSkip(file, 'image-processing');
+  } catch {
+    return imageSkip(file, 'image-processing');
+  } finally {
+    image.src = '';
+    URL.revokeObjectURL(objectUrl);
+    if (canvas) {
+      canvas.width = 0;
+      canvas.height = 0;
+    }
+  }
+}
+
+async function validatePassThroughImage(
+  file: File,
+  headerDimensions: ImageDimensions,
+): Promise<boolean> {
+  const loaded = await loadImage(file);
+  if (!loaded) return false;
+  const { image, objectUrl } = loaded;
+  try {
+    const decodedDimensions = { width: image.naturalWidth, height: image.naturalHeight };
+    const matchesHeader =
+      (decodedDimensions.width === headerDimensions.width && decodedDimensions.height === headerDimensions.height) ||
+      (decodedDimensions.width === headerDimensions.height && decodedDimensions.height === headerDimensions.width);
+    return matchesHeader && imageDimensionsAreSafe(decodedDimensions.width, decodedDimensions.height);
+  } finally {
+    image.src = '';
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
+function enqueuePassThroughValidation(file: File, dimensions: ImageDimensions): Promise<boolean> {
+  const read = imagePreprocessQueue.then(() => validatePassThroughImage(file, dimensions));
+  imagePreprocessQueue = read.then(() => undefined, () => undefined);
+  return read;
+}
+
+function enqueueImagePreprocess(
+  file: File,
+  headerDimensions: { width: number; height: number },
+): Promise<ReadResult> {
+  const read = imagePreprocessQueue.then(() => preprocessImage(file, headerDimensions));
+  imagePreprocessQueue = read.then(() => undefined, () => undefined);
+  return read;
+}
+
+/** Build one image attachment. Every JPEG/PNG is header-validated before any
+ *  browser decode or wire pass-through. Valid images over 2 MiB or 2000px are
+ *  serialized through the dimension-bounded JPEG preprocessing queue; small
+ *  GIF/WebP pass through while large GIF/WebP fail closed. */
+export async function buildImageAttachment(file: File): Promise<ReadResult> {
+  if (file.size > MAX_IMAGE_INPUT_BYTES) return imageSkip(file, 'image-oversize');
+
+  const mimeType = imageMimeType(file);
+  let decision: ImageHeaderDecision;
+  try {
+    decision = await readImageHeaderDecision(file, mimeType);
+  } catch {
+    return imageSkip(file, 'unreadable');
+  }
+  if (decision.action === 'reject') return imageSkip(file, 'image-processing');
+  if (decision.action === 'preprocess') {
+    return enqueueImagePreprocess(file, decision.dimensions);
+  }
+
+  if (!(await enqueuePassThroughValidation(file, decision.dimensions))) {
+    return imageSkip(file, 'image-processing');
+  }
+
+  const { promise, resolve } = withResolvers<ReadResult>();
+  const reader = new FileReader();
+  reader.onload = () => {
+    const dataUrl = typeof reader.result === 'string' ? reader.result : '';
+    const comma = dataUrl.indexOf(',');
+    const dataBase64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
+    resolve({
+      attachment: {
+        id: nextId('a'),
+        name: file.name,
+        size: file.size,
+        mimeType,
+        kind: 'image',
+        dataBase64,
+        previewUrl: dataUrl,
+      },
+    });
+  };
+  reader.onerror = () => resolve(imageSkip(file, 'unreadable'));
+  reader.readAsDataURL(file);
+  return promise;
 }
 
 /** Read one code/text file: ArrayBuffer -> UTF-8 validate -> attachment. A
@@ -730,20 +1314,72 @@ export function readAccepted(entry: AcceptedFile): Promise<ReadResult> {
 
 /* ---------------- video upload client (POST /upload/video) ---------------- */
 
-/** Structural subset of `fetch`'s Response the upload client consumes —
- *  satisfied by the real Response and by Node-test fakes. */
+/** Structural subset of `fetch`'s Response consumed by the bounded reader. */
 export interface VideoUploadResponseLike {
   status: number;
   ok: boolean;
-  json(): Promise<unknown>;
+  headers?: { get(name: string): string | null };
+  body?: ReadableStream<Uint8Array> | null;
+  text?(): Promise<string>;
 }
 
-/** Structural subset of `fetch` the upload client needs. Injected so the
- *  Node tests can fake the transport (timeouts, non-JSON bodies, statuses). */
 export type VideoFetch = (
   url: string,
   init: { method: string; headers: Record<string, string>; body: Blob; signal: AbortSignal },
 ) => Promise<VideoUploadResponseLike>;
+
+async function boundedUploadResponseBody(
+  response: VideoUploadResponseLike,
+  maxBytes: number,
+): Promise<unknown> {
+  const contentLength = response.headers?.get('content-length');
+  if (contentLength !== null && contentLength !== undefined) {
+    const declaredBytes = Number(contentLength);
+    if (!Number.isSafeInteger(declaredBytes) || declaredBytes < 0 || declaredBytes > maxBytes) {
+      throw new Error('oversized upload response');
+    }
+  }
+
+  let text: string;
+  if (response.body) {
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let totalBytes = 0;
+    try {
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        totalBytes += chunk.value.byteLength;
+        if (totalBytes > maxBytes) {
+          await reader.cancel();
+          throw new Error('oversized upload response');
+        }
+        chunks.push(chunk.value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    const bytes = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    text = new TextDecoder().decode(bytes);
+  } else if (response.text) {
+    text = await response.text();
+    if (utf8ByteLength(text) > maxBytes) throw new Error('oversized upload response');
+  } else {
+    return null;
+  }
+  if (text === '') return null;
+  return JSON.parse(text);
+}
+
+async function boundedVideoResponseBody(response: VideoUploadResponseLike): Promise<unknown> {
+  return boundedUploadResponseBody(response, MAX_VIDEO_RESPONSE_BYTES);
+}
+
 
 export interface VideoUploadOptions {
   /** The listener authority the WebSocket uses (host[:port]); the upload goes
@@ -1013,10 +1649,10 @@ export async function uploadVideoFile(file: File, opts: VideoUploadOptions): Pro
     });
     let body: unknown = null;
     try {
-      body = await response.json();
+      body = await boundedVideoResponseBody(response);
     } catch {
-      // Non-JSON error body (proxies, plain-text 5xx): the status fallback
-      // below still yields an actionable message.
+      // Non-JSON and oversized responses use the status fallback without
+      // surfacing proxy content or allocating beyond the explicit cap.
     }
     const parsed = parseVideoUploadResponse(response.status, body);
     if (!parsed.ok) return { ok: false, status: response.status, message: parsed.message };
@@ -1036,6 +1672,142 @@ export async function uploadVideoFile(file: File, opts: VideoUploadOptions): Pro
     clearTimeout(timer);
   }
 }
+
+export function pdfUploadUrl(pageProtocol: string, hostAuthority: string): string {
+  const scheme = pageProtocol === 'https:' ? 'https://' : 'http://';
+  return `${scheme}${hostAuthority}${PDF_UPLOAD_PATH}`;
+}
+
+export interface PdfUploadData {
+  attachmentId: string;
+  name: string;
+  mimeType: string;
+  sizeBytes: number;
+  textBytes: number;
+  text: string;
+  instruction: string;
+}
+
+export type PdfUploadOutcome =
+  | { ok: true; attachment: ComposerAttachment }
+  | { ok: false; status: number; message: string };
+
+function validatePdfUploadData(record: Record<string, unknown>): PdfUploadData | null {
+  if (typeof record.attachmentId !== 'string' || record.attachmentId === '') return null;
+  if (typeof record.text !== 'string' || record.text.trim() === '') return null;
+  if (utf8ByteLength(record.text) > MAX_PDF_TEXT_BYTES) return null;
+  if (
+    typeof record.instruction !== 'string' ||
+    utf8ByteLength(record.instruction) > MAX_PDF_INSTRUCTION_BYTES
+  ) {
+    return null;
+  }
+  return {
+    attachmentId: record.attachmentId,
+    name: typeof record.name === 'string' ? record.name : '',
+    mimeType: typeof record.mimeType === 'string' ? record.mimeType : 'application/pdf',
+    sizeBytes: typeof record.sizeBytes === 'number' ? record.sizeBytes : 0,
+    textBytes: typeof record.textBytes === 'number' ? record.textBytes : utf8ByteLength(record.text),
+    text: record.text,
+    instruction: record.instruction,
+  };
+}
+
+function pdfErrorMessageForStatus(status: number, body: unknown): string {
+  const record = (body ?? {}) as { error?: unknown };
+  if (typeof record.error === 'string' && record.error.trim() !== '') {
+    return record.error.slice(0, MAX_VIDEO_ERROR_CHARS);
+  }
+  switch (status) {
+    case 401:
+    case 403:
+      return 'authentication failed — check the token in Settings';
+    case 411:
+      return 'PDF upload rejected: missing content length';
+    case 413:
+      return `PDF too large (max ${Math.round(MAX_PDF_BYTES / (1024 * 1024))} MiB)`;
+    case 415:
+      return 'unsupported PDF file — attach a .pdf document';
+    case 400:
+      return 'PDF contains no extractable text (scanned or encrypted)';
+    case 503:
+      return 'PDF extraction unavailable: pdftotext (poppler-utils) is not installed on the server';
+    case 504:
+      return 'PDF processing timed out on the server';
+    default:
+      return `PDF upload failed (HTTP ${status})`;
+  }
+}
+
+export function parsePdfUploadResponse(
+  status: number,
+  body: unknown,
+): { ok: true; data: PdfUploadData } | { ok: false; message: string } {
+  if (status >= 200 && status < 300) {
+    const data = validatePdfUploadData((body ?? {}) as Record<string, unknown>);
+    if (data) return { ok: true, data };
+    return { ok: false, message: 'unexpected response from the PDF upload endpoint' };
+  }
+  return { ok: false, message: pdfErrorMessageForStatus(status, body) };
+}
+
+export function buildPdfAttachment(file: File, data: PdfUploadData): ComposerAttachment {
+  return {
+    id: '',
+    name: data.name || file.name,
+    size: data.sizeBytes || file.size,
+    mimeType: data.mimeType || 'application/pdf',
+    kind: 'pdf',
+    videoState: 'ready',
+    attachmentId: data.attachmentId,
+    text: data.text,
+    instruction: data.instruction,
+  };
+}
+
+export function pdfUploadHeaders(name: string, token: string): Record<string, string> {
+  const headers: Record<string, string> = { 'X-Pdf-Name': encodeURIComponent(name) };
+  if (token !== '') headers.Authorization = `Bearer ${token}`;
+  return headers;
+}
+
+export async function uploadPdfFile(file: File, opts: VideoUploadOptions): Promise<PdfUploadOutcome> {
+  const timeoutMs = opts.timeoutMs ?? PDF_UPLOAD_TIMEOUT_MS;
+  const fetchImpl = opts.fetchImpl ?? ((url: string, init: Parameters<VideoFetch>[1]) => fetch(url, init));
+  const url = pdfUploadUrl(opts.pageProtocol ?? 'http:', opts.hostAuthority);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const headers = pdfUploadHeaders(file.name, opts.token);
+  try {
+    const response = await fetchImpl(url, {
+      method: 'POST',
+      headers,
+      body: file,
+      signal: controller.signal,
+    });
+    let body: unknown = null;
+    try {
+      body = await boundedUploadResponseBody(response, MAX_PDF_RESPONSE_BYTES);
+    } catch {
+      /* status fallback */
+    }
+    const parsed = parsePdfUploadResponse(response.status, body);
+    if (!parsed.ok) return { ok: false, status: response.status, message: parsed.message };
+    return { ok: true, attachment: buildPdfAttachment(file, parsed.data) };
+  } catch {
+    if (controller.signal.aborted) {
+      return {
+        ok: false,
+        status: 0,
+        message: 'PDF upload timed out — the server took too long to process it',
+      };
+    }
+    return { ok: false, status: 0, message: 'PDF upload failed — check the connection and try again' };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 
 /** Wire + count footprint of an accepted batch. Used to RESERVE the budget
  *  synchronously before the reads/upload (see App's CONCURRENCY INVARIANT)
@@ -1083,6 +1855,10 @@ export class IntakeBudgetTracker {
     return { count, wire };
   }
 
+  hasOutstanding(): boolean {
+    return this.outstanding.size > 0;
+  }
+
   /** Register an intake's reservation BEFORE its await. Idempotent per key
    *  (a re-reserve replaces). */
   reserve(intakeId: string, reservation: BudgetReservation): void {
@@ -1108,10 +1884,7 @@ export class IntakeBudgetTracker {
 }
 
 /** Chip placeholder for one accepted file, queued BEFORE its read/upload
- *  settles so chips appear immediately in intake order (videos show the
- *  `uploading` state; image/code placeholders flip to their real content as
- *  soon as the FileReader returns). The placeholder id is patched in place by
- *  the settle paths, preserving queue order. */
+ *  settles so chips appear immediately in intake order. */
 export function placeholderFor(entry: AcceptedFile, id: string): ComposerAttachment {
   if (entry.kind === 'video') {
     return {
@@ -1123,24 +1896,23 @@ export function placeholderFor(entry: AcceptedFile, id: string): ComposerAttachm
       videoState: 'uploading',
     };
   }
+  if (entry.kind === 'pdf') {
+    return {
+      id,
+      name: entry.file.name,
+      size: entry.file.size,
+      mimeType: entry.file.type || 'application/pdf',
+      kind: 'pdf',
+      videoState: 'uploading',
+    };
+  }
   if (entry.kind === 'image') {
     return { id, name: entry.file.name, size: entry.file.size, mimeType: imageMimeType(entry.file), kind: 'image' };
   }
   return { id, name: entry.file.name, size: entry.file.size, mimeType: entry.file.type || 'text/plain', kind: 'code' };
 }
 
-/** Merge per-task read results + video placeholders back into INTAKE order
- *  for the single state push: a built image/code read becomes the attachment
- *  (id overridden to the task id), a late skip is collected (never built),
- *  and a video becomes its uploading placeholder. A non-video task with NO
- *  read result (defensive: the reader returned neither) is dropped.
- *
- *  This is the invariant that makes submit's ready check sound: state only
- *  ever receives FULLY-BUILT image/code attachments and uploading VIDEO
- *  placeholders. A half-read image can never be submitted as a phantom — an
- *  in-queue image/code always carries its payload, and the only guarded
- *  in-flight kind is the video's explicit `videoState`. Pure +
- *  Node-testable (the delayed-reader submit regression lives here). */
+/** Merge per-task read results + video/PDF placeholders back into INTAKE order. */
 export function mergeIntakeResults(
   tasks: readonly { id: string; entry: AcceptedFile }[],
   readById: ReadonlyMap<string, ReadResult>,
@@ -1150,7 +1922,9 @@ export function mergeIntakeResults(
   for (const task of tasks) {
     const result = readById.get(task.id);
     if (result === undefined) {
-      if (task.entry.kind === 'video') built.push(placeholderFor(task.entry, task.id));
+      if (task.entry.kind === 'video' || task.entry.kind === 'pdf') {
+        built.push(placeholderFor(task.entry, task.id));
+      }
       continue;
     }
     if (result.attachment) {
@@ -1162,20 +1936,7 @@ export function mergeIntakeResults(
   return { built, skips };
 }
 
-/** Pure settle of ONE video upload outcome against the CURRENT queue.
- *  `next` is the queue after the settle; `surface` tells the caller whether
- *  the failure must be toasted.
- *
- *  A STALE outcome — the chip was removed or the composer reset while the
- *  upload was in flight, so `id` is no longer queued — returns the queue
- *  UNCHANGED with `surface: false`: a late async result is silent, it never
- *  resurrects a removed chip and never toasts a phantom failure (the removal
- *  already released the budget). A live failure flips the chip to the
- *  actionable error state and surfaces the toast; a live success patches the
- *  ready attachment (frames + instruction + thumbnail) and, when the frames
- *  push the aggregate wire over the cap, flips to an error state AND drops
- *  the frames so the wire invariant is restored immediately. Pure +
- *  Node-testable. */
+/** Pure settle of ONE video upload outcome against the CURRENT queue. */
 export function settleVideoOutcome(
   prev: readonly ComposerAttachment[],
   id: string,
@@ -1210,6 +1971,69 @@ export function settleVideoOutcome(
   };
 }
 
+/** Pure settle of ONE PDF upload outcome against the CURRENT queue. */
+export function settlePdfOutcome(
+  prev: readonly ComposerAttachment[],
+  id: string,
+  outcome: PdfUploadOutcome,
+): { next: ComposerAttachment[]; surface: boolean } {
+  if (!prev.some((a) => a.id === id)) {
+    return { next: prev as ComposerAttachment[], surface: false };
+  }
+  if (outcome.ok) {
+    let next = prev.map((a) => (a.id === id ? { ...outcome.attachment, id } : a));
+    if (aggregateWire(next) > MAX_TOTAL_WIRE_BYTES) {
+      next = next.map((a) =>
+        a.id === id
+          ? {
+              ...a,
+              text: undefined,
+              instruction: undefined,
+              videoState: 'error' as const,
+              videoError:
+                'extracted PDF text exceeds the total send size limit — remove other attachments or this PDF',
+            }
+          : a,
+      );
+    }
+    return { next, surface: false };
+  }
+  return {
+    next: prev.map((a) =>
+      a.id === id ? { ...a, videoState: 'error' as const, videoError: outcome.message } : a,
+    ),
+    surface: true,
+  };
+}
+
+/** Admit fully built attachments against the exact queued wire footprint.
+ * This closes the gap where a small dimension-triggered image can re-encode
+ * larger than its intake reservation. Intake order is preserved. */
+export function admitBuiltAttachments(
+  current: readonly ComposerAttachment[],
+  built: readonly ComposerAttachment[],
+  maxTotalWireBytes = MAX_TOTAL_WIRE_BYTES,
+): { next: ComposerAttachment[]; skipped: AttachSkip[] } {
+  const next = [...current];
+  const skipped: AttachSkip[] = [];
+  let wire = aggregateWire(next);
+  for (const attachment of built) {
+    const attachmentWire = aggregateWire([attachment]);
+    if (wire + attachmentWire > maxTotalWireBytes) {
+      skipped.push({
+        name: attachment.name,
+        size: attachment.size,
+        type: attachment.mimeType,
+        reason: 'over-budget',
+      });
+      continue;
+    }
+    wire += attachmentWire;
+    next.push(attachment);
+  }
+  return { next, skipped };
+}
+
 /** Exact wire footprint (base64 characters) of a video's extracted frames —
  *  the part of a video attachment that actually rides the prompt `images`
  *  array. Raw video bytes contribute nothing. */
@@ -1221,13 +2045,13 @@ export function videoFramesWire(frames: readonly VideoUploadFrame[] | undefined)
   return total;
 }
 
-/** Fixed maximum length of the `c<N>` command id sendCommand assigns
- *  (`c${++seqRef}`). Real ids are `c` + a small decimal counter — far shorter
- *  in any real session — but the pre-dispatch frame-byte check must NEVER
- *  undercount, and it cannot know the real id without predicting the counter.
- *  Using this fixed max-length stand-in makes the check an upper bound on the
- *  true frame bytes. */
-export const MAX_COMMAND_ID = `c${'9'.repeat(23)}`;
+/** Fixed maximum length of the namespaced command id sendCommand assigns
+ *  (`c<page-namespace>-<seq>` from ./protocol). Real ids are far shorter in
+ *  any real session, but the pre-dispatch frame-byte check must NEVER
+ *  undercount, and it cannot know the real id without predicting the
+ *  counter. Using this fixed max-length stand-in makes the check an upper
+ *  bound on the true frame bytes. */
+export { MAX_COMMAND_ID } from './protocol';
 
 /** Composer context an intake was captured under. `gen` is a monotonically
  *  increasing intake-generation counter bumped on every full composer reset
@@ -1302,16 +2126,19 @@ export function attachmentsToImageBlocks(
  *  `codeSegmentWireBytes` — the real sanitized filename + fence + language),
  *  so the post-read budget never undercounts what actually goes on the wire;
  *  a not-yet-read code attachment falls back to the conservative `wireFootprint`
- *  estimate. Image base64 is the exact encoded length. */
+ *  estimate. Image base64 is the exact encoded length. Ready PDF text is the
+ *  exact extracted-marker bytes. */
 export function aggregateWire(attachments: readonly ComposerAttachment[]): number {
   let total = 0;
   for (const a of attachments) {
     if (a.kind === 'image') {
       total += a.dataBase64?.length ?? base64Length(a.size);
     } else if (a.kind === 'video') {
-      // Exact extracted-frame base64 once the backend has returned them;
-      // zero before the upload settles (raw video never rides the wire).
       total += videoFramesWire(a.frames);
+    } else if (a.kind === 'pdf') {
+      if (a.videoState === 'ready' && a.text != null) {
+        total += utf8ByteLength(pdfMarkerText(a));
+      }
     } else if (a.text != null) {
       total += codeSegmentWireBytes(a.name, a.language ?? '', a.text);
     } else {
@@ -1339,9 +2166,12 @@ export function codeBadgeLabel(name: string): string {
 export function formatSkipSummary(skipped: readonly AttachSkip[]): string | null {
   if (skipped.length === 0) return null;
   const labels: Record<AttachSkipReason, string> = {
-    unsupported: 'unsupported (images, videos, or text/code files only)',
+    unsupported: 'unsupported (images, videos, PDFs, or text/code files only)',
     oversize: `over ${MAX_FILE_BYTES} bytes`,
+    'image-oversize': `image over ${Math.round(MAX_IMAGE_INPUT_BYTES / (1024 * 1024))} MiB input limit`,
+    'image-processing': 'image could not be decoded or resized safely',
     'video-oversize': `over ${Math.round(MAX_VIDEO_BYTES / (1024 * 1024))} MiB (video upload cap)`,
+    'pdf-oversize': `over ${Math.round(MAX_PDF_BYTES / (1024 * 1024))} MiB (PDF upload cap)`,
     'too-many': `over ${MAX_ATTACHMENTS} attachments`,
     'over-budget': 'exceeds total size limit',
     'invalid-utf8': 'not valid UTF-8 (binary)',
@@ -1412,7 +2242,7 @@ const PICKER_VIDEO_EXTENSIONS = ['mkv', 'mp4', 'webm', 'mov', 'avi', 'ogg'];
 /** The file-picker `accept` value: the supported image MIME types (PNG/JPEG/
  *  GIF/WebP — NOT `image/*`, which would also advertise SVG/BMP the backend
  *  cannot carry), the supported video MIME types + container extensions
- *  (video/x-matroska included — pi-web-access 0.22 omits MKV), and the
+ *  (video/x-matroska included — pi-web-access 0.22 omits MKV), PDF, and the
  *  supported code/text extensions. Derived from the same classification sets
  *  so the picker and the intake contract share one source of truth. */
 export function attachmentAccept(): string {
@@ -1420,6 +2250,16 @@ export function attachmentAccept(): string {
     ...ALLOWED_IMAGE_MIMES,
     ...ALLOWED_VIDEO_MIMES,
     ...PICKER_VIDEO_EXTENSIONS.map((e) => `.${e}`),
+    'application/pdf',
+    '.pdf',
     ...PICKER_CODE_EXTENSIONS.map((e) => `.${e}`),
   ].join(',');
+}
+
+/** The image-only picker `accept` value for the code-review hunk composer:
+ *  exactly the four supported image MIME types, derived from the same
+ *  ALLOWED_IMAGE_MIMES set `isImageFile` gates with, so the picker never
+ *  advertises an image the intake would reject. */
+export function imageAttachmentAccept(): string {
+  return [...ALLOWED_IMAGE_MIMES].join(',');
 }

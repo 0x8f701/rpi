@@ -44,6 +44,13 @@ impl PtyProbe {
     fn spawn(args: &[&str]) -> Self {
         let home = TempDir::new().expect("temp HOME");
         let cwd = TempDir::new().expect("temp cwd");
+        let agent = home.path().join(".pi/agent");
+        std::fs::create_dir_all(&agent).expect("agent dir");
+        std::fs::write(
+            agent.join("settings.json"),
+            r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+        )
+        .expect("sandbox settings");
         let winsize = Winsize {
             ws_row: 28,
             ws_col: 100,
@@ -60,8 +67,8 @@ impl PtyProbe {
         cmd.env("HOME", home.path());
         cmd.env("PATH", std::env::var("PATH").unwrap_or_default());
         cmd.env("TERM", "xterm-256color");
-        cmd.env("PI_OFFLINE", "1");
-        cmd.env("PI_SKIP_VERSION_CHECK", "1");
+        cmd.env("RPI_OFFLINE", "1");
+        cmd.env("RPI_SKIP_VERSION_CHECK", "1");
         cmd.args(args);
         cmd.current_dir(cwd.path());
         cmd.stdin(Stdio::from(slave_in));
@@ -140,7 +147,10 @@ impl PtyProbe {
         let deadline = Instant::now() + timeout;
         loop {
             let snap = self.snapshot();
-            if snap.get(marker..).is_some_and(|delta| delta.contains(needle)) {
+            if snap
+                .get(marker..)
+                .is_some_and(|delta| delta.contains(needle))
+            {
                 return true;
             }
             if Instant::now() >= deadline {
@@ -239,11 +249,12 @@ fn pty_process_start_ps_panel_unknown_key_esc_focus_stop_cleanup() {
     // 1. Start a bounded background process (no TTY — plain sleep).
     probe.send(b"/process start sleep 60\r");
     assert!(
-        probe.wait_for_any(
-            &["running", "Running", "starting", "Starting", "sleep"],
-            Duration::from_secs(20)
-        )
-        .is_some(),
+        probe
+            .wait_for_any(
+                &["running", "Running", "starting", "Starting", "sleep"],
+                Duration::from_secs(20)
+            )
+            .is_some(),
         "process start must surface in UI: {}",
         probe.snapshot()
     );
@@ -273,36 +284,38 @@ fn pty_process_start_ps_panel_unknown_key_esc_focus_stop_cleanup() {
         }
     }
     probe.send(b"\r");
+    let panel_open_at = probe.len();
     assert!(
-        probe.wait_for_any(
-            &[
-                "Processes",
-                "select · Enter",
-                "Esc close",
-                "No supervised processes",
-                "sleep",
-                "running",
-                "Running",
-            ],
-            Duration::from_secs(15)
-        )
-        .is_some(),
+        probe
+            .wait_for_any_after(
+                panel_open_at,
+                &[
+                    "Processes",
+                    "select · Enter",
+                    "Esc close",
+                    "a attach PTY",
+                ],
+                Duration::from_secs(15)
+            )
+            .is_some(),
         "/ps must open the process panel: {}",
         probe.snapshot()
     );
     let panel_open = probe.snapshot();
 
     // 3. Unknown key while panel is open must preserve the panel (not close,
-    // not route into composer as a turn).
+    // not route into composer as a turn). Chrome from the open paint stays in
+    // the cumulative PTY buffer if the overlay remains; leftover "running" /
+    // "sleep" from `/process start` is not panel evidence.
     let before_unknown = probe.len();
-    probe.send(b"z"); // not bound in list view → ProcessKeyResult::Unknown
+    probe.send(b"z"); // not bound in list view — capturing modal swallows it
     thread::sleep(Duration::from_millis(250));
     let after_unknown = probe.snapshot();
     assert!(
         after_unknown.contains("Processes")
             || after_unknown.contains("Esc close")
             || after_unknown.contains("select · Enter")
-            || after_unknown.contains("sleep"),
+            || after_unknown.contains("a attach PTY"),
         "unknown key must preserve process panel: {}",
         &after_unknown[before_unknown.min(after_unknown.len())..]
     );
@@ -311,9 +324,7 @@ fn pty_process_start_ps_panel_unknown_key_esc_focus_stop_cleanup() {
         .get(before_unknown..)
         .unwrap_or(after_unknown.as_str());
     assert!(
-        !delta.contains("\nYou")
-            && !delta.contains("You\n")
-            && !delta.contains("Assistant"),
+        !delta.contains("\nYou") && !delta.contains("You\n") && !delta.contains("Assistant"),
         "unknown panel key must not start a model turn: {delta}"
     );
     let _ = panel_open;
@@ -321,13 +332,12 @@ fn pty_process_start_ps_panel_unknown_key_esc_focus_stop_cleanup() {
     // 4. Esc restores composer focus — panel closes, Ready status returns.
     probe.send(&[ESC]);
     assert!(
-        probe.wait_for("Ready", Duration::from_secs(10))
-            || {
-                // Panel chrome should stop being the dominant overlay; allow a
-                // brief settle then require that a subsequent composer edit works.
-                thread::sleep(Duration::from_millis(400));
-                true
-            },
+        probe.wait_for("Ready", Duration::from_secs(10)) || {
+            // Panel chrome should stop being the dominant overlay; allow a
+            // brief settle then require that a subsequent composer edit works.
+            thread::sleep(Duration::from_millis(400));
+            true
+        },
         "Esc should restore Ready / composer focus: {}",
         probe.snapshot()
     );
@@ -357,18 +367,19 @@ fn pty_process_start_ps_panel_unknown_key_esc_focus_stop_cleanup() {
     );
     probe.send(b"\r");
     assert!(
-        probe.wait_for_any(
-            &[
-                "Processes",
-                "Esc close",
-                "select · Enter",
-                "sleep",
-                "running",
-                "Running",
-            ],
-            Duration::from_secs(15)
-        )
-        .is_some(),
+        probe
+            .wait_for_any(
+                &[
+                    "Processes",
+                    "Esc close",
+                    "select · Enter",
+                    "sleep",
+                    "running",
+                    "Running",
+                ],
+                Duration::from_secs(15)
+            )
+            .is_some(),
         "second /ps must reopen panel: {}",
         probe.snapshot()
     );
@@ -405,7 +416,9 @@ fn pty_process_start_ps_panel_unknown_key_esc_focus_stop_cleanup() {
 
     // Observe process leaving running state when possible.
     let _ = probe.wait_for_any(
-        &["exited", "Exited", "stopping", "Stopping", "failed", "Failed"],
+        &[
+            "exited", "Exited", "stopping", "Stopping", "failed", "Failed",
+        ],
         Duration::from_secs(8),
     );
 
@@ -432,20 +445,27 @@ fn pty_process_start_ps_panel_unknown_key_esc_focus_stop_cleanup() {
     );
 }
 
-
 /// Contract: attach to a supervised PTY, send printable/Enter as direct
 /// terminal input, observe child output, and consume Ctrl+] locally.
 #[test]
 fn pty_process_attach_type_interrupt_and_detach() {
     let mut probe = PtyProbe::spawn(&["--model", "faux/faux-1"]);
-    assert!(await_entered(&probe), "TUI must start: {}", probe.snapshot());
+    assert!(
+        await_entered(&probe),
+        "TUI must start: {}",
+        probe.snapshot()
+    );
     thread::sleep(Duration::from_millis(400));
 
     let first_start = probe.len();
     probe.send(b"/process start --tty sh -c \"read line; echo CHILD:$line\"\r");
     assert!(
         probe
-            .wait_for_any_after(first_start, &["running", "Running", "sh -c"], Duration::from_secs(20))
+            .wait_for_any_after(
+                first_start,
+                &["running", "Running", "sh -c"],
+                Duration::from_secs(20)
+            )
             .is_some(),
         "PTY process must start: {}",
         probe.snapshot(),
@@ -457,7 +477,11 @@ fn pty_process_attach_type_interrupt_and_detach() {
     probe.send(b"\r");
     assert!(
         probe
-            .wait_for_any_after(first_panel, &["Processes", "a attach PTY"], Duration::from_secs(15))
+            .wait_for_any_after(
+                first_panel,
+                &["Processes", "a attach PTY"],
+                Duration::from_secs(15)
+            )
             .is_some(),
         "process panel must open: {}",
         probe.snapshot(),
@@ -493,11 +517,27 @@ fn pty_process_attach_type_interrupt_and_detach() {
     let second_start = probe.len();
     probe.type_chars("/process start --tty sleep 30");
     probe.send(b"\r");
-    assert!(probe.wait_for_any_after(second_start, &["running", "Running", "sleep"], Duration::from_secs(15)).is_some());
+    assert!(
+        probe
+            .wait_for_any_after(
+                second_start,
+                &["running", "Running", "sleep"],
+                Duration::from_secs(15)
+            )
+            .is_some()
+    );
     let second_panel = probe.len();
     probe.type_chars("/ps");
     probe.send(b"\r");
-    assert!(probe.wait_for_any_after(second_panel, &["Processes", "a attach PTY"], Duration::from_secs(15)).is_some());
+    assert!(
+        probe
+            .wait_for_any_after(
+                second_panel,
+                &["Processes", "a attach PTY"],
+                Duration::from_secs(15)
+            )
+            .is_some()
+    );
     let second_attach = probe.len();
     probe.send(b"a");
     assert!(probe.wait_for_after(second_attach, "direct input", Duration::from_secs(10)));

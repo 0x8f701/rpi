@@ -1,6 +1,4 @@
-use pi_coding::{
-    ApplicationEvent, SelectionHit, SelectionKind, SelectionPlan, SelectionSource,
-};
+use pi_coding::{ApplicationEvent, SelectionHit, SelectionKind, SelectionPlan, SelectionSource};
 
 fn plan() -> SelectionPlan {
     SelectionPlan {

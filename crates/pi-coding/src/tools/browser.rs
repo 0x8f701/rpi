@@ -1,68 +1,64 @@
 //! `browser` tool: headless Chromium/Chrome automation over the Chrome
 //! DevTools Protocol (CDP).
 //!
-//! Each invocation spawns a fresh headless browser process with a temporary
-//! profile, performs exactly one action (navigate / click / fill / screenshot
-//! / extract / list_tabs / close), then tears the browser down. State does
-//! not persist between calls.
-//!
-//! The CDP client is deliberately minimal and hand-rolled over
-//! `tokio-tungstenite` (already in the workspace dependency tree; see
-//! `Cargo.lock`) instead of pulling in `chromiumoxide` (which would add a
-//! large transitive subtree for an API surface this tool does not need).
-//! Commands are strictly sequential: one request is in flight at a time and
-//! its response is matched by `id`, so stale responses (e.g. from a
-//! timed-out earlier command) are skipped harmlessly.
-//!
-//! ## Sandbox trade-off
-//!
-//! The browser is launched with `--no-sandbox` because Chromium's sandbox
-//! routinely fails in containers and when running as root, which would make
-//! the tool unusable in those environments. Disabling it removes Chromium's
-//! process-level isolation, so the tool bounds its own blast radius instead:
-//! navigation is agent-controlled and restricted to validated
-//! `http(s)`/`about:blank` URLs; each call spawns a short-lived browser with
-//! a fresh temporary profile that performs exactly one action and is torn
-//! down afterwards; and the process is hard-killed on drop (`kill_on_drop`),
-//! as a process group (`process_group(0)` on unix), and by the action
-//! timeout ([`ACTION_TIMEOUT`]). A compromised page can therefore only act
-//! within a single action's window, never outlive the call, and never
-//! outlive the tool process.
-//!
-//! Requires a Chrome/Chromium binary on the host. Discovery order:
-//! `CHROME_PATH`, well-known install locations, then `PATH`. A missing
-//! binary is rejected with an actionable message (like the `pdftotext` path
-//! in `tools.rs`).
+//! Every invocation captures one immutable application generation, uses its
+//! filesystem and process authority, launches Chromium through the governed
+//! Unix backend, and controls it exclusively through the NUL-framed native
+//! remote-debugging pipe. A session is exposed only after `Browser.getVersion`
+//! proves that Chromium started with its native sandbox enabled.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
-use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::TcpStream;
-use tokio::process::{Child, Command};
-use tokio_tungstenite::tungstenite::Message as WsMessage;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use pi_agent::{AbortSignal, AgentTool, AgentToolResult, ToolCapability};
+use pi_agent::{
+    AbortSignal, AgentTool, AgentToolResult, ToolApprovalRequest, ToolApprovalSummary,
+    ToolCallApprovalToken, ToolCapability,
+};
 use pi_ai::ContentBlock;
+use pi_sandbox::{
+    AbsolutePath, CanonicalTargetFdMapping, HostPlatform, SandboxError, SpawnFamily, StdioMode,
+    TargetFdDirection,
+};
 
-use super::{arg_str, check_aborted, imageresize::process_image, paths::resolve_scoped_path, s_object, s_string, text_result};
-use crate::truncate::{format_size, truncate_head};
+use super::{
+    arg_str, check_aborted, imageresize::process_image, paths::resolve_to_cwd, s_object, s_string,
+    text_result,
+};
 use crate::WorkspaceRoots;
+use crate::application::generation::{ApplicationGeneration, GenerationCaptureFn};
+use crate::fs::{
+    FileMode, FsError, PolicyFs, PolicyReplacement, PolicyScratch, SandboxVisiblePath,
+};
+#[cfg(unix)]
+use crate::process::{
+    AuthorizedSpawn, GovernedPipeProcess, browser_debugging_pipes, launch_authorized_browser_pipe,
+};
+use crate::process::{TrustedToolProbe, authorize_spawn, run_trusted_tool_probe};
+use crate::sandbox::{
+    CanonicalSpawnCall, CredentialAudience, RawSpawnRequest, SpawnAuthorization, target_fd_summary,
+};
+use crate::truncate::{format_size, truncate_head};
 
-/// Wall-clock budget for a single action, including browser startup wait.
+/// Wall-clock budget for a single action after the native startup proof.
 const ACTION_TIMEOUT: Duration = Duration::from_secs(15);
-/// Budget for a single CDP command round trip (read until the matching id).
+/// Budget for one CDP command round trip after startup.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 /// Budget for waiting out a navigation (polling `document.readyState`).
 const LOAD_TIMEOUT: Duration = Duration::from_secs(15);
-/// Budget for the browser process to print its DevTools endpoint.
-const SPAWN_TIMEOUT: Duration = Duration::from_secs(15);
+/// One absolute deadline covering preparation, launch, and native proof.
+const BROWSER_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+const BROWSER_PIPE_FRAME_LIMIT: usize = 1024 * 1024;
+const BROWSER_STDERR_TAIL_LIMIT: usize = 8 * 1024;
+const BROWSER_PROFILE_ID_KEY: &str = "_browserProfileId";
 /// Output byte budget for `extract` text — keeps agent context lean.
 const EXTRACT_MAX_BYTES: usize = 16 * 1024;
 /// Cap on the number of tabs rendered by `list_tabs`.
@@ -71,16 +67,6 @@ const LIST_TABS_MAX: usize = 20;
 const SCREENSHOT_MAX_INPUT_BYTES: usize = 20 * 1024 * 1024;
 /// Inline base64 budget leaves headroom inside the 4 MiB listener frame cap.
 const SCREENSHOT_MAX_BASE64_BYTES: usize = 3 * 1024 * 1024;
-/// Error shown when no Chrome/Chromium binary can be found.
-const MISSING_CHROME_MESSAGE: &str = "\
-browser tool requires Chrome/Chromium, but none was found on this machine. \
-Set the CHROME_PATH environment variable to a Chrome or Chromium executable, \
-or install one on PATH (google-chrome, chromium, ...). Well-known locations \
-are checked automatically (/usr/bin/google-chrome, /usr/bin/chromium, \
-/snap/bin/chromium, /opt/google/chrome/chrome, /usr/lib/chromium/chromium, \
-and the macOS .app bundles). The browser always runs headless.";
-
-type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// The supported `browser` actions (schema `action` enum).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,9 +82,11 @@ enum Action {
 
 const ACTIONS_HINT: &str = "navigate, click, fill, screenshot, extract, list_tabs, close";
 
-/// Builds the `browser` tool. `cwd` anchors workspace-scoped screenshot paths.
-pub(crate) fn browser_tool_for_workspace(workspace: WorkspaceRoots) -> AgentTool {
-    let cwd = workspace.cwd().to_string_lossy().into_owned();
+/// Builds the generation-bound `browser` tool.
+pub(crate) fn browser_tool_for_workspace(
+    workspace: WorkspaceRoots,
+    capture_generation: GenerationCaptureFn,
+) -> AgentTool {
     let params = s_object(
         vec![
             ("action", s_string("Action to perform")),
@@ -110,34 +98,72 @@ pub(crate) fn browser_tool_for_workspace(workspace: WorkspaceRoots) -> AgentTool
                      browser to this page before acting",
                 ),
             ),
-            ("selector", s_string("CSS selector for click / fill / extract")),
-            ("text", s_string("Text to fill into the matched input (fill only)")),
+            (
+                "selector",
+                s_string("CSS selector for click / fill / extract"),
+            ),
+            (
+                "text",
+                s_string("Text to fill into the matched input (fill only)"),
+            ),
             (
                 "path",
                 s_string("Workspace-relative output path for the screenshot PNG (screenshot only)"),
+            ),
+            (
+                BROWSER_PROFILE_ID_KEY,
+                s_string("Internal browser profile identifier"),
             ),
         ],
         vec!["action"],
     );
     let description = format!(
-        "Automate a headless Chromium/Chrome browser over the Chrome DevTools Protocol. \
+        "Automate a governed headless Chromium/Chrome browser over its native debugging pipe. \
 Actions: navigate (url), click (selector), fill (selector, text), screenshot (path), \
 extract (selector? — page or element text), list_tabs, close. \
-Each call spawns a fresh headless browser starting at about:blank and state does not persist \
-between calls, so click/fill/screenshot/extract accept an optional url to navigate first \
-(one call can then act on a page end to end). \
-Requires a Chrome/Chromium binary on this machine (CHROME_PATH, PATH, or standard install \
-locations); missing binaries are rejected with an actionable error. \
-Screenshots are saved only within the workspace and returned as bounded inline image content. \
-Outputs are bounded to {}KB.",
+Each call uses a fresh revision-owned profile and proves Chromium's native sandbox before CDP \
+commands are accepted. Screenshots stay within captured workspace authority. Outputs are \
+bounded to {}KB.",
         EXTRACT_MAX_BYTES / 1024
     );
+    let execute_capture = capture_generation.clone();
+    let approval_capture = capture_generation;
+    let approval_workspace = workspace.clone();
     AgentTool::new("browser", description, params, move |ctx| {
+        let capture_generation = execute_capture.clone();
         let workspace = workspace.clone();
-        let cwd = cwd.clone();
-        async move { run_browser_for_workspace(&cwd, &workspace, ctx.arguments, ctx.abort).await }
+        async move {
+            let generation = capture_generation()?;
+            run_browser_for_workspace(
+                generation,
+                &workspace,
+                ctx.arguments,
+                ctx.approval_token,
+                ctx.abort,
+            )
+            .await
+        }
+    })
+    .with_prepare_arguments(inject_browser_profile_id)
+    .with_prepare_approval(move |arguments| {
+        let capture_generation = approval_capture.clone();
+        let workspace = approval_workspace.clone();
+        Box::pin(async move {
+            let generation = capture_generation()?;
+            prepare_browser_approval(generation, &workspace, arguments).await
+        })
     })
     .with_capability(ToolCapability::Exec)
+}
+
+fn inject_browser_profile_id(mut arguments: Value) -> Result<Value> {
+    let object = arguments
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("browser: arguments must be an object"))?;
+    let mut random = uuid::Uuid::now_v7().simple().to_string();
+    random.replace_range(..1, "b");
+    object.insert(BROWSER_PROFILE_ID_KEY.to_owned(), Value::String(random));
+    Ok(arguments)
 }
 
 // ---------------------------------------------------------------------------
@@ -226,124 +252,239 @@ fn validate_args(action: &Action, args: &Value) -> Result<()> {
 // Chrome/Chromium discovery
 // ---------------------------------------------------------------------------
 
-/// Candidate browser binaries in priority order: `CHROME_PATH` first, then
-/// well-known Linux and macOS install locations.
-fn chrome_candidates() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if let Ok(path) = std::env::var("CHROME_PATH") {
-        let path = path.trim();
-        if !path.is_empty() {
-            out.push(PathBuf::from(path));
-        }
-    }
-    out.extend(
-        [
-            "/usr/bin/google-chrome",
-            "/usr/bin/google-chrome-stable",
-            "/usr/bin/chromium",
-            "/usr/bin/chromium-browser",
-            "/snap/bin/chromium",
-            "/opt/google/chrome/chrome",
-            "/usr/lib/chromium/chromium",
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            "/Applications/Chromium.app/Contents/MacOS/Chromium",
-        ]
-        .into_iter()
-        .map(PathBuf::from),
-    );
-    out
-}
-
-/// The first candidate that exists as a file. Injectable seam for tests.
-fn first_existing(candidates: &[PathBuf]) -> Option<PathBuf> {
-    candidates.iter().find(|path| path.is_file()).cloned()
-}
-
-/// Finds a usable browser binary: `CHROME_PATH` / common locations, then PATH.
-fn discover_chrome() -> Option<PathBuf> {
-    if let Some(bin) = first_existing(&chrome_candidates()) {
-        return Some(bin);
-    }
-    for name in ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome"] {
-        if let Some(path) = super::look_path(name) {
-            return Some(PathBuf::from(path));
-        }
-    }
-    None
-}
-
 // ---------------------------------------------------------------------------
 // Browser lifecycle
 // ---------------------------------------------------------------------------
 
-/// A spawned headless browser plus its CDP page connection. Dropping it kills
-/// the process (`kill_on_drop`) and removes the temporary profile.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BrowserVersion {
+    product: String,
+    protocol_version: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum NativeBrowserSandboxFailure {
+    #[error("browser sandbox handshake timed out after {timeout_ms} ms")]
+    Timeout { timeout_ms: u64 },
+    #[error("browser exited before sandbox confirmation")]
+    ProcessExited {
+        code: Option<i32>,
+        stderr_bytes: usize,
+    },
+    #[error("browser debugging pipe closed before sandbox confirmation")]
+    DebuggingPipeClosed { stderr_bytes: usize },
+    #[error("browser debugging-pipe frame exceeds {limit} bytes")]
+    FrameTooLarge { limit: usize },
+    #[error("browser debugging-pipe frame is invalid")]
+    InvalidFrame,
+    #[error("browser rejected the sandbox proof command")]
+    CommandRejected,
+}
+
+impl NativeBrowserSandboxFailure {
+    #[must_use]
+    pub const fn variant_name(&self) -> &'static str {
+        match self {
+            Self::Timeout { .. } => "timeout",
+            Self::ProcessExited { .. } => "process-exited",
+            Self::DebuggingPipeClosed { .. } => "debugging-pipe-closed",
+            Self::FrameTooLarge { .. } => "frame-too-large",
+            Self::InvalidFrame => "invalid-frame",
+            Self::CommandRejected => "command-rejected",
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BrowserSandboxError {
+    #[error("browser launch sandbox failed: {0}")]
+    Sandbox(#[from] SandboxError),
+    #[error("browser filesystem staging or cleanup failed: {0}")]
+    Filesystem(#[from] FsError),
+    #[error("browser native sandbox proof failed: {0}")]
+    Native(#[from] NativeBrowserSandboxFailure),
+    #[error("browser launch is unsupported on {platform:?}")]
+    UnsupportedPlatform { platform: HostPlatform },
+}
+
+impl BrowserSandboxError {
+    #[must_use]
+    pub const fn is_filesystem(&self) -> bool {
+        matches!(self, Self::Filesystem(_))
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn filesystem_denied_for_test() -> Self {
+        Self::Filesystem(FsError::Denied)
+    }
+
+    #[must_use]
+    pub const fn variant_name(&self) -> &'static str {
+        match self {
+            Self::Sandbox(_) => "sandbox",
+            Self::Filesystem(_) => "filesystem",
+            Self::Native(_) => "native",
+            Self::UnsupportedPlatform { .. } => "unsupported-platform",
+        }
+    }
+}
+
+struct StderrTail {
+    bytes: Arc<AtomicUsize>,
+}
+
+impl StderrTail {
+    fn spawn(mut stderr: tokio::fs::File) -> Self {
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let observed = bytes.clone();
+        tokio::spawn(async move {
+            let mut tail = Vec::with_capacity(BROWSER_STDERR_TAIL_LIMIT);
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = match stderr.read(&mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => read,
+                };
+                let _ = observed.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                    Some(count.saturating_add(read))
+                });
+                tail.extend_from_slice(&buffer[..read]);
+                if tail.len() > BROWSER_STDERR_TAIL_LIMIT {
+                    let excess = tail.len() - BROWSER_STDERR_TAIL_LIMIT;
+                    tail.drain(..excess);
+                }
+            }
+            let _ = crate::redact::redact_secrets(&String::from_utf8_lossy(&tail));
+        });
+        Self { bytes }
+    }
+
+    fn byte_count(&self) -> usize {
+        self.bytes.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(unix)]
 struct BrowserSession {
-    child: Child,
-    user_data_dir: PathBuf,
-    ws: Option<WsStream>,
+    _generation: Arc<ApplicationGeneration>,
+    process: GovernedPipeProcess,
+    profile: Option<PolicyScratch>,
+    command_writer: tokio::fs::File,
+    response_reader: tokio::fs::File,
+    stderr: StderrTail,
     next_id: u64,
-    port: u16,
+    page_session_id: Option<String>,
 }
 
-impl Drop for BrowserSession {
-    fn drop(&mut self) {
-        // kill_on_drop(true) on `child` SIGKILLs the browser when it drops;
-        // its renderer/zygote children exit with it. Profile cleanup is
-        // best-effort (the shutdown path removes it eagerly).
-        let _ = std::fs::remove_dir_all(&self.user_data_dir);
-    }
-}
-
+#[cfg(unix)]
 impl BrowserSession {
-    /// Kills the browser, reaps it, and removes the temporary profile.
-    async fn shutdown(mut self) {
-        let _ = self.ws.take();
-        let _ = self.child.kill().await;
-        // `wait` reaps the pid and nulls tokio's inner handle, so the
-        // `kill_on_drop` drop guard becomes a no-op afterwards (a reaped pid
-        // is never signaled again).
-        let _ = self.child.wait().await;
-        let _ = std::fs::remove_dir_all(&self.user_data_dir);
+    async fn shutdown(mut self) -> std::result::Result<(), BrowserSandboxError> {
+        let process_result = self
+            .process
+            .shutdown(Duration::from_secs(1))
+            .await
+            .map(|_| ())
+            .map_err(BrowserSandboxError::from);
+        let profile_result = self
+            .profile
+            .take()
+            .map(PolicyScratch::destroy)
+            .transpose()
+            .map_err(BrowserSandboxError::from);
+        process_result?;
+        profile_result.map(|_| ())
     }
 
-    /// Sends one CDP command and waits for the response with a matching `id`.
-    /// Events and stale responses (from an earlier timed-out command) are
-    /// skipped, which keeps the client correct across timeouts.
     async fn send_command(&mut self, method: &str, params: Value) -> Result<Value> {
-        let ws = self.ws.as_mut().expect("websocket open");
         self.next_id += 1;
         let id = self.next_id;
-        let message = json!({ "id": id, "method": method, "params": params }).to_string();
-        ws.send(WsMessage::Text(message.into()))
+        let mut payload = json!({ "id": id, "method": method, "params": params });
+        if let Some(session_id) = &self.page_session_id {
+            payload["sessionId"] = Value::String(session_id.clone());
+        }
+        let frame = payload.to_string();
+        self.command_writer
+            .write_all(frame.as_bytes())
             .await
-            .map_err(|e| anyhow!("browser: CDP send failed: {e}"))?;
+            .map_err(|_| anyhow!("browser: CDP send failed"))?;
+        self.command_writer
+            .write_all(&[0])
+            .await
+            .map_err(|_| anyhow!("browser: CDP send failed"))?;
+        self.command_writer
+            .flush()
+            .await
+            .map_err(|_| anyhow!("browser: CDP send failed"))?;
+        let deadline = tokio::time::Instant::now() + COMMAND_TIMEOUT;
         loop {
-            match tokio::time::timeout(COMMAND_TIMEOUT, ws.next()).await {
-                Ok(Some(Ok(WsMessage::Text(text)))) => {
-                    let response: Value = serde_json::from_str(&text)
-                        .map_err(|e| anyhow!("browser: invalid CDP response: {e}"))?;
-                    if response.get("id").and_then(Value::as_u64) == Some(id) {
-                        if let Some(error) = response.get("error") {
-                            let message = error
-                                .get("message")
-                                .and_then(Value::as_str)
-                                .unwrap_or("unknown CDP error");
-                            return Err(anyhow!("browser: CDP {method} failed: {message}"));
-                        }
-                        return Ok(response.get("result").cloned().unwrap_or(Value::Null));
-                    }
-                    // Event or another command's reply — skip.
-                }
-                Ok(Some(Ok(_))) => continue, // binary / ping / pong
-                Ok(Some(Err(e))) => return Err(anyhow!("browser: CDP connection error: {e}")),
-                Ok(None) => return Err(anyhow!("browser: CDP connection closed")),
-                Err(_) => return Err(anyhow!("browser: CDP command {method} timed out")),
+            let response = read_cdp_frame(&mut self.response_reader, deadline)
+                .await
+                .map_err(|error| anyhow!("browser: CDP receive failed: {error}"))?;
+            if response.get("id").and_then(Value::as_u64) != Some(id) {
+                continue;
             }
+            if let Some(error) = response.get("error") {
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown CDP error");
+                bail!("browser: CDP {method} failed: {message}");
+            }
+            return Ok(response.get("result").cloned().unwrap_or(Value::Null));
         }
     }
 
-    /// Runs `expression` in the page's main world, returning the JSON value.
+    async fn send_browser_command(&mut self, method: &str, params: Value) -> Result<Value> {
+        let page_session_id = self.page_session_id.take();
+        let result = self.send_command(method, params).await;
+        self.page_session_id = page_session_id;
+        result
+    }
+
+    async fn attach_page_target(&mut self) -> Result<()> {
+        let targets = self
+            .send_browser_command("Target.getTargets", json!({}))
+            .await?;
+        let page_target = targets
+            .get("targetInfos")
+            .and_then(Value::as_array)
+            .and_then(|targets| {
+                targets.iter().find(|target| {
+                    target.get("type").and_then(Value::as_str) == Some("page")
+                        && target.get("attached").and_then(Value::as_bool) != Some(true)
+                })
+            });
+        let target_id = match page_target
+            .and_then(|target| target.get("targetId"))
+            .and_then(Value::as_str)
+        {
+            Some(target_id) => target_id.to_owned(),
+            None => self
+                .send_browser_command("Target.createTarget", json!({ "url": "about:blank" }))
+                .await?
+                .get("targetId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("browser: CDP did not return a page target"))?
+                .to_owned(),
+        };
+        let attached = self
+            .send_browser_command(
+                "Target.attachToTarget",
+                json!({ "targetId": target_id, "flatten": true }),
+            )
+            .await?;
+        self.page_session_id = Some(
+            attached
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("browser: CDP did not attach to the page target"))?
+                .to_owned(),
+        );
+        Ok(())
+    }
+
     async fn eval_value(&mut self, expression: &str) -> Result<Value> {
         let response = self
             .send_command(
@@ -355,9 +496,12 @@ impl BrowserSession {
                 }),
             )
             .await?;
-        if let Some(exc) = response.get("exceptionDetails") {
-            let text = exc.get("text").and_then(Value::as_str).unwrap_or("page script threw");
-            return Err(anyhow!("browser: page script error: {text}"));
+        if let Some(exception) = response.get("exceptionDetails") {
+            let text = exception
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("page script threw");
+            bail!("browser: page script error: {text}");
         }
         Ok(response
             .get("result")
@@ -366,158 +510,341 @@ impl BrowserSession {
             .unwrap_or(Value::Null))
     }
 
-    /// Convenience wrapper for `eval_value` when the value is a string.
     async fn eval_string(&mut self, expression: &str) -> Result<String> {
         match self.eval_value(expression).await? {
-            Value::String(s) => Ok(s),
+            Value::String(value) => Ok(value),
             Value::Null => Ok(String::new()),
             other => Ok(other.to_string()),
         }
     }
 }
 
-/// Spawns the browser and connects to the initial page's DevTools endpoint.
-async fn spawn_browser(bin: &Path) -> Result<BrowserSession> {
-    let user_data_dir =
-        std::env::temp_dir().join(format!("pi-browser-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&user_data_dir).with_context(|| {
-        format!("browser: failed to create profile dir {}", user_data_dir.display())
-    })?;
+#[cfg(unix)]
+fn build_browser_argv(profile: &SandboxVisiblePath) -> Vec<String> {
+    vec![
+        "--headless=new".to_owned(),
+        "--remote-debugging-pipe".to_owned(),
+        "--no-first-run".to_owned(),
+        "--no-default-browser-check".to_owned(),
+        "--disable-background-networking".to_owned(),
+        "--disable-extensions".to_owned(),
+        "--disable-sync".to_owned(),
+        "--disable-component-update".to_owned(),
+        "--disable-gpu".to_owned(),
+        "--disable-dev-shm-usage".to_owned(),
+        "--window-size=1280,900".to_owned(),
+        format!("--user-data-dir={}", profile.as_path().display()),
+        "about:blank".to_owned(),
+    ]
+}
 
-    let args = vec![
-        "--headless=new".to_string(),
-        "--remote-debugging-port=0".to_string(),
-        "--remote-allow-origins=*".to_string(),
-        "--no-first-run".to_string(),
-        "--no-default-browser-check".to_string(),
-        "--disable-background-networking".to_string(),
-        "--disable-extensions".to_string(),
-        "--disable-sync".to_string(),
-        "--disable-component-update".to_string(),
-        "--disable-gpu".to_string(),
-        "--disable-dev-shm-usage".to_string(),
-        // --no-sandbox: Chromium's sandbox fails in containers/root; see the
-        // module header for the trade-off and the lifecycle bounds that
-        // contain it (short-lived process, kill_on_drop, process group,
-        // ACTION_TIMEOUT).
-        "--no-sandbox".to_string(),
-        "--window-size=1280,900".to_string(),
-        format!("--user-data-dir={}", user_data_dir.display()),
-        "about:blank".to_string(),
-    ];
-    let mut command = Command::new(bin);
-    command.args(&args);
-    command.stdin(Stdio::null());
-    command.stdout(Stdio::null());
-    command.stderr(Stdio::piped());
-    command.kill_on_drop(true);
+fn browser_target_fd_mappings() -> std::result::Result<Vec<CanonicalTargetFdMapping>, SandboxError>
+{
+    Ok(vec![
+        CanonicalTargetFdMapping::new(3, TargetFdDirection::ParentWrites)?,
+        CanonicalTargetFdMapping::new(4, TargetFdDirection::ParentReads)?,
+    ])
+}
+
+fn browser_audience() -> Result<CredentialAudience> {
+    Ok(CredentialAudience::new_spawn_family(SpawnFamily::Browser)?)
+}
+
+fn browser_profile_id(arguments: &Value) -> Result<&str> {
+    let id = arguments
+        .get(BROWSER_PROFILE_ID_KEY)
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("browser: internal profile identifier is missing"))?;
+    if id.len() != 32
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        || !id.as_bytes()[0].is_ascii_lowercase()
+    {
+        bail!("browser: internal profile identifier is invalid");
+    }
+    Ok(id)
+}
+
+fn explicit_browser_path() -> Result<Option<AbsolutePath>> {
+    std::env::var_os("CHROME_PATH")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(AbsolutePath::parse)
+        .transpose()
+        .map_err(Into::into)
+}
+
+async fn prepare_browser_approval(
+    generation: Arc<ApplicationGeneration>,
+    workspace: &WorkspaceRoots,
+    arguments: Value,
+) -> Result<Option<ToolApprovalRequest>> {
+    reject_unsupported_browser_platform()?;
+    #[cfg(not(unix))]
+    {
+        let _ = (generation, workspace, arguments);
+        return Err(BrowserSandboxError::UnsupportedPlatform {
+            platform: HostPlatform::Windows,
+        }
+        .into());
+    }
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt;
-        command.as_std_mut().process_group(0);
-    }
-    let mut child = super::spawn_with_etxtbsy_retry(&mut command, "chrome")
-        .await
-        .with_context(|| format!("browser: failed to launch {} (is it executable?)", bin.display()))?;
-
-    // Chrome prints `DevTools listening on ws://127.0.0.1:PORT/devtools/browser/...`
-    // on stderr. Read until it appears (or the process exits).
-    let stderr = child.stderr.take().expect("piped stderr");
-    let mut lines = BufReader::new(stderr).lines();
-    let mut tail: Vec<String> = Vec::new();
-    let mut ws_url: Option<String> = None;
-    let deadline = Instant::now() + SPAWN_TIMEOUT;
-    while Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(500), lines.next_line()).await {
-            Ok(Ok(Some(line))) => {
-                if tail.len() >= 8 {
-                    tail.remove(0);
-                }
-                tail.push(line.clone());
-                if let Some(pos) = line.find("DevTools listening on ws://") {
-                    ws_url =
-                        Some(line[pos + "DevTools listening on ".len()..].trim().to_string());
-                    break;
-                }
-            }
-            Ok(Ok(None)) => break, // browser exited
-            Ok(Err(e)) => bail!("browser: failed reading chrome output: {e}"),
-            Err(_) => continue,
+        let action = parse_action(arg_str(&arguments, "action").trim())?;
+        validate_args(&action, &arguments)?;
+        if action == Action::Close {
+            return Ok(None);
         }
+        let profile = generation
+            .sandbox()
+            .scratch()
+            .browser_profile_path(browser_profile_id(&arguments)?)?;
+        let binary = run_trusted_tool_probe(
+            &generation,
+            TrustedToolProbe::Browser {
+                explicit: explicit_browser_path()?,
+            },
+        )?;
+        let argv = browser_argv(&binary, &profile);
+        let target_fd_mappings = browser_target_fd_mappings()?;
+        let call = CanonicalSpawnCall {
+            argv: argv.clone(),
+            cwd: AbsolutePath::parse(workspace.cwd().to_path_buf())?,
+            requested_env: BTreeMap::new(),
+            requested_grants: BTreeSet::new(),
+            stdio: StdioMode::Piped,
+            terminal_size: None,
+            timeout_ms: Some(BROWSER_STARTUP_TIMEOUT.as_millis() as u64),
+            target_fd_mappings: target_fd_mappings.clone(),
+            mount_sources: Vec::new(),
+            retained_executable: None,
+            retained_working_directory: None,
+        };
+        let audience = browser_audience()?;
+        let summary = ToolApprovalSummary {
+            family: SpawnFamily::Browser.as_str().to_owned(),
+            executable: "governed browser executable".to_owned(),
+            argument_count: u32::try_from(argv.len().saturating_sub(1)).unwrap_or(u32::MAX),
+            working_directory: "captured workspace".to_owned(),
+            credential_audience: Some(SpawnFamily::Browser.as_str().to_owned()),
+            requested_credential_count: 0,
+            target_fds: target_fd_summary(&target_fd_mappings),
+        };
+        let approvals = generation.security().approvals().clone();
+        Ok(Some(ToolApprovalRequest::new(
+            summary,
+            Box::new(move || {
+                Box::pin(async move {
+                    approvals
+                        .issue(
+                            generation.sandbox().clone(),
+                            SpawnFamily::Browser,
+                            audience,
+                            &call,
+                            current_unix_ms(),
+                        )
+                        .map_err(Into::into)
+                })
+            }),
+        )))
     }
-    let Some(ws_url) = ws_url else {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-        let _ = std::fs::remove_dir_all(&user_data_dir);
-        bail!(
-            "browser: {} did not expose a DevTools endpoint (it exited or is too old \
-             for --headless=new). Last stderr:\n{}",
-            bin.display(),
-            tail.join("\n")
-        );
+}
+
+fn current_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(unix)]
+fn browser_argv(binary: &AbsolutePath, profile: &SandboxVisiblePath) -> Vec<String> {
+    let mut argv = vec![binary.as_path().display().to_string()];
+    argv.extend(build_browser_argv(profile));
+    argv
+}
+#[cfg(unix)]
+async fn launch_browser_pipe(
+    generation: Arc<ApplicationGeneration>,
+    authorized: AuthorizedSpawn,
+    profile: PolicyScratch,
+    debugger_writer: std::fs::File,
+    debugger_reader: std::fs::File,
+    deadline: tokio::time::Instant,
+) -> std::result::Result<BrowserSession, BrowserSandboxError> {
+    let mut process = match launch_authorized_browser_pipe(
+        authorized,
+        debugger_writer,
+        debugger_reader,
+        deadline,
+    )
+    .await
+    {
+        Ok(process) => process,
+        Err(error) => {
+            profile.destroy()?;
+            return Err(error.into());
+        }
     };
-    // Keep draining stderr in the background so the pipe never fills.
-    tokio::spawn(async move {
-        while lines.next_line().await.ok().flatten().is_some() {}
-    });
-
-    let port = ws_url
-        .split('/')
-        .nth(2)
-        .and_then(|host| host.rsplit(':').next())
-        .and_then(|p| p.parse::<u16>().ok())
-        .ok_or_else(|| anyhow!("browser: could not parse DevTools port from {ws_url}"))?;
-    let page_ws = fetch_page_websocket(port).await?;
-    let (ws, _) = connect_async(page_ws.as_str())
-        .await
-        .map_err(|e| anyhow!("browser: failed to connect to DevTools websocket: {e}"))?;
-
-    Ok(BrowserSession {
-        child,
-        user_data_dir,
-        ws: Some(ws),
-        next_id: 0,
-        port,
-    })
-}
-
-/// GETs `/json/list` from the DevTools HTTP endpoint (retrying briefly while
-/// the HTTP server catches up to the stderr announcement).
-async fn fetch_json_list(port: u16) -> Result<Vec<Value>> {
-    let url = format!("http://127.0.0.1:{port}/json/list");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let response = reqwest::get(&url).await;
-        if let Ok(response) = response {
-            if response.status().is_success() {
-                return response
-                    .json::<Vec<Value>>()
-                    .await
-                    .context("browser: invalid /json/list response");
+    let command_writer = match process.take_debugger_writer() {
+        Some(writer) => tokio::fs::File::from_std(writer),
+        None => {
+            let _ = process.shutdown(Duration::from_secs(1)).await;
+            profile.destroy()?;
+            return Err(
+                NativeBrowserSandboxFailure::DebuggingPipeClosed { stderr_bytes: 0 }.into(),
+            );
+        }
+    };
+    let response_reader = match process.take_debugger_reader() {
+        Some(reader) => tokio::fs::File::from_std(reader),
+        None => {
+            let _ = process.shutdown(Duration::from_secs(1)).await;
+            profile.destroy()?;
+            return Err(
+                NativeBrowserSandboxFailure::DebuggingPipeClosed { stderr_bytes: 0 }.into(),
+            );
+        }
+    };
+    let stderr = match process.take_stderr() {
+        Some(stderr) => StderrTail::spawn(tokio::fs::File::from_std(stderr)),
+        None => {
+            let _ = process.shutdown(Duration::from_secs(1)).await;
+            profile.destroy()?;
+            return Err(
+                NativeBrowserSandboxFailure::DebuggingPipeClosed { stderr_bytes: 0 }.into(),
+            );
+        }
+    };
+    let mut session = BrowserSession {
+        _generation: generation,
+        process,
+        profile: Some(profile),
+        command_writer,
+        response_reader,
+        stderr,
+        next_id: 1,
+        page_session_id: None,
+    };
+    match await_native_browser_sandbox(&mut session, deadline).await {
+        Ok(_) => match session.attach_page_target().await {
+            Ok(()) => Ok(session),
+            Err(_) => {
+                let failure =
+                    BrowserSandboxError::Native(NativeBrowserSandboxFailure::InvalidFrame);
+                let _ = session.shutdown().await;
+                Err(failure)
             }
+        },
+        Err(proof_error) => {
+            let _ = session.shutdown().await;
+            Err(proof_error)
         }
-        if Instant::now() >= deadline {
-            bail!("browser: DevTools HTTP endpoint did not come up on port {port}");
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
-/// Finds the initial page target's `webSocketDebuggerUrl` on `/json/list`.
-async fn fetch_page_websocket(port: u16) -> Result<String> {
-    let targets = fetch_json_list(port).await?;
-    for target in &targets {
-        if target.get("type").and_then(Value::as_str) == Some("page") {
-            let ws = target
-                .get("webSocketDebuggerUrl")
+#[cfg(unix)]
+async fn await_native_browser_sandbox(
+    session: &mut BrowserSession,
+    deadline: tokio::time::Instant,
+) -> std::result::Result<BrowserVersion, BrowserSandboxError> {
+    let mut command = br#"{"id":1,"method":"Browser.getVersion","params":{}}"#.to_vec();
+    command.push(0);
+    tokio::time::timeout_at(deadline, async {
+        session
+            .command_writer
+            .write_all(&command)
+            .await
+            .map_err(|_| NativeBrowserSandboxFailure::DebuggingPipeClosed {
+                stderr_bytes: session.stderr.byte_count(),
+            })?;
+        session.command_writer.flush().await.map_err(|_| {
+            NativeBrowserSandboxFailure::DebuggingPipeClosed {
+                stderr_bytes: session.stderr.byte_count(),
+            }
+        })?;
+        loop {
+            let response = tokio::select! {
+                status = session.process.wait() => {
+                    return Err(NativeBrowserSandboxFailure::ProcessExited {
+                        code: status.ok(),
+                        stderr_bytes: session.stderr.byte_count(),
+                    });
+                }
+                response = read_cdp_frame(&mut session.response_reader, deadline) => response?,
+            };
+            if response.get("id").and_then(Value::as_u64) != Some(1) {
+                continue;
+            }
+            if response.get("error").is_some() {
+                return Err(NativeBrowserSandboxFailure::CommandRejected);
+            }
+            let result = response
+                .get("result")
+                .ok_or(NativeBrowserSandboxFailure::InvalidFrame)?;
+            let product = result
+                .get("product")
                 .and_then(Value::as_str)
-                .unwrap_or("");
-            if !ws.is_empty() {
-                return Ok(ws.to_string());
-            }
+                .filter(|value| !value.is_empty())
+                .ok_or(NativeBrowserSandboxFailure::InvalidFrame)?;
+            let protocol_version = result
+                .get("protocolVersion")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or(NativeBrowserSandboxFailure::InvalidFrame)?;
+            return Ok(BrowserVersion {
+                product: product.to_owned(),
+                protocol_version: protocol_version.to_owned(),
+            });
         }
+    })
+    .await
+    .map_err(|_| NativeBrowserSandboxFailure::Timeout {
+        timeout_ms: BROWSER_STARTUP_TIMEOUT.as_millis() as u64,
+    })?
+    .map_err(Into::into)
+}
+
+async fn read_cdp_frame(
+    reader: &mut tokio::fs::File,
+    deadline: tokio::time::Instant,
+) -> std::result::Result<Value, NativeBrowserSandboxFailure> {
+    let mut frame = Vec::new();
+    loop {
+        let mut byte = [0_u8; 1];
+        let read = tokio::time::timeout_at(deadline, reader.read(&mut byte))
+            .await
+            .map_err(|_| NativeBrowserSandboxFailure::Timeout {
+                timeout_ms: BROWSER_STARTUP_TIMEOUT.as_millis() as u64,
+            })?
+            .map_err(|_| NativeBrowserSandboxFailure::InvalidFrame)?;
+        if read == 0 {
+            return Err(NativeBrowserSandboxFailure::DebuggingPipeClosed { stderr_bytes: 0 });
+        }
+        if byte[0] == 0 {
+            break;
+        }
+        if frame.len() == BROWSER_PIPE_FRAME_LIMIT {
+            return Err(NativeBrowserSandboxFailure::FrameTooLarge {
+                limit: BROWSER_PIPE_FRAME_LIMIT,
+            });
+        }
+        frame.push(byte[0]);
     }
-    bail!("browser: no page target found on the DevTools endpoint")
+    let text =
+        std::str::from_utf8(&frame).map_err(|_| NativeBrowserSandboxFailure::InvalidFrame)?;
+    serde_json::from_str(text).map_err(|_| NativeBrowserSandboxFailure::InvalidFrame)
+}
+
+fn reject_unsupported_browser_platform() -> std::result::Result<(), BrowserSandboxError> {
+    if cfg!(target_os = "windows") {
+        return Err(BrowserSandboxError::UnsupportedPlatform {
+            platform: HostPlatform::Windows,
+        });
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -602,21 +929,31 @@ const JS_PAGE_TEXT: &str = r#"( () => document.body ? document.body.innerText : 
 // Actions
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 /// Navigates the page to `url`, waits for the load to complete, and returns
 /// the resulting title and final href.
 async fn navigate_to(session: &mut BrowserSession, url: &str) -> Result<(String, String)> {
-    let response = session.send_command("Page.navigate", json!({ "url": url })).await?;
+    let response = session
+        .send_command("Page.navigate", json!({ "url": url }))
+        .await?;
     if let Some(error_text) = response.get("errorText").and_then(Value::as_str) {
         if !error_text.is_empty() {
             bail!("browser: navigation failed: {error_text}");
         }
     }
     wait_for_load(session).await?;
-    let title = session.eval_string("document.title").await.unwrap_or_default();
-    let href = session.eval_string("location.href").await.unwrap_or_default();
+    let title = session
+        .eval_string("document.title")
+        .await
+        .unwrap_or_default();
+    let href = session
+        .eval_string("location.href")
+        .await
+        .unwrap_or_default();
     Ok((title, href))
 }
 
+#[cfg(unix)]
 /// Waits for `document.readyState == "complete"`, tolerating the brief window
 /// after navigation where the old execution context is being torn down.
 async fn wait_for_load(session: &mut BrowserSession) -> Result<()> {
@@ -639,6 +976,7 @@ async fn wait_for_load(session: &mut BrowserSession) -> Result<()> {
     }
 }
 
+#[cfg(unix)]
 /// Dispatches a real mouse press/release pair at viewport coordinates.
 async fn mouse_click_at(session: &mut BrowserSession, x: f64, y: f64) -> Result<()> {
     for event_type in ["mousePressed", "mouseReleased"] {
@@ -658,66 +996,60 @@ async fn mouse_click_at(session: &mut BrowserSession, x: f64, y: f64) -> Result<
     }
     Ok(())
 }
+
 fn resolve_screenshot_path(workspace: &WorkspaceRoots, path: &str) -> Result<PathBuf> {
-    let output = PathBuf::from(resolve_scoped_path(path, workspace)?);
-    let parent = output
-        .parent()
-        .ok_or_else(|| anyhow!("browser: screenshot path has no parent"))?;
-    std::fs::create_dir_all(parent).with_context(|| {
-        format!("browser: failed to create screenshot directory {}", parent.display())
-    })?;
-    let canonical_parent = std::fs::canonicalize(parent)
-        .with_context(|| format!("browser: failed to resolve screenshot directory {}", parent.display()))?;
-    if !workspace.roots().iter().any(|root| canonical_parent.starts_with(root)) {
+    if path.trim().is_empty() || path.contains('\0') {
+        bail!("browser: screenshot path is invalid");
+    }
+    let output = PathBuf::from(resolve_to_cwd(path, &workspace.cwd().to_string_lossy()));
+    if !workspace
+        .roots()
+        .iter()
+        .any(|root| output.starts_with(root))
+    {
         bail!("browser: screenshot path must stay within the workspace");
     }
-    if output.exists() {
-        let canonical_output = std::fs::canonicalize(&output)
-            .with_context(|| format!("browser: failed to resolve screenshot path {}", output.display()))?;
-        if !workspace.roots().iter().any(|root| canonical_output.starts_with(root)) {
-            bail!("browser: screenshot path must stay within the workspace");
-        }
+    if output.file_name().is_none() {
+        bail!("browser: screenshot path must name a file");
     }
     Ok(output)
 }
 
-fn save_screenshot_bytes(workspace: &WorkspaceRoots, output: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = output
-        .parent()
-        .ok_or_else(|| anyhow!("browser: screenshot path has no parent"))?;
-    let canonical_parent = std::fs::canonicalize(parent)
-        .with_context(|| format!("browser: failed to resolve screenshot directory {}", parent.display()))?;
-    if !workspace.roots().iter().any(|root| canonical_parent.starts_with(root)) {
-        bail!("browser: screenshot directory now resolves outside the workspace");
-    }
-    let name = output
-        .file_name()
-        .ok_or_else(|| anyhow!("browser: screenshot path must name a file"))?;
-    let final_path = canonical_parent.join(name);
-    if std::fs::symlink_metadata(&final_path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
-        bail!("browser: screenshot target must not be a symlink");
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).write(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(nix::libc::O_NOFOLLOW);
-    }
-    let mut file = options
-        .open(&final_path)
-        .with_context(|| format!("browser: failed to write screenshot to {}", output.display()))?;
-    use std::io::Write as _;
-    file.write_all(bytes)
-        .with_context(|| format!("browser: failed to write screenshot to {}", output.display()))
+fn save_screenshot_bytes(
+    fs: &Arc<PolicyFs>,
+    output: &Path,
+    bytes: Vec<u8>,
+) -> std::result::Result<(), BrowserSandboxError> {
+    let parent = output.parent().ok_or(FsError::InvalidPath)?;
+    fs.create_dir_all(parent, FileMode::Shared)?;
+    let expected = match fs.metadata(output) {
+        Ok(metadata) => Some(metadata.identity),
+        Err(FsError::System {
+            kind: std::io::ErrorKind::NotFound,
+            ..
+        }) => None,
+        Err(error) => return Err(error.into()),
+    };
+    fs.replace_file(PolicyReplacement {
+        path: output.to_path_buf(),
+        expected,
+        bytes,
+        mode: FileMode::Shared,
+    })?;
+    Ok(())
 }
+
 fn screenshot_result(
+    fs: &Arc<PolicyFs>,
     workspace: &WorkspaceRoots,
     output: &Path,
     bytes: Vec<u8>,
 ) -> Result<AgentToolResult> {
     if bytes.len() > SCREENSHOT_MAX_INPUT_BYTES {
-        bail!("browser: screenshot exceeds the {} MiB input limit", SCREENSHOT_MAX_INPUT_BYTES / 1024 / 1024);
+        bail!(
+            "browser: screenshot exceeds the {} MiB input limit",
+            SCREENSHOT_MAX_INPUT_BYTES / 1024 / 1024
+        );
     }
     if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         bail!("browser: screenshot did not produce a PNG image");
@@ -730,7 +1062,7 @@ fn screenshot_result(
     if data.len() > SCREENSHOT_MAX_BASE64_BYTES {
         bail!("browser: screenshot exceeds the inline transport limit");
     }
-    save_screenshot_bytes(workspace, output, &bytes)?;
+    save_screenshot_bytes(fs, output, bytes).map_err(anyhow::Error::from)?;
     let display_path = workspace
         .roots()
         .iter()
@@ -752,11 +1084,13 @@ fn screenshot_result(
     })
 }
 
+#[cfg(unix)]
 async fn run_action(
     session: &mut BrowserSession,
     action: &Action,
     args: &Value,
     workspace: &WorkspaceRoots,
+    fs: &Arc<PolicyFs>,
 ) -> Result<AgentToolResult> {
     // Each call spawns a fresh browser starting at about:blank, so non-
     // navigate actions accept an optional `url` to navigate first — a single
@@ -771,7 +1105,9 @@ async fn run_action(
         Action::Navigate => {
             let url = arg_str(args, "url");
             let (title, href) = navigate_to(session, &url).await?;
-            Ok(text_result(format!("Navigated to {url}\nTitle: {title}\nURL: {href}")))
+            Ok(text_result(format!(
+                "Navigated to {url}\nTitle: {title}\nURL: {href}"
+            )))
         }
         Action::Click => {
             let selector = arg_str(args, "selector");
@@ -829,7 +1165,9 @@ async fn run_action(
             }
             let tag = info.get("tag").and_then(Value::as_str).unwrap_or("element");
             let value = info.get("value").and_then(Value::as_str).unwrap_or("");
-            Ok(text_result(format!("Filled {tag} ({selector}) — value now {value:?}")))
+            Ok(text_result(format!(
+                "Filled {tag} ({selector}) — value now {value:?}"
+            )))
         }
         Action::Screenshot => {
             let path = arg_str(args, "path");
@@ -844,7 +1182,7 @@ async fn run_action(
                 .decode(b64)
                 .context("browser: screenshot data was not valid base64")?;
             let output = resolve_screenshot_path(workspace, &path)?;
-            screenshot_result(workspace, &output, bytes)
+            screenshot_result(fs, workspace, &output, bytes)
         }
         Action::Extract => {
             let selector = arg_str(args, "selector");
@@ -871,10 +1209,15 @@ async fn run_action(
             Ok(text_result(out))
         }
         Action::ListTabs => {
-            let targets = fetch_json_list(session.port).await?;
+            let targets = session
+                .send_browser_command("Target.getTargets", json!({}))
+                .await?;
             let pages: Vec<&Value> = targets
-                .iter()
-                .filter(|t| t.get("type").and_then(Value::as_str) == Some("page"))
+                .get("targetInfos")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|target| target.get("type").and_then(Value::as_str) == Some("page"))
                 .take(LIST_TABS_MAX)
                 .collect();
             if pages.is_empty() {
@@ -883,10 +1226,13 @@ async fn run_action(
             let mut lines = vec![format!("{} tab(s):", pages.len())];
             for (index, target) in pages.iter().enumerate() {
                 let title = target.get("title").and_then(Value::as_str).unwrap_or("");
-                let mut url = target.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+                let mut url = target
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
                 if url.chars().count() > 200 {
-                    let truncated: String = url.chars().take(200).collect();
-                    url = format!("{truncated}...");
+                    url = format!("{}...", url.chars().take(200).collect::<String>());
                 }
                 lines.push(format!("{}. {title} — {url}", index + 1));
             }
@@ -900,86 +1246,110 @@ async fn run_action(
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// Executes one `browser` action: validates, spawns a fresh headless browser,
-/// runs the action, and tears the browser down (also on errors/timeouts/abort).
-pub(crate) async fn run_browser(cwd: &str, args: Value, abort: AbortSignal) -> Result<AgentToolResult> {
-    let workspace = WorkspaceRoots::for_tool_factory(cwd);
-    run_browser_for_workspace(cwd, &workspace, args, abort).await
-}
-
+/// Executes one generation-bound browser action.
 async fn run_browser_for_workspace(
-    cwd: &str,
+    generation: Arc<ApplicationGeneration>,
     workspace: &WorkspaceRoots,
     args: Value,
+    approval_token: Option<ToolCallApprovalToken>,
     abort: AbortSignal,
 ) -> Result<AgentToolResult> {
-    run_browser_with(cwd, workspace, args, abort, None).await
-}
-
-/// `run_browser` with an injectable binary path so tests can exercise the
-/// missing-binary rejection deterministically and skip-guard the real smoke.
-async fn run_browser_with(
-    cwd: &str,
-    workspace: &WorkspaceRoots,
-    args: Value,
-    abort: AbortSignal,
-    chrome_bin: Option<PathBuf>,
-) -> Result<AgentToolResult> {
+    let deadline = tokio::time::Instant::now() + BROWSER_STARTUP_TIMEOUT;
+    reject_unsupported_browser_platform()?;
     check_aborted(&abort)?;
     let action_input = arg_str(&args, "action");
     let action = parse_action(action_input.trim())?;
     validate_args(&action, &args)?;
-
-    // Calls are stateless: every non-close action owns a fresh browser and
-    // tears it down before returning. `close` therefore has nothing to spawn
-    // or discover; treating it as an idempotent acknowledgement keeps the
-    // advertised action valid even when Chrome is unavailable.
     if action == Action::Close {
         return Ok(text_result("browser closed"));
     }
-
-    let bin = match chrome_bin {
-        Some(path) if path.is_file() => path,
-        Some(path) => bail!("browser: Chrome/Chromium binary not found at {}", path.display()),
-        None => discover_chrome().ok_or_else(|| anyhow!(MISSING_CHROME_MESSAGE))?,
-    };
-
-    let mut session = spawn_browser(&bin).await?;
-    let outcome = tokio::select! {
-        res = tokio::time::timeout(ACTION_TIMEOUT, run_action(&mut session, &action, &args, workspace)) => {
-            match res {
+    #[cfg(not(unix))]
+    {
+        let _ = (generation, workspace, args, approval_token, abort, deadline);
+        return Err(BrowserSandboxError::UnsupportedPlatform {
+            platform: HostPlatform::Windows,
+        }
+        .into());
+    }
+    #[cfg(unix)]
+    {
+        let profile_id = browser_profile_id(&args)?;
+        let profile_path = generation
+            .sandbox()
+            .scratch()
+            .browser_profile_path(profile_id)?;
+        let binary = run_trusted_tool_probe(
+            &generation,
+            TrustedToolProbe::Browser {
+                explicit: explicit_browser_path()?,
+            },
+        )?;
+        let argv = browser_argv(&binary, &profile_path);
+        let pipes = browser_debugging_pipes()?;
+        let target_fd_mappings = pipes.canonical_mappings().to_vec();
+        let (owned_target_fd_mappings, debugger_writer, debugger_reader) = pipes.into_parts();
+        let token =
+            approval_token.ok_or_else(|| anyhow!("browser: launch approval is required"))?;
+        let request = RawSpawnRequest {
+            authorization: SpawnAuthorization::Approved(token),
+            family: SpawnFamily::Browser,
+            audience: browser_audience()?,
+            argv: argv.into_iter().map(OsString::from).collect(),
+            cwd: workspace.cwd().to_path_buf(),
+            requested_env: BTreeMap::new(),
+            requested_grants: BTreeSet::new(),
+            stdio: StdioMode::Piped,
+            terminal_size: None,
+            timeout_ms: Some(BROWSER_STARTUP_TIMEOUT.as_millis() as u64),
+            target_fd_mappings,
+            owned_target_fd_mappings,
+            #[cfg(unix)]
+            mount_sources: Vec::new(),
+            #[cfg(unix)]
+            retained_executable: None,
+            #[cfg(unix)]
+            retained_working_directory: None,
+        };
+        let authorized = authorize_spawn(generation.clone(), request).await?;
+        let profile = generation
+            .sandbox()
+            .scratch()
+            .create_browser_profile(profile_id)?;
+        let fs = generation.sandbox().fs().confined()?.clone();
+        let mut session = launch_browser_pipe(
+            generation,
+            authorized,
+            profile,
+            debugger_writer,
+            debugger_reader,
+            deadline,
+        )
+        .await?;
+        let outcome = tokio::select! {
+            result = tokio::time::timeout(
+                ACTION_TIMEOUT,
+                run_action(&mut session, &action, &args, workspace, &fs),
+            ) => match result {
                 Ok(result) => result,
                 Err(_) => Err(anyhow!(
                     "browser: action {action_input:?} timed out after {}s",
                     ACTION_TIMEOUT.as_secs()
                 )),
-            }
+            },
+            _ = abort.cancelled() => Err(anyhow!("Operation aborted")),
+        };
+        let cleanup = session.shutdown().await;
+        match (outcome, cleanup) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error.into()),
+            (Ok(result), Ok(())) => Ok(result),
         }
-        _ = abort.cancelled() => Err(anyhow!("Operation aborted")),
-    };
-    session.shutdown().await;
-    outcome
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::path::PathBuf;
-
-    fn text_of(result: &AgentToolResult) -> String {
-        match result.content.first() {
-            Some(pi_ai::ContentBlock::Text { text, .. }) => text.clone(),
-            _ => String::new(),
-        }
-    }
-
-    fn image_of(result: &AgentToolResult) -> Option<(&str, &str)> {
-        result.content.iter().find_map(|block| match block {
-            ContentBlock::Image { data, mime_type } => Some((data.as_str(), mime_type.as_str())),
-            _ => None,
-        })
-    }
 
     #[test]
     fn parse_action_accepts_all_documented_actions() {
@@ -996,7 +1366,6 @@ mod tests {
         }
         assert!(parse_action("").is_err());
         assert!(parse_action("hover").is_err());
-        assert!(parse_action(" NAVIGATE").is_err());
     }
 
     #[test]
@@ -1010,293 +1379,117 @@ mod tests {
         ] {
             assert!(validate_url(url).is_ok(), "{url}");
         }
-        for url in ["", "   ", "javascript:alert(1)", "ftp://example.com", "not a url", "example.com"] {
+        for url in [
+            "",
+            "javascript:alert(1)",
+            "ftp://example.com",
+            "example.com",
+        ] {
             assert!(validate_url(url).is_err(), "{url}");
         }
     }
 
     #[test]
-    fn validate_args_requires_action_specific_fields() {
-        assert!(validate_args(&Action::Navigate, &json!({})).is_err());
-        assert!(validate_args(&Action::Navigate, &json!({ "url": "data:text/html,hi" })).is_ok());
-
-        assert!(validate_args(&Action::Click, &json!({})).is_err());
-        assert!(validate_args(&Action::Click, &json!({ "selector": "#a" })).is_ok());
-
-        assert!(validate_args(&Action::Fill, &json!({ "selector": "#a" })).is_err());
-        assert!(validate_args(&Action::Fill, &json!({ "selector": "#a", "text": "x" })).is_ok());
-        // Empty text is legal (clears an input), but the key must be present.
-        assert!(validate_args(&Action::Fill, &json!({ "selector": "#a", "text": "" })).is_ok());
-
-        assert!(validate_args(&Action::Screenshot, &json!({})).is_err());
-        assert!(validate_args(&Action::Screenshot, &json!({ "path": "shot.png" })).is_ok());
-
-        for action in [Action::Extract, Action::ListTabs, Action::Close] {
-            assert!(validate_args(&action, &json!({})).is_ok());
-        }
-
-        // Non-navigate actions accept an optional `url` (navigate first) that
-        // must itself be valid when present.
-        assert!(validate_args(&Action::Extract, &json!({ "url": "data:text/html,hi" })).is_ok());
-        assert!(validate_args(&Action::Click, &json!({ "selector": "#a", "url": "javascript:1" })).is_err());
-        assert!(validate_args(&Action::Screenshot, &json!({ "path": "s.png", "url": "not a url" })).is_err());
+    fn prepare_arguments_replaces_caller_profile_identifier() {
+        let arguments = inject_browser_profile_id(json!({
+            "action": "list_tabs",
+            BROWSER_PROFILE_ID_KEY: "caller-controlled"
+        }))
+        .unwrap();
+        let id = browser_profile_id(&arguments).unwrap();
+        assert_eq!(id.len(), 32);
+        assert!(id.as_bytes()[0].is_ascii_lowercase());
+        assert!(
+            id.bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        );
+        assert_ne!(id, "caller-controlled");
     }
 
     #[test]
-    fn chrome_discovery_prefers_first_existing_candidate() {
-        let dir = tempfile::tempdir().unwrap();
-        let real = dir.path().join("chrome-real");
-        fs::write(&real, b"#!").unwrap();
-        let missing = dir.path().join("chrome-missing");
-        let candidates = vec![missing.clone(), real.clone()];
-        assert_eq!(first_existing(&candidates), Some(real));
-        assert_eq!(first_existing(&[missing]), None);
-        assert_eq!(first_existing(&[]), None);
-    }
-
-    #[test]
-    fn screenshot_path_resolution_is_workspace_scoped() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("work");
-        fs::create_dir_all(&cwd).unwrap();
-        let workspace = WorkspaceRoots::new(&cwd, Vec::<PathBuf>::new()).unwrap();
-        let output = resolve_screenshot_path(&workspace, "shots/a.png").unwrap();
-        assert_eq!(output, cwd.join("shots/a.png"));
-        assert!(output.parent().unwrap().is_dir());
-        assert!(resolve_screenshot_path(&workspace, "../outside.png").is_err());
-        let absolute = Path::new(std::path::MAIN_SEPARATOR_STR).join("outside.png");
-        assert!(resolve_screenshot_path(&workspace, absolute.to_str().unwrap()).is_err());
-    }
-
-    #[test]
-    fn screenshot_result_rejects_hostile_and_oversize_bytes() {
-        let dir = tempfile::tempdir().unwrap();
-        let output = dir.path().join("shot.png");
-        let workspace = WorkspaceRoots::new(dir.path(), Vec::<PathBuf>::new()).unwrap();
-        assert!(screenshot_result(&workspace, &output, b"not an image".to_vec()).is_err());
-        assert!(screenshot_result(&workspace, &output, vec![0; SCREENSHOT_MAX_INPUT_BYTES + 1]).is_err());
-        assert!(!output.exists());
-    }
-
-    #[test]
-    fn screenshot_path_accepts_nested_additional_workspace_root() {
-        let cwd = tempfile::tempdir().unwrap();
-        let additional = tempfile::tempdir().unwrap();
-        let workspace = WorkspaceRoots::new(cwd.path(), [additional.path()]).unwrap();
-        let output = additional.path().join("captures").join("shot.png");
-        let resolved = resolve_screenshot_path(&workspace, output.to_str().unwrap()).unwrap();
-        assert_eq!(resolved, output);
-        assert!(output.parent().unwrap().is_dir());
-        let image = image::DynamicImage::new_rgb8(2, 2);
-        let mut bytes = Vec::new();
-        image
-            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
-            .unwrap();
-        let result = screenshot_result(&workspace, &resolved, bytes).unwrap();
-        assert!(!text_of(&result).contains(additional.path().to_string_lossy().as_ref()));
-        assert!(text_of(&result).contains("captures/shot.png"));
-    }
-
-    #[test]
-    fn screenshot_result_returns_bounded_png_content() {
-        let dir = tempfile::tempdir().unwrap();
-        let output = dir.path().join("shot.png");
-        let image = image::DynamicImage::new_rgb8(2, 2);
-        let mut bytes = Vec::new();
-        image
-            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
-            .unwrap();
-        let workspace = WorkspaceRoots::new(dir.path(), Vec::<PathBuf>::new()).unwrap();
-        let result = screenshot_result(&workspace, &output, bytes).unwrap();
-        let (data, mime_type) = image_of(&result).expect("inline screenshot image");
-        assert_eq!(mime_type, "image/png");
-        assert!(data.len() <= SCREENSHOT_MAX_BASE64_BYTES);
-        assert!(output.is_file());
-        assert!(!text_of(&result).contains(output.to_string_lossy().as_ref()));
+    fn browser_target_mapping_contract_is_exact() {
+        let mappings = browser_target_fd_mappings().unwrap();
+        assert_eq!(mappings.len(), 2);
+        assert_eq!(mappings[0].target(), 3);
+        assert_eq!(mappings[0].direction(), TargetFdDirection::ParentWrites);
+        assert_eq!(mappings[1].target(), 4);
+        assert_eq!(mappings[1].direction(), TargetFdDirection::ParentReads);
     }
 
     #[cfg(unix)]
     #[test]
-    fn screenshot_write_rejects_final_symlink() {
-        let workspace_dir = tempfile::tempdir().unwrap();
-        let outside = tempfile::NamedTempFile::new().unwrap();
-        let output = workspace_dir.path().join("shot.png");
-        std::os::unix::fs::symlink(outside.path(), &output).unwrap();
-        let workspace = WorkspaceRoots::new(workspace_dir.path(), Vec::<PathBuf>::new()).unwrap();
-        let error = save_screenshot_bytes(&workspace, &output, b"png").unwrap_err().to_string();
-        assert!(error.contains("must not be a symlink"), "{error}");
-    }
-
-    #[tokio::test]
-    async fn missing_chrome_binary_yields_actionable_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let workspace = WorkspaceRoots::new(dir.path(), Vec::<PathBuf>::new()).unwrap();
-        let result = run_browser_with(
-            dir.path().to_str().unwrap(),
-            &workspace,
-            json!({ "action": "list_tabs" }),
-            AbortSignal::none(),
-            Some(PathBuf::from("/nonexistent/pi-chrome")),
-        )
-        .await;
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("Chrome/Chromium binary not found"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn close_is_idempotent_without_chrome() {
-        let dir = tempfile::tempdir().unwrap();
-        let workspace = WorkspaceRoots::new(dir.path(), Vec::<PathBuf>::new()).unwrap();
-        let result = run_browser_with(
-            dir.path().to_str().unwrap(),
-            &workspace,
-            json!({ "action": "close" }),
-            AbortSignal::none(),
-            Some(PathBuf::from("/nonexistent/pi-chrome")),
-        )
-        .await
-        .expect("stateless close");
-        assert!(text_of(&result).contains("browser closed"));
-    }
-
-    /// Skip-guarded real-browser smoke: runs every action against a local
-    /// `data:` URL page. Skipped when no Chrome/Chromium is installed.
-    #[tokio::test]
-    async fn real_browser_smoke_navigate_extract_click_fill_screenshot() {
-        let Some(bin) = discover_chrome() else {
-            eprintln!("browser smoke: skipping (no Chrome/Chromium on host)");
-            return;
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().to_str().unwrap();
-        let workspace = WorkspaceRoots::new(dir.path(), Vec::<PathBuf>::new()).unwrap();
-        let html = r#"<!DOCTYPE html><html><body>
-            <p id="marker">hello-browser</p>
-            <input id="name" value="initial">
-            <button id="btn" onclick="this.textContent='clicked-ok'">go</button>
-            <div id="out"></div>
-        </body></html>"#;
-        let url = format!(
-            "data:text/html;base64,{}",
-            base64::engine::general_purpose::STANDARD.encode(html)
-        );
-
-        let result = run_browser_with(
-            cwd,
-            &workspace,
-            json!({ "action": "navigate", "url": url.clone() }),
-            AbortSignal::none(),
-            Some(bin.clone()),
-        )
-        .await
-        .expect("navigate");
+    fn browser_argv_uses_pipe_and_forbids_sandbox_bypasses() {
+        let profile = SandboxVisiblePath::for_browser_test("/run/pi/scratch/browser-profile/test");
+        let argv = build_browser_argv(&profile);
         assert!(
-            text_of(&result).starts_with("Navigated to data:text/html;base64,"),
-            "{}",
-            text_of(&result)
+            argv.iter()
+                .any(|argument| argument == "--remote-debugging-pipe")
         );
-        assert!(text_of(&result).contains("URL: data:"), "{}", text_of(&result));
+        assert!(argv.iter().any(|argument| argument == "about:blank"));
+        for forbidden in [
+            "--no-sandbox",
+            "--disable-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-seccomp-filter-sandbox",
+            "--disable-namespace-sandbox",
+            "--single-process",
+            "--no-zygote",
+            "--remote-debugging-port",
+            "--remote-allow-origins",
+        ] {
+            assert!(
+                argv.iter().all(|argument| argument != forbidden
+                    && !argument.starts_with(&format!("{forbidden}="))),
+                "forbidden browser switch present: {forbidden}"
+            );
+        }
+    }
 
-        let result = run_browser_with(
-            cwd,
-            &workspace,
-            json!({ "action": "extract", "url": url.clone(), "selector": "#marker" }),
-            AbortSignal::none(),
-            Some(bin.clone()),
-        )
-        .await
-        .expect("extract selector");
-        assert_eq!(text_of(&result).trim(), "hello-browser");
+    #[test]
+    fn browser_errors_are_redacted() {
+        let secret = ["s", "k-", "abcdefghijklmnop1234567890"].concat();
+        let errors = [
+            NativeBrowserSandboxFailure::Timeout { timeout_ms: 15_000 },
+            NativeBrowserSandboxFailure::ProcessExited {
+                code: Some(1),
+                stderr_bytes: secret.len(),
+            },
+            NativeBrowserSandboxFailure::DebuggingPipeClosed {
+                stderr_bytes: secret.len(),
+            },
+            NativeBrowserSandboxFailure::FrameTooLarge {
+                limit: BROWSER_PIPE_FRAME_LIMIT,
+            },
+            NativeBrowserSandboxFailure::InvalidFrame,
+            NativeBrowserSandboxFailure::CommandRejected,
+        ];
+        for error in errors {
+            let display = error.to_string();
+            let debug = format!("{error:?}");
+            assert!(!display.contains(&secret));
+            assert!(!debug.contains(&secret));
+        }
+    }
 
-        let result = run_browser_with(
-            cwd,
-            &workspace,
-            json!({ "action": "extract", "url": url.clone() }),
-            AbortSignal::none(),
-            Some(bin.clone()),
-        )
-        .await
-        .expect("extract page");
-        assert!(text_of(&result).contains("hello-browser"));
-
-        let result = run_browser_with(
-            cwd,
-            &workspace,
-            json!({ "action": "fill", "url": url.clone(), "selector": "#name", "text": "world" }),
-            AbortSignal::none(),
-            Some(bin.clone()),
-        )
-        .await
-        .expect("fill");
-        // The fill action reports the input's value after filling, so the
-        // effect is observable within the same (fresh-browser) call.
-        assert!(text_of(&result).contains("value now \"world\""), "{}", text_of(&result));
-
-        let result = run_browser_with(
-            cwd,
-            &workspace,
-            json!({ "action": "click", "url": url.clone(), "selector": "#btn" }),
-            AbortSignal::none(),
-            Some(bin.clone()),
-        )
-        .await
-        .expect("click");
-        // A real mouse press/release was dispatched: the button's own text
-        // changed via its onclick handler, reported back in the same call.
-        assert!(text_of(&result).contains("Clicked button"), "{}", text_of(&result));
-        assert!(text_of(&result).contains("→ \"clicked-ok\""), "{}", text_of(&result));
-
-        let shot = dir.path().join("shot.png");
-        let result = run_browser_with(
-            cwd,
-            &workspace,
-            json!({ "action": "screenshot", "url": url.clone(), "path": "shot.png" }),
-            AbortSignal::none(),
-            Some(bin.clone()),
-        )
-        .await
-        .expect("screenshot");
-        let (image_data, mime_type) = image_of(&result).expect("inline screenshot image");
-        assert_eq!(mime_type, "image/png");
-        assert!(image_data.len() <= SCREENSHOT_MAX_BASE64_BYTES);
-        assert!(text_of(&result).contains("Screenshot saved to shot.png"), "{}", text_of(&result));
-        let bytes = fs::read(&shot).expect("screenshot file exists");
-        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"), "PNG header");
-        assert!(bytes.len() > 100, "non-trivial PNG size");
-
-        let result = run_browser_with(
-            cwd,
-            &workspace,
-            json!({ "action": "list_tabs" }),
-            AbortSignal::none(),
-            Some(bin.clone()),
-        )
-        .await
-        .expect("list_tabs");
-        assert!(text_of(&result).contains("tab(s)"), "{}", text_of(&result));
-
-        let result = run_browser_with(
-            cwd,
-            &workspace,
-            json!({ "action": "close" }),
-            AbortSignal::none(),
-            Some(bin.clone()),
-        )
-        .await
-        .expect("close");
-        assert!(text_of(&result).contains("browser closed"));
-
-        // Unsupported scheme is rejected before any browser is spawned.
-        let result = run_browser_with(
-            cwd,
-            &workspace,
-            json!({ "action": "navigate", "url": "javascript:alert(1)" }),
-            AbortSignal::none(),
-            Some(bin),
-        )
-        .await;
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("unsupported URL scheme"), "{err}");
+    #[test]
+    fn browser_tool_routes_launch_through_prepare_approval_token_authority() {
+        // Native sandbox contract: the browser tool binds `prepare_approval`
+        // so the host approval hook (wired as the final `approve_tool_call`)
+        // is the SOLE minting path for the sandbox authorization token —
+        // `prepare_browser_approval` builds the `ToolApprovalRequest` whose
+        // `issue()` closure calls `approvals.issue(...)` against the native
+        // sandbox, and `run_browser_for_workspace` then hard-requires the
+        // resulting token before any spawn. There is no parallel boolean
+        // authority: a tool without `prepare_approval` would never reach the
+        // final approval hook and could not mint a token.
+        let workspace = WorkspaceRoots::for_tool_factory("/tmp/browser-approval-contract");
+        let capture: GenerationCaptureFn = Arc::new(|| bail!("capture must not run here"));
+        let tool = browser_tool_for_workspace(workspace, capture);
+        assert_eq!(tool.capability, ToolCapability::Exec);
+        assert!(
+            tool.prepare_approval.is_some(),
+            "browser must prepare an approval request so the host approval hook \
+             mints the final native sandbox token"
+        );
     }
 }

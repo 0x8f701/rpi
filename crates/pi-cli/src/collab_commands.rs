@@ -49,10 +49,7 @@ impl CollabHost {
     }
 }
 
-pub async fn execute(
-    host: Option<&CollabHost>,
-    invocation: CollabInvocation,
-) -> Result<String> {
+pub async fn execute(host: Option<&CollabHost>, invocation: CollabInvocation) -> Result<String> {
     let host = host.ok_or_else(|| anyhow!("/collab requires --listen"))?;
     host.execute(invocation).await
 }

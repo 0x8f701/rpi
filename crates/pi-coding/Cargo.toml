@@ -6,23 +6,33 @@ license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[[test]]
+name = "sandbox_confined"
+path = "tests/sandbox_confined.rs"
+harness = false
+
 [dependencies]
 anyhow.workspace = true
+arc-swap.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 brush-builtins = "0.2"
+brush-parser = "0.4"
 brush-core.workspace = true
 cap-fs-ext.workspace = true
 cap-std.workspace = true
+rustix.workspace = true
 chrono.workspace = true
 globset.workspace = true
 futures-util.workspace = true
 ignore.workspace = true
+http.workspace = true
 lsp-types.workspace = true
 image.workspace = true
 parking_lot.workspace = true
 pi-ai.workspace = true
 pi-agent.workspace = true
+pi-sandbox.workspace = true
 nix.workspace = true
 regex.workspace = true
 reqwest.workspace = true
@@ -46,6 +56,8 @@ url.workspace = true
 ast-grep-core.workspace = true
 ast-grep-language.workspace = true
 walkdir.workspace = true
+agent-loader.workspace = true
+notify.workspace = true
 tar.workspace = true
 flate2.workspace = true
 cpal = { workspace = true, optional = true }
@@ -57,9 +69,14 @@ cpal = { workspace = true, optional = true }
 # and settings all work — but mic capture reports an actionable
 # "not compiled in" error.
 live-capture = ["dep:cpal"]
+# Cross-crate protocol-owner tests in pi-cli need to inject synthetic
+# ApplicationEvent values into the existing broadcast channel. This exposes
+# only a test sender; production builds do not enable it.
+test-support = []
 
 [dev-dependencies]
 tempfile.workspace = true
+syn.workspace = true
 
 [lints]
 workspace = true

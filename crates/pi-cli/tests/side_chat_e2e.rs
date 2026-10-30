@@ -35,8 +35,9 @@ use pi_cli::side_chat::{
 use pi_cli::side_chat_panel::render_side_chat_panel;
 use pi_cli::theme;
 use pi_coding::{
-    Application, RequestAuth, Session, SessionAuthResolver, SessionOptions, TodoItem, TodoPhase,
-    TodoStatus, create_all_tools, create_coding_tools, tools_include_mutation,
+    Application, ApplicationRuntimeCandidate, RequestAuth, RequestAuthKind, ResourceDiscovery,
+    ResourceManager, ResourceManagerOptions, Session, SessionAuthResolver, SessionOptions,
+    TodoItem, TodoPhase, TodoStatus, ToolSelection, WorkspaceRoots, tools_include_mutation,
 };
 use ratatui::{Terminal, backend::TestBackend};
 use serde_json::json;
@@ -267,21 +268,62 @@ fn session_options(model: Model, cwd: &Path, stream_fn: Option<StreamFn>) -> Ses
         api_key: "faux-side-chat".into(),
         compaction: None,
         stream_options: Default::default(),
-        tools: Some(create_coding_tools(&cwd.to_string_lossy())),
+        tools: None,
         before_tool_call: None,
         after_tool_call: None,
         stream_fn,
         auth_resolver: None,
+        auth_manager: None,
     }
+}
+
+async fn hermetic_session(options: SessionOptions, cwd: &Path, session_dir: &Path) -> (TempDir, Session) {
+    fs::create_dir_all(session_dir).expect("session directory");
+    let agent_dir = TempDir::new().expect("agent directory");
+    fs::write(
+        agent_dir.path().join("settings.json"),
+        r#"{"sandbox":{"mode":"danger-full-access"},"orchestration":{"todo":false}}"#,
+    )
+    .expect("hermetic settings");
+    let workspace = WorkspaceRoots::new(cwd, Vec::<PathBuf>::new()).expect("workspace roots");
+    let session = Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
+        options,
+        Vec::new(),
+        ToolSelection::default(),
+        ResourceDiscovery::Disabled,
+        workspace,
+        None,
+    )
+    .expect("session");
+    session.set_session_dir(session_dir.to_path_buf());
+    let mut resource_options = ResourceManagerOptions::new(cwd);
+    resource_options.agent_dir = agent_dir.path().to_path_buf();
+    resource_options.project_trust_override = Some(true);
+    resource_options.disable_extensions = true;
+    resource_options.disable_skills = true;
+    resource_options.disable_prompt_templates = true;
+    resource_options.disable_themes = true;
+    resource_options.disable_context_files = true;
+    session
+        .attach_resources(ResourceManager::new(resource_options).expect("resources"))
+        .await
+        .expect("attach resources");
+    (agent_dir, session)
+}
+
+async fn publish_application(session: Session) -> Application {
+    Application::from_runtime_candidate(ApplicationRuntimeCandidate::new(session))
+        .await
+        .expect("publish application")
 }
 
 fn test_model(label: &str) -> Model {
     Model {
         id: format!("{label}-model"),
         name: format!("{label} Model"),
-        api: unique(&format!("{label}-api")),
+        api: "openai-completions".to_owned(),
         provider: unique(&format!("{label}-provider")),
-        base_url: "http://localhost:0".into(),
+        base_url: "http://127.0.0.1:1".into(),
         ..Model::default()
     }
 }
@@ -290,13 +332,18 @@ async fn application_with_history(
     cwd: &Path,
     history: Vec<Message>,
     stream_fn: Option<StreamFn>,
-) -> Application {
-    let session =
-        Session::new(session_options(test_model("side"), cwd, stream_fn)).expect("session");
+) -> (TempDir, Application) {
+    let session_dir = cwd.join(".side-chat-test-sessions");
+    let (agent_dir, session) = hermetic_session(
+        session_options(test_model("side"), cwd, stream_fn),
+        cwd,
+        &session_dir,
+    )
+    .await;
     if !history.is_empty() {
         session.load_history(history).await.expect("load history");
     }
-    Application::new(session).await
+    (agent_dir, publish_application(session).await)
 }
 
 async fn recorded_application(
@@ -305,9 +352,14 @@ async fn recorded_application(
     session_id: &str,
     history: Vec<Message>,
     stream_fn: Option<StreamFn>,
-) -> (Application, PathBuf) {
+) -> (TempDir, Application, PathBuf) {
     let model = test_model("recorded-side");
-    let session = Session::new(session_options(model.clone(), cwd, stream_fn)).expect("session");
+    let (agent_dir, session) = hermetic_session(
+        session_options(model.clone(), cwd, stream_fn),
+        cwd,
+        session_dir,
+    )
+    .await;
     let recorder = pi_coding::start_session_in(
         cwd,
         Some(&model),
@@ -322,7 +374,7 @@ async fn recorded_application(
     if !history.is_empty() {
         session.load_history(history).await.expect("load history");
     }
-    (Application::new(session).await, path)
+    (agent_dir, publish_application(session).await, path)
 }
 
 async fn wait_until<F>(mut predicate: F, timeout: Duration) -> bool
@@ -409,7 +461,7 @@ async fn fork_copies_main_context_without_mutating_main_identity_or_file() {
         Message::user_text("main alpha", 1),
         Message::user_text("main beta", 2),
     ];
-    let (application, session_path) = recorded_application(
+    let (_agent_dir, application, session_path) = recorded_application(
         cwd.path(),
         session_dir.path(),
         &session_id,
@@ -444,7 +496,7 @@ async fn fork_copies_main_context_without_mutating_main_identity_or_file() {
     // Side prompt + editor activity stay local.
     side.handle_paste("editor only");
     assert_eq!(side.editor_text(), "editor only");
-    side.submit_prompt("side-only prompt");
+    side.submit_prompt("side-only prompt", Vec::new());
     assert!(
         side.entries()
             .iter()
@@ -480,7 +532,7 @@ async fn independent_transcript_editor_stream_events_and_abort() {
         release.clone(),
         calls.clone(),
     );
-    let application = application_with_history(
+    let (_agent_dir, application) = application_with_history(
         cwd.path(),
         vec![Message::user_text("shared root", 1)],
         Some(stream),
@@ -502,7 +554,7 @@ async fn independent_transcript_editor_stream_events_and_abort() {
     );
 
     // Independent stream + events.
-    side.submit_prompt("stream please");
+    side.submit_prompt("stream please", Vec::new());
     assert!(side.is_streaming(), "submit should mark side streaming");
     assert!(
         wait_until(
@@ -554,7 +606,7 @@ async fn independent_transcript_editor_stream_events_and_abort() {
 #[tokio::test]
 async fn read_only_default_exposes_peek_main_without_write_or_exec() {
     let cwd = TempDir::new().expect("cwd");
-    let application = application_with_history(cwd.path(), Vec::new(), None).await;
+    let (_agent_dir, application) = application_with_history(cwd.path(), Vec::new(), None).await;
     let side = SideChatController::fork_from(&application)
         .await
         .expect("fork");
@@ -599,7 +651,7 @@ async fn read_only_default_exposes_peek_main_without_write_or_exec() {
 #[tokio::test]
 async fn ctrl_t_toggles_edit_mode_with_warning_then_restores_readonly() {
     let cwd = TempDir::new().expect("cwd");
-    let application = application_with_history(cwd.path(), Vec::new(), None).await;
+    let (_agent_dir, application) = application_with_history(cwd.path(), Vec::new(), None).await;
     let mut side = SideChatController::fork_from(&application)
         .await
         .expect("fork");
@@ -679,7 +731,7 @@ async fn ctrl_t_is_rejected_while_streaming_and_tools_stay_in_sync_with_status()
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let calls = Arc::new(AtomicUsize::new(0));
-    let application = application_with_history(
+    let (_agent_dir, application) = application_with_history(
         cwd.path(),
         Vec::new(),
         Some(gated_reply_stream(
@@ -695,7 +747,7 @@ async fn ctrl_t_is_rejected_while_streaming_and_tools_stay_in_sync_with_status()
         .expect("fork");
     side.toggle_tool_mode().await.expect("enter edit mode");
     assert!(side.tool_mode().is_edit());
-    side.submit_prompt("hold edit tools");
+    side.submit_prompt("hold edit tools", Vec::new());
     assert!(
         wait_until(
             || {
@@ -712,13 +764,19 @@ async fn ctrl_t_is_rejected_while_streaming_and_tools_stay_in_sync_with_status()
     let ctrl_t = key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL);
     assert_eq!(side.handle_key(ctrl_t), SideChatAction::Handled);
     assert_eq!(side.key_needs_async(ctrl_t), SideChatAsyncRequest::None);
-    side.toggle_tool_mode().await.expect("guarded direct toggle");
-    assert!(side.tool_mode().is_edit(), "active turn must retain edit mode");
+    side.toggle_tool_mode()
+        .await
+        .expect("guarded direct toggle");
+    assert!(
+        side.tool_mode().is_edit(),
+        "active turn must retain edit mode"
+    );
     let active_caps = side.tool_capabilities().await;
     assert!(
-        active_caps
-            .iter()
-            .any(|(_, capability)| matches!(capability, ToolCapability::Write | ToolCapability::Exec)),
+        active_caps.iter().any(|(_, capability)| matches!(
+            capability,
+            ToolCapability::Write | ToolCapability::Exec
+        )),
         "active turn tools changed behind its captured context: {active_caps:?}"
     );
     assert!(
@@ -745,7 +803,7 @@ async fn ctrl_t_is_rejected_while_streaming_and_tools_stay_in_sync_with_status()
 #[tokio::test]
 async fn peek_main_is_visible_and_read_only() {
     let cwd = TempDir::new().expect("cwd");
-    let application = application_with_history(
+    let (_agent_dir, application) = application_with_history(
         cwd.path(),
         vec![
             Message::user_text("visible-one", 1),
@@ -791,13 +849,18 @@ async fn peek_main_is_visible_and_read_only() {
 #[tokio::test]
 async fn peek_main_unrecorded_since_fork_returns_new_active_history() {
     let cwd = TempDir::new().expect("cwd");
-    let session = Session::new(session_options(test_model("unrecorded-peek"), cwd.path(), None))
-        .expect("session");
+    let session_dir = cwd.path().join("sessions");
+    let (_agent_dir, session) = hermetic_session(
+        session_options(test_model("unrecorded-peek"), cwd.path(), None),
+        cwd.path(),
+        &session_dir,
+    )
+    .await;
     session
         .load_history(vec![Message::user_text("before fork", 1)])
         .await
         .expect("initial history");
-    let application = Application::new(session.clone()).await;
+    let application = publish_application(session.clone()).await;
     let side = SideChatController::fork_from(&application)
         .await
         .expect("fork");
@@ -823,7 +886,7 @@ async fn esc_aborts_while_streaming_and_closes_when_idle() {
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let calls = Arc::new(AtomicUsize::new(0));
-    let application = application_with_history(
+    let (_agent_dir, application) = application_with_history(
         cwd.path(),
         Vec::new(),
         Some(gated_reply_stream(
@@ -844,7 +907,7 @@ async fn esc_aborts_while_streaming_and_closes_when_idle() {
     assert_eq!(side.key_needs_async(esc), SideChatAsyncRequest::None);
 
     // Streaming Esc aborts rather than closing.
-    side.submit_prompt("hold this stream");
+    side.submit_prompt("hold this stream", Vec::new());
     assert!(
         wait_until(
             || {
@@ -887,7 +950,7 @@ async fn abort_preserves_unpolled_stream_text_and_reaches_idle() {
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let calls = Arc::new(AtomicUsize::new(0));
-    let application = application_with_history(
+    let (_agent_dir, application) = application_with_history(
         cwd.path(),
         Vec::new(),
         Some(gated_reply_stream(
@@ -901,7 +964,7 @@ async fn abort_preserves_unpolled_stream_text_and_reaches_idle() {
     let mut side = SideChatController::fork_from(&application)
         .await
         .expect("fork");
-    side.submit_prompt("abort before poll");
+    side.submit_prompt("abort before poll", Vec::new());
     let _ = tokio::time::timeout(Duration::from_secs(2), started.notified())
         .await
         .expect("stream start");
@@ -917,7 +980,10 @@ async fn abort_preserves_unpolled_stream_text_and_reaches_idle() {
         "abort should retain already-emitted unpolled text: {:?}",
         side.entries()
     );
-    assert!(!side.poll_events(), "abort must drain terminal events after idle");
+    assert!(
+        !side.poll_events(),
+        "abort must drain terminal events after idle"
+    );
     release.notify_waiters();
     side.shutdown().await;
 }
@@ -925,7 +991,7 @@ async fn abort_preserves_unpolled_stream_text_and_reaches_idle() {
 #[tokio::test]
 async fn alt_r_reforks_from_main_and_discards_side_transcript() {
     let cwd = TempDir::new().expect("cwd");
-    let application = application_with_history(
+    let (_agent_dir, application) = application_with_history(
         cwd.path(),
         vec![Message::user_text("root before side", 1)],
         Some(immediate_reply_stream("side reply body")),
@@ -936,7 +1002,7 @@ async fn alt_r_reforks_from_main_and_discards_side_transcript() {
         .await
         .expect("fork");
 
-    side.submit_prompt("discard me on refork");
+    side.submit_prompt("discard me on refork", Vec::new());
     assert!(
         side.entries()
             .iter()
@@ -998,7 +1064,7 @@ async fn alt_r_reforks_from_main_and_discards_side_transcript() {
 #[tokio::test]
 async fn alt_n_clears_side_conversation_while_keeping_mode() {
     let cwd = TempDir::new().expect("cwd");
-    let application = application_with_history(
+    let (_agent_dir, application) = application_with_history(
         cwd.path(),
         vec![Message::user_text("fork root", 1)],
         Some(immediate_reply_stream("cleared later")),
@@ -1011,7 +1077,7 @@ async fn alt_n_clears_side_conversation_while_keeping_mode() {
 
     side.toggle_tool_mode().await.expect("enter edit");
     assert!(side.tool_mode().is_edit());
-    side.submit_prompt("clear this turn");
+    side.submit_prompt("clear this turn", Vec::new());
     assert!(!side.entries().is_empty());
 
     let alt_n = key_mod(KeyCode::Char('n'), KeyModifiers::ALT);
@@ -1054,7 +1120,7 @@ async fn alt_n_clears_side_conversation_while_keeping_mode() {
 #[tokio::test]
 async fn overlay_close_keeps_controller_state_for_reopen_within_process() {
     let cwd = TempDir::new().expect("cwd");
-    let application = application_with_history(
+    let (_agent_dir, application) = application_with_history(
         cwd.path(),
         Vec::new(),
         Some(immediate_reply_stream("persisted reply")),
@@ -1065,14 +1131,17 @@ async fn overlay_close_keeps_controller_state_for_reopen_within_process() {
         .expect("fork");
 
     side.handle_paste("reopen-draft");
-    side.submit_prompt("remember across overlay close");
+    side.submit_prompt("remember across overlay close", Vec::new());
     let deadline = Instant::now() + Duration::from_secs(5);
     while side.is_streaming() && Instant::now() < deadline {
         side.poll_events();
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     side.poll_events();
-    assert!(!side.is_streaming(), "side chat must settle before testing idle Esc");
+    assert!(
+        !side.is_streaming(),
+        "side chat must settle before testing idle Esc"
+    );
     let entries_snapshot: Vec<(SideChatRole, String)> = side
         .entries()
         .iter()
@@ -1114,7 +1183,7 @@ async fn shutdown_cleans_streaming_state_like_tui_exit() {
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let calls = Arc::new(AtomicUsize::new(0));
-    let application = application_with_history(
+    let (_agent_dir, application) = application_with_history(
         cwd.path(),
         Vec::new(),
         Some(gated_reply_stream(
@@ -1130,7 +1199,7 @@ async fn shutdown_cleans_streaming_state_like_tui_exit() {
         .await
         .expect("fork");
 
-    side.submit_prompt("still running at exit");
+    side.submit_prompt("still running at exit", Vec::new());
     let _ = wait_until(
         || {
             let _ = side.poll_events();
@@ -1161,7 +1230,7 @@ async fn abort_then_clear_or_refork_cannot_replay_old_stream_events() {
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let calls = Arc::new(AtomicUsize::new(0));
-    let application = application_with_history(
+    let (_agent_dir, application) = application_with_history(
         cwd.path(),
         vec![Message::user_text("main root", 1)],
         Some(gated_reply_stream(
@@ -1176,7 +1245,7 @@ async fn abort_then_clear_or_refork_cannot_replay_old_stream_events() {
         .await
         .expect("fork");
 
-    side.submit_prompt("clear old turn");
+    side.submit_prompt("clear old turn", Vec::new());
     assert!(
         wait_until(
             || {
@@ -1195,7 +1264,7 @@ async fn abort_then_clear_or_refork_cannot_replay_old_stream_events() {
     assert!(side.entries().is_empty());
     assert_eq!(side.status(), "Side chat cleared");
 
-    side.submit_prompt("refork old turn");
+    side.submit_prompt("refork old turn", Vec::new());
     assert!(
         wait_until(
             || {
@@ -1219,11 +1288,10 @@ async fn abort_then_clear_or_refork_cannot_replay_old_stream_events() {
 }
 #[tokio::test]
 async fn side_chat_never_mutates_main_session_id_file_messages_or_structured_stdout() {
-
     let cwd = TempDir::new().expect("cwd");
     let session_dir = TempDir::new().expect("session dir");
     let session_id = unique("btw-isolation");
-    let (application, session_path) = recorded_application(
+    let (_agent_dir, application, session_path) = recorded_application(
         cwd.path(),
         session_dir.path(),
         &session_id,
@@ -1248,7 +1316,7 @@ async fn side_chat_never_mutates_main_session_id_file_messages_or_structured_std
         .expect("fork");
     side.toggle_tool_mode().await.expect("edit");
     side.handle_paste("no main leak");
-    side.submit_prompt("isolation probe");
+    side.submit_prompt("isolation probe", Vec::new());
     let _ = side.peek_main(false).expect("peek");
     side.clear_conversation().await.expect("clear");
     side.refork_from_main().await.expect("refork");
@@ -1277,7 +1345,7 @@ async fn side_chat_never_mutates_main_session_id_file_messages_or_structured_std
 #[tokio::test]
 async fn executable_catalog_lists_btw_without_requiring_credentials() {
     let cwd = TempDir::new().expect("cwd");
-    let application = application_with_history(cwd.path(), Vec::new(), None).await;
+    let (_agent_dir, application) = application_with_history(cwd.path(), Vec::new(), None).await;
     let (commands, _diagnostics) = executable_catalog(&application);
     assert!(
         commands.iter().any(|command| command.name == "btw"),
@@ -1320,7 +1388,7 @@ async fn edit_mode_excludes_main_control_tools_and_write_stays_in_workspace() {
         ),
     ]);
 
-    let (application, session_path) = recorded_application(
+    let (_agent_dir, application, session_path) = recorded_application(
         cwd.path(),
         session_dir.path(),
         &session_id,
@@ -1339,7 +1407,7 @@ async fn edit_mode_excludes_main_control_tools_and_write_stays_in_workspace() {
                 status: TodoStatus::Pending,
                 depends_on: Vec::new(),
                 ready: true,
-                blocked_by: Vec::new(),
+                waiting_on: Vec::new(),
                 agent: None,
             }],
         }])
@@ -1375,58 +1443,37 @@ async fn edit_mode_excludes_main_control_tools_and_write_stays_in_workspace() {
             "edit mode must not expose main-runtime control tool {name:?}; got {names:?}"
         );
     }
-    // Fresh all-builtin workspace tools + peek_main only (no Session/extension closures).
-    let expected_workspace: Vec<String> = create_all_tools(&cwd.path().to_string_lossy())
-        .into_iter()
-        .map(|tool| tool.name)
-        .collect();
-    assert_eq!(
-        {
-            let mut names = expected_workspace.clone();
-            names.sort();
-            names
-        },
-        {
-            let mut expected = vec![
-                "ask".to_owned(),
-                "ast_edit".to_owned(),
-                "ast_grep".to_owned(),
-                "bash".to_owned(),
-                "browser".to_owned(),
-                "debug".to_owned(),
-                "edit".to_owned(),
-                "eval".to_owned(),
-                "find".to_owned(),
-                "generate_image".to_owned(),
-                "github".to_owned(),
-                "glob".to_owned(),
-                "grep".to_owned(),
-                "inspect_image".to_owned(),
-                "ls".to_owned(),
-                "lsp".to_owned(),
-                "mcp".to_owned(),
-                "memory".to_owned(),
-                "notebook".to_owned(),
-                "read".to_owned(),
-                "recall".to_owned(),
-                "reflect".to_owned(),
-                "retain".to_owned(),
-                "web_search".to_owned(),
-                "write".to_owned(),
-            ];
-            expected.sort();
-            expected
-        },
-        "create_all_tools contract drifted"
-    );
-    let mut expected = expected_workspace;
-    expected.push("peek_main".to_owned());
+    // Edit mode is selected from the isolated application's governed catalog.
+    let mut expected = vec![
+        "ast_edit".to_owned(),
+        "ast_grep".to_owned(),
+        "bash".to_owned(),
+        "browser".to_owned(),
+        "debug".to_owned(),
+        "edit".to_owned(),
+        "eval".to_owned(),
+        "find".to_owned(),
+        "generate_image".to_owned(),
+        "github".to_owned(),
+        "glob".to_owned(),
+        "grep".to_owned(),
+        "inspect_image".to_owned(),
+        "ls".to_owned(),
+        "lsp".to_owned(),
+        "mcp".to_owned(),
+        "memory".to_owned(),
+        "notebook".to_owned(),
+        "read".to_owned(),
+        "web_search".to_owned(),
+        "write".to_owned(),
+        "peek_main".to_owned(),
+    ];
     expected.sort();
     let mut actual = names.clone();
     actual.sort();
     assert_eq!(
         actual, expected,
-        "edit mode tool set must be create_all_tools + peek_main only"
+        "edit mode tool set must match the isolated published application catalog plus peek_main"
     );
     let caps = side.tool_capabilities().await;
     assert!(
@@ -1436,7 +1483,7 @@ async fn edit_mode_excludes_main_control_tools_and_write_stays_in_workspace() {
     );
 
     // Drive the controller-installed write tool via a real side prompt/turn.
-    side.submit_prompt("please write the workspace marker file");
+    side.submit_prompt("please write the workspace marker file", Vec::new());
     assert!(
         wait_until(
             || {
@@ -1570,7 +1617,7 @@ async fn side_fork_refreshes_auth_and_keeps_independent_provider_session() {
     let captured = Arc::new(Mutex::new(None::<CapturedStreamAuth>));
 
     let mut stream_options = SimpleStreamOptions::default();
-    stream_options.stream.transport = Transport::WebSocket;
+    stream_options.stream.transport = Transport::Sse;
     stream_options.stream.timeout_ms = Some(12_345);
     stream_options.stream.api_key = Some("stale-key".to_owned());
     stream_options.stream.headers = HashMap::from([
@@ -1654,26 +1701,32 @@ async fn side_fork_refreshes_auth_and_keeps_independent_provider_session() {
                 ]),
                 env: HashMap::from([("REFRESHED_ENV".to_owned(), "fresh".to_owned())]),
                 available_model_ids: None,
+                kind: RequestAuthKind::ApiKeyOrHeaders,
             })
         })
     });
 
     let model = test_model("auth-side");
-    let session = Session::new(SessionOptions {
-        model: model.clone(),
-        cwd: cwd.path().to_path_buf(),
-        system_prompt: "main system prompt".to_owned(),
-        thinking_level: ThinkingLevel::Off,
-        api_key: "stale-key".into(),
-        compaction: None,
-        stream_options,
-        tools: Some(create_coding_tools(&cwd.path().to_string_lossy())),
-        before_tool_call: None,
-        after_tool_call: None,
-        stream_fn: Some(stream_fn),
-        auth_resolver: Some(resolver),
-    })
-    .expect("session");
+    let (_agent_dir, session) = hermetic_session(
+        SessionOptions {
+            model: model.clone(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: "main system prompt".to_owned(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: "stale-key".into(),
+            compaction: None,
+            stream_options,
+            tools: None,
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: Some(stream_fn),
+            auth_resolver: Some(resolver),
+            auth_manager: None,
+        },
+        cwd.path(),
+        session_dir.path(),
+    )
+    .await;
     let main_stream = session.stream_options();
     let main_provider_session = main_stream
         .stream
@@ -1695,14 +1748,15 @@ async fn side_fork_refreshes_auth_and_keeps_independent_provider_session() {
         .load_history(vec![Message::user_text("auth root", 1)])
         .await
         .expect("load history");
-    let application = Application::new(session).await;
+    let application = publish_application(session).await;
     let before = capture_main(&application).await;
     let before_file = fs::read_to_string(&session_path).expect("session file before");
 
     let mut side = SideChatController::fork_from(&application)
         .await
         .expect("fork");
-    side.submit_prompt("refresh auth on side stream");
+    let resolver_calls_before_prompt = resolver_calls.load(Ordering::SeqCst);
+    side.submit_prompt("refresh auth on side stream", Vec::new());
     assert!(
         wait_until(
             || {
@@ -1726,8 +1780,8 @@ async fn side_fork_refreshes_auth_and_keeps_independent_provider_session() {
         .expect("side stream options");
     assert_eq!(
         resolver_calls.load(Ordering::SeqCst),
-        1,
-        "request-time auth resolver must run once for the side prompt"
+        resolver_calls_before_prompt + 1,
+        "side prompt must perform one fresh request-time auth resolution"
     );
     assert_eq!(
         hook_calls.load(Ordering::SeqCst),
@@ -1752,7 +1806,10 @@ async fn side_fork_refreshes_auth_and_keeps_independent_provider_session() {
         "stale refresh header must be replaced: {:?}",
         observed.headers
     );
-    assert_eq!(observed.env.get("STATIC_ENV").map(String::as_str), Some("static"));
+    assert_eq!(
+        observed.env.get("STATIC_ENV").map(String::as_str),
+        Some("static")
+    );
     assert_eq!(
         observed.env.get("REFRESHED_ENV").map(String::as_str),
         Some("fresh")
@@ -1788,7 +1845,11 @@ async fn side_fork_refreshes_auth_and_keeps_independent_provider_session() {
         after_file, before_file,
         "side auth turn must not mutate main session JSONL"
     );
-    for needle in ["refresh auth on side stream", "auth refresh ok", "refreshed-key"] {
+    for needle in [
+        "refresh auth on side stream",
+        "auth refresh ok",
+        "refreshed-key",
+    ] {
         assert!(
             !after_file.contains(needle),
             "main session file unexpectedly contains side artifact {needle:?}: {after_file}"
@@ -1800,25 +1861,13 @@ async fn side_fork_refreshes_auth_and_keeps_independent_provider_session() {
 
 /// Public controller stream path: a turn with two non-bash tool calls plus
 /// trailing ToolResult echoes must finalize exactly one row per tool_call_id
-/// even when completions arrive out of order. Causal B-before-A is
-/// test-controlled and deterministic via a kernel-blocking loopback TCP gate
-/// (not an ordering sleep): call-a (eval python) connects to a listener the
-/// test binds before the turn, then blocks on `recv(1)` until the test writes
-/// a release byte; call-b (read) completes immediately. Bash is intentionally
-/// process-wide serialized, so it is not used here — the contract under test
-/// is tool-call ordering/dedup, not bash concurrency. The test first accepts
-/// call-a's connection (proving it entered the barrier), then observes a
-/// finalized call-b row while call-a is still pending, then releases call-a.
-/// The side event channel is unbounded, so accepting without polling cannot
-/// backpressure the agent. The eval per-call timeout safely exceeds the outer
-/// observable wait so host scheduling delays cannot make call-a time out
-/// before the test releases it. Polling uses `yield_now` — a timeout is only a
-/// failure bound, never the ordering mechanism.
+/// even when completions arrive out of order. Causal B-before-A is controlled
+/// through two marker paths inside the governed workspace: call-a (bash)
+/// writes a started marker, then blocks until the test writes a release marker,
+/// while call-b (read) completes immediately. The test observes the marker
+/// before polling call-b, then releases call-a only after call-b finalized.
 #[tokio::test]
 async fn side_streamed_parallel_tool_calls_dedup_by_tool_call_id() {
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
-
     let cwd = TempDir::new().expect("cwd");
     let session_dir = TempDir::new().expect("session dir");
     let session_id = unique("btw-tools");
@@ -1828,29 +1877,18 @@ async fn side_streamed_parallel_tool_calls_dedup_by_tool_call_id() {
     let marker_b_path = "marker-b.txt";
     fs::write(cwd.path().join(marker_b_path), marker_b).expect("prewrite marker-b");
 
-    // Loopback TCP gate: call-a connects and blocks on recv(1) until released.
-    let gate = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("bind gate");
-    let gate_addr = gate.local_addr().expect("gate local addr");
-    let host = serde_json::to_string("127.0.0.1").expect("host json");
-    let marker = serde_json::to_string(marker_a).expect("marker json");
-    // call-a: eval python — deterministic kernel-blocking barrier. Connects to
-    // the loopback gate (proving it started), blocks on recv(1) until the test
-    // writes a release byte, then prints marker_a. Runs in a python3 subprocess
-    // off the reactor; the eval per-call timeout bounds the wait.
-    let code_a = format!(
-        "import socket\ns = socket.create_connection(({host}, {port}))\ns.recv(1)\nprint({marker})",
-        port = gate_addr.port(),
+    // Bash runs in the governed workspace. Only bash calls serialize with one
+    // another; the independent read tool can still finish while this call waits.
+    let started_path = cwd.path().join("call-a-started");
+    let release_path = cwd.path().join("call-a-release");
+    let command_a = format!(
+        "touch call-a-started; while [ ! -f call-a-release ]; do sleep 0.01; done; printf '%s\\n' {}",
+        serde_json::to_string(marker_a).expect("marker shell word")
     );
     let call_a = ContentBlock::ToolCall(ToolCall {
         id: "call-a".to_owned(),
-        name: "eval".to_owned(),
-        arguments: json!({
-            "language": "python",
-            "code": code_a,
-            "timeout": 30,
-        }),
+        name: "bash".to_owned(),
+        arguments: json!({ "command": command_a }),
         thought_signature: None,
     });
     // call-b: read the prewritten marker_b file. Fast, non-blocking, non-bash;
@@ -1869,7 +1907,7 @@ async fn side_streamed_parallel_tool_calls_dedup_by_tool_call_id() {
         ),
     ]);
 
-    let (application, session_path) = recorded_application(
+    let (_agent_dir, application, session_path) = recorded_application(
         cwd.path(),
         session_dir.path(),
         &session_id,
@@ -1883,7 +1921,7 @@ async fn side_streamed_parallel_tool_calls_dedup_by_tool_call_id() {
     let mut side = SideChatController::fork_from(&application)
         .await
         .expect("fork");
-    // Edit mode installs create_all_tools (includes eval + read) + peek_main;
+    // Edit mode selects governed eval + read tools from the isolated application;
     // never main Session control tools.
     side.toggle_tool_mode()
         .await
@@ -1898,15 +1936,17 @@ async fn side_streamed_parallel_tool_calls_dedup_by_tool_call_id() {
         "edit mode must expose side-scoped read: {edit_tools:?}"
     );
 
-    side.submit_prompt("run both gated tools");
+    side.submit_prompt("run both gated tools", Vec::new());
 
-    // Phase 0: accept call-a's connection — proves it started and is now
-    // blocked on recv(1). The side event channel is unbounded, so accumulated
-    // events cannot backpressure the agent while this awaits.
-    let (mut release_a, _peer) = tokio::time::timeout(Duration::from_secs(15), gate.accept())
-        .await
-        .expect("call-a must connect to the gate within 15s")
-        .expect("accept call-a");
+    // Phase 0: observe call-a's governed started marker, proving it entered the
+    // barrier and is waiting for the release marker.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !started_path.is_file() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("call-a must enter the governed workspace barrier within 15s");
 
     // Phase 1: drive the runtime until call-b is finalized. yield_now is
     // cooperative polling — no wall-clock sleep; the timeout is only a failure
@@ -1935,11 +1975,8 @@ async fn side_streamed_parallel_tool_calls_dedup_by_tool_call_id() {
         side.entries()
     );
 
-    // Release call-a: one byte unblocks its recv(1).
-    release_a
-        .write_all(b"x")
-        .await
-        .expect("release call-a over the gate");
+    // Release call-a through the same governed workspace.
+    fs::write(&release_path, b"release").expect("release call-a through workspace marker");
 
     // Phase 2: drive the runtime until the turn is idle with both tool rows
     // finalized and the trailing assistant text.
@@ -1979,8 +2016,8 @@ async fn side_streamed_parallel_tool_calls_dedup_by_tool_call_id() {
         assert!(!row.is_partial, "tool row must be finalized: {row:?}");
         assert!(!row.is_error, "tool row must not be error: {row:?}");
         assert!(
-            row.text.starts_with("[eval]") || row.text.starts_with("[read]"),
-            "tool row must keep its non-bash tool identity: {row:?}"
+            row.text.starts_with("[bash]") || row.text.starts_with("[read]"),
+            "tool row must keep its tool identity: {row:?}"
         );
     }
     let texts: Vec<&str> = rows.iter().map(|row| row.text.as_str()).collect();
@@ -2005,18 +2042,20 @@ async fn side_streamed_parallel_tool_calls_dedup_by_tool_call_id() {
     );
     // Association: each marker lives on its own single row (not swapped/merged).
     assert!(
-        rows.iter().any(|row| row.text.contains(marker_a) && !row.text.contains(marker_b)),
+        rows.iter()
+            .any(|row| row.text.contains(marker_a) && !row.text.contains(marker_b)),
         "call-a marker must own a dedicated row: {texts:?}"
     );
     assert!(
-        rows.iter().any(|row| row.text.contains(marker_b) && !row.text.contains(marker_a)),
+        rows.iter()
+            .any(|row| row.text.contains(marker_b) && !row.text.contains(marker_a)),
         "call-b marker must own a dedicated row: {texts:?}"
     );
-    // Identity association: marker_a on the eval row, marker_b on the read row.
+    // Identity association: marker_a on the bash row, marker_b on the read row.
     assert!(
         rows.iter()
-            .any(|row| row.text.starts_with("[eval]") && row.text.contains(marker_a)),
-        "call-a marker must be on the eval row: {texts:?}"
+            .any(|row| row.text.starts_with("[bash]") && row.text.contains(marker_a)),
+        "call-a marker must be on the bash row: {texts:?}"
     );
     assert!(
         rows.iter()
@@ -2088,7 +2127,7 @@ async fn side_chat_render_strips_csi_osc_from_streamed_payloads() {
         ),
     ]);
 
-    let (application, session_path) = recorded_application(
+    let (_agent_dir, application, session_path) = recorded_application(
         cwd.path(),
         session_dir.path(),
         &session_id,
@@ -2104,7 +2143,7 @@ async fn side_chat_render_strips_csi_osc_from_streamed_payloads() {
         .expect("fork");
     // Default read-only tools already include `read` — no edit toggle.
     assert!(!side.tool_mode().is_edit());
-    side.submit_prompt("stream ansi payload through side chat");
+    side.submit_prompt("stream ansi payload through side chat", Vec::new());
     assert!(
         wait_until(
             || {
@@ -2232,24 +2271,34 @@ async fn side_chat_tabs_switch_preserves_isolated_transcripts() {
         release.clone(),
         calls.clone(),
     );
-    let application = application_with_history(
+    let (_agent_dir, application) = application_with_history(
         cwd.path(),
         vec![Message::user_text("shared root", 1)],
         Some(stream),
     )
     .await;
 
-    let mut tabs = SideChatTabs::new_default(&application).await.expect("default tab");
+    let mut tabs = SideChatTabs::new_default(&application)
+        .await
+        .expect("default tab");
     assert_eq!(tabs.tab_names(), vec!["default"]);
     assert_eq!(tabs.active_name(), "default");
-    assert!(tabs.entries().is_empty(), "fresh tab transcript must be empty");
+    assert!(
+        tabs.entries().is_empty(),
+        "fresh tab transcript must be empty"
+    );
 
-    tabs.new_tab(&application, "alpha").await.expect("alpha tab");
+    tabs.new_tab(&application, "alpha")
+        .await
+        .expect("alpha tab");
     assert_eq!(tabs.active_name(), "alpha");
-    assert!(tabs.entries().is_empty(), "new tab transcript must be empty");
+    assert!(
+        tabs.entries().is_empty(),
+        "new tab transcript must be empty"
+    );
 
     // Write in tab A (alpha) — the side prompt stays in alpha's record.
-    tabs.submit_prompt("alpha draft");
+    tabs.submit_prompt("alpha draft", Vec::new());
     assert!(
         tabs.entries()
             .iter()
@@ -2261,7 +2310,10 @@ async fn side_chat_tabs_switch_preserves_isolated_transcripts() {
     // Switch to tab B (default) — instant, no model call — empty transcript.
     tabs.switch_to("default").expect("switch to default");
     assert_eq!(tabs.active_name(), "default");
-    assert!(tabs.entries().is_empty(), "default transcript must stay empty");
+    assert!(
+        tabs.entries().is_empty(),
+        "default transcript must stay empty"
+    );
 
     // Switch back to A: the transcript is preserved in A's own record.
     tabs.switch_to("alpha").expect("switch back to alpha");
@@ -2286,9 +2338,15 @@ async fn side_chat_tabs_switch_preserves_isolated_transcripts() {
     // list + close round trip through the container API.
     assert_eq!(tabs.tab_names(), vec!["default", "alpha"]);
     assert!(tabs.contains("default") && tabs.contains("alpha"));
-    tabs.close_tab(&application, "default").await.expect("close default");
+    tabs.close_tab(&application, "default")
+        .await
+        .expect("close default");
     assert_eq!(tabs.tab_names(), vec!["alpha"]);
-    assert_eq!(tabs.active_name(), "alpha", "closing inactive tab keeps active");
+    assert_eq!(
+        tabs.active_name(),
+        "alpha",
+        "closing inactive tab keeps active"
+    );
 
     tabs.shutdown().await;
 }
@@ -2296,21 +2354,35 @@ async fn side_chat_tabs_switch_preserves_isolated_transcripts() {
 #[tokio::test]
 async fn side_chat_tabs_bound_validation_and_last_tab_replacement() {
     let cwd = TempDir::new().expect("cwd");
-    let application = application_with_history(cwd.path(), Vec::new(), None).await;
+    let (_agent_dir, application) = application_with_history(cwd.path(), Vec::new(), None).await;
 
-    let mut tabs = SideChatTabs::new_default(&application).await.expect("default tab");
+    let mut tabs = SideChatTabs::new_default(&application)
+        .await
+        .expect("default tab");
     assert!(
         SideChatTabs::validate_tab_name("bad name").is_err(),
         "spaces must be rejected"
     );
-    assert!(SideChatTabs::validate_tab_name("new").is_err(), "reserved words rejected");
-    assert!(SideChatTabs::validate_tab_name("close").is_err(), "reserved words rejected");
-    assert!(SideChatTabs::validate_tab_name("list").is_err(), "reserved words rejected");
+    assert!(
+        SideChatTabs::validate_tab_name("new").is_err(),
+        "reserved words rejected"
+    );
+    assert!(
+        SideChatTabs::validate_tab_name("close").is_err(),
+        "reserved words rejected"
+    );
+    assert!(
+        SideChatTabs::validate_tab_name("list").is_err(),
+        "reserved words rejected"
+    );
     assert!(
         SideChatTabs::validate_tab_name(&"a".repeat(33)).is_err(),
         "names longer than 32 chars must be rejected"
     );
-    assert!(SideChatTabs::validate_tab_name("tab_1").is_ok(), "valid names accepted");
+    assert!(
+        SideChatTabs::validate_tab_name("tab_1").is_ok(),
+        "valid names accepted"
+    );
     assert!(
         SideChatTabs::validate_tab_name(&"b".repeat(32)).is_ok(),
         "exactly 32 chars accepted"
@@ -2318,10 +2390,15 @@ async fn side_chat_tabs_bound_validation_and_last_tab_replacement() {
 
     // Bound: MAX_SIDE_CHAT_TABS total tabs.
     for index in 1..MAX_SIDE_CHAT_TABS {
-        tabs.new_tab(&application, &format!("t{index}")).await.expect("tab within bound");
+        tabs.new_tab(&application, &format!("t{index}"))
+            .await
+            .expect("tab within bound");
     }
     assert_eq!(tabs.len(), MAX_SIDE_CHAT_TABS);
-    let error = tabs.new_tab(&application, "overflow").await.expect_err("bound must reject");
+    let error = tabs
+        .new_tab(&application, "overflow")
+        .await
+        .expect_err("bound must reject");
     assert!(
         error.to_string().contains("maximum"),
         "bound error must explain the limit: {error}"
@@ -2329,13 +2406,20 @@ async fn side_chat_tabs_bound_validation_and_last_tab_replacement() {
     assert_eq!(tabs.len(), MAX_SIDE_CHAT_TABS);
 
     // Closing the last tab replaces it with a fresh default tab.
-    tabs.close_tab(&application, "default").await.expect("close first");
+    tabs.close_tab(&application, "default")
+        .await
+        .expect("close first");
     for index in 1..MAX_SIDE_CHAT_TABS {
-        tabs.close_tab(&application, &format!("t{index}")).await.expect("close");
+        tabs.close_tab(&application, &format!("t{index}"))
+            .await
+            .expect("close");
     }
     assert_eq!(tabs.len(), 1, "container must never drop to zero tabs");
     assert_eq!(tabs.active_name(), "default");
-    assert!(tabs.entries().is_empty(), "replacement default tab must be fresh");
+    assert!(
+        tabs.entries().is_empty(),
+        "replacement default tab must be fresh"
+    );
 
     tabs.shutdown().await;
 }

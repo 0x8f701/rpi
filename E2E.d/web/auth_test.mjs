@@ -9,12 +9,19 @@
 //   RPI_EVIDENCE   evidence dir for screenshots
 // Asserts the rpi-auth subprotocol contract against a TOKENED listener
 // (auth_tokenless_test.mjs covers the tokenless listener):
-//   1. NO token: the boot auto-connect probe fails SILENTLY (no error toast,
-//      by design — the empty-hint explains the optional-token policy) and the
-//      pill never reaches `connected`; it settles into `reconnecting`
-//   2. WRONG token: Connect surfaces the "wrong or missing token" ERROR toast
-//      and never reaches `connected`
-//   3. GOOD token: Connect reaches `connected` and a prompt round-trips
+//   1. NO token: the bounded /status preflight proves the listener is
+//      token-gated and the boot HOLDS in the truthful `token_required` state —
+//      the empty-hint carries actionable copy, the pairing card
+//      auto-opens with the token input visible, and ZERO WebSocket creations
+//      happen during the hold (no silent 401 retry churn)
+//   2. WRONG token: saving it releases the hold with EXACTLY ONE connect
+//      attempt; the refused handshake surfaces the "wrong or missing token"
+//      ERROR toast and the socket never opens
+//   3. GOOD token: exactly ONE post-save socket generation opens (with the
+//      rpi-auth subprotocol), reaches the connected state (empty-hint flips
+//      to "Send a prompt"), and a prompt round-trips
+// The token value NEVER crosses into a log line: the in-page observer only
+// reports counts and booleans to Node.
 
 import { chromium } from 'playwright';
 
@@ -24,6 +31,12 @@ const wrongToken = process.env.RPI_WRONG_TOKEN || 'definitely-wrong-token';
 const slowTail = process.env.RPI_SLOW_TAIL || 'chunk-four-done';
 const chromePath = process.env.RPI_CHROME || '';
 const evidence = process.env.RPI_EVIDENCE || '.';
+
+// Longer than RECONNECT_INITIAL_DELAY (1000ms): if the hold still armed the
+// silent retry loop, a second attempt would land inside this window.
+const HOLD_SAMPLE_MS = 1600;
+const NO_RETRY_COPY = 'No reconnect is attempted until the token is saved.';
+const OLD_CONNECTING_COPY = 'Connecting to the control plane';
 
 function fail(message) {
   // Exit 2 (not 1): 1 means "playwright setup failure (node/chromium/npm)",
@@ -41,6 +54,53 @@ async function waitFor(page, fn, label, timeoutMs = 25000, arg) {
   }
 }
 
+/** WebSocket creation observer, installed before any page script runs so the
+ *  boot hold's no-socket contract is observable from the very first attempt.
+ *  Counts constructor attempts and successful opens (socket generations) plus
+ *  how many opens used the rpi-auth.<token> subprotocol; only the counters
+ *  cross back to Node (the token itself is never printed). */
+async function installWsObserver(page, authToken) {
+  await page.addInitScript((good) => {
+    const NativeWebSocket = window.WebSocket;
+    const state = { attempts: 0, opens: 0, authOpens: 0 };
+    class ObservedWebSocket extends NativeWebSocket {
+      constructor(...args) {
+        super(...args);
+        state.attempts += 1;
+        this.addEventListener('open', () => {
+          state.opens += 1;
+          if ((this.protocol || '') === `rpi-auth.${good}`) state.authOpens += 1;
+        });
+      }
+    }
+    for (const key of ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED']) {
+      Object.defineProperty(ObservedWebSocket, key, { value: NativeWebSocket[key] });
+    }
+    window.WebSocket = ObservedWebSocket;
+    window.__rpiAuthWs = state;
+  }, authToken);
+}
+
+const wsCounters = (page) => page.evaluate(() => ({ ...window.__rpiAuthWs }));
+
+/** Settings remains the token-editing surface after initial pairing. */
+async function ensureSettingsOpen(page, label) {
+  const open = await page.evaluate(() => document.querySelector('#settings-token-input') !== null);
+  if (!open) {
+    await page.click('#settings-toggle-btn');
+    await waitFor(
+      page,
+      () => document.querySelector('#settings-token-input') !== null,
+      `${label}: settings token input missing after toggle`
+    );
+  }
+}
+
+async function closeSettingsIfOpen(page) {
+  const open = await page.evaluate(() => document.querySelector('#settings-token-input') !== null);
+  if (open) await page.click('#settings-close-btn');
+}
+
 async function main() {
   if (!url) fail('RPI_URL is required');
   const launchOptions = chromePath ? { executablePath: chromePath } : {};
@@ -50,39 +110,57 @@ async function main() {
     page.on('pageerror', (err) => {
       console.error(`web-auth: page error: ${err.message}`);
     });
+    await installWsObserver(page, token);
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await waitFor(page, () => document.title === 'rpi web', 'page title missing');
-    await waitFor(page, () => document.querySelector('#conn-state') !== null, 'conn-state missing');
 
-    // 1. No token: the boot probe must fail silently and never connect.
-    let everOn = false;
-    const stateWatch = setInterval(async () => {
-      try {
-        const state = await page.evaluate(() => document.getElementById('conn-state')?.dataset.state || '');
-        if (state === 'on') everOn = true;
-      } catch {
-        /* page closed */
-      }
-    }, 50);
+    // 1. NO token: the /status preflight holds the boot in `token_required`.
+    //    The empty-hint carries the exact actionable copy (the old silent
+    //    "Connecting…" state is gone) and the pairing card auto-opens.
     await waitFor(
       page,
-      () => document.getElementById('conn-state').dataset.state === 'reconnecting',
-      'pill never entered "reconnecting" after the silent no-token probe',
+      () => (document.querySelector('.empty-hint')?.textContent || '').includes('This listener requires an access token'),
+      'token-required boot hold never surfaced the actionable empty hint',
       15000
     );
+    const holdHint = await page.evaluate(() => document.querySelector('.empty-hint')?.textContent || '');
+    if (!holdHint.includes(NO_RETRY_COPY)) {
+      fail('token-required empty hint lost the no-retry explanation copy');
+    }
+    if (holdHint.includes(OLD_CONNECTING_COPY)) {
+      fail('token_required state still shows the old silent "Connecting…" copy');
+    }
+    await waitFor(
+      page,
+      () => document.querySelector('#token-pairing-input') !== null,
+      'token_required hold did not open the pairing card'
+    );
+    await page.screenshot({ path: `${evidence}/auth-hold.png`, fullPage: true });
+
+    // The hold owns recovery: ZERO sockets during the hold, and the state is
+    // persistent — within the first reconnect-backoff window the observer
+    // must record no new attempts (no silent 401 retry churn) and no opens.
+    const hold = await wsCounters(page);
+    if (hold.attempts !== 0 || hold.opens !== 0) {
+      fail(`token_required hold opened a WebSocket before any token was saved (attempts=${hold.attempts} opens=${hold.opens})`);
+    }
     const noTokenToast = await page.evaluate(() =>
       Array.from(document.querySelectorAll('#toasts .toast')).some((t) => t.textContent.includes('connection failed'))
     );
-    if (noTokenToast) fail('no-token boot probe should be silent, but an error toast appeared');
-    if (everOn) fail('WS reached "connected" without a token');
+    if (noTokenToast) fail('token_required hold surfaced a transport error toast; the hold must stay silent until a token is saved');
+    await page.waitForTimeout(HOLD_SAMPLE_MS);
+    const heldStill = await wsCounters(page);
+    if (heldStill.attempts !== hold.attempts || heldStill.opens !== 0) {
+      fail(`token_required hold showed retry churn (attempts ${hold.attempts} -> ${heldStill.attempts}, opens=${heldStill.opens})`);
+    }
 
-    // 2. Wrong token: explicit Connect must surface the error toast and fail.
-    await page.click('#settings-toggle-btn');
-    await waitFor(page, () => document.querySelector('#settings-token-input') !== null, 'settings token input missing');
-    await page.fill('#settings-token-input', wrongToken);
-    await page.click('#settings-token-save-btn');
-    await page.click('#settings-close-btn');
+    // 2. WRONG token: saving it releases the hold with EXACTLY ONE connect
+    //    attempt; the refused handshake surfaces the error toast and the
+    //    socket never opens.
+    await page.fill('#token-pairing-input', wrongToken);
+    const beforeWrong = await wsCounters(page);
+    await page.click('.token-pairing__connect');
     await waitFor(
       page,
       () =>
@@ -91,21 +169,35 @@ async function main() {
         ),
       'wrong-token error toast never appeared'
     );
+    const afterWrong = await wsCounters(page);
+    if (afterWrong.attempts !== beforeWrong.attempts + 1) {
+      fail(`wrong-token save must release the hold with exactly one connect attempt (attempts ${beforeWrong.attempts} -> ${afterWrong.attempts})`);
+    }
+    if (afterWrong.opens !== beforeWrong.opens) {
+      fail('wrong-token handshake reached OPEN; the listener must refuse it');
+    }
     await page.screenshot({ path: `${evidence}/auth-wrong.png`, fullPage: true });
-    if (everOn) fail('WS reached "connected" with a wrong token');
+    await closeSettingsIfOpen(page);
 
-    // 3. Good token: Connect reaches "connected" and the session works.
-    await page.click('#settings-toggle-btn');
-    await waitFor(page, () => document.querySelector('#settings-token-input') !== null, 'settings token input missing');
+    // 3. GOOD token: the save supersedes any wrong-token retry timer and opens
+    //    EXACTLY ONE socket generation (with the rpi-auth subprotocol), which
+    //    reaches "connected" and round-trips a prompt.
+    await ensureSettingsOpen(page, 'good-token');
     await page.fill('#settings-token-input', token);
+    const beforeGood = await wsCounters(page);
     await page.click('#settings-token-save-btn');
-    await page.click('#settings-close-btn');
     await waitFor(
       page,
-      () => document.getElementById('conn-state').dataset.state === 'on',
+      () => (document.querySelector('.empty-hint')?.textContent || '').includes('Send a prompt to start the session.'),
       'WS never reached "connected" with the good token'
     );
-    clearInterval(stateWatch);
+    const afterGood = await wsCounters(page);
+    if (afterGood.opens !== beforeGood.opens + 1) {
+      fail(`good-token save must open exactly one socket generation (opens ${beforeGood.opens} -> ${afterGood.opens})`);
+    }
+    if (afterGood.authOpens !== beforeGood.authOpens + 1) {
+      fail('the post-save connection did not authenticate with the rpi-auth.<token> subprotocol');
+    }
     await page.fill('#prompt-input', 'auth round-trip');
     await page.press('#prompt-input', 'Enter');
     await waitFor(
@@ -117,7 +209,7 @@ async function main() {
     );
     await page.screenshot({ path: `${evidence}/auth-good.png`, fullPage: true });
 
-    console.log('web-auth: PASSED (no-token silent probe + wrong-token error toast + good-token connect/round-trip)');
+    console.log('web-auth: PASSED (token_required hold with zero sockets + wrong-token refusal + good-token single-connect round-trip)');
   } finally {
     await browser.close().catch(() => {});
   }

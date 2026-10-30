@@ -4,26 +4,23 @@ use anyhow::{Result, anyhow, bail};
 use base64::Engine as _;
 use chrono::Utc;
 use futures_util::{FutureExt, StreamExt};
-use reqwest::{
-    Response,
-    header::{HeaderMap, HeaderValue},
-};
+use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
     API_BEDROCK_CONVERSE_STREAM, ApiProvider, AssistantMessage, AssistantMessageEvent,
     AssistantMessageEventStream, CacheRetention, ConstrainedSampling,
-    ConstrainedSamplingStrictness, ContentBlock, Context, Message, Model, SimpleStreamFn,
-    SimpleStreamOptions, StopReason, StreamFn, StreamOptions, ThinkingBudgets, ThinkingLevel,
-    ToolCall, ToolDefinition, calculate_cost, clamp_max_tokens_to_context, clamp_thinking_level,
-    new_assistant_message_event_stream, parse_json_with_repair, register_api_provider,
-    transform_messages,
+    ConstrainedSamplingStrictness, ContentBlock, Context, HttpMethod, HttpResponse, Message, Model,
+    SimpleStreamFn, SimpleStreamOptions, StopReason, StreamFn, StreamOptions, ThinkingBudgets,
+    ThinkingLevel, ToolCall, ToolDefinition, calculate_cost, clamp_max_tokens_to_context,
+    clamp_thinking_level, new_assistant_message_event_stream, parse_json_with_repair,
+    register_api_provider, transform_messages,
 };
 
 use super::common::{
-    apply_provider_headers, apply_provider_request, client, error_body, fail, insert_header,
-    insert_header_map, is_aborted, notify_response, send_with_retry,
+    apply_provider_headers, apply_provider_request, build_request, client, error_body, fail,
+    insert_header, insert_header_map, is_aborted, notify_response, send_with_retry,
 };
 
 const EMPTY_TEXT_PLACEHOLDER: &str = "<empty>";
@@ -580,6 +577,11 @@ fn prepare_request(
                 &endpoint.region,
                 &signing_time.format("%Y%m%dT%H%M%SZ").to_string(),
             )?;
+            // SigV4 must sign the exact authority host, but `HttpRequest`
+            // deliberately rejects caller-supplied transport headers. The
+            // executor reconstructs this same Host value from `url` while
+            // preserving it in Authorization's SignedHeaders list.
+            headers.remove(reqwest::header::HOST);
         }
         BedrockAuth::Skip => {}
     }
@@ -1545,13 +1547,13 @@ fn crc32(bytes: &[u8]) -> u32 {
 }
 
 async fn consume_event_stream(
-    response: Response,
+    response: HttpResponse,
     options: &StreamOptions,
     model: &Model,
     stream: &AssistantMessageEventStream,
     output: &mut AssistantMessage,
 ) -> Result<()> {
-    let mut bytes = response.bytes_stream();
+    let mut bytes = response.into_body();
     let mut decoder = EventStreamDecoder::default();
     let mut builders = Vec::new();
     loop {
@@ -1722,22 +1724,24 @@ async fn run_bedrock_stream(
         }
     };
     let request = match prepare_request(&model, &endpoint, &payload, &auth, &options, Utc::now()) {
-        Ok(mut request) => match apply_provider_headers(request.headers, &model, &options.stream).await {
-            Ok(headers) => {
-                request.headers = headers;
-                request
+        Ok(mut request) => {
+            match apply_provider_headers(request.headers, &model, &options.stream).await {
+                Ok(headers) => {
+                    request.headers = headers;
+                    request
+                }
+                Err(error) => {
+                    fail(
+                        &stream,
+                        output,
+                        redact_bedrock_secrets(&error.to_string(), &model, &options),
+                        is_aborted(&options.stream),
+                    )
+                    .await;
+                    return;
+                }
             }
-            Err(error) => {
-                fail(
-                    &stream,
-                    output,
-                    redact_bedrock_secrets(&error.to_string(), &model, &options),
-                    is_aborted(&options.stream),
-                )
-                .await;
-                return;
-            }
-        },
+        }
         Err(error) => {
             fail(
                 &stream,
@@ -1749,23 +1753,24 @@ async fn run_bedrock_stream(
             return;
         }
     };
-    let http = match client(&options.stream) {
-        Ok(http) => http,
-        Err(error) => {
-            fail(
-                &stream,
-                output,
-                redact_bedrock_secrets(&error.to_string(), &model, &options),
-                is_aborted(&options.stream),
-            )
-            .await;
-            return;
-        }
-    };
+    if let Err(error) = client(&options.stream) {
+        fail(
+            &stream,
+            output,
+            redact_bedrock_secrets(&error.to_string(), &model, &options),
+            is_aborted(&options.stream),
+        )
+        .await;
+        return;
+    }
     let response = match send_with_retry(&options.stream, || {
-        http.post(&request.url)
-            .headers(request.headers.clone())
-            .body(request.body.clone())
+        build_request(
+            &options.stream,
+            HttpMethod::Post,
+            &request.url,
+            &request.headers,
+            request.body.clone().into_bytes(),
+        )
     })
     .await
     {
@@ -1781,7 +1786,14 @@ async fn run_bedrock_stream(
             return;
         }
     };
-    if let Err(error) = notify_response(&options.stream, &response, &model).await {
+    if let Err(error) = notify_response(
+        &options.stream,
+        response.status(),
+        response.headers().clone(),
+        &model,
+    )
+    .await
+    {
         fail(
             &stream,
             output,
@@ -1928,6 +1940,12 @@ pub fn register_bedrock() {
             stream,
             stream_simple,
             generate_image: None,
+            resolve_http_authorities: Arc::new(|model, stream| {
+                let endpoint = resolve_endpoint(model, &BedrockOptions::from(stream.clone()))?;
+                let (authority, _) =
+                    crate::resolve_http_endpoint(&request_url(&endpoint, &model.id))?;
+                Ok(std::collections::BTreeSet::from([authority]))
+            }),
         },
         None,
     );
@@ -2148,6 +2166,55 @@ mod tests {
     }
 
     #[test]
+    fn prepared_sigv4_request_signs_but_does_not_emit_host_header() {
+        let model = model("https://bedrock-runtime.us-east-1.amazonaws.com".into());
+        let endpoint = resolve_endpoint(&model, &BedrockOptions::default()).expect("endpoint");
+        let auth = BedrockAuth::SigV4(AwsCredentials {
+            access_key_id: "AKIDEXAMPLE".into(),
+            secret_access_key: "secret".into(),
+            session_token: None,
+        });
+        let request = prepare_request(
+            &model,
+            &endpoint,
+            &json!({}),
+            &auth,
+            &BedrockOptions::default(),
+            chrono::DateTime::parse_from_rfc3339("2025-01-02T03:04:05Z")
+                .expect("signing time")
+                .with_timezone(&Utc),
+        )
+        .expect("prepared request");
+        let authorization = request.headers["authorization"]
+            .to_str()
+            .expect("authorization header");
+        assert!(
+            authorization.contains(";host;"),
+            "SigV4 authorization must retain host in SignedHeaders: {authorization}"
+        );
+        assert!(
+            request.headers.get(reqwest::header::HOST).is_none(),
+            "the transport-neutral HttpRequest must reconstruct Host from the signed authority URL"
+        );
+        let emitted = build_request(
+            &BedrockOptions::default().stream,
+            HttpMethod::Post,
+            &request.url,
+            &request.headers,
+            request.body.into_bytes(),
+        )
+        .expect("transport-neutral request");
+        assert!(
+            emitted
+                .into_parts()
+                .headers
+                .iter()
+                .all(|(name, _)| name != reqwest::header::HOST),
+            "emitted HttpRequest headers must omit Host"
+        );
+    }
+
+    #[test]
     fn bearer_auth_wins_and_reserved_headers_are_ignored() {
         let mut native = BedrockOptions::default();
         native.stream.api_key = Some("bearer-secret".into());
@@ -2304,6 +2371,7 @@ mod tests {
         let (base_url, request_rx) = spawn_server(fixture_stream());
         let mut native = BedrockOptions::default();
         explicit_credentials(&mut native.stream);
+        native.stream.http_executor = Some(crate::http::test_http_executor());
         let stream = stream_bedrock(model(base_url), Context::default(), native).await;
         let mut events = Vec::new();
         while let Some(event) = stream.next().await {
@@ -2325,7 +2393,10 @@ mod tests {
             .map(|(_, body)| body)
             .expect("request body");
         let body: Value = serde_json::from_str(body).expect("Bedrock request JSON");
-        assert_eq!(body.pointer("/inferenceConfig/maxTokens"), Some(&json!(64000)));
+        assert_eq!(
+            body.pointer("/inferenceConfig/maxTokens"),
+            Some(&json!(64000))
+        );
         assert!(
             events
                 .iter()
@@ -2352,6 +2423,7 @@ mod tests {
         catalog_model.base_url = base_url;
         let mut options = SimpleStreamOptions::default();
         explicit_credentials(&mut options.stream);
+        options.stream.http_executor = Some(crate::http::test_http_executor());
         options.reasoning = Some(ThinkingLevel::High);
         let stream = stream_simple_bedrock(catalog_model, Context::default(), options).await;
         let output = stream.result().await.expect("catalog model result");
@@ -2425,6 +2497,7 @@ mod tests {
         let mut native = BedrockOptions::default();
         explicit_credentials(&mut native.stream);
         native.stream.max_retries = 1;
+        native.stream.http_executor = Some(crate::http::test_http_executor());
         let stream = stream_bedrock(
             model(format!("http://{address}")),
             Context {
@@ -2442,8 +2515,16 @@ mod tests {
         assert_eq!(first_request.len(), second_request.len());
         let first = String::from_utf8_lossy(&first_request);
         let second = String::from_utf8_lossy(&second_request);
-        assert!(first.to_ascii_lowercase().contains("authorization: aws4-hmac-sha256"));
-        assert!(second.to_ascii_lowercase().contains("authorization: aws4-hmac-sha256"));
+        assert!(
+            first
+                .to_ascii_lowercase()
+                .contains("authorization: aws4-hmac-sha256")
+        );
+        assert!(
+            second
+                .to_ascii_lowercase()
+                .contains("authorization: aws4-hmac-sha256")
+        );
     }
 
     #[tokio::test]
@@ -2465,6 +2546,7 @@ mod tests {
         });
         let mut native = BedrockOptions::default();
         native.stream.api_key = Some(secret.into());
+        native.stream.http_executor = Some(crate::http::test_http_executor());
         let stream = stream_bedrock(
             model(format!("http://{address}")),
             Context::default(),
@@ -2495,6 +2577,7 @@ mod tests {
         let mut native = BedrockOptions::default();
         native.stream.api_key = Some(secret.into());
         native.stream.abort_signal = Some(token.clone());
+        native.stream.http_executor = Some(crate::http::test_http_executor());
         let stream = stream_bedrock(
             model(format!("http://{address}")),
             Context::default(),

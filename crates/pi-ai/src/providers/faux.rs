@@ -105,6 +105,7 @@ pub fn register_faux_provider(options: FauxProviderOptions) -> FauxProviderRegis
             }),
             stream_simple: simple,
             generate_image: None,
+            resolve_http_authorities: Arc::new(|_, _| Ok(std::collections::BTreeSet::new())),
         },
         Some(source_id),
     );
@@ -351,7 +352,13 @@ mod tests {
         token.cancel();
         let mut options = SimpleStreamOptions::default();
         options.stream.abort_signal = Some(token);
-        let events = faux_stream(model, options.stream, registration.queue.clone(), registration.chunk_size).await;
+        let events = faux_stream(
+            model,
+            options.stream,
+            registration.queue.clone(),
+            registration.chunk_size,
+        )
+        .await;
         assert!(matches!(
             events.next().await,
             Some(AssistantMessageEvent::Error {
@@ -370,12 +377,14 @@ mod tests {
         let registrations = std::thread::scope(|scope| {
             let first = scope.spawn(unique_registration);
             let second = scope.spawn(unique_registration);
-            [first.join().expect("first registration"), second.join().expect("second registration")]
+            [
+                first.join().expect("first registration"),
+                second.join().expect("second registration"),
+            ]
         });
         assert_ne!(registrations[0].source_id, registrations[1].source_id);
         for registration in registrations {
             registration.unregister();
         }
     }
-
 }

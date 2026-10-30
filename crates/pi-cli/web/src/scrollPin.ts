@@ -1,9 +1,8 @@
 import { useCallback, useEffect, useRef, type UIEvent } from 'react';
 
-/** Distance from the bottom (px) that still counts as "pinned". Absorbs wheel
- *  jitter and sub-frame layout rounding without fighting a deliberate
- *  scroll-away. */
-export const PIN_TOLERANCE_PX = 80;
+/** Distance from the bottom (px) that still counts as pinned. Exclusive:
+ *  remaining 0 is pinned; remaining 1 is a scroll-away. */
+export const PIN_TOLERANCE_PX = 1;
 
 /** The live geometry the pin logic reads (and, for the scrollTop writer,
  *  writes). Structural, DOM-free type so the decision core below is
@@ -56,6 +55,8 @@ export function createScrollPin(initialPinned = true): ScrollPinController {
   let pinned = initialPinned;
   let scrollHeight: number | null = null;
   let clientHeight: number | null = null;
+  // Ignore the restored scroll write once; the next distinct scroll is user input.
+  let adoptedScrollTop: number | null = null;
 
   function rememberGeometry(el: ScrollPinElement): void {
     scrollHeight = el.scrollHeight;
@@ -63,12 +64,28 @@ export function createScrollPin(initialPinned = true): ScrollPinController {
   }
 
   function onScroll(el: ScrollPinElement): void {
-    const geometryChanged = scrollHeight !== null
-      && (scrollHeight !== el.scrollHeight || clientHeight !== el.clientHeight);
-    if (pinned && geometryChanged) {
+    const rememberedHeight = scrollHeight;
+    const rememberedClient = clientHeight;
+    const geometryChanged = rememberedHeight !== null
+      && (rememberedHeight !== el.scrollHeight || rememberedClient !== el.clientHeight);
+    if (pinned && geometryChanged && rememberedHeight !== null) {
+      if (!isPinned(el.scrollTop, rememberedHeight, rememberedClient ?? el.clientHeight)) {
+        pinned = false;
+        rememberGeometry(el);
+        return;
+      }
       el.scrollTop = el.scrollHeight;
       rememberGeometry(el);
       return;
+    }
+    // Preserve the saved follow=false state through its own scroll event.
+    if (adoptedScrollTop !== null) {
+      const programmatic = el.scrollTop === adoptedScrollTop;
+      adoptedScrollTop = null;
+      if (programmatic && !pinned) {
+        rememberGeometry(el);
+        return;
+      }
     }
     pinned = isPinned(el.scrollTop, el.scrollHeight, el.clientHeight);
     rememberGeometry(el);
@@ -93,11 +110,24 @@ export function createScrollPin(initialPinned = true): ScrollPinController {
     return true;
   }
 
+  // Adopt a saved follow=false view without moving or tolerance-reclassifying it.
+  function adoptUnpinned(el: ScrollPinElement | null): boolean {
+    if (!el) return false;
+    pinned = false;
+    adoptedScrollTop = el.scrollTop;
+    rememberGeometry(el);
+    return true;
+  }
+
   function handleResize(el: ScrollPinElement | null): boolean {
     return followIfPinned(el);
   }
 
-  return { onScroll, followIfPinned, forcePin, handleResize };
+  function isFollowing(): boolean {
+    return pinned;
+  }
+
+  return { onScroll, followIfPinned, forcePin, adoptUnpinned, handleResize, isFollowing };
 }
 
 export interface ScrollPinController {
@@ -112,19 +142,33 @@ export interface ScrollPinController {
   /** ResizeObserver delegate: content growth or a container clientHeight
    *  change — pinned stays glued to the bottom, unpinned freezes. */
   handleResize(el: ScrollPinElement | null): boolean;
+  /** Adopt a restored follow=false view: the controller is explicitly
+   *  UNPINNED at the element's current geometry (never tolerance-derived),
+   *  and the programmatic write's own scroll event cannot re-pin it; the
+   *  next scroll event with a different scrollTop (a genuine user scroll)
+   *  re-derives normally. null is a no-op like every other writer. */
+  adoptUnpinned(el: ScrollPinElement | null): boolean;
+  /** Authoritative follow state. Projection and live-viewport notes must
+   *  not re-derive this from geometry. */
+  isFollowing(): boolean;
 }
 
 /**
  * One coherent bottom-pin state for the transcript scroll container. There
  * is exactly ONE writer of `scrollTop` (the controller, reached through
- * followIfPinned / forcePin) and the scroll handler is the only reader of
+ * followIfPinned / forcePin; `adoptUnpinned` freezes an explicitly unpinned
+ * restored view at its current geometry without writing) and the scroll
+ * handler is the only reader of
  * the pin state. Browser scroll anchoring is disabled on the container
  * (`overflow-anchor: none` in styles.css) so a heuristic can never fight the
  * pin state, and programmatic pins always land AT the bottom — the scroll
- * event they produce re-computes `true`, so no suppression flag is needed
- * and no feedback loop is possible.
+ * event they produce re-computes `true`, so the pinned path needs no
+ * suppression. The one exception is adoptUnpinned's restored view: its own
+ * programmatic write's scroll event is recognized by the adopted scrollTop
+ * and never re-classifies pin state, so a saved non-follow view stays frozen
+ * until a genuinely different scroll event arrives.
  */
-export function useScrollPin() {
+export function useScrollPin(isMounted = true) {
   const transcriptRef = useRef<HTMLDivElement>(null);
   const transcriptContentRef = useRef<HTMLDivElement>(null);
   // Lazy-init: the controller instance is created once per hook mount.
@@ -163,12 +207,12 @@ export function useScrollPin() {
   useEffect(() => {
     const container = transcriptRef.current;
     const content = transcriptContentRef.current;
-    if (!container || !content) return;
+    if (!isMounted || !container || !content) return;
     const observer = new ResizeObserver(() => ctrl.handleResize(transcriptRef.current));
     observer.observe(container);
     observer.observe(content);
     return () => observer.disconnect();
-  }, [ctrl]);
+  }, [ctrl, isMounted]);
 
   return { transcriptRef, transcriptContentRef, onTranscriptScroll, pinIfPinned, forcePin };
 }

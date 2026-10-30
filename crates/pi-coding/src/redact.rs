@@ -108,9 +108,8 @@ mod tests {
         let bearer_sk = ["s", "k-", "abcdefghijklmnop1234567890"].concat();
         let private_key_label = ["BEGIN RSA ", "PRIVATE KEY"].concat();
         let private_key_end_label = ["END RSA ", "PRIVATE KEY"].concat();
-        let private_key = format!(
-            "-----{private_key_label}-----\nZm9vYmFy\n-----{private_key_end_label}-----"
-        );
+        let private_key =
+            format!("-----{private_key_label}-----\nZm9vYmFy\n-----{private_key_end_label}-----");
         let text = format!(
             "token=abc123, {sk}, {ghp}, {github_pat}, {aws_access}, \
              Authorization: Bearer xyz789, Bearer {bearer_sk}, access_token=leak_me, \
@@ -130,7 +129,10 @@ mod tests {
         ] {
             assert!(!redacted.contains(leaked), "{leaked:?} leaked: {redacted}");
         }
-        assert!(redacted.contains("[REDACTED]"), "marker missing: {redacted}");
+        assert!(
+            redacted.contains("[REDACTED]"),
+            "marker missing: {redacted}"
+        );
     }
 
     #[test]
@@ -182,7 +184,10 @@ mod tests {
                 "over budget at cut {cut}: {bounded}"
             );
             let stripped = bounded.replace("[REDACTED]", "");
-            assert!(!stripped.contains("[REDACT"), "partial marker at cut {cut}: {bounded}");
+            assert!(
+                !stripped.contains("[REDACT"),
+                "partial marker at cut {cut}: {bounded}"
+            );
         }
     }
 
@@ -204,7 +209,10 @@ mod tests {
             let bounded = redact_bounded(&body, cut);
             assert!(bounded.chars().count() <= cut, "{bounded}");
             let stripped = bounded.replace("[REDACTED]", "");
-            assert!(!stripped.contains("[REDACT"), "partial marker at cut {cut}: {bounded}");
+            assert!(
+                !stripped.contains("[REDACT"),
+                "partial marker at cut {cut}: {bounded}"
+            );
         }
     }
 }

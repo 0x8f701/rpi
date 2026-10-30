@@ -18,7 +18,9 @@
 #      same coverage bundle — each lane must PASS and must produce a coverage
 #      payload (a lane that skipped or fell back fails the coverage run); the
 #      sessions lane additionally writes its executed-assertion evidence
-#      ($EVIDENCE_ROOT/web-sessions/coverage-assertions.json)
+#      ($EVIDENCE_ROOT/web-sessions/coverage-assertions.json) and the File
+#      Explorer block of commands_review writes
+#      $EVIDENCE_ROOT/web-commands-review/coverage-assertions.json
 #   6. merge every V8 payload, convert through the inline source map
 #      (scripts/coverage-report.mjs), verify source mapping for every expected
 #      src file, emit text + JSON summary + lcov, enforce thresholds — the
@@ -30,7 +32,13 @@
 #      here.
 #   7. validate the feature matrix against the executed assertion evidence
 #      (coverage_matrix.mjs) — zero uncovered required assertions across the
-#      steering/xss/fallback drivers AND the sessions + scroll lanes
+#      steering/xss/fallback drivers AND the sessions, session-restore,
+#      scroll, projects, workflow-DAG (sessions_workflow), Files-drawer
+#      latency (files_latency), external-sessions, presentation, loop_goal,
+#      and File Explorer lanes; pointer-publishing lanes (external_sessions,
+#      sessions_workflow, files_latency, session_restore, commands_review)
+#      are resolved through their immutable run-dir + current.json pointer
+#      so the gate always reads the exact published ledger
 #
 # The normal bundle is rebuilt afterwards by the packaging owner
 # (FixWebDistPackaging); this command never writes dist/.
@@ -91,6 +99,8 @@ build_coverage_bundle() {
     "; then
         fail "coverage: built bundle lost its inline source map (source mapping unavailable)"
     fi
+    python3 "$WEB_DIST_FINGERPRINT" stamp "$WEB_DIR" "$COV_DIST" ||
+        fail "coverage: failed to fingerprint coverage bundle"
     log "coverage: bundle built + inline source map verified"
 }
 
@@ -129,6 +139,250 @@ run_driver() { # lane url evidence work testfile [env...]
     else
         fail "coverage: driver '$lane' failed (exit $pw_status)"
     fi
+}
+
+# Resolve a lane's executed-assertion ledger through its published pointer:
+# $EVIDENCE_ROOT/<lane-root>/current.json names a run directory (relative to
+# the lane's evidence root) and the ledger file inside it. Lanes publish
+# set-atomically as ONE immutable run dir + ONE current.json pointer, so the
+# matrix is always gated against the exact ledger of the run the pointer
+# names — never a stale or hand-copied file. The pointer is validated for
+# its EXACT lane-specific top-level key set (web-sessions-workflow and
+# web-files-latency publish lane/nonce/run/manifest/coverage/artifacts;
+# web-external-sessions publishes lane/nonce/run/manifests/coverage/phases
+# with the exact per-phase {phase, manifest, documented, executed} schema) —
+# any extra or missing top-level key is schema drift and fails — plus a
+# non-empty nonce, a normalized `runs/`-relative run name, and the
+# manifest(s) + coverage ledger + single-lane artifacts names as normalized
+# contained relative paths, with the declared manifest and coverage ledger
+# REQUIRED to appear inside the single-lane artifacts array (the pointer's
+# names and its artifact set are one consistent publication).
+# and the run dir is CANONICALIZED and CONFINED: the run directory is
+# realpath-resolved and must stay inside the realpath-resolved evidence root
+# (no `..` escapes, no symlinked escapes). Fails hard when the pointer is
+# malformed, when the run dir/manifests/ledger is missing or not a regular
+# file, or when the run escapes the evidence root (a lane that did not
+# publish is a failure, not a skip).
+pointer_ledger() { # <lane-evidence-dir> <lane>
+    local dir="$1" lane="$2"
+    [ -f "$dir/current.json" ] || fail "coverage: $lane evidence pointer missing: $dir/current.json"
+    node -e '
+        const fs = require("node:fs");
+        const path = require("node:path");
+        const [dir, lane] = process.argv.slice(1);
+        const die = (message) => {
+            console.error(`coverage: ${lane} pointer validation FAILED: ${message}`);
+            process.exit(1);
+        };
+        // Every component from the filesystem root down to current.json is
+        // lstat-ed and ANY symlink — including one pointing at a real file —
+        // rejects the pointer outright; the pointer itself must be a regular
+        // file.
+        const pointerAbs = path.resolve(path.join(dir, "current.json"));
+        const parts = pointerAbs.split(path.sep).filter((part) => part !== "");
+        const componentStat = (prefix) => {
+            try {
+                return fs.lstatSync(prefix);
+            } catch (err) {
+                die(`pointer path component missing: ${prefix}: ${err.message}`);
+            }
+        };
+        for (let i = 0; i < parts.length; i++) {
+            const prefix = `/${parts.slice(0, i + 1).join("/")}`;
+            const stats = componentStat(prefix);
+            if (stats.isSymbolicLink()) {
+                die(`pointer path component is a symlink (rejected): ${prefix}`);
+            }
+            if (i < parts.length - 1 && !stats.isDirectory()) {
+                die(`pointer path component is not a directory: ${prefix}`);
+            }
+        }
+        const pointerStats = componentStat(pointerAbs);
+        if (!pointerStats.isFile()) {
+            die(`pointer current.json is not a regular file: ${pointerAbs}`);
+        }
+        let pointer;
+        try {
+            pointer = JSON.parse(fs.readFileSync(pointerAbs, "utf8"));
+        } catch (err) {
+            die(`pointer is not readable JSON: ${err.message}`);
+        }
+        if (!pointer || typeof pointer !== "object" || Array.isArray(pointer)) {
+            die("pointer is not a JSON object");
+        }
+        // Exact top-level pointer schema, PER LANE: a pointer carrying any
+        // key outside the lane-specific published shape (or missing one) is
+        // schema drift and is rejected — consumers never guess about
+        // optional or future fields.
+        const POINTER_SCHEMA = {
+            "web-sessions-workflow": ["lane", "nonce", "run", "manifest", "coverage", "artifacts"],
+            "web-files-latency": ["lane", "nonce", "run", "manifest", "coverage", "artifacts"],
+            "web-external-sessions": ["lane", "nonce", "run", "manifests", "coverage", "phases"],
+            "web-session-restore": ["lane", "nonce", "run", "manifest", "coverage", "artifacts"],
+            "web-commands-review": ["lane", "nonce", "run", "manifest", "coverage", "artifacts"],
+        };
+        const allowedKeys = POINTER_SCHEMA[lane];
+        if (!allowedKeys) {
+            die(`no published pointer schema for lane ${JSON.stringify(lane)}`);
+        }
+        const pointerKeys = Object.keys(pointer).sort();
+        const expectedKeys = [...allowedKeys].sort();
+        const missingKeys = expectedKeys.filter((key) => !pointerKeys.includes(key));
+        const extraKeys = pointerKeys.filter((key) => !expectedKeys.includes(key));
+        if (missingKeys.length > 0 || extraKeys.length > 0) {
+            die(`pointer top-level keys are not exactly [${expectedKeys.join(", ")}] (missing=${JSON.stringify(missingKeys)}, extras=${JSON.stringify(extraKeys)})`);
+        }
+        if (pointer.lane !== lane) {
+            die(`pointer lane mismatch: expected ${JSON.stringify(lane)}, got ${JSON.stringify(pointer.lane)}`);
+        }
+        if (typeof pointer.nonce !== "string" || pointer.nonce === "") {
+            die(`pointer nonce is not a non-empty string: ${JSON.stringify(pointer.nonce)}`);
+        }
+        // Normalized POSIX-relative contained names only: non-empty strings,
+        // no backslashes, never absolute, exactly their posix.normalize form,
+        // and no `.`/`..` components. `run` must additionally live under
+        // `runs/`.
+        const normalizedRelative = (value, label, runsPrefix) => {
+            if (typeof value !== "string" || value === "") {
+                die(`pointer ${label} is not a non-empty string: ${JSON.stringify(value)}`);
+            }
+            if (value.includes("\\")) {
+                die(`pointer ${label} contains a backslash (POSIX relative only): ${JSON.stringify(value)}`);
+            }
+            if (path.posix.isAbsolute(value)) {
+                die(`pointer ${label} is an absolute path: ${JSON.stringify(value)}`);
+            }
+            if (path.posix.normalize(value) !== value) {
+                die(`pointer ${label} is not normalized (dot/dotdot/redundant separators): ${JSON.stringify(value)}`);
+            }
+            const segments = value.split("/");
+            if (segments.some((segment) => segment === "." || segment === "..")) {
+                die(`pointer ${label} contains dot/dotdot segments: ${JSON.stringify(value)}`);
+            }
+            if (runsPrefix && (segments[0] !== "runs" || segments.length < 2)) {
+                die(`pointer ${label} is not a runs/-relative path: ${JSON.stringify(value)}`);
+            }
+            return value;
+        };
+        const run = normalizedRelative(pointer.run, "run", true);
+        const coverage = normalizedRelative(pointer.coverage, "coverage", false);
+        // Lane-specific manifest field: single-manifest lanes publish
+        // `manifest` + `artifacts`; the external-sessions lane-set publishes
+        // a `manifests` ARRAY plus an exact `phases` schema.
+        let manifestList;
+        let artifactList = null; // single-lane pointers only
+        if (lane === "web-external-sessions") {
+            if (!Array.isArray(pointer.manifests) || pointer.manifests.length === 0) {
+                die(`pointer manifests is not a non-empty array: ${JSON.stringify(pointer.manifests)}`);
+            }
+            manifestList = pointer.manifests.map((name) => normalizedRelative(name, "manifest", false));
+            // Exact phases schema: one entry per manifest, in published
+            // phase order, each carrying EXACTLY
+            // {phase, manifest, documented, executed} with matching names and
+            // equal positive exact-once counts. Extras inside a phase entry
+            // are schema drift and are rejected.
+            const EXPECTED_PHASES = ["default", "native_only"];
+            if (!Array.isArray(pointer.phases) || pointer.phases.length !== manifestList.length) {
+                die(`pointer phases does not have one entry per manifest: ${JSON.stringify(pointer.phases)}`);
+            }
+            pointer.phases.forEach((entry, index) => {
+                if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+                    die(`pointer phases[${index}] is not an object: ${JSON.stringify(entry)}`);
+                }
+                const entryKeys = Object.keys(entry).sort();
+                if (entryKeys.join(",") !== "documented,executed,manifest,phase") {
+                    die(`pointer phases[${index}] keys are not exactly documented/executed/manifest/phase: ${JSON.stringify(entryKeys)}`);
+                }
+                if (entry.phase !== EXPECTED_PHASES[index]) {
+                    die(`pointer phases[${index}] phase mismatch: expected ${JSON.stringify(EXPECTED_PHASES[index])}, got ${JSON.stringify(entry.phase)}`);
+                }
+                if (typeof entry.manifest !== "string" || entry.manifest === "") {
+                    die(`pointer phases[${index}] manifest is not a non-empty string: ${JSON.stringify(entry.manifest)}`);
+                }
+                if (entry.manifest !== manifestList[index]) {
+                    die(`pointer phases[${index}] manifest does not match manifests[${index}]: ${JSON.stringify(entry.manifest)} vs ${JSON.stringify(manifestList[index])}`);
+                }
+                if (!Number.isSafeInteger(entry.documented) || entry.documented < 1
+                    || !Number.isSafeInteger(entry.executed) || entry.executed < 1
+                    || entry.documented !== entry.executed) {
+                    die(`pointer phases[${index}] documented/executed are not equal positive exact-once integers: ${JSON.stringify({ documented: entry.documented, executed: entry.executed })}`);
+                }
+            });
+        } else {
+            if (typeof pointer.manifest !== "string" || pointer.manifest === "") {
+                die(`pointer manifest is not a non-empty string: ${JSON.stringify(pointer.manifest)}`);
+            }
+            manifestList = [normalizedRelative(pointer.manifest, "manifest", false)];
+            if (!Array.isArray(pointer.artifacts) || pointer.artifacts.length === 0
+                || pointer.artifacts.some((name) => typeof name !== "string" || name === "")) {
+                die(`pointer artifacts is not a non-empty array of strings: ${JSON.stringify(pointer.artifacts)}`);
+            }
+            if (new Set(pointer.artifacts).size !== pointer.artifacts.length) {
+                die(`pointer artifacts repeats a name: ${JSON.stringify(pointer.artifacts)}`);
+            }
+            // Every artifact name is a normalized contained relative path,
+            // and the declared manifest + coverage ledger MUST both be
+            // published inside artifacts — the pointer names and its
+            // artifact set are one consistent publication, never
+            // independent strings.
+            const artifactNames = pointer.artifacts.map((name) => normalizedRelative(name, "artifact", false));
+            if (!artifactNames.includes(manifestList[0])) {
+                die(`pointer artifacts does not name the declared manifest: ${JSON.stringify(pointer.manifest)}`);
+            }
+            if (!artifactNames.includes(coverage)) {
+                die(`pointer artifacts does not name the declared coverage ledger: ${JSON.stringify(pointer.coverage)}`);
+            }
+            artifactList = artifactNames;
+        }
+        // The run dir is realpath-resolved and must stay INSIDE the
+        // realpath-resolved lane evidence root; every named manifest/ledger
+        // is walked segment-by-segment under the run dir (symlinks rejected
+        // at every level) and must resolve to a regular file inside the run.
+        const rootReal = fs.realpathSync(dir);
+        const resolveConfined = (base, rel, label) => {
+            let current = base;
+            const segments = rel.split("/");
+            for (let i = 0; i < segments.length; i++) {
+                current = path.join(current, segments[i]);
+                const stats = componentStat(current);
+                if (stats.isSymbolicLink()) {
+                    die(`pointer ${label} component is a symlink (rejected): ${current}`);
+                }
+                if (i < segments.length - 1 && !stats.isDirectory()) {
+                    die(`pointer ${label} path component is not a directory: ${current}`);
+                }
+            }
+            const real = fs.realpathSync(current);
+            const relCheck = path.relative(base, real);
+            if (relCheck === "" || relCheck.startsWith("..") || path.isAbsolute(relCheck)) {
+                die(`pointer ${label} escapes its root: ${rel} -> ${real}`);
+            }
+            return real;
+        };
+        const runReal = resolveConfined(rootReal, run, "run dir");
+        if (!fs.statSync(runReal).isDirectory()) {
+            die(`pointer run is not a directory: ${runReal}`);
+        }
+        const relRun = path.relative(rootReal, runReal);
+        if (relRun === "" || relRun.startsWith("..") || path.isAbsolute(relRun)) {
+            die(`pointer run escapes the evidence root: ${run} -> ${runReal}`);
+        }
+        // The coverage ledger + manifest(s) — and, for single-lane
+        // pointers, EVERY published artifact — are walked segment-by-segment
+        // under the run dir (symlinks rejected at every level), must stay
+        // confined, and must resolve to regular files (missing artifacts
+        // are a hard failure, never a skip).
+        const confinedNames = artifactList === null
+            ? [coverage, ...manifestList]
+            : [coverage, ...manifestList, ...artifactList];
+        for (const name of confinedNames) {
+            const real = resolveConfined(runReal, name, "artifact");
+            if (!fs.statSync(real).isFile()) {
+                die(`pointer ${name} is not a regular file: ${real}`);
+            }
+        }
+        process.stdout.write(path.join(runReal, coverage));
+    ' "$dir" "$lane"
 }
 
 # Real lane suite with the coverage bundle; every lane must pass AND produce
@@ -189,7 +443,7 @@ main() {
 
     build_coverage_bundle
     verify_playwright "$WORK_ROOT/playwright-precheck" "$chrome"
-    export RPI_WEB_DEV_DIR="$COV_DIST"
+    export RPI_WEB_DEV_DIR="$COV_DIST" RPI_WEB_DIST_READY=1
 
     # ---- 3. steering matrix driver (own fixture, real reconnect) ----
     local root evidence port url
@@ -204,7 +458,7 @@ main() {
     printf 'web coverage seed\n' >"$root/workspace/seed.txt"
     git -C "$root/workspace" add -- seed.txt
     git -C "$root/workspace" -c commit.gpgsign=false commit -q -m seed
-    cat >"$root/home/.pi/agent/settings.json" <<EOF
+    cat >"$root/home/.rpi/settings.json" <<EOF
 {
   "orchestration": {
     "tasks": true,
@@ -216,8 +470,8 @@ main() {
   }
 }
 EOF
-    mkdir -p "$root/home/.pi/agent/agents"
-    cat >"$root/home/.pi/agent/agents/writer.md" <<'EOF'
+    mkdir -p "$root/home/.rpi/agents"
+    cat >"$root/home/.rpi/agents/writer.md" <<'EOF'
 ---
 name: writer
 description: Write assigned content
@@ -238,7 +492,7 @@ EOF
     # steering driver's realtime scenario clicks the composer mic and drives
     # a REAL realtime_create_call RPC (Rust proxy -> this mock's create-call
     # endpoint). allowInsecure is required for the loopback http:// base URL.
-    python3 - "$root/home/.pi/agent/settings.json" "$port" <<'PY'
+    python3 - "$root/home/.rpi/settings.json" "$port" <<'PY'
 import json, sys
 path, port = sys.argv[1], sys.argv[2]
 settings = json.load(open(path, encoding="utf-8"))
@@ -450,19 +704,36 @@ EOF
         --out "$report_dir"
 
     # ---- 7. matrix validation ----
-    # The sessions lane writes its own executed-assertion evidence
-    # ($EVIDENCE_ROOT/web-sessions/coverage-assertions.json) during the
-    # step-5 real lane suite; it is gated here like the two drivers.
+    # The real lanes write their own executed-assertion evidence during the
+    # step-5 suite; every pointer-publishing lane (external_sessions,
+    # sessions_workflow, files_latency, session_restore, commands_review)
+    # publishes ONE immutable run dir + ONE current.json pointer, so the
+    # matrix always gates the EXACT ledger of the run the pointer names —
+    # never a stale or hand-copied file. The remaining direct reads are the
+    # two standalone coverage drivers and the lane drivers that write a
+    # single canonical ledger file themselves.
+    local wf_ledger fl_ledger ext_ledger sr_ledger cr_ledger
+    wf_ledger="$(pointer_ledger "$EVIDENCE_ROOT/web-sessions-workflow" "web-sessions-workflow")"
+    fl_ledger="$(pointer_ledger "$EVIDENCE_ROOT/web-files-latency" "web-files-latency")"
+    ext_ledger="$(pointer_ledger "$EVIDENCE_ROOT/web-external_sessions" "web-external-sessions")"
+    sr_ledger="$(pointer_ledger "$EVIDENCE_ROOT/web-session-restore" "web-session-restore")"
+    cr_ledger="$(pointer_ledger "$EVIDENCE_ROOT/web-commands-review" "web-commands-review")"
     node "$SCRIPT_DIR/coverage_matrix.mjs" \
         --evidence "$EVIDENCE_DIR/driver-steering/coverage-assertions.json" \
         --evidence "$EVIDENCE_DIR/driver-xss/coverage-assertions.json" \
         --evidence "$EVIDENCE_DIR/driver-fallback/coverage-assertions.json" \
         --evidence "$EVIDENCE_ROOT/web-sessions/coverage-assertions.json" \
+        --evidence "$sr_ledger" \
         --evidence "$EVIDENCE_ROOT/web-scroll/coverage-assertions.json" \
         --evidence "$EVIDENCE_ROOT/web-projects/coverage-assertions.json" \
-        --evidence "$EVIDENCE_ROOT/web-external_sessions/coverage-assertions.json" \
+        --evidence "$wf_ledger" \
+        --evidence "$fl_ledger" \
+        --evidence "$ext_ledger" \
         --evidence "$EVIDENCE_ROOT/web-presentation/coverage-assertions.json" \
-        --evidence "$EVIDENCE_ROOT/web-loop_goal/coverage-assertions.json"
+        --evidence "$EVIDENCE_ROOT/web-loop_goal/coverage-assertions.json" \
+        --evidence "$cr_ledger" \
+        --evidence "$EVIDENCE_ROOT/web-runtime-matrix/coverage-assertions.json" \
+        --evidence "$EVIDENCE_ROOT/web-thinking-level/coverage-assertions.json"
 
     # persist payloads next to the report for later inspection
     mkdir -p "$EVIDENCE_DIR/payloads"

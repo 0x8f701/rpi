@@ -6,10 +6,10 @@
 # model plus a SECOND model so both header selects are switchable), opens
 # `/web` in a real browser, and asserts:
 #   1. #model-select lists both fixture models and reflects the current one
-#   2. switching the model round-trips (set_model -> get_state -> select)
-#   3. #thinking-select is enabled for the reasoning model and switching
-#      round-trips (set_thinking_level -> get_state -> select)
-#   4. the session still round-trips after the switches
+#   2. switching during a slow response keeps that turn on its captured model
+#      while the header select shows the newly chosen model
+#   3. the following prompt round-trips after the model cutover
+#   4. #thinking-select stays enabled and switching round-trips
 #
 # Browser driver: playwright via npm (ephemeral install in the scenario work
 # dir) with a system Chrome/Chromium binary or playwright's bundled chromium.
@@ -34,7 +34,7 @@ main() {
     case "${1:-run}" in
         list|--list|--dry-run)
             printf '%s\n' \
-                'web-switch - model + thinking-level switch (set_model / set_thinking_level round-trips) with a reasoning dual-model fixture + post-switch round-trip (playwright, hard gate)'
+                'web-switch - active-stream model switch keeps the current turn on its captured model, applies the selection to the next turn, and preserves thinking-level switching (playwright, hard gate)'
             return 0
             ;;
         run|all) ;;
@@ -58,7 +58,7 @@ main() {
     web_run_playwright "$url" "$evidence" "$root/playwright" "$SCRIPT_DIR/switch_test.mjs" \
         RPI_SLOW_TAIL="$SLOW_TAIL" || pw_status=$?
     if [ "$pw_status" -eq 0 ]; then
-        printf 'playwright: model + thinking-level switch round-trips: PASSED\n' | tee "$evidence/playwright-summary.txt"
+        printf 'playwright: mid-stream model cutover + next-turn + thinking-level round-trips: PASSED\n' | tee "$evidence/playwright-summary.txt"
     elif [ "$pw_status" -eq 1 ]; then
         fail "$SCENARIO: playwright SETUP FAILED (node/chromium/npm unavailable)"
     else

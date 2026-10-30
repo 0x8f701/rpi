@@ -40,7 +40,7 @@ pub(crate) fn sanitize_inline(text: &str) -> String {
     output
 }
 
-pub(crate) fn wrap_text(text: &str, width: usize) -> Vec<String> {
+pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let safe = sanitize_inline(text);
     if safe.trim().is_empty() {
@@ -211,4 +211,3 @@ pub(crate) fn pad_to_width(text: &str, width: usize) -> String {
     output.extend(std::iter::repeat_n(' ', width.saturating_sub(actual)));
     output
 }
-

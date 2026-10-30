@@ -5,12 +5,17 @@
 # mock provider (--scenario steering), opens `/web` in a real browser, and
 # asserts the rpi-auth.<token> subprotocol contract against a TOKENED
 # listener (the tokenless-listener contract is covered by auth_tokenless.sh):
-#   1. NO token: the boot auto-connect probe fails SILENTLY (no error toast;
-#      the empty-hint explains the optional-token policy) and the pill never
-#      reaches `connected` — it settles into `reconnecting`
-#   2. WRONG token: an explicit Connect surfaces the "wrong or missing token"
-#      ERROR toast and never reaches `connected`
-#   3. GOOD token: Connect reaches `connected` and a prompt round-trips
+#   1. NO token: the bounded /status preflight proves the listener is
+#      token-gated and the boot HOLDS in the truthful token_required state —
+#      the empty-hint carries the actionable copy, Settings → Connection
+#      auto-opens with the token input visible, and ZERO WebSocket creations
+#      happen during the hold (no silent 401 retry churn)
+#   2. WRONG token: saving it releases the hold with exactly one connect
+#      attempt; the refused handshake surfaces the "wrong or missing token"
+#      ERROR toast and the socket never opens
+#   3. GOOD token: exactly ONE post-save socket generation opens (with the
+#      rpi-auth subprotocol), reaches the connected state, and a prompt
+#      round-trips
 #
 # Browser driver: playwright via npm (ephemeral install in the scenario work
 # dir) with a system Chrome/Chromium binary or playwright's bundled chromium.
@@ -36,7 +41,7 @@ main() {
     case "${1:-run}" in
         list|--list|--dry-run)
             printf '%s\n' \
-                'web-auth - rpi-auth subprotocol: no-token silent probe (never connects), wrong-token error toast, good-token connect + round-trip (playwright, hard gate)'
+                'web-auth - rpi-auth subprotocol: token-required boot hold (auto-open Settings, zero sockets), wrong-token refusal toast, good-token single connect + round-trip (playwright, hard gate)'
             return 0
             ;;
         run|all) ;;
@@ -60,7 +65,7 @@ main() {
     web_run_playwright "$url" "$evidence" "$root/playwright" "$SCRIPT_DIR/auth_test.mjs" \
         RPI_WRONG_TOKEN="$WRONG_TOKEN" RPI_SLOW_TAIL="$SLOW_TAIL" || pw_status=$?
     if [ "$pw_status" -eq 0 ]; then
-        printf 'playwright: no-token silent probe + wrong-token error toast + good-token connect: PASSED\n' | tee "$evidence/playwright-summary.txt"
+        printf 'playwright: token-required hold + wrong-token refusal + good-token single connect: PASSED\n' | tee "$evidence/playwright-summary.txt"
     elif [ "$pw_status" -eq 1 ]; then
         fail "$SCENARIO: playwright SETUP FAILED (node/chromium/npm unavailable)"
     else

@@ -17,19 +17,23 @@ mod markdown;
 
 use markdown::render_markdown_html;
 use std::collections::HashSet;
-use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, SecondsFormat, Utc};
 use pi_ai::{ContentBlock, Message, ToolCall};
+use pi_sandbox::AbsolutePath;
 use serde_json::Value;
 
-use crate::redact::redact_secrets;
-use crate::session_store::{
-    SessionEntry, SessionTree, load_session_tree, load_session_messages,
+use crate::fs::{
+    CapabilityAccess, CapabilityFs, CapabilityRootPurpose, FileMode, FsError, Replacement,
+    RootCreation,
 };
+
+use crate::redact::redact_secrets;
+use crate::session_store::{SessionEntry, SessionTree, load_session_messages, load_session_tree};
 
 const STYLES: &str = include_str!("styles.css");
 const THEME_JS: &str = include_str!("theme.js");
@@ -97,31 +101,34 @@ pub fn export_session_html(
     output: Option<&Path>,
     options: &ExportOptions,
 ) -> Result<PathBuf> {
-    let tree = load_session_tree(session_path)
+    let prepared = crate::PreparedSessionResume::prepare_path(session_path)
         .with_context(|| format!("loading session {}", session_path.display()))?;
-    if tree.entries.is_empty() {
-        bail!(
-            "session {} contains no transcript entries; nothing to export",
-            session_path.display()
-        );
-    }
-    let metadata = metadata_from_tree(&tree);
-    let html = render_tree_html(&tree, &metadata, options);
+    let html = render_saved_session_html(prepared.tree(), options)?;
     let out = resolve_output(session_path, output, "html")?;
-    refuse_in_place(session_path, &out)?;
-    atomic_write(&out, &html)
-        .with_context(|| format!("writing HTML export {}", out.display()))?;
+    refuse_in_place_identity(session_path, prepared.identity(), &out)?;
+    atomic_write(&out, &html).with_context(|| format!("writing HTML export {}", out.display()))?;
     Ok(out)
 }
 
+/// Render a loaded saved session to self-contained HTML in memory.
+///
+/// This is the write-free counterpart to [`export_session_html`]. It uses the
+/// same chronological entry rendering, credential redaction, HTML escaping,
+/// and theme assets, allowing capability-based transports to serve a saved
+/// session without staging an intermediate file or mutating its source.
+pub fn render_saved_session_html(tree: &SessionTree, options: &ExportOptions) -> Result<String> {
+    if tree.entries.is_empty() {
+        bail!("session contains no transcript entries; nothing to export");
+    }
+    let metadata = metadata_from_tree(tree);
+    Ok(render_tree_html(tree, &metadata, options))
+}
+
 /// Export the current branch (root → leaf) of a session to JSONL.
-pub fn export_session_jsonl(
-    session_path: &Path,
-    output: Option<&Path>,
-) -> Result<PathBuf> {
-    let jsonl = branch_jsonl(session_path)?;
+pub fn export_session_jsonl(session_path: &Path, output: Option<&Path>) -> Result<PathBuf> {
+    let (jsonl, source_identity) = branch_jsonl(session_path)?;
     let out = resolve_output(session_path, output, "jsonl")?;
-    refuse_in_place(session_path, &out)?;
+    refuse_in_place_identity(session_path, source_identity, &out)?;
     atomic_write(&out, &jsonl)
         .with_context(|| format!("writing JSONL export {}", out.display()))?;
     Ok(out)
@@ -133,12 +140,13 @@ pub fn export_session_jsonl(
 /// Used by the encrypted-share path so the plaintext branch is never staged
 /// as a temp file (see [`crate::share::encrypt_session_share_to_file`]).
 pub fn export_session_jsonl_bytes(session_path: &Path) -> Result<Vec<u8>> {
-    Ok(branch_jsonl(session_path)?.into_bytes())
+    Ok(branch_jsonl(session_path)?.0.into_bytes())
 }
 
-fn branch_jsonl(session_path: &Path) -> Result<String> {
-    let tree = load_session_tree(session_path)
+fn branch_jsonl(session_path: &Path) -> Result<(String, crate::SessionFileIdentity)> {
+    let prepared = crate::PreparedSessionResume::prepare_path(session_path)
         .with_context(|| format!("loading session {}", session_path.display()))?;
+    let tree = prepared.tree();
     if tree.entries.is_empty() {
         bail!(
             "session {} contains no transcript entries; nothing to export",
@@ -150,7 +158,8 @@ fn branch_jsonl(session_path: &Path) -> Result<String> {
         .iter()
         .map(|entry| entry.id.clone())
         .collect();
-    filter_branch_jsonl(session_path, &branch_ids)
+    let identity = prepared.identity();
+    Ok((filter_branch_jsonl(prepared, &branch_ids)?, identity))
 }
 
 /// Export in-memory messages to a self-contained HTML file (live session
@@ -164,8 +173,7 @@ pub fn export_messages_html(
     let html = render_messages_html(messages, metadata, options);
     let fallback = Path::new("session.html");
     let out = resolve_output(output.unwrap_or(fallback), output, "html")?;
-    atomic_write(&out, &html)
-        .with_context(|| format!("writing HTML export {}", out.display()))?;
+    atomic_write(&out, &html).with_context(|| format!("writing HTML export {}", out.display()))?;
     Ok(out)
 }
 
@@ -178,14 +186,25 @@ pub fn export_live_session(
     output: Option<&Path>,
     options: &ExportOptions,
 ) -> Result<PathBuf> {
-    if let Some((_id, path)) = session.recorder_info() {
-        if path.exists() {
-            if let Ok(result) = export_session_html(&path, output, options) {
-                return Ok(result);
-            }
-            // Fall through to in-memory fallback when the file is
-            // unreadable (partial write during a live turn).
+    if let Some(recorder) = session.recorder()
+        && let Ok(tree) = recorder.tree()
+        && !tree.entries.is_empty()
+    {
+        let source = recorder.path();
+        let metadata = metadata_from_tree(&tree);
+        let html = render_tree_html(&tree, &metadata, options);
+        let out = resolve_output(&source, output, "html")?;
+        if let Some(identity) = recorder.file_identity() {
+            refuse_in_place_identity(&source, identity, &out)?;
+        } else if out == source {
+            bail!(
+                "refusing to overwrite the source session {}",
+                source.display()
+            );
         }
+        atomic_write(&out, &html)
+            .with_context(|| format!("writing HTML export {}", out.display()))?;
+        return Ok(out);
     }
     let metadata = ExportMetadata {
         session_id: session.recorder_info().map(|(id, _)| id),
@@ -216,24 +235,27 @@ fn metadata_from_tree(tree: &SessionTree) -> ExportMetadata {
     }
 }
 
-fn render_tree_html(tree: &SessionTree, metadata: &ExportMetadata, options: &ExportOptions) -> String {
+fn render_tree_html(
+    tree: &SessionTree,
+    metadata: &ExportMetadata,
+    options: &ExportOptions,
+) -> String {
     let entries: Vec<&SessionEntry> = tree.entries.iter().collect();
     let body = render_entries(&entries);
     build_html(metadata, &body, options)
 }
 
-fn render_messages_html(messages: &[Message], metadata: &ExportMetadata, options: &ExportOptions) -> String {
+fn render_messages_html(
+    messages: &[Message],
+    metadata: &ExportMetadata,
+    options: &ExportOptions,
+) -> String {
     let body = render_message_list(messages);
     build_html(metadata, &body, options)
 }
 
 fn build_html(metadata: &ExportMetadata, body: &str, options: &ExportOptions) -> String {
-    let title = escape_text(
-        options
-            .title
-            .as_deref()
-            .unwrap_or("rpi session export"),
-    );
+    let title = escape_text(options.title.as_deref().unwrap_or("rpi session export"));
     let theme_attr = match options.theme {
         Theme::Light => "data-theme=\"light\"",
         Theme::Dark => "data-theme=\"dark\"",
@@ -334,10 +356,7 @@ fn render_entry(entry: &SessionEntry) -> String {
         ),
         "thinking_level_change" => render_system(
             "Thinking level",
-            entry
-                .thinking_level
-                .as_deref()
-                .unwrap_or("(unset)"),
+            entry.thinking_level.as_deref().unwrap_or("(unset)"),
             &entry.timestamp,
         ),
         "custom_message" => render_custom_entry(entry),
@@ -353,8 +372,12 @@ fn render_message(message: &Message) -> String {
         Message::ToolResult(msg) => render_tool_result(msg),
         Message::BashExecution(msg) => render_bash_execution(msg),
         Message::Custom(msg) => render_custom_message(msg),
-        Message::BranchSummary(msg) => render_summary_message("Branch summary", &msg.summary, msg.timestamp),
-        Message::CompactionSummary(msg) => render_summary_message("Compaction summary", &msg.summary, msg.timestamp),
+        Message::BranchSummary(msg) => {
+            render_summary_message("Branch summary", &msg.summary, msg.timestamp)
+        }
+        Message::CompactionSummary(msg) => {
+            render_summary_message("Compaction summary", &msg.summary, msg.timestamp)
+        }
     }
 }
 
@@ -374,11 +397,17 @@ fn render_assistant(message: &pi_ai::AssistantMessage) -> String {
                     has_visible = true;
                 }
             }
-            ContentBlock::Thinking { thinking, redacted, .. } => {
+            ContentBlock::Thinking {
+                thinking, redacted, ..
+            } => {
                 if thinking.is_empty() && !redacted {
                     continue;
                 }
-                let label = if *redacted { "Redacted thinking" } else { "Thinking" };
+                let label = if *redacted {
+                    "Redacted thinking"
+                } else {
+                    "Thinking"
+                };
                 let content = if *redacted {
                     "(redacted)".to_owned()
                 } else {
@@ -450,7 +479,10 @@ fn render_bash_execution(message: &pi_ai::BashExecutionMessage) -> String {
     if message.cancelled {
         body.push_str("\n<div class=\"entry__error\">(cancelled)</div>");
     } else if let Some(code) = message.exit_code.filter(|code| *code != 0) {
-        body.push_str(&format!("\n<div class=\"entry__error\">(exit {})</div>", code));
+        body.push_str(&format!(
+            "\n<div class=\"entry__error\">(exit {})</div>",
+            code
+        ));
     }
     if message.truncated {
         let notice = message.full_output_path.as_deref().map_or_else(
@@ -498,9 +530,18 @@ fn render_custom_message(message: &pi_ai::CustomMessage) -> String {
 fn render_custom_entry(entry: &SessionEntry) -> String {
     if entry.custom_type.as_deref() == Some(crate::LOOP_SCHEDULED_MESSAGE_TYPE) {
         let details = entry.details.as_ref();
-        let task_id = details.and_then(|value| value.get("taskId")).and_then(Value::as_str).unwrap_or("unknown");
-        let schedule = details.and_then(|value| value.get("schedule")).and_then(Value::as_str).unwrap_or("scheduled");
-        let prompt = details.and_then(|value| value.get("prompt")).and_then(Value::as_str).unwrap_or_default();
+        let task_id = details
+            .and_then(|value| value.get("taskId"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let schedule = details
+            .and_then(|value| value.get("schedule"))
+            .and_then(Value::as_str)
+            .unwrap_or("scheduled");
+        let prompt = details
+            .and_then(|value| value.get("prompt"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         return entry_html(
             "system",
             &format!("Loop {task_id} · {schedule}"),
@@ -513,10 +554,10 @@ fn render_custom_entry(entry: &SessionEntry) -> String {
     if entry.display != Some(true) {
         return String::new();
     }
-    let body = entry
-        .content
-        .as_ref()
-        .map_or_else(|| "<p>(no content)</p>".to_owned(), |content| render_content(&content.to_blocks()));
+    let body = entry.content.as_ref().map_or_else(
+        || "<p>(no content)</p>".to_owned(),
+        |content| render_content(&content.to_blocks()),
+    );
     entry_html(
         "system",
         entry.custom_type.as_deref().unwrap_or("Custom"),
@@ -542,8 +583,7 @@ fn render_tool_call(call: &ToolCall) -> String {
     let args_pretty = if call.arguments.is_null() {
         String::new()
     } else {
-        serde_json::to_string_pretty(&call.arguments)
-            .unwrap_or_else(|_| call.arguments.to_string())
+        serde_json::to_string_pretty(&call.arguments).unwrap_or_else(|_| call.arguments.to_string())
     };
     format!(
         "<div class=\"tool-call\"><span class=\"tool-call__name\">{}</span><span class=\"tool-call__args\">{}</span></div>",
@@ -590,7 +630,14 @@ fn render_content(content: &[ContentBlock]) -> String {
 
 fn render_system(label: &str, value: &str, timestamp: &str) -> String {
     let body = format!("<p>{}: {}</p>", escape_text(label), escape_text(value));
-    entry_html("system", label, None, Some(&format_timestamp(timestamp)), &body, false)
+    entry_html(
+        "system",
+        label,
+        None,
+        Some(&format_timestamp(timestamp)),
+        &body,
+        false,
+    )
 }
 
 fn render_compaction(entry: &SessionEntry) -> String {
@@ -602,13 +649,18 @@ fn render_compaction(entry: &SessionEntry) -> String {
             escape_text(summary)
         )
     } else {
-        format!("<p>History compacted.</p>\n<pre>{}</pre>", escape_text(summary))
+        format!(
+            "<p>History compacted.</p>\n<pre>{}</pre>",
+            escape_text(summary)
+        )
     };
     let head = format!(
         "<div class=\"entry__head\">\n  <span class=\"entry__role entry__role--system\">Compaction</span>\n  <time class=\"entry__time\">{}</time>\n</div>",
         escape_text(&format_timestamp(&entry.timestamp))
     );
-    format!("<article class=\"entry entry--compaction\">\n{head}\n<div class=\"entry__body\">\n{body}\n</div>\n</article>")
+    format!(
+        "<article class=\"entry entry--compaction\">\n{head}\n<div class=\"entry__body\">\n{body}\n</div>\n</article>"
+    )
 }
 
 fn entry_html(
@@ -716,8 +768,14 @@ fn render_custom_colors(colors: &CustomColors) -> String {
 // JSONL branch export
 // ---------------------------------------------------------------------------
 
-fn filter_branch_jsonl(path: &Path, branch_ids: &HashSet<String>) -> Result<String> {
-    let file = fs::File::open(path).with_context(|| format!("opening session {}", path.display()))?;
+fn filter_branch_jsonl(
+    prepared: crate::PreparedSessionResume,
+    branch_ids: &HashSet<String>,
+) -> Result<String> {
+    let path = prepared.path().to_path_buf();
+    let mut file = prepared.into_read_file();
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("seeking session {} for branch export", path.display()))?;
     let reader = BufReader::new(file);
     let mut out = Vec::new();
     for line in reader.lines() {
@@ -726,13 +784,13 @@ fn filter_branch_jsonl(path: &Path, branch_ids: &HashSet<String>) -> Result<Stri
             continue;
         }
         let value: Value = match serde_json::from_str(line.trim()) {
-            Ok(v) => v,
+            Ok(value) => value,
             Err(_) => continue,
         };
         let is_header = value
             .get("type")
             .and_then(Value::as_str)
-            .is_some_and(|t| t == "session");
+            .is_some_and(|entry_type| entry_type == "session");
         let in_branch = value
             .get("id")
             .and_then(Value::as_str)
@@ -765,16 +823,23 @@ fn resolve_output(session_path: &Path, output: Option<&Path>, ext: &str) -> Resu
     Ok(dir.join(format!("{stem}.{ext}")))
 }
 
-/// Refuse to write an export over its own source session file. The default
-/// JSONL output path (`<stem>.jsonl`) collides with a `.jsonl` input, and an
-/// explicit `--output` may too; silently replacing the source would discard
-/// off-branch records or truncate a live/partial session.
-fn refuse_in_place(session_path: &Path, out: &Path) -> Result<()> {
-    if out == session_path
-        || (out.exists()
-            && session_path.exists()
-            && fs::canonicalize(out).ok() == fs::canonicalize(session_path).ok())
-    {
+/// Refuse to write an export over its own source session file.
+fn refuse_in_place_identity(
+    session_path: &Path,
+    source_identity: crate::SessionFileIdentity,
+    out: &Path,
+) -> Result<()> {
+    if out == session_path {
+        bail!(
+            "refusing to overwrite the source session {}; pass --output with a different path",
+            session_path.display()
+        );
+    }
+    let output = EXPORT_CAPABILITIES.open_exact_file(
+        CapabilityRootPurpose::OperatorImport,
+        absolute_export_path(out)?,
+    );
+    if output.is_ok_and(|output| output.public_identity() == source_identity) {
         bail!(
             "refusing to overwrite the source session {}; pass --output with a different path",
             session_path.display()
@@ -783,29 +848,56 @@ fn refuse_in_place(session_path: &Path, out: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Write `content` to `path` atomically via a temp file in the same directory
-/// followed by a rename.
+/// Write `content` to `path` atomically through an exact retained parent lease.
 fn atomic_write(path: &Path, content: &str) -> Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
-    if !dir.as_os_str().is_empty() && !dir.exists() {
-        fs::create_dir_all(dir)
-            .with_context(|| format!("creating output directory {}", dir.display()))?;
-    }
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "export".to_owned());
-    let temp_path = dir.join(format!(".{name}.tmp.{}", std::process::id()));
-    if let Err(error) = fs::write(&temp_path, content) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(error)
-            .with_context(|| format!("writing temporary file {}", temp_path.display()));
-    }
-    if let Err(error) = fs::rename(&temp_path, path) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(error).with_context(|| format!("renaming to {}", path.display()));
-    }
-    Ok(())
+    let absolute = absolute_export_path(path)?;
+    let (parent, name) = EXPORT_CAPABILITIES
+        .open_exact_parent(
+            CapabilityRootPurpose::OperatorExport,
+            absolute,
+            CapabilityAccess::PrivateReadWrite,
+            RootCreation::CreateDirectory,
+        )
+        .with_context(|| format!("opening export parent {}", path.display()))?;
+    let relative = PathBuf::from(name);
+    let expected = match parent.metadata(&relative) {
+        Ok(metadata) => Some(metadata.identity),
+        Err(error) if fs_error_is_missing(&error) => None,
+        Err(error) => return Err(error).context("reading export target identity"),
+    };
+    parent
+        .replace_file(Replacement {
+            relative,
+            expected,
+            bytes: content.as_bytes().to_vec(),
+            mode: FileMode::Private,
+        })
+        .map(|_| ())
+        .with_context(|| format!("writing export {}", path.display()))
+}
+
+static EXPORT_CAPABILITIES: LazyLock<Arc<CapabilityFs>> =
+    LazyLock::new(|| CapabilityFs::new().expect("capability filesystem initialization"));
+
+fn absolute_export_path(path: &Path) -> Result<AbsolutePath> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("resolving export path")?
+            .join(path)
+    };
+    AbsolutePath::parse(path).map_err(|_| anyhow::anyhow!("invalid export path"))
+}
+
+fn fs_error_is_missing(error: &FsError) -> bool {
+    matches!(
+        error,
+        FsError::System {
+            kind: std::io::ErrorKind::NotFound,
+            ..
+        }
+    )
 }
 
 fn format_timestamp(iso: &str) -> String {
@@ -833,7 +925,12 @@ fn format_timestamp_millis(millis: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
+    fn recorded_session(cwd: &Path, session_dir: &Path, id: &str) -> crate::SessionRecorder {
+        crate::start_session_in(cwd, None, None, Some(session_dir), Some(id), None)
+            .expect("start session recorder")
+    }
     #[test]
     fn escape_text_replaces_dangerous_chars() {
         assert_eq!(escape_text("a<b>&c\"'d"), "a&lt;b&gt;&amp;c&quot;&#39;d");
@@ -903,7 +1000,11 @@ mod tests {
             timestamp: 1,
             exclude_from_context: Some(true),
         })];
-        let html = render_messages_html(&messages, &ExportMetadata::default(), &ExportOptions::default());
+        let html = render_messages_html(
+            &messages,
+            &ExportMetadata::default(),
+            &ExportOptions::default(),
+        );
         assert!(html.contains("printf &#39;&lt;script&gt;&#39;"));
         assert!(html.contains("&lt;img onerror=alert(1)&gt;"));
         assert!(html.contains("(exit 7)"));
@@ -932,7 +1033,11 @@ mod tests {
                 exclude_from_context: None,
             }),
         ];
-        let html = render_messages_html(&messages, &ExportMetadata::default(), &ExportOptions::default());
+        let html = render_messages_html(
+            &messages,
+            &ExportMetadata::default(),
+            &ExportOptions::default(),
+        );
         for leaked in [ghp.as_str(), "abc123", "xyz789", sk.as_str()] {
             assert!(!html.contains(leaked), "{leaked:?} leaked into export");
         }
@@ -942,7 +1047,11 @@ mod tests {
     #[test]
     fn html_export_leaves_plain_text_unchanged() {
         let messages = vec![Message::user_text("plain conversation, no secrets", 1)];
-        let html = render_messages_html(&messages, &ExportMetadata::default(), &ExportOptions::default());
+        let html = render_messages_html(
+            &messages,
+            &ExportMetadata::default(),
+            &ExportOptions::default(),
+        );
         assert!(html.contains("plain conversation, no secrets"));
         assert!(!html.contains("[REDACTED]"));
     }
@@ -960,7 +1069,11 @@ mod tests {
             })),
             timestamp: 1,
         })];
-        let html = render_messages_html(&messages, &ExportMetadata::default(), &ExportOptions::default());
+        let html = render_messages_html(
+            &messages,
+            &ExportMetadata::default(),
+            &ExportOptions::default(),
+        );
         assert!(html.contains("Loop abc123 · every 3 seconds"));
         assert!(html.contains("echo hello"));
         assert!(!html.contains("system-reminder"));
@@ -984,7 +1097,11 @@ mod tests {
                 timestamp: 2,
             }),
         ];
-        let html = render_messages_html(&messages, &ExportMetadata::default(), &ExportOptions::default());
+        let html = render_messages_html(
+            &messages,
+            &ExportMetadata::default(),
+            &ExportOptions::default(),
+        );
         assert!(html.contains("release-note"));
         assert!(html.contains("&lt;visible&gt;"));
         assert!(!html.contains("todo-error-reminder"));
@@ -1025,22 +1142,47 @@ mod tests {
 
     #[test]
     fn jsonl_export_filters_to_branch() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.jsonl");
-        fs::write(
-            &path,
-            "{\"type\":\"session\",\"version\":3,\"id\":\"s1\",\"timestamp\":\"2024-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n\
-             {\"type\":\"message\",\"id\":\"a\",\"parentId\":null,\"timestamp\":\"2024-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"timestamp\":0}}\n\
-             {\"type\":\"message\",\"id\":\"b\",\"parentId\":\"a\",\"timestamp\":\"2024-01-01T00:00:02Z\",\"message\":{\"role\":\"assistant\",\"content\":[],\"api\":\"x\",\"provider\":\"x\",\"model\":\"x\",\"stopReason\":\"stop\",\"timestamp\":0}}\n\
-             {\"type\":\"message\",\"id\":\"c\",\"parentId\":\"a\",\"timestamp\":\"2024-01-01T00:00:03Z\",\"message\":{\"role\":\"assistant\",\"content\":[],\"api\":\"x\",\"provider\":\"x\",\"model\":\"y\",\"stopReason\":\"stop\",\"timestamp\":0}}\n",
-        )
-        .unwrap();
-        let tree = load_session_tree(&path).unwrap();
-        let branch_ids: HashSet<String> = tree.branch(None).iter().map(|e| e.id.clone()).collect();
-        let jsonl = filter_branch_jsonl(&path, &branch_ids).unwrap();
-        assert!(jsonl.contains("\"id\":\"a\""));
-        assert!(jsonl.contains("\"id\":\"c\""));
-        assert!(!jsonl.contains("\"id\":\"b\""));
+        let cwd = tempfile::tempdir().expect("cwd");
+        let sessions = tempfile::tempdir().expect("sessions");
+        let recorder = recorded_session(cwd.path(), sessions.path(), "branch-filter");
+        let root = recorder
+            .record_message(&Message::user_text("hi", 0))
+            .expect("record root");
+        recorder
+            .record_message(&Message::user_text("abandoned", 1))
+            .expect("record abandoned branch");
+        recorder.fork_from(Some(&root));
+        let active = recorder
+            .record_message(&Message::user_text("active", 2))
+            .expect("record active branch");
+        recorder.persist_now().expect("persist recorder");
+        let path = recorder.path();
+        recorder.close().expect("close recorder");
+        let tree = load_session_tree(&path).expect("load session tree");
+        let branch_ids: HashSet<String> = tree
+            .branch(None)
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect();
+        let prepared = crate::PreparedSessionResume::prepare_path(&path).expect("prepare session");
+        let jsonl = filter_branch_jsonl(prepared, &branch_ids).expect("filter branch");
+        let rows = serde_json::Deserializer::from_str(&jsonl)
+            .into_iter::<Value>()
+            .map(|row| row.expect("parse filtered row"))
+            .collect::<Vec<_>>();
+        assert!(
+            rows.iter()
+                .any(|row| row.get("id").and_then(Value::as_str) == Some(root.as_str())),
+            "missing root {root} in {rows:#?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.get("id").and_then(Value::as_str) == Some(active.as_str())),
+            "missing active {active} in {rows:#?}"
+        );
+        assert!(rows.iter().all(|row| {
+            row.pointer("/message/content/0/text") != Some(&Value::String("abandoned".to_owned()))
+        }));
     }
 
     #[test]
@@ -1091,25 +1233,65 @@ mod tests {
     }
 
     #[test]
-    fn export_session_jsonl_produces_valid_output() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.jsonl");
+    fn render_saved_session_html_is_write_free_redacted_and_escaped() {
+        let dir = tempfile::tempdir().expect("session directory");
+        let path = dir.path().join("selected.jsonl");
         fs::write(
             &path,
-            "{\"type\":\"session\",\"version\":3,\"id\":\"s1\",\"timestamp\":\"2024-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n\
-             {\"type\":\"message\",\"id\":\"a\",\"parentId\":null,\"timestamp\":\"2024-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"timestamp\":0}}\n",
+            concat!(
+                r#"{"type":"session","version":3,"id":"selected-session","timestamp":"2024-01-01T00:00:00Z","cwd":"/tmp"}"#,
+                "\n",
+                r#"{"type":"message","id":"a","parentId":null,"timestamp":"2024-01-01T00:00:01Z","message":{"role":"user","content":[{"type":"text","text":"selected <row> token=secret-value"}],"timestamp":0}}"#,
+                "\n"
+            ),
         )
-        .unwrap();
-        let out = dir.path().join("branch.jsonl");
-        let result = export_session_jsonl(&path, Some(&out)).unwrap();
+        .expect("write selected session");
+        let prepared = crate::PreparedSessionResume::prepare_path(&path).expect("prepare session");
+        let before = fs::read(&path).expect("source before render");
+
+        let html = render_saved_session_html(prepared.tree(), &ExportOptions::default())
+            .expect("render saved session");
+
+        assert!(html.contains("selected-session"));
+        assert!(html.contains("selected"));
+        assert!(html.contains("&lt;row&gt;"));
+        assert!(html.contains("[REDACTED]"));
+        assert!(!html.contains("secret-value"));
+        assert_eq!(fs::read(&path).expect("source after render"), before);
+        assert_eq!(fs::read_dir(dir.path()).expect("read directory").count(), 1);
+    }
+    #[test]
+    fn export_session_jsonl_produces_valid_output() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let sessions = tempfile::tempdir().expect("sessions");
+        let recorder = recorded_session(cwd.path(), sessions.path(), "jsonl-export");
+        let entry = recorder
+            .record_message(&Message::user_text("hi", 0))
+            .expect("record message");
+        recorder.persist_now().expect("persist recorder");
+        let path = recorder.path();
+        recorder.close().expect("close recorder");
+        let out = sessions.path().join("branch.jsonl");
+        let result = export_session_jsonl(&path, Some(&out)).expect("export jsonl");
         assert_eq!(result, out);
-        let content = fs::read_to_string(&out).unwrap();
-        assert!(content.contains("\"type\":\"session\""));
-        assert!(content.contains("\"id\":\"a\""));
+        let content = fs::read_to_string(&out).expect("read export");
+        let rows = serde_json::Deserializer::from_str(&content)
+            .into_iter::<Value>()
+            .map(|row| row.expect("parse exported row"))
+            .collect::<Vec<_>>();
+        assert!(
+            rows.iter()
+                .any(|row| row.get("type").and_then(Value::as_str) == Some("session")),
+            "missing session header in {rows:#?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.get("id").and_then(Value::as_str) == Some(entry.as_str())),
+            "missing entry {entry} in {rows:#?}"
+        );
     }
 
-    const HEADER_ONLY_SESSION: &str =
-        "{\"type\":\"session\",\"version\":3,\"id\":\"s1\",\"timestamp\":\"2024-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n";
+    const HEADER_ONLY_SESSION: &str = "{\"type\":\"session\",\"version\":3,\"id\":\"s1\",\"timestamp\":\"2024-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n";
 
     const MESSAGED_SESSION: &str = concat!(
         "{\"type\":\"session\",\"version\":3,\"id\":\"s1\",\"timestamp\":\"2024-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n",
@@ -1143,8 +1325,8 @@ mod tests {
         let path = dir.path().join("empty.jsonl");
         fs::write(&path, HEADER_ONLY_SESSION).unwrap();
         let out = dir.path().join("empty-export.jsonl");
-        let error = export_session_jsonl(&path, Some(&out))
-            .expect_err("header-only session must fail");
+        let error =
+            export_session_jsonl(&path, Some(&out)).expect_err("header-only session must fail");
         assert!(
             error.to_string().contains("no transcript entries"),
             "error must be actionable: {error:#}"
@@ -1160,8 +1342,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
         fs::write(&path, MESSAGED_SESSION).unwrap();
-        let error =
-            export_session_jsonl(&path, None).expect_err("in-place jsonl export must fail");
+        let error = export_session_jsonl(&path, None).expect_err("in-place jsonl export must fail");
         assert!(
             error.to_string().contains("refusing to overwrite"),
             "error must be actionable: {error:#}"

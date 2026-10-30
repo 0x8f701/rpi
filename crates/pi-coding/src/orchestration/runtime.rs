@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read as _, Write as _};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}};
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -15,9 +17,14 @@ use serde_json::Value;
 use tokio::sync::{Notify, Semaphore, broadcast};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 use unicode_normalization::UnicodeNormalization;
+use uuid::Uuid;
 
+use crate::fs::{
+    CapabilityAccess, CapabilityEntry, CapabilityFile, CapabilityFs, CapabilityRootLease,
+    CapabilityRootPurpose, EntryKind, FileMode, FsError, Replacement, RootCreation,
+    is_link_blocked,
+};
 use crate::{Session, Skill};
 
 use super::{
@@ -28,12 +35,17 @@ use super::{
 pub const DEFAULT_MAILBOX_CAPACITY: usize = 100;
 pub const DEFAULT_MAX_CONCURRENCY: usize = 4;
 pub const DEFAULT_MAX_RECURSION_DEPTH: usize = 2;
+/// Cap applied to explicitly declared agent tool lists. Agents whose
+/// effective `tools` are `None` inherit the full parent/default child set
+/// and are exempt from this cap.
 pub const DEFAULT_MAX_TOOLS_PER_AGENT: usize = 16;
 pub const DEFAULT_IDLE_TTL_SECS: u64 = 300;
 pub const DEFAULT_MAX_RETAINED_JOBS: usize = 256;
 pub const DEFAULT_RETAINED_JOB_TTL_SECS: u64 = 24 * 60 * 60;
 /// Bound on the delivered-message log the workflow page's Recent IRC reads.
-const DELIVERED_MESSAGE_LOG_CAP: usize = 200;
+pub(crate) const DELIVERED_MESSAGE_LOG_CAP: usize = 200;
+/// Ingress/persistence bound on a mailbox message body.
+pub const MAX_MESSAGE_BODY_BYTES: usize = 64 * 1024;
 /// Stable custom-message type for orchestration mailbox deliveries.
 pub const ORCHESTRATION_MESSAGE_TYPE: &str = "orchestration_message";
 /// Default number of transcript lines rendered by `hub read_history`.
@@ -41,7 +53,7 @@ pub const DEFAULT_HISTORY_LINES: usize = 50;
 /// Hard maximum for `hub read_history` lines (clamped, never exceeded).
 pub const MAX_HISTORY_LINES: usize = 200;
 /// Hard byte cap for a rendered `hub read_history` transcript.
-pub const MAX_HISTORY_BYTES: usize = 32 * 1024;
+pub const MAX_HISTORY_BYTES: usize = 320 * 1024;
 const MAX_AUTOLOAD_SKILL_BYTES: u64 = 256 * 1024;
 const MAX_AUTOLOAD_PROMPT_BYTES: usize = 1024 * 1024;
 const MAX_PERSONALITY_BYTES: usize = 64 * 1024;
@@ -51,12 +63,37 @@ const MAX_SIBLING_ROSTER_ENTRIES: usize = 64;
 const MAX_SIBLING_ROSTER_BYTES: usize = MAX_AUTOLOAD_PROMPT_BYTES / 64;
 const MAX_ROSTER_AGENT_CHARS: usize = 80;
 const CHILD_ABORT_GRACE: Duration = Duration::from_secs(2);
-pub type AgentSelectorFn = Arc<
-    dyn Fn(&str, &[AgentDefinition]) -> Option<String> + Send + Sync,
->;
+const MAX_HISTORY_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+pub type AgentSelectorFn = Arc<dyn Fn(&str, &[AgentDefinition]) -> Option<String> + Send + Sync>;
 pub type ParentModelProvider = Arc<dyn Fn() -> pi_ai::Model + Send + Sync>;
 pub type ChildSessionFactory =
     Arc<dyn Fn(ChildSessionRequest) -> BoxFuture<Result<Session>> + Send + Sync>;
+
+pub const CODE_REVIEW_PARENT_AGENT_ID: &str = "Review";
+/// Short text preview of a queued pending message, for surfaced loss reports.
+fn queued_message_preview(message: &pi_ai::Message) -> String {
+    match message {
+        pi_ai::Message::User(user) => user
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                pi_ai::ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        pi_ai::Message::Custom(custom) => match &custom.content {
+            pi_ai::CustomMessageContent::Text(text) => text.clone(),
+            pi_ai::CustomMessageContent::Blocks(_) => "(blocks)".to_owned(),
+        },
+        _ => format!("{:?}", message.role()),
+    }
+    .chars()
+    .take(120)
+    .collect()
+}
+
 #[derive(Clone)]
 pub struct ChildSession {
     session: Session,
@@ -72,30 +109,55 @@ impl ChildSession {
         self.session.steer(mailbox_message_as_custom(message)).await
     }
 
-    /// Drain any orchestration mailbox messages that were steered into the
-    /// session's steering queue but never processed by the run. The active
-    /// delivery bridge acknowledges a message the moment it is steered; if the
-    /// run completes before the agent loop drains the queue (the final-turn
-    /// race), the message would otherwise be lost with the dropped session.
-    /// The caller restores them to the mailbox so the next run/revival
-    /// delivers them exactly once.
-    async fn drain_unprocessed_orchestration_steering(&self) -> Vec<MailboxMessage> {
+    /// Drain steering messages that were steered into the session's queue but
+    /// never processed by the run. The active delivery bridge acknowledges a
+    /// message the moment it is steered; if the run completes before the agent
+    /// loop drains the queue (the final-turn race), the message would
+    /// otherwise be lost with the dropped session. The caller restores the
+    /// mailbox messages to the mailbox so the next run/revival delivers them
+    /// exactly once. Anything that cannot be mapped back to a mailbox record
+    /// (foreign custom types, undecodable payloads, user-text steering) is
+    /// returned as a description so the caller can surface it — a teardown
+    /// never silently discards acknowledged steering.
+    async fn drain_unprocessed_orchestration_steering(&self) -> (Vec<MailboxMessage>, Vec<String>) {
         let (steering, _) = self.session.drain_queued_messages().await;
-        steering
-            .into_iter()
-            .filter_map(|message| match message {
+        let mut mailbox = Vec::new();
+        let mut unrestorable = Vec::new();
+        for message in steering {
+            match message {
                 pi_ai::Message::Custom(custom)
                     if custom.custom_type == ORCHESTRATION_MESSAGE_TYPE =>
                 {
-                    mailbox_message_from_custom(&custom)
+                    match mailbox_message_from_custom(&custom) {
+                        Some(message) => mailbox.push(message),
+                        None => unrestorable.push(format!(
+                            "orchestration message {} lost at child teardown (undecodable details)",
+                            custom.details.as_ref().and_then(|details| details.get("id")).and_then(serde_json::Value::as_str).unwrap_or("?")
+                        )),
+                    }
                 }
-                _ => None,
-            })
-            .collect()
+                other => unrestorable.push(format!(
+                    "steering message lost at child teardown: {}",
+                    queued_message_preview(&other)
+                )),
+            }
+        }
+        (mailbox, unrestorable)
     }
 
     async fn run(&self, assignment: &str) -> Result<crate::RunResult> {
         self.session.run(assignment, Vec::new()).await
+    }
+
+    async fn continue_run(&self) -> Result<crate::RunResult> {
+        self.session.continue_run().await
+    }
+
+    fn can_continue_without_input(&self) -> bool {
+        self.session
+            .history()
+            .last()
+            .is_some_and(|message| !matches!(message, pi_ai::Message::Assistant(_)))
     }
 
     /// Names of the tools this child actually possesses: the session's active
@@ -142,6 +204,10 @@ pub struct OrchestrationSkill {
     pub hidden: bool,
     pub disable_model_invocation: bool,
     pub source: crate::SkillSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_project_boundary: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_root: Option<PathBuf>,
     pub trusted: bool,
 }
 
@@ -157,11 +223,12 @@ impl From<&Skill> for OrchestrationSkill {
             hidden: skill.hidden,
             disable_model_invocation: skill.disable_model_invocation,
             source: skill.source,
+            managed_project_boundary: skill.managed_project_boundary.clone(),
+            managed_root: skill.managed_root.clone(),
             trusted: skill.trusted,
         }
     }
 }
-
 
 #[derive(Clone)]
 pub struct OrchestrationConfig {
@@ -193,6 +260,48 @@ pub struct OrchestrationConfig {
     job_clock: JobClock,
 }
 
+struct OrchestrationStorage {
+    artifacts: CapabilityRootLease,
+    persona_roots: BTreeMap<String, CapabilityRootLease>,
+    skill_files: BTreeMap<String, Arc<CapabilityFile>>,
+}
+
+#[derive(Clone)]
+enum RetainedHistoryFile {
+    Artifact(Arc<CapabilityFile>),
+    Session(Arc<CapabilityFile>),
+    Persona(Arc<CapabilityFile>),
+}
+
+impl RetainedHistoryFile {
+    fn display_path(&self) -> PathBuf {
+        match self {
+            Self::Artifact(file) | Self::Session(file) | Self::Persona(file) => file.display_path(),
+        }
+    }
+
+    fn read_bounded(&self, max_bytes: u64) -> Result<Vec<u8>> {
+        match self {
+            Self::Artifact(file) | Self::Session(file) | Self::Persona(file) => {
+                file.read_bounded(max_bytes).map_err(Into::into)
+            }
+        }
+    }
+
+    fn session_file(&self) -> Result<std::fs::File> {
+        match self {
+            Self::Session(file) | Self::Persona(file) => Ok(file.try_clone_std()?),
+            Self::Artifact(_) => bail!("history snapshot is not a session transcript"),
+        }
+    }
+
+    fn into_file(self) -> Arc<CapabilityFile> {
+        match self {
+            Self::Artifact(file) | Self::Session(file) | Self::Persona(file) => file,
+        }
+    }
+}
+
 impl std::fmt::Debug for OrchestrationConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -216,7 +325,10 @@ impl std::fmt::Debug for OrchestrationConfig {
             .field("retained_job_ttl", &self.retained_job_ttl)
             .field("soft_budget", &self.soft_budget)
             .field("agent_settings", &self.agent_settings)
-            .field("parent_model_provider", &self.parent_model_provider.as_ref().map(|_| "configured"))
+            .field(
+                "parent_model_provider",
+                &self.parent_model_provider.as_ref().map(|_| "configured"),
+            )
             .finish()
     }
 }
@@ -255,79 +367,117 @@ impl OrchestrationRuntime {
             Box::pin(async move {
                 let mut stream_options = snapshot.stream_options;
                 stream_options.stream.session_id = None;
-                let cwd = snapshot.cwd.to_string_lossy();
-                let sandbox = snapshot.sandbox.clone();
+                let cwd = snapshot.workspace.cwd().to_string_lossy();
+                let generation_capture = snapshot.generation_capture.capture_fn();
                 let memory = snapshot.memory.clone();
-                // Declared tools become base tools, EXCEPT orchestration plumbing
-                // (todo/process/task/hub/goal/yield): those are auto-provided by
-                // the factory below (orchestration_tools + the yield append), so
-                // they must never reach `create_tool`, which only knows the
-                // main-session tool set. Skipping a declared `yield` here is what
-                // keeps registration idempotent: declared-or-not, exactly one
-                // `yield` tool is appended below. Unknown declared names are
-                // likewise filtered before `create_tool` (which would otherwise
-                // error): they are silently ignored (OMP-compatible) and never
-                // injected into the child.
                 let persona_root = request.definition.persona_root();
-                let requested_memory = request.requested_tool_names.as_deref().is_some_and(|names| {
-                    names.iter().any(|name| matches!(name.as_str(), "memory" | "recall" | "retain" | "reflect"))
-                });
-                let base_tools = match request.requested_tool_names.as_deref() {
+                if request.definition.is_persona() {
+                    let missing = request
+                        .definition
+                        .missing_knowledge_roots(&snapshot.workspace);
+                    if !missing.is_empty() {
+                        return Err(crate::knowledge_root_membership_error(
+                            &request.definition.name,
+                            &missing,
+                        ));
+                    }
+                }
+                let requested_memory =
+                    request
+                        .requested_tool_names
+                        .as_deref()
+                        .is_some_and(|names| {
+                            names.iter().any(|name| {
+                                matches!(name.as_str(), "memory" | "recall" | "retain" | "reflect")
+                            })
+                        });
+                let shared_skills = request.shared_skills.clone();
+                let skill_provider: crate::SkillSnapshotFn =
+                    Arc::new(move || (*shared_skills).clone());
+                let requested_learn_skill = request.definition.is_persona()
+                    && request
+                        .requested_tool_names
+                        .as_deref()
+                        .is_some_and(|names| names.iter().any(|name| name == "learn_skill"));
+                let mut base_tools = match request.requested_tool_names.as_deref() {
                     Some(names) => {
-                        let mut tools = names
+                        let requested = names
                             .iter()
                             .filter(|name| {
                                 !crate::is_child_plumbing_tool(name)
-                                    && crate::is_known_child_tool(name)
+                                    && name.as_str() != "learn_skill"
+                                    && crate::is_known_child_tool_for_definition(name, &request.definition)
                                     && !matches!(name.as_str(), "memory" | "recall" | "retain" | "reflect")
                             })
-                            .map(|name| match persona_root.as_deref() {
-                                Some(root) => crate::tools::create_tool_with_context_and_resolver_and_rules_for_persona(
-                                    name, &cwd, root, None, None, sandbox.clone(), uri_resolver.clone(), snapshot.permission_rules.clone(),
-                                ),
-                                None => crate::create_tool_with_context_and_resolver_and_rules(
-                                    name, &cwd, None, None, sandbox.clone(), uri_resolver.clone(), snapshot.permission_rules.clone(),
-                                ),
-                            })
-                            .collect::<Result<Vec<_>>>()?;
+                            .cloned()
+                            .collect::<std::collections::BTreeSet<_>>();
+                        let mut tools = crate::tools::create_coding_tools_for_workspace_with_generation_and_persona_skills(
+                            snapshot.workspace.clone(),
+                            None,
+                            Some(skill_provider.clone()),
+                            None,
+                            uri_resolver.clone(),
+                            Some(Arc::new(|| Some(crate::MemoryConfig {
+                                backend: crate::MemoryBackend::Off,
+                                ..crate::MemoryConfig::default()
+                            }))),
+                            None,
+                            generation_capture.clone(),
+                            Some(request.persona_skills.clone()),
+                        )?
+                        .into_iter()
+                        .filter(|tool| requested.contains(&tool.name))
+                        .collect::<Vec<_>>();
                         if requested_memory {
                             let config = memory.as_ref().and_then(|resolver| resolver());
                             tools.extend(match persona_root.as_deref() {
-                                Some(root) => crate::memory::memory_tools_for_persona(&cwd, root, None, config),
-                                None => crate::memory::memory_tools_for(&cwd, None, config),
+                                Some(root) => crate::memory::memory_tools_for_persona(
+                                    &cwd,
+                                    root,
+                                    None,
+                                    config,
+                                ),
+                                None => crate::memory::memory_tools_for_with_generation(
+                                    &cwd,
+                                    None,
+                                    config,
+                                    Some(generation_capture.clone()),
+                                ),
                             });
                         }
                         tools
                     }
-                    None => match persona_root.as_deref() {
-                        Some(root) => crate::tools::create_coding_tools_with_context_and_resolver_for_persona(
-                            &cwd, root, None, None, None, sandbox, uri_resolver.clone(), memory.clone(), None,
-                        ),
-                        None => crate::create_coding_tools_with_context_and_resolver(
-                            &cwd, None, None, None, sandbox, uri_resolver.clone(), memory.clone(), None,
-                        ),
-                    },
+                    None => crate::tools::create_coding_tools_for_workspace_with_generation_and_persona_skills(
+                        snapshot.workspace.clone(),
+                        None,
+                        Some(skill_provider),
+                        None,
+                        uri_resolver.clone(),
+                        memory.clone(),
+                        None,
+                        generation_capture.clone(),
+                        Some(request.persona_skills.clone()),
+                    )?,
                 };
-                if base_tools.len() > request.max_tools_per_agent {
-                    bail!(
-                        "child agent {:?} resolves to more than {} tools",
-                        request.definition.name,
-                        request.max_tools_per_agent
-                    );
+                if requested_learn_skill {
+                    let store = request.persona_skill_store.as_ref().ok_or_else(|| {
+                        anyhow!(
+                            "persona {:?} has no retained skill authority",
+                            request.definition.name
+                        )
+                    })?;
+                    base_tools.push(store.learn_skill_tool());
                 }
-                // Apply the role contract filters to the child's tool set:
-                // drop disallowed tools by name and any tool whose declared
-                // capability sits above the role's ceiling. Orchestration
-                // plumbing (todo/process/task/hub/goal) is kept so a restricted
-                // role can still delegate and be supervised.
                 let disallowed = request
                     .definition
                     .disallowed_tools
                     .iter()
                     .map(String::as_str)
                     .collect::<std::collections::BTreeSet<_>>();
-                let ceiling = request.definition.capability_ceiling;
-                let allowed_capabilities = ceiling.map(CapabilityCeiling::allowed_capabilities);
+                let allowed_capabilities = request
+                    .definition
+                    .capability_ceiling
+                    .map(CapabilityCeiling::allowed_capabilities);
                 let mut tools = base_tools
                     .into_iter()
                     .filter(|tool| {
@@ -337,19 +487,37 @@ impl OrchestrationRuntime {
                                 .is_none_or(|allowed| allowed.contains(&tool.capability))
                     })
                     .collect::<Vec<_>>();
-                tools.extend(request.orchestration_tools);
-                // The `yield` tool joins every orchestration child's tool set
-                // (OMP's explicit-delivery protocol): it is orchestration
-                // plumbing like task/hub/goal, so role filters never remove
-                // it. It is wired to the per-run delivery state the run loop
-                // reads when the child settles.
+                // `tools: None` inherits the parent's full factory tool set,
+                // which may exceed the cap; only explicitly declared lists
+                // are capped.
+                if request.requested_tool_names.is_some()
+                    && tools.len() > request.max_tools_per_agent
+                {
+                    let names = tools
+                        .iter()
+                        .map(|tool| tool.name.clone())
+                        .collect::<Vec<_>>();
+                    return Err(crate::child_tool_cap_error(
+                        &request.definition.name,
+                        request.max_tools_per_agent,
+                        &names,
+                    ));
+                }
+                tools.extend(request.orchestration_tools.into_iter().filter(|tool| {
+                    tool.name != "yield" && !disallowed.contains(tool.name.as_str())
+                }));
                 tools.push(super::tools::yield_tool(request.yield_state.clone()));
                 let api_key = if request.model.provider == snapshot.model.provider {
                     snapshot.api_key
                 } else if let Some(resolver) = &snapshot.auth_resolver {
                     resolver(request.model.clone())
                         .await
-                        .with_context(|| format!("resolving auth for child model {}/{}", request.model.provider, request.model.id))?
+                        .with_context(|| {
+                            format!(
+                                "resolving auth for child model {}/{}",
+                                request.model.provider, request.model.id
+                            )
+                        })?
                         .api_key
                 } else {
                     bail!(
@@ -360,11 +528,17 @@ impl OrchestrationRuntime {
                         snapshot.model.provider,
                     );
                 };
-                Session::new_with_additional_tools_filtered_discovery_and_uri(
+                let context_files = snapshot
+                    .context_files_resolver
+                    .as_ref()
+                    .map_or_else(Vec::new, |resolver| resolver());
+                let context_section = crate::system_prompt::build_context_section(&context_files);
+                let primary_model = request.model.clone();
+                let child = Session::new_with_inherited_generation(
                     crate::SessionOptions {
-                        model: request.model,
-                        cwd: snapshot.cwd,
-                        system_prompt: request.system_prompt,
+                        model: primary_model.clone(),
+                        cwd: snapshot.workspace.cwd().to_path_buf(),
+                        system_prompt: format!("{}{context_section}", request.system_prompt),
                         thinking_level: request.thinking_level.unwrap_or(snapshot.thinking_level),
                         api_key,
                         compaction: None,
@@ -374,12 +548,67 @@ impl OrchestrationRuntime {
                         after_tool_call: None,
                         stream_fn: Some(snapshot.stream_fn),
                         auth_resolver: snapshot.auth_resolver,
+                        auth_manager: snapshot.auth_manager,
                     },
                     Vec::new(),
                     crate::ToolSelection::default(),
                     crate::ResourceDiscovery::Disabled,
+                    snapshot.workspace.clone(),
                     uri_resolver.clone(),
-                )
+                    generation_capture,
+                    snapshot.generation_capture.authority_required(),
+                )?;
+                // Nested child always uses its own definition name as the retry
+                // role — never the parent snapshot's retry_role (which is the
+                // parent's role, e.g. researcher, and would mis-key the child's
+                // fallback chain when the child is a different role like reviewer).
+                let retry_role = request.definition.name.clone();
+                let mut retry_settings = snapshot.retry_settings;
+                // Build the child fallback chain from the pre-resolved ordered
+                // sequence carried on the request, never reparsing the
+                // definition's source patterns. The entries after the active
+                // model form the ordered fallback list; configured chains for
+                // this role are appended (deduped) so operator-configured
+                // fallbacks still apply after the resolved sequence.
+                let definition_chain: Vec<String> = request
+                    .resolved_model_sequence
+                    .iter()
+                    .skip(request.resolved_model_selected_index.saturating_add(1))
+                    .map(|candidate| match candidate.thinking_level {
+                        None => candidate.selector.clone(),
+                        Some(level) => format!(
+                            "{}:{}",
+                            candidate.selector,
+                            match level {
+                                ThinkingLevel::Off => "off",
+                                ThinkingLevel::Minimal => "minimal",
+                                ThinkingLevel::Low => "low",
+                                ThinkingLevel::Medium => "medium",
+                                ThinkingLevel::High => "high",
+                                ThinkingLevel::Xhigh => "xhigh",
+                                ThinkingLevel::Max => "max",
+                            }
+                        ),
+                    })
+                    .collect();
+                if !definition_chain.is_empty() {
+                    let configured = retry_settings
+                        .fallback_chains
+                        .remove(&retry_role)
+                        .unwrap_or_default();
+                    let mut merged = definition_chain;
+                    for selector in configured {
+                        if !merged.contains(&selector) {
+                            merged.push(selector);
+                        }
+                    }
+                    retry_settings
+                        .fallback_chains
+                        .insert(retry_role.clone(), merged);
+                }
+                child.set_retry_settings(retry_settings);
+                child.set_retry_role(Some(retry_role));
+                Ok(child)
             })
         })
     }
@@ -436,15 +665,23 @@ impl OrchestrationConfig {
         }
         .validate()?;
         validate_agent_id(&self.main_agent_id)?;
-        let default = self
-            .catalog
-            .get(&self.default_agent)
-            .ok_or_else(|| anyhow!("default orchestration agent {:?} was not discovered", self.default_agent))?;
+        let default = self.catalog.get(&self.default_agent).ok_or_else(|| {
+            anyhow!(
+                "default orchestration agent {:?} was not discovered",
+                self.default_agent
+            )
+        })?;
         if !default.trusted {
-            bail!("default orchestration agent {:?} is not trusted", self.default_agent);
+            bail!(
+                "default orchestration agent {:?} is not trusted",
+                self.default_agent
+            );
         }
         if let Some(agent) = self.catalog.agents().iter().find(|agent| !agent.trusted) {
-            bail!("orchestration catalog contains untrusted agent {:?}", agent.name);
+            bail!(
+                "orchestration catalog contains untrusted agent {:?}",
+                agent.name
+            );
         }
         let mut skill_names = std::collections::BTreeMap::<&str, &Path>::new();
         for skill in &self.skills {
@@ -474,21 +711,19 @@ impl OrchestrationConfig {
         Ok(())
     }
     #[must_use]
-    pub fn with_selector_settings(
-        mut self,
-        settings: crate::SelectorSettings,
-    ) -> Self {
+    pub fn with_selector_settings(mut self, settings: crate::SelectorSettings) -> Self {
         self.selector_settings = Some(settings.clone());
-        self.default_agent_selector = Some(Arc::new(move |request, agents| {
-            match crate::selector::exact_agent_mention(request, agents) {
+        self.default_agent_selector = Some(Arc::new(
+            move |request, agents| match crate::selector::delegation_agent_mention(request, agents)
+            {
                 crate::selector::ExactAgentMention::Unique(name) => Some(name),
                 crate::selector::ExactAgentMention::Ambiguous(_) => None,
                 crate::selector::ExactAgentMention::None => {
                     let ranked = crate::rank_agents(request, agents, &settings);
                     crate::select_default_agent(&ranked, &settings)
                 }
-            }
-        }));
+            },
+        ));
         self
     }
 
@@ -579,6 +814,15 @@ pub struct ChildSessionRequest {
     pub system_prompt: String,
     pub requested_tool_names: Option<Vec<String>>,
     pub orchestration_tools: Vec<AgentTool>,
+    /// Retained persona authority used only to construct the explicitly
+    /// declared `learn_skill` tool. Never serialized.
+    pub persona_skill_store: Option<crate::PersonaSkillStore>,
+    /// Immutable persona-local skill snapshot shared by this child's prompt
+    /// and `skill://` read tool for the lifetime of the run.
+    pub persona_skills: Arc<Vec<crate::PersonaSkill>>,
+    /// Shared skill catalog snapshot used by this child's `skill://` reads.
+    /// Persona-local names shadow these entries without mutating the catalog.
+    pub shared_skills: Arc<Vec<Skill>>,
     pub thinking_level: Option<ThinkingLevel>,
     pub model: pi_ai::Model,
     /// Per-item JSON Schema contract for the delivered `yield` payload (OMP
@@ -592,6 +836,17 @@ pub struct ChildSessionRequest {
     /// already delivered via `yield` never needs revival, and a revived run
     /// gets a clean state for its remaining turns).
     pub yield_state: Arc<YieldState>,
+    /// Pre-resolved ordered fallback sequence for this child's model. The
+    /// child factory builds the retry fallback chain directly from this
+    /// sequence (the entries after the active model) instead of reparsing the
+    /// definition's source patterns against a different catalog. Empty when no
+    /// definition model list resolved or the active model came from a settings
+    /// override / parent fallback with a single-entry sequence.
+    pub resolved_model_sequence: Vec<crate::ResolvedAgentModelCandidate>,
+    /// 0-based position of [`ChildSessionRequest::model`] within
+    /// [`ChildSessionRequest::resolved_model_sequence`]. The fallback chain is
+    /// the entries after this index.
+    pub resolved_model_selected_index: usize,
 }
 
 impl std::fmt::Debug for ChildSessionRequest {
@@ -603,11 +858,15 @@ impl std::fmt::Debug for ChildSessionRequest {
             .field("depth", &self.depth)
             .field("definition", &self.definition)
             .field("assignment", &self.assignment)
-            .field("system_prompt", &self.system_prompt)
             .field("requested_tool_names", &self.requested_tool_names)
             .field("max_tools_per_agent", &self.max_tools_per_agent)
+            .field("persona_skills", &self.persona_skills.len())
+            .field("shared_skills", &self.shared_skills.len())
             .field("thinking_level", &self.thinking_level)
-            .field("model", &format!("{}/{}", self.model.provider, self.model.id))
+            .field(
+                "model",
+                &format!("{}/{}", self.model.provider, self.model.id),
+            )
             .field("output_schema", &self.output_schema)
             .field("schema_mode", &self.schema_mode)
             .field("yield_state", &self.yield_state.was_called())
@@ -683,6 +942,7 @@ pub enum DeliveryOutcome {
     Queued,
     Woken,
     Revived,
+    Processed,
     Failed,
 }
 
@@ -706,6 +966,10 @@ pub struct DeliveryReceipt {
     /// Original `to` when it differed from the canonical agent id (e.g. job UUID).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested: Option<String>,
+    /// Mailbox id of the outbound message, used as the correlation id for
+    /// `hub ask` replies (`replyTo`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -720,7 +984,7 @@ pub struct TaskItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub todo_task_id: Option<String>,
     /// Shared background context rendered into the child's system prompt as a
-    /// `CONTEXT` section (OMP batch parity). `None` for single spawns.
+    /// `CONTEXT` section. Optional for one child and required for a batch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
     /// Per-item JSON Schema contract for the child's delivered `yield`
@@ -872,7 +1136,10 @@ impl PersonaLifecycleGuard {
 impl Drop for PersonaLifecycleGuard {
     fn drop(&mut self) {
         if self.release_on_drop {
-            self.inner.persona_lifecycle_blocks.lock().remove(&self.persona);
+            self.inner
+                .persona_lifecycle_blocks
+                .lock()
+                .remove(&self.persona);
         }
     }
 }
@@ -886,10 +1153,26 @@ impl Clone for OrchestrationRuntime {
     }
 }
 
+/// Boundary inside [`OrchestrationRuntime::spawn_tasks`] where a
+/// test-armed parking hook can hold a spawn, making the interleaving with
+/// `commit_orchestration_candidate`'s spawn gate deterministic.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SpawnTestParkPoint {
+    /// Parks before the spawn lock is taken: the reload commit runs to
+    /// completion first, and the parked spawn must be rejected by the
+    /// retiring flag without creating an authoritative child.
+    BeforeSpawnLock,
+    /// Parks while the spawn lock is held: the commit blocks on the same
+    /// gate, then must observe the registered job and defer the replacement.
+    AfterSpawnLock,
+}
+
 struct RuntimeInner {
-    group_id: String,
+    group_id: OnceLock<String>,
     config: OrchestrationConfig,
     factory: ChildSessionFactory,
+    storage: OrchestrationStorage,
     semaphore: Arc<Semaphore>,
     shutdown: CancellationToken,
     active: Mutex<HashMap<String, CancellationToken>>,
@@ -904,12 +1187,43 @@ struct RuntimeInner {
     /// the workflow page's Recent IRC reads this stream, so messages stay
     /// visible after the recipient consumes them.
     delivered_messages: Mutex<VecDeque<MailboxMessage>>,
+    /// Per-runtime agent registry. Isolated from every other runtime so two
+    /// sessions may reuse the same group/agent ids independently.
+    registry: GlobalRegistry,
     durable: Mutex<Option<super::persistence::DurableRuntime>>,
     durable_bound: AtomicBool,
+    /// Workspace roots of the currently bound parent session. Persona
+    /// knowledgeRoots are validated against this snapshot before a task spawn
+    /// is accepted, rather than failing later inside the child factory.
+    parent_workspace: RwLock<Option<crate::WorkspaceRoots>>,
     durable_mutation: Mutex<()>,
+    durable_frozen: AtomicBool,
+    #[cfg(test)]
+    restart_checkpoint_count: AtomicUsize,
+    #[cfg(test)]
+    restart_checkpoint_error: Mutex<Option<String>>,
+    generation_capture: Mutex<Option<crate::application::generation::GenerationCaptureFn>>,
     /// Personas currently claimed by a destructive lifecycle operation.
     persona_lifecycle_blocks: Mutex<std::collections::BTreeSet<String>>,
     rebind_reserved: AtomicBool,
+    /// Set by the atomic retirement protocol in
+    /// `Application::commit_orchestration_candidate` while the spawn gate is
+    /// held: any stale-handle `spawn_tasks` after this point is rejected
+    /// before creating an authoritative child, so a reload-driven replacement
+    /// can never orphan a job that registered after the active-job check.
+    retiring: AtomicBool,
+
+    /// Test-only parking hook used by the deterministic reload-commit race
+    /// tests: parks a spawn at the exact check/registration boundary of
+    /// [`OrchestrationRuntime::spawn_tasks`] so the interleaving against
+    /// `commit_orchestration_candidate`'s spawn gate is deterministic.
+    #[cfg(test)]
+    spawn_test_park: Mutex<
+        Option<(
+            SpawnTestParkPoint,
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
+        )>,
+    >,
     /// Role selected with `/role <name> --select`; consulted as the default
     /// agent for child task spawns that do not name an agent explicitly.
     preferred_agent: RwLock<Option<String>>,
@@ -919,7 +1233,6 @@ struct RuntimeInner {
     /// [`OrchestrationRuntime::unknown_tool_warnings`].
     unknown_tool_warnings: Mutex<std::collections::BTreeSet<(String, String)>>,
 }
-
 /// Per-job soft-budget counters shared between the agent-loop stop hook and
 /// `run_one`/`run_revival`.
 ///
@@ -1023,10 +1336,11 @@ struct GlobalRegistry {
 struct MessageWaiter {
     token: u64,
     from: Option<String>,
+    reply_to: Option<String>,
     delivery: tokio::sync::mpsc::UnboundedSender<MailboxMessage>,
 }
 
-struct MessageWaiterGuard {
+pub(crate) struct MessageWaiterGuard {
     entry: Arc<AgentEntry>,
     token: u64,
     delivery_rx: tokio::sync::mpsc::UnboundedReceiver<MailboxMessage>,
@@ -1051,6 +1365,11 @@ impl Drop for MessageWaiterGuard {
         // before the handoff, so it must not be lost). The restore is forced:
         // it reverses the handoff removal, so the bound never rejects it, and
         // duplicates of the same id are replaced, never doubled.
+        self.restore_pending();
+    }
+}
+impl MessageWaiterGuard {
+    fn restore_pending(&mut self) {
         if let Ok(message) = self.delivery_rx.try_recv() {
             {
                 let mut mailbox = self.entry.mailbox.lock();
@@ -1096,11 +1415,13 @@ struct PreparedRecoveredState {
     main_mailbox: Vec<MailboxMessage>,
     agents: Vec<super::persistence::PersistedAgent>,
     jobs: PreparedJobRecords,
+    delivered_messages: Vec<MailboxMessage>,
 }
-
 pub struct PreparedDurableBinding {
     durable: super::persistence::DurableRuntime,
     recovered: Option<PreparedRecoveredState>,
+    generation: Option<Arc<crate::application::generation::ApplicationGeneration>>,
+    parent_workspace: Option<crate::WorkspaceRoots>,
     initialize: bool,
     install_recovered: bool,
     same_parent: bool,
@@ -1123,36 +1444,103 @@ impl Drop for PreparedDurableBinding {
     }
 }
 
-static REGISTRY: LazyLock<GlobalRegistry> = LazyLock::new(GlobalRegistry::default);
-
 impl OrchestrationRuntime {
     pub fn new(config: OrchestrationConfig, factory: ChildSessionFactory) -> Result<Self> {
         config.validate()?;
         let artifact_dir = absolute_lexical(&config.artifact_dir)?;
-        fs::create_dir_all(&artifact_dir).with_context(|| {
-            format!("creating orchestration artifact directory {}", artifact_dir.display())
-        })?;
+        let filesystem = CapabilityFs::new().context("initializing orchestration filesystem")?;
+        let artifacts = filesystem
+            .open_root(
+                CapabilityRootPurpose::OrchestrationArtifacts,
+                pi_sandbox::AbsolutePath::parse(artifact_dir.clone())
+                    .map_err(|_| anyhow!("invalid orchestration artifact directory"))?,
+                CapabilityAccess::PrivateReadWrite,
+                RootCreation::CreateDirectory,
+            )
+            .context("opening orchestration artifact capability")?;
+        let mut persona_roots = BTreeMap::new();
+        for definition in config.catalog.agents() {
+            let Some(root) = definition.persona_root() else {
+                continue;
+            };
+            let lease = filesystem
+                .open_root(
+                    CapabilityRootPurpose::PersonaStore,
+                    pi_sandbox::AbsolutePath::parse(root)
+                        .map_err(|_| anyhow!("invalid persona root for {:?}", definition.name))?,
+                    CapabilityAccess::PrivateReadWrite,
+                    RootCreation::Existing,
+                )
+                .with_context(|| format!("opening persona capability for {:?}", definition.name))?;
+            persona_roots.insert(definition.name.clone(), lease);
+        }
+        let mut skill_files = BTreeMap::new();
+        for skill in &config.skills {
+            // User and package-global links are resolved only inside their
+            // retained discovery root. Project, package-project, and explicit
+            // skills remain strict no-follow.
+            let file = if skill.source.allows_managed_links() {
+                let root = skill.managed_root.as_deref().ok_or_else(|| {
+                    anyhow!(
+                        "managed skill {:?} has no source-root authorization",
+                        skill.name
+                    )
+                })?;
+                let relative = skill.file_path.strip_prefix(root).map_err(|_| {
+                    anyhow!("managed skill {:?} is outside its source root", skill.name)
+                })?;
+                let lease = filesystem
+                    .open_root(
+                        CapabilityRootPurpose::ProjectResources,
+                        pi_sandbox::AbsolutePath::parse(root.to_path_buf())
+                            .map_err(|_| anyhow!("invalid managed skill source root"))?,
+                        CapabilityAccess::ReadOnly,
+                        RootCreation::Existing,
+                    )
+                    .with_context(|| format!("opening managed skill root for {:?}", skill.name))?;
+                let managed = lease
+                    .open_managed_file_within_root(relative)
+                    .with_context(|| format!("opening orchestration skill {:?}", skill.name))?;
+                if skill
+                    .managed_project_boundary
+                    .as_deref()
+                    .is_some_and(|boundary| managed.resolved_path().starts_with(boundary))
+                {
+                    bail!("managed skill target crosses the current project boundary");
+                }
+                managed.into_file()
+            } else {
+                let absolute = pi_sandbox::AbsolutePath::parse(skill.file_path.clone())
+                    .map_err(|_| anyhow!("invalid orchestration skill path"))?;
+                match filesystem.open_exact_file(CapabilityRootPurpose::ProjectResources, absolute)
+                {
+                    Ok(file) => file,
+                    Err(error) if is_link_blocked(&error) => {
+                        bail!(
+                            "symbolic links are not allowed for {} skill `{}`",
+                            crate::selector::skill_source_name(skill.source),
+                            skill.name,
+                        );
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("opening orchestration skill {:?}", skill.name)
+                        });
+                    }
+                }
+            };
+            skill_files.insert(skill.name.clone(), Arc::new(file));
+        }
+        let storage = OrchestrationStorage {
+            artifacts,
+            persona_roots,
+            skill_files,
+        };
         let mut config = config;
         config.artifact_dir = artifact_dir;
         let preferred_agent = config.preferred_agent.clone();
         let (events, _) = broadcast::channel(256);
-        let group_id = Uuid::now_v7().to_string();
-        REGISTRY.register(
-            &group_id,
-            AgentSnapshot {
-                id: config.main_agent_id.clone(),
-                display_name: config.main_agent_id.clone(),
-                agent: config.main_agent_id.clone(),
-                parent_id: None,
-                status: AgentStatus::Idle,
-                created_at: now_millis(),
-                last_activity: now_millis(),
-                unread: 0,
-                artifact_ref: None,
-                history_ref: None,
-            },
-            config.mailbox_capacity,
-        )?;
+        let registry = GlobalRegistry::default();
         let jobs = JobManager::with_retention(
             JobRetention {
                 max_settled: config.max_retained_jobs,
@@ -1162,8 +1550,9 @@ impl OrchestrationRuntime {
         );
         Ok(Self {
             inner: Arc::new(RuntimeInner {
-                group_id,
+                group_id: OnceLock::new(),
                 semaphore: Arc::new(Semaphore::new(config.max_concurrency)),
+                storage,
                 config,
                 factory,
                 shutdown: CancellationToken::new(),
@@ -1175,11 +1564,22 @@ impl OrchestrationRuntime {
                 global_concurrency: Mutex::new(None),
                 events,
                 delivered_messages: Mutex::new(VecDeque::new()),
+                registry,
                 durable: Mutex::new(None),
                 durable_bound: AtomicBool::new(false),
+                parent_workspace: RwLock::new(None),
                 durable_mutation: Mutex::new(()),
+                durable_frozen: AtomicBool::new(false),
+                #[cfg(test)]
+                restart_checkpoint_count: AtomicUsize::new(0),
+                #[cfg(test)]
+                restart_checkpoint_error: Mutex::new(None),
+                generation_capture: Mutex::new(None),
                 persona_lifecycle_blocks: Mutex::new(std::collections::BTreeSet::new()),
                 rebind_reserved: AtomicBool::new(false),
+                retiring: AtomicBool::new(false),
+                #[cfg(test)]
+                spawn_test_park: Mutex::new(None),
                 preferred_agent: RwLock::new(preferred_agent),
                 unknown_tool_warnings: Mutex::new(std::collections::BTreeSet::new()),
             }),
@@ -1189,7 +1589,49 @@ impl OrchestrationRuntime {
 
     #[must_use]
     pub fn group_id(&self) -> &str {
-        &self.inner.group_id
+        if let Some(group_id) = self.inner.group_id.get() {
+            return group_id;
+        }
+        let generated = Uuid::now_v7().to_string();
+        self.initialize_group_id(&generated)
+            .unwrap_or_else(|existing| existing)
+    }
+
+    fn initialize_group_id<'a>(&'a self, group_id: &str) -> std::result::Result<&'a str, &'a str> {
+        let configured_main_agent_id = self.inner.config.main_agent_id.clone();
+        let mailbox_capacity = self.inner.config.mailbox_capacity;
+        let established = self.inner.group_id.get_or_init(|| {
+            self.inner.registry.register_main(
+                group_id,
+                AgentSnapshot {
+                    id: configured_main_agent_id.clone(),
+                    display_name: configured_main_agent_id.clone(),
+                    agent: configured_main_agent_id,
+                    parent_id: None,
+                    status: AgentStatus::Idle,
+                    created_at: now_millis(),
+                    last_activity: now_millis(),
+                    unread: 0,
+                    artifact_ref: None,
+                    history_ref: None,
+                },
+                mailbox_capacity,
+            );
+            group_id.to_owned()
+        });
+        if established == group_id {
+            Ok(established)
+        } else {
+            Err(established)
+        }
+    }
+
+    fn adopt_durable_group_id(&self, group_id: &str) -> Result<()> {
+        self.initialize_group_id(group_id)
+            .map(|_| ())
+            .map_err(|established| anyhow!(
+                "durable orchestration group id mismatch: runtime {established:?}, sidecar {group_id:?}"
+            ))
     }
 
     /// Select the role used for child task spawns that do not name an agent
@@ -1216,17 +1658,30 @@ impl OrchestrationRuntime {
             .jobs(None)
             .into_iter()
             .map(|job| OrchestrationEvent::JobUpdated {
-                group_id: self.inner.group_id.clone(),
+                group_id: self.group_id().to_owned(),
                 job: presentation_job_snapshot(job),
             })
             .collect::<Vec<_>>();
         events.extend(self.list(self.main_agent_id()).into_iter().map(|agent| {
             OrchestrationEvent::AgentUpdated {
-                group_id: self.inner.group_id.clone(),
+                group_id: self.group_id().to_owned(),
                 agent: presentation_agent_snapshot(agent),
             }
         }));
         events
+    }
+
+    pub(crate) fn stage_generation(
+        &self,
+        provenance: std::sync::Arc<crate::application::generation::GenerationProvenance>,
+    ) -> anyhow::Result<std::sync::Arc<crate::application::generation::OrchestrationGeneration>>
+    {
+        crate::application::generation::OrchestrationGeneration::enabled(
+            provenance,
+            self.clone(),
+            crate::application::generation::OrchestrationSnapshot::default().into(),
+            self.inner.storage.artifacts.clone(),
+        )
     }
 
     #[must_use]
@@ -1247,15 +1702,35 @@ impl OrchestrationRuntime {
             .filter(|agent| {
                 let settings = self.inner.config.agent_settings.get(&agent.name);
                 settings.map_or(true, crate::AgentRuntimeSettings::is_enabled)
-                    && crate::agent_compatibility_error(
-                        agent,
-                        settings,
-                        &parent_model,
-                        &available,
-                    )
-                    .is_none()
+                    && crate::agent_compatibility_error(agent, settings, &parent_model, &available)
+                        .is_none()
             })
             .collect()
+    }
+
+    /// Enabled persona marked `userProxy: true`, if exactly one is configured.
+    #[must_use]
+    pub fn user_proxy_agent(&self) -> Option<&AgentDefinition> {
+        let mut found = None;
+        for agent in self.enabled_agents() {
+            if agent.is_persona() && agent.user_proxy {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(agent);
+            }
+        }
+        found
+    }
+
+    /// Whether `to` names the human user / Main and should be rewritten to
+    /// the configured user-proxy persona.
+    #[must_use]
+    pub fn is_user_ask_target(&self, to: &str) -> bool {
+        let trimmed = to.trim();
+        trimmed.eq_ignore_ascii_case("user")
+            || trimmed.eq_ignore_ascii_case("me")
+            || trimmed == self.inner.config.main_agent_id
     }
 
     /// Incompatibility diagnostics for configured agents excluded from advertisement.
@@ -1291,9 +1766,7 @@ impl OrchestrationRuntime {
             .unknown_tool_warnings
             .lock()
             .iter()
-            .map(|(agent, tool)| {
-                crate::unknown_tools_warning(agent, std::slice::from_ref(tool))
-            })
+            .map(|(agent, tool)| crate::unknown_tools_warning(agent, std::slice::from_ref(tool)))
             .collect()
     }
 
@@ -1306,31 +1779,64 @@ impl OrchestrationRuntime {
         }
     }
 
+    fn live_agents_name_parent(&self, agent_id: &str) -> bool {
+        if agent_id == self.inner.config.main_agent_id {
+            return true;
+        }
+        let group_id = self.group_id();
+        let groups = self.inner.registry.groups.lock();
+        let Some(entries) = groups.get(group_id) else {
+            return false;
+        };
+        entries.iter().any(|(id, entry)| {
+            if id == agent_id {
+                return false;
+            }
+            if entry.snapshot.lock().parent_id.as_deref() == Some(agent_id) {
+                return true;
+            }
+            entry
+                .durable_info
+                .lock()
+                .as_ref()
+                .is_some_and(|info| info.request.parent_id == agent_id)
+        })
+    }
+
+    fn retire_retained_job(&self, agent_id: &str, job_id: &str) {
+        let artifact_path = self
+            .inner
+            .config
+            .artifact_dir
+            .join(format!("{agent_id}-{job_id}.md"));
+        let history_path = self
+            .inner
+            .config
+            .artifact_dir
+            .join(format!("{agent_id}-{job_id}.history.json"));
+        if !(remove_retained_file(&self.inner.storage.artifacts, &artifact_path)
+            && remove_retained_file(&self.inner.storage.artifacts, &history_path))
+        {
+            return;
+        }
+        if !self.live_agents_name_parent(agent_id) {
+            self.inner.registry.remove_agent_if_paths(
+                self.group_id(),
+                agent_id,
+                &artifact_path,
+                &history_path,
+            );
+        }
+        self.inner.jobs.remove_settled(job_id);
+    }
+
     fn prune_retained_jobs(&self) {
         let _durable_mutation = self.inner.durable_mutation.lock();
         if self.inner.rebind_reserved.load(Ordering::Acquire) {
             return;
         }
         for candidate in self.inner.jobs.prune_candidates() {
-            let artifact_path = self
-                .inner
-                .config
-                .artifact_dir
-                .join(format!("{}-{}.md", candidate.agent_id, candidate.job_id));
-            let history_path = self
-                .inner
-                .config
-                .artifact_dir
-                .join(format!("{}-{}.history.json", candidate.agent_id, candidate.job_id));
-            if remove_retained_file(&artifact_path) && remove_retained_file(&history_path) {
-                REGISTRY.remove_agent_if_paths(
-                    &self.inner.group_id,
-                    &candidate.agent_id,
-                    &artifact_path,
-                    &history_path,
-                );
-                self.inner.jobs.remove_settled(&candidate.job_id);
-            }
+            self.retire_retained_job(&candidate.agent_id, &candidate.job_id);
         }
     }
 
@@ -1340,25 +1846,7 @@ impl OrchestrationRuntime {
             return;
         }
         for candidate in self.inner.jobs.settled_candidates() {
-            let artifact_path = self
-                .inner
-                .config
-                .artifact_dir
-                .join(format!("{}-{}.md", candidate.agent_id, candidate.job_id));
-            let history_path = self
-                .inner
-                .config
-                .artifact_dir
-                .join(format!("{}-{}.history.json", candidate.agent_id, candidate.job_id));
-            if remove_retained_file(&artifact_path) && remove_retained_file(&history_path) {
-                REGISTRY.remove_agent_if_paths(
-                    &self.inner.group_id,
-                    &candidate.agent_id,
-                    &artifact_path,
-                    &history_path,
-                );
-                self.inner.jobs.remove_settled(&candidate.job_id);
-            }
+            self.retire_retained_job(&candidate.agent_id, &candidate.job_id);
         }
     }
 
@@ -1384,6 +1872,11 @@ impl OrchestrationRuntime {
     #[must_use]
     pub fn main_agent_id(&self) -> &str {
         &self.inner.config.main_agent_id
+    }
+
+    #[must_use]
+    pub fn artifact_dir(&self) -> &Path {
+        &self.inner.config.artifact_dir
     }
 
     #[must_use]
@@ -1416,21 +1909,123 @@ impl OrchestrationRuntime {
         &self,
         session_id: String,
         session_path: PathBuf,
+        parent_directory: crate::fs::CapabilityRootLease,
+        parent_relative: PathBuf,
     ) -> Result<PreparedDurableBinding> {
-        self.prepare_parent_identity_binding(session_id, session_path)
+        self.prepare_parent_identity_binding(
+            session_id,
+            session_path,
+            parent_directory,
+            parent_relative,
+            true,
+        )
     }
 
-    pub(crate) fn prepare_parent_binding(&self, parent: &Session) -> Result<PreparedDurableBinding> {
+    pub(crate) fn prepare_parent_binding(
+        &self,
+        parent: &Session,
+    ) -> Result<PreparedDurableBinding> {
         let (session_id, session_path) = parent
             .recorder_info()
             .ok_or_else(|| anyhow!("parent session recording is unavailable"))?;
-        self.prepare_parent_identity(session_id, session_path)
+        let (parent_directory, parent_relative) = parent
+            .recorder_file_authority()
+            .ok_or_else(|| anyhow!("parent session recording authority is unavailable"))?;
+        self.prepare_parent_identity(session_id, session_path, parent_directory, parent_relative)
+            .map(|mut prepared| {
+                prepared.parent_workspace = Some(parent.workspace_roots().clone());
+                prepared
+            })
+    }
+    fn prepare_parent_reset_binding(&self, parent: &Session) -> Result<PreparedDurableBinding> {
+        let (session_id, session_path) = parent
+            .recorder_info()
+            .ok_or_else(|| anyhow!("parent session recording is unavailable"))?;
+        let (parent_directory, parent_relative) = parent
+            .recorder_file_authority()
+            .ok_or_else(|| anyhow!("parent session recording authority is unavailable"))?;
+        self.prepare_parent_identity_binding(
+            session_id,
+            session_path,
+            parent_directory,
+            parent_relative,
+            false,
+        )
+        .map(|mut prepared| {
+            prepared.parent_workspace = Some(parent.workspace_roots().clone());
+            prepared
+        })
+    }
+
+    pub(crate) fn durable_policy_for_parent(
+        &self,
+        parent: &Session,
+    ) -> Result<Option<crate::DurablePolicyState>> {
+        let (session_id, session_path) = parent
+            .recorder_info()
+            .ok_or_else(|| anyhow!("parent session recording is unavailable"))?;
+        let (parent_directory, parent_relative) = parent
+            .recorder_file_authority()
+            .ok_or_else(|| anyhow!("parent session recording authority is unavailable"))?;
+        let durable = super::persistence::DurableRuntime::new_with_main_agent_id(
+            session_id,
+            session_path,
+            parent_directory,
+            parent_relative,
+            self.main_agent_id().to_owned(),
+        )?;
+        match durable.load_optional()? {
+            Some(state) => {
+                self.adopt_durable_group_id(&state.group_id)?;
+                Ok(Some(state.durable_policy))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn capture_generation(
+        &self,
+    ) -> Result<Arc<crate::application::generation::ApplicationGeneration>> {
+        self.inner
+            .generation_capture
+            .lock()
+            .clone()
+            .ok_or_else(|| anyhow!("durable orchestration generation is unavailable"))?()
+    }
+
+    fn durable_policy_state(&self) -> Result<crate::DurablePolicyState> {
+        let generation = self.capture_generation()?;
+        crate::DurablePolicyState::capture(&generation).map_err(anyhow::Error::from)
+    }
+    pub(crate) fn bind_generation_capture(
+        &self,
+        generation_capture: crate::application::generation::GenerationCaptureFn,
+    ) -> Result<()> {
+        generation_capture()?;
+        *self.inner.generation_capture.lock() = Some(generation_capture);
+        Ok(())
+    }
+    pub(crate) fn install_generation_capture(
+        &self,
+        generation_capture: crate::application::generation::GenerationCaptureFn,
+    ) {
+        *self.inner.generation_capture.lock() = Some(generation_capture);
+    }
+
+    fn bind_parent_generation_capture(&self, parent: &Session) -> Result<()> {
+        if self.inner.generation_capture.lock().is_none() {
+            self.bind_generation_capture(parent.generation_capture_fn())?;
+        }
+        Ok(())
     }
 
     fn prepare_parent_identity_binding(
         &self,
         session_id: String,
         session_path: PathBuf,
+        parent_directory: crate::fs::CapabilityRootLease,
+        parent_relative: PathBuf,
+        should_recover: bool,
     ) -> Result<PreparedDurableBinding> {
         let _spawn_guard = self.inner.jobs.lock_spawns();
         let durable_mutation = self.inner.durable_mutation.lock();
@@ -1439,43 +2034,57 @@ impl OrchestrationRuntime {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| anyhow!("durable orchestration rebind is already in progress"))?;
         let result = (|| {
-            if !self.inner.active.lock().is_empty()
-                || self.inner.jobs.snapshots(None).iter().any(|job| !job.status.is_settled())
-            {
-                bail!("cannot rebind durable orchestration while child jobs are active");
-            }
-            let child_root = session_path
-                .parent()
-                .ok_or_else(|| anyhow!("parent session path has no parent"))?
-                .join("children")
-                .join(&session_id);
             let durable = super::persistence::DurableRuntime::new_with_main_agent_id(
                 session_id,
                 session_path,
-                child_root,
+                parent_directory,
+                parent_relative,
                 self.main_agent_id().to_owned(),
             )?;
-            let same_parent = self
-                .inner
-                .durable
-                .lock()
-                .as_ref()
-                .is_some_and(|current| {
-                    current.parent_session_id() == durable.parent_session_id()
-                        && current.parent_session_path() == durable.parent_session_path()
-                });
-            let recovered = if same_parent {
+            let same_parent = self.inner.durable.lock().as_ref().is_some_and(|current| {
+                current.parent_session_id() == durable.parent_session_id()
+                    && current.parent_session_path() == durable.parent_session_path()
+            });
+            if !same_parent
+                && (!self.inner.active.lock().is_empty()
+                    || self
+                        .inner
+                        .jobs
+                        .snapshots(None)
+                        .iter()
+                        .any(|job| !job.status.is_settled()))
+            {
+                bail!("cannot rebind durable orchestration while child jobs are active");
+            }
+            let generation = self.capture_generation()?;
+            let recovered = if !should_recover || same_parent {
                 None
             } else {
                 durable
                     .load_optional()?
-                    .map(|state| self.prepare_recovered_state(&durable, state))
+                    .map(|state| -> Result<PreparedRecoveredState> {
+                        let recovered =
+                            self.prepare_recovered_state(&durable, &generation, state)?;
+                        durable.persist(&super::persistence::build_state(
+                            self.group_id(),
+                            durable.parent_session_id(),
+                            durable.parent_session_path(),
+                            crate::DurablePolicyState::capture(&generation)?,
+                            recovered.main_mailbox.clone(),
+                            recovered.delivered_messages.clone(),
+                            recovered.agents.clone(),
+                            recovered.jobs.snapshots().to_vec(),
+                        ))?;
+                        Ok(recovered)
+                    })
                     .transpose()?
             };
-            let initialize = !same_parent && recovered.is_none();
+            let initialize = !should_recover || (!same_parent && recovered.is_none());
             Ok(PreparedDurableBinding {
                 durable,
                 recovered,
+                generation: Some(generation),
+                parent_workspace: None,
                 initialize,
                 install_recovered: false,
                 same_parent,
@@ -1496,9 +2105,15 @@ impl OrchestrationRuntime {
         prepared: &mut PreparedDurableBinding,
     ) -> Result<()> {
         if prepared.initialize {
+            let generation = prepared.generation.as_ref().ok_or_else(|| {
+                anyhow!("durable orchestration recovery generation is unavailable")
+            })?;
             prepared.durable.persist(&super::persistence::build_state(
+                self.group_id(),
                 prepared.durable.parent_session_id(),
                 prepared.durable.parent_session_path(),
+                crate::DurablePolicyState::capture(generation)?,
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -1506,6 +2121,7 @@ impl OrchestrationRuntime {
             prepared.recovered = Some(PreparedRecoveredState {
                 group_entries: self.prepared_group_entries(HashMap::new()),
                 main_mailbox: Vec::new(),
+                delivered_messages: Vec::new(),
                 agents: Vec::new(),
                 jobs: self.inner.jobs.prepare_replacement(Vec::new()),
             });
@@ -1519,43 +2135,105 @@ impl OrchestrationRuntime {
         &self,
         prepared: &mut PreparedDurableBinding,
     ) -> Result<()> {
-        self.initialize_prepared_binding(prepared)
+        if prepared.same_parent && self.inner.durable_bound.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if prepared.same_parent && prepared.recovered.is_none() && !prepared.initialize {
+            match prepared.durable.load_optional()? {
+                Some(state) => {
+                    let generation = prepared.generation.as_ref().ok_or_else(|| {
+                        anyhow!("durable orchestration recovery generation is unavailable")
+                    })?;
+                    let recovered =
+                        self.prepare_recovered_state(&prepared.durable, generation, state)?;
+                    prepared.durable.persist(&super::persistence::build_state(
+                        self.group_id(),
+                        prepared.durable.parent_session_id(),
+                        prepared.durable.parent_session_path(),
+                        crate::DurablePolicyState::capture(generation)?,
+                        recovered.main_mailbox.clone(),
+                        recovered.delivered_messages.clone(),
+                        recovered.agents.clone(),
+                        recovered.jobs.snapshots().to_vec(),
+                    ))?;
+                    prepared.recovered = Some(recovered);
+                }
+                None => prepared.initialize = true,
+            }
+        }
+        self.initialize_prepared_binding(prepared)?;
+        prepared.install_recovered = true;
+        Ok(())
     }
 
     pub(crate) fn commit_prepared_parent(&self, prepared: PreparedDurableBinding) {
-        self.commit_parent_binding(prepared);
+        if self.install_prepared_parent(prepared) {
+            self.revive_prepared_parent();
+        }
     }
 
-    /// Install a fully prepared binding. This path is intentionally infallible:
-    /// after an Application mutates its live Session, only in-memory swaps and
-    /// notifications remain.
-    pub(crate) fn commit_parent_binding(&self, mut prepared: PreparedDurableBinding) {
+    /// Install a fully prepared parent binding without starting recovered
+    /// children. The caller may inspect the installed job registry and bind
+    /// application-level ownership before making revival observable.
+    #[must_use]
+    pub(crate) fn install_prepared_parent(
+        &self,
+        mut prepared: PreparedDurableBinding,
+    ) -> bool {
         let _durable_mutation = self.inner.durable_mutation.lock();
-        if !prepared.same_parent {
+        let installed_recovered = if !prepared.same_parent {
             let recovered = prepared
                 .install_recovered
                 .then(|| prepared.recovered.take())
                 .flatten();
             *self.inner.durable.lock() = Some(prepared.durable.clone());
             self.inner.durable_bound.store(true, Ordering::Release);
+            if let Some(workspace) = prepared.parent_workspace.take() {
+                *self.inner.parent_workspace.write() = Some(workspace);
+            }
             if let Some(recovered) = recovered {
                 self.install_prepared_state(recovered);
+                true
+            } else {
+                false
             }
         } else if prepared.install_recovered {
-            if let Some(recovered) = prepared.recovered.take() {
+            let installed = if let Some(recovered) = prepared.recovered.take() {
                 self.install_prepared_state(recovered);
-            }
+                true
+            } else {
+                false
+            };
             *self.inner.durable.lock() = Some(prepared.durable.clone());
             self.inner.durable_bound.store(true, Ordering::Release);
-        }
+            if let Some(workspace) = prepared.parent_workspace.take() {
+                *self.inner.parent_workspace.write() = Some(workspace);
+            }
+            installed
+        } else {
+            false
+        };
         prepared.release_reservation();
+        installed_recovered
+    }
+
+    pub(crate) fn revive_prepared_parent(&self) {
+        self.revive_recovered_jobs();
+    }
+
+    /// Install a fully prepared binding and immediately revive recovered
+    /// children. Callers that need to bind ownership first use the split
+    /// `install_prepared_parent`/`revive_prepared_parent` sequence instead.
+    pub(crate) fn commit_parent_binding(&self, prepared: PreparedDurableBinding) {
+        self.commit_prepared_parent(prepared);
     }
 
     /// Bind to the parent recorder and either recover an existing sidecar or
-    /// initialize fresh state when no sidecar exists. Existing state is always
-    /// loaded and prebuilt before the first write or live-state swap.
+    /// initialize fresh state when no sidecar exists. The resumed application
+    /// generation must be bound before any recovered registry is constructed.
     pub fn bind_and_recover(&self, parent: &Session) -> Result<()> {
         let already_bound = self.inner.durable_bound.load(Ordering::Acquire);
+        self.bind_parent_generation_capture(parent)?;
         let mut prepared = self.prepare_parent_binding(parent)?;
         if prepared.same_parent && already_bound {
             self.commit_parent_binding(prepared);
@@ -1564,10 +2242,22 @@ impl OrchestrationRuntime {
         if prepared.same_parent {
             match prepared.durable.load_optional()? {
                 Some(state) => {
-                    prepared.recovered = Some(self.prepare_recovered_state(
-                        &prepared.durable,
-                        state,
-                    )?);
+                    let generation = prepared.generation.as_ref().ok_or_else(|| {
+                        anyhow!("durable orchestration recovery generation is unavailable")
+                    })?;
+                    let recovered =
+                        self.prepare_recovered_state(&prepared.durable, generation, state)?;
+                    prepared.durable.persist(&super::persistence::build_state(
+                        self.group_id(),
+                        prepared.durable.parent_session_id(),
+                        prepared.durable.parent_session_path(),
+                        crate::DurablePolicyState::capture(generation)?,
+                        recovered.main_mailbox.clone(),
+                        recovered.delivered_messages.clone(),
+                        recovered.agents.clone(),
+                        recovered.jobs.snapshots().to_vec(),
+                    ))?;
+                    prepared.recovered = Some(recovered);
                 }
                 None => prepared.initialize = true,
             }
@@ -1580,12 +2270,12 @@ impl OrchestrationRuntime {
 
     /// Bind to the parent recorder and initialize fresh durable state,
     /// discarding any existing sidecar. Used when a live orchestration runtime
-    /// is replaced by a non-equivalent reload: the previous runtime's jobs are
-    /// cancelled by its own shutdown, so the replacement must start clean
-    /// rather than recovering the prior sidecar (which would resurrect
-    /// cancelled jobs as live state under the new configuration).
+    /// is replaced by a non-equivalent reload after the previous runtime has
+    /// been explicitly shut down, so cancelled jobs cannot be recovered into
+    /// the replacement configuration.
     pub(crate) fn bind_and_reset(&self, parent: &Session) -> Result<()> {
-        let mut prepared = self.prepare_parent_binding(parent)?;
+        self.bind_parent_generation_capture(parent)?;
+        let mut prepared = self.prepare_parent_reset_binding(parent)?;
         prepared.recovered = None;
         prepared.initialize = true;
         self.initialize_prepared_binding(&mut prepared)?;
@@ -1593,13 +2283,69 @@ impl OrchestrationRuntime {
         Ok(())
     }
 
-    /// Persist the current live snapshot to the durable sidecar. Used after a
-    /// replaced runtime's shutdown re-writes the shared sidecar with stale
-    /// state, so the replacement (now the sole durable owner) re-syncs it to
-    /// its current state. Errors propagate: a clean sidecar is part of the
-    /// reload contract.
+    /// Persist the current live snapshot to the durable sidecar. Errors
+    /// propagate because a loadable sidecar is part of the reload contract.
     pub(crate) fn persist_durable_state(&self) -> Result<()> {
         self.persist_state()
+    }
+
+    /// Persist the live sidecar and freeze it so process teardown cannot
+    /// rewrite recovered Running/Queued identities. Does not cancel waiters
+    /// and does not mark the runtime shut down.
+    pub fn checkpoint_for_restart(&self) -> Result<()> {
+        let _spawn_guard = self.inner.jobs.lock_spawns();
+        let _durable_mutation = self.inner.durable_mutation.lock();
+        if self.inner.rebind_reserved.load(Ordering::Acquire) {
+            bail!("durable orchestration rebind is in progress");
+        }
+        #[cfg(test)]
+        if let Some(message) = self.inner.restart_checkpoint_error.lock().take() {
+            bail!(message);
+        }
+        self.persist_state()?;
+        self.inner.durable_frozen.store(true, Ordering::Release);
+        #[cfg(test)]
+        self.inner
+            .restart_checkpoint_count
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Reopens a runtime after the process-level restart checkpoint failed.
+    /// The latest live state is persisted before ordinary mutation resumes.
+    pub(crate) fn resume_after_failed_restart_checkpoint(&self) -> Result<()> {
+        let _spawn_guard = self.inner.jobs.lock_spawns();
+        let _durable_mutation = self.inner.durable_mutation.lock();
+        if !self.inner.durable_frozen.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        self.persist_state()
+            .context("persisting orchestration after failed restart checkpoint")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_restart_checkpoint_for_test(&self, message: &str) {
+        *self.inner.restart_checkpoint_error.lock() = Some(message.to_owned());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_restart_checkpointed_for_test(&self) -> bool {
+        self.inner.durable_frozen.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn durable_state_for_test(&self) -> Result<super::persistence::DurableState> {
+        self.inner
+            .durable
+            .lock()
+            .clone()
+            .ok_or_else(|| anyhow!("durable orchestration binding is unavailable"))?
+            .load()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn restart_checkpoint_count_for_test(&self) -> usize {
+        self.inner.restart_checkpoint_count.load(Ordering::Relaxed)
     }
 
     #[must_use]
@@ -1613,6 +2359,9 @@ impl OrchestrationRuntime {
         if !self.inner.durable_bound.load(Ordering::Acquire) {
             return Ok(());
         }
+        if self.inner.durable_frozen.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let durable = self
             .inner
             .durable
@@ -1621,9 +2370,12 @@ impl OrchestrationRuntime {
             .ok_or_else(|| anyhow!("durable orchestration binding is unavailable"))?;
         durable.persist_with(|| {
             Ok(super::persistence::build_state(
+                self.group_id(),
                 durable.parent_session_id(),
                 durable.parent_session_path(),
+                self.durable_policy_state()?,
                 self.collect_main_mailbox(),
+                self.delivered_messages(),
                 self.collect_persisted_agents(),
                 self.inner.jobs.snapshots(None),
             ))
@@ -1631,120 +2383,95 @@ impl OrchestrationRuntime {
     }
 
     fn collect_main_mailbox(&self) -> Vec<MailboxMessage> {
-        REGISTRY
-            .get(&self.inner.group_id, self.main_agent_id())
+        self.inner
+            .registry
+            .get(self.group_id(), self.main_agent_id())
             .map(|entry| entry.mailbox.lock().iter().cloned().collect())
             .unwrap_or_default()
     }
 
- /// Collect all non-main agents with their persisted definition, request,
- /// session path, and mailbox for durable state.
- fn collect_persisted_agents(&self) -> Vec<super::persistence::PersistedAgent> {
- let group_id = self.inner.group_id.clone();
- let mut agents = Vec::new();
- let groups = REGISTRY.groups.lock();
- if let Some(entries) = groups.get(&group_id) {
- for (id, entry) in entries {
- if *id == self.inner.config.main_agent_id {
- continue;
- }
- let snapshot = entry.snapshot.lock().clone();
- let mailbox = entry.mailbox.lock().iter().cloned().collect::<Vec<_>>();
- // The definition and request are only available for agents that
- // were spawned through spawn_tasks; they are stored on the entry
- // via the durable extension. For agents recovered from a prior
- // process, the persisted definition/request come from the sidecar.
- let durable_info = entry.durable_info.lock();
- agents.push(super::persistence::PersistedAgent {
- snapshot,
- definition: durable_info
- .as_ref()
- .map(|info| info.definition.clone())
- .unwrap_or_else(|| super::persistence::PersistedDefinition {
- name: id.clone(),
- description: String::new(),
- system_prompt: String::new(),
- tools: None,
- autoload_skills: Vec::new(),
- model: None,
- thinking_level: None,
- max_turns: None,
- max_tool_calls: None,
- timeout_secs: None,
- disallowed_tools: Vec::new(),
- capability_ceiling: None,
- source: super::persistence::PersistedDefinitionSource::Bundled,
- path: None,
-trusted: true,
-kind: super::AgentDefinitionKind::Agent,
-personality: None,
-soft_budget: None,
-}),
- request: durable_info
- .as_ref()
- .map(|info| info.request.clone())
- .unwrap_or_else(|| super::persistence::PersistedRequest {
- child_id: id.clone(),
- parent_id: self.inner.config.main_agent_id.clone(),
- depth: 1,
- assignment: String::new(),
- system_prompt: String::new(),
- requested_tool_names: None,
- thinking_level: None,
- max_tools_per_agent: self.inner.config.max_tools_per_agent,
- model_provider: None,
- model_id: None,
- output_schema: None,
- schema_mode: None,
- }),
- session_path: durable_info
- .as_ref()
- .and_then(|info| info.session_path.as_ref().map(|p| p.to_string_lossy().into_owned())),
- mailbox,
- });
- }
- }
- drop(groups);
- agents
- }
+    /// Collect all non-main agents with their persisted definition, request,
+    /// session path, and mailbox for durable state.
+    fn collect_persisted_agents(&self) -> Vec<super::persistence::PersistedAgent> {
+        let group_id = self.group_id().to_owned();
+        let mut agents = Vec::new();
+        let groups = self.inner.registry.groups.lock();
+        if let Some(entries) = groups.get(&group_id) {
+            for (id, entry) in entries {
+                if *id == self.inner.config.main_agent_id {
+                    continue;
+                }
+                let snapshot = entry.snapshot.lock().clone();
+                let mailbox = entry.mailbox.lock().iter().cloned().collect::<Vec<_>>();
+                // The definition and request are only available for agents that
+                // were spawned through spawn_tasks; they are stored on the entry
+                // via the durable extension. For agents recovered from a prior
+                // process, the persisted definition/request come from the sidecar.
+                let durable_info = entry.durable_info.lock();
+                agents.push(super::persistence::PersistedAgent {
+                    snapshot,
+                    definition: durable_info
+                        .as_ref()
+                        .map(|info| info.definition.clone())
+                        .unwrap_or_else(|| super::persistence::PersistedDefinition {
+                            name: id.clone(),
+                            description: String::new(),
+                            system_prompt: String::new(),
+                            tools: None,
+                            autoload_skills: Vec::new(),
+                            model: None,
+                            thinking_level: None,
+                            max_turns: None,
+                            max_tool_calls: None,
+                            timeout_secs: None,
+                            disallowed_tools: Vec::new(),
+                            capability_ceiling: None,
+                            source: super::persistence::PersistedDefinitionSource::Bundled,
+                            path: None,
+                            trusted: true,
+                            kind: super::AgentDefinitionKind::Agent,
+                            personality: None,
+                            soft_budget: None,
+                            knowledge_roots: Vec::new(),
+                            user_proxy: false,
+                        }),
+                    request: durable_info
+                        .as_ref()
+                        .map(|info| info.request.clone())
+                        .unwrap_or_else(|| super::persistence::PersistedRequest {
+                            child_id: id.clone(),
+                            parent_id: self.inner.config.main_agent_id.clone(),
+                            depth: 1,
+                            assignment: String::new(),
+                            system_prompt: String::new(),
+                            requested_tool_names: None,
+                            thinking_level: None,
+                            max_tools_per_agent: self.inner.config.max_tools_per_agent,
+                            model_provider: None,
+                            model_id: None,
+                            output_schema: None,
+                            schema_mode: None,
+                        }),
+                    session_path: durable_info.as_ref().and_then(|info| {
+                        info.session_path
+                            .as_ref()
+                            .map(|p| p.to_string_lossy().into_owned())
+                    }),
+                    mailbox,
+                });
+            }
+        }
+        drop(groups);
+        agents
+    }
 
-    /// Attempt to revive a parked or idle durable child. The caller holds
-    /// `durable_mutation`, making the {Parked,Idle}→Queued claim and
-    /// persistence one serialized transaction against sends and rebind
-    /// commit. Idle children are revived immediately on a committed message
-    /// (the idle→park TTL is no longer a forced delivery boundary); Main is
-    /// never claimed because its registry entry carries no `durable_info`.
-    fn maybe_revive(&self, target: &str) -> Result<Option<DeliveryOutcome>> {
-        if !self.inner.durable_bound.load(Ordering::Acquire) {
-            return Ok(None);
-        }
-        if self.inner.rebind_reserved.load(Ordering::Acquire) {
-            bail!("durable orchestration rebind is in progress");
-        }
-        let durable = self
-            .inner
-            .durable
-            .lock()
-            .clone()
-            .ok_or_else(|| anyhow!("durable orchestration binding is unavailable"))?;
-        let entry = match REGISTRY.get(&self.inner.group_id, target) {
-            Some(entry) => entry,
-            None => return Ok(None),
-        };
-        let snapshot = entry.snapshot.lock().clone();
-        if !matches!(snapshot.status, AgentStatus::Parked | AgentStatus::Idle) {
-            return Ok(None);
-        }
-        let previous_status = snapshot.status;
-        let info = match entry.durable_info.lock().clone() {
-            Some(info) => info,
-            None => return Ok(None),
-        };
-        let session_path = info
-            .session_path
-            .as_ref()
-            .map(|path| durable.canonicalize_child_session_path(path))
-            .transpose()?;
+    fn rebuild_revival_request(
+        &self,
+        target: &str,
+        snapshot: &AgentSnapshot,
+        info: &DurableAgentInfo,
+        session_path: Option<&PathBuf>,
+    ) -> Result<Option<ChildSessionRequest>> {
         let definition = match self.inner.config.catalog.get(&info.definition.name) {
             Some(definition) => definition.clone(),
             None => return Ok(None),
@@ -1770,55 +2497,269 @@ soft_budget: None,
             Ok(resolved) => resolved,
             Err(_) => return Ok(None),
         };
+        let (persona_skill_store, persona_skills) = self.persona_skill_context(&definition)?;
+        let shared_skills = self.shared_skill_snapshot();
         let peer_roster = self.sibling_roster(target);
-        let system_prompt = match self.child_system_prompt(
+        let system_prompt = self.child_system_prompt_with_persona_skills(
             &definition,
             &info.request.assignment,
             None,
             info.request.output_schema.as_ref(),
             info.request.schema_mode.as_deref(),
             &peer_roster,
-        ) {
-            Ok(prompt) => prompt,
-            Err(_) => return Ok(None),
-        };
+            &persona_skills,
+        )?;
         let requested_tool_names = crate::effective_agent_tool_names(
             &definition,
             self.inner.config.agent_settings.get(&definition.name),
         )
         .map(<[String]>::to_vec);
         let orchestration_tools = self.agent_tools(target, info.request.depth);
-        let request = match super::persistence::reconstruct_request(
+        Ok(super::persistence::reconstruct_request(
             &super::persistence::PersistedAgent {
                 snapshot: snapshot.clone(),
                 definition: info.definition.clone(),
                 request: info.request.clone(),
-                session_path: session_path
-                    .as_ref()
-                    .map(|path| path.to_string_lossy().into_owned()),
+                session_path: session_path.map(|path| path.to_string_lossy().into_owned()),
                 mailbox: Vec::new(),
             },
-            resolved.model,
+            resolved.model.clone(),
+            resolved.sequence,
+            resolved.selected_index,
             &definition,
             system_prompt,
             requested_tool_names,
             orchestration_tools,
             self.inner.config.max_tools_per_agent,
-        ) {
-            Some(request) => request,
+            persona_skill_store,
+            persona_skills,
+            shared_skills,
+        )
+        .into())
+    }
+
+    fn spawn_revival_runner(
+        &self,
+        agent_id: String,
+        request: ChildSessionRequest,
+        session_path: Option<PathBuf>,
+        assignment: String,
+        cancel: CancellationToken,
+        job_id: String,
+    ) {
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            let result = runtime
+                .run_revival(agent_id, request, session_path, assignment, cancel, &job_id)
+                .await;
+            {
+                let _durable_mutation = runtime.inner.durable_mutation.lock();
+                if !runtime.inner.rebind_reserved.load(Ordering::Acquire)
+                    && let Some(job) = runtime.inner.jobs.finish(&job_id, result, now_millis())
+                {
+                    let job = match runtime.persist_state() {
+                        Ok(()) => job,
+                        Err(error) => runtime
+                            .inner
+                            .jobs
+                            .append_result_error(&job_id, &error.to_string())
+                            .unwrap_or(job),
+                    };
+                    runtime.publish_job(job);
+                }
+            }
+            runtime.prune_retained_jobs();
+        });
+    }
+
+    fn settle_unrevivable_job(&self, job: &JobSnapshot, error: &str) {
+        let item = TaskItem {
+            index: 0,
+            id: job.agent_id.clone(),
+            agent: job.agent.clone(),
+            assignment: job.description.clone().unwrap_or_default(),
+            todo_task_id: job.todo_task_id.clone(),
+            ..Default::default()
+        };
+        let result = self.failed_result(&item, &job.id, AgentStatus::Parked, error);
+        if let Some(job) = self.inner.jobs.finish(&job.id, result, now_millis()) {
+            let job = match self.persist_state() {
+                Ok(()) => job,
+                Err(persist_error) => self
+                    .inner
+                    .jobs
+                    .append_result_error(&job.id, &persist_error.to_string())
+                    .unwrap_or(job),
+            };
+            self.publish_job(job);
+        }
+    }
+
+    /// Continue recovered Running/Queued jobs on the same job identity.
+    /// Must run only after the durable rebind reservation is released.
+    fn revive_recovered_jobs(&self) {
+        if !self.inner.durable_bound.load(Ordering::Acquire) {
+            return;
+        }
+        if self.inner.rebind_reserved.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(durable) = self.inner.durable.lock().clone() else {
+            return;
+        };
+        for job in self.inner.jobs.snapshots(None) {
+            if job.status.is_settled() {
+                continue;
+            }
+            if self.inner.active.lock().contains_key(&job.agent_id) {
+                continue;
+            }
+            let Some(entry) = self.inner.registry.get(self.group_id(), &job.agent_id) else {
+                self.settle_unrevivable_job(
+                    &job,
+                    "durable child identity is unavailable for revival",
+                );
+                continue;
+            };
+            let snapshot = entry.snapshot.lock().clone();
+            let Some(info) = entry.durable_info.lock().clone() else {
+                self.settle_unrevivable_job(
+                    &job,
+                    "durable child identity is unavailable for revival",
+                );
+                continue;
+            };
+            let session_path = match info
+                .session_path
+                .as_ref()
+                .map(|path| durable.child_file_authority(path).map(|_| path.clone()))
+                .transpose()
+            {
+                Ok(path) => path,
+                Err(error) => {
+                    self.settle_unrevivable_job(
+                        &job,
+                        &format!("durable child transcript is unavailable for revival: {error:#}"),
+                    );
+                    continue;
+                }
+            };
+            let request = match self.rebuild_revival_request(
+                &job.agent_id,
+                &snapshot,
+                &info,
+                session_path.as_ref(),
+            ) {
+                Ok(Some(request)) => request,
+                Ok(None) => {
+                    self.settle_unrevivable_job(
+                        &job,
+                        "durable child definition is no longer trusted or reconstructable for revival",
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    self.settle_unrevivable_job(
+                        &job,
+                        &format!("reconstructing durable child revival request: {error:#}"),
+                    );
+                    continue;
+                }
+            };
+            if request.definition.is_persona()
+                && self
+                    .inner
+                    .persona_lifecycle_blocks
+                    .lock()
+                    .contains(&request.definition.name)
+            {
+                self.settle_unrevivable_job(
+                    &job,
+                    &format!(
+                        "persona {:?} has a destructive operation in progress",
+                        request.definition.name
+                    ),
+                );
+                continue;
+            }
+            let Some(cancel) = self.inner.jobs.cancellation_token(&job.id) else {
+                self.settle_unrevivable_job(
+                    &job,
+                    "durable child cancellation token is unavailable for revival",
+                );
+                continue;
+            };
+            self.inner
+                .active
+                .lock()
+                .insert(job.agent_id.clone(), cancel.clone());
+            self.spawn_revival_runner(
+                job.agent_id.clone(),
+                request,
+                session_path,
+                info.request.assignment.clone(),
+                cancel,
+                job.id,
+            );
+        }
+    }
+
+    /// Attempt to revive a parked or idle durable child. The caller holds
+    /// `durable_mutation`, making the {Parked,Idle}→Queued claim and
+    /// persistence one serialized transaction against sends and rebind
+    /// commit. Idle children are revived immediately on a committed message
+    /// (the idle→park TTL is no longer a forced delivery boundary); Main is
+    /// never claimed because its registry entry carries no `durable_info`.
+    fn maybe_revive(&self, target: &str) -> Result<Option<DeliveryOutcome>> {
+        if !self.inner.durable_bound.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        if self.inner.rebind_reserved.load(Ordering::Acquire) {
+            bail!("durable orchestration rebind is in progress");
+        }
+        let durable = self
+            .inner
+            .durable
+            .lock()
+            .clone()
+            .ok_or_else(|| anyhow!("durable orchestration binding is unavailable"))?;
+        let entry = match self.inner.registry.get(self.group_id(), target) {
+            Some(entry) => entry,
             None => return Ok(None),
         };
-        if definition.is_persona()
+        let snapshot = entry.snapshot.lock().clone();
+        if !matches!(snapshot.status, AgentStatus::Parked | AgentStatus::Idle) {
+            return Ok(None);
+        }
+        let previous_status = snapshot.status;
+        let info = match entry.durable_info.lock().clone() {
+            Some(info) => info,
+            None => return Ok(None),
+        };
+        let session_path = info
+            .session_path
+            .as_ref()
+            .map(|path| durable.child_file_authority(path).map(|_| path.clone()))
+            .transpose()?;
+        let request =
+            match self.rebuild_revival_request(target, &snapshot, &info, session_path.as_ref())? {
+                Some(request) => request,
+                None => return Ok(None),
+            };
+        if request.definition.is_persona()
             && self
                 .inner
                 .persona_lifecycle_blocks
                 .lock()
-                .contains(&definition.name)
+                .contains(&request.definition.name)
         {
-            bail!("persona {:?} has a destructive operation in progress", definition.name);
+            bail!(
+                "persona {:?} has a destructive operation in progress",
+                request.definition.name
+            );
         }
-        if !REGISTRY.compare_status(
-            &self.inner.group_id,
+        if !self.inner.registry.compare_status(
+            self.group_id(),
             target,
             previous_status,
             AgentStatus::Queued,
@@ -1835,9 +2776,9 @@ soft_budget: None,
         let job_snapshot = JobSnapshot {
             id: job_id.clone(),
             agent_id: target.to_owned(),
-            agent: definition.name.clone(),
+            agent: request.definition.name.clone(),
             parent_id: info.request.parent_id.clone(),
-            description: Some(one_line(&info.request.assignment)),
+            description: Some(presentation_text(&info.request.assignment, TASK_DESCRIPTION_MAX_CHARS)),
             todo_task_id: None,
             workflow_id: None,
             workflow_generation: None,
@@ -1849,20 +2790,23 @@ soft_budget: None,
             soft_budget_exhausted: false,
         };
         if let Err(error) = self.inner.jobs.insert(job_snapshot.clone(), cancel.clone()) {
-            let _ = REGISTRY.compare_status(
-                &self.inner.group_id,
+            let _ = self.inner.registry.compare_status(
+                self.group_id(),
                 target,
                 AgentStatus::Queued,
                 previous_status,
             );
             return Err(error);
         }
-        self.inner.active.lock().insert(target.to_owned(), cancel.clone());
+        self.inner
+            .active
+            .lock()
+            .insert(target.to_owned(), cancel.clone());
         if let Err(error) = self.persist_state() {
             self.inner.jobs.remove(&job_id);
             self.inner.active.lock().remove(target);
-            let _ = REGISTRY.compare_status(
-                &self.inner.group_id,
+            let _ = self.inner.registry.compare_status(
+                self.group_id(),
                 target,
                 AgentStatus::Queued,
                 previous_status,
@@ -1879,39 +2823,14 @@ soft_budget: None,
         }
         self.publish_job(job_snapshot);
 
-        let runtime = self.clone();
-        let job_id_owned = job_id.clone();
-        let target_owned = target.to_owned();
-        let assignment = info.request.assignment.clone();
-        tokio::spawn(async move {
-            let result = runtime
-                .run_revival(
-                    target_owned,
-                    request,
-                    session_path,
-                    assignment,
-                    cancel,
-                    &job_id_owned,
-                )
-                .await;
-            {
-                let _durable_mutation = runtime.inner.durable_mutation.lock();
-                if !runtime.inner.rebind_reserved.load(Ordering::Acquire)
-                    && let Some(job) = runtime.inner.jobs.finish(&job_id_owned, result, now_millis())
-                {
-                    let job = match runtime.persist_state() {
-                        Ok(()) => job,
-                        Err(error) => runtime
-                            .inner
-                            .jobs
-                            .append_result_error(&job_id_owned, &error.to_string())
-                            .unwrap_or(job),
-                    };
-                    runtime.publish_job(job);
-                }
-            }
-            runtime.prune_retained_jobs();
-        });
+        self.spawn_revival_runner(
+            target.to_owned(),
+            request,
+            session_path,
+            info.request.assignment.clone(),
+            cancel,
+            job_id,
+        );
         Ok(Some(DeliveryOutcome::Revived))
     }
 
@@ -1929,17 +2848,27 @@ soft_budget: None,
         let _active_guard = ActiveChildGuard {
             inner: self.inner.clone(),
             id: agent_id.clone(),
-            group_id: self.inner.group_id.clone(),
+            group_id: self.group_id().to_owned(),
         };
         let definition = request.definition.clone();
-        let durable = match self.inner.durable.lock().clone() {
+        let durable = { self.inner.durable.lock().clone() };
+        let durable = match durable {
             Some(durable) => durable,
-            None => return self.failed_result(
-                &TaskItem { index: 0, id: agent_id.clone(), agent: request.definition.name.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
-                job_id,
-                AgentStatus::Idle,
-                "durable orchestration binding is unavailable",
-            ),
+            None => {
+                return self.failed_result(
+                    &TaskItem {
+                        index: 0,
+                        id: agent_id.clone(),
+                        agent: request.definition.name.clone(),
+                        assignment: assignment.clone(),
+                        todo_task_id: None,
+                        ..Default::default()
+                    },
+                    job_id,
+                    AgentStatus::Idle,
+                    "durable orchestration binding is unavailable",
+                );
+            }
         };
         let artifact_ref = format!("agent://{agent_id}");
         let history_ref = history_reference(&definition, &agent_id);
@@ -1976,14 +2905,22 @@ soft_budget: None,
         if self.inner.rebind_reserved.load(Ordering::Acquire) {
             drop(durable_mutation);
             return self.failed_result(
-                &TaskItem { index: 0, id: agent_id.clone(), agent: request.definition.name.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
+                &TaskItem {
+                    index: 0,
+                    id: agent_id.clone(),
+                    agent: request.definition.name.clone(),
+                    assignment: assignment.clone(),
+                    todo_task_id: None,
+                    ..Default::default()
+                },
                 job_id,
                 AgentStatus::Idle,
                 "durable orchestration rebind is in progress",
             );
         }
-        REGISTRY
-            .set_status(&self.inner.group_id, &agent_id, AgentStatus::Running)
+        self.inner
+            .registry
+            .set_status(self.group_id(), &agent_id, AgentStatus::Running)
             .ok();
         let running_agent = self.agent_snapshot(&agent_id);
         let running_job = self.inner.jobs.mark_running(job_id, now_millis());
@@ -1991,7 +2928,14 @@ soft_budget: None,
             let error = format!("persisting revived child running state: {error:#}");
             drop(durable_mutation);
             return self.failed_result(
-                &TaskItem { index: 0, id: agent_id.clone(), agent: request.definition.name.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
+                &TaskItem {
+                    index: 0,
+                    id: agent_id.clone(),
+                    agent: request.definition.name.clone(),
+                    assignment: assignment.clone(),
+                    todo_task_id: None,
+                    ..Default::default()
+                },
                 job_id,
                 AgentStatus::Idle,
                 &error,
@@ -2011,20 +2955,89 @@ soft_budget: None,
         let yield_state = request.yield_state.clone();
         let output_schema = request.output_schema.clone();
         let schema_mode = request.schema_mode.clone();
+        let continuation_recipient = request.child_id.clone();
         let persona_root = definition.persona_root();
         let mut canonical_session_path = session_path.clone();
         let child = match (self.inner.factory)(request).await {
             Ok(session) => {
+                let generation_capture = {
+                    let capture = self.inner.generation_capture.lock().clone();
+                    match capture {
+                        Some(capture) => capture,
+                        None => {
+                            return self.failed_result(
+                                &TaskItem {
+                                    index: 0,
+                                    id: agent_id.clone(),
+                                    agent: agent_type.clone(),
+                                    assignment: assignment.clone(),
+                                    todo_task_id: None,
+                                    ..Default::default()
+                                },
+                                job_id,
+                                AgentStatus::Idle,
+                                "durable orchestration generation is unavailable",
+                            );
+                        }
+                    }
+                };
+                if session.resource_manager().is_some() {
+                    return self.failed_result(
+                        &TaskItem {
+                            index: 0,
+                            id: agent_id.clone(),
+                            agent: agent_type.clone(),
+                            assignment: assignment.clone(),
+                            todo_task_id: None,
+                            ..Default::default()
+                        },
+                        job_id,
+                        AgentStatus::Idle,
+                        "child session factory returned a session with foreign resource authority",
+                    );
+                }
+                session.bind_generation_capture(generation_capture);
                 let recording = match session_path.as_deref() {
-                    Some(path) => session.resume_durable_child_recording(path).await,
-                    None => session.start_durable_child_recording(
-                        durable.child_root(),
-                        durable.parent_session_path(),
-                    ),
+                    Some(path) => {
+                        if let Err(error) = persist_interrupted_tool_results(path, &durable) {
+                            return self.failed_result(
+                                &TaskItem {
+                                    index: 0,
+                                    id: agent_id.clone(),
+                                    agent: agent_type.clone(),
+                                    assignment: assignment.clone(),
+                                    todo_task_id: None,
+                                    ..Default::default()
+                                },
+                                job_id,
+                                AgentStatus::Idle,
+                                &format!("reconciling interrupted child tool calls: {error:#}"),
+                            );
+                        }
+                        session.resume_durable_child_recording(path).await
+                    }
+                    None => match self.workflow_scope() {
+                        Some(_) => session.start_durable_child_recording_with_kind(
+                            crate::SessionKind::WorkflowWorker,
+                            durable.child_root(),
+                            durable.parent_session_path(),
+                        ),
+                        None => session.start_durable_child_recording(
+                            durable.child_root(),
+                            durable.parent_session_path(),
+                        ),
+                    },
                 };
                 if let Err(error) = recording {
                     return self.failed_result(
-                        &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
+                        &TaskItem {
+                            index: 0,
+                            id: agent_id.clone(),
+                            agent: agent_type.clone(),
+                            assignment: assignment.clone(),
+                            todo_task_id: None,
+                            ..Default::default()
+                        },
                         job_id,
                         AgentStatus::Idle,
                         &format!("opening durable child transcript: {error:#}"),
@@ -2033,33 +3046,56 @@ soft_budget: None,
                 if session_path.is_none() {
                     let Some((_, new_path)) = session.recorder_info() else {
                         return self.failed_result(
-                            &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
+                            &TaskItem {
+                                index: 0,
+                                id: agent_id.clone(),
+                                agent: agent_type.clone(),
+                                assignment: assignment.clone(),
+                                todo_task_id: None,
+                                ..Default::default()
+                            },
                             job_id,
                             AgentStatus::Idle,
                             "durable child recorder is unavailable",
                         );
                     };
-                    let new_path = match durable.canonicalize_child_session_path(&new_path) {
-                        Ok(path) => path,
-                        Err(error) => return self.failed_result(
-                            &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
-                            job_id,
-                            AgentStatus::Idle,
-                            &error.to_string(),
-                        ),
+                    let new_path = match durable.child_file_authority(&new_path) {
+                        Ok(_) => new_path,
+                        Err(error) => {
+                            return self.failed_result(
+                                &TaskItem {
+                                    index: 0,
+                                    id: agent_id.clone(),
+                                    agent: agent_type.clone(),
+                                    assignment: assignment.clone(),
+                                    todo_task_id: None,
+                                    ..Default::default()
+                                },
+                                job_id,
+                                AgentStatus::Idle,
+                                &error.to_string(),
+                            );
+                        }
                     };
                     canonical_session_path = Some(new_path.clone());
                     let durable_mutation = self.inner.durable_mutation.lock();
                     if self.inner.rebind_reserved.load(Ordering::Acquire) {
                         drop(durable_mutation);
                         return self.failed_result(
-                            &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
+                            &TaskItem {
+                                index: 0,
+                                id: agent_id.clone(),
+                                agent: agent_type.clone(),
+                                assignment: assignment.clone(),
+                                todo_task_id: None,
+                                ..Default::default()
+                            },
                             job_id,
                             AgentStatus::Idle,
                             "durable orchestration rebind is in progress",
                         );
                     }
-                    if let Some(entry) = REGISTRY.get(&self.inner.group_id, &agent_id)
+                    if let Some(entry) = self.inner.registry.get(self.group_id(), &agent_id)
                         && let Some(info) = entry.durable_info.lock().as_mut()
                     {
                         info.session_path = Some(new_path);
@@ -2068,7 +3104,14 @@ soft_budget: None,
                         let error = format!("persisting revived child transcript path: {error:#}");
                         drop(durable_mutation);
                         return self.failed_result(
-                            &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
+                            &TaskItem {
+                                index: 0,
+                                id: agent_id.clone(),
+                                agent: agent_type.clone(),
+                                assignment: assignment.clone(),
+                                todo_task_id: None,
+                                ..Default::default()
+                            },
                             job_id,
                             AgentStatus::Idle,
                             &error,
@@ -2076,20 +3119,36 @@ soft_budget: None,
                     }
                     drop(durable_mutation);
                 }
-                if let Some(root) = persona_root.as_deref() {
-                    let continuity = match load_persona_continuity(root) {
+                if definition.is_persona() {
+                    let continuity = match self.load_persona_continuity(&definition.name) {
                         Ok(messages) => messages,
-                        Err(error) => return self.failed_result(
-                            &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
-                            job_id,
-                            AgentStatus::Idle,
-                            &format!("loading revived persona continuity: {error:#}"),
-                        ),
+                        Err(error) => {
+                            return self.failed_result(
+                                &TaskItem {
+                                    index: 0,
+                                    id: agent_id.clone(),
+                                    agent: agent_type.clone(),
+                                    assignment: assignment.clone(),
+                                    todo_task_id: None,
+                                    ..Default::default()
+                                },
+                                job_id,
+                                AgentStatus::Idle,
+                                &format!("loading revived persona continuity: {error:#}"),
+                            );
+                        }
                     };
                     let merged = merge_persona_continuity(continuity, session.history());
                     if let Err(error) = session.load_history(merged).await {
                         return self.failed_result(
-                            &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
+                            &TaskItem {
+                                index: 0,
+                                id: agent_id.clone(),
+                                agent: agent_type.clone(),
+                                assignment: assignment.clone(),
+                                todo_task_id: None,
+                                ..Default::default()
+                            },
                             job_id,
                             AgentStatus::Idle,
                             &format!("installing revived persona continuity: {error:#}"),
@@ -2100,7 +3159,14 @@ soft_budget: None,
             }
             Err(error) => {
                 return self.failed_result(
-                    &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
+                    &TaskItem {
+                        index: 0,
+                        id: agent_id.clone(),
+                        agent: agent_type.clone(),
+                        assignment: assignment.clone(),
+                        todo_task_id: None,
+                        ..Default::default()
+                    },
                     job_id,
                     AgentStatus::Idle,
                     &error.to_string(),
@@ -2125,14 +3191,21 @@ soft_budget: None,
             if self.inner.rebind_reserved.load(Ordering::Acquire) {
                 drop(durable_mutation);
                 return self.failed_result(
-                    &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
+                    &TaskItem {
+                        index: 0,
+                        id: agent_id.clone(),
+                        agent: agent_type.clone(),
+                        assignment: assignment.clone(),
+                        todo_task_id: None,
+                        ..Default::default()
+                    },
                     job_id,
                     AgentStatus::Idle,
                     "durable orchestration rebind is in progress",
                 );
             }
-            match REGISTRY.register_active_delivery(
-                &self.inner.group_id,
+            match self.inner.registry.register_active_delivery(
+                self.group_id(),
                 &agent_id,
                 delivery_tx,
                 cancel.clone(),
@@ -2141,7 +3214,14 @@ soft_budget: None,
                 Err(error) => {
                     drop(durable_mutation);
                     return self.failed_result(
-                        &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
+                        &TaskItem {
+                            index: 0,
+                            id: agent_id.clone(),
+                            agent: agent_type.clone(),
+                            assignment: assignment.clone(),
+                            todo_task_id: None,
+                            ..Default::default()
+                        },
                         job_id,
                         AgentStatus::Idle,
                         &error.to_string(),
@@ -2154,20 +3234,60 @@ soft_budget: None,
         for message in &pre_run {
             if let Err(error) = child.steer(message).await {
                 return self.failed_result(
-                    &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
+                    &TaskItem {
+                        index: 0,
+                        id: agent_id.clone(),
+                        agent: agent_type.clone(),
+                        assignment: assignment.clone(),
+                        todo_task_id: None,
+                        ..Default::default()
+                    },
                     job_id,
                     AgentStatus::Idle,
                     &format!("failed to deliver queued message {}: {error:#}", message.id),
                 );
             }
-            self.acknowledge_delivery(&agent_id, &message.id);
+            if let Err(error) = self.acknowledge_delivery(&agent_id, &message.id) {
+                return self.failed_result(
+                    &TaskItem {
+                        index: 0,
+                        id: agent_id.clone(),
+                        agent: agent_type.clone(),
+                        assignment: assignment.clone(),
+                        todo_task_id: None,
+                        ..Default::default()
+                    },
+                    job_id,
+                    AgentStatus::Idle,
+                    &format!("acknowledging queued message {}: {error:#}", message.id),
+                );
+            }
         }
 
-        // Run the revival as a continuation turn.
-        let mut run = Box::pin(child.run(&assignment));
-        let run_deadline = definition.timeout_secs.map(|seconds| {
-            tokio::time::Instant::now() + Duration::from_secs(seconds)
+        let mut run = Box::pin(async {
+            if session_path.is_some() && (child.can_continue_without_input() || !pre_run.is_empty())
+            {
+                child.continue_run().await
+            } else if session_path.is_some() {
+                child
+                    .steer(&MailboxMessage {
+                        id: Uuid::now_v7().to_string(),
+                        from: self.inner.config.main_agent_id.clone(),
+                        to: continuation_recipient,
+                        body: "Continue the interrupted assignment from the recorded transcript."
+                            .to_owned(),
+                        timestamp: now_millis(),
+                        reply_to: None,
+                    })
+                    .await?;
+                child.continue_run().await
+            } else {
+                child.run(&assignment).await
+            }
         });
+        let run_deadline = definition
+            .timeout_secs
+            .map(|seconds| tokio::time::Instant::now() + Duration::from_secs(seconds));
 
         let outcome = loop {
             tokio::select! {
@@ -2178,7 +3298,9 @@ soft_budget: None,
                             if let Err(error) = child.steer(&message).await {
                                 break Err(format!("failed to deliver message {}: {error:#}", message.id));
                             }
-                            self.acknowledge_delivery(&agent_id, &message.id);
+                            if let Err(error) = self.acknowledge_delivery(&agent_id, &message.id) {
+                                break Err(format!("acknowledging delivered message {}: {error:#}", message.id));
+                            }
                         }
                         None => break Err("active child delivery bridge closed".to_owned()),
                     }
@@ -2186,7 +3308,7 @@ soft_budget: None,
                 () = cancel.cancelled() => {
                     {
                         let _durable_mutation = self.inner.durable_mutation.lock();
-                        REGISTRY.unregister_active_delivery(&self.inner.group_id, &agent_id);
+                        self.inner.registry.unregister_active_delivery(self.group_id(), &agent_id);
                     }
                     let drain = async {
                         child.abort().await;
@@ -2206,7 +3328,7 @@ soft_budget: None,
                 }, if run_deadline.is_some() => {
                     {
                         let _durable_mutation = self.inner.durable_mutation.lock();
-                        REGISTRY.unregister_active_delivery(&self.inner.group_id, &agent_id);
+                        self.inner.registry.unregister_active_delivery(self.group_id(), &agent_id);
                     }
                     let drain = async {
                         child.abort().await;
@@ -2230,7 +3352,9 @@ soft_budget: None,
 
         {
             let _durable_mutation = self.inner.durable_mutation.lock();
-            REGISTRY.unregister_active_delivery(&self.inner.group_id, &agent_id);
+            self.inner
+                .registry
+                .unregister_active_delivery(self.group_id(), &agent_id);
         }
         // A message steered in the final-turn window may still sit in the
         // session's steering queue (the bridge acknowledged it at steer time,
@@ -2238,7 +3362,8 @@ soft_budget: None,
         // or revival delivers it exactly once. A failed persist of the
         // restore must surface on the run result, never be swallowed.
         let mut restore_errors = Vec::new();
-        for message in child.drain_unprocessed_orchestration_steering().await {
+        let (mailbox_messages, unrestorable) = child.drain_unprocessed_orchestration_steering().await;
+        for message in mailbox_messages {
             if let Err(error) = self.restore_unprocessed_delivery(&agent_id, message.clone()) {
                 restore_errors.push(format!(
                     "restoring unprocessed delivery {}: {error:#}",
@@ -2246,6 +3371,7 @@ soft_budget: None,
                 ));
             }
         }
+        restore_errors.extend(unrestorable);
         drop(local_permit);
 
         let status = if cancel.is_cancelled() {
@@ -2256,7 +3382,9 @@ soft_budget: None,
         let soft_budget_exhausted = soft_budget_state.triggered.load(Ordering::Acquire);
         let execution_ceiling_reached = soft_budget_exhausted
             || contract_state.max_turns_triggered.load(Ordering::Acquire)
-            || contract_state.max_tool_calls_triggered.load(Ordering::Acquire);
+            || contract_state
+                .max_tool_calls_triggered
+                .load(Ordering::Acquire);
         let (output, error, usage) =
             self.settle_child_outcome(outcome, &child, &yield_state, execution_ceiling_reached);
         let structured_output = super::tools::validate_delivered_output(
@@ -2270,14 +3398,18 @@ soft_budget: None,
         } else {
             output.clone()
         };
-        let artifact_error = write_new_artifact(&artifact_path, artifact_body.as_bytes())
-            .with_context(|| format!("writing subagent artifact {}", artifact_path.display()))
-            .err();
+        let artifact_error = write_revival_artifact(
+            &self.inner.storage.artifacts,
+            &artifact_path,
+            artifact_body.as_bytes(),
+        )
+        .with_context(|| format!("writing subagent artifact {}", artifact_path.display()))
+        .err();
         let artifact_written = artifact_error.is_none();
         let history_error = serde_json::to_vec_pretty(&child.history())
             .context("serializing subagent history")
             .and_then(|bytes| {
-                write_new_artifact(&history_path, &bytes)
+                write_revival_artifact(&self.inner.storage.artifacts, &history_path, &bytes)
                     .with_context(|| format!("writing subagent history {}", history_path.display()))
             })
             .err();
@@ -2295,10 +3427,10 @@ soft_budget: None,
                 None => restore_error,
             });
         }
-        if let (Some(root), Some(source)) = (
-            persona_root.as_deref(),
-            canonical_session_path.as_deref(),
-        ) && let Err(archive_error) = archive_persona_session(root, &agent_id, source, true)
+        if definition.is_persona()
+            && let Some(source) = canonical_session_path.as_deref()
+            && let Err(archive_error) =
+                self.archive_persona_session(&definition.name, &agent_id, &durable, source, true)
         {
             let message = format!("archiving revived persona transcript: {archive_error:#}");
             final_error = Some(match final_error {
@@ -2359,16 +3491,17 @@ soft_budget: None,
         if self.inner.rebind_reserved.load(Ordering::Acquire) {
             bail!("durable orchestration rebind is in progress");
         }
-        let _durable_mutation = self.inner.durable_mutation.lock();
-        self.ensure_recovery_idle()?;
-        let durable = self
-            .inner
-            .durable
-            .lock()
-            .clone()
-            .ok_or_else(|| anyhow!("orchestration runtime is not bound to a durable parent session"))?;
-        let state = durable.load()?;
-        self.install_recovered_state_locked(&durable, state)
+        {
+            let _durable_mutation = self.inner.durable_mutation.lock();
+            self.ensure_recovery_idle()?;
+            let durable = self.inner.durable.lock().clone().ok_or_else(|| {
+                anyhow!("orchestration runtime is not bound to a durable parent session")
+            })?;
+            let state = durable.load()?;
+            self.install_recovered_state_locked(&durable, state)?;
+        }
+        self.revive_recovered_jobs();
+        Ok(())
     }
 
     /// Recover existing state before any write, or initialize a new sidecar
@@ -2378,44 +3511,67 @@ soft_budget: None,
         if self.inner.rebind_reserved.load(Ordering::Acquire) {
             bail!("durable orchestration rebind is in progress");
         }
-        let _durable_mutation = self.inner.durable_mutation.lock();
-        self.ensure_recovery_idle()?;
-        let durable = self
-            .inner
-            .durable
-            .lock()
-            .clone()
-            .ok_or_else(|| anyhow!("orchestration runtime is not bound to a durable parent session"))?;
-        match durable.load_optional()? {
-            Some(state) => self.install_recovered_state_locked(&durable, state),
-            None => self.persist_state(),
+        {
+            let _durable_mutation = self.inner.durable_mutation.lock();
+            self.ensure_recovery_idle()?;
+            let durable = self.inner.durable.lock().clone().ok_or_else(|| {
+                anyhow!("orchestration runtime is not bound to a durable parent session")
+            })?;
+            match durable.load_optional()? {
+                Some(state) => self.install_recovered_state_locked(&durable, state)?,
+                None => self.persist_state()?,
+            }
         }
+        self.revive_recovered_jobs();
+        Ok(())
     }
     fn prepared_group_entries(
         &self,
         mut children: HashMap<String, Arc<AgentEntry>>,
     ) -> HashMap<String, Arc<AgentEntry>> {
-        if let Some(main) = REGISTRY.get(&self.inner.group_id, self.main_agent_id()) {
+        if let Some(main) = self
+            .inner
+            .registry
+            .get(self.group_id(), self.main_agent_id())
+        {
             children.insert(self.main_agent_id().to_owned(), main);
         }
         children
     }
 
-
     fn prepare_recovered_state(
         &self,
         durable: &super::persistence::DurableRuntime,
+        generation: &Arc<crate::application::generation::ApplicationGeneration>,
         state: super::persistence::DurableState,
     ) -> Result<PreparedRecoveredState> {
+        self.adopt_durable_group_id(&state.group_id)?;
+        let captured = crate::DurablePolicyState::capture(generation)?;
+        if captured != state.durable_policy
+            && !crate::sandbox::durable_policy_same_authority(&state.durable_policy, &captured)
+            && !crate::sandbox::durable_policy_is_protected_subset_upgrade(
+                &state.durable_policy,
+                &captured,
+            )
+        {
+            return Err(anyhow::Error::new(
+                crate::DurableResumeError::PolicyMismatch,
+            ));
+        }
         let now = now_millis();
         let mut entries = HashMap::with_capacity(state.agents.len());
         let main_mailbox = state.main_mailbox;
+        let delivered_messages = state.delivered_messages;
         let mut agents = Vec::with_capacity(state.agents.len());
         for agent in state.agents {
             let session_path = agent
                 .session_path
                 .as_deref()
-                .map(|path| durable.canonicalize_child_session_path(Path::new(path)))
+                .map(|path| {
+                    durable
+                        .child_file_authority(Path::new(path))
+                        .map(|_| PathBuf::from(path))
+                })
                 .transpose()?;
             let definition = agent.definition;
             let request = agent.request;
@@ -2430,10 +3586,7 @@ soft_budget: None,
                 ..agent.snapshot
             };
             if was_unsettled || snapshot.history_ref.is_some() {
-                snapshot.history_ref = Some(persisted_history_reference(
-                    &definition,
-                    &snapshot.id,
-                ));
+                snapshot.history_ref = Some(persisted_history_reference(&definition, &snapshot.id));
             }
             agents.push(super::persistence::PersistedAgent {
                 snapshot: snapshot.clone(),
@@ -2482,6 +3635,7 @@ soft_budget: None,
         let jobs = self.inner.jobs.prepare_replacement(job_snapshots);
         Ok(PreparedRecoveredState {
             main_mailbox,
+            delivered_messages,
             group_entries: self.prepared_group_entries(entries),
             agents,
             jobs,
@@ -2491,7 +3645,10 @@ soft_budget: None,
         if let Some(main) = state.group_entries.get(self.main_agent_id()) {
             *main.mailbox.lock() = std::mem::take(&mut state.main_mailbox).into();
         }
-        REGISTRY.install_prepared_group(&self.inner.group_id, state.group_entries);
+        *self.inner.delivered_messages.lock() = state.delivered_messages.into();
+        self.inner
+            .registry
+            .install_prepared_group(self.group_id(), state.group_entries);
         self.inner.jobs.install_replacement(state.jobs);
     }
     fn ensure_recovery_idle(&self) -> Result<()> {
@@ -2514,11 +3671,16 @@ soft_budget: None,
         state: super::persistence::DurableState,
     ) -> Result<()> {
         self.ensure_recovery_idle()?;
-        let recovered = self.prepare_recovered_state(durable, state)?;
+        let generation = self.capture_generation()?;
+        let durable_policy = crate::DurablePolicyState::capture(&generation)?;
+        let recovered = self.prepare_recovered_state(durable, &generation, state)?;
         durable.persist(&super::persistence::build_state(
+            self.group_id(),
             durable.parent_session_id(),
             durable.parent_session_path(),
+            durable_policy,
             recovered.main_mailbox.clone(),
+            recovered.delivered_messages.clone(),
             recovered.agents.clone(),
             recovered.jobs.snapshots().to_vec(),
         ))?;
@@ -2535,7 +3697,13 @@ soft_budget: None,
         if self.inner.rebind_reserved.load(Ordering::Acquire) {
             bail!("durable orchestration rebind is in progress");
         }
-        if self.inner.jobs.snapshots(None).iter().any(|job| !job.status.is_settled()) {
+        if self
+            .inner
+            .jobs
+            .snapshots(None)
+            .iter()
+            .any(|job| !job.status.is_settled())
+        {
             bail!("cannot change workflow scope while orchestration jobs are active");
         }
         *self.inner.workflow_scope.lock() = Some(scope);
@@ -2553,11 +3721,20 @@ soft_budget: None,
         if self.inner.rebind_reserved.load(Ordering::Acquire) {
             bail!("durable orchestration rebind is in progress");
         }
-        if self.inner.jobs.snapshots(None).iter().any(|job| !job.status.is_settled()) {
+        if self
+            .inner
+            .jobs
+            .snapshots(None)
+            .iter()
+            .any(|job| !job.status.is_settled())
+        {
             bail!("cannot change global concurrency gate while orchestration jobs are active");
         }
         let mut current = self.inner.global_concurrency.lock();
-        if current.as_ref().is_some_and(|configured| configured != &gate) {
+        if current
+            .as_ref()
+            .is_some_and(|configured| configured != &gate)
+        {
             bail!("orchestration runtime already uses a different global concurrency gate");
         }
         *current = Some(gate);
@@ -2591,26 +3768,39 @@ soft_budget: None,
         self.inner.active.lock().len()
     }
 
+    pub async fn wait_until_idle(&self) {
+        loop {
+            let notified = self.inner.active_changed.notified();
+            if self.inner.active.lock().is_empty() {
+                break;
+            }
+            notified.await;
+        }
+    }
+
     fn publish_job(&self, job: JobSnapshot) {
         let _ = self.inner.events.send(OrchestrationEvent::JobUpdated {
-            group_id: self.inner.group_id.clone(),
+            group_id: self.group_id().to_owned(),
             job: presentation_job_snapshot(job),
         });
     }
 
     fn publish_agent(&self, agent: AgentSnapshot) {
         let _ = self.inner.events.send(OrchestrationEvent::AgentUpdated {
-            group_id: self.inner.group_id.clone(),
+            group_id: self.group_id().to_owned(),
             agent: presentation_agent_snapshot(agent),
         });
     }
 
     fn publish_message_delivered(&self, message: MailboxMessage, waiter_claimed: bool) {
-        let _ = self.inner.events.send(OrchestrationEvent::MessageDelivered {
-            group_id: self.inner.group_id.clone(),
-            message,
-            waiter_claimed,
-        });
+        let _ = self
+            .inner
+            .events
+            .send(OrchestrationEvent::MessageDelivered {
+                group_id: self.group_id().to_owned(),
+                message,
+                waiter_claimed,
+            });
     }
 
     /// Append one durably delivered group message to the bounded delivered
@@ -2619,18 +3809,30 @@ soft_budget: None,
     /// visible after the recipient reads them.
     fn record_delivered_message(&self, message: MailboxMessage) {
         let mut log = self.inner.delivered_messages.lock();
+        log.retain(|delivered| delivered.id != message.id);
         log.push_back(message);
         if log.len() > DELIVERED_MESSAGE_LOG_CAP {
             let excess = log.len() - DELIVERED_MESSAGE_LOG_CAP;
             log.drain(..excess);
         }
     }
+    fn remove_delivered_message(&self, message_id: &str) {
+        self.inner
+            .delivered_messages
+            .lock()
+            .retain(|message| message.id != message_id);
+    }
 
     /// Bounded, newest-last log of every durably delivered group message,
     /// independent of mailbox consumption.
     #[must_use]
     pub fn delivered_messages(&self) -> Vec<MailboxMessage> {
-        self.inner.delivered_messages.lock().iter().cloned().collect()
+        self.inner
+            .delivered_messages
+            .lock()
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Human-facing label for an agent id; falls back to the stable id.
@@ -2649,8 +3851,9 @@ soft_budget: None,
     }
 
     fn agent_snapshot(&self, id: &str) -> Option<AgentSnapshot> {
-        REGISTRY
-            .get(&self.inner.group_id, id)
+        self.inner
+            .registry
+            .get(self.group_id(), id)
             .map(|entry| entry.snapshot.lock().clone())
     }
     #[must_use]
@@ -2663,9 +3866,15 @@ soft_budget: None,
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
+    pub(crate) fn fresh_for_parent(&self, parent: &Session) -> Result<Self> {
+        let fresh = Self::new(self.inner.config.clone(), self.inner.factory.clone())?;
+        *fresh.inner.parent_workspace.write() = Some(parent.workspace_roots().clone());
+        Ok(fresh)
+    }
+
     #[must_use]
     pub fn list(&self, caller_id: &str) -> Vec<AgentSnapshot> {
-        REGISTRY.list(&self.inner.group_id, caller_id)
+        self.inner.registry.list(self.group_id(), caller_id)
     }
 
     pub fn send(
@@ -2675,18 +3884,74 @@ soft_budget: None,
         body: &str,
         reply_to: Option<String>,
     ) -> Vec<DeliveryReceipt> {
+        self.send_message_with_id(from, to, body, reply_to, None)
+    }
+    pub fn send_workflow_message(
+        &self,
+        workflow_id: &str,
+        generation: u64,
+        recipient: &str,
+        body: &str,
+        reply_to: Option<String>,
+    ) -> Result<Vec<DeliveryReceipt>> {
+        let scope = self
+            .workflow_scope()
+            .ok_or_else(|| anyhow!("orchestration runtime is not workflow-scoped"))?;
+        if scope.workflow_id != workflow_id || scope.generation != generation {
+            bail!("workflow runtime identity mismatch");
+        }
+        if recipient.trim().eq_ignore_ascii_case("all") {
+            bail!("workflow hub send does not allow broadcast recipients");
+        }
+        let receipts =
+            self.send_message_with_id(self.main_agent_id(), recipient, body, reply_to, None);
+        Ok(receipts)
+    }
+
+    fn send_message_with_id(
+        &self,
+        from: &str,
+        to: &str,
+        body: &str,
+        reply_to: Option<String>,
+        message_id: Option<String>,
+    ) -> Vec<DeliveryReceipt> {
+        let invalid = if body.trim().is_empty() {
+            Some("orchestration message body must not be empty".to_owned())
+        } else if body.len() > MAX_MESSAGE_BODY_BYTES {
+            Some(format!(
+                "orchestration message body exceeds maximum of {MAX_MESSAGE_BODY_BYTES} bytes"
+            ))
+        } else if let Err(error) = validate_agent_id(from) {
+            Some(format!("invalid orchestration sender {from:?}: {error:#}"))
+        } else if self.agent_snapshot(from).is_none() {
+            Some(format!("unknown orchestration sender {from:?}"))
+        } else {
+            None
+        };
+        if let Some(error) = invalid {
+            return vec![DeliveryReceipt {
+                to: to.to_owned(),
+                outcome: DeliveryOutcome::Failed,
+                requested: None,
+                message_id: None,
+                error: Some(error),
+            }];
+        }
         if self.inner.rebind_reserved.load(Ordering::Acquire) {
             return vec![DeliveryReceipt {
                 to: to.to_owned(),
                 outcome: DeliveryOutcome::Failed,
                 requested: None,
+                message_id: None,
                 error: Some("durable orchestration rebind is in progress".to_owned()),
             }];
         }
         let (targets, requested_alias) = if to == "all" {
             (
-                REGISTRY
-                    .list(&self.inner.group_id, from)
+                self.inner
+                    .registry
+                    .list(self.group_id(), from)
                     .into_iter()
                     .filter(|entry| entry.status != AgentStatus::Aborted)
                     .map(|entry| entry.id)
@@ -2699,11 +3964,16 @@ soft_budget: None,
                     let requested = (agent_id != to).then(|| to.to_owned());
                     (vec![agent_id], requested)
                 }
-                Err(error) if error.to_string().starts_with("ambiguous orchestration job or agent id") => {
+                Err(error)
+                    if error
+                        .to_string()
+                        .starts_with("ambiguous orchestration job or agent id") =>
+                {
                     return vec![DeliveryReceipt {
                         to: to.to_owned(),
                         outcome: DeliveryOutcome::Failed,
                         requested: None,
+                        message_id: None,
                         error: Some(error.to_string()),
                     }];
                 }
@@ -2711,11 +3981,13 @@ soft_budget: None,
             }
         };
         let main_id = self.main_agent_id().to_owned();
-        let group_id = self.inner.group_id.clone();
+        let group_id = self.group_id().to_owned();
         let mut receipts = Vec::with_capacity(targets.len());
         for target in targets {
             let message = MailboxMessage {
-                id: Uuid::now_v7().to_string(),
+                id: message_id
+                    .clone()
+                    .unwrap_or_else(|| Uuid::now_v7().to_string()),
                 from: from.to_owned(),
                 to: target.clone(),
                 body: body.to_owned(),
@@ -2727,6 +3999,7 @@ soft_budget: None,
                     to: target,
                     outcome: DeliveryOutcome::Failed,
                     requested: requested_alias.clone(),
+                    message_id: Some(message.id.clone()),
                     error: Some("durable orchestration rebind is in progress".to_owned()),
                 });
                 continue;
@@ -2737,93 +4010,97 @@ soft_budget: None,
                     to: target,
                     outcome: DeliveryOutcome::Failed,
                     requested: requested_alias.clone(),
+                    message_id: Some(message.id.clone()),
                     error: Some("durable orchestration rebind is in progress".to_owned()),
                 });
                 continue;
             }
-            match REGISTRY.enqueue(&group_id, &target, message.clone()) {
-                Ok(outcome) => match self
-                    .persist_state()
-                    .with_context(|| format!("persisting message to orchestration agent {target:?}"))
-                {
-                    Err(error) => {
-                        REGISTRY.remove_message(&group_id, &target, &message.id);
-                        receipts.push(DeliveryReceipt {
-                            to: target,
-                            outcome: DeliveryOutcome::Failed,
-                            requested: requested_alias.clone(),
-                            error: Some(error.to_string()),
-                        });
-                    }
-                    Ok(()) => {
-                        let mut outcome = outcome;
-                        let mut waiter_claimed = false;
-                        if matches!(outcome, DeliveryOutcome::Woken) {
-                            match REGISTRY.deliver_committed(&group_id, &target, &message.id) {
-                                CommittedDelivery::Delivered => {}
-                                CommittedDelivery::WaiterClaimed => waiter_claimed = true,
-                                // No active bridge (e.g. the run settled
-                                // between enqueue and this call): the message
-                                // stays in the mailbox for the next run or
-                                // revival. Report the truthful Queued outcome
-                                // instead of a fake Woken.
-                                CommittedDelivery::Retained => {
-                                    outcome = DeliveryOutcome::Queued;
+            match self
+                .inner
+                .registry
+                .enqueue(&group_id, &target, message.clone())
+            {
+                Ok(outcome) => {
+                    self.record_delivered_message(message.clone());
+                    match self.persist_state().with_context(|| {
+                        format!("persisting message to orchestration agent {target:?}")
+                    }) {
+                        Err(error) => {
+                            self.inner
+                                .registry
+                                .remove_message(&group_id, &target, &message.id);
+                            self.remove_delivered_message(&message.id);
+                            receipts.push(DeliveryReceipt {
+                                to: target,
+                                outcome: DeliveryOutcome::Failed,
+                                requested: requested_alias.clone(),
+                                message_id: Some(message.id.clone()),
+                                error: Some(format!("{error:#}")),
+                            });
+                        }
+                        Ok(()) => {
+                            let mut outcome = outcome;
+                            let mut waiter_claimed = false;
+                            if matches!(outcome, DeliveryOutcome::Woken) {
+                                match self.inner.registry.deliver_committed(
+                                    &group_id,
+                                    &target,
+                                    &message.id,
+                                ) {
+                                    CommittedDelivery::Delivered => {}
+                                    CommittedDelivery::WaiterClaimed => {
+                                        waiter_claimed = true;
+                                        outcome = DeliveryOutcome::Processed;
+                                    }
+                                    CommittedDelivery::Retained => {
+                                        outcome = DeliveryOutcome::Queued;
+                                    }
+                                }
+                            } else if self
+                                .inner
+                                .registry
+                                .hand_to_waiter(&group_id, &target, &message)
+                            {
+                                waiter_claimed = true;
+                                outcome = DeliveryOutcome::Processed;
+                            }
+                            match if matches!(outcome, DeliveryOutcome::Queued) {
+                                self.maybe_revive(&target)
+                            } else {
+                                Ok(None)
+                            } {
+                                Ok(revival) => {
+                                    let outcome = revival.unwrap_or(outcome);
+                                    let message_id = message.id.clone();
+                                    if target == main_id {
+                                        self.publish_message_delivered(message, waiter_claimed);
+                                    }
+                                    receipts.push(DeliveryReceipt {
+                                        to: target,
+                                        outcome,
+                                        requested: requested_alias.clone(),
+                                        message_id: Some(message_id),
+                                        error: None,
+                                    });
+                                }
+                                Err(error) => {
+                                    receipts.push(DeliveryReceipt {
+                                        to: target,
+                                        outcome: DeliveryOutcome::Queued,
+                                        requested: requested_alias.clone(),
+                                        message_id: Some(message.id.clone()),
+                                        error: Some(error.to_string()),
+                                    });
                                 }
                             }
-                        } else if REGISTRY.hand_to_waiter(&group_id, &target, &message) {
-                            // An active `hub wait` atomically claimed the
-                            // message: it left the mailbox and the waiter
-                            // returns it as its own result, so no revival is
-                            // needed and the application must not steer a
-                            // duplicate. The removal is NOT persisted here:
-                            // consumption is durably recorded only when
-                            // `wait_message` actually returns the message, so
-                            // an aborted/timed-out waiter's restore keeps the
-                            // durable mailbox consistent with memory (the
-                            // committed message survives a restart).
-                            waiter_claimed = true;
-                            outcome = DeliveryOutcome::Woken;
-                        }
-                        match if matches!(outcome, DeliveryOutcome::Queued) {
-                            self.maybe_revive(&target)
-                        } else {
-                            Ok(None)
-                        } {
-                            Ok(revival) => {
-                                let outcome = revival.unwrap_or(outcome);
-                                // Every durably delivered group message lands
-                                // in the bounded delivered-message log (the
-                                // workflow page's Recent IRC source), whether
-                                // or not the recipient has consumed it yet.
-                                self.record_delivered_message(message.clone());
-                                if target == main_id {
-                                    self.publish_message_delivered(message, waiter_claimed);
-                                }
-                                receipts.push(DeliveryReceipt {
-                                    to: target,
-                                    outcome,
-                                    requested: requested_alias.clone(),
-                                    error: None,
-                                });
-                            }
-                            Err(error) => {
-                                // The mailbox enqueue was durably committed before the
-                                // revival claim. Keep the queued message in memory/disk.
-                                receipts.push(DeliveryReceipt {
-                                    to: target,
-                                    outcome: DeliveryOutcome::Failed,
-                                    requested: requested_alias.clone(),
-                                    error: Some(error.to_string()),
-                                });
-                            }
                         }
                     }
-                },
+                }
                 Err(error) => receipts.push(DeliveryReceipt {
                     to: target,
                     outcome: DeliveryOutcome::Failed,
                     requested: requested_alias.clone(),
+                    message_id: Some(message.id.clone()),
                     error: Some(error.to_string()),
                 }),
             }
@@ -2832,52 +4109,71 @@ soft_budget: None,
     }
 
     pub fn inbox_result(&self, agent_id: &str, peek: bool) -> Result<Vec<MailboxMessage>> {
+        if self.agent_snapshot(agent_id).is_none() {
+            bail!("unknown orchestration agent {agent_id:?}");
+        }
         if peek {
             if self.inner.rebind_reserved.load(Ordering::Acquire) {
                 bail!("durable orchestration rebind is in progress");
             }
-            return Ok(REGISTRY.inbox(&self.inner.group_id, agent_id, true));
+            return Ok(self.inner.registry.inbox(self.group_id(), agent_id, true));
         }
         let _durable_mutation = self.inner.durable_mutation.lock();
         if self.inner.rebind_reserved.load(Ordering::Acquire) {
             bail!("durable orchestration rebind is in progress");
         }
-        let messages = REGISTRY.inbox(&self.inner.group_id, agent_id, false);
+        let messages = self.inner.registry.inbox(self.group_id(), agent_id, false);
         if messages.is_empty() {
             return Ok(messages);
         }
-        if let Err(error) = self.persist_state().context("persisting orchestration inbox drain") {
-            REGISTRY.restore_mailbox(&self.inner.group_id, agent_id, messages);
+        if let Err(error) = self
+            .persist_state()
+            .context("persisting orchestration inbox drain")
+        {
+            self.inner
+                .registry
+                .restore_mailbox(self.group_id(), agent_id, messages);
             return Err(error);
         }
         Ok(messages)
     }
-    fn acknowledge_delivery(&self, agent_id: &str, message_id: &str) {
+    fn acknowledge_delivery(&self, agent_id: &str, message_id: &str) -> Result<()> {
         let _durable_mutation = self.inner.durable_mutation.lock();
-        let Some(message) = REGISTRY.remove_message_value(
-            &self.inner.group_id,
-            agent_id,
-            message_id,
-        ) else {
-            return;
+        let Some(message) =
+            self.inner
+                .registry
+                .remove_message_value(self.group_id(), agent_id, message_id)
+        else {
+            return Ok(());
         };
-        if self.persist_state().is_err() {
-            REGISTRY.restore_mailbox(&self.inner.group_id, agent_id, vec![message]);
+        if let Err(error) = self.persist_state().with_context(|| {
+            format!("persisting delivered message {message_id:?} for agent {agent_id:?}")
+        }) {
+            self.inner
+                .registry
+                .restore_mailbox_message(self.group_id(), agent_id, message);
+            return Err(error);
         }
+        Ok(())
     }
 
     pub(crate) fn acknowledge_main_delivery(&self, message_id: &str) -> Result<()> {
         let _durable_mutation = self.inner.durable_mutation.lock();
         let main_id = self.main_agent_id();
-        let Some(message) = REGISTRY.remove_message_value(
-            &self.inner.group_id,
-            main_id,
-            message_id,
-        ) else {
+        let Some(message) =
+            self.inner
+                .registry
+                .remove_message_value(self.group_id(), main_id, message_id)
+        else {
             return Ok(());
         };
-        if let Err(error) = self.persist_state().context("persisting delivered Main message") {
-            REGISTRY.restore_mailbox_message(&self.inner.group_id, main_id, message);
+        if let Err(error) = self
+            .persist_state()
+            .context("persisting delivered Main message")
+        {
+            self.inner
+                .registry
+                .restore_mailbox_message(self.group_id(), main_id, message);
             return Err(error);
         }
         Ok(())
@@ -2894,12 +4190,16 @@ soft_budget: None,
     fn restore_unprocessed_delivery(&self, agent_id: &str, message: MailboxMessage) -> Result<()> {
         let _durable_mutation = self.inner.durable_mutation.lock();
         if self.inner.rebind_reserved.load(Ordering::Acquire) {
-            bail!("durable orchestration rebind is in progress; restored delivery persisted by the rebind");
+            bail!(
+                "durable orchestration rebind is in progress; restored delivery persisted by the rebind"
+            );
         }
         // Forced restore (dedup + front, never cap-rejected): the message was
         // durably committed and acknowledged away, and the in-flight capacity
         // it occupied is being returned.
-        REGISTRY.restore_mailbox_message(&self.inner.group_id, agent_id, message);
+        self.inner
+            .registry
+            .restore_mailbox_message(self.group_id(), agent_id, message);
         self.persist_state()
             .context("persisting restored unprocessed delivery")
     }
@@ -2907,20 +4207,96 @@ soft_budget: None,
     /// Restore a waited/handed-off message whose consumption could not be
     /// persisted, using the forced id-dedup restore (the message was durably
     /// committed before the handoff). Main-target messages are republished
-    /// with `waiter_claimed: false`: the original delivery event was
-    /// claimed-flagged, so the application skipped steering, and without a
     /// fresh non-claimed event the restored reply would never reach the main
     /// session's model context.
     fn restore_waited_message(&self, agent_id: &str, message: MailboxMessage) {
-        REGISTRY.restore_mailbox_message(&self.inner.group_id, agent_id, message.clone());
+        self.inner
+            .registry
+            .restore_mailbox_message(self.group_id(), agent_id, message.clone());
         if message.to == self.main_agent_id() {
             self.publish_message_delivered(message, false);
         }
     }
 
-    #[must_use]
-    pub fn inbox(&self, agent_id: &str, peek: bool) -> Vec<MailboxMessage> {
-        self.inbox_result(agent_id, peek).unwrap_or_default()
+    pub fn inbox(&self, agent_id: &str, peek: bool) -> Result<Vec<MailboxMessage>> {
+        self.inbox_result(agent_id, peek)
+    }
+
+    pub(crate) fn canonical_agent_id(&self, identifier: &str) -> Result<String> {
+        if self.agent_snapshot(identifier).is_some() {
+            return Ok(identifier.to_owned());
+        }
+        self.inner.jobs.resolve_agent_id(identifier)
+    }
+
+    fn register_waiter(
+        &self,
+        agent_id: &str,
+        from: Option<&str>,
+        reply_to: Option<&str>,
+    ) -> Result<MessageWaiterGuard> {
+        if self.inner.rebind_reserved.load(Ordering::Acquire) {
+            bail!("durable orchestration rebind is in progress");
+        }
+        let from = from
+            .map(|identifier| self.canonical_agent_id(identifier))
+            .transpose()?;
+        let republish: Option<Arc<dyn Fn(MailboxMessage) + Send + Sync>> = Some(Arc::new({
+            let runtime = self.clone();
+            move |message: MailboxMessage| {
+                if message.to == runtime.main_agent_id() {
+                    runtime.publish_message_delivered(message, false);
+                }
+            }
+        }));
+        self.inner
+            .registry
+            .register_message_waiter(
+                self.group_id(),
+                agent_id,
+                from,
+                reply_to.map(str::to_owned),
+                republish,
+            )
+            .ok_or_else(|| anyhow!("unknown orchestration agent {agent_id:?}"))
+    }
+
+    pub(crate) fn send_with_reply_waiter(
+        &self,
+        from: &str,
+        to: &str,
+        body: &str,
+        reply_to: Option<String>,
+    ) -> Result<(Vec<DeliveryReceipt>, MessageWaiterGuard, String)> {
+        if to == "all" {
+            bail!("await is invalid with to=all");
+        }
+        let canonical_to = self.canonical_agent_id(to)?;
+        let message_id = Uuid::now_v7().to_string();
+        let waiter = self.register_waiter(from, Some(&canonical_to), Some(&message_id))?;
+        let receipts =
+            self.send_message_with_id(from, to, body, reply_to, Some(message_id.clone()));
+        Ok((receipts, waiter, message_id))
+    }
+
+    pub(crate) async fn wait_registered_reply(
+        &self,
+        agent_id: &str,
+        from: &str,
+        message_id: &str,
+        mut waiter: MessageWaiterGuard,
+        timeout: Option<Duration>,
+        abort: Option<pi_agent::AbortSignal>,
+    ) -> Result<Option<MailboxMessage>> {
+        self.wait_with_guard(
+            agent_id,
+            Some(from),
+            Some(message_id),
+            &mut waiter,
+            timeout,
+            abort,
+        )
+        .await
     }
 
     pub async fn wait_message(
@@ -2930,45 +4306,62 @@ soft_budget: None,
         timeout: Option<Duration>,
         abort: Option<pi_agent::AbortSignal>,
     ) -> Result<Option<MailboxMessage>> {
-        if self.inner.rebind_reserved.load(Ordering::Acquire) {
-            bail!("durable orchestration rebind is in progress");
+        self.wait_correlated(agent_id, from, None, timeout, abort)
+            .await
+    }
+
+    /// Wait for a reply whose `replyTo` matches `message_id`.
+    pub async fn wait_reply(
+        &self,
+        agent_id: &str,
+        from: Option<&str>,
+        message_id: &str,
+        timeout: Option<Duration>,
+        abort: Option<pi_agent::AbortSignal>,
+    ) -> Result<Option<MailboxMessage>> {
+        self.wait_correlated(agent_id, from, Some(message_id), timeout, abort)
+            .await
+    }
+
+    async fn wait_correlated(
+        &self,
+        agent_id: &str,
+        from: Option<&str>,
+        reply_to: Option<&str>,
+        timeout: Option<Duration>,
+        abort: Option<pi_agent::AbortSignal>,
+    ) -> Result<Option<MailboxMessage>> {
+        if self.inner.shutdown.is_cancelled() {
+            bail!("orchestration shut down");
         }
-        let from = from.map(|identifier| {
-            self.inner
-                .jobs
-                .resolve_agent_id(identifier)
-                .unwrap_or_else(|_| identifier.to_owned())
-        });
-        let from = from.as_deref();
-        let entry = REGISTRY
-            .get(&self.inner.group_id, agent_id)
-            .ok_or_else(|| anyhow!("unknown orchestration agent {agent_id:?}"))?;
-        // Register an explicit waiter before the loop checks the mailbox so a
-        // concurrent send atomically hands matching (and wildcard) deliveries
-        // to this waiter instead of the active steering bridge. The guard is
-        // RAII: it unregisters on every return path — return, timeout, abort,
-        // shutdown, or task drop — and restores any handed-off message this
-        // wait did not return, so no stale claim can strand a message.
-        let republish: Option<Arc<dyn Fn(MailboxMessage) + Send + Sync>> = Some(Arc::new({
-            let runtime = self.clone();
-            move |message: MailboxMessage| {
-                // The wait ended (timeout/abort/drop) after an atomic handoff
-                // restored the message to the mailbox. Re-surface Main-target
-                // deliveries with a fresh non-claimed event so the application
-                // still steers them into the main session; presentation
-                // surfaces dedupe the duplicate render by message id.
-                if message.to == runtime.main_agent_id() {
-                    runtime.publish_message_delivered(message, false);
-                }
-            }
-        }));
-        let mut _waiter_guard = REGISTRY
-            .register_message_waiter(
-                &self.inner.group_id,
-                agent_id,
-                from.map(str::to_owned),
-                republish,
-            )
+        let from = from
+            .map(|identifier| self.canonical_agent_id(identifier))
+            .transpose()?;
+        let mut waiter = self.register_waiter(agent_id, from.as_deref(), reply_to)?;
+        self.wait_with_guard(
+            agent_id,
+            from.as_deref(),
+            reply_to,
+            &mut waiter,
+            timeout,
+            abort,
+        )
+        .await
+    }
+
+    async fn wait_with_guard(
+        &self,
+        agent_id: &str,
+        from: Option<&str>,
+        reply_to: Option<&str>,
+        waiter_guard: &mut MessageWaiterGuard,
+        timeout: Option<Duration>,
+        abort: Option<pi_agent::AbortSignal>,
+    ) -> Result<Option<MailboxMessage>> {
+        let entry = self
+            .inner
+            .registry
+            .get(self.group_id(), agent_id)
             .ok_or_else(|| anyhow!("unknown orchestration agent {agent_id:?}"))?;
         let wait = async {
             loop {
@@ -2980,7 +4373,7 @@ soft_budget: None,
                     if self.inner.rebind_reserved.load(Ordering::Acquire) {
                         return Err(anyhow!("durable orchestration rebind is in progress"));
                     }
-                    match take_matching_message(&entry, from) {
+                    match take_matching_message(&entry, from, reply_to) {
                         Some(message) => {
                             if let Err(error) = self
                                 .persist_state()
@@ -3001,7 +4394,7 @@ soft_budget: None,
                 // message from the mailbox and delivered it to this waiter's
                 // channel) or a mailbox wake that warrants re-checking.
                 tokio::select! {
-                    message = _waiter_guard.delivery_rx.recv() => {
+                    message = waiter_guard.delivery_rx.recv() => {
                         match message {
                             Some(message) => {
                                 if let Err(error) = self
@@ -3074,10 +4467,12 @@ soft_budget: None,
             .agent_snapshot(id)
             .ok_or_else(|| anyhow!("unknown orchestration agent {id:?}"))?
             .status;
-        REGISTRY.set_status(&self.inner.group_id, id, AgentStatus::Parked)?;
+        self.inner
+            .registry
+            .set_status(self.group_id(), id, AgentStatus::Parked)?;
         if let Err(error) = self.persist_state().context("persisting parked child") {
-            let _ = REGISTRY.compare_status(
-                &self.inner.group_id,
+            let _ = self.inner.registry.compare_status(
+                self.group_id(),
                 id,
                 AgentStatus::Parked,
                 previous,
@@ -3105,22 +4500,22 @@ soft_budget: None,
         let previous = self
             .agent_snapshot(id)
             .ok_or_else(|| anyhow!("unknown orchestration agent {id:?}"))?;
-        let previous_artifact = REGISTRY
-            .get(&self.inner.group_id, id)
+        let previous_artifact = self
+            .inner
+            .registry
+            .get(self.group_id(), id)
             .and_then(|entry| entry.artifact_path.lock().clone());
-        let previous_history = REGISTRY
-            .get(&self.inner.group_id, id)
+        let previous_history = self
+            .inner
+            .registry
+            .get(self.group_id(), id)
             .and_then(|entry| entry.history_path.lock().clone());
-        REGISTRY.finish(
-            &self.inner.group_id,
-            id,
-            status,
-            artifact_path,
-            history_path,
-        )?;
+        self.inner
+            .registry
+            .finish(self.group_id(), id, status, artifact_path, history_path)?;
         if let Err(error) = self.persist_state().context("persisting finished child") {
-            REGISTRY.restore_finish(
-                &self.inner.group_id,
+            self.inner.registry.restore_finish(
+                self.group_id(),
                 id,
                 previous,
                 previous_artifact,
@@ -3149,7 +4544,7 @@ soft_budget: None,
         if id == self.inner.config.main_agent_id {
             return;
         }
-        let Some(entry) = REGISTRY.get(&self.inner.group_id, id) else {
+        let Some(entry) = self.inner.registry.get(self.group_id(), id) else {
             return;
         };
         let token = CancellationToken::new();
@@ -3170,15 +4565,15 @@ soft_budget: None,
                     if runtime.inner.rebind_reserved.load(Ordering::Acquire) {
                         return;
                     }
-                    if let Some(agent) = REGISTRY.park_if_idle(
-                        &runtime.inner.group_id,
+                    if let Some(agent) = runtime.inner.registry.park_if_idle(
+                        runtime.group_id(),
                         &id_owned,
                         &runtime.inner.config.main_agent_id,
                     ) {
                         runtime.publish_agent(agent);
                         if runtime.persist_state().is_err() {
-                            let _ = REGISTRY.compare_status(
-                                &runtime.inner.group_id,
+                            let _ = runtime.inner.registry.compare_status(
+                                runtime.group_id(),
                                 &id_owned,
                                 AgentStatus::Parked,
                                 AgentStatus::Idle,
@@ -3199,7 +4594,7 @@ soft_budget: None,
         if let Some(handle) = handle {
             handle.abort();
         }
-        if let Some(entry) = REGISTRY.get(&self.inner.group_id, id)
+        if let Some(entry) = self.inner.registry.get(self.group_id(), id)
             && let Some(token) = entry.idle_park_token.lock().take()
         {
             token.cancel();
@@ -3218,8 +4613,29 @@ soft_budget: None,
         if items.is_empty() {
             bail!("task batch must contain at least one item");
         }
+        #[cfg(test)]
+        if let Some((SpawnTestParkPoint::BeforeSpawnLock, release)) =
+            self.inner.spawn_test_park.lock().clone()
+        {
+            while !release.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+        }
         let _spawn_guard = self.inner.jobs.lock_spawns();
+        #[cfg(test)]
+        if let Some((SpawnTestParkPoint::AfterSpawnLock, release)) =
+            self.inner.spawn_test_park.lock().clone()
+        {
+            while !release.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+        }
         let _durable_mutation = self.inner.durable_mutation.lock();
+        if self.inner.retiring.load(Ordering::Acquire) {
+            bail!(
+                "orchestration runtime is being replaced; retry the task after the runtime switch completes"
+            );
+        }
         if self.inner.rebind_reserved.load(Ordering::Acquire) {
             bail!("durable orchestration rebind is in progress");
         }
@@ -3241,13 +4657,13 @@ soft_budget: None,
                     .lock()
                     .contains(&definition.name)
             {
-                bail!("persona {:?} has a destructive operation in progress", definition.name);
+                bail!(
+                    "persona {:?} has a destructive operation in progress",
+                    definition.name
+                );
             }
-            item.id = self.allocate_unique_agent_id_for_definition(
-                &item.id,
-                &definition,
-                &mut reserved,
-            )?;
+            item.id =
+                self.allocate_unique_agent_id_for_definition(&item.id, &definition, &mut reserved)?;
             if !definition.trusted {
                 bail!("agent definition {:?} is not trusted", item.agent);
             }
@@ -3270,32 +4686,24 @@ soft_budget: None,
                 return Err(crate::agent_disabled_error(&item.agent));
             }
             let agent_settings = self.inner.config.agent_settings.get(&item.agent);
-            // Unknown declared tools are silently ignored (OMP-compatible):
-            // record a deduped warning and continue — they never abort the
-            // batch and never make the agent unusable.
             let unsupported = crate::unsupported_agent_tools(&definition, agent_settings);
             if !unsupported.is_empty() {
                 self.record_unknown_tool_warnings(&item.agent, &unsupported);
             }
-            // The pre-check counts only names that will actually be injected
-            // (known, non-plumbing): unknown declarations and plumbing never
-            // consume max_tools_per_agent budget, matching the child-side
-            // enforcement in the factory.
-            if crate::effective_agent_tool_names(&definition, agent_settings).is_some_and(|tools| {
-                tools
-                    .iter()
-                    .filter(|name| {
-                        !crate::is_child_plumbing_tool(name)
-                            && crate::is_known_child_tool(name)
-                    })
-                    .count()
-                    > self.inner.config.max_tools_per_agent
-            }) {
-                bail!(
-                    "agent definition {:?} requests more than {} tools",
-                    item.agent,
-                    self.inner.config.max_tools_per_agent
-                );
+            let resolved_tools = crate::resolved_child_coding_tools(&definition, agent_settings);
+            // `tools: None` inherits the full parent/default child tool set,
+            // which may exceed the cap; only explicitly declared lists are
+            // capped.
+            let inherited_full_set =
+                crate::effective_agent_tool_names(&definition, agent_settings).is_none();
+            if !inherited_full_set
+                && resolved_tools.len() > self.inner.config.max_tools_per_agent
+            {
+                return Err(crate::child_tool_cap_error(
+                    &item.agent,
+                    self.inner.config.max_tools_per_agent,
+                    &resolved_tools,
+                ));
             }
             let parent_model = self.inner.config.current_parent_model();
             let resolved_model = crate::resolve_agent_model(
@@ -3339,14 +4747,12 @@ soft_budget: None,
                 agent_id: item.id.clone(),
                 agent: item.agent.clone(),
                 parent_id: parent_id.to_owned(),
-                description: Some(one_line(&item.assignment)),
+                description: Some(presentation_text(&item.assignment, TASK_DESCRIPTION_MAX_CHARS)),
                 todo_task_id: item.todo_task_id.clone(),
                 workflow_id: workflow_scope
                     .as_ref()
                     .map(|scope| scope.workflow_id.clone()),
-                workflow_generation: workflow_scope
-                    .as_ref()
-                    .map(|scope| scope.generation),
+                workflow_generation: workflow_scope.as_ref().map(|scope| scope.generation),
                 status: JobStatus::Queued,
                 created_at,
                 started_at: None,
@@ -3354,11 +4760,18 @@ soft_budget: None,
                 result: None,
                 soft_budget_exhausted: false,
             };
-            launches.push((item, definition, resolved_model, cancel, agent_snapshot, job_snapshot));
+            launches.push((
+                item,
+                definition,
+                resolved_model,
+                cancel,
+                agent_snapshot,
+                job_snapshot,
+            ));
         }
 
-        REGISTRY.register_batch(
-            &self.inner.group_id,
+        self.inner.registry.register_batch(
+            self.group_id(),
             launches
                 .iter()
                 .map(|(_, _, _, _, agent, _)| agent.clone())
@@ -3372,42 +4785,55 @@ soft_budget: None,
             .collect::<Vec<_>>();
         let launches = match launches
             .into_iter()
-            .map(|(item, definition, resolved_model, cancel, agent_snapshot, job_snapshot)| {
-                let peer_roster = self.sibling_roster(&item.id);
-                let request = ChildSessionRequest {
-                    child_id: item.id.clone(),
-                    parent_id: parent_id.to_owned(),
-                    depth: parent_depth + 1,
-                    system_prompt: self.child_system_prompt(
-                        &definition,
-                        &item.assignment,
-                        item.context.as_deref(),
-                        item.output_schema.as_ref(),
-                        item.schema_mode.as_deref(),
-                        &peer_roster,
-                    )?,
-                    requested_tool_names: crate::effective_agent_tool_names(
-                        &definition,
-                        self.inner.config.agent_settings.get(&definition.name),
-                    )
-                    .map(<[String]>::to_vec),
-                    orchestration_tools: self.agent_tools(&item.id, parent_depth + 1),
-                    thinking_level: resolved_model.thinking_level.or(definition.thinking_level),
-                    max_tools_per_agent: self.inner.config.max_tools_per_agent,
-                    model: resolved_model.model,
-                    definition,
-                    assignment: item.assignment.clone(),
-                    output_schema: item.output_schema.clone(),
-                    schema_mode: item.schema_mode.clone(),
-                    yield_state: Arc::new(YieldState::default()),
-                };
-                Ok((item, request, cancel, agent_snapshot, job_snapshot))
-            })
+            .map(
+                |(item, definition, resolved_model, cancel, agent_snapshot, job_snapshot)| {
+                    let (persona_skill_store, persona_skills) =
+                        self.persona_skill_context(&definition)?;
+                    let shared_skills = self.shared_skill_snapshot();
+                    let peer_roster = self.sibling_roster(&item.id);
+                    let request = ChildSessionRequest {
+                        child_id: item.id.clone(),
+                        parent_id: parent_id.to_owned(),
+                        depth: parent_depth + 1,
+                        system_prompt: self.child_system_prompt_with_persona_skills(
+                            &definition,
+                            &item.assignment,
+                            item.context.as_deref(),
+                            item.output_schema.as_ref(),
+                            item.schema_mode.as_deref(),
+                            &peer_roster,
+                            &persona_skills,
+                        )?,
+                        requested_tool_names: crate::effective_agent_tool_names(
+                            &definition,
+                            self.inner.config.agent_settings.get(&definition.name),
+                        )
+                        .map(<[String]>::to_vec),
+                        orchestration_tools: self.agent_tools(&item.id, parent_depth + 1),
+                        thinking_level: resolved_model.thinking_level.or(definition.thinking_level),
+                        max_tools_per_agent: self.inner.config.max_tools_per_agent,
+                        model: resolved_model.model,
+                        persona_skill_store,
+                        persona_skills,
+                        shared_skills,
+                        definition,
+                        assignment: item.assignment.clone(),
+                        output_schema: item.output_schema.clone(),
+                        schema_mode: item.schema_mode.clone(),
+                        yield_state: Arc::new(YieldState::default()),
+                        resolved_model_sequence: resolved_model.sequence.clone(),
+                        resolved_model_selected_index: resolved_model.selected_index,
+                    };
+                    Ok((item, request, cancel, agent_snapshot, job_snapshot))
+                },
+            )
             .collect::<Result<Vec<_>>>()
         {
             Ok(launches) => launches,
             Err(error) => {
-                REGISTRY.unregister_batch(&self.inner.group_id, &registered_ids);
+                self.inner
+                    .registry
+                    .unregister_batch(self.group_id(), &registered_ids);
                 return Err(error);
             }
         };
@@ -3416,13 +4842,18 @@ soft_budget: None,
             let job_snapshot = match self.inner.jobs.insert(job_snapshot.clone(), cancel.clone()) {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
-                    REGISTRY.unregister_batch(&self.inner.group_id, &registered_ids);
+                    self.inner
+                        .registry
+                        .unregister_batch(self.group_id(), &registered_ids);
                     return Err(error);
                 }
             };
             self.publish_agent(agent_snapshot.clone());
             self.publish_job(job_snapshot.clone());
-            self.inner.active.lock().insert(item.id.clone(), cancel.clone());
+            self.inner
+                .active
+                .lock()
+                .insert(item.id.clone(), cancel.clone());
             spawns.push(TaskSpawn {
                 index: item.index,
                 job_id: job_snapshot.id,
@@ -3434,7 +4865,7 @@ soft_budget: None,
 
         if self.inner.durable_bound.load(Ordering::Acquire) {
             for (item, request, _, _, _) in &launches {
-                if let Some(entry) = REGISTRY.get(&self.inner.group_id, &item.id) {
+                if let Some(entry) = self.inner.registry.get(self.group_id(), &item.id) {
                     *entry.durable_info.lock() = Some(DurableAgentInfo {
                         definition: super::persistence::persist_definition(&request.definition),
                         request: super::persistence::persist_request(request),
@@ -3451,7 +4882,9 @@ soft_budget: None,
             for id in &registered_ids {
                 self.inner.active.lock().remove(id);
             }
-            REGISTRY.unregister_batch(&self.inner.group_id, &registered_ids);
+            self.inner
+                .registry
+                .unregister_batch(self.group_id(), &registered_ids);
             return Err(error).context("persisting durable child spawn");
         }
 
@@ -3464,10 +4897,11 @@ soft_budget: None,
                 {
                     let _durable_mutation = runtime.inner.durable_mutation.lock();
                     if !runtime.inner.rebind_reserved.load(Ordering::Acquire)
-                        && let Some(job) = runtime
-                            .inner
-                            .jobs
-                            .finish(&job_snapshot.id, result, now_millis())
+                        && let Some(job) =
+                            runtime
+                                .inner
+                                .jobs
+                                .finish(&job_snapshot.id, result, now_millis())
                     {
                         let job = match runtime.persist_state() {
                             Ok(()) => job,
@@ -3521,7 +4955,9 @@ soft_budget: None,
         state: &JobSoftBudgetState,
     ) -> Option<ShouldStopAfterTurnFn> {
         let budget = if definition.is_persona() {
-            definition.soft_budget.unwrap_or(self.inner.config.soft_budget)
+            definition
+                .soft_budget
+                .unwrap_or(self.inner.config.soft_budget)
         } else {
             self.inner.config.soft_budget
         };
@@ -3536,11 +4972,15 @@ soft_budget: None,
         let triggered = state.triggered.clone();
         Some(Arc::new(move |turn: &ShouldStopAfterTurnContext| {
             let request_count = requests.fetch_add(1, Ordering::Relaxed) + 1;
-            let turn_tokens = u64::try_from(turn.message.usage.total_tokens.max(0))
-                .unwrap_or(u64::MAX);
+            let turn_tokens =
+                u64::try_from(turn.message.usage.total_tokens.max(0)).unwrap_or(u64::MAX);
             let token_count = tokens.fetch_add(turn_tokens, Ordering::Relaxed) + turn_tokens;
-            let stop = budget.yield_after.is_some_and(|limit| request_count >= limit)
-                || budget.max_requests.is_some_and(|limit| request_count >= limit)
+            let stop = budget
+                .yield_after
+                .is_some_and(|limit| request_count >= limit)
+                || budget
+                    .max_requests
+                    .is_some_and(|limit| request_count >= limit)
                 || budget.max_tokens.is_some_and(|limit| token_count >= limit);
             if stop {
                 triggered.store(true, Ordering::Release);
@@ -3582,7 +5022,8 @@ soft_budget: None,
                 .iter()
                 .filter(|block| matches!(block, pi_ai::ContentBlock::ToolCall(_)))
                 .count();
-            let call_count = tool_calls.fetch_add(turn_tool_calls, Ordering::Relaxed) + turn_tool_calls;
+            let call_count =
+                tool_calls.fetch_add(turn_tool_calls, Ordering::Relaxed) + turn_tool_calls;
             if max_tool_calls.is_some_and(|limit| call_count >= limit) {
                 max_tool_calls_triggered.store(true, Ordering::Release);
                 stop = true;
@@ -3604,9 +5045,8 @@ soft_budget: None,
         yield_state: &YieldState,
     ) -> Option<ShouldStopAfterTurnFn> {
         let yield_called = yield_state.clone();
-        let yield_hook = Arc::new(move |_turn: &ShouldStopAfterTurnContext| {
-            yield_called.was_called()
-        });
+        let yield_hook =
+            Arc::new(move |_turn: &ShouldStopAfterTurnContext| yield_called.was_called());
         match (
             self.soft_budget_stop_hook(definition, soft_budget),
             self.definition_contract_stop_hook(definition, contract),
@@ -3680,11 +5120,9 @@ soft_budget: None,
                 // read-only run. A provider-reported error still wins when
                 // present; the synthesized summary is bounded and carries no
                 // tool output.
-                let tool_failure = last_failed_tool_kind(
-                    &result.messages,
-                    &child.available_tool_names(),
-                )
-                .map(|kind| format!("last tool execution failed: {kind}"));
+                let tool_failure =
+                    last_failed_tool_kind(&result.messages, &child.available_tool_names())
+                        .map(|kind| format!("last tool execution failed: {kind}"));
                 (
                     result.text,
                     result.error_message.or(tool_failure),
@@ -3717,7 +5155,7 @@ soft_budget: None,
         let _active_guard = ActiveChildGuard {
             inner: self.inner.clone(),
             id: item.id.clone(),
-            group_id: self.inner.group_id.clone(),
+            group_id: self.group_id().to_owned(),
         };
         let definition = request.definition.clone();
         let artifact_ref = format!("agent://{}", item.id);
@@ -3762,20 +5200,16 @@ soft_budget: None,
                 "durable orchestration rebind is in progress",
             );
         }
-        REGISTRY
-            .set_status(&self.inner.group_id, &item.id, AgentStatus::Running)
+        self.inner
+            .registry
+            .set_status(self.group_id(), &item.id, AgentStatus::Running)
             .ok();
         let running_agent = self.agent_snapshot(&item.id);
         let running_job = self.inner.jobs.mark_running(job_id, now_millis());
         if let Err(error) = self.persist_state() {
             let error = format!("persisting child running state: {error:#}");
             drop(durable_mutation);
-            return self.failed_result(
-                &item,
-                job_id,
-                AgentStatus::Idle,
-                &error,
-            );
+            return self.failed_result(&item, job_id, AgentStatus::Idle, &error);
         }
         drop(durable_mutation);
         if let Some(agent) = running_agent {
@@ -3797,15 +5231,29 @@ soft_budget: None,
             },
             () = cancel.cancelled() => return self.failed_result(&item, job_id, AgentStatus::Aborted, "task cancelled during child session creation"),
         };
-        if let Some(root) = persona_root.as_deref() {
-            let continuity = match load_persona_continuity(root) {
-                Ok(messages) => messages,
-                Err(error) => return self.failed_result(
+        let generation_capture = { self.inner.generation_capture.lock().clone() };
+        if let Some(generation_capture) = generation_capture {
+            if child_session.resource_manager().is_some() {
+                return self.failed_result(
                     &item,
                     job_id,
                     AgentStatus::Idle,
-                    &format!("loading persona continuity: {error:#}"),
-                ),
+                    "child session factory returned a session with foreign resource authority",
+                );
+            }
+            child_session.bind_generation_capture(generation_capture);
+        }
+        if definition.is_persona() {
+            let continuity = match self.load_persona_continuity(&definition.name) {
+                Ok(messages) => messages,
+                Err(error) => {
+                    return self.failed_result(
+                        &item,
+                        job_id,
+                        AgentStatus::Idle,
+                        &format!("loading persona continuity: {error:#}"),
+                    );
+                }
             };
             if let Err(error) = child_session.load_history(continuity).await {
                 return self.failed_result(
@@ -3817,19 +5265,36 @@ soft_budget: None,
             }
         }
         let durable = if self.inner.durable_bound.load(Ordering::Acquire) {
-            match self.inner.durable.lock().clone() {
+            let durable = { self.inner.durable.lock().clone() };
+            match durable {
                 Some(durable) => Some(durable),
-                None => return self.failed_result(&item, job_id, AgentStatus::Idle, "durable orchestration binding is unavailable"),
+                None => {
+                    return self.failed_result(
+                        &item,
+                        job_id,
+                        AgentStatus::Idle,
+                        "durable orchestration binding is unavailable",
+                    );
+                }
             }
         } else {
             None
         };
         let mut canonical_session_path = None;
         if let Some(durable) = durable.as_ref() {
-            if let Err(error) = child_session.start_durable_child_recording(
-                durable.child_root(),
-                durable.parent_session_path(),
-            ) {
+            let recording = if self.workflow_scope().is_some() {
+                child_session.start_durable_child_recording_with_kind(
+                    crate::SessionKind::WorkflowWorker,
+                    durable.child_root(),
+                    durable.parent_session_path(),
+                )
+            } else {
+                child_session.start_durable_child_recording(
+                    durable.child_root(),
+                    durable.parent_session_path(),
+                )
+            };
+            if let Err(error) = recording {
                 return self.failed_result(
                     &item,
                     job_id,
@@ -3838,11 +5303,23 @@ soft_budget: None,
                 );
             }
             let Some((_, session_path)) = child_session.recorder_info() else {
-                return self.failed_result(&item, job_id, AgentStatus::Idle, "durable child recorder is unavailable");
+                return self.failed_result(
+                    &item,
+                    job_id,
+                    AgentStatus::Idle,
+                    "durable child recorder is unavailable",
+                );
             };
-            let session_path = match durable.canonicalize_child_session_path(&session_path) {
-                Ok(path) => path,
-                Err(error) => return self.failed_result(&item, job_id, AgentStatus::Idle, &error.to_string()),
+            let session_path = match durable.child_file_authority(&session_path) {
+                Ok(_) => session_path,
+                Err(error) => {
+                    return self.failed_result(
+                        &item,
+                        job_id,
+                        AgentStatus::Idle,
+                        &error.to_string(),
+                    );
+                }
             };
             canonical_session_path = Some(session_path.clone());
             let durable_mutation = self.inner.durable_mutation.lock();
@@ -3855,7 +5332,7 @@ soft_budget: None,
                     "durable orchestration rebind is in progress",
                 );
             }
-            if let Some(entry) = REGISTRY.get(&self.inner.group_id, &item.id)
+            if let Some(entry) = self.inner.registry.get(self.group_id(), &item.id)
                 && let Some(info) = entry.durable_info.lock().as_mut()
             {
                 info.session_path = Some(session_path);
@@ -3889,8 +5366,8 @@ soft_budget: None,
                     "durable orchestration rebind is in progress",
                 );
             }
-            match REGISTRY.register_active_delivery(
-                &self.inner.group_id,
+            match self.inner.registry.register_active_delivery(
+                self.group_id(),
                 &item.id,
                 delivery_tx,
                 cancel.clone(),
@@ -3898,7 +5375,12 @@ soft_budget: None,
                 Ok(messages) => messages,
                 Err(error) => {
                     drop(durable_mutation);
-                    return self.failed_result(&item, job_id, AgentStatus::Idle, &error.to_string());
+                    return self.failed_result(
+                        &item,
+                        job_id,
+                        AgentStatus::Idle,
+                        &error.to_string(),
+                    );
                 }
             }
         };
@@ -3911,12 +5393,19 @@ soft_budget: None,
                     &format!("failed to deliver queued message {}: {error:#}", message.id),
                 );
             }
-            self.acknowledge_delivery(&item.id, &message.id);
+            if let Err(error) = self.acknowledge_delivery(&item.id, &message.id) {
+                return self.failed_result(
+                    &item,
+                    job_id,
+                    AgentStatus::Idle,
+                    &format!("acknowledging queued message {}: {error:#}", message.id),
+                );
+            }
         }
         let mut run = Box::pin(child.run(&item.assignment));
-        let run_deadline = definition.timeout_secs.map(|seconds| {
-            tokio::time::Instant::now() + Duration::from_secs(seconds)
-        });
+        let run_deadline = definition
+            .timeout_secs
+            .map(|seconds| tokio::time::Instant::now() + Duration::from_secs(seconds));
         let outcome = loop {
             tokio::select! {
                 result = &mut run => break result.map_err(|error| error.to_string()),
@@ -3926,7 +5415,9 @@ soft_budget: None,
                             if let Err(error) = child.steer(&message).await {
                                 break Err(format!("failed to deliver message {}: {error:#}", message.id));
                             }
-                            self.acknowledge_delivery(&item.id, &message.id);
+                            if let Err(error) = self.acknowledge_delivery(&item.id, &message.id) {
+                                break Err(format!("acknowledging delivered message {}: {error:#}", message.id));
+                            }
                         }
                         None => break Err("active child delivery bridge closed".to_owned()),
                     }
@@ -3934,7 +5425,7 @@ soft_budget: None,
                 () = cancel.cancelled() => {
                     {
                         let _durable_mutation = self.inner.durable_mutation.lock();
-                        REGISTRY.unregister_active_delivery(&self.inner.group_id, &item.id);
+                        self.inner.registry.unregister_active_delivery(self.group_id(), &item.id);
                     }
                     let drain = async {
                         child.abort().await;
@@ -3954,7 +5445,7 @@ soft_budget: None,
                 }, if run_deadline.is_some() => {
                     {
                         let _durable_mutation = self.inner.durable_mutation.lock();
-                        REGISTRY.unregister_active_delivery(&self.inner.group_id, &item.id);
+                        self.inner.registry.unregister_active_delivery(self.group_id(), &item.id);
                     }
                     let drain = async {
                         child.abort().await;
@@ -3977,7 +5468,9 @@ soft_budget: None,
         };
         {
             let _durable_mutation = self.inner.durable_mutation.lock();
-            REGISTRY.unregister_active_delivery(&self.inner.group_id, &item.id);
+            self.inner
+                .registry
+                .unregister_active_delivery(self.group_id(), &item.id);
         }
         // A message steered in the final-turn window may still sit in the
         // session's steering queue (the bridge acknowledged it at steer time,
@@ -3985,7 +5478,8 @@ soft_budget: None,
         // or revival delivers it exactly once. A failed persist of the
         // restore must surface on the run result, never be swallowed.
         let mut restore_errors = Vec::new();
-        for message in child.drain_unprocessed_orchestration_steering().await {
+        let (mailbox_messages, unrestorable) = child.drain_unprocessed_orchestration_steering().await;
+        for message in mailbox_messages {
             if let Err(error) = self.restore_unprocessed_delivery(&item.id, message.clone()) {
                 restore_errors.push(format!(
                     "restoring unprocessed delivery {}: {error:#}",
@@ -3993,6 +5487,7 @@ soft_budget: None,
                 ));
             }
         }
+        restore_errors.extend(unrestorable);
         drop(global_permit);
         drop(local_permit);
         let status = if cancel.is_cancelled() {
@@ -4003,7 +5498,9 @@ soft_budget: None,
         let soft_budget_exhausted = soft_budget_state.triggered.load(Ordering::Acquire);
         let execution_ceiling_reached = soft_budget_exhausted
             || contract_state.max_turns_triggered.load(Ordering::Acquire)
-            || contract_state.max_tool_calls_triggered.load(Ordering::Acquire);
+            || contract_state
+                .max_tool_calls_triggered
+                .load(Ordering::Acquire);
         let (output, error, usage) =
             self.settle_child_outcome(outcome, &child, &yield_state, execution_ceiling_reached);
         let structured_output = super::tools::validate_delivered_output(
@@ -4017,14 +5514,18 @@ soft_budget: None,
         } else {
             output.clone()
         };
-        let artifact_error = write_new_artifact(&artifact_path, artifact_body.as_bytes())
-            .with_context(|| format!("writing subagent artifact {}", artifact_path.display()))
-            .err();
+        let artifact_error = write_new_artifact(
+            &self.inner.storage.artifacts,
+            &artifact_path,
+            artifact_body.as_bytes(),
+        )
+        .with_context(|| format!("writing subagent artifact {}", artifact_path.display()))
+        .err();
         let artifact_written = artifact_error.is_none();
         let history_error = serde_json::to_vec_pretty(&child.history())
             .context("serializing subagent history")
             .and_then(|bytes| {
-                write_new_artifact(&history_path, &bytes)
+                write_new_artifact(&self.inner.storage.artifacts, &history_path, &bytes)
                     .with_context(|| format!("writing subagent history {}", history_path.display()))
             })
             .err();
@@ -4042,8 +5543,11 @@ soft_budget: None,
                 None => restore_error,
             });
         }
-        if let (Some(root), Some(source)) = (persona_root.as_deref(), canonical_session_path.as_deref())
-            && let Err(archive_error) = archive_persona_session(root, &item.id, source, false)
+        if definition.is_persona()
+            && let (Some(durable), Some(source)) =
+                (durable.as_ref(), canonical_session_path.as_deref())
+            && let Err(archive_error) =
+                self.archive_persona_session(&definition.name, &item.id, durable, source, false)
         {
             let message = format!("archiving persona transcript: {archive_error:#}");
             final_error = Some(match final_error {
@@ -4105,15 +5609,16 @@ soft_budget: None,
         error: &str,
     ) -> TaskResult {
         let artifact_ref = format!("agent://{}", item.id);
-        let history_ref = self
-            .inner
-            .config
-            .catalog
-            .get(&item.agent)
-            .map_or_else(
-                || format!("history://{}", item.id),
-                |definition| history_reference(definition, &item.id),
-            );
+        let history_ref = self.inner.config.catalog.get(&item.agent).map_or_else(
+            || format!("history://{}", item.id),
+            |definition| {
+                if definition.is_persona() {
+                    format!("history://persona/{}/{}", definition.name, item.id)
+                } else {
+                    format!("history://{}", item.id)
+                }
+            },
+        );
         let artifact_uri = format!("artifact://{}", item.id);
         let artifact_path = self
             .inner
@@ -4125,9 +5630,15 @@ soft_budget: None,
             .config
             .artifact_dir
             .join(format!("{}-{job_id}.history.json", item.id));
-        let artifact_error = write_new_artifact(&artifact_path, error.as_bytes()).err();
+        let artifact_error = write_new_artifact(
+            &self.inner.storage.artifacts,
+            &artifact_path,
+            error.as_bytes(),
+        )
+        .err();
         let artifact_written = artifact_error.is_none();
-        let history_error = write_new_artifact(&history_path, b"[]").err();
+        let history_error =
+            write_new_artifact(&self.inner.storage.artifacts, &history_path, b"[]").err();
         let history_written = history_error.is_none();
         let mut final_error = match artifact_error.or(history_error) {
             Some(write_error) => format!("{error}; {write_error}"),
@@ -4157,6 +5668,57 @@ soft_budget: None,
         }
     }
 
+    fn shared_skill_snapshot(&self) -> Arc<Vec<Skill>> {
+        Arc::new(
+            self.inner
+                .config
+                .skills
+                .iter()
+                .map(|skill| Skill {
+                    name: skill.name.clone(),
+                    description: skill.description.clone(),
+                    file_path: skill.file_path.to_string_lossy().into_owned(),
+                    base_dir: skill.base_dir.to_string_lossy().into_owned(),
+                    globs: skill.globs.clone(),
+                    always_apply: skill.always_apply,
+                    hidden: skill.hidden,
+                    disable_model_invocation: skill.disable_model_invocation,
+                    source: skill.source,
+                    managed_project_boundary: skill.managed_project_boundary.clone(),
+                    managed_root: skill.managed_root.clone(),
+                    trusted: skill.trusted,
+                })
+                .collect(),
+        )
+    }
+
+    fn persona_skill_context(
+        &self,
+        definition: &AgentDefinition,
+    ) -> Result<(
+        Option<crate::PersonaSkillStore>,
+        Arc<Vec<crate::PersonaSkill>>,
+    )> {
+        if !definition.is_persona() {
+            return Ok((None, Arc::new(Vec::new())));
+        }
+        let lease = self
+            .inner
+            .storage
+            .persona_roots
+            .get(&definition.name)
+            .ok_or_else(|| {
+                anyhow!(
+                    "persona {:?} has no retained root authority",
+                    definition.name
+                )
+            })?
+            .clone();
+        let store = crate::PersonaSkillStore::new(lease)?;
+        let skills = Arc::new(store.load_persona_skills()?);
+        Ok((Some(store), skills))
+    }
+
     fn child_system_prompt(
         &self,
         definition: &AgentDefinition,
@@ -4166,6 +5728,27 @@ soft_budget: None,
         schema_mode: Option<&str>,
         peer_roster: &str,
     ) -> Result<String> {
+        self.child_system_prompt_with_persona_skills(
+            definition,
+            assignment,
+            context,
+            output_schema,
+            schema_mode,
+            peer_roster,
+            &[],
+        )
+    }
+
+    fn child_system_prompt_with_persona_skills(
+        &self,
+        definition: &AgentDefinition,
+        assignment: &str,
+        context: Option<&str>,
+        output_schema: Option<&Value>,
+        schema_mode: Option<&str>,
+        peer_roster: &str,
+        persona_skills: &[crate::PersonaSkill],
+    ) -> Result<String> {
         let mut prompt = definition.system_prompt.clone();
         if let Some(personality) = definition
             .is_persona()
@@ -4174,25 +5757,47 @@ soft_budget: None,
             .filter(|personality| !personality.trim().is_empty())
         {
             if personality.len() > MAX_PERSONALITY_BYTES {
-                bail!(
-                    "persona personality exceeds maximum size of {MAX_PERSONALITY_BYTES} bytes"
-                );
+                bail!("persona personality exceeds maximum size of {MAX_PERSONALITY_BYTES} bytes");
             }
             prompt.push_str("\n\n<personality>\n");
             prompt.push_str(&escape_xml(personality));
             prompt.push_str("\n</personality>");
         }
-        let mut autoload_bytes = 0_usize;
-        let visible_skills = self
+        if definition.is_persona() && !definition.knowledge_roots.is_empty() {
+            prompt.push_str("\n\n<knowledge_roots>\n");
+            for root in &definition.knowledge_roots {
+                prompt.push_str("  <root>");
+                prompt.push_str(&escape_xml(root));
+                prompt.push_str("</root>\n");
+            }
+            prompt.push_str("Absolute knowledge roots must already be parent workspace roots (`--add-dir`). Placeholders such as `&lt;memory-repo&gt;` are labels only.\n</knowledge_roots>");
+        }
+        let persona_names = persona_skills
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect::<BTreeSet<_>>();
+        let visible_shared = self
             .inner
             .config
             .skills
             .iter()
-            .filter(|skill| !skill.hidden && !skill.disable_model_invocation)
+            .filter(|skill| {
+                !persona_names.contains(skill.name.as_str())
+                    && !skill.hidden
+                    && !skill.disable_model_invocation
+            })
             .collect::<Vec<_>>();
-        if !visible_skills.is_empty() {
+        if !visible_shared.is_empty() || !persona_skills.is_empty() {
             prompt.push_str("\n\n<available_skills>\n");
-            for skill in visible_skills {
+            for skill in visible_shared {
+                prompt.push_str(&format!(
+                    "  <skill><name>{}</name><description>{}</description><location>skill://{}</location></skill>\n",
+                    escape_xml(&skill.name),
+                    escape_xml(&skill.description),
+                    escape_xml(&skill.name),
+                ));
+            }
+            for skill in persona_skills {
                 prompt.push_str(&format!(
                     "  <skill><name>{}</name><description>{}</description><location>skill://{}</location></skill>\n",
                     escape_xml(&skill.name),
@@ -4208,6 +5813,7 @@ soft_budget: None,
             .config
             .skills
             .iter()
+            .filter(|skill| !persona_names.contains(skill.name.as_str()))
             .map(|skill| Skill {
                 name: skill.name.clone(),
                 description: skill.description.clone(),
@@ -4218,6 +5824,8 @@ soft_budget: None,
                 hidden: skill.hidden,
                 disable_model_invocation: skill.disable_model_invocation,
                 source: skill.source,
+                managed_project_boundary: skill.managed_project_boundary.clone(),
+                managed_root: skill.managed_root.clone(),
                 trusted: skill.trusted,
             })
             .collect::<Vec<_>>();
@@ -4234,58 +5842,62 @@ soft_budget: None,
             settings: &selector_settings,
         });
         let mut autoload_names = Vec::new();
-        let mut seen_autoload = std::collections::BTreeSet::new();
-        for name in definition.autoload_skills.iter().chain(&plan.autoload_skills) {
-            if seen_autoload.insert(name.as_str()) {
+        let mut seen_autoload = BTreeSet::new();
+        for name in definition
+            .autoload_skills
+            .iter()
+            .chain(&plan.autoload_skills)
+            .map(String::as_str)
+            .chain(persona_skills.iter().map(|skill| skill.name.as_str()))
+        {
+            if seen_autoload.insert(name) {
                 autoload_names.push(name);
             }
         }
+        let mut autoload_bytes = 0_usize;
         for name in autoload_names {
-            let skill = self
-                .inner
-                .config
-                .skills
-                .iter()
-                .find(|skill| skill.name == *name)
-                .ok_or_else(|| anyhow!("autoload skill {name:?} is unavailable"))?;
-            let size = fs::metadata(&skill.file_path)
-                .with_context(|| format!("reading autoload skill metadata {}", skill.file_path.display()))?
-                .len();
-            if size > MAX_AUTOLOAD_SKILL_BYTES {
-                bail!(
-                    "autoload skill {} exceeds maximum size of {} bytes",
-                    skill.file_path.display(),
-                    MAX_AUTOLOAD_SKILL_BYTES
-                );
-            }
-            let size = usize::try_from(size).unwrap_or(usize::MAX);
-            autoload_bytes = autoload_bytes.saturating_add(size);
+            let (skill_name, content) =
+                if let Some(skill) = persona_skills.iter().find(|skill| skill.name == name) {
+                    (skill.name.as_str(), skill.content.clone())
+                } else {
+                    let skill = self
+                        .inner
+                        .config
+                        .skills
+                        .iter()
+                        .find(|skill| skill.name == name)
+                        .ok_or_else(|| anyhow!("autoload skill {name:?} is unavailable"))?;
+                    let file =
+                        self.inner
+                            .storage
+                            .skill_files
+                            .get(&skill.name)
+                            .ok_or_else(|| {
+                                anyhow!("autoload skill {:?} has no retained file", skill.name)
+                            })?;
+                    let bytes = file
+                        .read_bounded(MAX_AUTOLOAD_SKILL_BYTES)
+                        .with_context(|| format!("reading autoload skill {:?}", skill.name))?;
+                    let content = String::from_utf8(bytes)
+                        .with_context(|| format!("decoding autoload skill {:?}", skill.name))?;
+                    (skill.name.as_str(), content)
+                };
+            autoload_bytes = autoload_bytes.saturating_add(content.len());
             if autoload_bytes > MAX_AUTOLOAD_PROMPT_BYTES {
-                bail!("autoload skills exceed aggregate prompt budget of {MAX_AUTOLOAD_PROMPT_BYTES} bytes");
-            }
-            let mut content = String::with_capacity(size);
-            File::open(&skill.file_path)
-                .with_context(|| format!("opening autoload skill {}", skill.file_path.display()))?
-                .take(MAX_AUTOLOAD_SKILL_BYTES + 1)
-                .read_to_string(&mut content)
-                .with_context(|| format!("reading autoload skill {}", skill.file_path.display()))?;
-            if content.len() as u64 > MAX_AUTOLOAD_SKILL_BYTES {
-                bail!("autoload skill {} grew beyond maximum size while reading", skill.file_path.display());
+                bail!(
+                    "autoload skills exceed aggregate prompt budget of {MAX_AUTOLOAD_PROMPT_BYTES} bytes"
+                );
             }
             prompt.push_str(&format!(
                 "\n\n<autoloaded_skill name=\"{}\" location=\"skill://{}\">\n{}\n</autoloaded_skill>",
-                escape_xml(&skill.name),
-                escape_xml(&skill.name),
+                escape_xml(skill_name),
+                escape_xml(skill_name),
                 content
             ));
         }
         prompt.push_str("\n\n");
         prompt.push_str(peer_roster);
         if let Some(context) = context.filter(|text| !text.trim().is_empty()) {
-            // OMP batch parity: the shared `context` is rendered verbatim into
-            // every spawned child's system prompt as a CONTEXT section, so
-            // each child of a batch sees the shared background alongside its
-            // own delegated assignment.
             prompt.push_str(&format!("\n\n<context>\n{context}\n</context>"));
         }
         prompt.push_str(
@@ -4312,7 +5924,10 @@ soft_budget: None,
         const FOOTER: &str = "</peer_roster>";
 
         let main_id = self.main_agent_id();
-        let mut peers = REGISTRY.live_roster(&self.inner.group_id, child_id, main_id);
+        let mut peers = self
+            .inner
+            .registry
+            .live_roster(self.group_id(), child_id, main_id);
         let live_count = peers.len();
         if peers.len() > MAX_SIBLING_ROSTER_ENTRIES {
             let main = peers.iter().find(|peer| peer.id == main_id).cloned();
@@ -4373,19 +5988,60 @@ soft_budget: None,
         }
     }
 
+    fn validate_resolved_persona(&self, name: &str) -> Result<()> {
+        let Some(definition) = self.inner.config.catalog.get(name) else {
+            return Ok(());
+        };
+        if !definition.is_persona() {
+            return Ok(());
+        }
+        if !self.inner.durable_bound.load(Ordering::Acquire) {
+            bail!(
+                "persona `{}` requires orchestration to be bound to a durable parent session; enable durable binding before spawning this persona",
+                definition.name
+            );
+        }
+        if definition.persona_root().is_none() {
+            bail!("persona `{}` has no durable persona root", definition.name);
+        }
+        let workspace = self
+            .inner
+            .parent_workspace
+            .read()
+            .clone()
+            .ok_or_else(|| anyhow!(
+                "persona `{}` requires the durable parent workspace to be available; rebind the parent session before spawning this persona",
+                definition.name
+            ))?;
+        let missing = definition.missing_knowledge_roots(&workspace);
+        if !missing.is_empty() {
+            return Err(crate::knowledge_root_membership_error(
+                &definition.name,
+                &missing,
+            ));
+        }
+        Ok(())
+    }
+
     /// Resolve the agent for a task assignment.
     ///
     /// Precedence: explicit `task.agent` override (validated against the
-    /// catalog: missing, disabled, or incompatible definitions fail actionably
-    /// instead of falling back), then unique exact trusted agent-name mention
-    /// (including disabled/untrusted rejection), then ranked metadata
-    /// selection / default. Ambiguous exact mentions return an error.
+    /// catalog: missing, disabled, or incompatible definitions fail
+    /// actionably instead of falling back), then a unique exact trusted
+    /// agent-name delegation — a raw token-stream mention of the agent name
+    /// in the assignment via [`crate::selector::exact_agent_mention`], the
+    /// single-target contract for typed task content — then ranked
+    /// metadata selection / default. Ambiguous delegations return an
+    /// error. Typed task content is model-generated and routed raw;
+    /// interactive user prompts keep the gated delegation grammar
+    /// ([`crate::selector::delegation_agent_mention`]) on the
+    /// `pi.agent.mention` / auto-spawn surfaces.
     pub fn resolve_task_agent(&self, assignment: &str, explicit: Option<&str>) -> Result<String> {
         if let Some(explicit) = explicit.filter(|name| !name.trim().is_empty()) {
             if self.inner.config.catalog.get(explicit).is_none() {
                 bail!(
                     "explicit agent {:?} is not defined in the agent catalog; \
-                     define it as a user agent (~/.pi/agents) or a project agent in the \
+                     define it as a user agent (~/.rpi/agents) or a project agent in the \
                      current worktree, or remove the explicit agent choice",
                     explicit
                 );
@@ -4401,28 +6057,25 @@ soft_budget: None,
                     explicit
                 );
             }
+            self.validate_resolved_persona(explicit)?;
             return Ok(explicit.to_owned());
         }
         match self.exact_agent_mention_in_catalog(assignment) {
             crate::selector::ExactAgentMention::Unique(name) => {
                 self.ensure_agent_enabled(&name)?;
-                if !self
-                    .enabled_agents()
-                    .iter()
-                    .any(|agent| agent.name == name)
-                {
+                if !self.enabled_agents().iter().any(|agent| agent.name == name) {
                     bail!(
                         "exact agent mention {:?} is not available for spawning",
                         name
                     );
                 }
+                self.validate_resolved_persona(&name)?;
                 Ok(name)
             }
             crate::selector::ExactAgentMention::Ambiguous(_) => Err(anyhow!(
                 "{}",
-                self.exact_agent_ambiguity(assignment).unwrap_or_else(|| {
-                    "exact agent mention is ambiguous".to_owned()
-                })
+                self.exact_agent_ambiguity(assignment)
+                    .unwrap_or_else(|| { "exact agent mention is ambiguous".to_owned() })
             )),
             crate::selector::ExactAgentMention::None => {
                 Ok(self.select_ranked_or_default_agent(assignment))
@@ -4430,115 +6083,16 @@ soft_budget: None,
         }
     }
 
-    /// Spawn children when the request carries a delegation construction
-    /// naming one or more exact trusted agents. Delegation intent is
-    /// Unicode-aware: a conservative CJK construction where a Chinese
-    /// delegation token abuts the FIRST mentioned name and an action clause
-    /// follows the whole conjunction chain (`你让glm和grok一起调研这个仓库`),
-    /// or an English delegation verb whose raw-text list includes the
-    /// mentions (`Have glm and grok study this`; object mentions like
-    /// `Have glm review grok's output` are not delegated). Every explicitly
-    /// delegated name is spawned in one batch, in mention order, each with
-    /// the full request as assignment.
-    /// Informational mentions (`researcher 是做什么的？`,
-    /// `glm和grok哪个好？`) and generic skill/semantic text return
-    /// `Ok(None)` so the caller can keep selection recommendations without
-    /// spawning. Distinct names that normalize identically (e.g.
-    /// `Research-Agent` vs `research-agent`) stay ambiguous and fail
-    /// actionably instead of fanning out.
-    pub fn spawn_from_natural_language(
-        &self,
-        parent_id: &str,
-        parent_depth: usize,
-        request: &str,
-    ) -> Result<Option<Vec<TaskSpawn>>> {
-        let mentions = self.exact_agent_mentions_in_catalog(request);
-        if mentions.is_empty() {
-            return Ok(None);
-        }
-        let delegated_runs = self.delegated_runs_in(request, &mentions);
-        // Normalized-name collisions (e.g. `Research-Agent` vs
-        // `research-agent`) stay ambiguous ONLY when the colliding phrase
-        // participates in the explicit delegation clause — an informational
-        // mention (`Tell me whether Research Agent is available`) or a
-        // non-delegating verb list (`Have me compare Research Agent
-        // descriptions`) never errors and never spawns.
-        if let Some(colliding) = crate::selector::exact_agent_mention_collisions(&mentions)
-            && colliding
-                .iter()
-                .any(|name| delegated_phrase_participates(&delegated_runs, name))
-        {
-            let names = colliding
-                .iter()
-                .map(|name| format!("{name:?}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!(
-                "exact agent mention is ambiguous between {names}; pass the intended name in \
-                 task.agent or rename agents so their normalized names are unique"
-            );
-        }
-        let delegated_mentions = mentions
-            .iter()
-            .filter(|name| {
-                let lowered = normalized_lower(name);
-                delegated_runs.iter().any(|member| member == &lowered)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if delegated_mentions.is_empty() {
-            return Ok(None);
-        }
-        // Delegation intent gates the fan-out: only mentions inside an
-        // explicit delegation clause spawn. CJK: every mention carrying a
-        // delegation construction delegates its own conjunction chain
-        // (`你让glm和grok调研` -> both; `让glm调研；grok是做什么` -> glm only;
-        // `glm是做什么？让grok调研` -> grok only; `不要让glm调研` -> nothing).
-        // English: the verb's raw-text list — `Have glm and grok study this`
-        // spawns both, `Have glm review grok's output` spawns only glm (grok
-        // is the review's object), `Tell me whether glm or grok is better`
-        // spawns nothing, and a negated verb (`Do not have glm study this`)
-        // spawns nothing.
-        let delegated_mentions = self.delegated_mentions_in(request);
-        if delegated_mentions.is_empty() {
-            return Ok(None);
-        }
-        // Validate every named agent up front so a single absent/disabled
-        // name fails actionably before any job is created.
-        for name in &delegated_mentions {
-            self.ensure_agent_enabled(name)?;
-            if !self
-                .enabled_agents()
-                .iter()
-                .any(|agent| agent.name == *name)
-            {
-                bail!(
-                    "exact agent mention {:?} is not available for spawning",
-                    name
-                );
-            }
-        }
-        let items = delegated_mentions
-            .iter()
-            .enumerate()
-            .map(|(index, name)| TaskItem {
-                index,
-                id: name.clone(),
-                agent: name.clone(),
-                assignment: request.to_owned(),
-                todo_task_id: None,
-                ..Default::default()
-            })
-            .collect::<Vec<_>>();
-        let spawns = self.spawn_tasks(parent_id, parent_depth, items)?;
-        Ok(Some(spawns))
-    }
-
-    /// P0-C catalog diagnostics: fail actionably when `request` (a workflow
+    /// Catalog diagnostics: fail actionably when `request` (a workflow
     /// objective) explicitly delegates to agent names that are absent from
     /// this catalog or disabled in it, instead of silently degrading to the
     /// default agent. Skill names are exempt (a skill invocation is not an
-    /// agent delegation). The message names the missing/disabled definition
+    /// agent delegation). The grammar is the selector's own delegation
+    /// grammar, shared through
+    /// [`crate::selector::delegation_agent_mention`]: delegation markers, the
+    /// name-initial imperative, CJK constructions, the bare whole-name
+    /// address, and the name-leading comma/colon vocative all surface a
+    /// catalogued name. The message names the missing/disabled definition
     /// and where workflow agents are discovered.
     pub fn validate_delegation_agents(&self, request: &str) -> Result<()> {
         let catalog_agents = self.inner.config.catalog.agents().clone();
@@ -4547,9 +6101,20 @@ soft_budget: None,
             .iter()
             .map(|skill| skill.name.as_str())
             .collect::<std::collections::BTreeSet<_>>();
+        // Known identities are EXACT configured agent and skill names only.
+        // Description words are deliberately excluded: they are common
+        // language (`content`, `topics`, `code`) and accepting them as
+        // identities would recreate the W3 false-positive class.
+        let known_identities = catalog_agents
+            .iter()
+            .map(|agent| normalized_lower(&agent.name))
+            .chain(skill_names.iter().map(|name| normalized_lower(name)))
+            .collect::<BTreeSet<_>>();
         let mut absent = std::collections::BTreeSet::new();
         let mut disabled = std::collections::BTreeSet::new();
-        for candidate in delegation_candidates(request) {
+        for candidate in
+            delegation_candidates_with_identities(request, &catalog_agents, Some(&known_identities))
+        {
             if skill_names
                 .iter()
                 .any(|name| name.eq_ignore_ascii_case(&candidate))
@@ -4585,7 +6150,7 @@ soft_budget: None,
                 .join(", ");
             message.push_str(&format!(
                 "workflow objective delegates to agent(s) {names} that are not defined in the \
-                 workflow agent catalog; define them as user agents under ~/.pi/agents or as \
+                 workflow agent catalog; define them as user agents under ~/.rpi/agents or as \
                  project agents inside the workflow worktree, or reword the objective"
             ));
         }
@@ -4667,12 +6232,18 @@ soft_budget: None,
                 hidden: skill.hidden,
                 disable_model_invocation: skill.disable_model_invocation,
                 source: skill.source,
+                managed_project_boundary: skill.managed_project_boundary.clone(),
+                managed_root: skill.managed_root.clone(),
                 trusted: skill.trusted,
             })
             .collect::<Vec<_>>();
         crate::selector::exact_skill_mention(assignment, &skills)
     }
 
+    /// Raw token-stream exact mention of trusted agent names in `request`
+    /// — the single-target contract for typed task assignment. Interactive
+    /// user-prompt surfaces gate through
+    /// [`crate::selector::delegation_agent_mention`] instead.
     fn exact_agent_mention_in_catalog(
         &self,
         assignment: &str,
@@ -4704,229 +6275,275 @@ soft_budget: None,
         crate::selector::exact_agent_mentions(request, &trusted)
     }
 
-    /// Exact trusted agent mentions that form an explicit delegation clause
-    /// in `request` — the same scan [`spawn_from_natural_language`] fans out
-    /// — without spawning anything. Callers use this to gate the spawn
-    /// through the task authorization boundary before any job is created.
-    #[must_use]
-    pub(crate) fn delegated_mentions_in(&self, request: &str) -> Vec<String> {
-        let mentions = self.exact_agent_mentions_in_catalog(request);
-        let runs = self.delegated_runs_in(request, &mentions);
-        mentions
-            .iter()
-            .filter(|name| {
-                let lowered = normalized_lower(name);
-                runs.iter().any(|member| member == &lowered)
-            })
-            .cloned()
-            .collect()
-    }
-
-    /// Raw lowercase runs that form explicit delegation clauses in `request`
-    /// (English verb lists plus per-mention CJK conjunction chains).
-    fn delegated_runs_in(&self, request: &str, mentions: &[String]) -> Vec<String> {
-        let mut delegated = Vec::new();
-        if request_has_delegation_verb(request) {
-            delegated.extend(english_delegation_list(request));
-        }
-        for mention in mentions {
-            if let Some(chain) = cjk_delegation_chain(request, mention) {
-                delegated.extend(chain);
-            }
-        }
-        delegated
-    }
-
-    /// True when `request` carries an explicit delegation clause that is
-    /// NEGATED (`别让glm调研`, `Do not have glm study this`): the user said
-    /// NOT to delegate the named agents, so nothing may spawn and nothing
-    /// may be orchestrated through an alternate owner (the auto-todo DAG).
-    /// Shares the exact parser with the positive scan — never an ad hoc app
-    /// string check.
-    #[must_use]
-    pub(crate) fn has_explicit_negated_delegation(&self, request: &str) -> bool {
-        let mentions = self.exact_agent_mentions_in_catalog(request);
-        if mentions.is_empty() {
-            return false;
-        }
-        if request_has_delegation_verb(request)
-            && mentions.iter().any(|name| {
-                delegated_phrase_participates(&english_delegation_list_negated(request), name)
-            })
-        {
-            return true;
-        }
-        mentions
-            .iter()
-            .any(|mention| cjk_delegation_chain_negated(request, mention).is_some())
-    }
-
     pub(crate) fn exact_agent_ambiguity(&self, assignment: &str) -> Option<String> {
         self.exact_agent_mention_in_catalog(assignment)
             .ambiguity_message()
     }
 
-    pub fn read_uri_resolver(&self) -> crate::InternalUriResolverFn {
+    pub fn read_uri_resolver(&self) -> crate::InternalUriResolver {
         let runtime = self.clone();
-        Arc::new(move |uri| {
-            if let Some(reference) = uri.strip_prefix("history://") {
-                return runtime.resolve_history_reference(reference);
-            }
-            resolve_read_uri_in(
-                &runtime.inner.group_id,
-                &runtime.inner.config.artifact_dir,
-                uri,
-            )
-        })
+        crate::InternalUriResolver::new(move |uri| runtime.resolve_read_uri_file(uri))
     }
 
     pub fn resolve_read_uri(&self, uri: &str) -> Result<PathBuf> {
+        Ok(self.resolve_read_uri_file(uri)?.display_path())
+    }
+
+    fn resolve_read_uri_file(&self, uri: &str) -> Result<Arc<CapabilityFile>> {
         if let Some(reference) = uri.strip_prefix("history://") {
-            return self.resolve_history_reference(reference);
+            return Ok(self.resolve_history_file(reference)?.into_file());
         }
-        resolve_read_uri_in(&self.inner.group_id, &self.inner.config.artifact_dir, uri)
+        let id = uri
+            .strip_prefix("agent://")
+            .or_else(|| uri.strip_prefix("artifact://"))
+            .ok_or_else(|| anyhow!("unsupported orchestration URI {uri:?}"))?;
+        self.resolve_registered_artifact_file(id, false)
+    }
+
+    fn open_artifact_path(&self, path: &Path) -> Result<Arc<CapabilityFile>> {
+        let relative = path
+            .strip_prefix(self.inner.storage.artifacts.display_root())
+            .map_err(|_| anyhow!("artifact path escapes orchestration artifact capability"))?;
+        self.inner
+            .storage
+            .artifacts
+            .open_file(relative)
+            .map(Arc::new)
+            .context("opening orchestration artifact through retained authority")
+    }
+
+    fn resolve_registered_artifact_file(
+        &self,
+        id: &str,
+        history: bool,
+    ) -> Result<Arc<CapabilityFile>> {
+        validate_agent_id(id)?;
+        let entry = self
+            .inner
+            .registry
+            .get(self.group_id(), id)
+            .ok_or_else(|| anyhow!("unknown orchestration agent {id:?}"))?;
+        let path = if history {
+            entry.history_path.lock().clone()
+        } else {
+            entry.artifact_path.lock().clone()
+        }
+        .ok_or_else(|| anyhow!("orchestration artifact for agent {id:?} is not available yet"))?;
+        self.open_artifact_path(&path)
     }
 
     pub fn resolve_agent_reference(&self, id: &str) -> Result<PathBuf> {
-        resolve_registered_artifact(
-            &self.inner.group_id,
-            &self.inner.config.artifact_dir,
-            id,
-            false,
-        )
+        Ok(self
+            .resolve_registered_artifact_file(id, false)?
+            .display_path())
     }
 
     pub fn resolve_history_reference(&self, reference: &str) -> Result<PathBuf> {
+        Ok(self.resolve_history_file(reference)?.display_path())
+    }
+
+    fn resolve_history_file(&self, reference: &str) -> Result<RetainedHistoryFile> {
         if let Some(qualified) = reference.strip_prefix("persona/") {
-            let (persona, agent_id) = qualified
-                .split_once('/')
-                .ok_or_else(|| anyhow!("persona history URI must be history://persona/<persona>/<agent-id>"))?;
+            let (persona, agent_id) = qualified.split_once('/').ok_or_else(|| {
+                anyhow!("persona history URI must be history://persona/<persona>/<agent-id>")
+            })?;
             validate_agent_id(persona)?;
             validate_agent_id(agent_id)?;
             return self.resolve_qualified_persona_archive(persona, agent_id);
         }
         validate_agent_id(reference)?;
-        let Some(entry) = REGISTRY.get(&self.inner.group_id, reference) else {
+        let Some(entry) = self.inner.registry.get(self.group_id(), reference) else {
             return self.resolve_persona_archive(reference);
         };
-        match entry.history_path.lock().clone() {
-            Some(path) => ensure_existing_artifact(&self.inner.config.artifact_dir, &path),
-            None => self.resolve_persona_archive(reference),
+        if let Some(info) = entry.durable_info.lock().clone()
+            && let Some(session_path) = info.session_path
+        {
+            let durable = self.inner.durable.lock().clone().ok_or_else(|| {
+                anyhow!("orchestration history for agent {reference:?} is not available yet")
+            })?;
+            return durable
+                .child_file(&session_path)
+                .map(|file| RetainedHistoryFile::Session(Arc::new(file)))
+                .with_context(|| format!("resolving history for agent {reference:?}"));
         }
+        if let Some(path) = entry.history_path.lock().clone() {
+            return self
+                .open_artifact_path(&path)
+                .map(RetainedHistoryFile::Artifact);
+        }
+        if reference == self.main_agent_id() {
+            let durable = self.inner.durable.lock().clone().ok_or_else(|| {
+                anyhow!("orchestration history for agent {reference:?} is not available yet")
+            })?;
+            return durable
+                .parent_file()
+                .map(|file| RetainedHistoryFile::Session(Arc::new(file)))
+                .with_context(|| format!("resolving history for agent {reference:?}"));
+        }
+        self.resolve_persona_archive(reference)
     }
 
     pub fn read_child_history(&self, agent_id: &str, lines: usize) -> Result<String> {
         let lines = lines.clamp(1, MAX_HISTORY_LINES);
-        let path = if agent_id.starts_with("persona/") {
-            self.resolve_history_reference(agent_id)?
-        } else {
-            validate_agent_id(agent_id)?;
-            self.resolve_history_source(agent_id)?
-        };
-        let rendered = render_history_file(&path, lines)
+        let file = self.resolve_history_file(agent_id)?;
+        let rendered = render_history_file(&file, lines)
             .with_context(|| format!("rendering history for agent {agent_id:?}"))?;
         let redacted = crate::redact::redact_secrets(&rendered);
-        if redacted.len() <= MAX_HISTORY_BYTES {
-            return Ok(redacted);
-        }
-        let marker = format!("\n[history truncated at {} KiB]", MAX_HISTORY_BYTES / 1024);
-        let budget = MAX_HISTORY_BYTES.saturating_sub(marker.len());
-        let mut end = budget;
-        while !redacted.is_char_boundary(end) {
-            end -= 1;
-        }
-        let mut capped = redacted[..end].to_owned();
-        capped.push_str(&marker);
-        Ok(capped)
+        Ok(cap_history_bytes(redacted))
     }
 
-    fn resolve_persona_archive(&self, agent_id: &str) -> Result<PathBuf> {
+    fn resolve_persona_archive(&self, agent_id: &str) -> Result<RetainedHistoryFile> {
+        let relative = Path::new("sessions").join(format!("{agent_id}.jsonl"));
         let mut matches = Vec::new();
-        for definition in self.inner.config.catalog.agents() {
-            if !definition.trusted || !definition.is_persona() {
-                continue;
-            }
-            let Some(root) = definition.persona_root() else {
-                continue;
-            };
-            let candidate = persona_archive_path(&root, agent_id)?;
-            match fs::symlink_metadata(&candidate) {
-                Ok(_) => matches.push((definition.name.clone(), root, candidate)),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error).context("reading persona history metadata"),
+        for (persona, root) in &self.inner.storage.persona_roots {
+            match root.open_file(&relative) {
+                Ok(file) => matches.push((persona.clone(), file)),
+                Err(error) if fs_missing(&error) => {}
+                Err(error) => return Err(error).context("reading persona history"),
             }
         }
-        match matches.as_slice() {
-            [] => bail!("unknown orchestration agent {agent_id:?}"),
-            [(persona, root, candidate)] => validate_persona_archive_candidate(
-                &root.join("sessions"),
-                candidate,
-            )
-            .with_context(|| format!("resolving persona history {persona:?}/{agent_id:?}")),
+        match matches.len() {
+            0 => bail!("unknown orchestration agent {agent_id:?}"),
+            1 => Ok(RetainedHistoryFile::Persona(Arc::new(
+                matches.pop().expect("one persona history match").1,
+            ))),
             _ => bail!(
                 "persona history id {agent_id:?} is ambiguous; use history://persona/<persona>/{agent_id}"
             ),
         }
     }
 
-    fn resolve_qualified_persona_archive(&self, persona: &str, agent_id: &str) -> Result<PathBuf> {
-        let definition = self
+    fn persona_sessions(
+        &self,
+        persona: &str,
+        creation: RootCreation,
+    ) -> Result<CapabilityRootLease> {
+        let root = self
             .inner
-            .config
-            .catalog
+            .storage
+            .persona_roots
             .get(persona)
-            .filter(|definition| definition.trusted && definition.is_persona())
             .ok_or_else(|| anyhow!("unknown persona {persona:?}"))?;
-        let root = definition
-            .persona_root()
-            .ok_or_else(|| anyhow!("persona {persona:?} has no durable root"))?;
-        let candidate = persona_archive_path(&root, agent_id)?;
-        validate_persona_archive_candidate(&root.join("sessions"), &candidate)
-            .with_context(|| format!("resolving persona history {persona:?}/{agent_id:?}"))
+        root.lease_directory(
+            Path::new("sessions"),
+            CapabilityAccess::PrivateReadWrite,
+            creation,
+        )
+        .context("opening persona sessions capability")
     }
 
-    /// Resolve the canonical transcript file for a registered agent: the
-    /// durable child session JSONL (the live transcript) when the agent has
-    /// one, the settle-time `.history.json` snapshot otherwise, and the bound
-    /// parent session JSONL for Main (whose registry history path starts
-    /// unset). Every path is runtime-owned and canonical — never constructed
-    /// from the caller-supplied `agent_id` (which only selects a registry entry).
-    fn resolve_history_source(&self, agent_id: &str) -> Result<PathBuf> {
-        let Some(entry) = REGISTRY.get(&self.inner.group_id, agent_id) else {
-            return self.resolve_persona_archive(agent_id);
-        };
-        if let Some(info) = entry.durable_info.lock().clone()
-            && let Some(session_path) = info.session_path
-        {
-            let durable = self
-                .inner
-                .durable
-                .lock()
-                .clone()
-                .ok_or_else(|| anyhow!("orchestration history for agent {agent_id:?} is not available yet"))?;
-            return durable
-                .canonicalize_child_session_path(&session_path)
-                .with_context(|| format!("resolving history for agent {agent_id:?}"));
-        }
-        if let Some(path) = entry.history_path.lock().clone() {
-            return ensure_existing_artifact(&self.inner.config.artifact_dir, &path);
-        }
-        if agent_id == self.main_agent_id() {
-            let durable = self
-                .inner
-                .durable
-                .lock()
-                .clone()
-                .ok_or_else(|| anyhow!("orchestration history for agent {agent_id:?} is not available yet"))?;
-            let path = durable.parent_session_path().to_path_buf();
-            let metadata = fs::metadata(&path)
-                .with_context(|| format!("reading parent session history {}", path.display()))?;
-            if !metadata.is_file() {
-                bail!("orchestration history for agent {agent_id:?} is not available yet");
+    fn load_persona_continuity(&self, persona: &str) -> Result<Vec<pi_ai::Message>> {
+        let sessions = match self.persona_sessions(persona, RootCreation::Existing) {
+            Ok(sessions) => sessions,
+            Err(error) if error.downcast_ref::<FsError>().is_some_and(fs_missing) => {
+                return Ok(Vec::new());
             }
-            return Ok(path);
+            Err(error) => return Err(error),
+        };
+        let mut entries = sessions.read_dir(Path::new(""))?;
+        let mut archives = Vec::new();
+        while let Some(entry) = entries.next()? {
+            let name = entry.name().to_os_string();
+            if Path::new(&name)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                != Some("jsonl")
+            {
+                continue;
+            }
+            let CapabilityEntry::File(file) = entry.into_entry() else {
+                continue;
+            };
+            let modified = file.metadata()?.modified_ns;
+            archives.push((modified, name, file));
         }
-        bail!("orchestration history for agent {agent_id:?} is not available yet")
+        archives.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+        let mut newest_to_oldest = Vec::new();
+        let mut bytes = 0usize;
+        for (_, _, file) in archives {
+            let display = file.display_path();
+            let tree = crate::session_store::load_session_tree_from_file(
+                file.try_clone_std()
+                    .context("cloning persona archive handle")?,
+                &display,
+            )
+            .context("loading persona continuity archive")?;
+            for message in tree.build_context(None).messages.into_iter().rev() {
+                if newest_to_oldest.len() >= PERSONA_CONTINUITY_MAX_MESSAGES {
+                    break;
+                }
+                let message_bytes = serde_json::to_vec(&message)
+                    .context("measuring persona continuity message")?
+                    .len();
+                if bytes.saturating_add(message_bytes) > PERSONA_CONTINUITY_MAX_BYTES {
+                    newest_to_oldest.reverse();
+                    return Ok(newest_to_oldest);
+                }
+                bytes += message_bytes;
+                newest_to_oldest.push(message);
+            }
+            if newest_to_oldest.len() >= PERSONA_CONTINUITY_MAX_MESSAGES {
+                break;
+            }
+        }
+        newest_to_oldest.reverse();
+        Ok(newest_to_oldest)
+    }
+
+    fn archive_persona_session(
+        &self,
+        persona: &str,
+        agent_id: &str,
+        durable: &super::persistence::DurableRuntime,
+        source: &Path,
+        replace_existing: bool,
+    ) -> Result<PathBuf> {
+        validate_agent_id(agent_id)?;
+        let source = durable.child_file(source)?;
+        let bytes = source
+            .read_bounded(MAX_HISTORY_FILE_BYTES)
+            .context("reading retained child transcript")?;
+        let sessions = self.persona_sessions(persona, RootCreation::CreateDirectory)?;
+        let relative = PathBuf::from(format!("{agent_id}.jsonl"));
+        if replace_existing {
+            let expected = match sessions.metadata(&relative) {
+                Ok(metadata) if metadata.identity.kind() == EntryKind::RegularFile => {
+                    Some(metadata.identity)
+                }
+                Err(error) if fs_missing(&error) => None,
+                Ok(_) => bail!("existing persona archive is not a regular file"),
+                Err(error) => return Err(error).context("reading persona archive identity"),
+            };
+            sessions.replace_file(Replacement {
+                relative: relative.clone(),
+                expected,
+                bytes,
+                mode: FileMode::Private,
+            })?;
+        } else {
+            let mut destination = sessions
+                .create_new(&relative, FileMode::Private)
+                .context("creating persona archive")?;
+            destination.write_all(&bytes)?;
+            destination.finish()?;
+        }
+        Ok(sessions.display_root().join(relative))
+    }
+
+    fn resolve_qualified_persona_archive(
+        &self,
+        persona: &str,
+        agent_id: &str,
+    ) -> Result<RetainedHistoryFile> {
+        let root = self
+            .inner
+            .storage
+            .persona_roots
+            .get(persona)
+            .ok_or_else(|| anyhow!("unknown persona {persona:?}"))?;
+        root.open_file(&Path::new("sessions").join(format!("{agent_id}.jsonl")))
+            .map(|file| RetainedHistoryFile::Persona(Arc::new(file)))
+            .with_context(|| format!("resolving persona history {persona:?}/{agent_id:?}"))
     }
     /// Claim a persona for reset/removal after proving it has no queued or
     /// running jobs and no active registry entry.
@@ -4951,9 +6568,17 @@ soft_budget: None,
         if blocked.contains(&definition.name) {
             bail!("persona {persona:?} already has a destructive operation in progress");
         }
-        let active_ids = self.inner.active.lock().keys().cloned().collect::<std::collections::BTreeSet<_>>();
-        let registry_active = REGISTRY
-            .list(&self.inner.group_id, self.main_agent_id())
+        let active_ids = self
+            .inner
+            .active
+            .lock()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let registry_active = self
+            .inner
+            .registry
+            .list(self.group_id(), self.main_agent_id())
             .into_iter()
             .any(|snapshot| {
                 snapshot.agent == definition.name
@@ -4977,7 +6602,6 @@ soft_budget: None,
         })
     }
 
-
     #[must_use]
     pub fn jobs(&self, ids: Option<&[String]>) -> Vec<JobSnapshot> {
         self.prune_retained_jobs();
@@ -4997,30 +6621,73 @@ soft_budget: None,
             .await
     }
 
+    /// Entry to the atomic retirement protocol shared with
+    /// `Application::commit_orchestration_candidate`: hold this spawn gate
+    /// while checking unsettled jobs and marking the runtime retiring, so no
+    /// spawn can register between the active-job check and the replacement.
+    pub(crate) fn lock_spawns_for_retirement(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.inner.jobs.lock_spawns()
+    }
+
+    /// Marks the runtime retiring under the held spawn gate: every
+    /// stale-handle `spawn_tasks` from here on is rejected before creating an
+    /// authoritative child. Terminal shutdown and checkpoint paths are
+    /// unaffected — they keep their own authority.
+    pub(crate) fn begin_retirement(&self) {
+        self.inner.retiring.store(true, Ordering::Release);
+    }
+
+    /// Test-only: arms a parking hook at `point` inside [`spawn_tasks`]. The
+    /// parked spawn blocks its thread on `release` (event flag, no sleeps) so
+    /// the reload-commit race tests can interleave deterministically at the
+    /// exact check/registration boundary.
+    #[cfg(test)]
+    pub(crate) fn arm_spawn_test_park(
+        &self,
+        point: SpawnTestParkPoint,
+        release: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        *self.inner.spawn_test_park.lock() = Some((point, release));
+    }
+
     pub fn cancel_jobs_result(&self, ids: &[String]) -> Result<Vec<String>> {
-        let _durable_mutation = self.inner.durable_mutation.lock();
-        if self.inner.rebind_reserved.load(Ordering::Acquire) {
-            bail!("durable orchestration rebind is in progress");
+        let (cancelled, snapshots) =
+            {
+                let _durable_mutation = self.inner.durable_mutation.lock();
+                if self.inner.rebind_reserved.load(Ordering::Acquire) {
+                    bail!("durable orchestration rebind is in progress");
+                }
+                if self.inner.durable_frozen.load(Ordering::Acquire) {
+                    bail!("restart-checkpointed orchestration cannot cancel jobs");
+                }
+                let mut prepared = self.inner.jobs.prepare_cancellation(ids, "task cancelled");
+                if self.inner.durable_bound.load(Ordering::Acquire) {
+                    let durable =
+                        self.inner.durable.lock().clone().ok_or_else(|| {
+                            anyhow!("durable orchestration binding is unavailable")
+                        })?;
+                    let jobs = prepared.take_snapshots();
+                    durable.persist(&super::persistence::build_state(
+                        self.group_id(),
+                        durable.parent_session_id(),
+                        durable.parent_session_path(),
+                        self.durable_policy_state()?,
+                        self.collect_main_mailbox(),
+                        self.delivered_messages(),
+                        self.collect_persisted_agents(),
+                        jobs,
+                    ))?;
+                } else {
+                    prepared.take_snapshots();
+                }
+                let cancelled = self.inner.jobs.commit_cancellation(prepared);
+                let snapshots = self.inner.jobs.snapshots(Some(&cancelled));
+                (cancelled, snapshots)
+            };
+        for job in snapshots {
+            self.publish_job(job);
         }
-        if self.inner.durable_bound.load(Ordering::Acquire) {
-            let durable = self
-                .inner
-                .durable
-                .lock()
-                .clone()
-                .ok_or_else(|| anyhow!("durable orchestration binding is unavailable"))?;
-            let mut prepared = self.inner.jobs.prepare_cancellation(ids);
-            let jobs = prepared.take_snapshots();
-            durable.persist(&super::persistence::build_state(
-                durable.parent_session_id(),
-                durable.parent_session_path(),
-                self.collect_main_mailbox(),
-                self.collect_persisted_agents(),
-                jobs,
-            ))?;
-            return Ok(self.inner.jobs.commit_cancellation(prepared));
-        }
-        Ok(self.inner.jobs.cancel(ids))
+        Ok(cancelled)
     }
     pub fn cancel_jobs(&self, ids: &[String]) -> Vec<String> {
         self.cancel_jobs_result(ids).unwrap_or_default()
@@ -5039,17 +6706,96 @@ soft_budget: None,
         }
     }
 
-    pub async fn shutdown(&self) {
-        self.inner.shutdown.cancel();
-        let tokens = self
-            .inner
-            .active
-            .lock()
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for token in tokens {
-            token.cancel();
+    #[must_use]
+    pub fn is_shutdown(&self) -> bool {
+        self.inner.shutdown.is_cancelled()
+    }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        if self.is_shutdown() {
+            return Ok(());
+        }
+        if self.inner.durable_frozen.load(Ordering::Acquire) {
+            bail!("restart-checkpointed orchestration cannot enter terminal shutdown");
+        }
+        let cancelled_jobs =
+            {
+                let _spawn_guard = self.inner.jobs.lock_spawns();
+                let _durable_mutation = self.inner.durable_mutation.lock();
+                if self.inner.durable_frozen.load(Ordering::Acquire) {
+                    bail!("restart-checkpointed orchestration cannot enter terminal shutdown");
+                }
+                if self.inner.rebind_reserved.load(Ordering::Acquire) {
+                    bail!("durable orchestration rebind is in progress");
+                }
+                let ids = self
+                    .inner
+                    .jobs
+                    .snapshots(None)
+                    .into_iter()
+                    .filter(|job| !job.status.is_settled())
+                    .map(|job| job.id)
+                    .collect::<Vec<_>>();
+                let mut prepared = self
+                    .inner
+                    .jobs
+                    .prepare_cancellation(&ids, "orchestration shut down");
+                let cancelled_ids = prepared.cancelled_ids().to_vec();
+                let jobs = prepared.take_snapshots();
+                let cancelled_jobs = jobs
+                    .iter()
+                    .filter(|job| cancelled_ids.contains(&job.id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if self.inner.durable_bound.load(Ordering::Acquire) {
+                    let durable =
+                        self.inner.durable.lock().clone().ok_or_else(|| {
+                            anyhow!("durable orchestration binding is unavailable")
+                        })?;
+                    let cancelled_agents = cancelled_jobs
+                        .iter()
+                        .map(|job| job.agent_id.as_str())
+                        .collect::<std::collections::HashSet<_>>();
+                    let mut agents = self.collect_persisted_agents();
+                    for agent in &mut agents {
+                        if cancelled_agents.contains(agent.snapshot.id.as_str()) {
+                            agent.snapshot.status = AgentStatus::Aborted;
+                            agent.snapshot.last_activity = now_millis();
+                        }
+                    }
+
+                    durable.persist(&super::persistence::build_state(
+                        self.group_id(),
+                        durable.parent_session_id(),
+                        durable.parent_session_path(),
+                        self.durable_policy_state()?,
+                        self.collect_main_mailbox(),
+                        self.delivered_messages(),
+                        agents,
+                        jobs,
+                    ))?;
+                }
+                self.inner.jobs.commit_cancellation(prepared);
+                for job in &cancelled_jobs {
+                    let _ = self.inner.registry.set_status(
+                        self.group_id(),
+                        &job.agent_id,
+                        AgentStatus::Aborted,
+                    );
+                }
+                self.begin_retirement();
+                cancelled_jobs
+            };
+        for job in cancelled_jobs {
+            if let Some(job) = self
+                .inner
+                .jobs
+                .snapshots(Some(std::slice::from_ref(&job.id)))
+                .into_iter()
+                .next()
+            {
+                self.publish_job(job);
+            }
         }
         let park_handles = self
             .inner
@@ -5061,19 +6807,192 @@ soft_budget: None,
         for handle in park_handles {
             handle.abort();
         }
-        loop {
-            let notified = self.inner.active_changed.notified();
-            if self.inner.active.lock().is_empty() {
-                break;
-            }
-            notified.await;
+        self.wait_until_idle().await;
+        {
+            let _durable_mutation = self.inner.durable_mutation.lock();
+            self.persist_state()
+                .context("persisting terminal orchestration shutdown")?;
         }
-        // Shutdown has no synchronous command caller after all children drain;
-        // preserve the last successfully persisted sidecar if this final sync fails.
-        let _shutdown_persist_error = self.persist_state().err();
+        log_shutdown_cancel_site(
+            "explicit_shutdown",
+            self.inner.group_id.get().map(String::as_str),
+        );
+        self.inner.shutdown.cancel();
         self.cleanup_retained_jobs();
-        REGISTRY.remove_group(&self.inner.group_id);
+        self.inner.registry.remove_group(self.group_id());
+        self.remove_review_artifact_tree()?;
+        Ok(())
     }
+
+    fn remove_review_artifact_tree(&self) -> Result<()> {
+        if self.main_agent_id() != CODE_REVIEW_PARENT_AGENT_ID {
+            return Ok(());
+        }
+        let artifact_dir = &self.inner.config.artifact_dir;
+        match std::fs::remove_dir_all(artifact_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).context("removing review orchestration artifact directory");
+            }
+        }
+        let Some(review_dir) = artifact_dir.parent() else {
+            return Ok(());
+        };
+        match std::fs::remove_dir(review_dir) {
+            Ok(()) => Ok(()),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.kind() == std::io::ErrorKind::DirectoryNotEmpty =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error).context("removing review orchestration directory"),
+        }
+    }
+
+    pub fn establish_group_id(&self, group_id: &str) -> Result<()> {
+        if group_id.is_empty() {
+            bail!("orchestration group id cannot be empty");
+        }
+        self.initialize_group_id(group_id)
+            .map(|_| ())
+            .map_err(|established| {
+                anyhow!("orchestration group id mismatch: runtime {established:?}, requested {group_id:?}")
+            })
+    }
+
+    pub fn create_unbound_review_runtime(
+        &self,
+        review_id: &str,
+        parent: &crate::Session,
+    ) -> Result<Self> {
+        let mut config = self.inner.config.clone();
+        config.main_agent_id = CODE_REVIEW_PARENT_AGENT_ID.to_owned();
+        config.artifact_dir = parent
+            .cwd()
+            .join(crate::resources::CONFIG_DIR_NAME)
+            .join("review")
+            .join(review_id)
+            .join("artifacts");
+        config.idle_ttl = None;
+        config.parent_model_provider = None;
+        let snapshot = parent.child_session_options_snapshot();
+        config.parent_model = snapshot.model.clone();
+        let factory = Self::child_factory_from_snapshot(snapshot);
+        let runtime = Self::new(config, factory)?;
+        runtime.establish_group_id(review_id)?;
+        Ok(runtime)
+    }
+}
+fn persist_interrupted_tool_results(
+    path: &Path,
+    durable: &super::persistence::DurableRuntime,
+) -> Result<()> {
+    let file = durable.child_file(path)?;
+    let display = file.display_path();
+    let tree = crate::session_store::load_session_tree_from_file(
+        file.try_clone_std()
+            .context("cloning child transcript handle")?,
+        &display,
+    )
+    .context("loading child transcript for interrupted tool reconciliation")?;
+    let messages = tree.build_context(None).messages;
+    let mut last_tool_assistant = None;
+    for (index, message) in messages.iter().enumerate() {
+        if let pi_ai::Message::Assistant(assistant) = message
+            && assistant
+                .content
+                .iter()
+                .any(|block| matches!(block, pi_ai::ContentBlock::ToolCall(_)))
+        {
+            last_tool_assistant = Some(index);
+        }
+    }
+    let Some(index) = last_tool_assistant else {
+        return Ok(());
+    };
+    if messages[index + 1..]
+        .iter()
+        .any(|message| matches!(message, pi_ai::Message::Assistant(_)))
+    {
+        return Ok(());
+    }
+    let mut found = std::collections::HashSet::new();
+    for message in &messages[index + 1..] {
+        if let pi_ai::Message::ToolResult(result) = message {
+            found.insert(result.tool_call_id.clone());
+        }
+    }
+    let missing: Vec<(String, String)> = match &messages[index] {
+        pi_ai::Message::Assistant(assistant) => assistant
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                pi_ai::ContentBlock::ToolCall(call) if !found.contains(&call.id) => {
+                    Some((call.id.clone(), call.name.clone()))
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let timestamp = now_millis() as i64;
+    let mut extra = Vec::new();
+    let mut parent_id = tree.leaf_id.clone();
+    for (tool_call_id, tool_name) in missing {
+        let entry_id = format!("interrupted-{tool_call_id}");
+        extra.push(serde_json::json!({
+            "type": "message",
+            "id": entry_id,
+            "parentId": parent_id,
+            "timestamp": "1970-01-01T00:00:00.000Z",
+            "message": pi_ai::Message::ToolResult(pi_ai::ToolResultMessage {
+                tool_call_id: tool_call_id.clone(),
+                tool_name,
+                content: vec![pi_ai::ContentBlock::text(
+                    "tool interrupted by process restart; the original call was not replayed",
+                )],
+                usage: None,
+                details: None,
+                added_tool_names: Vec::new(),
+                is_error: true,
+                timestamp,
+            }),
+        }));
+        parent_id = Some(entry_id);
+    }
+    let (root, relative) = durable.child_file_authority(path)?;
+    let mut bytes = root
+        .open_file(&relative)
+        .context("opening child transcript for interrupted tool append")?
+        .read_bounded(MAX_HISTORY_FILE_BYTES)
+        .context("reading child transcript for interrupted tool append")?;
+    if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
+        bytes.push(b'\n');
+    }
+    for entry in extra {
+        bytes.extend_from_slice(entry.to_string().as_bytes());
+        bytes.push(b'\n');
+    }
+    let expected = match root.metadata(&relative) {
+        Ok(metadata) if metadata.identity.kind() == EntryKind::RegularFile => {
+            Some(metadata.identity)
+        }
+        Ok(_) => bail!("child transcript is not a regular file"),
+        Err(error) => return Err(error).context("reading child transcript identity"),
+    };
+    root.replace_file(Replacement {
+        relative,
+        expected,
+        bytes,
+        mode: FileMode::Private,
+    })
+    .context("appending interrupted tool results to child transcript")?;
+    Ok(())
 }
 
 /// Structural scan of a settled child run's transcript for the FINAL tool
@@ -5131,6 +7050,22 @@ fn last_failed_tool_kind(
     failed
 }
 
+/// Debug-only forensics for the three shutdown-token cancellation sites
+/// (explicit [`OrchestrationRuntime::shutdown`], owner drop, final inner
+/// drop). Enabled exclusively by `RPI_DEBUG_SHUTDOWN_TOKEN`; identity is
+/// truncated and the captured backtrace pinpoints the production caller that
+/// cancelled the token. Never part of the error contract.
+fn log_shutdown_cancel_site(site: &'static str, group_id: Option<&str>) {
+    if std::env::var_os("RPI_DEBUG_SHUTDOWN_TOKEN").is_none() {
+        return;
+    }
+    let group = group_id.map(|id| id.get(..11.min(id.len())).unwrap_or(id));
+    let backtrace = std::backtrace::Backtrace::force_capture();
+    eprintln!(
+        "orchestration: debug shutdown-token cancelled site={site} group={group:?} backtrace={backtrace:#}"
+    );
+}
+
 struct ActiveChildGuard {
     inner: Arc<RuntimeInner>,
     id: String,
@@ -5140,7 +7075,9 @@ struct ActiveChildGuard {
 impl Drop for ActiveChildGuard {
     fn drop(&mut self) {
         let _durable_mutation = self.inner.durable_mutation.lock();
-        REGISTRY.unregister_active_delivery(&self.group_id, &self.id);
+        self.inner
+            .registry
+            .unregister_active_delivery(&self.group_id, &self.id);
         self.inner.active.lock().remove(&self.id);
         self.inner.active_changed.notify_waiters();
     }
@@ -5148,23 +7085,34 @@ impl Drop for ActiveChildGuard {
 
 impl Drop for OrchestrationRuntime {
     fn drop(&mut self) {
-        if !self.owner {
+        if !self.owner || self.inner.durable_frozen.load(Ordering::Acquire) {
             return;
         }
+        log_shutdown_cancel_site("owner_drop", self.inner.group_id.get().map(String::as_str));
         self.inner.shutdown.cancel();
         for token in self.inner.active.lock().values() {
             token.cancel();
         }
-        for handle in self.inner.park_timers.lock().drain().map(|(_, handle)| handle) {
+        for handle in self
+            .inner
+            .park_timers
+            .lock()
+            .drain()
+            .map(|(_, handle)| handle)
+        {
             handle.abort();
         }
         self.cleanup_retained_jobs();
-        REGISTRY.remove_group(&self.inner.group_id);
+        self.inner.registry.remove_group(self.group_id());
     }
 }
 
 impl Drop for RuntimeInner {
     fn drop(&mut self) {
+        if *self.durable_frozen.get_mut() {
+            return;
+        }
+        log_shutdown_cancel_site("inner_drop", self.group_id.get().map(String::as_str));
         self.shutdown.cancel();
         for token in self.active.get_mut().values() {
             token.cancel();
@@ -5177,19 +7125,31 @@ impl Drop for RuntimeInner {
                 .config
                 .artifact_dir
                 .join(format!("{}-{}.md", candidate.agent_id, candidate.job_id));
-            let history_path = self
-                .config
-                .artifact_dir
-                .join(format!("{}-{}.history.json", candidate.agent_id, candidate.job_id));
-            let _ = remove_retained_file(&artifact_path);
-            let _ = remove_retained_file(&history_path);
+            let history_path = self.config.artifact_dir.join(format!(
+                "{}-{}.history.json",
+                candidate.agent_id, candidate.job_id
+            ));
+            let _ = remove_retained_file(&self.storage.artifacts, &artifact_path);
+            let _ = remove_retained_file(&self.storage.artifacts, &history_path);
         }
-        REGISTRY.remove_group(&self.group_id);
+        if let Some(group_id) = self.group_id.get() {
+            self.registry.remove_group(group_id);
+        }
     }
 }
 
 impl GlobalRegistry {
-    fn register(&self, group: &str, snapshot: AgentSnapshot, mailbox_capacity: usize) -> Result<()> {
+    fn register_main(&self, group: &str, snapshot: AgentSnapshot, mailbox_capacity: usize) {
+        self.register(group, snapshot, mailbox_capacity)
+            .expect("generated orchestration main identity is valid");
+    }
+
+    fn register(
+        &self,
+        group: &str,
+        snapshot: AgentSnapshot,
+        mailbox_capacity: usize,
+    ) -> Result<()> {
         self.register_batch(group, vec![snapshot], mailbox_capacity)
     }
 
@@ -5207,15 +7167,23 @@ impl GlobalRegistry {
                     .with_context(|| format!("invalid parent agent id {parent_id:?}"))?;
             }
             if !batch_ids.insert(snapshot.id.as_str()) {
-                bail!("orchestration agent id {:?} appears more than once in batch", snapshot.id);
+                bail!(
+                    "orchestration agent id {:?} appears more than once in batch",
+                    snapshot.id
+                );
             }
         }
 
         let mut groups = self.groups.lock();
         if let Some(entries) = groups.get(group)
-            && let Some(snapshot) = snapshots.iter().find(|snapshot| entries.contains_key(&snapshot.id))
+            && let Some(snapshot) = snapshots
+                .iter()
+                .find(|snapshot| entries.contains_key(&snapshot.id))
         {
-            bail!("orchestration agent id {:?} is already registered", snapshot.id);
+            bail!(
+                "orchestration agent id {:?} is already registered",
+                snapshot.id
+            );
         }
         let entries = groups.entry(group.to_owned()).or_default();
         for snapshot in snapshots {
@@ -5247,11 +7215,7 @@ impl GlobalRegistry {
         entries.retain(|entry_id, _| entry_id == id);
     }
 
-    fn install_prepared_group(
-        &self,
-        group: &str,
-        prepared: HashMap<String, Arc<AgentEntry>>,
-    ) {
+    fn install_prepared_group(&self, group: &str, prepared: HashMap<String, Arc<AgentEntry>>) {
         let mut groups = self.groups.lock();
         if let Some(entries) = groups.get_mut(group) {
             *entries = prepared;
@@ -5318,7 +7282,12 @@ impl GlobalRegistry {
         snapshots.sort_by(|left, right| left.id.cmp(&right.id));
         snapshots
     }
-    fn enqueue(&self, group: &str, target: &str, message: MailboxMessage) -> Result<DeliveryOutcome> {
+    fn enqueue(
+        &self,
+        group: &str,
+        target: &str,
+        message: MailboxMessage,
+    ) -> Result<DeliveryOutcome> {
         let entry = self
             .get(group, target)
             .ok_or_else(|| anyhow!("unknown orchestration agent {target:?}"))?;
@@ -5385,7 +7354,7 @@ impl GlobalRegistry {
         let mut waiters = entry.waiters.lock();
         let Some(index) = waiters
             .iter()
-            .position(|waiter| waiter.from.is_none() || waiter.from.as_deref() == Some(&message.from))
+            .position(|waiter| waiter_matches(waiter, message))
         else {
             return false;
         };
@@ -5414,12 +7383,7 @@ impl GlobalRegistry {
 
     /// Deliver a committed mailbox message to an active recipient, reporting
     /// exactly what happened so `send` can return a truthful receipt.
-    fn deliver_committed(
-        &self,
-        group: &str,
-        target: &str,
-        message_id: &str,
-    ) -> CommittedDelivery {
+    fn deliver_committed(&self, group: &str, target: &str, message_id: &str) -> CommittedDelivery {
         let Some(entry) = self.get(group, target) else {
             return CommittedDelivery::Retained;
         };
@@ -5490,6 +7454,7 @@ impl GlobalRegistry {
         group: &str,
         id: &str,
         from: Option<String>,
+        reply_to: Option<String>,
         republish: Option<Arc<dyn Fn(MailboxMessage) + Send + Sync>>,
     ) -> Option<MessageWaiterGuard> {
         let entry = self.get(group, id)?;
@@ -5498,6 +7463,7 @@ impl GlobalRegistry {
         entry.waiters.lock().push(MessageWaiter {
             token,
             from,
+            reply_to,
             delivery,
         });
         Some(MessageWaiterGuard {
@@ -5553,7 +7519,9 @@ impl GlobalRegistry {
     ) -> Option<MailboxMessage> {
         let entry = self.get(group, id)?;
         let mut mailbox = entry.mailbox.lock();
-        let index = mailbox.iter().position(|message| message.id == message_id)?;
+        let index = mailbox
+            .iter()
+            .position(|message| message.id == message_id)?;
         mailbox.remove(index)
     }
 
@@ -5634,16 +7602,10 @@ impl GlobalRegistry {
             *entry.artifact_path.lock() = Some(artifact_path);
         }
         if let Some(history_path) = history_path {
-            snapshot.history_ref = Some(
-                entry
-                    .durable_info
-                    .lock()
-                    .as_ref()
-                    .map_or_else(
-                        || format!("history://{id}"),
-                        |info| persisted_history_reference(&info.definition, id),
-                    ),
-            );
+            snapshot.history_ref = Some(entry.durable_info.lock().as_ref().map_or_else(
+                || format!("history://{id}"),
+                |info| persisted_history_reference(&info.definition, id),
+            ));
             *entry.history_path.lock() = Some(history_path);
         }
         Ok(())
@@ -5701,11 +7663,34 @@ impl GlobalRegistry {
     }
 }
 
-fn take_matching_message(entry: &AgentEntry, from: Option<&str>) -> Option<MailboxMessage> {
+fn waiter_matches(waiter: &MessageWaiter, message: &MailboxMessage) -> bool {
+    if waiter
+        .from
+        .as_ref()
+        .is_some_and(|from| from != &message.from)
+    {
+        return false;
+    }
+    if waiter
+        .reply_to
+        .as_ref()
+        .is_some_and(|id| message.reply_to.as_deref() != Some(id.as_str()))
+    {
+        return false;
+    }
+    true
+}
+
+fn take_matching_message(
+    entry: &AgentEntry,
+    from: Option<&str>,
+    reply_to: Option<&str>,
+) -> Option<MailboxMessage> {
     let mut mailbox = entry.mailbox.lock();
-    let index = mailbox
-        .iter()
-        .position(|message| from.is_none_or(|from| message.from == from))?;
+    let index = mailbox.iter().position(|message| {
+        from.is_none_or(|from| message.from == from)
+            && reply_to.is_none_or(|id| message.reply_to.as_deref() == Some(id))
+    })?;
     mailbox.remove(index)
 }
 
@@ -5766,7 +7751,6 @@ pub(crate) fn mailbox_message_from_custom(custom: &pi_ai::CustomMessage) -> Opti
     })
 }
 
-
 /// Typed view over an orchestration IRC custom message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrchestrationMessageView {
@@ -5779,7 +7763,9 @@ pub struct OrchestrationMessageView {
 
 /// Extract a typed orchestration message view without leaking the raw XML wrapper.
 #[must_use]
-pub fn orchestration_message_view(message: &pi_ai::CustomMessage) -> Option<OrchestrationMessageView> {
+pub fn orchestration_message_view(
+    message: &pi_ai::CustomMessage,
+) -> Option<OrchestrationMessageView> {
     if message.custom_type != ORCHESTRATION_MESSAGE_TYPE {
         return None;
     }
@@ -5805,7 +7791,9 @@ pub fn orchestration_message_view(message: &pi_ai::CustomMessage) -> Option<Orch
     })
 }
 
-fn extract_orchestration_body_from_content(content: &pi_ai::CustomMessageContent) -> Option<String> {
+fn extract_orchestration_body_from_content(
+    content: &pi_ai::CustomMessageContent,
+) -> Option<String> {
     let text = match content {
         pi_ai::CustomMessageContent::Text(text) => text.clone(),
         pi_ai::CustomMessageContent::Blocks(blocks) => blocks
@@ -5836,10 +7824,28 @@ fn extract_orchestration_body_from_wrapper(text: &str) -> Option<String> {
     }
     Some(body)
 }
-fn remove_retained_file(path: &Path) -> bool {
-    match fs::remove_file(path) {
+fn fs_missing(error: &FsError) -> bool {
+    matches!(
+        error,
+        FsError::System {
+            kind: std::io::ErrorKind::NotFound,
+            ..
+        }
+    )
+}
+
+fn remove_retained_file(root: &CapabilityRootLease, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root.display_root()) else {
+        return false;
+    };
+    let identity = match root.metadata(relative) {
+        Ok(metadata) if metadata.identity.kind() == EntryKind::RegularFile => metadata.identity,
+        Err(error) if fs_missing(&error) => return true,
+        _ => return false,
+    };
+    match root.remove_file_expected(relative, identity) {
         Ok(()) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) if fs_missing(&error) => true,
         Err(_) => false,
     }
 }
@@ -5851,38 +7857,6 @@ pub(super) fn now_millis() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
-}
-
-fn resolve_read_uri_in(group_id: &str, artifact_dir: &Path, uri: &str) -> Result<PathBuf> {
-    let (id, history) = if let Some(id) = uri.strip_prefix("agent://") {
-        (id, false)
-    } else if let Some(id) = uri.strip_prefix("history://") {
-        (id, true)
-    } else if let Some(id) = uri.strip_prefix("artifact://") {
-        (id, false)
-    } else {
-        bail!("unsupported orchestration URI {uri:?}");
-    };
-    resolve_registered_artifact(group_id, artifact_dir, id, history)
-}
-
-fn resolve_registered_artifact(
-    group_id: &str,
-    artifact_dir: &Path,
-    id: &str,
-    history: bool,
-) -> Result<PathBuf> {
-    validate_agent_id(id)?;
-    let entry = REGISTRY
-        .get(group_id, id)
-        .ok_or_else(|| anyhow!("unknown orchestration agent {id:?}"))?;
-    let path = if history {
-        entry.history_path.lock().clone()
-    } else {
-        entry.artifact_path.lock().clone()
-    }
-    .ok_or_else(|| anyhow!("orchestration artifact for agent {id:?} is not available yet"))?;
-    ensure_existing_artifact(artifact_dir, &path)
 }
 
 fn validate_agent_id(id: &str) -> Result<()> {
@@ -5899,130 +7873,6 @@ fn validate_agent_id(id: &str) -> Result<()> {
         bail!("agent id must contain only ASCII letters, digits, '_' or '-'");
     }
     Ok(())
-}
-
-fn persona_archive_path(persona_root: &Path, agent_id: &str) -> Result<PathBuf> {
-    validate_agent_id(agent_id)?;
-    Ok(persona_root
-        .join("sessions")
-        .join(format!("{agent_id}.jsonl")))
-}
-
-fn validate_persona_archive_candidate(
-    sessions_root: &Path,
-    candidate: &Path,
-) -> Result<PathBuf> {
-    // User-visible error contexts stay path-free: persona failures surface on
-    // the job wire (job.result.error / agent history), so the filesystem
-    // layout must never leak.
-    let metadata = fs::symlink_metadata(candidate)
-        .with_context(|| "reading persona archive metadata")?;
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-        bail!("persona archive is not a regular non-symlink file");
-    }
-    let canonical_root = fs::canonicalize(sessions_root)
-        .with_context(|| "resolving persona sessions root")?;
-    let canonical = fs::canonicalize(candidate)
-        .with_context(|| "resolving persona archive")?;
-    if canonical.parent() != Some(canonical_root.as_path())
-        || canonical.extension().and_then(|extension| extension.to_str()) != Some("jsonl")
-    {
-        bail!("persona archive escapes its sessions root");
-    }
-    Ok(canonical)
-}
-fn validate_persona_sessions_root(persona_root: &Path) -> Result<Option<PathBuf>> {
-    let root_metadata = fs::symlink_metadata(persona_root)
-        .with_context(|| "reading persona root")?;
-    if root_metadata.file_type().is_symlink() || !root_metadata.file_type().is_dir() {
-        bail!("persona root is not a regular non-symlink directory");
-    }
-    let canonical_root = fs::canonicalize(persona_root)
-        .with_context(|| "resolving persona root")?;
-    let sessions = persona_root.join("sessions");
-    let metadata = match fs::symlink_metadata(&sessions) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| "reading persona sessions");
-        }
-    };
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-        bail!("persona sessions path is not a regular non-symlink directory");
-    }
-    let canonical_sessions = fs::canonicalize(&sessions)
-        .with_context(|| "resolving persona sessions")?;
-    if canonical_sessions.parent() != Some(canonical_root.as_path()) {
-        bail!("persona sessions directory escapes its persona root");
-    }
-    Ok(Some(canonical_sessions))
-}
-
-fn persona_archives_newest_first(persona_root: &Path) -> Result<Vec<PathBuf>> {
-    let Some(sessions) = validate_persona_sessions_root(persona_root)? else {
-        return Ok(Vec::new());
-    };
-    let mut archives = Vec::new();
-    for entry in fs::read_dir(&sessions).with_context(|| "reading persona sessions")? {
-        let entry = entry.with_context(|| "reading persona sessions")?;
-        let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let path = validate_persona_archive_candidate(&sessions, &path)?;
-        let modified = fs::metadata(&path)
-            .and_then(|metadata| metadata.modified())
-            .unwrap_or(UNIX_EPOCH);
-        archives.push((modified, path));
-    }
-    archives.sort_by(|(left_time, left_path), (right_time, right_path)| {
-        right_time
-            .cmp(left_time)
-            .then_with(|| right_path.cmp(left_path))
-    });
-    Ok(archives.into_iter().map(|(_, path)| path).collect())
-}
-
-fn load_persona_continuity(persona_root: &Path) -> Result<Vec<pi_ai::Message>> {
-    let mut newest_to_oldest = Vec::new();
-    let mut bytes = 0usize;
-    for path in persona_archives_newest_first(persona_root)? {
-        let messages = match crate::session_store::load_session_messages(&path) {
-            Ok(messages) => messages,
-            Err(error) => {
-                // The session-store error chain embeds the absolute archive
-                // path, which would surface on the job wire (job.result.error
-                // / agent history). Re-map to a bounded, path-free failure —
-                // the operation stays actionable without leaking the
-                // filesystem layout.
-                let mut message = format!("{error:#}");
-                message = message.replace(&path.to_string_lossy().as_ref(), "");
-                anyhow::bail!(
-                    "loading persona continuity archive: {}",
-                    message.trim().trim_end_matches(':')
-                );
-            }
-        };
-        for message in messages.into_iter().rev() {
-            if newest_to_oldest.len() >= PERSONA_CONTINUITY_MAX_MESSAGES {
-                break;
-            }
-            let message_bytes = serde_json::to_vec(&message)
-                .context("measuring persona continuity message")?
-                .len();
-            if bytes.saturating_add(message_bytes) > PERSONA_CONTINUITY_MAX_BYTES {
-                newest_to_oldest.reverse();
-                return Ok(newest_to_oldest);
-            }
-            bytes += message_bytes;
-            newest_to_oldest.push(message);
-        }
-        if newest_to_oldest.len() >= PERSONA_CONTINUITY_MAX_MESSAGES {
-            break;
-        }
-    }
-    newest_to_oldest.reverse();
-    Ok(newest_to_oldest)
 }
 
 fn merge_persona_continuity(
@@ -6057,102 +7907,10 @@ fn persisted_history_reference(
     }
 }
 
-fn archive_persona_session(
-    persona_root: &Path,
-    agent_id: &str,
-    source: &Path,
-    replace_existing: bool,
-) -> Result<PathBuf> {
-    // User-visible contexts stay path-free (persona job failures surface on
-    // the job wire); the server-side diagnostics keep the operation label.
-    let source_metadata = fs::symlink_metadata(source)
-        .with_context(|| "reading canonical child transcript")?;
-    if source_metadata.file_type().is_symlink() || !source_metadata.file_type().is_file() {
-        bail!("canonical child transcript is not a regular non-symlink file");
-    }
-    let destination = persona_archive_path(persona_root, agent_id)?;
-    let parent = match validate_persona_sessions_root(persona_root)? {
-        Some(parent) => parent,
-        None => {
-            let parent = destination
-                .parent()
-                .ok_or_else(|| anyhow!("persona archive has no parent"))?;
-            fs::create_dir(parent)
-                .with_context(|| "creating persona sessions directory")?;
-            validate_persona_sessions_root(persona_root)?
-                .ok_or_else(|| anyhow!("persona sessions directory was not created"))?
-        }
-    };
-    let destination = parent.join(format!("{agent_id}.jsonl"));
-    let temporary = parent.join(format!(".{agent_id}.{}.tmp", Uuid::new_v4().simple()));
-    let result = (|| -> Result<()> {
-        let mut input = File::open(source)
-            .with_context(|| "opening canonical child transcript")?;
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .with_context(|| "creating persona archive temporary")?;
-        std::io::copy(&mut input, &mut output)
-            .with_context(|| "copying persona archive")?;
-        output.flush().context("flushing persona archive")?;
-        output.sync_all().context("syncing persona archive")?;
-        drop(output);
-        if replace_existing {
-            match fs::symlink_metadata(&destination) {
-                Ok(metadata)
-                    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() =>
-                {
-                    bail!("existing persona archive is not a regular non-symlink file");
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(error).with_context(|| "reading persona archive");
-                }
-            }
-            match fs::rename(&temporary, &destination) {
-                Ok(()) => {}
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
-                    ) =>
-                {
-                    let destination_metadata = fs::symlink_metadata(&destination)
-                        .with_context(|| "reading persona archive")?;
-                    if destination_metadata.file_type().is_symlink()
-                        || !destination_metadata.file_type().is_file()
-                    {
-                        bail!("existing persona archive is not a regular non-symlink file");
-                    }
-                    fs::remove_file(&destination)
-                        .with_context(|| "replacing persona archive")?;
-                    fs::rename(&temporary, &destination)
-                        .with_context(|| "installing persona archive")?;
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| "installing persona archive");
-                }
-            }
-        } else {
-            fs::hard_link(&temporary, &destination)
-                .with_context(|| "installing persona archive")?;
-            fs::remove_file(&temporary)
-                .with_context(|| "removing persona archive temporary")?;
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result?;
-    validate_persona_archive_candidate(&parent, &destination)
-}
-
 #[cfg(test)]
 mod persona_runtime_tests {
     use super::*;
+    use std::fs;
 
     fn persona_definition(root: &Path) -> AgentDefinition {
         let persona_root = root.join("personas").join("mentor");
@@ -6166,6 +7924,147 @@ mod persona_runtime_tests {
         )
         .expect("persona definition")
     }
+    #[test]
+    fn resolve_task_agent_rejects_unbound_persona_before_spawn() {
+        let root = tempfile::tempdir().expect("root");
+        let (runtime, _) = runtime(root.path());
+        let error = runtime
+            .resolve_task_agent("study the design", Some("mentor"))
+            .expect_err("unbound persona must fail during resolution")
+            .to_string();
+        assert!(error.contains("persona `mentor`"), "{error}");
+        assert!(error.contains("durable binding"), "{error}");
+    }
+
+    #[test]
+    fn resolve_task_agent_rejects_missing_cj_knowledge_root_before_spawn() {
+        let root = tempfile::tempdir().expect("root");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let missing = tempfile::tempdir().expect("missing knowledge root");
+        let mut definition = persona_definition(root.path());
+        definition.name = "cj".to_owned();
+        definition.knowledge_roots = vec![missing.path().to_string_lossy().into_owned()];
+        let mut config = OrchestrationConfig::new(
+            AgentCatalog::from_agents(vec![definition]),
+            root.path().join("artifacts"),
+        );
+        config.default_agent = "cj".to_owned();
+        let runtime =
+            OrchestrationRuntime::new(config, Arc::new(|_| Box::pin(async { unreachable!() })))
+                .expect("runtime");
+        runtime.inner.durable_bound.store(true, Ordering::Release);
+        *runtime.inner.parent_workspace.write() = Some(
+            crate::WorkspaceRoots::new(workspace.path(), Vec::<PathBuf>::new())
+                .expect("parent workspace"),
+        );
+
+        let error = runtime
+            .resolve_task_agent("study the design", Some("cj"))
+            .expect_err("missing knowledge root must fail during resolution")
+            .to_string();
+        assert!(error.contains("persona `cj`"), "{error}");
+        assert!(
+            error.contains(missing.path().to_string_lossy().as_ref()),
+            "{error}"
+        );
+        assert!(error.contains("--add-dir"), "{error}");
+    }
+
+    #[test]
+    fn preferred_agent_precedence_unchanged_after_persona_prevalidation() {
+        let root = tempfile::tempdir().expect("root");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let missing = tempfile::tempdir().expect("missing knowledge root");
+        let mut persona = persona_definition(root.path());
+        persona.knowledge_roots = vec![missing.path().to_string_lossy().into_owned()];
+        let mut ordinary = persona.clone();
+        ordinary.name = "worker".to_owned();
+        ordinary.kind = super::super::AgentDefinitionKind::Agent;
+        ordinary.path = None;
+        ordinary.knowledge_roots.clear();
+        let mut config = OrchestrationConfig::new(
+            AgentCatalog::from_agents(vec![persona, ordinary]),
+            root.path().join("artifacts"),
+        );
+        config.default_agent = "mentor".to_owned();
+        let runtime =
+            OrchestrationRuntime::new(config, Arc::new(|_| Box::pin(async { unreachable!() })))
+                .expect("runtime");
+        runtime.inner.durable_bound.store(true, Ordering::Release);
+        *runtime.inner.parent_workspace.write() = Some(
+            crate::WorkspaceRoots::new(workspace.path(), Vec::<PathBuf>::new())
+                .expect("parent workspace"),
+        );
+        runtime.set_preferred_agent(Some("worker"));
+
+        let error = runtime
+            .resolve_task_agent("study the design", Some("mentor"))
+            .expect_err("invalid persona must be rejected before preferred fallback")
+            .to_string();
+        assert!(error.contains("--add-dir"), "{error}");
+        assert_eq!(runtime.preferred_agent().as_deref(), Some("worker"));
+        assert_eq!(
+            runtime
+                .resolve_task_agent("study the design", None)
+                .expect("ordinary preferred agent"),
+            "worker"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_parent_reset_binding_carries_parent_workspace() {
+        let root = tempfile::tempdir().expect("root");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let parent = isolated_session(workspace.path(), Vec::new(), None).await;
+        parent
+            .session
+            .start_new_recording()
+            .expect("record reset parent");
+        let (runtime, _) = runtime(root.path());
+        runtime
+            .install_generation_capture(parent.session.generation_capture_fn());
+
+        let prepared = runtime
+            .prepare_parent_reset_binding(&parent.session)
+            .expect("prepare reset binding");
+
+        let binding = prepared
+            .parent_workspace
+            .as_ref()
+            .expect("reset binding must carry parent workspace");
+        let parent_roots = parent.session.workspace_roots();
+        assert_eq!(
+            binding.cwd(),
+            parent_roots.cwd(),
+            "reset binding must carry the parent cwd"
+        );
+        assert_eq!(
+            binding.roots(),
+            parent_roots.roots(),
+            "reset binding must carry the same ordered workspace snapshot as ordinary parent binding"
+        );
+        assert_eq!(
+            binding.additional_roots(),
+            parent_roots.additional_roots(),
+            "reset binding must carry the parent additional roots"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(
+                &binding.capabilities().expect("binding capability authority"),
+                &parent_roots
+                    .capabilities()
+                    .expect("parent capability authority"),
+            ),
+            "reset binding must retain the parent capability authority"
+        );
+        for (index, root) in parent_roots.roots().iter().enumerate() {
+            assert_eq!(
+                binding.authority(index).map(|lease| lease.identity()),
+                parent_roots.authority(index).map(|lease| lease.identity()),
+                "reset binding authority identity must match the parent snapshot for {root:?}"
+            );
+        }
+    }
 
     fn runtime(root: &Path) -> (OrchestrationRuntime, AgentDefinition) {
         let definition = persona_definition(root);
@@ -6174,31 +8073,104 @@ mod persona_runtime_tests {
             root.join("artifacts"),
         );
         config.default_agent = definition.name.clone();
-        let runtime = OrchestrationRuntime::new(
-            config,
-            Arc::new(|_| Box::pin(async { unreachable!() })),
-        )
-        .expect("runtime");
+        let runtime =
+            OrchestrationRuntime::new(config, Arc::new(|_| Box::pin(async { unreachable!() })))
+                .expect("runtime");
         (runtime, definition)
+    }
+
+    #[test]
+    fn rebuild_revival_request_propagates_prompt_construction_failure() {
+        let root = tempfile::tempdir().expect("root");
+        let mut definition = persona_definition(root.path());
+        definition.personality = Some("x".repeat(MAX_PERSONALITY_BYTES + 1));
+        let mut config = OrchestrationConfig::new(
+            AgentCatalog::from_agents(vec![definition.clone()]),
+            root.path().join("artifacts"),
+        );
+        config.default_agent = definition.name.clone();
+        let runtime =
+            OrchestrationRuntime::new(config, Arc::new(|_| Box::pin(async { unreachable!() })))
+                .expect("runtime");
+        let snapshot = AgentSnapshot {
+            id: "MentorRun".to_owned(),
+            display_name: definition.name.clone(),
+            agent: definition.name.clone(),
+            parent_id: Some("Main".to_owned()),
+            status: AgentStatus::Parked,
+            created_at: 1,
+            last_activity: 1,
+            unread: 0,
+            artifact_ref: None,
+            history_ref: None,
+        };
+        let info = DurableAgentInfo {
+            definition: super::super::persistence::persist_definition(&definition),
+            request: super::super::persistence::PersistedRequest {
+                child_id: "MentorRun".to_owned(),
+                parent_id: "Main".to_owned(),
+                depth: 1,
+                assignment: "work".to_owned(),
+                system_prompt: "prompt".to_owned(),
+                requested_tool_names: None,
+                thinking_level: None,
+                max_tools_per_agent: 16,
+                model_provider: None,
+                model_id: None,
+                output_schema: None,
+                schema_mode: None,
+            },
+            session_path: None,
+        };
+
+        let error = runtime
+            .rebuild_revival_request("MentorRun", &snapshot, &info, None)
+            .expect_err("prompt construction failure must propagate as Err, not Ok(None)")
+            .to_string();
+        assert!(
+            error.contains("personality exceeds maximum size"),
+            "{error}"
+        );
     }
 
     #[cfg(unix)]
     #[test]
     fn persona_archive_rejects_symlinked_sessions_directory() {
         let root = tempfile::tempdir().expect("root");
-        let persona_root = root.path().join("persona");
+        let (runtime, definition) = runtime(root.path());
+        let persona_root = definition.persona_root().expect("persona root");
         let outside = root.path().join("outside");
-        fs::create_dir_all(&persona_root).expect("persona root");
         fs::create_dir_all(&outside).expect("outside");
         std::os::unix::fs::symlink(&outside, persona_root.join("sessions"))
             .expect("sessions symlink");
-        let source = root.path().join("source.jsonl");
-        fs::write(&source, "{}\n").expect("source");
 
-        let error = archive_persona_session(&persona_root, "run-1", &source, false)
+        let error = runtime
+            .persona_sessions("mentor", RootCreation::CreateDirectory)
             .expect_err("symlinked sessions directory must fail");
-        assert!(error.to_string().contains("non-symlink directory"), "{error:#}");
-        assert!(!outside.join("run-1.jsonl").exists());
+        assert!(
+            error.chain().any(|source| {
+                source
+                    .downcast_ref::<crate::fs::FsError>()
+                    .is_some_and(|error| {
+                        matches!(
+                            error,
+                            crate::fs::FsError::UnsupportedEntryType
+                                | crate::fs::FsError::System {
+                                    raw_os_error: Some(40) | Some(62),
+                                    ..
+                                }
+                        )
+                    })
+            }),
+            "{error:#}"
+        );
+        assert!(
+            outside
+                .read_dir()
+                .expect("outside directory")
+                .next()
+                .is_none()
+        );
     }
 
     #[test]
@@ -6206,10 +8178,10 @@ mod persona_runtime_tests {
         let root = tempfile::tempdir().expect("root");
         let (runtime, definition) = runtime(root.path());
         let persona_root = definition.persona_root().expect("persona root");
-        let source = root.path().join("source.jsonl");
-        fs::write(&source, "{}\n").expect("source");
-        let archive = archive_persona_session(&persona_root, "MentorRun", &source, false)
-            .expect("archive");
+        let sessions = persona_root.join("sessions");
+        fs::create_dir_all(&sessions).expect("sessions");
+        let archive = sessions.join("MentorRun.jsonl");
+        fs::write(&archive, "{}\n").expect("archive");
 
         assert_eq!(
             runtime
@@ -6218,7 +8190,10 @@ mod persona_runtime_tests {
             archive,
         );
         runtime.prune_retained_jobs();
-        assert!(archive.exists(), "ordinary retention must preserve persona archives");
+        assert!(
+            archive.exists(),
+            "ordinary retention must preserve persona archives"
+        );
     }
 
     #[test]
@@ -6239,16 +8214,13 @@ mod persona_runtime_tests {
             root.path().join("artifacts"),
         );
         config.default_agent = mentor.name.clone();
-        let runtime = OrchestrationRuntime::new(
-            config,
-            Arc::new(|_| Box::pin(async { unreachable!() })),
-        )
-        .expect("runtime");
+        let runtime =
+            OrchestrationRuntime::new(config, Arc::new(|_| Box::pin(async { unreachable!() })))
+                .expect("runtime");
         for definition in [&mentor, &reviewer] {
             let persona_root = definition.persona_root().expect("persona root");
             fs::create_dir_all(persona_root.join("sessions")).expect("sessions");
-            fs::write(persona_root.join("sessions").join("Shared.jsonl"), "{}\n")
-                .expect("archive");
+            fs::write(persona_root.join("sessions").join("Shared.jsonl"), "{}\n").expect("archive");
         }
         let error = runtime
             .resolve_read_uri("history://Shared")
@@ -6282,15 +8254,15 @@ mod persona_runtime_tests {
             AgentCatalog::from_agents(vec![persona.clone(), ordinary.clone()]),
             root.path().join("artifacts"),
         );
-        let runtime = OrchestrationRuntime::new(
-            config,
-            Arc::new(|_| Box::pin(async { unreachable!() })),
-        )
-        .expect("runtime");
+        let runtime =
+            OrchestrationRuntime::new(config, Arc::new(|_| Box::pin(async { unreachable!() })))
+                .expect("runtime");
         for (id, definition) in [("MentorRun", persona), ("TaskRun", ordinary)] {
-            REGISTRY
+            runtime
+                .inner
+                .registry
                 .register(
-                    &runtime.inner.group_id,
+                    runtime.group_id(),
                     AgentSnapshot {
                         id: id.to_owned(),
                         display_name: definition.name.clone(),
@@ -6306,8 +8278,10 @@ mod persona_runtime_tests {
                     runtime.inner.config.mailbox_capacity,
                 )
                 .expect("register child");
-            let entry = REGISTRY
-                .get(&runtime.inner.group_id, id)
+            let entry = runtime
+                .inner
+                .registry
+                .get(runtime.group_id(), id)
                 .expect("registered entry");
             *entry.durable_info.lock() = Some(DurableAgentInfo {
                 definition: super::super::persistence::persist_definition(&definition),
@@ -6338,11 +8312,19 @@ mod persona_runtime_tests {
         }
 
         assert_eq!(
-            runtime.agent_snapshot("MentorRun").expect("persona snapshot").history_ref.as_deref(),
+            runtime
+                .agent_snapshot("MentorRun")
+                .expect("persona snapshot")
+                .history_ref
+                .as_deref(),
             Some("history://persona/mentor/MentorRun")
         );
         assert_eq!(
-            runtime.agent_snapshot("TaskRun").expect("agent snapshot").history_ref.as_deref(),
+            runtime
+                .agent_snapshot("TaskRun")
+                .expect("agent snapshot")
+                .history_ref
+                .as_deref(),
             Some("history://TaskRun")
         );
     }
@@ -6353,8 +8335,7 @@ mod persona_runtime_tests {
         let (runtime, definition) = runtime(root.path());
         let persona_root = definition.persona_root().expect("persona root");
         fs::create_dir_all(persona_root.join("sessions")).expect("sessions");
-        fs::write(persona_root.join("sessions").join("Mentor.jsonl"), "{}\n")
-            .expect("archive");
+        fs::write(persona_root.join("sessions").join("Mentor.jsonl"), "{}\n").expect("archive");
         let mut reserved = std::collections::BTreeSet::new();
 
         let id = runtime
@@ -6362,7 +8343,6 @@ mod persona_runtime_tests {
             .expect("unique id");
         assert_eq!(id, "Mentor_2");
     }
-
 
     #[test]
     fn persona_lifecycle_guard_blocks_spawn_and_preserves_other_personas() {
@@ -6388,11 +8368,9 @@ mod persona_runtime_tests {
             AgentCatalog::from_agents(vec![mentor, reviewer, task]),
             root.path().join("artifacts"),
         );
-        let runtime = OrchestrationRuntime::new(
-            config,
-            Arc::new(|_| Box::pin(async { unreachable!() })),
-        )
-        .expect("runtime");
+        let runtime =
+            OrchestrationRuntime::new(config, Arc::new(|_| Box::pin(async { unreachable!() })))
+                .expect("runtime");
         let guard = runtime
             .begin_persona_destructive_operation("mentor")
             .expect("idle mentor claim");
@@ -6410,7 +8388,10 @@ mod persona_runtime_tests {
                 }],
             )
             .expect_err("claimed persona spawn must fail");
-        assert!(blocked.to_string().contains("destructive operation"), "{blocked:#}");
+        assert!(
+            blocked.to_string().contains("destructive operation"),
+            "{blocked:#}"
+        );
         assert!(
             runtime
                 .inner
@@ -6437,16 +8418,21 @@ mod persona_runtime_tests {
         let second = runtime
             .begin_persona_destructive_operation("mentor")
             .expect_err("retained lifecycle block must fail closed");
-        assert!(second.to_string().contains("destructive operation"), "{second:#}");
+        assert!(
+            second.to_string().contains("destructive operation"),
+            "{second:#}"
+        );
     }
 
     #[test]
     fn persona_lifecycle_guard_rejects_active_registry_entry_without_job() {
         let root = tempfile::tempdir().expect("root");
         let (runtime, _) = runtime(root.path());
-        REGISTRY
+        runtime
+            .inner
+            .registry
             .register(
-                &runtime.inner.group_id,
+                runtime.group_id(),
                 AgentSnapshot {
                     id: "MentorActive".to_owned(),
                     display_name: "mentor".to_owned(),
@@ -6466,13 +8452,18 @@ mod persona_runtime_tests {
         let error = runtime
             .begin_persona_destructive_operation("mentor")
             .expect_err("active registry entry must reject lifecycle claim");
-        assert!(error.to_string().contains("active orchestration job"), "{error:#}");
+        assert!(
+            error.to_string().contains("active orchestration job"),
+            "{error:#}"
+        );
     }
     #[test]
     fn persona_continuity_accumulates_across_archives() {
         let root = tempfile::tempdir().expect("root");
-        let persona_root = root.path().join("persona");
-        fs::create_dir_all(&persona_root).expect("persona root");
+        let (runtime, definition) = runtime(root.path());
+        let persona_root = definition.persona_root().expect("persona root");
+        let sessions = persona_root.join("sessions");
+        fs::create_dir_all(&sessions).expect("sessions");
 
         let first = root.path().join("first.jsonl");
         let first_recorder = crate::session_store::start_session_in(
@@ -6488,7 +8479,7 @@ mod persona_runtime_tests {
             .record_message(&pi_ai::Message::user_text("first run", 0))
             .expect("first record");
         first_recorder.close().expect("close first session");
-        archive_persona_session(&persona_root, "run-1", &first, false).expect("first archive");
+        fs::copy(&first, sessions.join("run-1.jsonl")).expect("first archive");
 
         let second = root.path().join("second.jsonl");
         let second_recorder = crate::session_store::start_session_in(
@@ -6504,9 +8495,11 @@ mod persona_runtime_tests {
             .record_message(&pi_ai::Message::user_text("second run", 1))
             .expect("second record");
         second_recorder.close().expect("close second session");
-        archive_persona_session(&persona_root, "run-2", &second, false).expect("second archive");
+        fs::copy(&second, sessions.join("run-2.jsonl")).expect("second archive");
 
-        let continuity = load_persona_continuity(&persona_root).expect("continuity");
+        let continuity = runtime
+            .load_persona_continuity("mentor")
+            .expect("continuity");
         let rendered = serde_json::to_string(&continuity).expect("continuity json");
         assert!(rendered.contains("first run"), "{rendered}");
         assert!(rendered.contains("second run"), "{rendered}");
@@ -6571,22 +8564,182 @@ mod persona_runtime_tests {
             "ordinary agent must use the unlimited global budget"
         );
     }
+    #[test]
+    fn persona_skills_shadow_shared_prompt_without_mutating_global_catalog() {
+        let root = tempfile::tempdir().expect("root");
+        let (mut runtime, definition) = runtime(root.path());
+        let shared_path = root.path().join("shared-skill.md");
+        fs::write(
+            &shared_path,
+            "---\nname: overlap\ndescription: shared description\n---\nshared body",
+        )
+        .expect("shared skill");
+        let shared = OrchestrationSkill {
+            name: "overlap".to_owned(),
+            description: "shared description".to_owned(),
+            file_path: shared_path.clone(),
+            base_dir: root.path().to_path_buf(),
+            globs: Vec::new(),
+            always_apply: false,
+            hidden: false,
+            disable_model_invocation: false,
+            source: crate::SkillSource::User,
+            managed_project_boundary: None,
+            managed_root: Some(root.path().to_path_buf()),
+            trusted: true,
+        };
+        Arc::get_mut(&mut runtime.inner)
+            .expect("unique runtime")
+            .config
+            .skills = vec![shared];
+        let persona = crate::PersonaSkill {
+            name: "overlap".to_owned(),
+            description: "persona description".to_owned(),
+            content: "---\nname: overlap\ndescription: persona description\n---\npersona body"
+                .to_owned(),
+        };
+        let prompt = runtime
+            .child_system_prompt_with_persona_skills(
+                &definition,
+                "work",
+                None,
+                None,
+                None,
+                "<peer_roster />",
+                std::slice::from_ref(&persona),
+            )
+            .expect("persona prompt");
+        assert!(prompt.contains("persona description"), "{prompt}");
+        assert!(prompt.contains("persona body"), "{prompt}");
+        assert!(!prompt.contains("shared description"), "{prompt}");
+        let mut ordinary = definition.clone();
+        ordinary.kind = super::super::AgentDefinitionKind::Agent;
+        let ordinary_prompt = runtime
+            .child_system_prompt(&ordinary, "work", None, None, None, "<peer_roster />")
+            .expect("ordinary prompt");
+        assert!(
+            ordinary_prompt.contains("shared description"),
+            "{ordinary_prompt}"
+        );
+        assert!(
+            !ordinary_prompt.contains("persona description"),
+            "{ordinary_prompt}"
+        );
+        assert_eq!(runtime.skills().len(), 1);
+        assert_eq!(runtime.skills()[0].description, "shared description");
+    }
+
+    #[test]
+    fn persona_skill_snapshot_changes_only_on_next_prompt() {
+        let root = tempfile::tempdir().expect("root");
+        let (runtime, definition) = runtime(root.path());
+        let (store, initial) = runtime
+            .persona_skill_context(&definition)
+            .expect("initial persona skill context");
+        let initial_prompt = runtime
+            .child_system_prompt_with_persona_skills(
+                &definition,
+                "work",
+                None,
+                None,
+                None,
+                "<peer_roster />",
+                &initial,
+            )
+            .expect("initial prompt");
+        store
+            .expect("persona store")
+            .learn("fresh", "fresh description", "fresh instructions")
+            .expect("learn skill");
+        assert!(!initial_prompt.contains("fresh instructions"));
+        assert!(initial.is_empty(), "current snapshot must remain immutable");
+
+        let (_, next) = runtime
+            .persona_skill_context(&definition)
+            .expect("next persona skill context");
+        let next_prompt = runtime
+            .child_system_prompt_with_persona_skills(
+                &definition,
+                "work",
+                None,
+                None,
+                None,
+                "<peer_roster />",
+                &next,
+            )
+            .expect("next prompt");
+        assert!(next_prompt.contains("fresh instructions"), "{next_prompt}");
+        assert_eq!(
+            runtime.skills().len(),
+            0,
+            "global skill catalog stays unchanged"
+        );
+    }
+
+    #[test]
+    fn persona_skill_snapshot_load_rejects_symlink_traversal() {
+        #[cfg(unix)]
+        {
+            let root = tempfile::tempdir().expect("root");
+            let outside = tempfile::tempdir().expect("outside");
+            let (runtime, definition) = runtime(root.path());
+            std::os::unix::fs::symlink(
+                outside.path(),
+                definition
+                    .persona_root()
+                    .expect("persona root")
+                    .join("skills"),
+            )
+            .expect("skills symlink");
+            let error = runtime
+                .persona_skill_context(&definition)
+                .expect_err("symlinked skills must fail closed");
+            assert!(!error.to_string().is_empty());
+        }
+    }
 }
 
-fn write_new_artifact(path: &Path, content: &[u8]) -> Result<()> {
-    use std::io::Write as _;
-
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .with_context(|| format!("creating artifact {}", path.display()))?;
+fn write_new_artifact(root: &CapabilityRootLease, path: &Path, content: &[u8]) -> Result<()> {
+    if content.len() as u64 > MAX_ARTIFACT_BYTES {
+        bail!("orchestration artifact exceeds maximum size");
+    }
+    let relative = path
+        .strip_prefix(root.display_root())
+        .map_err(|_| anyhow!("artifact path escapes orchestration artifact capability"))?;
+    let mut file = root
+        .create_new(relative, FileMode::Private)
+        .context("creating orchestration artifact")?;
     file.write_all(content)
-        .with_context(|| format!("writing artifact {}", path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("syncing artifact {}", path.display()))
+        .context("writing orchestration artifact")?;
+    file.finish().context("syncing orchestration artifact")?;
+    Ok(())
 }
 
+fn write_revival_artifact(root: &CapabilityRootLease, path: &Path, content: &[u8]) -> Result<()> {
+    if content.len() as u64 > MAX_ARTIFACT_BYTES {
+        bail!("orchestration artifact exceeds maximum size");
+    }
+    let relative = path
+        .strip_prefix(root.display_root())
+        .map_err(|_| anyhow!("artifact path escapes orchestration artifact capability"))?
+        .to_path_buf();
+    let expected = match root.metadata(&relative) {
+        Ok(metadata) if metadata.identity.kind() == EntryKind::RegularFile => {
+            Some(metadata.identity)
+        }
+        Err(error) if fs_missing(&error) => None,
+        Ok(_) => bail!("orchestration artifact is not a regular file"),
+        Err(error) => return Err(error).context("reading orchestration artifact identity"),
+    };
+    root.replace_file(Replacement {
+        relative,
+        expected,
+        bytes: content.to_vec(),
+        mode: FileMode::Private,
+    })
+    .context("replacing orchestration artifact")?;
+    Ok(())
+}
 fn absolute_lexical(path: &Path) -> Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -6606,27 +8759,17 @@ fn absolute_lexical(path: &Path) -> Result<PathBuf> {
     Ok(normalized)
 }
 
-fn ensure_existing_artifact(root: &Path, path: &Path) -> Result<PathBuf> {
-    let canonical_root = root
-        .canonicalize()
-        .with_context(|| format!("resolving artifact directory {}", root.display()))?;
-    let canonical = path
-        .canonicalize()
-        .with_context(|| format!("resolving artifact {}", path.display()))?;
-    if !canonical.starts_with(canonical_root) {
-        bail!("artifact path escapes orchestration artifact directory");
-    }
-    Ok(canonical)
-}
-
 fn presentation_job_snapshot(mut job: JobSnapshot) -> JobSnapshot {
     job.description = job
         .description
         .as_deref()
-        .map(|description| presentation_text(description, 160));
+        .map(|description| presentation_text(description, TASK_DESCRIPTION_MAX_CHARS));
     if let Some(result) = &mut job.result {
         result.output = presentation_text(&result.output, 600);
-        result.error = result.error.as_deref().map(|error| presentation_text(error, 300));
+        result.error = result
+            .error
+            .as_deref()
+            .map(|error| presentation_text(error, 300));
         result.artifact_ref = presentation_text(&result.artifact_ref, 240);
         result.history_ref = presentation_text(&result.history_ref, 240);
         result.artifact_uri = presentation_text(&result.artifact_uri, 240);
@@ -6676,61 +8819,30 @@ fn render_roster_peer(peer: &AgentSnapshot) -> String {
         .as_deref()
         .map(escape_xml)
         .unwrap_or_else(|| "none".to_owned());
-    format!(
-        "  <peer id=\"{id}\" agent=\"{agent}\" status=\"{status}\" parent=\"{parent}\" />\n"
-    )
+    format!("  <peer id=\"{id}\" agent=\"{agent}\" status=\"{status}\" parent=\"{parent}\" />\n")
 }
-
-/// English natural-language delegation verbs recognized as tokens anywhere in
-/// the request. `request_has_delegation_verb` and the diagnostics candidate
-/// scan share this list.
+/// These are unambiguous delegation grammars — the causative
+/// `have`/`ask`/`tell X do …` and the explicit `delegate`/`assign`/`spawn`/
+/// `dispatch` — so their object is a delegation candidate whether or not it
+/// is catalogued: delegating to a missing agent is still caught and reported
+/// actionably.
 const ENGLISH_DELEGATION_VERBS: &[&str] = &[
-    "have", "ask", "tell", "get", "let", "make", "please", "delegate", "assign", "spawn", "run",
-    "send", "kick", "dispatch",
+    "have", "ask", "tell", "delegate", "assign", "spawn", "dispatch",
 ];
 
-/// Chinese delegation constructions recognized by [`cjk_delegation_construction`].
-/// The single-character tokens (`让`/`请`/`叫`/`派`) must directly abut the
-/// agent name or follow it with exactly one ASCII space (`让 mentor 审查…`);
-/// the two-character tokens (`安排`/`委托`/`交给`) end immediately before it.
+/// Verbs that double as ordinary instruction verbs (`run python3`,
+/// `make sure`, `let me know`, `send the report`) or common nouns (`the
+/// run`, `the start`, `the launch`). Their object only counts as a
+/// delegation candidate when it names an actual configured agent or skill
+/// identity, so natural language never fabricates missing agents; the
+/// noun-prone ones additionally require an imperative frame, matching the
+/// selector grammar.
+const ENGLISH_WEAK_DELEGATION_VERBS: &[&str] = &[
+    "get", "launch", "let", "make", "please", "run", "send", "kick", "start", "use",
+];
+
 const CJK_DELEGATION_TOKENS: &[&str] = &["让", "请", "叫", "派", "安排", "委托", "交给"];
 
-/// True when the request uses an explicit natural-language delegation
-/// construction: a recognized English delegation verb token anywhere in the
-/// request, or a conservative CJK construction where a Chinese delegation
-/// token directly abuts the agent name (or precedes it with exactly one ASCII
-/// space) and a non-trivial action clause follows it. Informational mentions
-/// ("researcher 是做什么的？", "我在文档里看到researcher") return false even
-/// when they name the agent exactly.
-#[cfg(test)]
-#[must_use]
-fn delegation_intent(request: &str, agent_name: &str) -> bool {
-    request_has_delegation_verb(request) || cjk_delegation_construction(request, agent_name)
-}
-
-/// True when the request uses an explicit English natural-language delegation
-/// verb token (whitespace/`-`/`_` separated). Used to gate parent prompt-time
-/// auto-spawn; the task tool does not require it.
-#[must_use]
-fn request_has_delegation_verb(request: &str) -> bool {
-    let tokens = request
-        .nfkc()
-        .flat_map(char::to_lowercase)
-        .collect::<String>()
-        .split(|ch: char| !ch.is_alphanumeric() && ch != '-' && ch != '_')
-        .filter(|token| !token.is_empty())
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    tokens
-        .iter()
-        .any(|token| ENGLISH_DELEGATION_VERBS.iter().any(|verb| token == verb))
-}
-
-/// Byte span of the first occurrence of `agent_name` in `request` with
-/// non-ASCII-alphanumeric boundaries on both sides (mirrors the selector's
-/// `contains_embedded_ascii_word` semantics, so `researcher` never matches
-/// inside `researchers` and CJK-embedded names are found). Case-insensitive
-/// for ASCII; agent names are ASCII by construction.
 fn agent_name_span(request: &str, agent_name: &str) -> Option<(usize, usize)> {
     let name_chars = agent_name.chars().collect::<Vec<_>>();
     if name_chars.is_empty() {
@@ -6765,68 +8877,55 @@ fn agent_name_span(request: &str, agent_name: &str) -> Option<(usize, usize)> {
     None
 }
 
-/// Conservative CJK delegation construction: a Chinese delegation token
-/// (`让`/`请`/`叫`/`派`/`安排`/`委托`/`交给`) directly abuts the agent name
-/// (`你让researcher…`) or precedes it with exactly one ASCII space
-/// (`让 mentor 审查…`), and a non-trivial action clause follows the WHOLE
-/// conjunction chain (`你让glm和grok调研…` — `你让glm和grok` with no action is
-/// not a delegation). Negated delegations (`不要让glm调研`, `别让grok调研`)
-/// are not delegations. This is deliberately stricter than the English token
-/// path: `请 review the security patch` is not a delegation to an agent named
-/// `review`, and `请使用research技能` names a skill, not an agent. Returns
-/// the lowercase raw names of the delegation clause (the matched name plus
-/// every name joined to it by CJK conjunctions), or `None`. NFKC+lowercase
-/// parity with the selector scan: `让ｇｌｍ调研` matches `glm` exactly like
-/// `让glm调研`.
-#[must_use]
-fn cjk_delegation_chain(request: &str, agent_name: &str) -> Option<Vec<String>> {
-    cjk_delegation_matching(request, agent_name, false)
-}
-
-/// Negated projection of [`cjk_delegation_matching`]: the conjunction chain
-/// of an explicitly NEGATED CJK delegation (`别让glm调研`), used by the
-/// negated-intent probe. The action-clause gate does not apply — the
-/// negation itself is the signal.
-#[must_use]
-fn cjk_delegation_chain_negated(request: &str, agent_name: &str) -> Option<Vec<String>> {
-    cjk_delegation_matching(request, agent_name, true)
-}
-
-/// Shared CJK delegation parser. The positive projection (false) yields the
-/// chain when a delegation token abuts the name and an action clause follows
-/// the WHOLE conjunction chain, without negation; the negated projection
-/// (true) yields the chain when the construction is explicitly negated. Both
-/// run on the NFKC-lowercased request so fullwidth forms match identically.
-#[must_use]
-fn cjk_delegation_matching(
-    request: &str,
-    agent_name: &str,
-    expected_negated: bool,
-) -> Option<Vec<String>> {
+fn cjk_delegation_construction(request: &str, agent_name: &str) -> bool {
     let normalized = normalized_lower(request);
-    let (span_start, span_end) = agent_name_span(&normalized, &normalized_lower(agent_name))?;
+    let (span_start, span_end) = match agent_name_span(&normalized, &normalized_lower(agent_name)) {
+        Some(span) => span,
+        None => return false,
+    };
     let before = &normalized[..span_start];
-    // The token must directly abut the name (`你让researcher…`) or precede it
-    // with exactly one ASCII space (`让 mentor 审查这次修改`); two or more
-    // spaces stay non-delegations (conservative).
-    if !cjk_delegation_token_hit(before) {
-        return None;
+    let token_hit = CJK_DELEGATION_TOKENS.iter().any(|token| {
+        before.ends_with(token)
+            || before
+                .strip_suffix(' ')
+                .is_some_and(|prefix| prefix.ends_with(token) && !prefix.ends_with("  "))
+    });
+    if !token_hit {
+        return false;
     }
-    // Negation in the trailing clause before the name (`不要让glm调研`,
-    // `别让grok调研`).
-    let negated = cjk_clause_is_negated(trailing_cjk_clause(before));
-    if negated != expected_negated {
-        return None;
+    let clause = before
+        .rsplit(|character: char| {
+            matches!(
+                character,
+                '。' | '；' | '，' | '、' | '！' | '？' | '…' | '.' | ';' | ',' | '!' | '?'
+            )
+        })
+        .next()
+        .unwrap_or(before);
+    // Mirror the selector's clause-aware CJK gate: the 不要/不用/不必/勿/莫
+    // negation family, the paired 是否 interrogative, and the potential
+    // 能不能 form void the delegation, while a lone `否` (否则) does not.
+    if ["不要", "不用", "不必", "勿", "莫", "是否", "能不能"]
+        .iter()
+        .any(|marker| clause.contains(marker))
+        || clause.char_indices().any(|(index, character)| {
+            character == '别'
+                && !matches!(
+                    clause[..index].chars().next_back(),
+                    Some('特' | '分' | '个')
+                )
+        })
+    {
+        return false;
     }
-    // Walk the CJK conjunction chain so the action clause is required AFTER
-    // the LAST joined name: `你让glm和grok` names the pair but delegates no
-    // work, while `你让glm和grok调研` delegates both.
     let runs = ascii_identifier_runs(&normalized);
-    let (index, (head_run, _)) = runs
+    let Some((index, _)) = runs
         .iter()
         .enumerate()
-        .find(|(_, (_, start))| *start == span_start)?;
-    let mut chain = vec![head_run.to_ascii_lowercase()];
+        .find(|(_, (_, start))| *start == span_start)
+    else {
+        return false;
+    };
     let mut chain_end = span_end;
     for (next_run, next_start) in runs.iter().skip(index + 1) {
         let gap = &normalized[chain_end..*next_start];
@@ -6839,184 +8938,148 @@ fn cjk_delegation_matching(
         if !joined {
             break;
         }
-        chain.push(next_run.to_ascii_lowercase());
         chain_end = next_start + next_run.len();
     }
-    if expected_negated {
-        return Some(chain);
-    }
-    let after = &normalized[chain_end..];
-    // If the clause opens with a determiner/preposition (English), the name is
-    // the clause's object ("请review the security patch"), not a delegated
-    // agent — reject it like the English candidate scan does.
-    let clause_open = after
-        .trim_start_matches(|c: char| {
-            c.is_whitespace()
-                || c.is_ascii_punctuation()
-                || matches!(
-                    c,
-                    '。' | '？' | '！' | '，' | '、' | '；' | '：' | '…' | '～' | '「' | '」'
-                        | '『' | '』' | '（' | '）' | '《' | '》'
+    normalized[chain_end..]
+        .chars()
+        .filter(|character| {
+            !character.is_whitespace()
+                && !character.is_ascii_punctuation()
+                && !matches!(
+                    character,
+                    '。' | '？'
+                        | '！'
+                        | '，'
+                        | '、'
+                        | '；'
+                        | '：'
+                        | '…'
+                        | '～'
+                        | '「'
+                        | '」'
+                        | '『'
+                        | '』'
+                        | '（'
+                        | '）'
+                        | '《'
+                        | '》'
                 )
         })
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-        .collect::<String>();
-    if !clause_open.is_empty() && follows_without_action(&clause_open.to_ascii_lowercase()) {
-        return None;
-    }
-    // An action clause must follow: at least two characters that are neither
-    // whitespace nor punctuation (e.g. 仔细调研 in the literal prompt). A bare
-    // name, trailing punctuation, or a possessive marker (的) does not count.
-    let mut clause_chars = 0;
-    for character in after.chars() {
-        if character == '的' {
-            break;
-        }
-        if character.is_whitespace()
-            || character.is_ascii_punctuation()
-            || matches!(
-                character,
-                '。' | '？' | '！' | '，' | '、' | '；' | '：' | '…' | '～' | '「' | '」'
-                    | '『' | '』' | '（' | '）' | '《' | '》'
-            )
-        {
-            continue;
-        }
-        clause_chars += 1;
-        if clause_chars >= 2 {
-            return Some(chain);
-        }
-    }
-    None
+        .take(2)
+        .count()
+        >= 2
 }
 
-/// The CJK delegation token directly abuts the name (`你让researcher…`) or
-/// precedes it with exactly one ASCII space (`让 mentor 审查这次修改`).
-#[must_use]
-fn cjk_delegation_token_hit(before: &str) -> bool {
-    CJK_DELEGATION_TOKENS.iter().any(|token| {
-        before.ends_with(token)
-            || before
-                .strip_suffix(' ')
-                .is_some_and(|prefix| prefix.ends_with(token) && !prefix.ends_with("  "))
-    })
-}
-
-/// The trailing clause of the text before a name, used for the negation
-/// check. Splits on CJK AND ASCII sentence punctuation — the parser runs on
-/// the NFKC-normalized request, where fullwidth `；` becomes ASCII `;`.
-#[must_use]
-fn trailing_cjk_clause(before: &str) -> &str {
-    before
-        .rsplit(|c: char| {
-            matches!(
-                c,
-                '。' | '；' | '，' | '、' | '！' | '？' | '…' | '.' | ';' | ',' | '!' | '?'
-            )
-        })
-        .next()
-        .unwrap_or(before)
-}
-
-/// True when a conservative CJK delegation construction targets `agent_name`
-/// (see [`cjk_delegation_chain`]).
-#[must_use]
-fn cjk_delegation_construction(request: &str, agent_name: &str) -> bool {
-    cjk_delegation_chain(request, agent_name).is_some()
-}
-
-/// CJK negation markers that make a delegation construction an instruction
-/// NOT to delegate (`不要让glm调研`, `别让grok调研`).
-const CJK_DELEGATION_NEGATIONS: &[&str] = &["不要", "不用", "不必", "勿", "莫"];
-
-/// True when the trailing clause before a CJK delegation token negates the
-/// delegation. The multi-character markers match anywhere. A trailing `别`
-/// is also a negation unless it belongs to a known non-negating compound:
-/// `你别让…` and `请别让…` are denied, while `特别让…`, `分别让…`, and
-/// `个别让…` retain their ordinary meanings.
-#[must_use]
-fn cjk_clause_is_negated(clause: &str) -> bool {
-    if CJK_DELEGATION_NEGATIONS
-        .iter()
-        .any(|marker| clause.contains(marker))
-    {
-        return true;
-    }
-    clause.char_indices().any(|(index, character)| {
-        if character != '别' {
-            return false;
-        }
-        !matches!(
-            clause[..index].chars().next_back(),
-            Some('特' | '分' | '个')
-        )
-    })
-}
-
-/// NFKC-lowercased form used for cross-space name comparison (the same
-/// normalization the selector applies to requests).
-#[must_use]
 fn normalized_lower(value: &str) -> String {
     value.nfkc().flat_map(char::to_lowercase).collect()
 }
 
-/// True when the colliding name's normalized phrase participates in an
-/// explicit delegation clause: the phrase as a single run (hyphenated form,
-/// e.g. `research-agent`) or any of its split runs (`research` for
-/// `Research Agent`) appears in the delegated run set.
-#[must_use]
-fn delegated_phrase_participates(delegated_runs: &[String], name: &str) -> bool {
-    let lowered = normalized_lower(name);
-    if delegated_runs.iter().any(|member| member == &lowered) {
-        return true;
-    }
-    lowered
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|token| !token.is_empty())
-        .any(|token| delegated_runs.iter().any(|member| member == token))
-}
-
-/// ASCII identifier-like tokens that could name an agent: `[A-Za-z][A-Za-z0-9_-]*`
-/// with 2..=80 characters (the orchestration agent-id charset).
 fn looks_like_agent_name(token: &str) -> bool {
     let mut chars = token.chars();
     matches!(chars.next(), Some(first) if first.is_ascii_alphabetic())
         && token.len() >= 2
         && token.len() <= 80
-        && token.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
-        })
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
-/// English function words that cannot be agent names. Used to reject
-/// `have the researcher …` / `ask me …` style false candidates.
 fn is_english_function_word(token: &str) -> bool {
     matches!(
         token,
-        "the" | "a" | "an" | "this" | "that" | "these" | "those" | "some" | "any" | "my"
-            | "your" | "our" | "their" | "its" | "his" | "her" | "me" | "us" | "them"
-            | "him" | "we" | "you" | "i" | "it" | "they" | "he" | "she"
+        "the"
+            | "a"
+            | "an"
+            | "this"
+            | "that"
+            | "these"
+            | "those"
+            | "some"
+            | "any"
+            | "my"
+            | "your"
+            | "our"
+            | "their"
+            | "its"
+            | "his"
+            | "her"
+            | "me"
+            | "us"
+            | "them"
+            | "him"
+            | "we"
+            | "you"
+            | "i"
+            | "it"
+            | "they"
+            | "he"
+            | "she"
     )
 }
 
-/// Tokens whose presence directly after a candidate indicates the candidate is
-/// the grammatical object of the clause rather than a delegated agent
-/// (`please review THE patch`, `ask writer TO write` is deliberately allowed,
-/// so `to` is not listed).
 fn follows_without_action(token: &str) -> bool {
     matches!(
         token,
-        "the" | "a" | "an" | "this" | "that" | "these" | "those" | "my" | "your" | "our"
-            | "its" | "his" | "her" | "him" | "them" | "us" | "me" | "it" | "for" | "of"
-            | "in" | "on" | "at" | "with" | "by" | "from" | "and" | "or" | "but" | "is"
-            | "are" | "was" | "were" | "be" | "being" | "been" | "as" | "than" | "then"
-            | "there" | "here" | "so" | "just" | "only" | "also" | "too" | "very" | "really"
-            | "how" | "why" | "what" | "when" | "where" | "who" | "whom" | "which" | "whose"
+        "the"
+            | "a"
+            | "an"
+            | "this"
+            | "that"
+            | "these"
+            | "those"
+            | "my"
+            | "your"
+            | "our"
+            | "its"
+            | "his"
+            | "her"
+            | "him"
+            | "them"
+            | "us"
+            | "me"
+            | "it"
+            | "for"
+            | "of"
+            | "in"
+            | "on"
+            | "at"
+            | "with"
+            | "by"
+            | "from"
+            | "and"
+            | "or"
+            | "but"
+            | "is"
+            | "are"
+            | "was"
+            | "were"
+            | "be"
+            | "being"
+            | "been"
+            | "as"
+            | "than"
+            | "then"
+            | "there"
+            | "here"
+            | "so"
+            | "just"
+            | "only"
+            | "also"
+            | "too"
+            | "very"
+            | "really"
+            | "how"
+            | "why"
+            | "what"
+            | "when"
+            | "where"
+            | "who"
+            | "whom"
+            | "which"
+            | "whose"
     )
 }
 
-/// ASCII identifier runs of `request` (the orchestration agent-id charset).
 fn ascii_identifier_runs(request: &str) -> Vec<(String, usize)> {
     let mut runs = Vec::new();
     let mut current = String::new();
@@ -7037,97 +9100,125 @@ fn ascii_identifier_runs(request: &str) -> Vec<(String, usize)> {
     runs
 }
 
-/// Deterministic candidate agent names referenced with explicit delegation
-/// intent in `request`: CJK constructions (a Chinese delegation token abuts
-/// the name and an action clause follows) and the noun directly after an
-/// English delegation verb. Names joined to a candidate by a conjunction
-/// (`你让missing1和missing2一起调研`, `Have missing1 and missing2 study this`)
-/// are candidates too, so validation reports EVERY named agent, never just
-/// the first. Function words and the verbs themselves are never candidates,
-/// so `Have researcher study this` yields `researcher` while `please review
-/// the security patch` and `请使用research技能` yield nothing.
+#[cfg(test)]
 fn delegation_candidates(request: &str) -> Vec<String> {
-    let mut candidates = std::collections::BTreeSet::new();
-    // English: the token right after a delegation verb, plus names chained
-    // to it by list conjunctions (`and`/`or`) or separators (`,`/`，`/`&`):
-    // `Have ghost-one and ghost-two study this` names BOTH agents, so
-    // validation reports every named agent, not just the first. The chain
-    // stops at the first token that is neither a conjunction nor a candidate
-    // name — the action clause — so `Have writer check this` chains nothing
-    // after `writer`.
-    let normalized = request
-        .nfkc()
-        .flat_map(char::to_lowercase)
-        .collect::<String>();
+    delegation_candidates_with_identities(request, &[], None)
+}
+
+fn delegation_candidates_with_identities(
+    request: &str,
+    trusted_agents: &[AgentDefinition],
+    known_identities: Option<&BTreeSet<String>>,
+) -> Vec<String> {
+    let mut candidates = BTreeSet::new();
+    let normalized = normalized_lower(request);
     let tokens = delegation_scan_tokens(&normalized);
-    for (index, (token, _)) in tokens.iter().enumerate() {
-        if !ENGLISH_DELEGATION_VERBS.contains(&token.as_str()) {
+    for (index, (verb, _)) in tokens.iter().enumerate() {
+        let strong = ENGLISH_DELEGATION_VERBS.contains(&verb.as_str());
+        let weak = ENGLISH_WEAK_DELEGATION_VERBS.contains(&verb.as_str());
+        if !strong && !weak {
             continue;
         }
-        let Some((next, next_start)) = tokens.get(index + 1) else {
+        // Grammar gate mirroring the selector: interrogatives,
+        // clause-local negations, declarative subject clauses, and
+        // mid-clause noun-prone verbs never delegate.
+        if diagnostics_verb_clause_vetoed(&normalized, &tokens, index) {
+            continue;
+        }
+
+        let mut cursor = index + 1;
+        if strong
+            && matches!(verb.as_str(), "delegate" | "assign" | "dispatch")
+            && tokens.get(cursor).is_some_and(|(token, _)| token == "to")
+        {
+            cursor += 1;
+        }
+        let Some((first, first_start)) = tokens.get(cursor) else {
             continue;
         };
-        if !looks_like_agent_name(next)
-            || is_english_function_word(next)
-            || is_english_agent_conjunction(next)
+        if !looks_like_agent_name(first)
+            || is_english_function_word(first)
+            || is_english_agent_conjunction(first)
         {
             continue;
         }
-        // The token after the candidate must not be a determiner / pronoun /
-        // preposition that turns the candidate into the clause's object
-        // ("please review the patch", "ask me to …"). A list continuation
-        // (conjunction or separator) after the name keeps it a candidate.
-        let noun_end = next_start + next.len();
-        let after = tokens.get(index + 2);
-        let list_continues = after.is_some_and(|(after_token, after_start)| {
-            is_english_agent_conjunction(after_token)
-                || gap_has_english_list_separator(&normalized, noun_end, *after_start)
-        });
-        let action_follows = list_continues
-            || after.is_none_or(|(after_token, _)| !follows_without_action(after_token));
-        if !action_follows {
-            continue;
-        }
-        candidates.insert(next.clone());
-        // Chain the rest of the list: a name following a conjunction or a
-        // separator is also delegated; the first token that is neither ends
-        // the list (the action clause).
-        let mut cursor = index + 2;
-        let mut previous_end = noun_end;
-        loop {
-            let (candidate, candidate_start) = match tokens.get(cursor) {
-                Some(tuple) => tuple,
-                None => break,
-            };
+
+        let mut members = vec![first.clone()];
+        let mut previous_end = first_start + first.len();
+        cursor += 1;
+        let mut list_started = false;
+        while let Some((token, token_start)) = tokens.get(cursor) {
             let separated =
-                gap_has_english_list_separator(&normalized, previous_end, *candidate_start);
-            let conjunction = is_english_agent_conjunction(candidate);
+                gap_has_english_list_separator(&normalized, previous_end, *token_start);
+            let conjunction = is_english_agent_conjunction(token);
             if !separated && !conjunction {
-                break; // the action clause follows the list
+                break;
             }
+            list_started = true;
             if conjunction {
-                cursor += 1; // `and`/`or` joins the next name
+                cursor += 1;
             }
-            let Some((chained, chained_start)) = tokens.get(cursor) else {
+            let Some((member, member_start)) = tokens.get(cursor) else {
                 break;
             };
-            if !looks_like_agent_name(chained)
-                || is_english_function_word(chained)
-                || is_english_agent_conjunction(chained)
+            if !looks_like_agent_name(member)
+                || is_english_function_word(member)
+                || is_english_agent_conjunction(member)
             {
                 break;
             }
-            candidates.insert(chained.clone());
-            previous_end = chained_start + chained.len();
+            members.push(member.clone());
+            previous_end = member_start + member.len();
             cursor += 1;
         }
+
+        // Weak instruction verbs only establish delegation when at least one
+        // complete-list member exactly names a configured agent or skill.
+        // Once anchored, retain every member so absent co-delegates cannot be
+        // hidden by their position in a conjunction/comma list.
+        if weak
+            && !members.iter().any(|member| {
+                known_identities.is_some_and(|identities| identities.contains(member))
+            })
+        {
+            continue;
+        }
+        if members.len() == 1
+            && !list_started
+            && tokens
+                .get(cursor)
+                .is_some_and(|(after, _)| follows_without_action(after))
+        {
+            continue;
+        }
+        candidates.extend(members);
     }
-    // CJK: names abutted by a Chinese delegation token with an action clause,
-    // plus names joined to them by CJK conjunctions (`和`/`跟`/`与`/`、`/`，`
-    // or commas): `你让missing1和missing2一起调研` names BOTH agents, so
-    // validation must report every named agent, not just the first. A
-    // conjunction-free gap (an action clause, or a bare space) breaks the
-    // chain, mirroring the conservative single-space CJK token rule.
+
+    // Name-initial imperative (`coordinator please fix the build`,
+    // `reviewer audit this`): the request opens with a name-like token
+    // followed by a selector delegation verb, an optional polite `please`
+    // in between. Mirrors the selector's `name_initial_imperative`;
+    // identity-anchored like the weak verbs so ordinary sentences never
+    // fabricate missing agents, and skipped in question form.
+    if let Some((first, _)) = tokens.first()
+        && looks_like_agent_name(first)
+        && !is_english_function_word(first)
+        && !crate::selector::is_question_form(&normalized)
+    {
+        let verb_index = if tokens.get(1).is_some_and(|(token, _)| token == "please") {
+            2
+        } else {
+            1
+        };
+        if tokens
+            .get(verb_index)
+            .is_some_and(|(token, _)| crate::selector::DELEGATION_VERBS.contains(&token.as_str()))
+            && known_identities.is_some_and(|identities| identities.contains(first))
+        {
+            candidates.insert(first.clone());
+        }
+    }
+
     let runs = ascii_identifier_runs(request);
     let mut chained = false;
     for (index, (run, start)) in runs.iter().enumerate() {
@@ -7136,18 +9227,15 @@ fn delegation_candidates(request: &str) -> Vec<String> {
             continue;
         }
         let direct = cjk_delegation_construction(request, run);
-        let joined = chained
-            && {
-                let (previous, previous_start) = &runs[index - 1];
-                let gap = &request[previous_start + previous.len()..*start];
-                !gap.is_empty()
-                    && gap
-                        .chars()
-                        .any(|character| is_cjk_agent_conjunction(character))
-                    && gap.chars().all(|character| {
-                        is_cjk_agent_conjunction(character) || character.is_whitespace()
-                    })
-            };
+        let joined = chained && {
+            let (previous, previous_start) = &runs[index - 1];
+            let gap = &request[previous_start + previous.len()..*start];
+            !gap.is_empty()
+                && gap.chars().any(is_cjk_agent_conjunction)
+                && gap.chars().all(|character| {
+                    is_cjk_agent_conjunction(character) || character.is_whitespace()
+                })
+        };
         if direct || joined {
             candidates.insert(run.clone());
             chained = true;
@@ -7155,19 +9243,123 @@ fn delegation_candidates(request: &str) -> Vec<String> {
             chained = false;
         }
     }
+
+    // Selector-parity direct addresses, taken verbatim from the shared
+    // selector delegated-name API (`crate::selector::delegation_agent_mention`)
+    // so the diagnostics can never drift from the grammar that gates
+    // user-prompt delegation: a bare whole-name request (`coordinator`) and a
+    // name-leading comma/colon vocative (`coordinator: route next`,
+    // `coordinator, route next`) are explicit delegations there, so a
+    // disabled or enabled catalogued name addressed that way must surface in
+    // the missing/disabled diagnostics too. The API only ever returns names
+    // of the passed trusted catalogued agents, so uncatalogued text can never
+    // be fabricated into a missing-agent report here.
+    match crate::selector::delegation_agent_mention(request, trusted_agents) {
+        crate::selector::ExactAgentMention::None => {}
+        crate::selector::ExactAgentMention::Unique(name) => {
+            candidates.insert(name);
+        }
+        crate::selector::ExactAgentMention::Ambiguous(names) => candidates.extend(names),
+    }
     candidates.into_iter().collect()
 }
 
-/// CJK conjunctions that join two delegated agent names in one clause
-/// (`你让glm和grok一起调研`): the next name follows through one of these
-/// without an intervening action clause.
+/// Clause-initial test for `tokens[index]`, mirroring the selector's
+/// `english_clause_starts`: first token, or a clause punctuation gap
+/// directly before it.
+#[must_use]
+fn diagnostics_clause_initial(
+    normalized: &str,
+    tokens: &[(String, usize)],
+    index: usize,
+) -> bool {
+    if index == 0 {
+        return true;
+    }
+    let (previous, previous_start) = &tokens[index - 1];
+    normalized[previous_start + previous.len()..tokens[index].1]
+        .contains([',', '.', ';', '!', '?'])
+}
+
+/// Clause-local grammar veto for one English verb occurrence in the
+/// workflow missing-agent scan, sharing the selector's constants
+/// (`DELEGATION_MARKER_NEGATIONS`, `ENGLISH_CLAUSE_AUXILIARIES`,
+/// `ENGLISH_CLAUSE_PRONOUNS`, `ENGLISH_DECLARATIVE_SUBJECTS`,
+/// `DELEGATION_NOUN_PRONE_MARKERS`) so both parsers cannot drift apart:
+/// subject-inverted or contracted interrogatives (`did you have glm run`,
+/// `can't have glm run`) and clause-local negations (`don't have glm run`)
+/// void the verb; a declarative subject + auxiliary clause (`we have used
+/// glm`, `I did have glm run it`) describes rather than delegates; question
+/// form keeps only clause-initial verbs; and the noun-prone verbs (`run`,
+/// `get`, `launch`, `start`) delegate only from an imperative frame
+/// (`run glm on the failure`, never `review the run glm produced`).
+#[must_use]
+fn diagnostics_verb_clause_vetoed(
+    normalized: &str,
+    tokens: &[(String, usize)],
+    verb_index: usize,
+) -> bool {
+    let clause_initial = diagnostics_clause_initial(normalized, tokens, verb_index);
+    if crate::selector::is_question_form(normalized) && !clause_initial {
+        return true;
+    }
+    if crate::selector::DELEGATION_NOUN_PRONE_MARKERS.contains(&tokens[verb_index].0.as_str())
+        && !clause_initial
+    {
+        return true;
+    }
+    let mut scanned = 0;
+    let mut index = verb_index;
+    while index > 0 && scanned < 8 {
+        let (previous, previous_start) = &tokens[index - 1];
+        if normalized[previous_start + previous.len()..tokens[index].1]
+            .contains([',', '.', ';', '!', '?'])
+        {
+            return false;
+        }
+        index -= 1;
+        scanned += 1;
+        if crate::selector::DELEGATION_MARKER_NEGATIONS.contains(&tokens[index].0.as_str()) {
+            return true;
+        }
+        // Declarative subject + auxiliary (the auxiliary may be the verb
+        // itself, as in `we have used glm` / `I have glm fix it`).
+        if crate::selector::ENGLISH_DECLARATIVE_SUBJECTS.contains(&tokens[index].0.as_str())
+            && index + 1 < tokens.len()
+            && index + 1 <= verb_index
+            && crate::selector::ENGLISH_CLAUSE_AUXILIARIES
+                .contains(&tokens[index + 1].0.as_str())
+        {
+            return true;
+        }
+        if crate::selector::ENGLISH_CLAUSE_AUXILIARIES.contains(&tokens[index].0.as_str()) {
+            // `can't` / `shouldn't` contraction remnant after the auxiliary.
+            if normalized[tokens[index].1..].starts_with('\'') {
+                return true;
+            }
+            // Subject inversion: `did you have glm run it`.
+            if index + 1 < tokens.len()
+                && crate::selector::ENGLISH_CLAUSE_PRONOUNS
+                    .contains(&tokens[index + 1].0.as_str())
+            {
+                return true;
+            }
+            // Declarative subject directly before the auxiliary.
+            if index > 0
+                && crate::selector::ENGLISH_DECLARATIVE_SUBJECTS
+                    .contains(&tokens[index - 1].0.as_str())
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn is_cjk_agent_conjunction(character: char) -> bool {
     matches!(character, '和' | '跟' | '与' | '、' | '，' | ',')
 }
 
-/// NFKC-lowercased token scan for the English delegation branch: runs of
-/// alphanumerics, `-` and `_` with byte offsets into `normalized` (used to
-/// inspect raw separators such as commas between tokens).
 fn delegation_scan_tokens(normalized: &str) -> Vec<(String, usize)> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -7188,15 +9380,10 @@ fn delegation_scan_tokens(normalized: &str) -> Vec<(String, usize)> {
     tokens
 }
 
-/// English list conjunctions that join delegated agent names
-/// (`Have glm and grok study this`).
 fn is_english_agent_conjunction(token: &str) -> bool {
     matches!(token, "and" | "or")
 }
 
-/// True when the raw gap between two tokens contains an English list
-/// separator (comma or ampersand), so `Have glm, grok study this` chains
-/// even though tokenization drops the comma.
 fn gap_has_english_list_separator(
     normalized: &str,
     previous_end: usize,
@@ -7207,139 +9394,8 @@ fn gap_has_english_list_separator(
         .any(|character| matches!(character, ',' | '，' | '&'))
 }
 
-/// Raw-text list of names delegated by the English delegation verbs in
-/// `request` (lowercase runs, unioned across every verb occurrence): the
-/// head of each verb's list is the first non-function-word run after the
-/// verb, and every later run whose gap to the previous member contains a
-/// list separator (`,`/`，`/`&`) or that follows a `and`/`or` run is also a
-/// member. The walk stops at the first non-member run — the action clause.
-/// `Have glm review grok's output` yields only `glm` (grok is the review's
-/// object), and `Tell me whether glm or grok is better` yields nothing
-/// (`whether` is not a function word, so it becomes the head and is never a
-/// catalog mention).
-fn english_delegation_list(request: &str) -> Vec<String> {
-    english_delegation_list_by(request, false)
-}
-
-/// Negated projection of [`english_delegation_list_by`]: the lists of the
-/// NEGATED verbs (`Do not have glm study this` yields `glm`), used by the
-/// negated-intent probe.
-#[must_use]
-fn english_delegation_list_negated(request: &str) -> Vec<String> {
-    english_delegation_list_by(request, true)
-}
-
-/// Shared English delegation list parser: the verb-list runs under
-/// `expected_negated` — with `false` the non-negated verb lists (the names
-/// actually delegated), with `true` the lists of negated verbs (the names
-/// the user forbade). NFKC+lowercase parity with the selector scan:
-/// `Have ｇｌｍ study this` == `Have glm study this`. All offsets are in the
-/// normalized space.
-fn english_delegation_list_by(request: &str, expected_negated: bool) -> Vec<String> {
-    let normalized = normalized_lower(request);
-    let runs = ascii_identifier_runs(&normalized);
-    let mut members = std::collections::BTreeSet::new();
-    for (verb_index, (run, verb_start)) in runs.iter().enumerate() {
-        if !ENGLISH_DELEGATION_VERBS
-            .iter()
-            .any(|verb| run.eq_ignore_ascii_case(verb))
-        {
-            continue;
-        }
-        // A negated verb (`Do not have glm study this`, `Don't ask glm to
-        // review this`) is an instruction NOT to delegate.
-        let negated = english_verb_is_negated(&normalized, *verb_start);
-        if negated != expected_negated {
-            continue;
-        }
-        // Head: the first run after the verb that is not a function word.
-        let mut cursor = verb_index + 1;
-        let mut previous_end = 0usize;
-        let mut head = None;
-        while let Some((candidate, start)) = runs.get(cursor) {
-            if is_english_function_word(candidate) {
-                cursor += 1;
-                continue;
-            }
-            head = Some(candidate.to_ascii_lowercase());
-            previous_end = start + candidate.len();
-            cursor += 1;
-            break;
-        }
-        let Some(head) = head else {
-            continue;
-        };
-        members.insert(head);
-        // Chain: a `and`/`or` run or a separator-joined run continues the
-        // list; the first token that is neither ends it (the action clause).
-        loop {
-            let Some((candidate, start)) = runs.get(cursor) else {
-                break;
-            };
-            let conjunction = candidate.eq_ignore_ascii_case("and")
-                || candidate.eq_ignore_ascii_case("or");
-            let separated = !conjunction
-                && gap_has_english_list_separator(&normalized, previous_end, *start);
-            if !conjunction && !separated {
-                break;
-            }
-            if conjunction {
-                cursor += 1;
-                let Some((chained, chained_start)) = runs.get(cursor) else {
-                    break;
-                };
-                if is_english_function_word(chained) || !looks_like_agent_name(chained) {
-                    break;
-                }
-                members.insert(chained.to_ascii_lowercase());
-                previous_end = chained_start + chained.len();
-                cursor += 1;
-                continue;
-            }
-            if is_english_function_word(candidate) || !looks_like_agent_name(candidate) {
-                break;
-            }
-            members.insert(candidate.to_ascii_lowercase());
-            previous_end = start + candidate.len();
-            cursor += 1;
-        }
-    }
-    members.into_iter().collect()
-}
-
-/// True when the delegation verb starting at `verb_start` is negated in its
-/// clause (`Do not have glm study this`, `Don't ask glm to review this`): an
-/// instruction NOT to delegate. Checks the trailing clause before the verb
-/// for negation tokens (`not`/`never`/`dont`/`doesnt`/`didnt`/`cannot`/
-/// `cant`/`wont`) or a contracted `n't`.
-fn english_verb_is_negated(request: &str, verb_start: usize) -> bool {
-    let before = &request[..verb_start];
-    let clause = before
-        .rsplit(|c: char| {
-            matches!(
-                c,
-                '.' | ';' | '!' | '?' | ',' | '。' | '；' | '！' | '？' | '、' | '，'
-            )
-        })
-        .next()
-        .unwrap_or(before)
-        .to_ascii_lowercase();
-    let negated_token = clause
-        .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
-        .filter(|token| !token.is_empty())
-        .any(|token| {
-            matches!(
-                token,
-                "not" | "never" | "dont" | "doesnt" | "didnt" | "cannot" | "cant" | "wont"
-            )
-        });
-    negated_token || clause.contains("n't")
-}
-
-fn one_line(value: &str) -> String {
-    let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    collapsed.chars().take(80).collect()
-}
+/// Stored/wire bound for a task description (redacted, newlines preserved).
+const TASK_DESCRIPTION_MAX_CHARS: usize = 1024;
 
 fn escape_xml(value: &str) -> String {
     value
@@ -7350,60 +9406,65 @@ fn escape_xml(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-/// Per-line preview cap for `hub read_history` transcript labels, mirroring the
-/// tree-panel label style (prefix + first-line preview) with a slightly larger
-/// allowance than the TUI's 60-char row cap so a coach can read useful context.
-const HISTORY_LABEL_MAX_CHARS: usize = 120;
+/// Per-line preview cap for `hub read_history` transcript labels, mirroring
+/// the tree-panel label style (prefix + first-line preview) with a generous
+/// allowance so a coach reads real context on the subagent detail page.
+const HISTORY_LABEL_MAX_CHARS: usize = 1200;
 
-/// Renders a session transcript file into compact single-line labels, keeping
-/// the last `lines` FLAT rows. Labels are flattened into rows before the tail
-/// so a message that projects several rows (an assistant turn with multiple
-/// tool calls) cannot smuggle more than `lines` rows past the bound — the
-/// `lines` contract counts rendered lines, not messages. The file is either a
-/// durable child JSONL (session records) or the settle-time `.history.json`
-/// snapshot (a JSON array of [`pi_ai::Message`]); the format is sniffed from
-/// the first non-whitespace byte.
-fn render_history_file(path: &Path, lines: usize) -> Result<String> {
-    let data = fs::read(path).with_context(|| format!("reading history {}", path.display()))?;
-    if data.iter().copied().find(|byte| !byte.is_ascii_whitespace()) == Some(b'[') {
-        let messages: Vec<pi_ai::Message> = serde_json::from_slice(&data)
-            .with_context(|| format!("parsing history snapshot {}", path.display()))?;
-        let rendered = messages
-            .iter()
-            .flat_map(|message| history_message_label(message).lines().map(str::to_owned).collect::<Vec<_>>())
-            .collect::<Vec<_>>();
-        let start = rendered.len().saturating_sub(lines);
-        return Ok(rendered[start..].join("\n"));
-    }
-    let tree = crate::session_store::load_session_tree(path)
-        .with_context(|| format!("parsing session transcript {}", path.display()))?;
-    let rendered = tree
-        .entries
-        .iter()
-        .filter(|entry| entry.entry_type != "label" && entry.entry_type != "checkpoint")
-        .flat_map(|entry| history_entry_label(entry).lines().map(str::to_owned).collect::<Vec<_>>())
-        .collect::<Vec<_>>();
-    let start = rendered.len().saturating_sub(lines);
-    Ok(rendered[start..].join("\n"))
-}
+/// Leading indent of every continuation row. No label row starts with
+/// whitespace, so a consumer attributes an indented row to the label above it
+/// (the web details modal splits on exactly this indent).
+const HISTORY_CONTINUATION_INDENT: &str = "  ";
 
-/// Compact single-line labels for one transcript message, mirroring the
-/// tree-panel style: a type prefix plus a first-line preview. Assistant
-/// messages additionally project one readable line per tool call — the
-/// concrete action (target/selector/command/operation) — so a rendered
-/// history never reduces a child's work to generic `[tool: <name>]` tags;
-/// tool results stay tag-only with a reliably-known `· ok`/`· error` outcome
-/// so their output never floods the rendering.
+/// Closes a preview cut by any budget, so a reader never mistakes a truncated
+/// preview for the whole body. It is an ADDITIONAL row: the `*_PREVIEW_LINES`
+/// budgets count content rows, so a cut preview contributes at most
+/// `HISTORY_*_PREVIEW_LINES + 1` rows.
+const HISTORY_PREVIEW_TRUNCATED_MARKER: &str = "… [preview truncated]";
+
+/// Prose rows previewed after an assistant label row.
+const HISTORY_ASSISTANT_PREVIEW_LINES: usize = 40;
+
+/// Tool-result output preview budgets: rows and bytes per tool result.
+const HISTORY_TOOL_OUTPUT_PREVIEW_LINES: usize = 60;
+const HISTORY_TOOL_OUTPUT_PREVIEW_BYTES: usize = 5120;
+
+/// Compact labels for one transcript message, mirroring the tree-panel style:
+/// a type prefix plus a first-line preview. Assistant messages additionally
+/// project one readable line per tool call — the concrete action
+/// (target/selector/command/operation) — so a rendered history never reduces a
+/// child's work to generic `[tool: <name>]` tags, and follow their prose with
+/// up to [`HISTORY_ASSISTANT_PREVIEW_LINES`] indented continuation rows. A
+/// tool result keeps its reliably-known `· ok`/`· error` outcome on the row
+/// itself and follows it with a bounded indented output preview instead of raw
+/// unbounded output. Both previews are secret-scrubbed over the WHOLE body
+/// first (one implementation, [`crate::redact::redact_secrets`]), redacting the
+/// body's logical text concatenation before any row is cut: a cut applied
+/// first could strip a pattern's closing delimiter or its minimum token length
+/// and leak a credential prefix.
+/// EVERY branch scrubs its body before its own cut; the whole-payload pass
+/// in [`OrchestrationRuntime::read_child_history`] stays on top of that.
 fn history_message_label(message: &pi_ai::Message) -> String {
     let mut lines = Vec::new();
     match message {
         pi_ai::Message::User(user) => {
-            lines.push(format!("user: {}", first_line(&content_list_text(&user.content))));
+            let text = crate::redact::redact_secrets(&content_list_text(&user.content));
+            lines.push(format!("user: {}", first_line(&text)));
+            lines.extend(history_continuation_rows(
+                text.split(['\r', '\n']).skip(1),
+                HISTORY_ASSISTANT_PREVIEW_LINES,
+                None,
+            ));
         }
         pi_ai::Message::Assistant(assistant) => {
-            let text = assistant.text();
+            let text = crate::redact::redact_secrets(&assistant.text());
             if !text.trim().is_empty() {
                 lines.push(format!("assistant: {}", first_line(&text)));
+                lines.extend(history_continuation_rows(
+                    text.split(['\r', '\n']).skip(1),
+                    HISTORY_ASSISTANT_PREVIEW_LINES,
+                    None,
+                ));
             }
             // One readable line per call, in content order. `text()` above
             // drops ToolCall blocks, so walk `content` directly for the
@@ -7418,22 +9479,58 @@ fn history_message_label(message: &pi_ai::Message) -> String {
             }
         }
         pi_ai::Message::ToolResult(result) => {
-            // Output is never previewed; only the tool and its outcome. The
-            // `is_error` flag is authoritative, so nothing is fabricated.
-            let outcome = if result.is_error { " · error" } else { " · ok" };
+            // The outcome stays on the row (`is_error` is authoritative, so
+            // nothing is fabricated); the output follows as a bounded,
+            // indented preview so a coach can read what the child got back.
+            let outcome = if result.is_error {
+                " · error"
+            } else {
+                " · ok"
+            };
             lines.push(format!("[tool: {}]{outcome}", result.tool_name));
+            // Secret-scrub the whole output before any row is cut. The blocks
+            // are redacted as their LOGICAL CONCATENATION, with no separator
+            // inserted — the semantic the rest of the codebase uses for a
+            // message's text (`tool_presentation::content_blocks_text`,
+            // `AssistantMessage::text`) — so a private-key delimiter split
+            // across adjacent blocks still matches. Non-text blocks are
+            // skipped.
+            let output = crate::redact::redact_secrets(
+                &result
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        pi_ai::ContentBlock::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+            );
+            lines.extend(history_continuation_rows(
+                output.split(['\r', '\n']),
+                HISTORY_TOOL_OUTPUT_PREVIEW_LINES,
+                Some(HISTORY_TOOL_OUTPUT_PREVIEW_BYTES),
+            ));
         }
         pi_ai::Message::BashExecution(bash) => {
-            lines.push(format!("[bash] {}", first_line(&bash.command)));
+            let command = crate::redact::redact_secrets(&bash.command);
+            lines.push(format!("[bash] {}", first_line(&command)));
         }
         pi_ai::Message::Custom(custom) => {
-            lines.push(format!("custom: {}", first_line(&custom_content_text(&custom.content))));
+            let text = crate::redact::redact_secrets(&custom_content_text(&custom.content));
+            lines.push(format!("custom: {}", first_line(&text)));
+            lines.extend(history_continuation_rows(
+                text.split(['\r', '\n']).skip(1),
+                HISTORY_ASSISTANT_PREVIEW_LINES,
+                None,
+            ));
         }
         pi_ai::Message::BranchSummary(summary) => {
-            lines.push(format!("[branch summary] {}", first_line(&summary.summary)));
+            let text = crate::redact::redact_secrets(&summary.summary);
+            lines.push(format!("[branch summary] {}", first_line(&text)));
         }
         pi_ai::Message::CompactionSummary(summary) => {
-            lines.push(format!("[compaction] {}", first_line(&summary.summary)));
+            let text = crate::redact::redact_secrets(&summary.summary);
+            lines.push(format!("[compaction] {}", first_line(&text)));
         }
     }
     lines
@@ -7443,10 +9540,57 @@ fn history_message_label(message: &pi_ai::Message) -> String {
         .join("\n")
 }
 
+/// Indented continuation rows for the body of a row whose own label is already
+/// emitted and whose secrets are already scrubbed: at most `max_rows` content
+/// rows, each path-redacted exactly like a label
+/// ([`redact_absolute_path_tokens`] — no second redaction implementation) and
+/// capped at [`HISTORY_LABEL_MAX_CHARS`] including the indent, admitted only
+/// while the SERIALIZED block they form — every row plus its newline
+/// separator, with the marker row and its separator reserved — still fits
+/// `max_bytes` when that bound is given. Blank rows are dropped because
+/// consumers drop them too; whenever a budget cut content the marker row
+/// closes the preview, so text is never cut silently and never mid-row.
+fn history_continuation_rows<'a>(
+    body: impl Iterator<Item = &'a str>,
+    max_rows: usize,
+    max_bytes: Option<usize>,
+) -> Vec<String> {
+    let marker = format!("{HISTORY_CONTINUATION_INDENT}{HISTORY_PREVIEW_TRUNCATED_MARKER}");
+    let width = HISTORY_LABEL_MAX_CHARS - HISTORY_CONTINUATION_INDENT.len();
+    let mut rows: Vec<String> = Vec::new();
+    let mut bytes = 0usize;
+    let mut cut = false;
+    for line in body {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if rows.len() == max_rows {
+            cut = true;
+            break;
+        }
+        let row = format!(
+            "{HISTORY_CONTINUATION_INDENT}{}",
+            truncate_label(&redact_absolute_path_tokens(line), width)
+        );
+        // Charge this row's separator plus the reserved marker row and its
+        // separator: the budget bounds the block a caller actually joins.
+        let charged = 1 + row.len();
+        if max_bytes.is_some_and(|max| bytes + charged + 1 + marker.len() > max) {
+            cut = true;
+            break;
+        }
+        bytes += charged;
+        rows.push(row);
+    }
+    if cut {
+        rows.push(marker);
+    }
+    rows
+}
+
 /// Compact human-facing summary of one assistant tool call for history
-/// labels. Reuses [`crate::tool_presentation::compact_tool_arguments`] so the
-/// redaction rules stay a single source of truth — no second secret-filtering
-/// implementation here: file tools surface their repo-relative
+/// labels. Reuses the budgeted `compact_tool_arguments_with_budget`; file tools surface their repo-relative
 /// target/selector, `bash` its first concrete command, planning/messaging
 /// tools their operation + target, and unknown tools a safe compact digest
 /// (never raw JSON). Absolute machine paths never leak: a bare absolute
@@ -7454,10 +9598,17 @@ fn history_message_label(message: &pi_ai::Message) -> String {
 /// embedded anywhere in a command or argument digest are redacted to `[PATH]`
 /// (http/https URLs are preserved as targets).
 fn tool_call_summary(tool: &pi_ai::ToolCall) -> String {
-    let compact = crate::tool_presentation::compact_tool_arguments(&tool.arguments);
+    let compact = crate::tool_presentation::compact_tool_arguments_with_budget(
+        &tool.arguments,
+        HISTORY_LABEL_MAX_CHARS,
+    );
     let digest = compact.split_whitespace().collect::<Vec<_>>().join(" ");
     let digest = if is_absolute_path(&digest) && !is_http_url(&digest) {
-        digest.rsplit(['/', '\\']).next().unwrap_or(&digest).to_owned()
+        digest
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(&digest)
+            .to_owned()
     } else {
         digest
     };
@@ -7484,31 +9635,83 @@ fn is_http_url(value: &str) -> bool {
     value.starts_with("http://") || value.starts_with("https://")
 }
 
-/// Redact absolute machine-path tokens (Unix, home-relative, Windows drive)
-/// from a tool-call digest, keeping any `key=` prefix readable and preserving
-/// http/https URLs. Used ONLY for path redaction; secret shapes stay with the
-/// shared redactor ([`crate::tool_presentation::compact_tool_arguments`]).
 fn redact_absolute_path_tokens(value: &str) -> String {
     value
         .split_whitespace()
         .map(|token| {
-            if is_http_url(token) {
-                return token.to_owned();
-            }
-            // A key=value digest carries the path after the last '='.
-            let candidate = token.rsplit('=').next().unwrap_or(token);
-            if is_absolute_path(candidate) {
-                if candidate.len() == token.len() {
-                    "[PATH]".to_owned()
-                } else {
-                    format!("{}[PATH]", &token[..token.len() - candidate.len()])
-                }
+            if is_absolute_path(token) && !is_http_url(token) {
+                "[PATH]"
             } else {
-                token.to_owned()
+                token
             }
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Caps a rendered transcript at [`MAX_HISTORY_BYTES`]. The cut lands on a line
+/// boundary whenever the budget contains one — a partial row would render as a
+/// broken label in the panel — and falls back to a char boundary only for a
+/// single line longer than the whole budget; an explicit marker always closes
+/// the result.
+fn cap_history_bytes(mut rendered: String) -> String {
+    if rendered.len() <= MAX_HISTORY_BYTES {
+        return rendered;
+    }
+    let marker = format!("\n[history truncated at {} KiB]", MAX_HISTORY_BYTES / 1024);
+    let budget = MAX_HISTORY_BYTES.saturating_sub(marker.len());
+    let mut end = budget;
+    while !rendered.is_char_boundary(end) {
+        end -= 1;
+    }
+    if let Some(newline) = rendered[..end].rfind('\n') {
+        end = newline;
+    }
+    rendered.truncate(end);
+    rendered.push_str(&marker);
+    rendered
+}
+
+fn render_history_file(file: &RetainedHistoryFile, lines: usize) -> Result<String> {
+    let path = file.display_path();
+    let data = file
+        .read_bounded(MAX_HISTORY_FILE_BYTES)
+        .with_context(|| format!("reading history {}", path.display()))?;
+    if data
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        == Some(b'[')
+    {
+        let messages: Vec<pi_ai::Message> = serde_json::from_slice(&data)
+            .with_context(|| format!("parsing history snapshot {}", path.display()))?;
+        let rendered = messages
+            .iter()
+            .flat_map(|message| {
+                history_message_label(message)
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let start = rendered.len().saturating_sub(lines);
+        return Ok(rendered[start..].join("\n"));
+    }
+    let tree = crate::session_store::load_session_tree_from_file(file.session_file()?, &path)
+        .with_context(|| format!("parsing session transcript {}", path.display()))?;
+    let rendered = tree
+        .entries
+        .iter()
+        .filter(|entry| entry.entry_type != "label" && entry.entry_type != "checkpoint")
+        .flat_map(|entry| {
+            history_entry_label(entry)
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let start = rendered.len().saturating_sub(lines);
+    Ok(rendered[start..].join("\n"))
 }
 
 /// Compact single-line label for one session record. Message records delegate
@@ -7521,7 +9724,11 @@ fn history_entry_label(entry: &crate::session_store::SessionEntry) -> String {
     let (prefix, body) = match entry.entry_type.as_str() {
         "custom_message" => (
             "custom: ".to_owned(),
-            entry.content.as_ref().map(custom_content_text).unwrap_or_default(),
+            entry
+                .content
+                .as_ref()
+                .map(custom_content_text)
+                .unwrap_or_default(),
         ),
         "model_change" => (
             format!(
@@ -7532,22 +9739,33 @@ fn history_entry_label(entry: &crate::session_store::SessionEntry) -> String {
             String::new(),
         ),
         "thinking_level_change" => (
-            format!("[thinking: {}]", entry.thinking_level.as_deref().unwrap_or_default()),
+            format!(
+                "[thinking: {}]",
+                entry.thinking_level.as_deref().unwrap_or_default()
+            ),
             String::new(),
         ),
         "session_info" => (
             format!("[title: {}]", entry.name.as_deref().unwrap_or_default()),
             String::new(),
         ),
-        "compaction" => ("[compaction] ".to_owned(), entry.summary.clone().unwrap_or_default()),
-        "branch_summary" => {
-            ("[branch summary] ".to_owned(), entry.summary.clone().unwrap_or_default())
-        }
+        "compaction" => (
+            "[compaction] ".to_owned(),
+            entry.summary.clone().unwrap_or_default(),
+        ),
+        "branch_summary" => (
+            "[branch summary] ".to_owned(),
+            entry.summary.clone().unwrap_or_default(),
+        ),
         other => (format!("[{other}]"), String::new()),
     };
-    let preview = first_line(&body);
-    let composed = if preview.is_empty() { prefix } else { format!("{prefix}{preview}") };
-    truncate_label(composed.trim_end(), HISTORY_LABEL_MAX_CHARS)
+    let composed = if body.is_empty() {
+        prefix
+    } else {
+        format!("{prefix}{body}")
+    };
+    let redacted = crate::redact::redact_secrets(&composed);
+    truncate_label(first_line(&redacted).trim_end(), HISTORY_LABEL_MAX_CHARS)
 }
 
 /// Joins the text blocks of a content list with single spaces (mirrors the
@@ -7595,6 +9813,7 @@ fn truncate_label(value: &str, max_chars: usize) -> String {
 mod history_label_tests {
     use super::*;
     use pi_ai::{AssistantMessage, ContentBlock, ToolCall};
+    use std::fs;
 
     fn tool_call(name: &str, arguments: serde_json::Value) -> ContentBlock {
         ContentBlock::ToolCall(ToolCall {
@@ -7616,19 +9835,34 @@ mod history_label_tests {
         let message = assistant(vec![
             ContentBlock::text("checking the seed"),
             tool_call("read", serde_json::json!({ "path": "seed.txt" })),
-            tool_call("bash", serde_json::json!({ "command": "cargo build --release" })),
-            tool_call("hub", serde_json::json!({ "op": "send", "to": "worker", "message": "go" })),
+            tool_call(
+                "bash",
+                serde_json::json!({ "command": "cargo build --release" }),
+            ),
+            tool_call(
+                "hub",
+                serde_json::json!({ "op": "send", "to": "worker", "message": "go" }),
+            ),
             tool_call("yield", serde_json::json!({ "text": "deliverable done" })),
         ]);
         let label = history_message_label(&message);
         // Assistant text is preserved alongside the projected calls.
         assert!(label.contains("assistant: checking the seed"), "{label}");
         assert!(label.contains("assistant · read seed.txt"), "{label}");
-        assert!(label.contains("assistant · bash cargo build --release"), "{label}");
+        assert!(
+            label.contains("assistant · bash cargo build --release"),
+            "{label}"
+        );
         // Planning/messaging tools surface operation + target key fields.
-        assert!(label.contains("assistant · hub message=go, op=send, to=worker"), "{label}");
+        assert!(
+            label.contains("assistant · hub message=go, op=send, to=worker"),
+            "{label}"
+        );
         // Unknown tools get a safe compact digest, never raw JSON.
-        assert!(label.contains("assistant · yield text=deliverable done"), "{label}");
+        assert!(
+            label.contains("assistant · yield text=deliverable done"),
+            "{label}"
+        );
         // One readable line per call (text line + 4 call lines).
         assert_eq!(label.lines().count(), 5, "{label}");
         assert!(!label.contains("\"path\""), "no raw JSON dump: {label}");
@@ -7658,7 +9892,10 @@ mod history_label_tests {
         });
         assert_eq!(bash, "bash echo [REDACTED] second line", "{bash}");
         assert!(!bash.contains(&secret), "secret must be redacted: {bash}");
-        assert!(!bash.contains('\n'), "command must collapse to one line: {bash}");
+        assert!(
+            !bash.contains('\n'),
+            "command must collapse to one line: {bash}"
+        );
     }
 
     #[test]
@@ -7682,7 +9919,10 @@ mod history_label_tests {
             arguments: serde_json::json!({ "command": format!("cat <workspace>/secrets/{secret}.txt") }),
             thought_signature: None,
         });
-        assert_eq!(leaky, "bash cat <workspace>/secrets/[REDACTED].txt", "{leaky}");
+        assert_eq!(
+            leaky, "bash cat <workspace>/secrets/[REDACTED].txt",
+            "{leaky}"
+        );
         assert!(!leaky.contains(&secret), "secret must be redacted: {leaky}");
 
         // http/https URLs are targets, not machine paths: preserved verbatim.
@@ -7695,31 +9935,352 @@ mod history_label_tests {
         assert_eq!(curl, "bash curl https://example.com/api", "{curl}");
     }
 
-    #[test]
-    fn tool_result_labels_carry_ok_error_outcome_without_output() {
-        let ok = history_message_label(&pi_ai::Message::ToolResult(pi_ai::ToolResultMessage {
-            tool_call_id: "call-1".to_owned(),
-            tool_name: "read".to_owned(),
-            content: vec![pi_ai::ContentBlock::text("raw output that must not appear")],
+    fn tool_result(tool_name: &str, output: &str, is_error: bool) -> pi_ai::Message {
+        pi_ai::Message::ToolResult(pi_ai::ToolResultMessage {
+            tool_call_id: format!("call-{tool_name}"),
+            tool_name: tool_name.to_owned(),
+            content: vec![ContentBlock::text(output)],
             usage: None,
             details: None,
             added_tool_names: Vec::new(),
-            is_error: false,
+            is_error,
             timestamp: 0,
-        }));
-        assert_eq!(ok, "[tool: read] · ok", "{ok}");
+        })
+    }
 
-        let failed = history_message_label(&pi_ai::Message::ToolResult(pi_ai::ToolResultMessage {
-            tool_call_id: "call-2".to_owned(),
-            tool_name: "bash".to_owned(),
-            content: vec![pi_ai::ContentBlock::text("boom")],
-            usage: None,
-            details: None,
-            added_tool_names: Vec::new(),
-            is_error: true,
-            timestamp: 0,
-        }));
-        assert_eq!(failed, "[tool: bash] · error", "{failed}");
+    fn rows(label: &str) -> Vec<&str> {
+        label.lines().collect()
+    }
+
+    #[test]
+    fn assistant_reply_previews_the_first_lines_after_the_label_row() {
+        let short = assistant(vec![ContentBlock::text("first line\nsecond line\nthird line")]);
+        let label = history_message_label(&short);
+        assert_eq!(
+            rows(&label),
+            vec!["assistant: first line", "  second line", "  third line"],
+            "{label}"
+        );
+
+        let long = (1..=(HISTORY_ASSISTANT_PREVIEW_LINES * 2))
+            .map(|index| format!("answer {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let label = history_message_label(&assistant(vec![ContentBlock::text(long)]));
+        let lines = rows(&label);
+        assert_eq!(
+            lines.len(),
+            1 + HISTORY_ASSISTANT_PREVIEW_LINES + 1,
+            "label + preview + marker: {label}"
+        );
+        assert_eq!(lines[0], "assistant: answer 1");
+        for (offset, line) in lines[1..=HISTORY_ASSISTANT_PREVIEW_LINES].iter().enumerate() {
+            assert_eq!(*line, format!("  answer {}", offset + 2));
+        }
+        assert_eq!(
+            lines[HISTORY_ASSISTANT_PREVIEW_LINES + 1],
+            format!("{HISTORY_CONTINUATION_INDENT}{HISTORY_PREVIEW_TRUNCATED_MARKER}"),
+            "{label}"
+        );
+        assert!(
+            !label.contains(&format!("answer {}", HISTORY_ASSISTANT_PREVIEW_LINES + 5)),
+            "cut content absent: {label}"
+        );
+
+        // Blank prose lines are dropped, not previewed as empty rows.
+        let spaced = assistant(vec![ContentBlock::text("first\n\n   \nsecond")]);
+        assert_eq!(
+            rows(&history_message_label(&spaced)),
+            vec!["assistant: first", "  second"]
+        );
+    }
+
+    #[test]
+    fn tool_result_row_keeps_the_outcome_with_a_bounded_output_preview() {
+        // Row budget binds: short output lines preview the row budget and say so.
+        let many = (1..=(HISTORY_TOOL_OUTPUT_PREVIEW_LINES + 20))
+            .map(|index| format!("out {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let label = history_message_label(&tool_result("bash", &many, false));
+        let lines = rows(&label);
+        assert_eq!(lines[0], "[tool: bash] · ok", "{label}");
+        assert_eq!(
+            lines.len(),
+            1 + HISTORY_TOOL_OUTPUT_PREVIEW_LINES + 1,
+            "row + preview + marker: {label}"
+        );
+        assert_eq!(lines[1], "  out 1");
+        assert_eq!(
+            lines[HISTORY_TOOL_OUTPUT_PREVIEW_LINES],
+            format!("  out {HISTORY_TOOL_OUTPUT_PREVIEW_LINES}")
+        );
+        assert_eq!(
+            lines[HISTORY_TOOL_OUTPUT_PREVIEW_LINES + 1],
+            format!("{HISTORY_CONTINUATION_INDENT}{HISTORY_PREVIEW_TRUNCATED_MARKER}"),
+            "{label}"
+        );
+        assert!(
+            !label.contains(&format!("out {}", HISTORY_TOOL_OUTPUT_PREVIEW_LINES + 10)),
+            "cut content absent: {label}"
+        );
+        // Byte budget binds first for long rows, and the cut lands between
+        // whole output lines — never a silently truncated one.
+        let wide = (1..=(HISTORY_TOOL_OUTPUT_PREVIEW_LINES + 20))
+            .map(|index| format!("{index:02}{}", "y".repeat(400)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let label = history_message_label(&tool_result("bash", &wide, false));
+        let lines = rows(&label);
+        assert_eq!(lines[0], "[tool: bash] · ok", "{label}");
+        let preview = &lines[1..lines.len() - 1];
+        assert!(
+            preview.len() < HISTORY_TOOL_OUTPUT_PREVIEW_LINES,
+            "byte budget must bind before the row budget: {label}"
+        );
+        for (index, row) in preview.iter().enumerate() {
+            assert_eq!(
+                *row,
+                format!("  {:02}{}", index + 1, "y".repeat(400)),
+                "row {index} unchanged within the byte budget: {row:?}"
+            );
+        }
+        assert_eq!(
+            lines[lines.len() - 1],
+            format!("{HISTORY_CONTINUATION_INDENT}{HISTORY_PREVIEW_TRUNCATED_MARKER}"),
+            "{label}"
+        );
+        assert!(
+            !label.contains(&format!("{}y", HISTORY_TOOL_OUTPUT_PREVIEW_LINES)),
+            "rows past the byte budget are absent: {label}"
+        );
+        // A row longer than the label width is still cut at the width, marked.
+        let wider = history_message_label(&tool_result(
+            "bash",
+            &"y".repeat(HISTORY_LABEL_MAX_CHARS + 40),
+            false,
+        ));
+        assert!(rows(&wider)[1].ends_with('…'), "{wider}");
+        let serialized: usize = lines[1..].iter().map(|row| row.len() + 1).sum();
+        assert!(
+            serialized <= HISTORY_TOOL_OUTPUT_PREVIEW_BYTES,
+            "the joined continuation block stays within the byte budget: {serialized}"
+        );
+
+        // A failing result keeps `error` on the row and still previews output.
+        let failed = history_message_label(&tool_result("read", "boom\nmore detail", true));
+        assert_eq!(
+            rows(&failed),
+            vec!["[tool: read] · error", "  boom", "  more detail"],
+            "{failed}"
+        );
+
+        // Output without lines (or without text) renders the bare row.
+        let empty = history_message_label(&tool_result("read", "", false));
+        assert_eq!(empty, "[tool: read] · ok", "{empty}");
+    }
+
+    #[test]
+    fn tool_output_preview_never_leaks_a_private_key_block() {
+        // The block is far longer than the preview, so a redaction pass applied
+        // after the preview cuts would never see the closing delimiter.
+        let fill = "Zm9vYmFy".repeat(10);
+        let key = format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----",
+            std::iter::repeat_n(fill.as_str(), 40)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let label = history_message_label(&tool_result("bash", &key, false));
+        assert!(!label.contains("-----"), "no delimiter may survive: {label}");
+        assert!(!label.contains(&fill), "no key material: {label}");
+        assert_eq!(rows(&label), vec!["[tool: bash] · ok", "  [REDACTED]"], "{label}");
+
+        // Adjacent text blocks are one logical text: a delimiter split across
+        // them (either one, including mid-word) must still match, which rules
+        // out inserting any separator between blocks before redaction.
+        let body = std::iter::repeat_n(fill.as_str(), 40)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let split_key = |blocks: Vec<String>| {
+            let mut message = tool_result("bash", "unused", false);
+            if let pi_ai::Message::ToolResult(result) = &mut message {
+                result.content = blocks
+                    .iter()
+                    .map(|block| ContentBlock::text(block.as_str()))
+                    .collect();
+            }
+            let label = history_message_label(&message);
+            assert_eq!(
+                rows(&label),
+                vec!["[tool: bash] · ok", "  [REDACTED]"],
+                "{label}"
+            );
+            assert!(!label.contains("-----"), "delimiter fragment: {label}");
+            assert!(!label.contains("PRIVATE"), "delimiter fragment: {label}");
+            assert!(!label.contains(&fill), "key material: {label}");
+        };
+        split_key(vec![
+            format!("-----BEGIN PRIVATE KEY-----\n{body}"),
+            format!("{body}\n-----END PRIVATE KEY-----"),
+        ]);
+        split_key(vec![
+            "-----BEGIN PRI".to_owned(),
+            format!("VATE KEY-----\n{body}\n-----END PRIVATE KEY-----"),
+        ]);
+        split_key(vec![
+            format!("-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE"),
+            " KEY-----".to_owned(),
+        ]);
+    }
+
+    #[test]
+    fn tool_output_preview_never_leaks_a_credential_at_the_row_cut() {
+        let secret = ["s", "k-", "abcdefghijklmnop1234"].concat();
+        // The credential ends before the preview width, so it must arrive
+        // scrubbed rather than as a visible prefix.
+        let line = format!("{} {secret} tail", "a".repeat(100));
+        let label = history_message_label(&tool_result("bash", &line, false));
+        assert!(!label.contains("sk-"), "credential prefix leaked: {label}");
+        assert!(!label.contains(&secret), "{label}");
+        assert!(label.contains("[REDACTED]"), "{label}");
+
+        // A credential just inside the width cut, with content after it: the
+        // row is cut either way, but only a pass that runs before the cut
+        // leaves the scrubbed form (the shared patterns need the delimiter
+        // that separates the token from the padding).
+        let straddling = format!(
+            "{} {secret} {}",
+            "b".repeat(HISTORY_LABEL_MAX_CHARS - 19),
+            "z".repeat(30)
+        );
+        let label = history_message_label(&tool_result("bash", &straddling, false));
+        assert!(!label.contains("sk-"), "credential prefix leaked: {label}");
+        assert!(!label.contains(&secret), "{label}");
+        assert!(
+            label.contains("[REDACTED] zzzz…"),
+            "cut row keeps the scrubbed form: {label}"
+        );
+
+        // Assistant prose is scrubbed ahead of its own label/row cuts too.
+        let prose = assistant(vec![ContentBlock::text(format!(
+            "{} {secret} tail",
+            "c".repeat(HISTORY_LABEL_MAX_CHARS - 19)
+        ))]);
+        let label = history_message_label(&prose);
+        assert!(!label.contains("sk-"), "credential prefix leaked: {label}");
+        assert!(!label.contains(&secret), "{label}");
+    }
+
+    #[test]
+    fn continuation_rows_always_follow_a_label_row() {
+        let long = (1..=(HISTORY_ASSISTANT_PREVIEW_LINES * 2))
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cases = [
+            (
+                pi_ai::Message::user_text(format!("ask\n{long}"), 0),
+                HISTORY_ASSISTANT_PREVIEW_LINES + 1,
+                "a user turn previews its prose under the label",
+            ),
+            (
+                assistant(vec![ContentBlock::text(long.as_str())]),
+                HISTORY_ASSISTANT_PREVIEW_LINES + 1,
+                "assistant prose previews its tail",
+            ),
+            (
+                pi_ai::Message::Custom(pi_ai::CustomMessage {
+                    custom_type: "note".to_owned(),
+                    content: pi_ai::CustomMessageContent::from(format!("note\n{long}")),
+                    display: true,
+                    details: None,
+                    timestamp: 0,
+                }),
+                HISTORY_ASSISTANT_PREVIEW_LINES + 1,
+                "a custom message previews its prose under the label",
+            ),
+            (
+                tool_result("bash", long.as_str(), false),
+                HISTORY_TOOL_OUTPUT_PREVIEW_LINES + 1,
+                "tool output previews under its row",
+            ),
+        ];
+        for (message, continuations, case) in cases {
+            let label = history_message_label(&message);
+            let lines = rows(&label);
+            assert_eq!(
+                lines.len(),
+                continuations + 1,
+                "one label row plus its continuations ({case}): {label:?}"
+            );
+            assert!(
+                !lines[0].starts_with(HISTORY_CONTINUATION_INDENT),
+                "the first row of a message block is its label ({case}): {label:?}"
+            );
+            for line in &lines[1..] {
+                assert!(
+                    line.starts_with(HISTORY_CONTINUATION_INDENT),
+                    "a continuation without a preceding label ({case}): {label:?}"
+                );
+                assert!(
+                    !line.starts_with(&format!("{HISTORY_CONTINUATION_INDENT} ")),
+                    "continuations carry exactly one indent ({case}): {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn continuation_rows_redact_absolute_path_tokens() {
+        let secret_path = "/home/coach/.ssh/id_rsa";
+        let label = history_message_label(&tool_result(
+            "bash",
+            &format!("{secret_path}\nsee {secret_path} for the key\nplain line"),
+            false,
+        ));
+        assert!(!label.contains(secret_path), "path must be redacted: {label}");
+        assert_eq!(
+            rows(&label),
+            vec!["[tool: bash] · ok", "  [PATH]", "  see [PATH] for the key", "  plain line"],
+            "{label}"
+        );
+
+        // Prose continuations go through the same single redaction path.
+        let prose = assistant(vec![ContentBlock::text(format!(
+            "checked\nran {secret_path} twice"
+        ))]);
+        let label = history_message_label(&prose);
+        assert!(!label.contains(secret_path), "{label}");
+        assert!(label.contains("  ran [PATH] twice"), "{label}");
+    }
+
+    #[test]
+    fn history_byte_cap_cuts_on_a_line_boundary_with_a_marker() {
+        let marker = format!("\n[history truncated at {} KiB]", MAX_HISTORY_BYTES / 1024);
+        let line = format!("{}\n", "x".repeat(100));
+        let rendered = line.repeat(MAX_HISTORY_BYTES / line.len() + 10);
+        assert!(rendered.len() > MAX_HISTORY_BYTES, "fixture must exceed the cap");
+        let capped = cap_history_bytes(rendered.clone());
+        assert!(capped.len() <= MAX_HISTORY_BYTES, "{}", capped.len());
+        assert!(capped.ends_with(&marker), "explicit marker required");
+        let body = capped.strip_suffix(&marker).expect("marker suffix");
+        assert!(rendered.starts_with(body), "only new rows are dropped");
+        assert!(
+            rendered[body.len()..].starts_with('\n'),
+            "the cut lands on a line boundary, never mid-row"
+        );
+
+        // Under the cap the payload is returned unchanged, no marker.
+        let short = "user: ask\nassistant: reply".to_owned();
+        assert_eq!(cap_history_bytes(short.clone()), short);
+
+        // A single line longer than the whole budget has no line boundary to
+        // land on: the cut backs off to a char boundary and still says so.
+        let unbroken = "文".repeat(MAX_HISTORY_BYTES);
+        let capped = cap_history_bytes(unbroken);
+        assert!(capped.len() <= MAX_HISTORY_BYTES, "{}", capped.len());
+        assert!(capped.ends_with(&marker), "explicit marker required");
     }
 
     #[test]
@@ -7727,10 +10288,71 @@ mod history_label_tests {
         let long = "x".repeat(400);
         let message = assistant(vec![
             tool_call("read", serde_json::json!({ "path": long.clone() })),
-            tool_call("bash", serde_json::json!({ "command": long })),
+            tool_call("bash", serde_json::json!({ "command": long.clone() })),
         ]);
         let label = history_message_label(&message);
-        assert!(label.lines().all(|line| line.chars().count() <= HISTORY_LABEL_MAX_CHARS), "{label}");
+        assert!(
+            label
+                .lines()
+                .all(|line| line.chars().count() <= HISTORY_LABEL_MAX_CHARS),
+            "{label}"
+        );
+
+        // Continuation rows respect the same per-line cap, indent included, so
+        // the renderer never receives an over-wide row from either producer.
+        let wide = (1..=8).map(|_| long.clone()).collect::<Vec<_>>().join("\n");
+        for message in [
+            assistant(vec![ContentBlock::text(wide.as_str())]),
+            tool_result("bash", wide.as_str(), false),
+        ] {
+            let label = history_message_label(&message);
+            assert!(
+                label.lines().count() > 1,
+                "fixture must preview rows: {label}"
+            );
+            assert!(
+                label
+                    .lines()
+                    .all(|line| line.chars().count() <= HISTORY_LABEL_MAX_CHARS),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn rendered_history_redacts_secrets_inside_continuations() {
+        let secret = ["s", "k-", "abcdefghijklmnop1234"].concat();
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join("history.json");
+        let messages = vec![tool_result(
+            "bash",
+            &format!("wrote {secret} to disk\nsecond output row"),
+            false,
+        )];
+        fs::write(&path, serde_json::to_vec(&messages).expect("snapshot")).expect("write history");
+        let capabilities = CapabilityFs::new().expect("capability filesystem");
+        let file = capabilities
+            .open_exact_file(
+                CapabilityRootPurpose::OrchestrationArtifacts,
+                pi_sandbox::AbsolutePath::parse(path).expect("absolute history path"),
+            )
+            .expect("history capability");
+        let retained = RetainedHistoryFile::Artifact(Arc::new(file));
+        let rendered = render_history_file(&retained, HISTORY_TOOL_OUTPUT_PREVIEW_LINES + 1)
+            .expect("render");
+        assert!(
+            rendered.contains("  second output row"),
+            "continuations reach the wire: {rendered}"
+        );
+
+        // `read_child_history` applies exactly this redaction to the rendered
+        // text, so a secret inside a continuation row is scrubbed on the wire.
+        let wire = cap_history_bytes(crate::redact::redact_secrets(&rendered));
+        assert!(
+            !wire.contains(&secret),
+            "secret must never reach the wire: {wire}"
+        );
+        assert!(wire.contains("[REDACTED]"), "{wire}");
     }
 
     #[test]
@@ -7749,12 +10371,211 @@ mod history_label_tests {
             ]),
         ];
         fs::write(&path, serde_json::to_vec(&messages).expect("snapshot")).expect("write history");
-        let rendered = render_history_file(&path, 2).expect("render");
-        assert_eq!(rendered.lines().count(), 2, "lines bound must count flat rows: {rendered}");
-        assert!(rendered.contains("cargo check"), "last two flat rows kept: {rendered}");
-        assert!(rendered.contains("read b.txt"), "last two flat rows kept: {rendered}");
-        assert!(!rendered.contains("a.txt"), "older rows dropped: {rendered}");
-        assert!(!rendered.contains("line one"), "older rows dropped: {rendered}");
+        let capabilities = CapabilityFs::new().expect("capability filesystem");
+        let file = capabilities
+            .open_exact_file(
+                CapabilityRootPurpose::OrchestrationArtifacts,
+                pi_sandbox::AbsolutePath::parse(path).expect("absolute history path"),
+            )
+            .expect("history capability");
+        let retained = RetainedHistoryFile::Artifact(Arc::new(file));
+        let rendered = render_history_file(&retained, 2).expect("render");
+        assert_eq!(
+            rendered.lines().count(),
+            2,
+            "lines bound must count flat rows: {rendered}"
+        );
+        assert!(
+            rendered.contains("cargo check"),
+            "last two flat rows kept: {rendered}"
+        );
+        assert!(
+            rendered.contains("read b.txt"),
+            "last two flat rows kept: {rendered}"
+        );
+        assert!(
+            !rendered.contains("a.txt"),
+            "older rows dropped: {rendered}"
+        );
+        assert!(
+            !rendered.contains("line one"),
+            "older rows dropped: {rendered}"
+        );
+    }
+
+    #[test]
+    fn long_assistant_prose_is_preserved_with_its_ending() {
+        // Beyond the old 120-char label cut a paragraph reaches the details
+        // page whole — ending included — and a reply with more lines than
+        // the old four-row preview keeps every line without a cut marker.
+        let paragraph = "The child retried the flaky integration suite twice, isolated the race to the mailbox drain path, and landed a fix that keeps delivery exactly-once while shrinking settled bookkeeping.";
+        assert!(paragraph.chars().count() > 120);
+        let label = history_message_label(&assistant(vec![ContentBlock::text(paragraph)]));
+        assert!(label.contains(paragraph), "paragraph was cut: {label}");
+        assert!(!label.contains('…'), "{label}");
+        let reply = (1..=12)
+            .map(|index| format!("reasoning step {index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let label = history_message_label(&assistant(vec![ContentBlock::text(reply)]));
+        let lines = rows(&label);
+        assert_eq!(lines.len(), 12, "{label}");
+        assert_eq!(lines[11], "  reasoning step 12", "{label}");
+        assert!(!label.contains(HISTORY_PREVIEW_TRUNCATED_MARKER), "{label}");
+    }
+
+    #[test]
+    fn long_tool_targets_are_preserved_in_history_and_stay_bounded() {
+        // The concrete action is the point of a tool row: targets longer than
+        // the old compact-60 title cut stay readable in history (the public
+        // title contract itself is unchanged); anything beyond the raised
+        // budget is cut safely at a marked boundary.
+        let relative_path = "crates/pi-coding/src/orchestration/fixtures/nested/deep/module/history_rendering_fixture.rs";
+        let command = "cargo test -p pi-coding orchestration::runtime::history_label -- --nocapture --test-threads=1";
+        let label = history_message_label(&assistant(vec![
+            tool_call("read", serde_json::json!({ "path": relative_path })),
+            tool_call(
+                "grep",
+                serde_json::json!({
+                    "pattern": "exactly-once delivery with mailbox drain race and settled bookkeeping regression"
+                }),
+            ),
+            tool_call("bash", serde_json::json!({ "command": command })),
+        ]));
+        assert!(label.contains(relative_path), "{label}");
+        assert!(label.contains("settled bookkeeping regression"), "{label}");
+        assert!(label.contains(command), "{label}");
+        assert!(!label.contains("..."), "no silent cut: {label}");
+        let oversized = format!("generated/{}", "module/".repeat(400));
+        let label = history_message_label(&assistant(vec![tool_call(
+            "read",
+            serde_json::json!({ "path": oversized }),
+        )]));
+        assert!(label.ends_with('…'), "marked cut: {label}");
+        assert!(
+            label.lines().all(|line| line.chars().count() <= HISTORY_LABEL_MAX_CHARS),
+            "{label}"
+        );
+    }
+
+    #[test]
+    fn every_branch_scrubs_secrets_before_the_label_cut() {
+        // User, custom, bash-command and tool-output rows must all run the
+        // secret pass before their own label cut: a credential straddling the
+        // cut arrives scrubbed, never as a visible prefix.
+        let secret = ["s", "k-", "abcdefghijklmnop1234"].concat();
+        let straddling = |prefix: &str| {
+            format!(
+                "{prefix} {} {secret} {}",
+                "x".repeat(HISTORY_LABEL_MAX_CHARS - 30),
+                "y".repeat(40)
+            )
+        };
+        let cases = [
+            ("user", pi_ai::Message::user_text(straddling("ask"), 0)),
+            (
+                "custom",
+                pi_ai::Message::Custom(pi_ai::CustomMessage {
+                    custom_type: "orchestration_message".to_owned(),
+                    content: pi_ai::CustomMessageContent::from(straddling("note")),
+                    display: true,
+                    details: None,
+                    timestamp: 0,
+                }),
+            ),
+            (
+                "bash",
+                pi_ai::Message::BashExecution(pi_ai::BashExecutionMessage {
+                    command: straddling("echo"),
+                    output: String::new(),
+                    exit_code: None,
+                    cancelled: false,
+                    truncated: false,
+                    full_output_path: None,
+                    timestamp: 0,
+                    exclude_from_context: None,
+                }),
+            ),
+            ("tool", tool_result("bash", &straddling("out"), false)),
+        ];
+        for (branch, message) in cases {
+            let label = history_message_label(&message);
+            assert!(
+                !label.contains("sk-") && !label.contains(&secret),
+                "{branch} leaked a credential across the cut: {label}"
+            );
+            assert!(
+                label.contains("[REDACTED]"),
+                "{branch} must scrub before its label cut: {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn raised_history_ceiling_keeps_a_wide_transcript_whole() {
+        // The byte cap stays a retained backstop (covered by the cap test
+        // above); at the raised ceiling a wide multibyte transcript far past
+        // the old cap reaches the wire whole, ending included.
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join("history.json");
+        let wide = "文".repeat(4000);
+        let messages = (1..=40)
+            .map(|index| tool_result("bash", &format!("report {index:02} {wide}"), false))
+            .collect::<Vec<_>>();
+        fs::write(&path, serde_json::to_vec(&messages).expect("snapshot")).expect("write");
+        let capabilities = CapabilityFs::new().expect("capability filesystem");
+        let file = capabilities
+            .open_exact_file(
+                CapabilityRootPurpose::OrchestrationArtifacts,
+                pi_sandbox::AbsolutePath::parse(path).expect("absolute path"),
+            )
+            .expect("history capability");
+        let rendered = render_history_file(
+            &RetainedHistoryFile::Artifact(Arc::new(file)),
+            MAX_HISTORY_LINES,
+        )
+        .expect("render");
+        let wire = cap_history_bytes(crate::redact::redact_secrets(&rendered));
+        assert!(rendered.len() > 64 * 1024, "{}", rendered.len());
+        assert!(
+            wire.len() <= MAX_HISTORY_BYTES && !wire.contains("[history truncated"),
+            "{}",
+            wire.len()
+        );
+        assert!(wire.contains("report 40"), "ending reaches the wire");
+    }
+
+    #[test]
+    fn jsonl_non_message_records_scrub_secrets_before_the_label_cut() {
+        // Real child-transcript JSONL: non-message records (custom state,
+        // compaction) are redacted before their own label cut.
+        let secret = ["s", "k-", "abcdefghijklmnop1234"].concat();
+        let long = "x".repeat(HISTORY_LABEL_MAX_CHARS - 30);
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join("child.jsonl");
+        let header = "{\"type\":\"session\",\"version\":3,\"id\":\"detail-history-parity\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/w\"}";
+        let custom = format!("{{\"type\":\"custom_message\",\"id\":\"c1\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:01.000Z\",\"customType\":\"note\",\"content\":\"note {long} {secret} tail\",\"display\":true,\"details\":{{}}}}");
+        let compaction = format!("{{\"type\":\"compaction\",\"id\":\"c2\",\"parentId\":\"c1\",\"timestamp\":\"2026-01-01T00:00:02.000Z\",\"summary\":\"compacted {long} {secret} tail\"}}");
+        fs::write(&path, format!("{header}\n{custom}\n{compaction}\n")).expect("write jsonl");
+        let capabilities = CapabilityFs::new().expect("capability filesystem");
+        let file = capabilities
+            .open_exact_file(
+                CapabilityRootPurpose::SessionStore,
+                pi_sandbox::AbsolutePath::parse(path).expect("absolute path"),
+            )
+            .expect("history capability");
+        let rendered = render_history_file(
+            &RetainedHistoryFile::Session(Arc::new(file)),
+            MAX_HISTORY_LINES,
+        )
+        .expect("render");
+        assert!(
+            !rendered.contains(&secret) && !rendered.contains("sk-"),
+            "non-message record leaked a credential: {rendered}"
+        );
+        assert!(rendered.contains("custom: "), "{rendered}");
+        assert!(rendered.contains("[compaction] "), "{rendered}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
     }
 }
 
@@ -7770,9 +10591,10 @@ impl OrchestrationRuntime {
         definition: &AgentDefinition,
         reserved: &mut std::collections::BTreeSet<String>,
     ) -> Result<String> {
-        let Some(persona_root) = definition.persona_root() else {
+        if !definition.is_persona() {
             return self.allocate_unique_agent_id(requested, reserved);
-        };
+        }
+        let persona = &definition.name;
         validate_agent_id(requested)?;
         let mut suffix = 1u32;
         loop {
@@ -7782,17 +10604,13 @@ impl OrchestrationRuntime {
                 format!("{requested}_{suffix}")
             };
             validate_agent_id(&candidate)?;
-            let archive_exists = match fs::symlink_metadata(persona_archive_path(
-                &persona_root,
-                &candidate,
-            )?) {
-                Ok(_) => true,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("reading persona archive metadata for {candidate:?}")
-                    });
-                }
+            let relative = Path::new("sessions").join(format!("{candidate}.jsonl"));
+            let archive_exists = match self.inner.storage.persona_roots[persona].metadata(&relative)
+            {
+                Ok(metadata) if metadata.identity.kind() == EntryKind::RegularFile => true,
+                Ok(_) => bail!("persona archive for {candidate:?} is not a regular file"),
+                Err(error) if fs_missing(&error) => false,
+                Err(error) => return Err(error).context("reading persona archive identity"),
             };
             if !archive_exists && !self.agent_id_is_taken(&candidate, reserved) {
                 reserved.insert(candidate.clone());
@@ -7822,9 +10640,9 @@ impl OrchestrationRuntime {
                 let candidate = format!("{base}_{suffix}");
                 validate_agent_id(&candidate)?;
                 if self.agent_id_is_taken(&candidate, reserved) {
-                    suffix = suffix
-                        .checked_add(1)
-                        .ok_or_else(|| anyhow!("exhausted unique agent id suffixes for {base:?}"))?;
+                    suffix = suffix.checked_add(1).ok_or_else(|| {
+                        anyhow!("exhausted unique agent id suffixes for {base:?}")
+                    })?;
                     continue;
                 }
                 candidate
@@ -7834,13 +10652,9 @@ impl OrchestrationRuntime {
         }
     }
 
-    fn agent_id_is_taken(
-        &self,
-        id: &str,
-        reserved: &std::collections::BTreeSet<String>,
-    ) -> bool {
+    fn agent_id_is_taken(&self, id: &str, reserved: &std::collections::BTreeSet<String>) -> bool {
         reserved.contains(id)
-            || REGISTRY.get(&self.inner.group_id, id).is_some()
+            || self.inner.registry.get(self.group_id(), id).is_some()
             || self.inner.jobs.contains_identifier(id)
     }
 
@@ -7897,9 +10711,11 @@ pub(crate) fn register_test_agent(
     id: &str,
     history_path: Option<PathBuf>,
 ) {
-    REGISTRY
+    runtime
+        .inner
+        .registry
         .register(
-            &runtime.inner.group_id,
+            runtime.group_id(),
             AgentSnapshot {
                 id: id.to_owned(),
                 display_name: id.to_owned(),
@@ -7921,10 +10737,95 @@ pub(crate) fn register_test_agent(
             .expect("finish test agent");
     }
 }
+#[cfg(test)]
+struct IsolatedSessionFixture {
+    _agent: tempfile::TempDir,
+    _sessions: tempfile::TempDir,
+    _application: crate::Application,
+    _faux: pi_ai::providers::FauxProviderRegistration,
+    session: Session,
+}
+
+#[cfg(test)]
+async fn isolated_session(
+    root: &Path,
+    tools: Vec<AgentTool>,
+    stream_fn: Option<pi_agent::StreamFn>,
+) -> IsolatedSessionFixture {
+    let agent = tempfile::tempdir().expect("agent dir");
+    std::fs::write(
+        agent.path().join("settings.json"),
+        r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+    )
+    .expect("isolated sandbox settings");
+    let sessions = tempfile::tempdir().expect("session dir");
+    let mut resource_options = crate::ResourceManagerOptions::new(root);
+    resource_options.agent_dir = agent.path().to_path_buf();
+    resource_options.project_trust_override = Some(true);
+    resource_options.disable_extensions = true;
+    resource_options.disable_skills = true;
+    resource_options.disable_prompt_templates = true;
+    resource_options.disable_themes = true;
+    resource_options.disable_context_files = true;
+    let resources = crate::ResourceManager::new(resource_options).expect("resources");
+    let suffix = uuid::Uuid::now_v7().simple().to_string();
+    let model = pi_ai::Model {
+        id: format!("orchestration-fixture-{suffix}"),
+        name: "Orchestration Fixture".to_owned(),
+        api: format!("orchestration-fixture-api-{suffix}"),
+        provider: format!("orchestration-fixture-provider-{suffix}"),
+        base_url: "http://localhost:0".to_owned(),
+        ..pi_ai::Model::default()
+    };
+    let faux = pi_ai::providers::register_faux_provider(pi_ai::providers::FauxProviderOptions {
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+        models: vec![model.clone()],
+        chunk_size: 12,
+    });
+    let workspace = crate::WorkspaceRoots::new(root, Vec::<PathBuf>::new()).expect("workspace");
+    let session = Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
+        crate::SessionOptions {
+            model,
+            cwd: root.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(tools),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn,
+            auth_resolver: None,
+            auth_manager: None,
+        },
+        Vec::new(),
+        crate::ToolSelection::default(),
+        crate::ResourceDiscovery::Disabled,
+        workspace,
+        None,
+    )
+    .expect("session");
+    session.set_session_dir(sessions.path().to_path_buf());
+    session
+        .attach_resources(resources)
+        .await
+        .expect("attach resources");
+    let application = crate::Application::new(session.clone()).await;
+    IsolatedSessionFixture {
+        _agent: agent,
+        _sessions: sessions,
+        _application: application,
+        _faux: faux,
+        session,
+    }
+}
 
 #[cfg(test)]
 mod prompt_size_tests {
     use super::*;
+    use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn retention_runtime(
@@ -7941,12 +10842,9 @@ mod prompt_size_tests {
         )
         .expect("definition");
         let clock_now = now.clone();
-        let config = OrchestrationConfig::new(
-            AgentCatalog::from_agents(vec![definition]),
-            root,
-        )
-        .with_job_retention(max_retained, ttl)
-        .with_job_clock(Arc::new(move || clock_now.load(Ordering::SeqCst)));
+        let config = OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition]), root)
+            .with_job_retention(max_retained, ttl)
+            .with_job_clock(Arc::new(move || clock_now.load(Ordering::SeqCst)));
         OrchestrationRuntime::new(config, Arc::new(|_| Box::pin(async { unreachable!() })))
             .expect("runtime")
     }
@@ -7958,9 +10856,11 @@ mod prompt_size_tests {
         parent_id: Option<&str>,
         status: AgentStatus,
     ) {
-        REGISTRY
+        runtime
+            .inner
+            .registry
             .register(
-                &runtime.inner.group_id,
+                runtime.group_id(),
                 AgentSnapshot {
                     id: id.to_owned(),
                     display_name: "untrusted <display>".to_owned(),
@@ -7995,8 +10895,20 @@ mod prompt_size_tests {
         let root = tempfile::tempdir().expect("root");
         let runtime = prompt_runtime(root.path());
         // "Main" is pre-registered by the runtime itself.
-        register_peer(&runtime, "WorkerA", "task", Some("Main"), AgentStatus::Parked);
-        register_peer(&runtime, "WorkerB", "task", Some("Main"), AgentStatus::Parked);
+        register_peer(
+            &runtime,
+            "WorkerA",
+            "task",
+            Some("Main"),
+            AgentStatus::Parked,
+        );
+        register_peer(
+            &runtime,
+            "WorkerB",
+            "task",
+            Some("Main"),
+            AgentStatus::Parked,
+        );
 
         runtime.send("WorkerA", "WorkerB", "results ready", None);
         runtime.send("WorkerB", "WorkerA", "acknowledged", None);
@@ -8013,10 +10925,237 @@ mod prompt_size_tests {
         assert_eq!(log[2].to, "Main");
 
         // The recipient consumes its mailbox; the log is unchanged.
-        assert_eq!(runtime.inbox("WorkerB", false).len(), 1);
-        assert_eq!(runtime.inbox("WorkerB", true).len(), 0);
-        assert_eq!(runtime.delivered_messages().len(), 3, "consumption must not erase the log");
-        assert!(runtime.delivered_messages().iter().any(|message| message.body == "results ready"));
+        assert_eq!(runtime.inbox("WorkerB", false).expect("drain").len(), 1);
+        assert_eq!(runtime.inbox("WorkerB", true).expect("peek").len(), 0);
+        assert_eq!(
+            runtime.delivered_messages().len(),
+            3,
+            "consumption must not erase the log"
+        );
+        assert!(
+            runtime
+                .delivered_messages()
+                .iter()
+                .any(|message| message.body == "results ready")
+        );
+    }
+
+    #[test]
+    fn delivered_message_log_deduplicates_and_retains_newest_bound() {
+        let root = tempfile::tempdir().expect("root");
+        let runtime = prompt_runtime(root.path());
+        let duplicate_id = "message-duplicate";
+        runtime.record_delivered_message(MailboxMessage {
+            id: duplicate_id.to_owned(),
+            from: "Main".to_owned(),
+            to: "Main".to_owned(),
+            body: "old".to_owned(),
+            timestamp: 1,
+            reply_to: None,
+        });
+        for index in 0..DELIVERED_MESSAGE_LOG_CAP {
+            runtime.record_delivered_message(MailboxMessage {
+                id: format!("message-{index}"),
+                from: "Main".to_owned(),
+                to: "Main".to_owned(),
+                body: format!("body-{index}"),
+                timestamp: index as u64 + 2,
+                reply_to: None,
+            });
+        }
+        runtime.record_delivered_message(MailboxMessage {
+            id: duplicate_id.to_owned(),
+            from: "Main".to_owned(),
+            to: "Main".to_owned(),
+            body: "new".to_owned(),
+            timestamp: 500,
+            reply_to: None,
+        });
+
+        let log = runtime.delivered_messages();
+        assert_eq!(log.len(), DELIVERED_MESSAGE_LOG_CAP);
+        assert_eq!(log.last().expect("newest message").id, duplicate_id);
+        assert_eq!(log.last().expect("newest message").body, "new");
+        assert_eq!(
+            log.iter()
+                .filter(|message| message.id == duplicate_id)
+                .count(),
+            1,
+            "duplicate message ids are replaced, never retained twice"
+        );
+        assert!(
+            !log.iter().any(|message| message.id == "message-0"),
+            "the oldest message is evicted when the bounded log overflows"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_reports_processed_queued_and_failed_per_recipient() {
+        let root = tempfile::tempdir().expect("root");
+        let runtime = prompt_runtime(root.path());
+        register_peer(&runtime, "Waiter", "task", Some("Main"), AgentStatus::Idle);
+        register_peer(&runtime, "Queued", "task", Some("Main"), AgentStatus::Idle);
+        register_peer(&runtime, "Full", "task", Some("Main"), AgentStatus::Idle);
+        register_peer(
+            &runtime,
+            "Aborted",
+            "task",
+            Some("Main"),
+            AgentStatus::Aborted,
+        );
+        for index in 0..runtime.inner.config.mailbox_capacity {
+            let receipt = runtime.send("Main", "Full", &format!("fill-{index}"), None);
+            assert_eq!(receipt[0].outcome, DeliveryOutcome::Queued);
+        }
+        let waiter_runtime = runtime.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_runtime
+                .wait_message("Waiter", Some("Main"), Some(Duration::from_secs(1)), None)
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        let receipts = runtime.send("Main", "all", "broadcast", None);
+        let outcomes = receipts
+            .iter()
+            .map(|receipt| (receipt.to.as_str(), receipt.outcome))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(outcomes.get("Waiter"), Some(&DeliveryOutcome::Processed));
+        assert_eq!(outcomes.get("Queued"), Some(&DeliveryOutcome::Queued));
+        assert_eq!(outcomes.get("Full"), Some(&DeliveryOutcome::Failed));
+        assert!(
+            !outcomes.contains_key("Aborted"),
+            "broadcast excludes aborted recipients rather than reporting a false delivery"
+        );
+        let message = waiter
+            .await
+            .expect("waiter join")
+            .expect("wait result")
+            .expect("broadcast handoff");
+        assert_eq!(message.body, "broadcast");
+        assert_eq!(
+            runtime.inbox("Queued", true).expect("queued inbox").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn send_rejects_blank_oversized_invalid_and_unknown_senders() {
+        let root = tempfile::tempdir().expect("root");
+        let runtime = prompt_runtime(root.path());
+        register_peer(&runtime, "Worker", "task", Some("Main"), AgentStatus::Idle);
+
+        let blank = runtime.send("Main", "Worker", "   ", None);
+        assert_eq!(blank[0].outcome, DeliveryOutcome::Failed);
+        assert!(
+            blank[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("must not be empty"))
+        );
+
+        let oversized_body = "x".repeat(MAX_MESSAGE_BODY_BYTES + 1);
+        let oversized = runtime.send("Main", "Worker", &oversized_body, None);
+        assert_eq!(oversized[0].outcome, DeliveryOutcome::Failed);
+        assert!(
+            oversized[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("exceeds maximum"))
+        );
+
+        let invalid = runtime.send("bad sender", "Worker", "hello", None);
+        assert_eq!(invalid[0].outcome, DeliveryOutcome::Failed);
+        assert!(
+            invalid[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("invalid orchestration sender"))
+        );
+
+        let unknown = runtime.send("Missing", "Worker", "hello", None);
+        assert_eq!(unknown[0].outcome, DeliveryOutcome::Failed);
+        assert!(
+            unknown[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("unknown orchestration sender"))
+        );
+        assert!(
+            runtime
+                .inbox("Worker", true)
+                .expect("worker inbox")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn inbox_rejects_unknown_agents_and_rebind_window() {
+        let root = tempfile::tempdir().expect("root");
+        let runtime = prompt_runtime(root.path());
+        let unknown = runtime
+            .inbox("Missing", true)
+            .expect_err("unknown inbox must propagate an error");
+        assert!(
+            unknown.to_string().contains("unknown orchestration agent"),
+            "{unknown:#}"
+        );
+
+        runtime.inner.rebind_reserved.store(true, Ordering::Release);
+        let peek = runtime
+            .inbox("Main", true)
+            .expect_err("peek must fail closed during rebind");
+        assert!(
+            peek.to_string().contains("rebind is in progress"),
+            "{peek:#}"
+        );
+        let drain = runtime
+            .inbox("Main", false)
+            .expect_err("drain must fail closed during rebind");
+        assert!(
+            drain.to_string().contains("rebind is in progress"),
+            "{drain:#}"
+        );
+        runtime
+            .inner
+            .rebind_reserved
+            .store(false, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn wait_reply_claims_only_the_matching_correlation_id() {
+        let root = tempfile::tempdir().expect("root");
+        let runtime = prompt_runtime(root.path());
+        register_peer(&runtime, "Worker", "task", Some("Main"), AgentStatus::Idle);
+        let ask = runtime.send("Main", "Worker", "what is the path?", None);
+        let message_id = ask[0].message_id.clone().expect("ask correlation id");
+        runtime.send("Worker", "Main", "unrelated chatter", None);
+        runtime.send(
+            "Worker",
+            "Main",
+            "the path is src/lib.rs",
+            Some(message_id.clone()),
+        );
+        let reply = runtime
+            .wait_reply(
+                "Main",
+                Some("Worker"),
+                &message_id,
+                Some(Duration::from_secs(1)),
+                None,
+            )
+            .await
+            .expect("wait")
+            .expect("correlated reply");
+        assert_eq!(reply.body, "the path is src/lib.rs");
+        assert_eq!(reply.reply_to.as_deref(), Some(message_id.as_str()));
+        let leftover = runtime.inbox("Main", true).expect("peek");
+        assert_eq!(
+            leftover.len(),
+            1,
+            "unrelated mail stays in the mailbox: {leftover:?}"
+        );
+        assert_eq!(leftover[0].body, "unrelated chatter");
     }
 
     #[test]
@@ -8032,7 +11171,11 @@ mod prompt_size_tests {
         for index in 0..capacity {
             runtime.send("Main", "Cap", &format!("fill-{index}"), None);
         }
-        assert_eq!(runtime.inbox("Cap", true).len(), capacity, "mailbox at capacity");
+        assert_eq!(
+            runtime.inbox("Cap", true).expect("peek").len(),
+            capacity,
+            "mailbox at capacity"
+        );
         assert_eq!(
             runtime.send("Main", "Cap", "overflow", None)[0].outcome,
             DeliveryOutcome::Failed,
@@ -8047,20 +11190,36 @@ mod prompt_size_tests {
             reply_to: None,
         };
         assert!(
-            REGISTRY.restore_mailbox_message(&runtime.inner.group_id, "Cap", restored.clone()),
+            runtime.inner.registry.restore_mailbox_message(
+                runtime.group_id(),
+                "Cap",
+                restored.clone()
+            ),
             "restore must succeed even at capacity"
         );
-        let inbox = runtime.inbox("Cap", true);
-        assert_eq!(inbox.len(), capacity + 1, "restore returns the in-flight slot");
-        assert_eq!(inbox[0].id, "restored-1", "restored message returns to the front");
-        // Restoring the same committed message again replaces it, never doubles.
-        assert!(
-            REGISTRY.restore_mailbox_message(&runtime.inner.group_id, "Cap", restored.clone())
+        let inbox = runtime.inbox("Cap", true).expect("peek");
+        assert_eq!(
+            inbox.len(),
+            capacity + 1,
+            "restore returns the in-flight slot"
         );
-        let inbox = runtime.inbox("Cap", true);
+        assert_eq!(
+            inbox[0].id, "restored-1",
+            "restored message returns to the front"
+        );
+        // Restoring the same committed message again replaces it, never doubles.
+        assert!(runtime.inner.registry.restore_mailbox_message(
+            runtime.group_id(),
+            "Cap",
+            restored.clone()
+        ));
+        let inbox = runtime.inbox("Cap", true).expect("peek");
         assert_eq!(inbox.len(), capacity + 1, "id-dedup restore");
         assert_eq!(
-            inbox.iter().filter(|message| message.id == "restored-1").count(),
+            inbox
+                .iter()
+                .filter(|message| message.id == "restored-1")
+                .count(),
             1,
             "exactly one copy of the restored message"
         );
@@ -8082,32 +11241,31 @@ mod prompt_size_tests {
             None,
         )
         .expect("recorder");
-        let parent = Session::new(crate::SessionOptions {
-            model: pi_ai::Model::default(),
-            cwd: root.path().to_path_buf(),
-            system_prompt: String::new(),
-            thinking_level: ThinkingLevel::Off,
-            api_key: String::new(),
-            compaction: None,
-            stream_options: Default::default(),
-            tools: Some(Vec::new()),
-            before_tool_call: None,
-            after_tool_call: None,
-            stream_fn: None,
-            auth_resolver: None,
-        })
-        .expect("parent");
+        let parent_fixture = isolated_session(root.path(), Vec::new(), None).await;
+        let parent = &parent_fixture.session;
         parent.record(recorder).expect("record");
         let runtime = prompt_runtime(root.path());
-        runtime.bind_and_recover(&parent).expect("bind durable");
+        runtime.bind_and_recover(parent).expect("bind durable");
         assert!(runtime.is_durable(), "runtime must be durable-bound");
-        // Main is pre-registered and excluded from the durable state, so the
-        // enqueue persists cleanly.
-        runtime.send("Worker", "Main", "committed", None);
-        assert_eq!(runtime.inbox("Main", true).len(), 1);
+        // Main is pre-registered and excluded from the durable state. The raw
+        // peer fixture must keep its role equal to its id so its synthesized
+        // durable definition remains validation-consistent.
+        register_peer(
+            &runtime,
+            "Worker",
+            "Worker",
+            Some("Main"),
+            AgentStatus::Idle,
+        );
+        let receipt = runtime.send("Worker", "Main", "committed", None);
+        assert!(
+            receipt[0].error.is_none(),
+            "setup send must persist: {receipt:?}"
+        );
+        assert_eq!(runtime.inbox("Main", true).expect("peek").len(), 1);
         // Simulate the bridge acknowledgement (durable removal), then break
         // the sidecar so the restore persist must fail.
-        let message = runtime.inbox("Main", false).remove(0);
+        let message = runtime.inbox("Main", false).expect("drain").remove(0);
         let sidecar = runtime
             .inner
             .durable
@@ -8126,9 +11284,61 @@ mod prompt_size_tests {
                 || error.to_string().to_lowercase().contains("restor"),
             "{error:#}"
         );
-        let inbox = runtime.inbox("Main", true);
+        let inbox = runtime.inbox("Main", true).expect("peek");
         assert_eq!(inbox.len(), 1, "the in-memory restore must stand");
         assert_eq!(inbox[0].id, message.id);
+    }
+
+    #[tokio::test]
+    async fn acknowledge_persistence_failure_restores_child_mailbox_once() {
+        let root = tempfile::tempdir().expect("root");
+        let parent_dir = tempfile::tempdir().expect("parent sessions");
+        let recorder = crate::session_store::start_session_in(
+            root.path(),
+            Some(&pi_ai::Model::default()),
+            None,
+            Some(parent_dir.path()),
+            None,
+            None,
+        )
+        .expect("recorder");
+        let parent_fixture = isolated_session(root.path(), Vec::new(), None).await;
+        let parent = &parent_fixture.session;
+        parent.record(recorder).expect("record");
+        let runtime = prompt_runtime(root.path());
+        runtime.bind_and_recover(parent).expect("bind durable");
+        register_peer(
+            &runtime,
+            "Worker",
+            "Worker",
+            Some("Main"),
+            AgentStatus::Idle,
+        );
+        let receipt = runtime.send("Main", "Worker", "ack-fail", None);
+        assert!(
+            receipt[0].error.is_none(),
+            "setup send must persist: {receipt:?}"
+        );
+        let message_id = receipt[0].message_id.as_deref().expect("message id");
+        let sidecar = runtime
+            .inner
+            .durable
+            .lock()
+            .as_ref()
+            .expect("durable binding")
+            .sidecar_path();
+        std::fs::remove_file(&sidecar).expect("remove sidecar");
+        std::fs::create_dir(&sidecar).expect("block sidecar writes");
+
+        let error = runtime
+            .acknowledge_delivery("Worker", message_id)
+            .expect_err("ack persistence failure must propagate");
+        assert!(error.to_string().contains("persist"), "{error:#}");
+        let inbox = runtime
+            .inbox("Worker", true)
+            .expect("peek restored mailbox");
+        assert_eq!(inbox.len(), 1, "ack failure restores exactly one copy");
+        assert_eq!(inbox[0].id, message_id);
     }
 
     #[tokio::test]
@@ -8149,36 +11359,26 @@ mod prompt_size_tests {
             None,
         )
         .expect("recorder");
-        let parent = Session::new(crate::SessionOptions {
-            model: pi_ai::Model::default(),
-            cwd: root.path().to_path_buf(),
-            system_prompt: String::new(),
-            thinking_level: ThinkingLevel::Off,
-            api_key: String::new(),
-            compaction: None,
-            stream_options: Default::default(),
-            tools: Some(Vec::new()),
-            before_tool_call: None,
-            after_tool_call: None,
-            stream_fn: None,
-            auth_resolver: None,
-        })
-        .expect("parent");
+        let parent_fixture = isolated_session(root.path(), Vec::new(), None).await;
+        let parent = &parent_fixture.session;
         parent.record(recorder).expect("record");
         let runtime = prompt_runtime(root.path());
-        runtime.bind_and_recover(&parent).expect("bind durable");
+        runtime.bind_and_recover(parent).expect("bind durable");
         let mut events = runtime.subscribe();
-        let waiter_runtime = runtime.clone();
-        let waiter = tokio::spawn(async move {
-            waiter_runtime
-                .wait_message("Main", Some("Worker"), Some(Duration::from_secs(30)), None)
-                .await
-        });
-        tokio::task::yield_now().await;
-        // The enqueue persists while the sidecar is intact; the atomic
-        // handoff happens synchronously inside send.
+        register_peer(
+            &runtime,
+            "Worker",
+            "Worker",
+            Some("Main"),
+            AgentStatus::Idle,
+        );
+        let mut waiter = runtime
+            .register_waiter("Main", Some("Worker"), None)
+            .expect("register waiter before send");
+        // Registration is synchronous, so the send can atomically hand the
+        // committed message to this exact waiter without a scheduling race.
         let receipt = runtime.send("Worker", "Main", "handoff-persist-fail", None);
-        assert_eq!(receipt[0].outcome, DeliveryOutcome::Woken);
+        assert_eq!(receipt[0].outcome, DeliveryOutcome::Processed);
         // Break the sidecar so the waiter's consumption persist must fail.
         let sidecar = runtime
             .inner
@@ -8190,13 +11390,22 @@ mod prompt_size_tests {
             .to_path_buf();
         std::fs::remove_file(&sidecar).expect("remove sidecar");
         std::fs::create_dir(&sidecar).expect("sidecar path becomes directory");
-        let wait_result = waiter.await.expect("waiter join");
+        let wait_result = runtime
+            .wait_with_guard(
+                "Main",
+                Some("Worker"),
+                None,
+                &mut waiter,
+                Some(Duration::from_secs(3)),
+                None,
+            )
+            .await;
         assert!(
             wait_result.is_err(),
             "consumption persist failure must surface: {wait_result:?}"
         );
         assert_eq!(
-            runtime.inbox("Main", true).len(),
+            runtime.inbox("Main", true).expect("peek").len(),
             1,
             "exactly one restored copy of the handed-off message"
         );
@@ -8229,14 +11438,23 @@ mod prompt_size_tests {
         .await
         .expect("claimed and republished events");
         assert!(saw_claimed, "original claimed event must publish");
-        assert!(saw_republished, "republished non-claimed event must publish");
+        assert!(
+            saw_republished,
+            "republished non-claimed event must publish"
+        );
     }
 
     #[test]
     fn child_prompt_includes_stable_live_peer_roster_and_excludes_self() {
         let root = tempfile::tempdir().expect("root");
         let runtime = prompt_runtime(root.path());
-        register_peer(&runtime, "Zulu", "reviewer<&\"", Some("Main"), AgentStatus::Running);
+        register_peer(
+            &runtime,
+            "Zulu",
+            "reviewer<&\"",
+            Some("Main"),
+            AgentStatus::Running,
+        );
         register_peer(
             &runtime,
             "peer_token_abcdefgh",
@@ -8244,11 +11462,41 @@ mod prompt_size_tests {
             Some("Main"),
             AgentStatus::Running,
         );
-        register_peer(&runtime, "Alpha", "researcher", Some("Parent"), AgentStatus::Queued);
-        register_peer(&runtime, "Pending", "task", Some("Main"), AgentStatus::Running);
-        register_peer(&runtime, "Finished", "writer", Some("Main"), AgentStatus::Idle);
-        register_peer(&runtime, "Retained", "reviewer", Some("Main"), AgentStatus::Parked);
-        register_peer(&runtime, "Aborted", "task", Some("Main"), AgentStatus::Aborted);
+        register_peer(
+            &runtime,
+            "Alpha",
+            "researcher",
+            Some("Parent"),
+            AgentStatus::Queued,
+        );
+        register_peer(
+            &runtime,
+            "Pending",
+            "task",
+            Some("Main"),
+            AgentStatus::Running,
+        );
+        register_peer(
+            &runtime,
+            "Finished",
+            "writer",
+            Some("Main"),
+            AgentStatus::Idle,
+        );
+        register_peer(
+            &runtime,
+            "Retained",
+            "reviewer",
+            Some("Main"),
+            AgentStatus::Parked,
+        );
+        register_peer(
+            &runtime,
+            "Aborted",
+            "task",
+            Some("Main"),
+            AgentStatus::Aborted,
+        );
 
         let definition = runtime.catalog().get("task").expect("agent");
         let roster = runtime.sibling_roster("Pending");
@@ -8265,8 +11513,8 @@ mod prompt_size_tests {
             "</peer_roster>",
         );
         let roster_start = prompt.find("<peer_roster>").expect("roster start");
-        let roster_end = prompt.find("</peer_roster>").expect("roster end")
-            + "</peer_roster>".len();
+        let roster_end =
+            prompt.find("</peer_roster>").expect("roster end") + "</peer_roster>".len();
         assert_eq!(&prompt[roster_start..roster_end], expected);
         assert!(!prompt.contains("untrusted <display>"));
         assert!(!prompt[roster_start..roster_end].contains("Pending"));
@@ -8294,12 +11542,19 @@ mod prompt_size_tests {
 
         let roster = runtime.sibling_roster("Pending");
         assert!(roster.len() <= MAX_SIBLING_ROSTER_BYTES);
-        assert_eq!(roster.matches("  <peer ").count(), MAX_SIBLING_ROSTER_ENTRIES);
+        assert_eq!(
+            roster.matches("  <peer ").count(),
+            MAX_SIBLING_ROSTER_ENTRIES
+        );
         assert!(roster.contains("<peer id=\"Main\""));
         assert!(roster.contains("  <truncated />"));
         let ids = roster
             .lines()
-            .filter_map(|line| line.strip_prefix("  <peer id=\"")?.split_once('"').map(|(id, _)| id))
+            .filter_map(|line| {
+                line.strip_prefix("  <peer id=\"")?
+                    .split_once('"')
+                    .map(|(id, _)| id)
+            })
             .collect::<Vec<_>>();
         assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
     }
@@ -8324,8 +11579,8 @@ mod prompt_size_tests {
             .child_system_prompt(definition, "work", None, None, None, &roster)
             .expect("prompt");
         let roster_start = prompt.find("<peer_roster>").expect("roster start");
-        let roster_end = prompt.find("</peer_roster>").expect("roster end")
-            + "</peer_roster>".len();
+        let roster_end =
+            prompt.find("</peer_roster>").expect("roster end") + "</peer_roster>".len();
         let roster = &prompt[roster_start..roster_end];
         assert!(roster.len() <= MAX_SIBLING_ROSTER_BYTES);
         assert!(roster.matches("  <peer ").count() < MAX_SIBLING_ROSTER_ENTRIES);
@@ -8350,10 +11605,15 @@ mod prompt_size_tests {
             artifact_ref: None,
             history_ref: None,
         };
-        let error = REGISTRY
+        let error = runtime
+            .inner
+            .registry
             .register_batch(
-                &runtime.inner.group_id,
-                vec![snapshot("WouldInsert", "Main"), snapshot("InvalidParent", "Main\n")],
+                runtime.group_id(),
+                vec![
+                    snapshot("WouldInsert", "Main"),
+                    snapshot("InvalidParent", "Main\n"),
+                ],
                 runtime.inner.config.mailbox_capacity,
             )
             .expect_err("invalid batch rejected atomically");
@@ -8366,9 +11626,11 @@ mod prompt_size_tests {
     fn registration_rejects_control_characters_in_parent_id() {
         let root = tempfile::tempdir().expect("root");
         let runtime = prompt_runtime(root.path());
-        let error = REGISTRY
+        let error = runtime
+            .inner
+            .registry
             .register(
-                &runtime.inner.group_id,
+                runtime.group_id(),
                 AgentSnapshot {
                     id: "ValidChild".to_owned(),
                     display_name: "ignored".to_owned(),
@@ -8395,7 +11657,7 @@ mod prompt_size_tests {
         let factory_capture = captured.clone();
         let definition = super::super::definitions::parse_agent_definition(
             Path::new("task.md"),
-            "---\nname: task\ndescription: task\n---\nprompt",
+            "---\nname: task\ndescription: task\ntools: []\n---\nprompt",
             super::super::AgentDefinitionSource::Bundled,
             true,
         )
@@ -8446,6 +11708,77 @@ mod prompt_size_tests {
         ));
     }
 
+    #[tokio::test]
+    async fn spawned_task_description_survives_the_detail_budget() {
+        // The public job snapshot is where a coach reads what a spawn was
+        // asked to do: bounded redacted 1024 with newlines preserved (not the
+        // old collapsed 80-char cut), and the presentation wire keeps the
+        // stored text instead of re-cutting it.
+        let root = tempfile::tempdir().expect("root");
+        let definition = super::super::definitions::parse_agent_definition(
+            Path::new("task.md"),
+            "---\nname: task\ndescription: task\ntools: []\n---\nprompt",
+            super::super::AgentDefinitionSource::Bundled,
+            true,
+        )
+        .expect("definition");
+        let runtime = OrchestrationRuntime::new(
+            OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition]), root.path()),
+            Arc::new(|_| Box::pin(async { Err(anyhow!("stop after spawn")) })),
+        )
+        .expect("runtime");
+        let secret = ["s", "k-", "abcdefghijklmnop1234"].concat();
+        let assignment = format!(
+            "Investigate the failing subagent detail history rendering\nthe leaked {secret} token must not survive\n{}report the final verdict in the job result",
+            "filler ".repeat(20)
+        );
+        let spawn = runtime
+            .spawn_tasks(
+                "Main",
+                0,
+                vec![TaskItem {
+                    index: 0,
+                    id: "DetailProbe".to_owned(),
+                    agent: "task".to_owned(),
+                    assignment: assignment.clone(),
+                    todo_task_id: None,
+                    ..Default::default()
+                }],
+            )
+            .expect("spawn")
+            .remove(0);
+        let job = runtime
+            .jobs(Some(std::slice::from_ref(&spawn.job_id)))
+            .into_iter()
+            .next()
+            .expect("job snapshot");
+        let description = job.description.as_deref().expect("task description");
+        assert!(
+            description
+                .starts_with("Investigate the failing subagent detail history rendering\n"),
+            "{description}"
+        );
+        assert!(
+            description.ends_with("report the final verdict in the job result"),
+            "{description}"
+        );
+        assert!(
+            !description.contains(&secret) && description.contains("[REDACTED]"),
+            "{description}"
+        );
+        assert!(
+            description.chars().count() <= 1024,
+            "{}",
+            description.chars().count()
+        );
+        let presented = presentation_job_snapshot(job.clone());
+        assert_eq!(
+            presented.description.as_deref(),
+            Some(description),
+            "wire keeps the stored description"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn batch_children_each_receive_all_registered_siblings() {
         let root = tempfile::tempdir().expect("root");
@@ -8453,7 +11786,7 @@ mod prompt_size_tests {
         let factory_capture = captured.clone();
         let definition = super::super::definitions::parse_agent_definition(
             Path::new("task.md"),
-            "---\nname: task\ndescription: task\n---\nprompt",
+            "---\nname: task\ndescription: task\ntools: []\n---\nprompt",
             super::super::AgentDefinitionSource::Bundled,
             true,
         )
@@ -8505,14 +11838,14 @@ mod prompt_size_tests {
         let prompts = captured.lock();
         let first = prompts.get("First").expect("first prompt");
         let second = prompts.get("Second").expect("second prompt");
-        assert!(first.contains(
-            "<peer id=\"Second\" agent=\"task\" status=\"queued\" parent=\"Main\""
-        ));
+        assert!(
+            first.contains("<peer id=\"Second\" agent=\"task\" status=\"queued\" parent=\"Main\"")
+        );
         assert!(!first.contains("<peer id=\"First\""));
         assert!(first.contains("<peer id=\"Main\""));
-        assert!(second.contains(
-            "<peer id=\"First\" agent=\"task\" status=\"queued\" parent=\"Main\""
-        ));
+        assert!(
+            second.contains("<peer id=\"First\" agent=\"task\" status=\"queued\" parent=\"Main\"")
+        );
         assert!(!second.contains("<peer id=\"Second\""));
         assert!(second.contains("<peer id=\"Main\""));
     }
@@ -8538,15 +11871,12 @@ mod prompt_size_tests {
         }
     }
 
-    fn insert_retained_job(
-        runtime: &OrchestrationRuntime,
-        id: &str,
-        job_id: &str,
-        timestamp: u64,
-    ) {
-        REGISTRY
+    fn insert_retained_job(runtime: &OrchestrationRuntime, id: &str, job_id: &str, timestamp: u64) {
+        runtime
+            .inner
+            .registry
             .register(
-                &runtime.inner.group_id,
+                runtime.group_id(),
                 AgentSnapshot {
                     id: id.to_owned(),
                     display_name: id.to_owned(),
@@ -8590,11 +11920,84 @@ mod prompt_size_tests {
             .finish_agent(
                 id,
                 AgentStatus::Idle,
-                Some(runtime.inner.config.artifact_dir.join(format!("{id}-{job_id}.md"))),
-                Some(runtime.inner.config.artifact_dir.join(format!("{id}-{job_id}.history.json"))),
+                Some(
+                    runtime
+                        .inner
+                        .config
+                        .artifact_dir
+                        .join(format!("{id}-{job_id}.md")),
+                ),
+                Some(
+                    runtime
+                        .inner
+                        .config
+                        .artifact_dir
+                        .join(format!("{id}-{job_id}.history.json")),
+                ),
             )
             .expect("finish agent");
         runtime.inner.jobs.finish(job_id, result, timestamp);
+    }
+
+    fn attach_request_parent(runtime: &OrchestrationRuntime, child_id: &str, parent_id: &str) {
+        let definition = super::super::definitions::parse_agent_definition(
+            Path::new("task.md"),
+            "---\nname: task\ndescription: task\n---\nprompt",
+            super::super::AgentDefinitionSource::Bundled,
+            true,
+        )
+        .expect("definition");
+        let entry = runtime
+            .inner
+            .registry
+            .get(runtime.group_id(), child_id)
+            .expect("child");
+        *entry.durable_info.lock() = Some(DurableAgentInfo {
+            definition: super::super::persistence::persist_definition(&definition),
+            request: super::super::persistence::PersistedRequest {
+                child_id: child_id.to_owned(),
+                parent_id: parent_id.to_owned(),
+                depth: 1,
+                assignment: String::new(),
+                system_prompt: String::new(),
+                requested_tool_names: None,
+                thinking_level: None,
+                max_tools_per_agent: 16,
+                model_provider: None,
+                model_id: None,
+                output_schema: None,
+                schema_mode: None,
+            },
+            session_path: None,
+        });
+    }
+
+    fn assert_persisted_graph_valid(runtime: &OrchestrationRuntime) {
+        let agents = runtime.collect_persisted_agents();
+        let ids = agents
+            .iter()
+            .map(|agent| agent.snapshot.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let main = runtime.main_agent_id();
+        for agent in &agents {
+            if let Some(parent) = agent.snapshot.parent_id.as_deref() {
+                assert!(
+                    parent == main || ids.contains(parent),
+                    "snapshot parent {parent:?} missing for {}",
+                    agent.snapshot.id
+                );
+            }
+            let request_parent = agent.request.parent_id.as_str();
+            assert!(
+                request_parent == main || ids.contains(request_parent),
+                "request parent {request_parent:?} missing for {}",
+                agent.snapshot.id
+            );
+        }
+    }
+
+    fn registry_has(runtime: &OrchestrationRuntime, id: &str) -> bool {
+        runtime.inner.registry.get(runtime.group_id(), id).is_some()
     }
 
     #[tokio::test]
@@ -8608,9 +12011,11 @@ mod prompt_size_tests {
         let new_history = root.path().join("Shared-job-new.history.json");
         fs::write(&new_artifact, "new").expect("new artifact");
         fs::write(&new_history, "[]").expect("new history");
-        REGISTRY
+        runtime
+            .inner
+            .registry
             .finish(
-                &runtime.inner.group_id,
+                runtime.group_id(),
                 "Shared",
                 AgentStatus::Idle,
                 Some(new_artifact.clone()),
@@ -8663,7 +12068,9 @@ mod prompt_size_tests {
         assert_eq!(jobs[0].id, "job-new");
         assert!(!old_artifact.exists());
         assert_eq!(
-            runtime.resolve_read_uri("artifact://Shared").expect("new alias"),
+            runtime
+                .resolve_read_uri("artifact://Shared")
+                .expect("new alias"),
             new_artifact.canonicalize().expect("canonical new artifact"),
         );
         assert_eq!(fs::read_to_string(new_artifact).expect("new body"), "new");
@@ -8746,20 +12153,496 @@ mod prompt_size_tests {
     }
 
     #[tokio::test]
+    async fn prune_keeps_parent_named_by_jobless_parked_children() {
+        let root = tempfile::tempdir().expect("root");
+        let now = Arc::new(AtomicU64::new(1));
+        let runtime = retention_runtime(root.path(), now.clone(), 10, Duration::from_millis(10));
+        insert_retained_job(&runtime, "Parent", "job-parent", 1);
+        register_peer(
+            &runtime,
+            "audit-vm",
+            "task",
+            Some("Parent"),
+            AgentStatus::Parked,
+        );
+        register_peer(
+            &runtime,
+            "audit-web",
+            "task",
+            Some("Parent"),
+            AgentStatus::Parked,
+        );
+        now.store(12, Ordering::SeqCst);
+        let jobs = runtime.jobs(None);
+        assert!(!jobs.iter().any(|job| job.id == "job-parent"));
+        assert!(registry_has(&runtime, "Parent"));
+        assert!(registry_has(&runtime, "audit-vm"));
+        assert!(registry_has(&runtime, "audit-web"));
+        assert_persisted_graph_valid(&runtime);
+    }
+
+    #[tokio::test]
+    async fn prune_keeps_parent_named_only_by_request_parent_id() {
+        let root = tempfile::tempdir().expect("root");
+        let now = Arc::new(AtomicU64::new(1));
+        let runtime = retention_runtime(root.path(), now.clone(), 10, Duration::from_millis(10));
+        insert_retained_job(&runtime, "Parent", "job-parent", 1);
+        register_peer(
+            &runtime,
+            "audit-prover",
+            "task",
+            Some("Main"),
+            AgentStatus::Parked,
+        );
+        attach_request_parent(&runtime, "audit-prover", "Parent");
+        now.store(12, Ordering::SeqCst);
+        let jobs = runtime.jobs(None);
+        assert!(!jobs.iter().any(|job| job.id == "job-parent"));
+        assert!(registry_has(&runtime, "Parent"));
+        assert!(registry_has(&runtime, "audit-prover"));
+        assert_persisted_graph_valid(&runtime);
+    }
+
+    #[tokio::test]
+    async fn prune_keeps_mid_parent_while_grandchild_remains() {
+        let root = tempfile::tempdir().expect("root");
+        let now = Arc::new(AtomicU64::new(1));
+        let runtime = retention_runtime(root.path(), now.clone(), 10, Duration::from_millis(10));
+        insert_retained_job(&runtime, "Mid", "job-mid", 1);
+        register_peer(&runtime, "Child", "task", Some("Mid"), AgentStatus::Parked);
+        register_peer(
+            &runtime,
+            "Grandchild",
+            "task",
+            Some("Child"),
+            AgentStatus::Parked,
+        );
+        now.store(12, Ordering::SeqCst);
+        let jobs = runtime.jobs(None);
+        assert!(!jobs.iter().any(|job| job.id == "job-mid"));
+        assert!(registry_has(&runtime, "Mid"));
+        assert!(registry_has(&runtime, "Child"));
+        assert!(registry_has(&runtime, "Grandchild"));
+        assert_persisted_graph_valid(&runtime);
+    }
+
+    #[tokio::test]
+    async fn prune_one_settled_job_keeps_multi_job_agent() {
+        let root = tempfile::tempdir().expect("root");
+        let now = Arc::new(AtomicU64::new(20));
+        let runtime = retention_runtime(root.path(), now, 10, Duration::from_millis(10));
+        insert_retained_job(&runtime, "Shared", "job-old", 1);
+        runtime
+            .inner
+            .jobs
+            .insert(
+                JobSnapshot {
+                    id: "job-new".to_owned(),
+                    agent_id: "Shared".to_owned(),
+                    agent: "task".to_owned(),
+                    parent_id: "Main".to_owned(),
+                    description: None,
+                    todo_task_id: None,
+                    workflow_id: None,
+                    workflow_generation: None,
+                    status: JobStatus::Queued,
+                    created_at: 15,
+                    started_at: None,
+                    finished_at: None,
+                    result: None,
+                    soft_budget_exhausted: false,
+                },
+                CancellationToken::new(),
+            )
+            .expect("insert newer job");
+        let new_artifact = root.path().join("Shared-job-new.md");
+        let new_history = root.path().join("Shared-job-new.history.json");
+        fs::write(&new_artifact, "new").expect("new artifact");
+        fs::write(&new_history, "[]").expect("new history");
+        runtime
+            .finish_agent(
+                "Shared",
+                AgentStatus::Idle,
+                Some(new_artifact),
+                Some(new_history),
+            )
+            .expect("finish newer alias");
+        runtime.inner.jobs.finish(
+            "job-new",
+            retained_result("Shared", &runtime.inner.config.artifact_dir, "job-new"),
+            15,
+        );
+        let jobs = runtime.jobs(None);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, "job-new");
+        assert!(registry_has(&runtime, "Shared"));
+    }
+
+    #[tokio::test]
+    async fn prune_drops_expired_leaf_without_children() {
+        let root = tempfile::tempdir().expect("root");
+        let now = Arc::new(AtomicU64::new(1));
+        let runtime = retention_runtime(root.path(), now.clone(), 10, Duration::from_millis(10));
+        insert_retained_job(&runtime, "Leaf", "job-leaf", 1);
+        now.store(12, Ordering::SeqCst);
+        let jobs = runtime.jobs(None);
+        assert!(jobs.is_empty());
+        assert!(!registry_has(&runtime, "Leaf"));
+        assert_persisted_graph_valid(&runtime);
+    }
+
+    #[tokio::test]
+    async fn cleanup_keeps_parent_named_by_parked_children() {
+        let root = tempfile::tempdir().expect("root");
+        let runtime = retention_runtime(
+            root.path(),
+            Arc::new(AtomicU64::new(1)),
+            10,
+            Duration::from_secs(60),
+        );
+        insert_retained_job(&runtime, "Parent", "job-parent", 1);
+        register_peer(
+            &runtime,
+            "audit-deployer",
+            "task",
+            Some("Parent"),
+            AgentStatus::Parked,
+        );
+        runtime.cleanup_retained_jobs();
+        assert!(runtime.jobs(None).is_empty());
+        assert!(registry_has(&runtime, "Parent"));
+        assert!(registry_has(&runtime, "audit-deployer"));
+        assert_persisted_graph_valid(&runtime);
+    }
+
+    #[tokio::test]
+    async fn job_cancellation_publishes_terminal_job_update() {
+        let root = tempfile::tempdir().expect("root");
+        let runtime = prompt_runtime(root.path());
+        runtime
+            .inner
+            .jobs
+            .insert(
+                JobSnapshot {
+                    id: "job-running".to_owned(),
+                    agent_id: "Worker".to_owned(),
+                    agent: "task".to_owned(),
+                    parent_id: "Main".to_owned(),
+                    description: None,
+                    todo_task_id: None,
+                    workflow_id: None,
+                    workflow_generation: None,
+                    status: JobStatus::Running,
+                    created_at: 1,
+                    started_at: Some(1),
+                    finished_at: None,
+                    result: None,
+                    soft_budget_exhausted: false,
+                },
+                CancellationToken::new(),
+            )
+            .expect("insert running job");
+        let mut events = runtime.subscribe();
+
+        let cancelled = runtime
+            .cancel_jobs_result(&["job-running".to_owned()])
+            .expect("cancel job");
+
+        assert_eq!(cancelled, ["job-running"]);
+        let published = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(OrchestrationEvent::JobUpdated { job, .. }) = events.recv().await
+                    && job.id == "job-running"
+                {
+                    break job;
+                }
+            }
+        })
+        .await
+        .expect("terminal job update");
+        assert_eq!(
+            published
+                .result
+                .as_ref()
+                .and_then(|result| result.error.as_deref()),
+            Some("task cancelled"),
+        );
+        assert_eq!(runtime.jobs(Some(&cancelled))[0], published);
+    }
+
+    #[tokio::test]
+    async fn durable_job_cancellation_publishes_terminal_job_update() {
+        let root = tempfile::tempdir().expect("root");
+        let parent_dir = tempfile::tempdir().expect("parent sessions");
+        let recorder = crate::session_store::start_session_in(
+            root.path(),
+            Some(&pi_ai::Model::default()),
+            None,
+            Some(parent_dir.path()),
+            None,
+            None,
+        )
+        .expect("recorder");
+        let parent_fixture = isolated_session(root.path(), Vec::new(), None).await;
+        let parent = &parent_fixture.session;
+        parent.record(recorder).expect("record");
+        let runtime = prompt_runtime(root.path());
+        runtime.bind_and_recover(parent).expect("bind durable");
+        register_peer(
+            &runtime,
+            "Worker",
+            "Worker",
+            Some("Main"),
+            AgentStatus::Running,
+        );
+        runtime
+            .inner
+            .jobs
+            .insert(
+                JobSnapshot {
+                    id: "job-running".to_owned(),
+                    agent_id: "Worker".to_owned(),
+                    agent: "Worker".to_owned(),
+                    parent_id: "Main".to_owned(),
+                    description: None,
+                    todo_task_id: None,
+                    workflow_id: None,
+                    workflow_generation: None,
+                    status: JobStatus::Running,
+                    created_at: 1,
+                    started_at: Some(1),
+                    finished_at: None,
+                    result: None,
+                    soft_budget_exhausted: false,
+                },
+                CancellationToken::new(),
+            )
+            .expect("insert running job");
+        runtime.persist_state().expect("persist running job");
+        let mut events = runtime.subscribe();
+
+        let cancelled = runtime
+            .cancel_jobs_result(&["job-running".to_owned()])
+            .expect("cancel durable job");
+        assert_eq!(cancelled, ["job-running"]);
+        let published = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(OrchestrationEvent::JobUpdated { job, .. }) = events.recv().await
+                    && job.id == "job-running"
+                {
+                    break job;
+                }
+            }
+        })
+        .await
+        .expect("terminal job update");
+        assert_eq!(
+            published
+                .result
+                .as_ref()
+                .and_then(|result| result.error.as_deref()),
+            Some("task cancelled"),
+        );
+        let durable = runtime
+            .inner
+            .durable
+            .lock()
+            .as_ref()
+            .expect("durable binding")
+            .load()
+            .expect("load durable state");
+        let persisted = durable
+            .jobs
+            .iter()
+            .find(|job| job.id == "job-running")
+            .expect("persisted cancelled job");
+        assert_eq!(persisted.status, JobStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn restart_checkpoint_rejects_job_cancellation_without_rewriting_sidecar() {
+        let root = tempfile::tempdir().expect("root");
+        let parent_dir = tempfile::tempdir().expect("parent sessions");
+        let recorder = crate::session_store::start_session_in(
+            root.path(),
+            Some(&pi_ai::Model::default()),
+            None,
+            Some(parent_dir.path()),
+            None,
+            None,
+        )
+        .expect("recorder");
+        let parent_fixture = isolated_session(root.path(), Vec::new(), None).await;
+        let parent = &parent_fixture.session;
+        parent.record(recorder).expect("record");
+        let runtime = prompt_runtime(root.path());
+        runtime.bind_and_recover(parent).expect("bind durable");
+        register_peer(
+            &runtime,
+            "Running",
+            "Running",
+            Some("Main"),
+            AgentStatus::Running,
+        );
+        runtime
+            .inner
+            .jobs
+            .insert(
+                JobSnapshot {
+                    id: "job-running".to_owned(),
+                    agent_id: "Running".to_owned(),
+                    agent: "Running".to_owned(),
+                    parent_id: "Main".to_owned(),
+                    description: None,
+                    todo_task_id: None,
+                    workflow_id: None,
+                    workflow_generation: None,
+                    status: JobStatus::Running,
+                    created_at: 1,
+                    started_at: Some(1),
+                    finished_at: None,
+                    result: None,
+                    soft_budget_exhausted: false,
+                },
+                CancellationToken::new(),
+            )
+            .expect("insert running job");
+        runtime.persist_state().expect("persist running job");
+        runtime
+            .checkpoint_for_restart()
+            .expect("checkpoint restart");
+        let durable = runtime
+            .inner
+            .durable
+            .lock()
+            .as_ref()
+            .expect("durable binding")
+            .clone();
+        let before = durable.load().expect("load checkpointed sidecar");
+
+        let error = runtime
+            .cancel_jobs_result(&["job-running".to_owned()])
+            .expect_err("restart-frozen cancellation must fail");
+        assert!(
+            error.to_string().contains("restart-checkpointed"),
+            "{error:#}"
+        );
+        let after = durable.load().expect("reload checkpointed sidecar");
+        assert_eq!(
+            after, before,
+            "failed cancellation must not mutate the sidecar"
+        );
+        let job = after
+            .jobs
+            .iter()
+            .find(|job| job.id == "job-running")
+            .expect("running job remains durable");
+        assert_eq!(job.status, JobStatus::Running);
+        assert!(job.finished_at.is_none());
+        assert!(job.result.is_none());
+    }
+
+    #[tokio::test]
+    async fn restart_checkpoint_rejects_terminal_shutdown_without_rewriting_sidecar() {
+        let root = tempfile::tempdir().expect("root");
+        let parent_dir = tempfile::tempdir().expect("parent sessions");
+        let recorder = crate::session_store::start_session_in(
+            root.path(),
+            Some(&pi_ai::Model::default()),
+            None,
+            Some(parent_dir.path()),
+            None,
+            None,
+        )
+        .expect("recorder");
+        let parent_fixture = isolated_session(root.path(), Vec::new(), None).await;
+        let parent = &parent_fixture.session;
+        parent.record(recorder).expect("record");
+        let runtime = prompt_runtime(root.path());
+        runtime.bind_and_recover(parent).expect("bind durable");
+        register_peer(
+            &runtime,
+            "Running",
+            "Running",
+            Some("Main"),
+            AgentStatus::Running,
+        );
+        runtime
+            .inner
+            .jobs
+            .insert(
+                JobSnapshot {
+                    id: "job-running".to_owned(),
+                    agent_id: "Running".to_owned(),
+                    agent: "Running".to_owned(),
+                    parent_id: "Main".to_owned(),
+                    description: None,
+                    todo_task_id: None,
+                    workflow_id: None,
+                    workflow_generation: None,
+                    status: JobStatus::Running,
+                    created_at: 1,
+                    started_at: Some(1),
+                    finished_at: None,
+                    result: None,
+                    soft_budget_exhausted: false,
+                },
+                CancellationToken::new(),
+            )
+            .expect("insert running job");
+        runtime.persist_state().expect("persist running job");
+        runtime
+            .checkpoint_for_restart()
+            .expect("checkpoint restart");
+        let durable = runtime
+            .inner
+            .durable
+            .lock()
+            .as_ref()
+            .expect("durable binding")
+            .clone();
+        let before = durable.load().expect("load checkpointed sidecar");
+
+        let error = runtime
+            .shutdown()
+            .await
+            .expect_err("restart-frozen terminal shutdown must fail");
+        assert!(
+            error.to_string().contains("restart-checkpointed"),
+            "{error:#}"
+        );
+        assert_eq!(durable.load().expect("reload checkpointed sidecar"), before);
+    }
+
+    #[tokio::test]
     async fn owner_shutdown_removes_retained_physical_files_and_aliases() {
         let root = tempfile::tempdir().expect("root");
         let now = Arc::new(AtomicU64::new(1));
         let runtime = retention_runtime(root.path(), now, 10, Duration::from_secs(60));
         insert_retained_job(&runtime, "Owned", "job-owned", 1);
         let resolver = runtime.read_uri_resolver();
-        let artifact = resolver("artifact://Owned").expect("artifact");
+        let artifact = resolver.resolve_file("artifact://Owned").expect("artifact");
         runtime.shutdown().await;
-        assert!(!artifact.exists());
-        assert!(resolver("artifact://Owned").is_err());
+        assert!(!artifact.display_path().exists());
+        assert!(resolver.resolve_file("artifact://Owned").is_err());
     }
 
-
     fn runtime_with_skill(path: PathBuf) -> OrchestrationRuntime {
+        try_runtime_with_skill_source(path, crate::SkillSource::Explicit).expect("runtime")
+    }
+
+    fn try_runtime_with_skill_source(
+        path: PathBuf,
+        source: crate::SkillSource,
+    ) -> anyhow::Result<OrchestrationRuntime> {
+        try_runtime_with_skill_source_at(path.clone(), source, path.parent().expect("skill parent"))
+    }
+
+    fn try_runtime_with_skill_source_at(
+        path: PathBuf,
+        source: crate::SkillSource,
+        artifact_dir: &Path,
+    ) -> anyhow::Result<OrchestrationRuntime> {
         let definition = super::super::definitions::parse_agent_definition(
             Path::new("bounded.md"),
             "---\nname: bounded\ndescription: bounded\nautoloadSkills: [large]\n---\nprompt",
@@ -8767,11 +12650,20 @@ mod prompt_size_tests {
             true,
         )
         .expect("definition");
-        let mut config = OrchestrationConfig::new(
-            AgentCatalog::from_agents(vec![definition]),
-            path.parent().expect("skill parent"),
-        );
+        let mut config =
+            OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition]), artifact_dir);
         config.default_agent = "bounded".to_owned();
+        // Managed User/PackageGlobal skills require a real project-boundary
+        // authorization. Supply a sibling directory outside the skill files
+        // only when the source allows managed links; strict sources stay
+        // None so the fail-closed no-follow path is exercised unchanged.
+        let managed_project_boundary = if source.allows_managed_links() {
+            let boundary = artifact_dir.join("boundary");
+            fs::create_dir_all(&boundary).expect("boundary directory");
+            Some(boundary)
+        } else {
+            None
+        };
         config.skills.push(OrchestrationSkill {
             name: "large".to_owned(),
             description: "large".to_owned(),
@@ -8781,11 +12673,48 @@ mod prompt_size_tests {
             always_apply: false,
             hidden: false,
             disable_model_invocation: false,
-            source: crate::SkillSource::User,
+            source,
+            managed_project_boundary,
+            managed_root: source
+                .allows_managed_links()
+                .then(|| path.parent().expect("skill parent").to_path_buf()),
             trusted: true,
         });
         OrchestrationRuntime::new(config, Arc::new(|_| Box::pin(async { unreachable!() })))
-            .expect("runtime")
+    }
+    fn try_runtime_with_discovered_skills(
+        skills_root: &Path,
+        source: crate::SkillSource,
+        artifact_dir: &Path,
+    ) -> anyhow::Result<OrchestrationRuntime> {
+        let capabilities = crate::fs::CapabilityFs::new()?;
+        let project_boundary = artifact_dir.join("project-boundary");
+        fs::create_dir_all(&project_boundary)?;
+        let (skills, diagnostics) =
+            crate::resources::load_skills_from_dir_with_capabilities_and_boundary(
+                &capabilities,
+                &skills_root.to_string_lossy(),
+                source,
+                true,
+                true,
+                Some(&project_boundary),
+            );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let skill_name = skills.first().expect("discovered skill").name.clone();
+        let definition = super::super::definitions::parse_agent_definition(
+            Path::new("bounded.md"),
+            &format!(
+                "---\nname: bounded\ndescription: bounded\nautoloadSkills: [{skill_name}]\n---\nprompt"
+            ),
+            super::super::AgentDefinitionSource::Bundled,
+            true,
+        )
+        .expect("definition");
+        let mut config =
+            OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition]), artifact_dir);
+        config.default_agent = "bounded".to_owned();
+        config.skills = skills.iter().map(OrchestrationSkill::from).collect();
+        OrchestrationRuntime::new(config, Arc::new(|_| Box::pin(async { unreachable!() })))
     }
 
     #[test]
@@ -8811,9 +12740,338 @@ mod prompt_size_tests {
         let roster = runtime.sibling_roster("Pending");
         let error = runtime
             .child_system_prompt(definition, "work", None, None, None, &roster)
-            .expect_err("oversized rejected")
-            .to_string();
-        assert!(error.contains("exceeds maximum size"));
+            .expect_err("oversized rejected");
+        assert!(
+            error.chain().any(|source| {
+                source
+                    .downcast_ref::<crate::fs::FsError>()
+                    .is_some_and(|error| {
+                        matches!(
+                            error,
+                            crate::fs::FsError::ReadLimitExceeded { limit }
+                                if *limit == MAX_AUTOLOAD_SKILL_BYTES
+                        )
+                    })
+            }),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_global_skill_with_symlinked_directory_loads() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("root");
+        let skills = root.path().join("skills");
+        fs::create_dir_all(&skills).expect("skills dir");
+        // The visible `core` directory is a link to another directory retained
+        // inside the managed user skill root.
+        let real = skills.join(".managed-core");
+        fs::create_dir_all(&real).expect("real core dir");
+        fs::write(
+            real.join("SKILL.md"),
+            "---\nname: core\ndescription: managed core skill\n---\nbody\n",
+        )
+        .expect("skill body");
+        symlink(&real, skills.join("core")).expect("core dir symlink");
+
+        // User-sourced (global) skill must load through the symlinked dir
+        // instead of failing with FilesystemLoop. The orchestration artifact
+        // dir is a real (non-symlinked) path, as in production.
+        let artifacts = root.path().join("artifacts");
+        fs::create_dir_all(&artifacts).expect("artifacts dir");
+        let runtime =
+            try_runtime_with_discovered_skills(&skills, crate::SkillSource::User, &artifacts)
+                .expect("managed global skill must load through symlinked directory");
+        assert_eq!(runtime.skills().len(), 1);
+        let definition = runtime.catalog().get("bounded").expect("agent");
+        let prompt = runtime
+            .child_system_prompt(
+                definition,
+                "work",
+                None,
+                None,
+                None,
+                &runtime.sibling_roster("Pending"),
+            )
+            .expect("autoload managed directory skill");
+        assert!(
+            prompt.contains("managed core skill") && prompt.contains("body"),
+            "{prompt}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_global_skill_with_symlinked_skill_md_loads() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("root");
+        let skills = root.path().join("skills");
+        fs::create_dir_all(&skills).expect("skills dir");
+        fs::create_dir(skills.join("lib")).expect("lib dir");
+        let real = skills.join(".managed-lib");
+        fs::create_dir_all(&real).expect("real lib dir");
+        fs::write(
+            real.join("SKILL.md"),
+            "---\nname: lib\ndescription: managed lib skill\n---\nbody\n",
+        )
+        .expect("skill body");
+        // The SKILL.md entry itself is a link within the managed root.
+        symlink(real.join("SKILL.md"), skills.join("lib").join("SKILL.md"))
+            .expect("skill md symlink");
+
+        let runtime =
+            try_runtime_with_discovered_skills(&skills, crate::SkillSource::User, root.path())
+                .expect("managed global skill must load through symlinked SKILL.md");
+        assert_eq!(runtime.skills().len(), 1);
+        let definition = runtime.catalog().get("bounded").expect("agent");
+        let prompt = runtime
+            .child_system_prompt(
+                definition,
+                "work",
+                None,
+                None,
+                None,
+                &runtime.sibling_roster("Pending"),
+            )
+            .expect("autoload managed SKILL.md link");
+        assert!(
+            prompt.contains("managed lib skill") && prompt.contains("body"),
+            "{prompt}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_skill_with_external_directory_symlink_fails_closed() {
+        use std::os::unix::fs::symlink;
+
+        for source in [
+            crate::SkillSource::Project,
+            crate::SkillSource::PackageProject,
+            crate::SkillSource::Explicit,
+        ] {
+            let root = tempfile::tempdir().expect("root");
+            let project = root.path().join("project");
+            let skills = project.join(".pi").join("skills");
+            fs::create_dir_all(&skills).expect("skills dir");
+            let outside = root.path().join("outside");
+            fs::create_dir_all(&outside).expect("outside dir");
+            fs::write(
+                outside.join("SKILL.md"),
+                "---\nname: evil\ndescription: malicious\n---\nbody\n",
+            )
+            .expect("outside skill");
+            // Malicious project: a skill subdirectory symlinks outside the project.
+            symlink(&outside, skills.join("evil")).expect("evil dir symlink");
+            // Artifact dir stays inside the real project root, never through the
+            // malicious symlink.
+            let artifacts = project.join("artifacts");
+            fs::create_dir_all(&artifacts).expect("artifacts dir");
+
+            let error = match try_runtime_with_skill_source_at(
+                skills.join("evil").join("SKILL.md"),
+                source,
+                &artifacts,
+            ) {
+                Ok(_) => unreachable!(
+                    "strict skill with external directory symlink must fail closed for {source:?}"
+                ),
+                Err(error) => error,
+            };
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("symbolic links are not allowed"),
+                "missing diagnostic for {source:?}: {message}"
+            );
+            assert!(
+                message.contains("skill `large`"),
+                "missing skill name for {source:?}: {message}"
+            );
+            // The bounded diagnostic must never leak the absolute host path.
+            assert!(
+                !message.contains(outside.to_str().unwrap()),
+                "absolute outside path leaked for {source:?}: {message}"
+            );
+            assert!(
+                !message.contains(skills.join("evil").to_str().unwrap()),
+                "absolute symlink path leaked for {source:?}: {message}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_skill_with_external_skill_md_symlink_fails_closed() {
+        use std::os::unix::fs::symlink;
+
+        for source in [
+            crate::SkillSource::Project,
+            crate::SkillSource::PackageProject,
+            crate::SkillSource::Explicit,
+        ] {
+            let root = tempfile::tempdir().expect("root");
+            let project = root.path().join("project");
+            let skills = project.join(".pi").join("skills");
+            fs::create_dir_all(&skills).expect("skills dir");
+            fs::create_dir(skills.join("evil")).expect("evil dir");
+            let outside = root.path().join("outside.md");
+            fs::write(
+                &outside,
+                "---\nname: evil\ndescription: malicious\n---\nbody\n",
+            )
+            .expect("outside skill");
+            // Malicious project: SKILL.md itself symlinks outside the project.
+            symlink(&outside, skills.join("evil").join("SKILL.md")).expect("skill md symlink");
+
+            let error = match try_runtime_with_skill_source(
+                skills.join("evil").join("SKILL.md"),
+                source,
+            ) {
+                Ok(_) => unreachable!(
+                    "strict skill with external SKILL.md symlink must fail closed for {source:?}"
+                ),
+                Err(error) => error,
+            };
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("symbolic links are not allowed"),
+                "missing diagnostic for {source:?}: {message}"
+            );
+            assert!(
+                message.contains("skill `large`"),
+                "missing skill name for {source:?}: {message}"
+            );
+            assert!(
+                !message.contains(outside.to_str().unwrap()),
+                "absolute outside path leaked for {source:?}: {message}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_discovered_skill_inside_project_never_reaches_child_prompt() {
+        use std::os::unix::fs::symlink;
+
+        for trusted in [false, true] {
+            for source in [crate::SkillSource::User, crate::SkillSource::PackageGlobal] {
+                let root = tempfile::tempdir().expect("root");
+                let project = root.path().join("project");
+                let skills = root.path().join("global-skills");
+                let project_skill = project.join("linked");
+                fs::create_dir_all(&project_skill).expect("project skill");
+                fs::create_dir_all(&skills).expect("global skills");
+                fs::write(
+                    project_skill.join("SKILL.md"),
+                    "---\nname: linked\ndescription: project body\n---\nsecret\n",
+                )
+                .expect("skill body");
+                symlink(&project_skill, skills.join("linked")).expect("skill link");
+                let capabilities = crate::fs::CapabilityFs::new().expect("capabilities");
+                let (discovered, diagnostics) =
+                    crate::resources::load_skills_from_dir_with_capabilities_and_boundary(
+                        &capabilities,
+                        &skills.to_string_lossy(),
+                        source,
+                        trusted,
+                        true,
+                        Some(&project),
+                    );
+                assert!(discovered.is_empty(), "{discovered:?}");
+                assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+                assert!(diagnostics[0].message.contains("project boundary"));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_package_global_skill_with_symlinked_directory_loads() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("root");
+        let skills = root.path().join("skills");
+        fs::create_dir_all(&skills).expect("skills dir");
+        let real = skills.join(".managed-core");
+        fs::create_dir_all(&real).expect("real core dir");
+        fs::write(
+            real.join("SKILL.md"),
+            "---\nname: core\ndescription: managed core skill\n---\nbody\n",
+        )
+        .expect("skill body");
+        symlink(&real, skills.join("core")).expect("core dir symlink");
+
+        let artifacts = root.path().join("artifacts");
+        fs::create_dir_all(&artifacts).expect("artifacts dir");
+        let runtime = try_runtime_with_discovered_skills(
+            &skills,
+            crate::SkillSource::PackageGlobal,
+            &artifacts,
+        )
+        .expect("managed package-global skill must load through symlinked directory");
+        assert_eq!(runtime.skills().len(), 1);
+        let definition = runtime.catalog().get("bounded").expect("agent");
+        let prompt = runtime
+            .child_system_prompt(
+                definition,
+                "work",
+                None,
+                None,
+                None,
+                &runtime.sibling_roster("Pending"),
+            )
+            .expect("autoload managed directory skill");
+        assert!(
+            prompt.contains("managed core skill") && prompt.contains("body"),
+            "{prompt}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_package_global_skill_with_symlinked_skill_md_loads() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("root");
+        let skills = root.path().join("skills");
+        fs::create_dir_all(&skills).expect("skills dir");
+        fs::create_dir(skills.join("lib")).expect("lib dir");
+        let real = skills.join(".managed-lib");
+        fs::create_dir_all(&real).expect("real lib dir");
+        fs::write(
+            real.join("SKILL.md"),
+            "---\nname: lib\ndescription: managed lib skill\n---\nbody\n",
+        )
+        .expect("skill body");
+        // The SKILL.md entry itself is a link within the managed root.
+        symlink(real.join("SKILL.md"), skills.join("lib").join("SKILL.md"))
+            .expect("skill md symlink");
+
+        let runtime = try_runtime_with_discovered_skills(
+            &skills,
+            crate::SkillSource::PackageGlobal,
+            root.path(),
+        )
+        .expect("managed package-global skill must load through symlinked SKILL.md");
+        assert_eq!(runtime.skills().len(), 1);
+        let definition = runtime.catalog().get("bounded").expect("agent");
+        let prompt = runtime
+            .child_system_prompt(
+                definition,
+                "work",
+                None,
+                None,
+                None,
+                &runtime.sibling_roster("Pending"),
+            )
+            .expect("autoload managed SKILL.md link");
+        assert!(
+            prompt.contains("managed lib skill") && prompt.contains("body"),
+            "{prompt}"
+        );
     }
 
     #[test]
@@ -8844,7 +13102,10 @@ mod prompt_size_tests {
         assert_eq!(wire["historyRef"], "history://worker-1");
 
         let mut legacy = wire;
-        legacy.as_object_mut().expect("snapshot object").remove("agent");
+        legacy
+            .as_object_mut()
+            .expect("snapshot object")
+            .remove("agent");
         let decoded: AgentSnapshot =
             serde_json::from_value(legacy).expect("deserialize legacy agent snapshot");
         assert_eq!(decoded.agent, "");
@@ -8952,16 +13213,12 @@ mod prompt_size_tests {
         )
         .expect("definition");
         let definition_for_hook = definition.clone();
-        let mut config = OrchestrationConfig::new(
-            AgentCatalog::from_agents(vec![definition]),
-            root,
-        );
+        let mut config =
+            OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition]), root);
         config.soft_budget = budget;
-        let runtime = OrchestrationRuntime::new(
-            config,
-            Arc::new(|_| Box::pin(async { unreachable!() })),
-        )
-        .expect("runtime");
+        let runtime =
+            OrchestrationRuntime::new(config, Arc::new(|_| Box::pin(async { unreachable!() })))
+                .expect("runtime");
         (runtime, definition_for_hook)
     }
 
@@ -8997,7 +13254,10 @@ mod prompt_size_tests {
             .expect("configured budget must build a stop hook");
         assert!(!hook(&budget_turn(0)), "first request stays under the cap");
         assert!(hook(&budget_turn(0)), "second request reaches the cap");
-        assert!(state.triggered.load(Ordering::Relaxed), "budget marks the job");
+        assert!(
+            state.triggered.load(Ordering::Relaxed),
+            "budget marks the job"
+        );
 
         // Token cap: 100 tokens per turn against a 150-token budget.
         let (token_runtime, token_definition) = budget_runtime(
@@ -9012,7 +13272,10 @@ mod prompt_size_tests {
         let token_hook = token_runtime
             .soft_budget_stop_hook(&token_definition, &token_state)
             .expect("token budget must build a stop hook");
-        assert!(!token_hook(&budget_turn(100)), "100 tokens stay under the cap");
+        assert!(
+            !token_hook(&budget_turn(100)),
+            "100 tokens stay under the cap"
+        );
         assert!(
             token_hook(&budget_turn(100)),
             "200 cumulative tokens exceed the cap"
@@ -9033,141 +13296,325 @@ mod prompt_size_tests {
             "unlimited budget must preserve run-to-completion behavior"
         );
     }
+
+    #[tokio::test]
+    async fn wait_jobs_resolves_only_when_every_requested_child_is_terminal() {
+        // P0 (parent Task Done while a child is still Running): a parent wait
+        // spanning several children must never resolve while any requested
+        // job is still non-terminal — a partially settled batch is not a
+        // settled batch.
+        let root = tempfile::tempdir().expect("root");
+        let runtime = prompt_runtime(root.path());
+        for (id, agent_id) in [("job-alpha", "Alpha"), ("job-beta", "Beta")] {
+            runtime
+                .inner
+                .jobs
+                .insert(
+                    JobSnapshot {
+                        id: id.to_owned(),
+                        agent_id: agent_id.to_owned(),
+                        agent: "task".to_owned(),
+                        parent_id: "Main".to_owned(),
+                        description: None,
+                        todo_task_id: None,
+                        workflow_id: None,
+                        workflow_generation: None,
+                        status: JobStatus::Running,
+                        created_at: 1,
+                        started_at: Some(1),
+                        finished_at: None,
+                        result: None,
+                        soft_budget_exhausted: false,
+                    },
+                    CancellationToken::new(),
+                )
+                .expect("insert running job");
+        }
+        let completed = TaskResult {
+            index: 0,
+            id: "Alpha".to_owned(),
+            agent: "task".to_owned(),
+            status: AgentStatus::Idle,
+            output: "alpha done".to_owned(),
+            usage: pi_ai::Usage::default(),
+            soft_budget_exhausted: false,
+            error: None,
+            structured_output: None,
+            artifact_ref: "agent://Alpha".to_owned(),
+            history_ref: "history://Alpha".to_owned(),
+            artifact_uri: "artifact://Alpha".to_owned(),
+        };
+        runtime
+            .inner
+            .jobs
+            .finish("job-alpha", completed, 2)
+            .expect("alpha settles");
+
+        let ids = vec!["job-alpha".to_owned(), "job-beta".to_owned()];
+        let mut wait = tokio::spawn({
+            let runtime = runtime.clone();
+            async move { runtime.wait_jobs(&ids, None, None).await }
+        });
+        let early = tokio::time::timeout(Duration::from_millis(150), &mut wait).await;
+        assert!(
+            early.is_err(),
+            "wait_jobs must not resolve while any requested child is non-terminal: {early:?}"
+        );
+
+        let beta = TaskResult {
+            index: 0,
+            id: "Beta".to_owned(),
+            agent: "task".to_owned(),
+            status: AgentStatus::Idle,
+            output: "beta done".to_owned(),
+            usage: pi_ai::Usage::default(),
+            soft_budget_exhausted: false,
+            error: None,
+            structured_output: None,
+            artifact_ref: "agent://Beta".to_owned(),
+            history_ref: "history://Beta".to_owned(),
+            artifact_uri: "artifact://Beta".to_owned(),
+        };
+        runtime
+            .inner
+            .jobs
+            .finish("job-beta", beta, 3)
+            .expect("beta settles");
+        let settled = tokio::time::timeout(Duration::from_secs(3), wait)
+            .await
+            .expect("wait resolves once every requested child is terminal")
+            .expect("wait join")
+            .expect("wait result");
+        assert_eq!(settled.len(), 2);
+        assert!(
+            settled.iter().all(|job| job.status.is_settled()),
+            "{settled:#?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn explicit_shutdown_waiting_child_terminates_exactly_once_and_never_revives() {
+        // P0 (Waiting child + explicit runtime-wide shutdown): a child blocked
+        // in a hub wait is authoritative Waiting/Running work. Explicit
+        // shutdown must transition it to terminal EXACTLY ONCE with the
+        // `orchestration shut down` reason, publish exactly one terminal job
+        // update, never hang, and never revive it after reopening the same
+        // parent.
+        let root = tempfile::tempdir().expect("root");
+        let parent_dir = tempfile::tempdir().expect("parent sessions");
+        let recorder = crate::session_store::start_session_in(
+            root.path(),
+            Some(&pi_ai::Model::default()),
+            None,
+            Some(parent_dir.path()),
+            None,
+            None,
+        )
+        .expect("recorder");
+        recorder.persist_now().expect("materialize parent header");
+        let parent_fixture = isolated_session(root.path(), Vec::new(), None).await;
+        let parent = parent_fixture.session.clone();
+        parent.record(recorder).expect("record parent");
+        let (parent_id, parent_path) = parent.recorder_info().expect("parent recorder info");
+        let sidecar = parent_path
+            .parent()
+            .expect("parent directory")
+            .join("children")
+            .join(&parent_id)
+            .join("orchestration-state.json");
+
+        let definition = super::super::definitions::parse_agent_definition(
+            Path::new("task.md"),
+            "---\nname: task\ndescription: task\ntools: [read]\n---\nprompt",
+            super::super::AgentDefinitionSource::Bundled,
+            true,
+        )
+        .expect("definition");
+        let child_cwd = root.path().to_path_buf();
+        let runtime = OrchestrationRuntime::new(
+            OrchestrationConfig::new(
+                AgentCatalog::from_agents(vec![definition.clone()]),
+                root.path(),
+            ),
+            Arc::new(move |request: ChildSessionRequest| {
+                let child_cwd = child_cwd.clone();
+                Box::pin(async move {
+                    let stream_fn: pi_agent::StreamFn = Arc::new(
+                        |_model: pi_ai::Model,
+                         _context: pi_ai::Context,
+                         _options: pi_ai::SimpleStreamOptions| {
+                            Box::pin(async move {
+                                let stream = pi_ai::new_assistant_message_event_stream();
+                                let producer = stream.clone();
+                                tokio::spawn(async move {
+                                    let mut message =
+                                        pi_ai::AssistantMessage::pending(&pi_ai::Model::default());
+                                    message.content.push(pi_ai::ContentBlock::ToolCall(
+                                        pi_ai::ToolCall {
+                                            id: "call-wait".to_owned(),
+                                            name: "hub".to_owned(),
+                                            arguments: serde_json::json!({ "op": "wait" }),
+                                            thought_signature: None,
+                                        },
+                                    ));
+                                    message.stop_reason = pi_ai::StopReason::ToolUse;
+                                    producer.end(Some(message)).await;
+                                });
+                                stream
+                            })
+                        },
+                    );
+                    Session::new_with_additional_tools_filtered_and_discovery(
+                        crate::SessionOptions {
+                            model: request.model,
+                            cwd: child_cwd,
+                            system_prompt: request.system_prompt,
+                            thinking_level: ThinkingLevel::Off,
+                            api_key: String::new(),
+                            compaction: None,
+                            stream_options: Default::default(),
+                            tools: Some(request.orchestration_tools),
+                            before_tool_call: None,
+                            after_tool_call: None,
+                            stream_fn: Some(stream_fn),
+                            auth_resolver: None,
+                            auth_manager: None,
+                        },
+                        Vec::new(),
+                        Default::default(),
+                        crate::ResourceDiscovery::Disabled,
+                    )
+                })
+            }),
+        )
+        .expect("runtime");
+        runtime.bind_and_recover(&parent).expect("bind durable");
+        let mut events = runtime.subscribe();
+
+        let spawn = runtime
+            .spawn_tasks(
+                "Main",
+                0,
+                vec![TaskItem {
+                    index: 0,
+                    id: "WaitingChild".to_owned(),
+                    agent: "task".to_owned(),
+                    assignment: "wait for a hub message that never arrives".to_owned(),
+                    ..Default::default()
+                }],
+            )
+            .expect("spawn waiting child")
+            .remove(0);
+        // Event-driven gate: the job is Running and the child's own hub wait
+        // has registered its waiter (authoritative Waiting state).
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let running = runtime
+                    .jobs(Some(std::slice::from_ref(&spawn.job_id)))
+                    .first()
+                    .is_some_and(|job| job.status == JobStatus::Running);
+                let waiting = runtime
+                    .inner
+                    .registry
+                    .get(runtime.group_id(), "WaitingChild")
+                    .is_some_and(|entry| !entry.waiters.lock().is_empty());
+                if running && waiting {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("child entered hub wait while its job is Running");
+
+        tokio::time::timeout(Duration::from_secs(10), runtime.shutdown())
+            .await
+            .expect("explicit shutdown must not hang on a Waiting child")
+            .expect("terminal shutdown");
+        assert!(
+            runtime.is_shutdown(),
+            "explicit shutdown must cancel waiters"
+        );
+        assert_eq!(runtime.active_child_count(), 0);
+
+        let terminal = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                OrchestrationEvent::JobUpdated { job, .. } if job.id == spawn.job_id => Some(job),
+                _ => None,
+            })
+            .filter(|job| job.status.is_settled())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            terminal.len(),
+            1,
+            "exactly one terminal job update may be published: {terminal:#?}"
+        );
+        assert_eq!(terminal[0].status, JobStatus::Cancelled);
+        assert_eq!(
+            terminal[0]
+                .result
+                .as_ref()
+                .and_then(|result| result.error.as_deref()),
+            Some("orchestration shut down")
+        );
+
+        let durable = runtime.durable_state_for_test().expect("durable state");
+        let persisted = durable
+            .jobs
+            .iter()
+            .find(|job| job.id == spawn.job_id)
+            .expect("terminal job persisted");
+        assert_eq!(persisted.status, JobStatus::Cancelled);
+        assert_eq!(
+            persisted
+                .result
+                .as_ref()
+                .and_then(|result| result.error.as_deref()),
+            Some("orchestration shut down")
+        );
+
+        // Reopen the SAME parent: the sidecar job is terminal, so the resumed
+        // runtime must revive nothing.
+        let reopened = crate::resume_session(&parent_path).expect("reopen parent recording");
+        let resumed_fixture = isolated_session(root.path(), Vec::new(), None).await;
+        resumed_fixture
+            .session
+            .set_session_dir(parent.session_dir());
+        resumed_fixture
+            .session
+            .record(reopened)
+            .expect("attach reopened recorder");
+        let resumed_definition = super::super::definitions::parse_agent_definition(
+            Path::new("task.md"),
+            "---\nname: task\ndescription: task\ntools: [read]\n---\nprompt",
+            super::super::AgentDefinitionSource::Bundled,
+            true,
+        )
+        .expect("definition");
+        let resumed_runtime = OrchestrationRuntime::new(
+            OrchestrationConfig::new(
+                AgentCatalog::from_agents(vec![resumed_definition]),
+                root.path(),
+            ),
+            Arc::new(|_request| {
+                Box::pin(async { Err(anyhow!("revival must never run after explicit shutdown")) })
+            }),
+        )
+        .expect("resumed runtime");
+        resumed_runtime
+            .bind_and_recover(&resumed_fixture.session)
+            .expect("recover reopened parent");
+        let recovered = resumed_runtime.jobs(Some(std::slice::from_ref(&spawn.job_id)));
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].status, JobStatus::Cancelled);
+        assert_eq!(recovered[0].id, spawn.job_id);
+        assert_eq!(resumed_runtime.active_child_count(), 0);
+    }
 }
 
 #[cfg(test)]
 mod delegation_intent_tests {
     use super::*;
-
-    #[test]
-    fn english_delegation_verbs_are_recognized() {
-        for prompt in [
-            "Have researcher study this",
-            "please ask researcher to investigate",
-            "let researcher handle the patch",
-            "dispatch researcher now",
-        ] {
-            assert!(request_has_delegation_verb(prompt), "{prompt}");
-            assert!(delegation_intent(prompt, "researcher"), "{prompt}");
-        }
-    }
-
-    #[test]
-    fn literal_cjk_prompt_has_delegation_intent() {
-        assert!(delegation_intent(
-            "你让researcher仔细调研pi-coding-agent",
-            "researcher"
-        ));
-    }
-
-    #[test]
-    fn cjk_constructions_are_conservative() {
-        for (prompt, agent) in [
-            ("请你让researcher去调查这个项目", "researcher"),
-            ("请researcher写一份调研报告", "researcher"),
-            ("把这项调研交给researcher完成", "researcher"),
-            ("安排researcher仔细调研这个仓库", "researcher"),
-            ("委托researcher调研这个仓库", "researcher"),
-            ("叫researcher去研究这个bug", "researcher"),
-            ("派researcher去处理这个任务", "researcher"),
-            // Spaced single-char-token form: exactly one ASCII space between
-            // the CJK delegation token and the agent name is a delegation.
-            ("让 mentor 审查这次修改", "mentor"),
-            ("请 researcher 去调查", "researcher"),
-            ("叫 writer 检查这段代码", "writer"),
-            // The action clause must follow the WHOLE conjunction chain:
-            // `你让glm和grok调研` delegates both names.
-            ("你让glm和grok调研这个仓库", "glm"),
-            // `别` inside a word (`特别让…` = "especially let …") is not a
-            // negation marker.
-            ("特别让researcher仔细调研", "researcher"),
-        ] {
-            assert!(
-                cjk_delegation_construction(prompt, agent),
-                "{prompt:?} must be a CJK delegation construction"
-            );
-        }
-        // Negatives: informational mentions, questions, possessive markers,
-        // whitespace-separated English after a CJK token, double spaces
-        // after the token (only a single space is accepted), a conjunction
-        // chain WITHOUT a following action clause (`你让glm和grok` names the
-        // pair but delegates no work), and negations (`不要让…`, `别让…`).
-        for (prompt, agent) in [
-            ("researcher 是做什么的？", "researcher"),
-            ("我在文档里看到researcher", "researcher"),
-            ("让researcher的调研完成", "researcher"),
-            ("请review the security patch", "review"),
-            ("请使用research技能", "research"),
-            ("让  mentor 审查这次修改", "mentor"),
-            ("请  researcher 去调查", "researcher"),
-            ("你让glm和grok", "glm"),
-            ("不要让glm调研这个仓库", "glm"),
-            ("别让missing1调研", "missing1"),
-            ("你别让missing1调研", "missing1"),
-            ("请别让missing1调研", "missing1"),
-        ] {
-            assert!(
-                !cjk_delegation_construction(prompt, agent),
-                "{prompt:?} must NOT be a CJK delegation construction"
-            );
-        }
-    }
-
-    #[test]
-    fn space_separated_cjk_delegation_routes_persona_through_catalog_selector() {
-        // A Persona-kind definition (durable root under personas/mentor) is
-        // routed exactly like any agent: `让 mentor 审查这次修改` with NO
-        // explicit agent resolves to mentor through the existing catalog/
-        // selector — the delegated agent is the persona itself, never a
-        // frontend heuristic.
-        let root = tempfile::tempdir().expect("root");
-        let persona_root = root.path().join("personas").join("mentor");
-        fs::create_dir_all(&persona_root).expect("persona root");
-        let definition = super::super::definitions::parse_persona_definition(
-            &persona_root.join("persona.md"),
-            "---\nname: mentor\ndescription: mentor\n---\nprompt",
-            super::super::AgentDefinitionSource::User,
-            true,
-        )
-        .expect("persona definition");
-        assert!(definition.is_persona(), "fixture must be kind Persona");
-        let mut config = OrchestrationConfig::new(
-            AgentCatalog::from_agents(vec![definition.clone()]),
-            root.path().join("artifacts"),
-        );
-        config.default_agent = "mentor".to_owned();
-        config.parent_model = pi_ai::Model::default();
-        let runtime = OrchestrationRuntime::new(
-            config,
-            Arc::new(|_| Box::pin(async { unreachable!() })),
-        )
-        .expect("runtime");
-
-        let assignment = "让 mentor 审查这次修改";
-        // The spaced CJK construction is delegation intent for the persona.
-        assert!(delegation_intent(assignment, "mentor"), "{assignment}");
-        // The exact-mention scan finds the persona name in the prompt.
-        assert!(matches!(
-            runtime.exact_agent_mention_in_catalog(assignment),
-            crate::selector::ExactAgentMention::Unique(name) if name == "mentor"
-        ));
-        // The catalog/selector routes the NL task to the persona WITHOUT an
-        // explicit agent, and the persona is spawn-selectable.
-        assert_eq!(
-            runtime.resolve_task_agent(assignment, None).expect("resolve"),
-            "mentor"
-        );
-        assert!(
-            runtime
-                .enabled_agents()
-                .iter()
-                .any(|agent| agent.name == "mentor" && agent.is_persona()),
-            "the persona must be enabled for spawning"
-        );
-        // The informational-mention guard still applies to the persona: a
-        // question about it is not a delegation.
-        assert!(!delegation_intent("mentor 是做什么的？", "mentor"));
-    }
 
     #[test]
     fn agent_name_span_respects_embedded_ascii_word_boundaries() {
@@ -9274,18 +13721,324 @@ mod delegation_intent_tests {
         assert!(delegation_candidates("please review the security patch").is_empty());
         assert!(delegation_candidates("ask me to review").is_empty());
     }
+
+    #[test]
+    fn delegation_candidates_gate_ordinary_instruction_verbs_on_known_identities() {
+        // Unambiguous delegation verbs keep their object regardless of the
+        // catalog: delegating to a missing agent must still be caught.
+        assert_eq!(
+            delegation_candidates("Have ghost-agent study this"),
+            vec!["ghost-agent".to_owned()]
+        );
+        assert_eq!(
+            delegation_candidates("delegate to ghost-agent, ghost-two and ghost-three"),
+            vec![
+                "ghost-agent".to_owned(),
+                "ghost-three".to_owned(),
+                "ghost-two".to_owned()
+            ]
+        );
+        // Ordinary instruction verbs produce nothing without a known
+        // identity, so natural language never fabricates agents.
+        assert!(delegation_candidates("run python3 --version").is_empty());
+        assert!(delegation_candidates("make sure the build passes").is_empty());
+        assert!(delegation_candidates("please review the security patch").is_empty());
+        assert!(delegation_candidates("let me know when it lands").is_empty());
+        assert!(delegation_candidates("get the latest results").is_empty());
+
+        let known = BTreeSet::from([
+            "researcher".to_owned(),
+            "research".to_owned(),
+            "writer".to_owned(),
+        ]);
+        assert_eq!(
+            delegation_candidates_with_identities("run researcher study this", &[], Some(&known)),
+            vec!["researcher".to_owned()]
+        );
+        // `make sure` remains ordinary even when a later word happens to be a
+        // configured identity: weak verbs only inspect their direct object or
+        // a syntactically joined object list.
+        assert!(
+            delegation_candidates_with_identities(
+                "make sure research skills are loaded",
+                &[],
+                Some(&known),
+            )
+            .is_empty()
+        );
+        // A configured identity anywhere in a weak-verb list anchors the
+        // entire list, including every missing target before and after it.
+        assert_eq!(
+            delegation_candidates_with_identities(
+                "run ghost-one, writer and ghost-two now",
+                &[],
+                Some(&known),
+            ),
+            vec![
+                "ghost-one".to_owned(),
+                "ghost-two".to_owned(),
+                "writer".to_owned()
+            ]
+        );
+        assert!(
+            delegation_candidates_with_identities("run ghost-agent now", &[], Some(&known)).is_empty()
+        );
+    }
+
+    #[test]
+    fn configured_identity_matching_is_exact_and_normalized() {
+        let known = BTreeSet::from(["review-bot".to_owned(), "research".to_owned()]);
+        assert_eq!(
+            delegation_candidates_with_identities("RUN REVIEW-BOT now", &[], Some(&known)),
+            vec!["review-bot".to_owned()]
+        );
+        assert_eq!(
+            delegation_candidates_with_identities("run research now", &[], Some(&known)),
+            vec!["research".to_owned()]
+        );
+        assert!(
+            delegation_candidates_with_identities("run review now", &[], Some(&known)).is_empty()
+        );
+    }
+
+    #[test]
+    fn delegation_candidates_never_fire_on_w3_report_phrases() {
+        assert!(delegation_candidates("run python3 --version").is_empty());
+        assert!(delegation_candidates("make sure the workflow passes").is_empty());
+        assert!(delegation_candidates("make sure integration is clean").is_empty());
+        assert!(delegation_candidates("ensure the build is green").is_empty());
+        assert!(delegation_candidates("check that tests pass").is_empty());
+    }
+
+    fn routing_definition(name: &str) -> AgentDefinition {
+        AgentDefinition {
+            name: name.to_owned(),
+            description: format!("{name} routing definition"),
+            system_prompt: "p".to_owned(),
+            tools: None,
+            autoload_skills: Vec::new(),
+            model: None,
+            thinking_level: None,
+            max_turns: None,
+            max_tool_calls: None,
+            timeout_secs: None,
+            disallowed_tools: Vec::new(),
+            capability_ceiling: None,
+            source: crate::AgentDefinitionSource::Bundled,
+            path: None,
+            trusted: true,
+            kind: crate::orchestration::AgentDefinitionKind::Agent,
+            personality: None,
+            soft_budget: None,
+            knowledge_roots: Vec::new(),
+            user_proxy: false,
+        }
+    }
+
+    /// Typed task assignment routes on the RAW exact-name mention: a
+    /// descriptive reference inside typed task content still selects the
+    /// named agent, while the interactive user-prompt surfaces keep the
+    /// gated delegation grammar and stay Main.
+    #[test]
+    fn resolve_task_agent_routes_typed_content_on_raw_exact_mention() {
+        let dir = tempfile::tempdir().expect("artifacts");
+        let runtime = OrchestrationRuntime::new(
+            OrchestrationConfig::new(
+                AgentCatalog::from_agents(vec![
+                    routing_definition("task"),
+                    routing_definition("coordinator"),
+                ]),
+                dir.path(),
+            ),
+            Arc::new(|_| Box::pin(async { unreachable!() })),
+        )
+        .expect("runtime");
+        assert_eq!(
+            runtime
+                .resolve_task_agent("summarize the coordinator findings for the report", None)
+                .expect("raw exact mention routes"),
+            "coordinator"
+        );
+        assert_eq!(
+            runtime
+                .resolve_task_agent("coordinator please fix the build", None)
+                .expect("imperative mention routes"),
+            "coordinator"
+        );
+        // Interactive prompts keep the gated grammar: the descriptive
+        // reference is metadata only there.
+        let trusted = runtime.inner.config.catalog.agents().clone();
+        assert!(matches!(
+            crate::selector::delegation_agent_mention(
+                "summarize the coordinator findings for the report",
+                &trusted,
+            ),
+            crate::selector::ExactAgentMention::None
+        ));
+        assert!(matches!(
+            crate::selector::delegation_agent_mention(
+                "coordinator please fix the build",
+                &trusted,
+            ),
+            crate::selector::ExactAgentMention::Unique(name) if name == "coordinator"
+        ));
+    }
+
+    #[test]
+    fn resolve_task_agent_reports_ambiguity_for_colliding_exact_mentions() {
+        let dir = tempfile::tempdir().expect("artifacts");
+        let runtime = OrchestrationRuntime::new(
+            OrchestrationConfig::new(
+                AgentCatalog::from_agents(vec![
+                    routing_definition("task"),
+                    routing_definition("Research-Agent"),
+                    routing_definition("research-agent"),
+                ]),
+                dir.path(),
+            ),
+            Arc::new(|_| Box::pin(async { unreachable!() })),
+        )
+        .expect("runtime");
+        let error = runtime
+            .resolve_task_agent("study with research-agent", None)
+            .expect_err("normalized name collisions must stay ambiguous");
+        assert!(
+            error.to_string().contains("ambiguous"),
+            "{error}"
+        );
+    }
+
+    /// Contract: the workflow missing-agent diagnostics parser and the
+    /// selector's delegation grammar agree exactly on catalogued names —
+    /// every prompt the selector treats as delegation surfaces as a
+    /// workflow candidate, every prompt the selector keeps Main yields
+    /// none. Direct addresses are taken from the selector's own
+    /// [`crate::selector::delegation_agent_mention`] (the bare whole-name
+    /// request and the name-leading comma/colon vocative included), and the
+    /// remaining marker/imperative/CJK forms share the selector's clause
+    /// constants (`DELEGATION_MARKER_NEGATIONS`, `ENGLISH_CLAUSE_AUXILIARIES`,
+    /// `ENGLISH_CLAUSE_PRONOUNS`, `ENGLISH_DECLARATIVE_SUBJECTS`,
+    /// `DELEGATION_NOUN_PRONE_MARKERS`) so no second, weaker parser can
+    /// regress independently.
+    #[test]
+    fn workflow_diagnostics_candidates_match_selector_delegation_grammar() {
+        let known = BTreeSet::from(["coordinator".to_owned()]);
+        let trusted = vec![routing_definition("coordinator")];
+        let delegations = [
+            "Have coordinator audit the parser",
+            "please coordinator fix the build",
+            "coordinator",
+            "coordinator: route next",
+            "coordinator, route next",
+            "coordinator please fix the build",
+            "run coordinator on the failing test",
+            "get coordinator to review the patch",
+            "launch coordinator to fix the build",
+            "start coordinator before the batch",
+            "delegate to coordinator for the triage",
+            "use coordinator (after warmup)",
+            "你让coordinator处理这个",
+            "否则让coordinator接手",
+        ];
+        for request in delegations {
+            let diagnostics = delegation_candidates_with_identities(request, &trusted, Some(&known));
+            assert!(
+                diagnostics.contains(&"coordinator".to_owned()),
+                "workflow diagnostics must treat {request:?} as delegation: {diagnostics:?}"
+            );
+            assert!(
+                matches!(
+                    crate::selector::delegation_agent_mention(request, &trusted),
+                    crate::selector::ExactAgentMention::Unique(name) if name == "coordinator"
+                ),
+                "selector must delegate: {request:?}"
+            );
+        }
+        let references = [
+            "I did use coordinator for this",
+            "She does use coordinator for this",
+            "We have used coordinator for this",
+            "review the run coordinator produced",
+            "check the get coordinator output",
+            "did you have coordinator run it",
+            "don't have coordinator run it",
+            "can you use coordinator for this",
+            "I do not want you to use coordinator",
+            "是否让coordinator处理这个",
+            "能不能让coordinator处理这个",
+            "不要让coordinator处理这个",
+        ];
+        for request in references {
+            let diagnostics = delegation_candidates_with_identities(request, &trusted, Some(&known));
+            assert!(
+                !diagnostics.contains(&"coordinator".to_owned()),
+                "workflow diagnostics must not treat {request:?} as delegation: {diagnostics:?}"
+            );
+            assert!(
+                matches!(
+                    crate::selector::delegation_agent_mention(request, &trusted),
+                    crate::selector::ExactAgentMention::None
+                ),
+                "selector must keep Main: {request:?}"
+            );
+        }
+    }
+
+    /// The workflow missing-agent diagnostics share the selector grammar:
+    /// a politely delegated disabled agent fails actionably, and so do the
+    /// selector's direct-address forms (bare whole-name, name-leading
+    /// comma/colon vocative), while the same name referenced by a
+    /// descriptive subject form stays silent.
+    #[test]
+    fn validate_delegation_agents_matches_selector_grammar() {
+        let dir = tempfile::tempdir().expect("artifacts");
+        let mut config = OrchestrationConfig::new(
+            AgentCatalog::from_agents(vec![
+                routing_definition("task"),
+                routing_definition("coordinator"),
+            ]),
+            dir.path(),
+        );
+        config.agent_settings.insert(
+            "coordinator".to_owned(),
+            crate::AgentRuntimeSettings {
+                enabled: Some(false),
+                model: None,
+                tools: None,
+            },
+        );
+        let runtime =
+            OrchestrationRuntime::new(config, Arc::new(|_| Box::pin(async { unreachable!() })))
+                .expect("runtime");
+        let error = runtime
+            .validate_delegation_agents("please coordinator fix the build")
+            .expect_err("disabled polite delegate must fail");
+        assert!(error.to_string().contains("disabled"), "{error}");
+        for request in ["coordinator", "coordinator: route next", "coordinator, route next"] {
+            let error = runtime
+                .validate_delegation_agents(request)
+                .expect_err("disabled direct-address delegate must fail");
+            assert!(error.to_string().contains("disabled"), "{error}");
+        }
+        runtime
+            .validate_delegation_agents("the coordinator: route next")
+            .expect("non-leading vocative reference must not report a disabled agent");
+        runtime
+            .validate_delegation_agents("I did use coordinator for this")
+            .expect("descriptive reference must not report a disabled agent");
+    }
 }
 
 #[cfg(test)]
 mod yield_tool_tests {
     use super::*;
     use crate::orchestration::tools::yield_tool;
-    use crate::SessionOptions;
     use pi_ai::{
         AssistantMessage, AssistantMessageEvent, ContentBlock, Model, SimpleStreamOptions,
         StopReason, ToolCall, new_assistant_message_event_stream,
     };
     use serde_json::json;
+    use std::fs;
 
     /// Scripted provider: pops one assistant message per stream invocation so
     /// the turn count is deterministic; an exhausted script falls back to a
@@ -9293,50 +14046,52 @@ mod yield_tool_tests {
     /// observable in the transcript.
     fn scripted(messages: Vec<AssistantMessage>) -> pi_agent::StreamFn {
         let messages = Arc::new(parking_lot::Mutex::new(VecDeque::from(messages)));
-        Arc::new(move |model: Model, _context: pi_ai::Context, _options: SimpleStreamOptions| {
-            let messages = messages.clone();
-            Box::pin(async move {
-                let message = messages.lock().pop_front().unwrap_or_else(|| {
-                    let mut fallback = AssistantMessage::pending(&model);
-                    fallback.content = vec![ContentBlock::text("done")];
-                    fallback.stop_reason = StopReason::Stop;
-                    fallback
-                });
-                let stream = new_assistant_message_event_stream();
-                let producer = stream.clone();
-                let model = model.clone();
-                tokio::spawn(async move {
-                    producer
-                        .push(AssistantMessageEvent::Start {
-                            partial: AssistantMessage::pending(&model),
-                        })
-                        .await;
-                    let terminal = if matches!(
-                        message.stop_reason,
-                        StopReason::Error | StopReason::Aborted
-                    ) {
-                        AssistantMessageEvent::Error {
-                            reason: message.stop_reason,
-                            error: message.clone(),
-                        }
-                    } else {
-                        AssistantMessageEvent::Done {
-                            reason: message.stop_reason,
-                            message: message.clone(),
-                        }
-                    };
-                    producer.push(terminal).await;
-                    producer.end(Some(message)).await;
-                });
-                stream
-            })
-        })
+        Arc::new(
+            move |model: Model, _context: pi_ai::Context, _options: SimpleStreamOptions| {
+                let messages = messages.clone();
+                Box::pin(async move {
+                    let message = messages.lock().pop_front().unwrap_or_else(|| {
+                        let mut fallback = AssistantMessage::pending(&model);
+                        fallback.content = vec![ContentBlock::text("done")];
+                        fallback.stop_reason = StopReason::Stop;
+                        fallback
+                    });
+                    let stream = new_assistant_message_event_stream();
+                    let producer = stream.clone();
+                    let model = model.clone();
+                    tokio::spawn(async move {
+                        producer
+                            .push(AssistantMessageEvent::Start {
+                                partial: AssistantMessage::pending(&model),
+                            })
+                            .await;
+                        let terminal = if matches!(
+                            message.stop_reason,
+                            StopReason::Error | StopReason::Aborted
+                        ) {
+                            AssistantMessageEvent::Error {
+                                reason: message.stop_reason,
+                                error: message.clone(),
+                            }
+                        } else {
+                            AssistantMessageEvent::Done {
+                                reason: message.stop_reason,
+                                message: message.clone(),
+                            }
+                        };
+                        producer.push(terminal).await;
+                        producer.end(Some(message)).await;
+                    });
+                    stream
+                })
+            },
+        )
     }
 
     fn task_definition() -> AgentDefinition {
         super::super::definitions::parse_agent_definition(
             Path::new("task.md"),
-            "---\nname: task\ndescription: task\n---\nprompt",
+            "---\nname: task\ndescription: task\ntools: []\n---\nprompt",
             super::super::AgentDefinitionSource::Bundled,
             true,
         )
@@ -9360,70 +14115,47 @@ mod yield_tool_tests {
 
     /// Runtime whose catalog carries the yield-declaring definition, so spawns
     /// exercise the declared-`yield` path through the real child factory.
-    fn yield_declaring_runtime(
+    async fn yield_declaring_runtime(
         root: &Path,
         messages: Vec<AssistantMessage>,
-    ) -> OrchestrationRuntime {
-        let session = Session::new(SessionOptions {
-            model: Model::default(),
-            cwd: root.to_path_buf(),
-            system_prompt: String::new(),
-            thinking_level: ThinkingLevel::Off,
-            api_key: String::new(),
-            compaction: None,
-            stream_options: Default::default(),
-            tools: Some(Vec::new()),
-            before_tool_call: None,
-            after_tool_call: None,
-            stream_fn: Some(scripted(messages)),
-            auth_resolver: None,
-        })
-        .expect("parent session");
-        let snapshot = session.child_session_options_snapshot();
-        let catalog = AgentCatalog::from_agents(vec![task_definition(), yield_declaring_definition()]);
-        let config = OrchestrationConfig::new(catalog, root.join("artifacts"));
-        OrchestrationRuntime::new(
+    ) -> (IsolatedSessionFixture, OrchestrationRuntime) {
+        let fixture = isolated_session(root, Vec::new(), Some(scripted(messages))).await;
+        let snapshot = fixture.session.child_session_options_snapshot();
+        let catalog =
+            AgentCatalog::from_agents(vec![task_definition(), yield_declaring_definition()]);
+        let config = OrchestrationConfig::new(catalog, root.join("artifacts"))
+            .with_parent_model(fixture.session.model().expect("parent model"));
+        let runtime = OrchestrationRuntime::new(
             config,
             OrchestrationRuntime::child_factory_from_snapshot(snapshot),
         )
-        .expect("runtime")
+        .expect("runtime");
+        (fixture, runtime)
     }
 
     /// Runtime whose child factory builds real sessions from a parent session
     /// carrying the scripted provider — the exact production path, so the
     /// child's tool set includes the orchestration plumbing plus the appended
     /// `yield` tool.
-    fn yield_runtime(
+    async fn yield_runtime(
         root: &Path,
         messages: Vec<AssistantMessage>,
         soft_budget: JobSoftBudget,
-    ) -> OrchestrationRuntime {
-        let session = Session::new(SessionOptions {
-            model: Model::default(),
-            cwd: root.to_path_buf(),
-            system_prompt: String::new(),
-            thinking_level: ThinkingLevel::Off,
-            api_key: String::new(),
-            compaction: None,
-            stream_options: Default::default(),
-            tools: Some(Vec::new()),
-            before_tool_call: None,
-            after_tool_call: None,
-            stream_fn: Some(scripted(messages)),
-            auth_resolver: None,
-        })
-        .expect("parent session");
-        let snapshot = session.child_session_options_snapshot();
+    ) -> (IsolatedSessionFixture, OrchestrationRuntime) {
+        let fixture = isolated_session(root, Vec::new(), Some(scripted(messages))).await;
+        let snapshot = fixture.session.child_session_options_snapshot();
         let mut config = OrchestrationConfig::new(
             AgentCatalog::from_agents(vec![task_definition()]),
             root.join("artifacts"),
-        );
+        )
+        .with_parent_model(fixture.session.model().expect("parent model"));
         config.soft_budget = soft_budget;
-        OrchestrationRuntime::new(
+        let runtime = OrchestrationRuntime::new(
             config,
             OrchestrationRuntime::child_factory_from_snapshot(snapshot),
         )
-        .expect("runtime")
+        .expect("runtime");
+        (fixture, runtime)
     }
 
     async fn spawn_and_settle(
@@ -9492,11 +14224,12 @@ mod yield_tool_tests {
     #[tokio::test]
     async fn yield_call_settles_job_with_delivered_payload_and_stops_after_the_turn() {
         let root = tempfile::tempdir().expect("root");
-        let runtime = yield_runtime(
+        let (_fixture, runtime) = yield_runtime(
             root.path(),
             vec![yield_call_message("deliverable")],
             JobSoftBudget::default(),
-        );
+        )
+        .await;
         let job = spawn_and_settle(&runtime, "YieldChild", "produce a deliverable").await;
 
         assert_eq!(
@@ -9534,11 +14267,12 @@ mod yield_tool_tests {
     #[tokio::test]
     async fn child_that_never_calls_yield_keeps_natural_text_with_missing_yield_warning() {
         let root = tempfile::tempdir().expect("root");
-        let runtime = yield_runtime(
+        let (_fixture, runtime) = yield_runtime(
             root.path(),
             vec![text_message("natural final text")],
             JobSoftBudget::default(),
-        );
+        )
+        .await;
         let job = spawn_and_settle(&runtime, "NoYieldChild", "work without yield").await;
 
         assert_eq!(job.status, JobStatus::Completed);
@@ -9555,14 +14289,15 @@ mod yield_tool_tests {
     #[tokio::test]
     async fn soft_budget_and_yield_compose_without_panic() {
         let root = tempfile::tempdir().expect("root");
-        let runtime = yield_runtime(
+        let (_fixture, runtime) = yield_runtime(
             root.path(),
             vec![yield_call_message("budgeted deliverable")],
             JobSoftBudget {
                 max_requests: Some(1),
                 ..JobSoftBudget::default()
             },
-        );
+        )
+        .await;
         let job = spawn_and_settle(&runtime, "BudgetedYield", "budgeted work").await;
 
         assert_eq!(
@@ -9591,7 +14326,10 @@ mod yield_tool_tests {
             error.to_string().contains("Unknown tool"),
             "rejection must be the standard unknown-tool error: {error}"
         );
-        assert!(!crate::TOOL_NAMES.contains(&"yield"), "yield must not be a built-in");
+        assert!(
+            !crate::TOOL_NAMES.contains(&"yield"),
+            "yield must not be a built-in"
+        );
         assert!(
             !crate::create_all_tools(cwd)
                 .iter()
@@ -9611,11 +14349,12 @@ mod yield_tool_tests {
         let root = tempfile::tempdir().expect("root");
         let secret = ["gh", "p_", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"].concat();
         let payload = format!("deploy using {secret} and token=abc123");
-        let runtime = yield_runtime(
+        let (_fixture, runtime) = yield_runtime(
             root.path(),
             vec![yield_call_message(&payload)],
             JobSoftBudget::default(),
-        );
+        )
+        .await;
         let job = spawn_and_settle(&runtime, "RedactedYield", "work with secrets").await;
         let result = job.result.as_ref().expect("settled result");
 
@@ -9636,7 +14375,10 @@ mod yield_tool_tests {
                 .join(format!("RedactedYield-{}.history.json", job.id)),
         )
         .expect("history file");
-        assert!(history.contains(secret.as_str()), "the raw transcript keeps the payload");
+        assert!(
+            history.contains(secret.as_str()),
+            "the raw transcript keeps the payload"
+        );
 
         // Presentation redacts the payload at the same boundary as any other
         // tool text: the presented job output and the presented tool-call
@@ -9648,8 +14390,7 @@ mod yield_tool_tests {
             "presentation must redact the payload: {presented_output}"
         );
         assert!(presented_output.contains("[REDACTED]"), "redaction marker");
-        let redacted_arguments =
-            crate::redact_value(&serde_json::json!({ "text": payload }));
+        let redacted_arguments = crate::redact_value(&serde_json::json!({ "text": payload }));
         assert!(
             !redacted_arguments.to_string().contains(secret.as_str()),
             "presented tool-call arguments must be redacted like every other tool's"
@@ -9675,6 +14416,7 @@ mod yield_tool_tests {
             on_update: Arc::new(|_| {}),
             abort,
             model: None,
+            approval_token: None,
         };
         let result = (tool.execute)(context).await.expect("yield executes");
         assert_eq!(state.payload().as_deref(), Some("direct deliverable"));
@@ -9697,14 +14439,15 @@ mod yield_tool_tests {
         // ignored: the first payload wins.
         let (_, second_abort) = pi_agent::AbortController::new();
         let second = (tool.execute)(pi_agent::ToolCallContext {
-                tool_call_id: "call-yield-2".to_owned(),
-                arguments: serde_json::json!({ "text": "second payload" }),
-                on_update: Arc::new(|_| {}),
-                abort: second_abort,
-                model: None,
-            })
-            .await
-            .expect("second yield executes");
+            tool_call_id: "call-yield-2".to_owned(),
+            arguments: serde_json::json!({ "text": "second payload" }),
+            on_update: Arc::new(|_| {}),
+            abort: second_abort,
+            model: None,
+            approval_token: None,
+        })
+        .await
+        .expect("second yield executes");
         let second_text = second
             .content
             .iter()
@@ -9732,8 +14475,8 @@ mod yield_tool_tests {
         // `yield` settles with the delivered payload, proving the single
         // appended tool is live and the declared copy was not double-registered.
         let root = tempfile::tempdir().expect("root");
-        let runtime =
-            yield_declaring_runtime(root.path(), vec![yield_call_message("declared-yield")]);
+        let (_fixture, runtime) =
+            yield_declaring_runtime(root.path(), vec![yield_call_message("declared-yield")]).await;
         let job = spawn_and_settle(&runtime, "QwenChild", "deliver via declared yield").await;
 
         assert_eq!(
@@ -9746,7 +14489,11 @@ mod yield_tool_tests {
             result.output, "declared-yield",
             "the single appended yield tool must deliver the payload"
         );
-        assert!(result.error.is_none(), "no spawn/tool errors: {:?}", result.error);
+        assert!(
+            result.error.is_none(),
+            "no spawn/tool errors: {:?}",
+            result.error
+        );
         // Exactly one assistant turn: the factory did not register two yield
         // tools that could confuse the model into extra turns.
         let history = read_history(root.path(), "QwenChild", &job.id);
@@ -9797,11 +14544,12 @@ mod yield_tool_tests {
     #[tokio::test]
     async fn output_schema_validates_conforming_delivered_payload_per_child() {
         let root = tempfile::tempdir().expect("root");
-        let runtime = yield_runtime(
+        let (_fixture, runtime) = yield_runtime(
             root.path(),
             vec![yield_call_message(r#"{"ok": true}"#)],
             JobSoftBudget::default(),
-        );
+        )
+        .await;
         let schema = json!({
             "type": "object",
             "properties": {"ok": {"type": "boolean"}},
@@ -9819,7 +14567,11 @@ mod yield_tool_tests {
         assert_eq!(job.status, JobStatus::Completed);
         let result = job.result.expect("settled result");
         assert_eq!(result.output, r#"{"ok": true}"#);
-        assert!(result.error.is_none(), "conforming payload must not fail: {:?}", result.error);
+        assert!(
+            result.error.is_none(),
+            "conforming payload must not fail: {:?}",
+            result.error
+        );
         let validation = result.structured_output.expect("structured output");
         assert!(validation.valid, "conforming payload must validate");
         assert_eq!(validation.schema_source, "task");
@@ -9831,11 +14583,12 @@ mod yield_tool_tests {
     #[tokio::test]
     async fn output_schema_reports_non_conforming_payload_without_failing_permissive_job() {
         let root = tempfile::tempdir().expect("root");
-        let runtime = yield_runtime(
+        let (_fixture, runtime) = yield_runtime(
             root.path(),
             vec![yield_call_message(r#"{"ok": "nope"}"#)],
             JobSoftBudget::default(),
-        );
+        )
+        .await;
         let schema = json!({
             "type": "object",
             "properties": {"ok": {"type": "boolean"}},
@@ -9850,15 +14603,26 @@ mod yield_tool_tests {
         )
         .await;
 
-        assert_eq!(job.status, JobStatus::Completed, "permissive mode keeps the job completed");
+        assert_eq!(
+            job.status,
+            JobStatus::Completed,
+            "permissive mode keeps the job completed"
+        );
         let result = job.result.expect("settled result");
-        assert!(result.error.is_none(), "permissive mode must not fail the job: {:?}", result.error);
+        assert!(
+            result.error.is_none(),
+            "permissive mode must not fail the job: {:?}",
+            result.error
+        );
         let validation = result.structured_output.expect("structured output");
         assert!(!validation.valid, "non-conforming payload must be flagged");
         assert_eq!(validation.schema_mode, "permissive");
         assert_eq!(validation.data, Some(json!({"ok": "nope"})));
         assert!(
-            validation.error.as_deref().is_some_and(|error| error.contains("outputSchema")),
+            validation
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("outputSchema")),
             "validation error: {:?}",
             validation.error
         );
@@ -9867,11 +14631,12 @@ mod yield_tool_tests {
     #[tokio::test]
     async fn strict_output_schema_failure_surfaces_as_job_error() {
         let root = tempfile::tempdir().expect("root");
-        let runtime = yield_runtime(
+        let (_fixture, runtime) = yield_runtime(
             root.path(),
             vec![yield_call_message("not json at all")],
             JobSoftBudget::default(),
-        );
+        )
+        .await;
         let schema = json!({"type": "object"});
         let job = spawn_and_settle_with_contract(
             &runtime,
@@ -9889,7 +14654,10 @@ mod yield_tool_tests {
         );
         let result = job.result.expect("settled result");
         assert!(
-            result.error.as_deref().is_some_and(|error| error.contains("not valid JSON")),
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not valid JSON")),
             "strict mode surfaces the validation failure as a job error: {:?}",
             result.error
         );
@@ -9966,22 +14734,28 @@ mod yield_tool_tests {
             "first child's own task: {first}"
         );
         assert!(
-            second.contains("<delegated_assignment>\nsecond task briefing\n</delegated_assignment>"),
+            second
+                .contains("<delegated_assignment>\nsecond task briefing\n</delegated_assignment>"),
             "second child's own task: {second}"
         );
         // The context is not duplicated into the assignment.
         assert!(!first.contains("shared background context\n\nfirst task briefing"));
         // The output contract is rendered only for the item that carries it.
-        assert!(first.contains("<output_contract>"), "first child sees its contract: {first}");
+        assert!(
+            first.contains("<output_contract>"),
+            "first child sees its contract: {first}"
+        );
         assert!(first.contains("Validation mode: strict"));
-        assert!(!second.contains("<output_contract>"), "no contract for the second child: {second}");
+        assert!(
+            !second.contains("<output_contract>"),
+            "no contract for the second child: {second}"
+        );
     }
 }
 
 #[cfg(test)]
 mod unknown_tool_declaration_tests {
     use super::*;
-    use crate::SessionOptions;
     use pi_ai::{
         AssistantMessage, AssistantMessageEvent, ContentBlock, Model, SimpleStreamOptions,
         StopReason, new_assistant_message_event_stream,
@@ -9991,36 +14765,34 @@ mod unknown_tool_declaration_tests {
     /// child session (the `Context.tools` the provider sees) and then
     /// completes with a plain "done" message so the run settles cleanly.
     fn recording_stream(captured: Arc<Mutex<Vec<String>>>) -> pi_agent::StreamFn {
-        Arc::new(move |model: Model, context: pi_ai::Context, _options: SimpleStreamOptions| {
-            *captured.lock() = context
-                .tools
-                .iter()
-                .map(|tool| tool.name.clone())
-                .collect();
-            Box::pin(async move {
-                let mut done = AssistantMessage::pending(&model);
-                done.content = vec![ContentBlock::text("done")];
-                done.stop_reason = StopReason::Stop;
-                let stream = new_assistant_message_event_stream();
-                let producer = stream.clone();
-                let model = model.clone();
-                tokio::spawn(async move {
-                    producer
-                        .push(AssistantMessageEvent::Start {
-                            partial: AssistantMessage::pending(&model),
-                        })
-                        .await;
-                    producer
-                        .push(AssistantMessageEvent::Done {
-                            reason: StopReason::Stop,
-                            message: done.clone(),
-                        })
-                        .await;
-                    producer.end(Some(done)).await;
-                });
-                stream
-            })
-        })
+        Arc::new(
+            move |model: Model, context: pi_ai::Context, _options: SimpleStreamOptions| {
+                *captured.lock() = context.tools.iter().map(|tool| tool.name.clone()).collect();
+                Box::pin(async move {
+                    let mut done = AssistantMessage::pending(&model);
+                    done.content = vec![ContentBlock::text("done")];
+                    done.stop_reason = StopReason::Stop;
+                    let stream = new_assistant_message_event_stream();
+                    let producer = stream.clone();
+                    let model = model.clone();
+                    tokio::spawn(async move {
+                        producer
+                            .push(AssistantMessageEvent::Start {
+                                partial: AssistantMessage::pending(&model),
+                            })
+                            .await;
+                        producer
+                            .push(AssistantMessageEvent::Done {
+                                reason: StopReason::Stop,
+                                message: done.clone(),
+                            })
+                            .await;
+                        producer.end(Some(done)).await;
+                    });
+                    stream
+                })
+            },
+        )
     }
 
     fn qa_definition(tools: &[&str]) -> AgentDefinition {
@@ -10039,7 +14811,7 @@ mod unknown_tool_declaration_tests {
     fn task_definition() -> AgentDefinition {
         super::super::definitions::parse_agent_definition(
             Path::new("task.md"),
-            "---\nname: task\ndescription: task\n---\nprompt",
+            "---\nname: task\ndescription: task\ntools: [read]\n---\nprompt",
             super::super::AgentDefinitionSource::Bundled,
             true,
         )
@@ -10050,38 +14822,26 @@ mod unknown_tool_declaration_tests {
     /// ghost `yield_output` plus valid tools) and a plain task definition.
     /// The child factory is the real production path; the recording stream fn
     /// captures each child's injected tool set.
-    fn qa_runtime(
+    async fn qa_runtime(
         root: &Path,
         qa_tools: &[&str],
         captured: Arc<Mutex<Vec<String>>>,
         max_tools_per_agent: usize,
-    ) -> OrchestrationRuntime {
-        let session = Session::new(SessionOptions {
-            model: Model::default(),
-            cwd: root.to_path_buf(),
-            system_prompt: String::new(),
-            thinking_level: ThinkingLevel::Off,
-            api_key: String::new(),
-            compaction: None,
-            stream_options: Default::default(),
-            tools: Some(Vec::new()),
-            before_tool_call: None,
-            after_tool_call: None,
-            stream_fn: Some(recording_stream(captured)),
-            auth_resolver: None,
-        })
-        .expect("parent session");
-        let snapshot = session.child_session_options_snapshot();
+    ) -> (IsolatedSessionFixture, OrchestrationRuntime) {
+        let fixture = isolated_session(root, Vec::new(), Some(recording_stream(captured))).await;
+        let snapshot = fixture.session.child_session_options_snapshot();
         let mut config = OrchestrationConfig::new(
             AgentCatalog::from_agents(vec![task_definition(), qa_definition(qa_tools)]),
             root.join("artifacts"),
-        );
+        )
+        .with_parent_model(fixture.session.model().expect("parent model"));
         config.max_tools_per_agent = max_tools_per_agent;
-        OrchestrationRuntime::new(
+        let runtime = OrchestrationRuntime::new(
             config,
             OrchestrationRuntime::child_factory_from_snapshot(snapshot),
         )
-        .expect("runtime")
+        .expect("runtime");
+        (fixture, runtime)
     }
 
     fn spawn_item(runtime: &OrchestrationRuntime, id: &str, agent: &str) -> TaskSpawn {
@@ -10103,7 +14863,10 @@ mod unknown_tool_declaration_tests {
     }
 
     async fn settle(runtime: &OrchestrationRuntime, spawns: &[TaskSpawn]) {
-        let ids = spawns.iter().map(|spawn| spawn.job_id.clone()).collect::<Vec<_>>();
+        let ids = spawns
+            .iter()
+            .map(|spawn| spawn.job_id.clone())
+            .collect::<Vec<_>>();
         runtime
             .wait_jobs(&ids, Some(Duration::from_secs(10)), None)
             .await
@@ -10118,12 +14881,13 @@ mod unknown_tool_declaration_tests {
         // hard-fail `create_tool` with "Unknown tool name").
         let root = tempfile::tempdir().expect("root");
         let captured = Arc::new(Mutex::new(Vec::<String>::new()));
-        let runtime = qa_runtime(
+        let (_fixture, runtime) = qa_runtime(
             root.path(),
             &["read", "yield_output", "ghost"],
             captured.clone(),
             16,
-        );
+        )
+        .await;
         let spawn = spawn_item(&runtime, "QaChild", "qa");
         settle(&runtime, &[spawn]).await;
 
@@ -10141,7 +14905,9 @@ mod unknown_tool_declaration_tests {
             "orchestration plumbing is injected: {injected:?}"
         );
         assert!(
-            !injected.iter().any(|name| name == "yield_output" || name == "ghost"),
+            !injected
+                .iter()
+                .any(|name| name == "yield_output" || name == "ghost"),
             "unknown declared tools are silently dropped, never injected: {injected:?}"
         );
     }
@@ -10153,12 +14919,13 @@ mod unknown_tool_declaration_tests {
         // even across repeated spawns.
         let root = tempfile::tempdir().expect("root");
         let captured = Arc::new(Mutex::new(Vec::<String>::new()));
-        let runtime = qa_runtime(
+        let (_fixture, runtime) = qa_runtime(
             root.path(),
             &["read", "grep", "bash", "write", "yield_output"],
             captured.clone(),
             16,
-        );
+        )
+        .await;
         let first = spawn_item(&runtime, "QaChildA", "qa");
         let second = spawn_item(&runtime, "QaChildB", "qa");
         settle(&runtime, &[first, second]).await;
@@ -10181,12 +14948,8 @@ mod unknown_tool_declaration_tests {
         // abort the batch: every item spawns.
         let root = tempfile::tempdir().expect("root");
         let captured = Arc::new(Mutex::new(Vec::<String>::new()));
-        let runtime = qa_runtime(
-            root.path(),
-            &["read", "yield_output"],
-            captured.clone(),
-            16,
-        );
+        let (_fixture, runtime) =
+            qa_runtime(root.path(), &["read", "yield_output"], captured.clone(), 16).await;
         let batch = runtime
             .spawn_tasks(
                 "Main",
@@ -10229,12 +14992,13 @@ mod unknown_tool_declaration_tests {
         // over-counting ghosts.
         let root = tempfile::tempdir().expect("root");
         let captured = Arc::new(Mutex::new(Vec::<String>::new()));
-        let runtime = qa_runtime(
+        let (_fixture, runtime) = qa_runtime(
             root.path(),
             &["read", "yield_output", "ghost_a", "ghost_b"],
             captured.clone(),
             1,
-        );
+        )
+        .await;
         let spawn = spawn_item(&runtime, "QaChild", "qa");
         settle(&runtime, &[spawn]).await;
 
@@ -10245,8 +15009,136 @@ mod unknown_tool_declaration_tests {
             "exactly one declared tool is injected: {injected:?}"
         );
         assert!(
-            !injected.iter().any(|name| name == "yield_output" || name == "ghost_a" || name == "ghost_b"),
+            !injected
+                .iter()
+                .any(|name| name == "yield_output" || name == "ghost_a" || name == "ghost_b"),
             "unknowns never count toward or occupy the tool budget: {injected:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bundled_task_spawn_inherits_full_toolset_beyond_cap() {
+        // The bundled task agent declares no `tools`, inheriting the full
+        // parent/default child tool set (19 coding tools). That inherited
+        // set is exempt from cap 16: the spawn succeeds and the child
+        // receives the inherited set plus orchestration plumbing.
+        let root = tempfile::tempdir().expect("root");
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let fixture =
+            isolated_session(root.path(), Vec::new(), Some(recording_stream(captured.clone())))
+                .await;
+        let snapshot = fixture.session.child_session_options_snapshot();
+        let default_task = super::super::definitions::parse_agent_definition(
+            Path::new("task.md"),
+            "---\nname: task\ndescription: task\n---\nprompt",
+            super::super::AgentDefinitionSource::Bundled,
+            true,
+        )
+        .expect("default task");
+        assert!(crate::effective_agent_tool_names(&default_task, None).is_none());
+        assert_eq!(
+            crate::resolved_child_coding_tools(&default_task, None).len(),
+            19,
+            "bundled task resolves the full default child coding set"
+        );
+        let mut config = OrchestrationConfig::new(
+            AgentCatalog::from_agents(vec![default_task]),
+            root.path().join("artifacts"),
+        )
+        .with_parent_model(fixture.session.model().expect("parent model"));
+        config.max_tools_per_agent = 16;
+        let runtime = OrchestrationRuntime::new(
+            config,
+            OrchestrationRuntime::child_factory_from_snapshot(snapshot),
+        )
+        .expect("runtime");
+        let spawn = spawn_item(&runtime, "Todo1", "task");
+        settle(&runtime, &[spawn]).await;
+        let injected = captured.lock().clone();
+        assert!(
+            injected.len() > 16,
+            "inherited set beyond the cap must be injected: {injected:?}"
+        );
+        for name in ["read", "bash", "edit", "grep"] {
+            assert!(
+                injected.iter().any(|tool| tool == name),
+                "{name} must be inherited into the child: {injected:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_tool_list_over_cap_still_fails() {
+        // An explicit 17-name tool list stays capped at 16: the spawn fails
+        // with the actionable cap error and never queues a job.
+        let root = tempfile::tempdir().expect("root");
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let fixture =
+            isolated_session(root.path(), Vec::new(), Some(recording_stream(captured))).await;
+        let snapshot = fixture.session.child_session_options_snapshot();
+        let declared: Vec<String> = super::super::definitions::DEFAULT_CHILD_CODING_TOOLS
+            .iter()
+            .take(17)
+            .map(|name| (*name).to_owned())
+            .collect();
+        let wide = super::super::definitions::parse_agent_definition(
+            Path::new("wide.md"),
+            &format!(
+                "---\nname: wide\ndescription: wide\ntools: [{}]\n---\nprompt",
+                declared.join(", ")
+            ),
+            super::super::AgentDefinitionSource::Bundled,
+            true,
+        )
+        .expect("wide definition");
+        assert!(crate::effective_agent_tool_names(&wide, None).is_some());
+        assert_eq!(
+            crate::resolved_child_coding_tools(&wide, None),
+            declared,
+            "all 17 declared names are known and resolve unchanged"
+        );
+        let default_task = super::super::definitions::parse_agent_definition(
+            Path::new("task.md"),
+            "---\nname: task\ndescription: task\n---\nprompt",
+            super::super::AgentDefinitionSource::Bundled,
+            true,
+        )
+        .expect("default task");
+        let mut config = OrchestrationConfig::new(
+            AgentCatalog::from_agents(vec![default_task, wide]),
+            root.path().join("artifacts"),
+        )
+        .with_parent_model(fixture.session.model().expect("parent model"));
+        config.max_tools_per_agent = 16;
+        let runtime = OrchestrationRuntime::new(
+            config,
+            OrchestrationRuntime::child_factory_from_snapshot(snapshot),
+        )
+        .expect("runtime");
+        let error = runtime
+            .spawn_tasks(
+                "Main",
+                0,
+                vec![TaskItem {
+                    index: 0,
+                    id: "Wide1".to_owned(),
+                    agent: "wide".to_owned(),
+                    assignment: "work".to_owned(),
+                    todo_task_id: None,
+                    ..TaskItem::default()
+                }],
+            )
+            .expect_err("explicit 17-tool list must stay capped at 16");
+        let message = error.to_string();
+        assert!(message.contains("cap 16"), "{message}");
+        assert!(message.contains("resolves to 17 tools"), "{message}");
+        assert!(
+            message.contains("orchestration.maxToolsPerAgent"),
+            "{message}"
+        );
+        assert!(
+            runtime.jobs(None).is_empty(),
+            "cap failure must not queue a job"
         );
     }
 
@@ -10256,13 +15148,21 @@ mod unknown_tool_declaration_tests {
         // spawns; no declared tool is injected (plumbing + yield remain).
         let root = tempfile::tempdir().expect("root");
         let captured = Arc::new(Mutex::new(Vec::<String>::new()));
-        let runtime = qa_runtime(root.path(), &["yield_output", "computer"], captured.clone(), 16);
+        let (_fixture, runtime) = qa_runtime(
+            root.path(),
+            &["yield_output", "computer"],
+            captured.clone(),
+            16,
+        )
+        .await;
         let spawn = spawn_item(&runtime, "GhostChild", "qa");
         settle(&runtime, &[spawn]).await;
 
         let injected = captured.lock().clone();
         assert!(
-            !injected.iter().any(|name| name == "yield_output" || name == "computer"),
+            !injected
+                .iter()
+                .any(|name| name == "yield_output" || name == "computer"),
             "no unknown tool is injected: {injected:?}"
         );
         assert!(
@@ -10275,72 +15175,188 @@ mod unknown_tool_declaration_tests {
             runtime.unknown_tool_warnings()
         );
     }
+
+    #[tokio::test]
+    async fn settings_tools_override_over_cap_fails_closed_at_spawn() {
+        // A settings.agents.<name>.tools override is an explicit list: it
+        // must stay fail-closed against max_tools_per_agent even when the
+        // bundled definition itself declares no tools. The inherited
+        // `tools: None` exemption applies only to genuinely omitted lists.
+        let root = tempfile::tempdir().expect("root");
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let fixture =
+            isolated_session(root.path(), Vec::new(), Some(recording_stream(captured))).await;
+        let snapshot = fixture.session.child_session_options_snapshot();
+        let declared: Vec<String> = super::super::definitions::DEFAULT_CHILD_CODING_TOOLS
+            .iter()
+            .take(17)
+            .map(|name| (*name).to_owned())
+            .collect();
+        let default_task = super::super::definitions::parse_agent_definition(
+            Path::new("task.md"),
+            "---\nname: task\ndescription: task\n---\nprompt",
+            super::super::AgentDefinitionSource::Bundled,
+            true,
+        )
+        .expect("default task");
+        assert!(
+            crate::effective_agent_tool_names(&default_task, None).is_none(),
+            "the bundled task must start inherit-None"
+        );
+        let mut settings = BTreeMap::new();
+        settings.insert(
+            "task".to_owned(),
+            crate::AgentRuntimeSettings {
+                enabled: Some(true),
+                model: None,
+                tools: Some(declared.clone()),
+            },
+        );
+        let mut config = OrchestrationConfig::new(
+            AgentCatalog::from_agents(vec![default_task]),
+            root.path().join("artifacts"),
+        )
+        .with_parent_model(fixture.session.model().expect("parent model"))
+        .with_agent_settings(settings);
+        config.max_tools_per_agent = 16;
+        let runtime = OrchestrationRuntime::new(
+            config,
+            OrchestrationRuntime::child_factory_from_snapshot(snapshot),
+        )
+        .expect("runtime");
+        let error = runtime
+            .spawn_tasks(
+                "Main",
+                0,
+                vec![TaskItem {
+                    index: 0,
+                    id: "OverrideWide".to_owned(),
+                    agent: "task".to_owned(),
+                    assignment: "work".to_owned(),
+                    todo_task_id: None,
+                    ..TaskItem::default()
+                }],
+            )
+            .expect_err("explicit settings override must stay capped at 16");
+        let message = error.to_string();
+        assert!(message.contains("cap 16"), "{message}");
+        assert!(message.contains("resolves to 17 tools"), "{message}");
+        assert!(
+            message.contains("orchestration.maxToolsPerAgent"),
+            "{message}"
+        );
+        assert!(
+            runtime.jobs(None).is_empty(),
+            "cap failure must not queue a job"
+        );
+    }
 }
 
 #[cfg(test)]
 mod memory_child_factory_tests {
     use super::*;
-    use crate::SessionOptions;
-    use pi_ai::{AssistantMessage, AssistantMessageEvent, ContentBlock, Model, SimpleStreamOptions, StopReason, new_assistant_message_event_stream};
+    use pi_ai::{
+        AssistantMessage, AssistantMessageEvent, ContentBlock, Model, SimpleStreamOptions,
+        StopReason, new_assistant_message_event_stream,
+    };
 
     fn recording_stream(captured: Arc<Mutex<Vec<String>>>) -> pi_agent::StreamFn {
-        Arc::new(move |model: Model, context: pi_ai::Context, _options: SimpleStreamOptions| {
-            *captured.lock() = context.tools.iter().map(|tool| tool.name.clone()).collect();
-            Box::pin(async move {
-                let mut done = AssistantMessage::pending(&model);
-                done.content = vec![ContentBlock::text("done")];
-                done.stop_reason = StopReason::Stop;
-                let stream = new_assistant_message_event_stream();
-                let producer = stream.clone();
-                let model = model.clone();
-                tokio::spawn(async move {
-                    producer.push(AssistantMessageEvent::Start { partial: AssistantMessage::pending(&model) }).await;
-                    producer.push(AssistantMessageEvent::Done { reason: StopReason::Stop, message: done.clone() }).await;
-                    producer.end(Some(done)).await;
-                });
-                stream
-            })
-        })
+        Arc::new(
+            move |model: Model, context: pi_ai::Context, _options: SimpleStreamOptions| {
+                *captured.lock() = context.tools.iter().map(|tool| tool.name.clone()).collect();
+                Box::pin(async move {
+                    let mut done = AssistantMessage::pending(&model);
+                    done.content = vec![ContentBlock::text("done")];
+                    done.stop_reason = StopReason::Stop;
+                    let stream = new_assistant_message_event_stream();
+                    let producer = stream.clone();
+                    let model = model.clone();
+                    tokio::spawn(async move {
+                        producer
+                            .push(AssistantMessageEvent::Start {
+                                partial: AssistantMessage::pending(&model),
+                            })
+                            .await;
+                        producer
+                            .push(AssistantMessageEvent::Done {
+                                reason: StopReason::Stop,
+                                message: done.clone(),
+                            })
+                            .await;
+                        producer.end(Some(done)).await;
+                    });
+                    stream
+                })
+            },
+        )
     }
 
     fn definition(root: &Path, persona: bool, tools: Option<&str>) -> AgentDefinition {
-        let path = if persona { root.join("reviewer").join("persona.md") } else { root.join("task.md") };
-        if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).expect("definition parent"); }
-        let tools = tools.map(|tools| format!("tools: [{tools}]\n")).unwrap_or_default();
+        let path = if persona {
+            root.join("reviewer").join("persona.md")
+        } else {
+            root.join("task.md")
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("definition parent");
+        }
+        let tools = tools
+            .map(|tools| format!("tools: [{tools}]\n"))
+            .unwrap_or_default();
         let mut definition = super::super::definitions::parse_agent_definition(
             &path,
             &format!("---\nname: test\ndescription: test\n{tools}---\nprompt"),
             super::super::AgentDefinitionSource::User,
             true,
-        ).expect("definition");
-        if persona { definition.kind = super::super::definitions::AgentDefinitionKind::Persona; }
+        )
+        .expect("definition");
+        if persona {
+            definition.kind = super::super::definitions::AgentDefinitionKind::Persona;
+        }
         definition
     }
 
-    fn parent_snapshot(root: &Path, captured: Arc<Mutex<Vec<String>>>, config: crate::MemoryConfig) -> crate::ChildSessionOptionsSnapshot {
-        let session = Session::new(SessionOptions {
-            model: Model::default(), cwd: root.to_path_buf(), system_prompt: String::new(),
-            thinking_level: ThinkingLevel::Off, api_key: String::new(), compaction: None,
-            stream_options: Default::default(), tools: Some(Vec::new()), before_tool_call: None,
-            after_tool_call: None, stream_fn: Some(recording_stream(captured)), auth_resolver: None,
-        }).expect("parent session");
-        let mut snapshot = session.child_session_options_snapshot();
+    async fn parent_snapshot(
+        root: &Path,
+        captured: Arc<Mutex<Vec<String>>>,
+        config: crate::MemoryConfig,
+    ) -> (IsolatedSessionFixture, crate::ChildSessionOptionsSnapshot) {
+        let fixture = isolated_session(root, Vec::new(), Some(recording_stream(captured))).await;
+        let mut snapshot = fixture.session.child_session_options_snapshot();
         snapshot.memory = Some(Arc::new(move || Some(config.clone())));
-        snapshot
+        (fixture, snapshot)
     }
-
-    fn request(definition: AgentDefinition, requested: Option<Vec<String>>) -> ChildSessionRequest {
+    fn request(
+        definition: AgentDefinition,
+        requested: Option<Vec<String>>,
+        model: Model,
+    ) -> ChildSessionRequest {
         ChildSessionRequest {
-            child_id: "Child".to_owned(), parent_id: "Main".to_owned(), max_tools_per_agent: 32,
-            depth: 1, definition, assignment: "work".to_owned(), system_prompt: String::new(),
-            requested_tool_names: requested, orchestration_tools: Vec::new(), thinking_level: None,
-            model: Model::default(), output_schema: None, schema_mode: None,
+            child_id: "Child".to_owned(),
+            parent_id: "Main".to_owned(),
+            max_tools_per_agent: 32,
+            depth: 1,
+            definition,
+            assignment: "work".to_owned(),
+            system_prompt: String::new(),
+            requested_tool_names: requested,
+            orchestration_tools: Vec::new(),
+            thinking_level: None,
+            persona_skill_store: None,
+            persona_skills: Arc::new(Vec::new()),
+            resolved_model_sequence: Vec::new(),
+            resolved_model_selected_index: 0,
+            shared_skills: Arc::new(Vec::new()),
+            model,
+            output_schema: None,
+            schema_mode: None,
             yield_state: Arc::new(YieldState::default()),
         }
     }
 
     #[tokio::test]
-    async fn ordinary_and_persona_children_inherit_hindsight_for_default_and_explicit_memory_requests() {
+    async fn ordinary_and_persona_children_inherit_hindsight_for_default_and_explicit_memory_requests()
+     {
         for (persona, explicit) in [(false, false), (false, true), (true, false), (true, true)] {
             let root = tempfile::tempdir().expect("root");
             let captured = Arc::new(Mutex::new(Vec::new()));
@@ -10351,15 +15367,22 @@ mod memory_child_factory_tests {
                 hindsight_scoping: crate::HindsightScoping::PerProject,
                 ..Default::default()
             };
-            let factory = OrchestrationRuntime::child_factory_from_snapshot(parent_snapshot(root.path(), captured.clone(), config));
+            let (_fixture, snapshot) = parent_snapshot(root.path(), captured.clone(), config).await;
+            let model = snapshot.model.clone();
+            let factory = OrchestrationRuntime::child_factory_from_snapshot(snapshot);
             let child = factory(request(
                 definition(root.path(), persona, explicit.then_some("memory")),
                 explicit.then(|| vec!["memory".to_owned()]),
-            )).await.expect("child");
+                model,
+            ))
+            .await
+            .expect("child");
             child.run("work", Vec::new()).await.expect("run child");
             let tools = captured.lock().clone();
             assert!(!tools.iter().any(|name| name == "memory"), "{tools:?}");
-            for name in ["recall", "retain", "reflect"] { assert!(tools.iter().any(|tool| tool == name), "{tools:?}"); }
+            for name in ["recall", "retain", "reflect"] {
+                assert!(tools.iter().any(|tool| tool == name), "{tools:?}");
+            }
         }
     }
 
@@ -10369,18 +15392,286 @@ mod memory_child_factory_tests {
             for backend in [crate::MemoryBackend::Off, crate::MemoryBackend::Local] {
                 let root = tempfile::tempdir().expect("root");
                 let captured = Arc::new(Mutex::new(Vec::new()));
-                let factory = OrchestrationRuntime::child_factory_from_snapshot(parent_snapshot(root.path(), captured.clone(), crate::MemoryConfig { backend, ..Default::default() }));
-                let child = factory(request(definition(root.path(), persona, None), None)).await.expect("child");
+                let (_fixture, snapshot) = parent_snapshot(
+                    root.path(),
+                    captured.clone(),
+                    crate::MemoryConfig {
+                        backend,
+                        ..Default::default()
+                    },
+                )
+                .await;
+                let model = snapshot.model.clone();
+                let factory = OrchestrationRuntime::child_factory_from_snapshot(snapshot);
+                let child = factory(request(definition(root.path(), persona, None), None, model))
+                    .await
+                    .expect("child");
                 child.run("work", Vec::new()).await.expect("run child");
                 let tools = captured.lock().clone();
                 if backend == crate::MemoryBackend::Off {
-                    assert!(!tools.iter().any(|name| matches!(name.as_str(), "memory" | "recall" | "retain" | "reflect")), "{tools:?}");
+                    assert!(
+                        !tools.iter().any(|name| matches!(
+                            name.as_str(),
+                            "memory" | "recall" | "retain" | "reflect"
+                        )),
+                        "{tools:?}"
+                    );
                 } else {
                     assert!(tools.iter().any(|name| name == "memory"), "{tools:?}");
-                    assert!(!tools.iter().any(|name| matches!(name.as_str(), "recall" | "retain" | "reflect")), "{tools:?}");
+                    assert!(
+                        !tools
+                            .iter()
+                            .any(|name| matches!(name.as_str(), "recall" | "retain" | "reflect")),
+                        "{tools:?}"
+                    );
                 }
             }
         }
+    }
+
+    fn named_tool(name: &str, capability: pi_agent::ToolCapability) -> AgentTool {
+        AgentTool::new(
+            name,
+            name,
+            pi_ai::Schema::object(std::collections::HashMap::new(), Vec::new()),
+            |_| async { Ok(pi_agent::AgentToolResult::default()) },
+        )
+        .with_capability(capability)
+    }
+
+    #[tokio::test]
+    async fn learn_skill_injects_only_for_explicit_writable_persona_declaration() {
+        for (persona, ceiling, disallowed, expected) in [
+            (true, None, Vec::<String>::new(), true),
+            (
+                true,
+                Some(CapabilityCeiling {
+                    read: true,
+                    write: false,
+                    exec: true,
+                }),
+                Vec::new(),
+                false,
+            ),
+            (true, None, vec!["learn_skill".to_owned()], false),
+            (false, None, Vec::new(), false),
+        ] {
+            let root = tempfile::tempdir().expect("root");
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let (_fixture, snapshot) = parent_snapshot(
+                root.path(),
+                captured.clone(),
+                crate::MemoryConfig::default(),
+            )
+            .await;
+            let model = snapshot.model.clone();
+            let mut definition = definition(root.path(), persona, Some("learn_skill"));
+            definition.capability_ceiling = ceiling;
+            definition.disallowed_tools = disallowed;
+            let store = if persona {
+                let filesystem = CapabilityFs::new().expect("filesystem");
+                let lease = filesystem
+                    .open_root(
+                        CapabilityRootPurpose::PersonaStore,
+                        pi_sandbox::AbsolutePath::parse(
+                            definition.persona_root().expect("persona root"),
+                        )
+                        .expect("absolute persona root"),
+                        CapabilityAccess::PrivateReadWrite,
+                        RootCreation::Existing,
+                    )
+                    .expect("persona lease");
+                Some(crate::PersonaSkillStore::new(lease).expect("persona skill store"))
+            } else {
+                None
+            };
+            let mut request = request(definition, Some(vec!["learn_skill".to_owned()]), model);
+            request.persona_skill_store = store;
+            let child = OrchestrationRuntime::child_factory_from_snapshot(snapshot)(request)
+                .await
+                .expect("child");
+            child.run("work", Vec::new()).await.expect("run child");
+            assert_eq!(
+                captured.lock().iter().any(|name| name == "learn_skill"),
+                expected
+            );
+        }
+    }
+
+    fn skill_read_context(path: &str) -> pi_agent::ToolCallContext {
+        let (_controller, abort) = pi_agent::AbortController::new();
+        std::mem::forget(_controller);
+        pi_agent::ToolCallContext {
+            tool_call_id: "read-skill".to_owned(),
+            arguments: serde_json::json!({ "path": path }),
+            on_update: Arc::new(|_result: pi_agent::AgentToolResult| {}),
+            abort,
+            model: None,
+            approval_token: None,
+        }
+    }
+
+    fn skill_read_text(result: &pi_agent::AgentToolResult) -> String {
+        match result.content.first() {
+            Some(ContentBlock::Text { text, .. }) => text.clone(),
+            _ => String::new(),
+        }
+    }
+
+    fn trusted_shared_skill(root: &Path, name: &str, body: &str) -> crate::Skill {
+        let base = root.join(name);
+        std::fs::create_dir_all(&base).expect("shared skill directory");
+        std::fs::write(base.join("SKILL.md"), body).expect("shared skill file");
+        crate::Skill {
+            name: name.to_owned(),
+            description: format!("{name} shared"),
+            file_path: base.join("SKILL.md").to_string_lossy().into_owned(),
+            base_dir: base.to_string_lossy().into_owned(),
+            globs: Vec::new(),
+            always_apply: false,
+            hidden: false,
+            disable_model_invocation: false,
+            source: crate::SkillSource::User,
+            managed_project_boundary: None,
+            managed_root: None,
+            trusted: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn persona_child_skill_uri_overlays_shared_catalog() {
+        let root = tempfile::tempdir().expect("root");
+        let overlap = trusted_shared_skill(root.path(), "overlap", "shared body");
+        let unique_shared = trusted_shared_skill(root.path(), "shared-asset", "shared unique");
+        std::fs::write(root.path().join("shared-asset/asset.txt"), "shared asset body")
+            .expect("shared asset");
+        let shared = Arc::new(vec![overlap, unique_shared]);
+        let persona_skills = Arc::new(vec![
+            crate::PersonaSkill {
+                name: "overlap".to_owned(),
+                description: "persona description".to_owned(),
+                content: "persona body".to_owned(),
+            },
+            crate::PersonaSkill {
+                name: "persona-only".to_owned(),
+                description: "persona only".to_owned(),
+                content: "persona only body".to_owned(),
+            },
+        ]);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let (_fixture, snapshot) = parent_snapshot(
+            root.path(),
+            captured,
+            crate::MemoryConfig::default(),
+        )
+        .await;
+        let model = snapshot.model.clone();
+        let factory = OrchestrationRuntime::child_factory_from_snapshot(snapshot);
+
+        let mut persona_request = request(
+            definition(root.path(), true, Some("read")),
+            Some(vec!["read".to_owned()]),
+            model.clone(),
+        );
+        persona_request.shared_skills = shared.clone();
+        persona_request.persona_skills = persona_skills.clone();
+        let persona_child = factory(persona_request).await.expect("persona child");
+        let persona_read = persona_child
+            .active_tools()
+            .into_iter()
+            .find(|tool| tool.name == "read")
+            .expect("persona read tool");
+        let overlap_text = skill_read_text(
+            &(persona_read.execute)(skill_read_context("skill://overlap"))
+                .await
+                .expect("persona overlap"),
+        );
+        assert!(overlap_text.contains("persona body"), "{overlap_text}");
+        assert!(!overlap_text.contains("shared body"), "{overlap_text}");
+        let only = skill_read_text(
+            &(persona_read.execute)(skill_read_context("skill://persona-only"))
+                .await
+                .expect("persona only"),
+        );
+        assert!(only.contains("persona only body"), "{only}");
+        let traversal = (persona_read.execute)(skill_read_context("skill://overlap/../escape"))
+            .await
+            .expect_err("persona traversal")
+            .to_string();
+        assert!(
+            traversal.contains("persona skills expose only their main SKILL.md"),
+            "{traversal}"
+        );
+        let asset = skill_read_text(
+            &(persona_read.execute)(skill_read_context("skill://shared-asset/asset.txt"))
+                .await
+                .expect("shared asset fallthrough"),
+        );
+        assert!(asset.contains("shared asset body"), "{asset}");
+
+        let mut ordinary_request = request(
+            definition(root.path(), false, Some("read")),
+            Some(vec!["read".to_owned()]),
+            model,
+        );
+        ordinary_request.shared_skills = shared;
+        let ordinary_child = factory(ordinary_request).await.expect("ordinary child");
+        let ordinary_read = ordinary_child
+            .active_tools()
+            .into_iter()
+            .find(|tool| tool.name == "read")
+            .expect("ordinary read tool");
+        let shared_text = skill_read_text(
+            &(ordinary_read.execute)(skill_read_context("skill://overlap"))
+                .await
+                .expect("ordinary overlap"),
+        );
+        assert!(shared_text.contains("shared body"), "{shared_text}");
+        assert!(!shared_text.contains("persona body"), "{shared_text}");
+        let missing = (ordinary_read.execute)(skill_read_context("skill://persona-only"))
+            .await
+            .expect_err("ordinary persona-only")
+            .to_string();
+        assert!(missing.contains("unknown or untrusted skill"), "{missing}");
+    }
+
+    #[tokio::test]
+    async fn disallowed_plumbing_removes_five_tools_and_keeps_single_yield() {
+        let root = tempfile::tempdir().expect("root");
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let (_fixture, snapshot) = parent_snapshot(
+            root.path(),
+            captured.clone(),
+            crate::MemoryConfig::default(),
+        )
+        .await;
+        let model = snapshot.model.clone();
+        let mut definition = definition(root.path(), true, Some("read"));
+        definition.disallowed_tools = ["todo", "process", "task", "hub", "goal", "yield"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let mut request = request(definition, Some(vec!["read".to_owned()]), model);
+        request.orchestration_tools = vec![
+            named_tool("todo", pi_agent::ToolCapability::Write),
+            named_tool("process", pi_agent::ToolCapability::Exec),
+            named_tool("task", pi_agent::ToolCapability::Exec),
+            named_tool("hub", pi_agent::ToolCapability::Read),
+            named_tool("goal", pi_agent::ToolCapability::Write),
+            named_tool("yield", pi_agent::ToolCapability::Write),
+        ];
+        let child = OrchestrationRuntime::child_factory_from_snapshot(snapshot)(request)
+            .await
+            .expect("child");
+        child.run("work", Vec::new()).await.expect("run child");
+        let tools = captured.lock().clone();
+        for removed in ["todo", "process", "task", "hub", "goal"] {
+            assert!(!tools.iter().any(|name| name == removed), "{tools:?}");
+        }
+        assert_eq!(
+            tools.iter().filter(|name| name.as_str() == "yield").count(),
+            1
+        );
     }
 }
 
@@ -10401,13 +15692,17 @@ mod settle_tool_failure_tests {
     //! are authoritative failures.
 
     use super::*;
-    use crate::{AgentDefinitionSource, SessionOptions};
+    use crate::AgentDefinitionSource;
 
     fn tool_result(tool_name: &str, is_error: bool, timestamp: i64) -> pi_ai::Message {
         pi_ai::Message::ToolResult(pi_ai::ToolResultMessage {
             tool_call_id: format!("call-{timestamp}"),
             tool_name: tool_name.to_owned(),
-            content: vec![pi_ai::ContentBlock::text(if is_error { "boom" } else { "ok" })],
+            content: vec![pi_ai::ContentBlock::text(if is_error {
+                "boom"
+            } else {
+                "ok"
+            })],
             usage: None,
             details: None,
             added_tool_names: Vec::new(),
@@ -10416,7 +15711,12 @@ mod settle_tool_failure_tests {
         })
     }
 
-    fn bash(command: &str, exit_code: Option<i32>, cancelled: bool, timestamp: i64) -> pi_ai::Message {
+    fn bash(
+        command: &str,
+        exit_code: Option<i32>,
+        cancelled: bool,
+        timestamp: i64,
+    ) -> pi_ai::Message {
         pi_ai::Message::BashExecution(pi_ai::BashExecutionMessage {
             command: command.to_owned(),
             output: String::new(),
@@ -10443,14 +15743,14 @@ mod settle_tool_failure_tests {
     fn task_definition() -> AgentDefinition {
         super::super::definitions::parse_agent_definition(
             Path::new("task.md"),
-            "---\nname: task\ndescription: task\n---\nprompt",
+            "---\nname: task\ndescription: task\ntools: [read]\n---\nprompt",
             AgentDefinitionSource::Bundled,
             true,
         )
         .expect("definition")
     }
 
-    fn session_with_tools(root: &Path, names: &[&str]) -> Session {
+    async fn session_with_tools(root: &Path, names: &[&str]) -> IsolatedSessionFixture {
         let tools = names
             .iter()
             .map(|name| {
@@ -10459,25 +15759,11 @@ mod settle_tool_failure_tests {
                 })
             })
             .collect::<Vec<_>>();
-        Session::new(SessionOptions {
-            model: pi_ai::Model::default(),
-            cwd: root.to_path_buf(),
-            system_prompt: String::new(),
-            thinking_level: ThinkingLevel::Off,
-            api_key: String::new(),
-            compaction: None,
-            stream_options: Default::default(),
-            tools: Some(tools),
-            before_tool_call: None,
-            after_tool_call: None,
-            stream_fn: None,
-            auth_resolver: None,
-        })
-        .expect("session")
+        isolated_session(root, tools, None).await
     }
 
-    fn session(root: &Path) -> Session {
-        session_with_tools(root, &[])
+    async fn session(root: &Path) -> IsolatedSessionFixture {
+        session_with_tools(root, &[]).await
     }
 
     fn settled_run(
@@ -10521,7 +15807,10 @@ mod settle_tool_failure_tests {
             tool_result("edit", false, 2),
             prose("fixed"),
         ];
-        assert_eq!(last_failed_tool_kind(&messages, &tool_names(&["edit"])), None);
+        assert_eq!(
+            last_failed_tool_kind(&messages, &tool_names(&["edit"])),
+            None
+        );
     }
 
     #[test]
@@ -10560,7 +15849,10 @@ mod settle_tool_failure_tests {
         // A zero exit clears an earlier non-zero failure (recovery).
         assert_eq!(
             last_failed_tool_kind(
-                &[bash("false", Some(1), false, 1), bash("true", Some(0), false, 2)],
+                &[
+                    bash("false", Some(1), false, 1),
+                    bash("true", Some(0), false, 2)
+                ],
                 &tool_names(&[])
             ),
             None
@@ -10635,19 +15927,22 @@ mod settle_tool_failure_tests {
         );
     }
 
-    #[test]
-    fn settle_failed_last_tool_keeps_prose_and_surfaces_bounded_error() {
+    #[tokio::test]
+    async fn settle_failed_last_tool_keeps_prose_and_surfaces_bounded_error() {
         let root = tempfile::tempdir().expect("root");
-        let parent = session(root.path());
-        let snapshot = parent.child_session_options_snapshot();
-        let child = ChildSession::new(session_with_tools(root.path(), &["read", "edit"]));
+        let parent = session(root.path()).await;
+        let snapshot = parent.session.child_session_options_snapshot();
+        let child_fixture = session_with_tools(root.path(), &["read", "edit"]).await;
+        let child = ChildSession::new(child_fixture.session.clone());
         let config = OrchestrationConfig::new(
             AgentCatalog::from_agents(vec![task_definition()]),
             root.path().join("artifacts"),
         );
-        let runtime =
-            OrchestrationRuntime::new(config, OrchestrationRuntime::child_factory_from_snapshot(snapshot))
-                .expect("runtime");
+        let runtime = OrchestrationRuntime::new(
+            config,
+            OrchestrationRuntime::child_factory_from_snapshot(snapshot),
+        )
+        .expect("runtime");
         let result = settled_run(
             "final prose after the failed tool",
             vec![
@@ -10657,35 +15952,34 @@ mod settle_tool_failure_tests {
             ],
             None,
         );
-        let (output, error, _) = runtime.settle_child_outcome(
-            Ok(result),
-            &child,
-            &YieldState::default(),
-            false,
-        );
+        let (output, error, _) =
+            runtime.settle_child_outcome(Ok(result), &child, &YieldState::default(), false);
         // The final prose stands as output, but the authoritative tool
         // failure still errors the job — prose never masks it.
         assert_eq!(output, "final prose after the failed tool");
         assert_eq!(error.as_deref(), Some("last tool execution failed: edit"));
     }
 
-    #[test]
-    fn settle_denied_write_on_read_only_child_completes() {
+    #[tokio::test]
+    async fn settle_denied_write_on_read_only_child_completes() {
         // A read-only child whose only tool is `read` deliberately calls
         // `write`: the denial stays visible in the transcript as an is_error
         // result, but the run completes without error (the campaign contract:
         // the write denial is recorded while the scout finishes read-only).
         let root = tempfile::tempdir().expect("root");
-        let parent = session(root.path());
-        let snapshot = parent.child_session_options_snapshot();
-        let child = ChildSession::new(session_with_tools(root.path(), &["read"]));
+        let parent = session(root.path()).await;
+        let snapshot = parent.session.child_session_options_snapshot();
+        let child_fixture = session_with_tools(root.path(), &["read"]).await;
+        let child = ChildSession::new(child_fixture.session.clone());
         let config = OrchestrationConfig::new(
             AgentCatalog::from_agents(vec![task_definition()]),
             root.path().join("artifacts"),
         );
-        let runtime =
-            OrchestrationRuntime::new(config, OrchestrationRuntime::child_factory_from_snapshot(snapshot))
-                .expect("runtime");
+        let runtime = OrchestrationRuntime::new(
+            config,
+            OrchestrationRuntime::child_factory_from_snapshot(snapshot),
+        )
+        .expect("runtime");
         let result = settled_run(
             "scout finished without write",
             vec![
@@ -10695,12 +15989,8 @@ mod settle_tool_failure_tests {
             ],
             None,
         );
-        let (output, error, _) = runtime.settle_child_outcome(
-            Ok(result),
-            &child,
-            &YieldState::default(),
-            false,
-        );
+        let (output, error, _) =
+            runtime.settle_child_outcome(Ok(result), &child, &YieldState::default(), false);
         assert_eq!(
             output,
             format!("scout finished without write\n\n{MISSING_YIELD_WARNING}")
@@ -10711,58 +16001,66 @@ mod settle_tool_failure_tests {
         );
     }
 
-    #[test]
-    fn settle_recovered_tool_failure_completes_without_error() {
+    #[tokio::test]
+    async fn settle_recovered_tool_failure_completes_without_error() {
         let root = tempfile::tempdir().expect("root");
-        let parent = session(root.path());
-        let snapshot = parent.child_session_options_snapshot();
-        let child = ChildSession::new(session_with_tools(root.path(), &["edit"]));
+        let parent = session(root.path()).await;
+        let snapshot = parent.session.child_session_options_snapshot();
+        let child_fixture = session_with_tools(root.path(), &["edit"]).await;
+        let child = ChildSession::new(child_fixture.session.clone());
         let config = OrchestrationConfig::new(
             AgentCatalog::from_agents(vec![task_definition()]),
             root.path().join("artifacts"),
         );
-        let runtime =
-            OrchestrationRuntime::new(config, OrchestrationRuntime::child_factory_from_snapshot(snapshot))
-                .expect("runtime");
+        let runtime = OrchestrationRuntime::new(
+            config,
+            OrchestrationRuntime::child_factory_from_snapshot(snapshot),
+        )
+        .expect("runtime");
         let result = settled_run(
             "recovered and done",
-            vec![tool_result("edit", true, 1), tool_result("edit", false, 2), prose("done")],
+            vec![
+                tool_result("edit", true, 1),
+                tool_result("edit", false, 2),
+                prose("done"),
+            ],
             None,
         );
-        let (output, error, _) = runtime.settle_child_outcome(
-            Ok(result),
-            &child,
-            &YieldState::default(),
-            false,
+        let (output, error, _) =
+            runtime.settle_child_outcome(Ok(result), &child, &YieldState::default(), false);
+        assert_eq!(
+            output,
+            format!("recovered and done\n\n{MISSING_YIELD_WARNING}")
         );
-        assert_eq!(output, format!("recovered and done\n\n{MISSING_YIELD_WARNING}"));
-        assert!(error.is_none(), "recovered tool failure must not error: {error:?}");
+        assert!(
+            error.is_none(),
+            "recovered tool failure must not error: {error:?}"
+        );
     }
 
-    #[test]
-    fn settle_provider_error_keeps_priority_over_tool_failure() {
+    #[tokio::test]
+    async fn settle_provider_error_keeps_priority_over_tool_failure() {
         let root = tempfile::tempdir().expect("root");
-        let parent = session(root.path());
-        let snapshot = parent.child_session_options_snapshot();
-        let child = ChildSession::new(session_with_tools(root.path(), &["read"]));
+        let parent = session(root.path()).await;
+        let snapshot = parent.session.child_session_options_snapshot();
+        let child_fixture = session_with_tools(root.path(), &["read"]).await;
+        let child = ChildSession::new(child_fixture.session.clone());
         let config = OrchestrationConfig::new(
             AgentCatalog::from_agents(vec![task_definition()]),
             root.path().join("artifacts"),
         );
-        let runtime =
-            OrchestrationRuntime::new(config, OrchestrationRuntime::child_factory_from_snapshot(snapshot))
-                .expect("runtime");
+        let runtime = OrchestrationRuntime::new(
+            config,
+            OrchestrationRuntime::child_factory_from_snapshot(snapshot),
+        )
+        .expect("runtime");
         let result = settled_run(
             "partial prose",
             vec![tool_result("read", true, 1)],
             Some("provider: upstream request failed".to_owned()),
         );
-        let (_, error, _) = runtime.settle_child_outcome(
-            Ok(result),
-            &child,
-            &YieldState::default(),
-            false,
-        );
+        let (_, error, _) =
+            runtime.settle_child_outcome(Ok(result), &child, &YieldState::default(), false);
         // The provider's own error wins; the tool failure summary must not
         // replace or be appended to it.
         assert_eq!(error.as_deref(), Some("provider: upstream request failed"));

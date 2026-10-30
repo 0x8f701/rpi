@@ -1,7 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{self, File, OpenOptions};
 use std::future::Future;
-use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,6 +12,12 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use pi_sandbox::AbsolutePath;
+
+use crate::fs::{
+    CapabilityAccess, CapabilityFs, CapabilityRootLease, CapabilityRootPurpose, FileIdentity,
+    FileMode, FsError, Replacement, RootCreation,
+};
 use crate::oauth;
 
 const MAX_AVAILABLE_MODEL_IDS: usize = 1_024;
@@ -23,6 +27,8 @@ const AUTH_LOCK_TIMEOUT: Duration = Duration::from_secs(45);
 const AUTH_LOCK_RETRY_DELAY: Duration = Duration::from_millis(50);
 const MAX_AUTH_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_AUTH_LOCK_BYTES: u64 = 16 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_PROC_IDENTITY_BYTES: u64 = 4 * 1024;
 /// Environment variable that selects the active credential scope. It wins
 /// over the `authScope` settings key when both are set.
 pub const AUTH_SCOPE_ENV: &str = "PI_AUTH_SCOPE";
@@ -151,9 +157,7 @@ pub fn validate_scope_label(label: &str) -> Result<String> {
         bail!("credential scope must not be empty");
     }
     if label.len() > MAX_SCOPE_LABEL_BYTES {
-        bail!(
-            "credential scope exceeds {MAX_SCOPE_LABEL_BYTES} bytes: {label:?}"
-        );
+        bail!("credential scope exceeds {MAX_SCOPE_LABEL_BYTES} bytes: {label:?}");
     }
     if label
         .chars()
@@ -178,7 +182,12 @@ pub fn select_scoped_credential<'a>(
     entries: &'a [ScopedCredential],
     active_scope: Option<&str>,
 ) -> Result<Option<&'a ScopedCredential>> {
-    select_scoped_credential_by(provider, entries, |entry| entry.scope.as_deref(), active_scope)
+    select_scoped_credential_by(
+        provider,
+        entries,
+        |entry| entry.scope.as_deref(),
+        active_scope,
+    )
 }
 
 /// Shared credential-selection core behind [`select_scoped_credential`] and
@@ -214,7 +223,10 @@ where
             "provider {provider:?} has credentials only in scope(s) {scopes}; set {AUTH_SCOPE_ENV} or the authScope setting to select one"
         );
     };
-    if let Some(entry) = entries.iter().find(|entry| scope_of(entry) == Some(active_scope)) {
+    if let Some(entry) = entries
+        .iter()
+        .find(|entry| scope_of(entry) == Some(active_scope))
+    {
         return Ok(Some(entry));
     }
     if let Some(entry) = entries.iter().find(|entry| scope_of(entry).is_none()) {
@@ -250,10 +262,7 @@ where
 /// best-effort: unreadable or invalid settings fall back to no active scope.
 #[must_use]
 pub fn active_auth_scope() -> Option<String> {
-    resolve_scope_preference(
-        std::env::var(AUTH_SCOPE_ENV).ok(),
-        settings_auth_scope(),
-    )
+    resolve_scope_preference(std::env::var(AUTH_SCOPE_ENV).ok(), settings_auth_scope())
 }
 
 /// Precedence for the active credential scope: a non-empty `PI_AUTH_SCOPE`
@@ -276,8 +285,9 @@ pub fn resolve_scope_preference(
 
 fn settings_auth_scope() -> Option<String> {
     let cwd = std::env::current_dir().ok()?;
-    let manager = crate::settings::SettingsManager::load_phase_one(cwd, crate::resources::agent_dir_path())
-        .ok()?;
+    let manager =
+        crate::settings::SettingsManager::load_phase_one(cwd, crate::resources::agent_dir_path())
+            .ok()?;
     manager.global_settings().auth_scope
 }
 
@@ -357,7 +367,9 @@ pub trait AuthInteraction: Send + Sync {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuthMethodInfo {
-    ApiKey { name: String },
+    ApiKey {
+        name: String,
+    },
     OAuth {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -373,12 +385,32 @@ pub struct AuthProviderInfo {
     pub methods: Vec<AuthMethodInfo>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RequestAuthKind {
+    #[default]
+    ApiKeyOrHeaders,
+    StoredOAuth,
+}
+
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct RequestAuth {
     pub api_key: String,
     pub headers: HashMap<String, String>,
     pub env: HashMap<String, String>,
     pub available_model_ids: Option<Vec<String>>,
+    pub kind: RequestAuthKind,
+}
+
+impl RequestAuth {
+    #[must_use]
+    pub const fn kind(&self) -> RequestAuthKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn uses_stored_oauth(&self) -> bool {
+        matches!(self.kind, RequestAuthKind::StoredOAuth)
+    }
 }
 
 impl std::fmt::Debug for RequestAuth {
@@ -388,7 +420,11 @@ impl std::fmt::Debug for RequestAuth {
             .field("has_api_key", &!self.api_key.is_empty())
             .field("header_count", &self.headers.len())
             .field("env_count", &self.env.len())
-            .field("available_model_count", &self.available_model_ids.as_ref().map(Vec::len))
+            .field(
+                "available_model_count",
+                &self.available_model_ids.as_ref().map(Vec::len),
+            )
+            .field("kind", &self.kind)
             .finish()
     }
 }
@@ -429,7 +465,7 @@ impl Default for AuthLockOptions {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AuthLockOwner {
     pid: u32,
@@ -474,47 +510,50 @@ impl AuthLockOwner {
 }
 
 struct AuthFileLock {
-    path: PathBuf,
+    parent: CapabilityRootLease,
+    relative: PathBuf,
     token: String,
 }
 
 impl AuthFileLock {
-    async fn acquire(auth_path: &Path, options: AuthLockOptions) -> Result<Self> {
-        let parent = auth_path.parent().unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating auth directory {}", parent.display()))?;
-        set_directory_permissions(parent)?;
-
-        let path = auth_lock_path(auth_path);
+    async fn acquire(storage: &AuthStorage, options: AuthLockOptions) -> Result<Self> {
+        let relative = auth_lock_relative(&storage.file_name);
         let owner = AuthLockOwner::current();
+        let bytes = serialize_lock_owner(&owner)?;
         let started = Instant::now();
         loop {
-            match create_auth_lock_file(&path, &owner) {
-                Ok(()) => {
+            match storage.parent.create_new(&relative, FileMode::Private) {
+                Ok(mut file) => {
+                    file.write_all(&bytes).context("writing auth lock owner")?;
+                    file.finish().context("syncing auth lock owner")?;
                     return Ok(Self {
-                        path,
+                        parent: storage.parent.clone(),
+                        relative,
                         token: owner.token,
                     });
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if remove_stale_auth_lock(&path, &owner)? {
+                Err(error) if fs_error_kind(&error) == Some(std::io::ErrorKind::AlreadyExists) => {
+                    if remove_stale_auth_lock(&storage.parent, &relative, &owner)? {
                         continue;
                     }
                 }
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("creating auth lock file {}", path.display()));
-                }
+                Err(error) => return Err(error).context("creating auth lock file"),
             }
 
             let elapsed = started.elapsed();
             if elapsed >= options.timeout {
-                bail!("timed out acquiring auth lock for {}", auth_path.display());
+                bail!(
+                    "timed out acquiring auth lock for {}",
+                    storage.path.display()
+                );
             }
             let remaining = options.timeout - elapsed;
             tokio::time::sleep(options.retry_delay.min(remaining)).await;
             if started.elapsed() >= options.timeout {
-                bail!("timed out acquiring auth lock for {}", auth_path.display());
+                bail!(
+                    "timed out acquiring auth lock for {}",
+                    storage.path.display()
+                );
             }
         }
     }
@@ -522,42 +561,33 @@ impl AuthFileLock {
 
 impl Drop for AuthFileLock {
     fn drop(&mut self) {
-        let Ok(content) = fs::read(&self.path) else {
+        let Ok(content) = self
+            .parent
+            .read_bounded(&self.relative, MAX_AUTH_LOCK_BYTES)
+        else {
             return;
         };
         let Ok(owner) = serde_json::from_slice::<AuthLockOwner>(&content) else {
             return;
         };
         if owner.token == self.token {
-            let _ = fs::remove_file(&self.path);
+            let _ = self.parent.remove_file(&self.relative);
         }
     }
 }
 
-fn create_auth_lock_file(path: &Path, owner: &AuthLockOwner) -> std::io::Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-
-    let mut file = options.open(path)?;
-    let result = (|| {
-        serde_json::to_writer(&mut file, owner).map_err(std::io::Error::other)?;
-        file.write_all(b"\n")?;
-        file.sync_all()
-    })();
-    drop(file);
-    if result.is_err() {
-        let _ = fs::remove_file(path);
-    }
-    result
+fn serialize_lock_owner(owner: &AuthLockOwner) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec(owner).context("serializing auth lock owner")?;
+    bytes.push(b'\n');
+    Ok(bytes)
 }
 
-fn remove_stale_auth_lock(path: &Path, current: &AuthLockOwner) -> Result<bool> {
-    let owner = match read_auth_lock_owner(path)? {
+fn remove_stale_auth_lock(
+    parent: &CapabilityRootLease,
+    relative: &Path,
+    current: &AuthLockOwner,
+) -> Result<bool> {
+    let owner = match read_auth_lock_owner(parent, relative)? {
         LockOwnerRead::Missing => return Ok(true),
         LockOwnerRead::Invalid => return Ok(false),
         LockOwnerRead::Owner(owner) => owner,
@@ -566,156 +596,164 @@ fn remove_stale_auth_lock(path: &Path, current: &AuthLockOwner) -> Result<bool> 
         return Ok(false);
     }
 
+    // Claim the stale lock by creating a hard-link sibling with a unique name.
+    // The hard link pins the stale inode so two concurrent recoverers cannot
+    // both act on a replaced lock: only a recoverer whose claim still shares
+    // the original inode proceeds to the unlink, and a fresh lock created by
+    // another process survives the race.
     let claim = loop {
-        let candidate = stale_claim_path(path);
-        match fs::hard_link(path, &candidate) {
+        let candidate = stale_claim_relative(relative);
+        match parent.link_existing(relative, &candidate) {
             Ok(()) => break candidate,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("claiming stale auth lock at {}", path.display()));
+            Err(error) if fs_error_kind(&error) == Some(std::io::ErrorKind::NotFound) => {
+                // Lock vanished between the staleness read and the claim.
+                return Ok(true);
             }
+            Err(error) if fs_error_kind(&error) == Some(std::io::ErrorKind::AlreadyExists) => {
+                // UUID collision on the claim name; retry with a fresh name.
+                continue;
+            }
+            Err(FsError::IdentityChanged) => {
+                // `relative` was replaced under us; the link may target the
+                // new inode, so drop the stray claim before retrying
+                // acquisition so the live lock is not stolen.
+                let _ = parent.remove_file(&candidate);
+                return Ok(true);
+            }
+            Err(error) => return Err(error).context("claiming stale auth lock"),
         }
     };
 
     let result = (|| -> Result<bool> {
-        let claimed_owner = match read_auth_lock_owner(&claim)? {
+        let claimed_owner = match read_auth_lock_owner(parent, &claim)? {
             LockOwnerRead::Owner(owner) => owner,
             LockOwnerRead::Missing | LockOwnerRead::Invalid => return Ok(false),
         };
         if claimed_owner.token != owner.token || !claimed_owner.is_definitely_stale(current) {
             return Ok(false);
         }
-
-        let Some(path_identity) = file_identity(path)? else {
-            return Ok(true);
+        let path_identity = optional_identity(parent, relative)?;
+        let claim_identity = optional_identity(parent, &claim)?;
+        let claim_id = match (path_identity, claim_identity) {
+            (None, _) => return Ok(true),  // lock already gone
+            (_, None) => return Ok(false), // claim lost unexpectedly
+            (Some(path), Some(claim_id)) if path != claim_id => return Ok(false), // replaced
+            (Some(_), Some(claim_id)) => claim_id,
         };
-        let Some(claim_identity) = file_identity(&claim)? else {
-            return Ok(false);
-        };
-        if path_identity != claim_identity {
-            return Ok(false);
-        }
-        let Some(final_path_identity) = file_identity(path)? else {
-            return Ok(true);
-        };
-        if final_path_identity != claim_identity {
-            return Ok(false);
-        }
-
-        match fs::remove_file(path) {
+        // Remove the lock only while it still shares the claimed (stale)
+        // inode. `remove_file_expected` re-verifies the identity atomically
+        // with the unlink, so a fresh lock created by another process in the
+        // remaining race window survives instead of being deleted.
+        match parent.remove_file_expected(relative, claim_id) {
             Ok(()) => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
-            Err(error) => Err(error)
-                .with_context(|| format!("removing stale auth lock at {}", path.display())),
+            Err(error) if fs_error_kind(&error) == Some(std::io::ErrorKind::NotFound) => Ok(true),
+            Err(FsError::IdentityChanged) => Ok(true),
+            Err(error) => Err(error).context("removing stale auth lock"),
         }
     })();
-    let _ = fs::remove_file(&claim);
+    let _ = parent.remove_file(&claim);
     result
 }
+
 enum LockOwnerRead {
     Missing,
     Invalid,
     Owner(AuthLockOwner),
 }
 
-fn read_auth_lock_owner(path: &Path) -> Result<LockOwnerRead> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(LockOwnerRead::Missing),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("reading auth lock metadata at {}", path.display()));
+fn read_auth_lock_owner(parent: &CapabilityRootLease, relative: &Path) -> Result<LockOwnerRead> {
+    let content = match parent.read_bounded(relative, MAX_AUTH_LOCK_BYTES) {
+        Ok(content) => content,
+        Err(error) if fs_error_kind(&error) == Some(std::io::ErrorKind::NotFound) => {
+            return Ok(LockOwnerRead::Missing);
         }
+        Err(FsError::ReadLimitExceeded { .. } | FsError::UnsupportedEntryType) => {
+            return Ok(LockOwnerRead::Invalid);
+        }
+        Err(error) => return Err(error).context("reading auth lock owner"),
     };
-    if !metadata.is_file() || metadata.len() > MAX_AUTH_LOCK_BYTES {
-        return Ok(LockOwnerRead::Invalid);
-    }
-
-    let mut file = File::open(path)
-        .with_context(|| format!("opening auth lock owner at {}", path.display()))?;
-    let mut content = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-    Read::by_ref(&mut file)
-        .take(MAX_AUTH_LOCK_BYTES + 1)
-        .read_to_end(&mut content)
-        .with_context(|| format!("reading auth lock owner at {}", path.display()))?;
-    if content.len() as u64 > MAX_AUTH_LOCK_BYTES {
-        return Ok(LockOwnerRead::Invalid);
-    }
     Ok(match serde_json::from_slice(&content) {
         Ok(owner) => LockOwnerRead::Owner(owner),
         Err(_) => LockOwnerRead::Invalid,
     })
 }
 
-fn stale_claim_path(path: &Path) -> PathBuf {
+fn optional_identity(
+    parent: &CapabilityRootLease,
+    relative: &Path,
+) -> Result<Option<FileIdentity>> {
+    match parent.metadata(relative) {
+        Ok(metadata) => Ok(Some(metadata.identity)),
+        Err(error) if fs_error_kind(&error) == Some(std::io::ErrorKind::NotFound) => Ok(None),
+        Err(error) => Err(error).context("reading auth lock identity"),
+    }
+}
+
+fn auth_lock_relative(auth_file_name: &std::ffi::OsStr) -> PathBuf {
+    let mut file_name = auth_file_name.to_os_string();
+    file_name.push(".lock");
+    PathBuf::from(file_name)
+}
+
+fn stale_claim_relative(path: &Path) -> PathBuf {
     let mut file_name = path
         .file_name()
         .unwrap_or_else(|| std::ffi::OsStr::new("auth.json.lock"))
         .to_os_string();
     file_name.push(format!(".{}.claim", Uuid::new_v4()));
-    path.with_file_name(file_name)
+    PathBuf::from(file_name)
 }
-
-#[cfg(unix)]
-fn file_identity(path: &Path) -> Result<Option<(u64, u64)>> {
-    use std::os::unix::fs::MetadataExt;
-
-    match fs::metadata(path) {
-        Ok(metadata) => Ok(Some((metadata.dev(), metadata.ino()))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error)
-            .with_context(|| format!("reading auth lock identity at {}", path.display())),
-    }
-}
-
-#[cfg(not(unix))]
-fn file_identity(_path: &Path) -> Result<Option<(u64, u64)>> {
-    // Stable std does not expose a portable file identity on every platform.
-    // Without it, stale recovery must fail closed rather than risk unlinking a
-    // replacement live lock.
-    Ok(None)
-}
-
-fn auth_lock_path(auth_path: &Path) -> PathBuf {
-    let mut file_name = auth_path
-        .file_name()
-        .unwrap_or_else(|| std::ffi::OsStr::new("auth.json"))
-        .to_os_string();
-    file_name.push(".lock");
-    auth_path.with_file_name(file_name)
-}
-
 
 fn local_host_fingerprint() -> Option<String> {
-    let identity = ["/etc/machine-id", "/var/lib/dbus/machine-id"]
-        .into_iter()
-        .find_map(read_nonempty_trimmed)
-        .or_else(|| read_nonempty_trimmed("/proc/sys/kernel/hostname"))
-        .or_else(|| {
-            std::env::var("COMPUTERNAME")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        })
+    // Prefer the kernel hostname over shell-exported env vars: on Linux the
+    // `HOSTNAME` shell variable is not exported into the process environment
+    // for non-interactive contexts (systemd units, spawned children), which
+    // would otherwise leave the fingerprint unset and silently disable
+    // same-host stale-lock detection.
+    let identity = hostname_from_system()
         .or_else(|| {
             std::env::var("HOSTNAME")
                 .ok()
                 .filter(|value| !value.trim().is_empty())
+        })
+        .or_else(|| {
+            std::env::var("COMPUTERNAME")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
         })?;
-    Some(format!("{:x}", Sha256::digest(identity.trim().as_bytes())))
+    let trimmed = identity.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(format!("{:x}", Sha256::digest(trimmed.as_bytes())))
 }
 
-fn read_nonempty_trimmed(path: &str) -> Option<String> {
-    fs::read_to_string(path)
+/// Reliable per-host identity source independent of shell-exported environment
+/// variables. On Linux the kernel hostname is read directly from
+/// `/proc/sys/kernel/hostname` (where `HOSTNAME` is not exported into
+/// non-interactive environments); elsewhere `None` is returned so the env-var
+/// fallbacks in [`local_host_fingerprint`] apply. The bounded
+/// [`read_fixed_system_file`] helper caps the read so a malformed proc entry
+/// cannot exhaust memory.
+#[cfg(target_os = "linux")]
+fn hostname_from_system() -> Option<String> {
+    read_fixed_system_file(Path::new("/proc/sys/kernel/hostname"))
         .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
+        .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned())
+        .filter(|identity| !identity.is_empty())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn hostname_from_system() -> Option<String> {
+    None
 }
 
 #[cfg(target_os = "linux")]
 fn local_boot_id() -> Option<String> {
-    read_nonempty_trimmed("/proc/sys/kernel/random/boot_id")
+    read_fixed_system_file(Path::new("/proc/sys/kernel/random/boot_id"))
+        .ok()
+        .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned())
+        .filter(|identity| !identity.is_empty())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -725,36 +763,52 @@ fn local_boot_id() -> Option<String> {
 
 #[cfg(target_os = "linux")]
 fn process_start_identity(pid: u32) -> std::io::Result<Option<String>> {
-    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(stat) => stat,
+    let path = PathBuf::from(format!("/proc/{pid}/stat"));
+    let bytes = match read_fixed_system_file(&path) {
+        Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    let command_end = stat.rfind(')').ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid process stat")
-    })?;
-    let start = stat[command_end + 1..]
-        .split_whitespace()
+    let stat = std::str::from_utf8(&bytes)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid proc stat"))?;
+    let after_name = stat
+        .rsplit_once(") ")
+        .map(|(_, fields)| fields)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid proc stat"))?;
+    Ok(after_name
+        .split_ascii_whitespace()
         .nth(19)
-        .ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid process stat")
-        })?;
-    Ok(Some(start.to_owned()))
+        .map(str::to_owned))
 }
 
-#[cfg(not(target_os = "linux"))]
-fn process_start_identity(_pid: u32) -> std::io::Result<Option<String>> {
-    Ok(None)
+#[cfg(target_os = "linux")]
+fn read_fixed_system_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    // `Read::take` bounds the read so a malformed proc entry cannot exhaust
+    // memory; reading one byte past the limit lets us detect oversize files
+    // instead of silently truncating them.
+    file.take(MAX_PROC_IDENTITY_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_PROC_IDENTITY_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "system identity file exceeds bounded read limit",
+        ));
+    }
+    Ok(bytes)
 }
 
 #[cfg(target_os = "linux")]
 fn process_owner_is_stale(owner: &AuthLockOwner) -> bool {
     match process_start_identity(owner.pid) {
         Ok(None) => true,
-        Ok(Some(actual_start)) => owner
+        Ok(Some(current_start)) => owner
             .process_start
             .as_ref()
-            .is_some_and(|recorded_start| recorded_start != &actual_start),
+            .is_some_and(|recorded_start| recorded_start != &current_start),
         Err(_) => false,
     }
 }
@@ -781,18 +835,31 @@ fn process_owner_is_stale(_owner: &AuthLockOwner) -> bool {
 #[derive(Clone)]
 pub struct AuthStorage {
     path: PathBuf,
+    parent: CapabilityRootLease,
+    file_name: std::ffi::OsString,
     lock: Arc<Mutex<()>>,
     lock_options: AuthLockOptions,
 }
 
 impl AuthStorage {
-    #[must_use]
-    pub fn new(path: PathBuf) -> Self {
-        Self {
+    pub fn new(path: PathBuf) -> Result<Self> {
+        let capabilities = CapabilityFs::new().context("creating auth filesystem capabilities")?;
+        let absolute = AbsolutePath::parse(path.clone()).map_err(|_| FsError::InvalidPath)?;
+        let (parent, file_name) = capabilities
+            .open_exact_parent(
+                CapabilityRootPurpose::OperatorAuth,
+                absolute,
+                CapabilityAccess::PrivateReadWrite,
+                RootCreation::CreateDirectory,
+            )
+            .context("opening private auth storage")?;
+        Ok(Self {
             path,
+            parent,
+            file_name,
             lock: Arc::new(Mutex::new(())),
             lock_options: AuthLockOptions::default(),
-        }
+        })
     }
 
     #[must_use]
@@ -805,8 +872,9 @@ impl AuthStorage {
     /// resolution is applied.
     pub async fn read(&self, provider: &str, scope: Option<&str>) -> Result<Option<Credential>> {
         let _guard = self.lock.lock().await;
-        let _file_guard = AuthFileLock::acquire(&self.path, self.lock_options).await?;
-        let store = load_scoped_credentials(&self.path)?;
+        let _file_guard = AuthFileLock::acquire(self, self.lock_options).await?;
+        let store =
+            load_scoped_credentials_from(&self.parent, Path::new(&self.file_name), &self.path)?;
         Ok(store
             .get(provider)
             .and_then(|entries| entries.iter().find(|entry| entry.scope.as_deref() == scope))
@@ -821,8 +889,9 @@ impl AuthStorage {
         active_scope: Option<&str>,
     ) -> Result<Option<ScopedCredential>> {
         let _guard = self.lock.lock().await;
-        let _file_guard = AuthFileLock::acquire(&self.path, self.lock_options).await?;
-        let store = load_scoped_credentials(&self.path)?;
+        let _file_guard = AuthFileLock::acquire(self, self.lock_options).await?;
+        let store =
+            load_scoped_credentials_from(&self.parent, Path::new(&self.file_name), &self.path)?;
         let entries = store.get(provider).map(Vec::as_slice).unwrap_or_default();
         Ok(select_scoped_credential(provider, entries, active_scope)?.cloned())
     }
@@ -831,26 +900,29 @@ impl AuthStorage {
     /// resolution.
     pub async fn entries(&self, provider: &str) -> Result<Vec<ScopedCredential>> {
         let _guard = self.lock.lock().await;
-        let _file_guard = AuthFileLock::acquire(&self.path, self.lock_options).await?;
-        Ok(load_scoped_credentials(&self.path)?
-            .get(provider)
-            .cloned()
-            .unwrap_or_default())
+        let _file_guard = AuthFileLock::acquire(self, self.lock_options).await?;
+        Ok(
+            load_scoped_credentials_from(&self.parent, Path::new(&self.file_name), &self.path)?
+                .get(provider)
+                .cloned()
+                .unwrap_or_default(),
+        )
     }
 
     pub async fn list(&self) -> Result<Vec<CredentialInfo>> {
         let _guard = self.lock.lock().await;
-        let _file_guard = AuthFileLock::acquire(&self.path, self.lock_options).await?;
-        let mut entries = load_scoped_credentials(&self.path)?
-            .into_iter()
-            .flat_map(|(provider_id, entries)| {
-                entries.into_iter().map(move |entry| CredentialInfo {
-                    provider_id: provider_id.clone(),
-                    credential_type: entry.credential.credential_type(),
-                    scope: entry.scope,
+        let _file_guard = AuthFileLock::acquire(self, self.lock_options).await?;
+        let mut entries =
+            load_scoped_credentials_from(&self.parent, Path::new(&self.file_name), &self.path)?
+                .into_iter()
+                .flat_map(|(provider_id, entries)| {
+                    entries.into_iter().map(move |entry| CredentialInfo {
+                        provider_id: provider_id.clone(),
+                        credential_type: entry.credential.credential_type(),
+                        scope: entry.scope,
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>();
         entries.sort_by(|left, right| {
             left.provider_id
                 .cmp(&right.provider_id)
@@ -871,8 +943,9 @@ impl AuthStorage {
         Fut: Future<Output = Result<Option<Credential>>> + Send,
     {
         let _guard = self.lock.lock().await;
-        let _file_guard = AuthFileLock::acquire(&self.path, self.lock_options).await?;
-        let mut store = load_scoped_credentials(&self.path)?;
+        let _file_guard = AuthFileLock::acquire(self, self.lock_options).await?;
+        let mut store =
+            load_scoped_credentials_from(&self.parent, Path::new(&self.file_name), &self.path)?;
         let entries = store.entry(provider.to_owned()).or_default();
         let current = entries
             .iter()
@@ -891,14 +964,15 @@ impl AuthStorage {
                 scope: scope.map(str::to_owned),
             }),
         }
-        write_scoped_credentials_atomic(&self.path, &store)?;
+        write_scoped_credentials_to(&self.parent, Path::new(&self.file_name), &store)?;
         Ok(Some(next))
     }
 
     pub async fn delete(&self, provider: &str, scope: Option<&str>) -> Result<bool> {
         let _guard = self.lock.lock().await;
-        let _file_guard = AuthFileLock::acquire(&self.path, self.lock_options).await?;
-        let mut store = load_scoped_credentials(&self.path)?;
+        let _file_guard = AuthFileLock::acquire(self, self.lock_options).await?;
+        let mut store =
+            load_scoped_credentials_from(&self.parent, Path::new(&self.file_name), &self.path)?;
         let Some(entries) = store.get_mut(provider) else {
             return Ok(false);
         };
@@ -912,26 +986,30 @@ impl AuthStorage {
         if entries.is_empty() {
             store.remove(provider);
         }
-        write_scoped_credentials_atomic(&self.path, &store)?;
+        write_scoped_credentials_to(&self.parent, Path::new(&self.file_name), &store)?;
         Ok(true)
     }
+}
+
+pub use crate::operator_http::InitialAuthError;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CredentialGrantAuthError {
+    Lookup,
+    Refresh,
 }
 
 #[derive(Clone)]
 pub struct AuthManager {
     storage: AuthStorage,
-    client: reqwest::Client,
+    operator: Arc<crate::operator_http::OperatorHttpTransport>,
 }
 
 impl AuthManager {
     pub fn new(path: PathBuf) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .context("creating authentication HTTP client")?;
         Ok(Self {
-            storage: AuthStorage::new(path),
-            client,
+            storage: AuthStorage::new(path)?,
+            operator: crate::operator_http::OperatorHttpTransport::new()?,
         })
     }
 
@@ -968,7 +1046,14 @@ impl AuthManager {
             .transpose()?;
         let provider_id = match provider.filter(|value| !value.trim().is_empty()) {
             Some(provider) => provider.trim().to_owned(),
-            None => select_provider(interaction, &self.providers(), "Select provider to configure:").await?,
+            None => {
+                select_provider(
+                    interaction,
+                    &self.providers(),
+                    "Select provider to configure:",
+                )
+                .await?
+            }
         };
         let info = provider_info(&provider_id);
         let selected_type = match auth_type {
@@ -1032,12 +1117,14 @@ impl AuthManager {
                     extra: Map::new(),
                 }
             }
-            AuthType::OAuth => oauth::login(&provider_id, interaction, &self.client)
+            AuthType::OAuth => oauth::login(&provider_id, interaction, &self.operator)
                 .await
                 .with_context(|| format!("{} login failed", info.name))?,
         };
         self.storage
-            .modify(&provider_id, scope.as_deref(), |_| async move { Ok(Some(credential)) })
+            .modify(&provider_id, scope.as_deref(), |_| async move {
+                Ok(Some(credential))
+            })
             .await
             .with_context(|| format!("storing credential for provider {provider_id:?}"))?;
         Ok(CredentialInfo {
@@ -1053,11 +1140,17 @@ impl AuthManager {
         scope: Option<&str>,
         interaction: &dyn AuthInteraction,
     ) -> Result<CredentialInfo> {
-        let configured = self.storage.list().await.context("listing stored credentials")?;
+        let configured = self
+            .storage
+            .list()
+            .await
+            .context("listing stored credentials")?;
         let (provider_id, scope) = match provider.filter(|value| !value.trim().is_empty()) {
             Some(provider) => (
                 provider.trim().to_owned(),
-                scope.filter(|value| !value.trim().is_empty()).map(str::to_owned),
+                scope
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_owned),
             ),
             None => {
                 if configured.is_empty() {
@@ -1069,7 +1162,9 @@ impl AuthManager {
                         id: scoped_selection_id(&entry.provider_id, entry.scope.as_deref()),
                         label: provider_info(&entry.provider_id).name,
                         description: Some(match &entry.scope {
-                            Some(scope) => format!("{} (scope {scope})", entry.credential_type.label()),
+                            Some(scope) => {
+                                format!("{} (scope {scope})", entry.credential_type.label())
+                            }
                             None => entry.credential_type.label().to_owned(),
                         }),
                     })
@@ -1154,7 +1249,7 @@ impl AuthManager {
             return Ok(None);
         };
         let slot = selected.scope.as_deref();
-        let client = self.client.clone();
+        let operator = self.operator.clone();
         let provider_id = provider.to_owned();
         let credential = match selected.credential {
             Credential::OAuth { expires, .. }
@@ -1163,7 +1258,7 @@ impl AuthManager {
                 self.storage
                     .modify(provider, slot, move |current| {
                         let provider_id = provider_id.clone();
-                        let client = client.clone();
+                        let operator = operator.clone();
                         async move {
                             let Some(Credential::OAuth { expires, .. }) = current.as_ref() else {
                                 return Ok(None);
@@ -1172,11 +1267,15 @@ impl AuthManager {
                                 return Ok(None);
                             }
                             let current = current.expect("OAuth credential is present");
-                            let refreshed = oauth::refresh(&provider_id, &current, &client)
-                                .await
-                                .with_context(|| {
-                                    format!("refreshing OAuth credential for provider {provider_id:?}")
-                                })?;
+                            let refreshed = oauth::refresh_initial_with_operator(
+                                &provider_id,
+                                &current,
+                                &operator,
+                            )
+                            .await
+                            .with_context(|| {
+                                format!("refreshing OAuth credential for provider {provider_id:?}")
+                            })?;
                             Ok(Some(refreshed))
                         }
                     })
@@ -1185,7 +1284,11 @@ impl AuthManager {
             credential => Some(credential),
         };
         match credential {
-            Some(Credential::ApiKey { key, env: credential_env, .. }) => {
+            Some(Credential::ApiKey {
+                key,
+                env: credential_env,
+                ..
+            }) => {
                 let key = match key {
                     Some(key) => resolve_stored_value(&key, env, &credential_env)?,
                     None => String::new(),
@@ -1195,6 +1298,7 @@ impl AuthManager {
                     env: credential_env,
                     headers: HashMap::new(),
                     available_model_ids: None,
+                    kind: RequestAuthKind::ApiKeyOrHeaders,
                 }))
             }
             Some(credential @ Credential::OAuth { .. }) => {
@@ -1202,6 +1306,47 @@ impl AuthManager {
             }
             None => Ok(None),
         }
+    }
+
+    pub(crate) async fn resolve_stored_credential_exact(
+        &self,
+        provider: &str,
+        scope: Option<&str>,
+        oauth_http: pi_ai::SharedHttpExecutor,
+    ) -> std::result::Result<Option<Credential>, CredentialGrantAuthError> {
+        let selected = self
+            .storage
+            .read(provider, scope)
+            .await
+            .map_err(|_| CredentialGrantAuthError::Lookup)?;
+        let Some(credential) = selected else {
+            return Ok(None);
+        };
+        let Credential::OAuth { expires, .. } = &credential else {
+            return Ok(Some(credential));
+        };
+        if chrono::Utc::now().timestamp_millis() < *expires {
+            return Ok(Some(credential));
+        }
+        let provider_id = provider.to_owned();
+        self.storage
+            .modify(provider, scope, move |current| {
+                let provider_id = provider_id.clone();
+                let oauth_http = oauth_http.clone();
+                async move {
+                    let Some(current @ Credential::OAuth { expires, .. }) = current else {
+                        return Ok(current);
+                    };
+                    if chrono::Utc::now().timestamp_millis() < expires {
+                        return Ok(Some(current));
+                    }
+                    crate::oauth::refresh_with_executor(&provider_id, &current, oauth_http)
+                        .await
+                        .map(Some)
+                }
+            })
+            .await
+            .map_err(|_| CredentialGrantAuthError::Refresh)
     }
 }
 
@@ -1256,12 +1401,7 @@ async fn select_provider(
 
 fn provider_info(id: &str) -> AuthProviderInfo {
     let (name, oauth_name, oauth_label, api_key) = match id {
-        "anthropic" => (
-            "Anthropic",
-            Some("Anthropic (Claude Pro/Max)"),
-            None,
-            true,
-        ),
+        "anthropic" => ("Anthropic", Some("Anthropic (Claude Pro/Max)"), None, true),
         "openai-codex" => (
             "OpenAI Codex",
             Some("OpenAI (ChatGPT Plus/Pro)"),
@@ -1324,45 +1464,25 @@ fn method_supported(provider: &AuthProviderInfo, auth_type: AuthType) -> bool {
 }
 
 pub fn load_credentials(path: &Path) -> Result<BTreeMap<String, Credential>> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("reading auth.json metadata at {}", path.display()));
-        }
+    let (parent, file_name) = operator_auth_parent(path)?;
+    let content = read_optional_auth_bytes(&parent, Path::new(&file_name), path)?;
+    let Some(content) = content else {
+        return Ok(BTreeMap::new());
     };
-    if !metadata.is_file() {
-        bail!("auth.json path is not a file: {}", path.display());
-    }
-    if metadata.len() > MAX_AUTH_FILE_BYTES {
-        bail!(
-            "auth.json at {} exceeds {MAX_AUTH_FILE_BYTES} bytes",
-            path.display()
-        );
-    }
+    parse_credentials(&content, path)
+}
 
-    let mut file = File::open(path)
-        .with_context(|| format!("opening auth.json at {}", path.display()))?;
-    let mut content = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-    Read::by_ref(&mut file)
-        .take(MAX_AUTH_FILE_BYTES + 1)
-        .read_to_end(&mut content)
-        .with_context(|| format!("reading auth.json at {}", path.display()))?;
-    if content.len() as u64 > MAX_AUTH_FILE_BYTES {
-        bail!(
-            "auth.json at {} exceeds {MAX_AUTH_FILE_BYTES} bytes",
-            path.display()
-        );
-    }
+fn parse_credentials(content: &[u8], path: &Path) -> Result<BTreeMap<String, Credential>> {
     if content.iter().all(u8::is_ascii_whitespace) {
         return Ok(BTreeMap::new());
     }
-
-    let root: Value = serde_json::from_slice(&content)
+    let root: Value = serde_json::from_slice(content)
         .with_context(|| format!("parsing auth.json at {}", path.display()))?;
     let entries = root.as_object().ok_or_else(|| {
-        anyhow!("invalid auth.json at {}: expected an object", path.display())
+        anyhow!(
+            "invalid auth.json at {}: expected an object",
+            path.display()
+        )
     })?;
     let mut credentials = BTreeMap::new();
     for (provider, value) in entries {
@@ -1385,48 +1505,30 @@ pub fn load_credentials(path: &Path) -> Result<BTreeMap<String, Credential>> {
 /// `scope label -> provider -> credential`. Old files without a `scopes`
 /// section load as unscoped entries only. Invalid scope labels are rejected
 /// with an actionable error.
-pub fn load_scoped_credentials(
-    path: &Path,
-) -> Result<BTreeMap<String, Vec<ScopedCredential>>> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("reading auth.json metadata at {}", path.display()));
-        }
-    };
-    if !metadata.is_file() {
-        bail!("auth.json path is not a file: {}", path.display());
-    }
-    if metadata.len() > MAX_AUTH_FILE_BYTES {
-        bail!(
-            "auth.json at {} exceeds {MAX_AUTH_FILE_BYTES} bytes",
-            path.display()
-        );
-    }
+pub fn load_scoped_credentials(path: &Path) -> Result<BTreeMap<String, Vec<ScopedCredential>>> {
+    let (parent, file_name) = operator_auth_parent(path)?;
+    load_scoped_credentials_from(&parent, Path::new(&file_name), path)
+}
 
-    let mut file = File::open(path)
-        .with_context(|| format!("opening auth.json at {}", path.display()))?;
-    let mut content = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-    Read::by_ref(&mut file)
-        .take(MAX_AUTH_FILE_BYTES + 1)
-        .read_to_end(&mut content)
-        .with_context(|| format!("reading auth.json at {}", path.display()))?;
-    if content.len() as u64 > MAX_AUTH_FILE_BYTES {
-        bail!(
-            "auth.json at {} exceeds {MAX_AUTH_FILE_BYTES} bytes",
-            path.display()
-        );
-    }
+fn load_scoped_credentials_from(
+    parent: &CapabilityRootLease,
+    relative: &Path,
+    display_path: &Path,
+) -> Result<BTreeMap<String, Vec<ScopedCredential>>> {
+    let content = read_optional_auth_bytes(parent, relative, display_path)?;
+    let Some(content) = content else {
+        return Ok(BTreeMap::new());
+    };
     if content.iter().all(u8::is_ascii_whitespace) {
         return Ok(BTreeMap::new());
     }
-
     let root: Value = serde_json::from_slice(&content)
-        .with_context(|| format!("parsing auth.json at {}", path.display()))?;
+        .with_context(|| format!("parsing auth.json at {}", display_path.display()))?;
     let entries = root.as_object().ok_or_else(|| {
-        anyhow!("invalid auth.json at {}: expected an object", path.display())
+        anyhow!(
+            "invalid auth.json at {}: expected an object",
+            display_path.display()
+        )
     })?;
     let mut store: BTreeMap<String, Vec<ScopedCredential>> = BTreeMap::new();
     for (provider, value) in entries {
@@ -1438,7 +1540,7 @@ pub fn load_scoped_credentials(
                 let credential = serde_json::from_value(value.clone()).map_err(|error| {
                     anyhow!(
                         "invalid auth.json credential for provider {provider:?} at {}: {error}",
-                        path.display()
+                        display_path.display()
                     )
                 })?;
                 store
@@ -1446,14 +1548,14 @@ pub fn load_scoped_credentials(
                     .or_default()
                     .push(ScopedCredential::unscoped(credential));
             } else {
-                parse_scopes_section(&mut store, value, path)?;
+                parse_scopes_section(&mut store, value, display_path)?;
             }
             continue;
         }
         let credential = serde_json::from_value(value.clone()).map_err(|error| {
             anyhow!(
                 "invalid auth.json credential for provider {provider:?} at {}: {error}",
-                path.display()
+                display_path.display()
             )
         })?;
         store
@@ -1516,13 +1618,19 @@ pub fn write_scoped_credentials_atomic(
     path: &Path,
     store: &BTreeMap<String, Vec<ScopedCredential>>,
 ) -> Result<()> {
+    let (parent, file_name) = operator_auth_parent(path)?;
+    write_scoped_credentials_to(&parent, Path::new(&file_name), store)
+}
+
+fn write_scoped_credentials_to(
+    parent: &CapabilityRootLease,
+    relative: &Path,
+    store: &BTreeMap<String, Vec<ScopedCredential>>,
+) -> Result<()> {
     let has_unscoped_scopes_provider = store
         .get(AUTH_SCOPES_KEY)
         .is_some_and(|entries| entries.iter().any(|entry| entry.scope.is_none()));
-    let has_scoped_entries = store
-        .values()
-        .flatten()
-        .any(|entry| entry.scope.is_some());
+    let has_scoped_entries = store.values().flatten().any(|entry| entry.scope.is_some());
     if has_unscoped_scopes_provider && has_scoped_entries {
         bail!(
             "cannot write auth.json: a provider named {AUTH_SCOPES_KEY:?} cannot coexist with scoped credentials (the {AUTH_SCOPES_KEY} key is reserved for the scoped section)"
@@ -1557,7 +1665,7 @@ pub fn write_scoped_credentials_atomic(
             }
         }
     }
-    write_auth_json(path, &Value::Object(root))
+    write_auth_json_to(parent, relative, &Value::Object(root))
 }
 
 /// Read one stored credential without constructing an [`AuthStorage`] or
@@ -1580,77 +1688,113 @@ pub fn write_credentials_atomic(
 }
 
 fn write_auth_json(path: &Path, root: &Value) -> Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)
-        .with_context(|| format!("creating auth directory {}", parent.display()))?;
-    set_directory_permissions(parent)?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("auth.json");
-    let temporary = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
-    let result = (|| -> Result<()> {
-        let file = open_private_file(&temporary)?;
-        let mut writer = BufWriter::new(file);
-        serde_json::to_writer_pretty(&mut writer, root).context("serializing auth.json")?;
-        writer.write_all(b"\n").context("writing auth.json newline")?;
-        writer.flush().context("flushing auth.json temporary file")?;
-        writer
-            .get_ref()
-            .sync_all()
-            .context("syncing auth.json temporary file")?;
-        fs::rename(&temporary, path).with_context(|| {
-            format!(
-                "atomically replacing auth.json {} from {}",
-                path.display(),
-                temporary.display()
-            )
-        })?;
-        set_file_permissions(path)?;
-        if let Ok(directory) = File::open(parent) {
-            directory
-                .sync_all()
-                .with_context(|| format!("syncing auth directory {}", parent.display()))?;
+    let (parent, file_name) = operator_auth_parent(path)?;
+    write_auth_json_to(&parent, Path::new(&file_name), root)
+}
+
+fn write_auth_json_to(parent: &CapabilityRootLease, relative: &Path, root: &Value) -> Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(root).context("serializing auth.json")?;
+    bytes.push(b'\n');
+    replace_private_auth_bytes(parent, relative, bytes)
+}
+
+fn replace_private_auth_bytes(
+    parent: &CapabilityRootLease,
+    relative: &Path,
+    bytes: Vec<u8>,
+) -> Result<()> {
+    parent
+        .replace_file_allowing_live_leaf_link(Replacement {
+            relative: relative.to_path_buf(),
+            expected: None,
+            bytes,
+            mode: FileMode::Private,
+        })
+        .context("atomically replacing private auth file")?;
+    Ok(())
+}
+
+fn read_optional_auth_bytes(
+    parent: &CapabilityRootLease,
+    relative: &Path,
+    display_path: &Path,
+) -> Result<Option<Vec<u8>>> {
+    match parent.read_bounded(relative, MAX_AUTH_FILE_BYTES) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if fs_error_kind(&error) == Some(std::io::ErrorKind::NotFound) => Ok(None),
+        Err(FsError::ReadLimitExceeded { .. }) => bail!(
+            "auth.json at {} exceeds {MAX_AUTH_FILE_BYTES} bytes",
+            display_path.display()
+        ),
+        Err(error)
+            if crate::fs::is_link_blocked(&error)
+                || matches!(error, FsError::UnsupportedEntryType) =>
+        {
+            match parent.open_managed_file_within_root(relative) {
+                Ok(file) => match file.read_bounded(MAX_AUTH_FILE_BYTES) {
+                    Ok(bytes) => Ok(Some(bytes)),
+                    Err(FsError::ReadLimitExceeded { .. }) => bail!(
+                        "auth.json at {} exceeds {MAX_AUTH_FILE_BYTES} bytes",
+                        display_path.display()
+                    ),
+                    Err(error) => Err(error).with_context(|| {
+                        format!("reading private auth.json at {}", display_path.display())
+                    }),
+                },
+                Err(error) => Err(error).with_context(|| {
+                    format!("reading private auth.json at {}", display_path.display())
+                }),
+            }
         }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
+        Err(error) => Err(error)
+            .with_context(|| format!("reading private auth.json at {}", display_path.display())),
     }
-    result
 }
 
-fn open_private_file(path: &Path) -> Result<File> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+pub fn read_operator_auth_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
+    let (parent, file_name) = operator_auth_parent(path)?;
+    let relative = Path::new(&file_name);
+    match parent.read_bounded(relative, max_bytes) {
+        Ok(bytes) => Ok(bytes),
+        Err(error)
+            if crate::fs::is_link_blocked(&error)
+                || matches!(error, FsError::UnsupportedEntryType) =>
+        {
+            parent
+                .open_managed_file_within_root(relative)
+                .context("opening operator auth file")?
+                .read_bounded(max_bytes)
+                .context("reading bounded operator auth file")
+        }
+        Err(error) => Err(error)
+            .context("opening operator auth file")
+            .context("reading bounded operator auth file"),
     }
-    options
-        .open(path)
-        .with_context(|| format!("creating temporary auth file {}", path.display()))
 }
 
-fn set_directory_permissions(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("securing auth directory {}", path.display()))?;
-    }
-    Ok(())
+pub fn replace_private_operator_auth_file(path: &Path, bytes: Vec<u8>) -> Result<()> {
+    let (parent, file_name) = operator_auth_parent(path)?;
+    replace_private_auth_bytes(&parent, Path::new(&file_name), bytes)
 }
 
-fn set_file_permissions(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("securing auth file {}", path.display()))?;
+fn operator_auth_parent(path: &Path) -> Result<(CapabilityRootLease, std::ffi::OsString)> {
+    let capabilities = CapabilityFs::new().context("creating auth filesystem capabilities")?;
+    let absolute = AbsolutePath::parse(path.to_path_buf()).map_err(|_| FsError::InvalidPath)?;
+    capabilities
+        .open_exact_parent(
+            CapabilityRootPurpose::OperatorAuth,
+            absolute,
+            CapabilityAccess::PrivateReadWrite,
+            RootCreation::CreateDirectory,
+        )
+        .context("opening private auth storage")
+}
+
+fn fs_error_kind(error: &FsError) -> Option<std::io::ErrorKind> {
+    match error {
+        FsError::System { kind, .. } => Some(*kind),
+        _ => None,
     }
-    Ok(())
 }
 
 fn resolve_stored_value(
@@ -1722,9 +1866,7 @@ fn expand_credential_value(
             (name, closing + 1)
         } else if next.is_ascii_alphabetic() || next == '_' {
             let mut end = index + 1;
-            while end < chars.len()
-                && (chars[end].is_ascii_alphanumeric() || chars[end] == '_')
-            {
+            while end < chars.len() && (chars[end].is_ascii_alphanumeric() || chars[end] == '_') {
                 end += 1;
             }
             (chars[index + 1..end].iter().collect::<String>(), end)
@@ -1733,9 +1875,10 @@ fn expand_credential_value(
             index += 1;
             continue;
         };
-        let resolved = env_lookup_with_fallback(&name, request_env, credential_env).ok_or_else(
-            || anyhow!("environment variable {name} referenced by {source} is not set"),
-        )?;
+        let resolved =
+            env_lookup_with_fallback(&name, request_env, credential_env).ok_or_else(|| {
+                anyhow!("environment variable {name} referenced by {source} is not set")
+            })?;
         output.push_str(&resolved);
         index = next_index;
     }
@@ -1767,13 +1910,7 @@ fn env_lookup_with_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn test_lock_options() -> AuthLockOptions {
-        AuthLockOptions {
-            timeout: Duration::from_millis(80),
-            retry_delay: Duration::from_millis(5),
-        }
-    }
+    use std::fs;
 
     fn long_test_lock_options() -> AuthLockOptions {
         AuthLockOptions {
@@ -1789,14 +1926,197 @@ mod tests {
             extra: Map::new(),
         }
     }
+    #[cfg(target_os = "linux")]
+    fn current_lock_owner() -> AuthLockOwner {
+        let owner = AuthLockOwner::current();
+        assert!(owner.host_fingerprint.is_some(), "test host fingerprint");
+        assert!(owner.boot_id.is_some(), "Linux boot identity");
+        assert!(
+            owner.process_start.is_some(),
+            "Linux process start identity"
+        );
+        owner
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_lock_owner(storage: &AuthStorage, owner: &AuthLockOwner) {
+        let relative = auth_lock_relative(&storage.file_name);
+        let mut file = storage
+            .parent
+            .create_new(&relative, FileMode::Private)
+            .expect("create auth lock owner file");
+        file.write_all(&serialize_lock_owner(owner).expect("serialize lock owner"))
+            .expect("write auth lock owner");
+        file.finish().expect("finish auth lock owner file");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn short_test_lock_options() -> AuthLockOptions {
+        AuthLockOptions {
+            timeout: Duration::from_millis(25),
+            retry_delay: Duration::from_millis(2),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn live_same_boot_auth_lock_remains_exclusive() {
+        let directory = tempfile::tempdir().expect("temporary auth directory");
+        let path = directory.path().join("auth.json");
+        let storage = AuthStorage::new(path).expect("auth storage");
+        write_lock_owner(&storage, &current_lock_owner());
+
+        let error = match AuthFileLock::acquire(&storage, short_test_lock_options()).await {
+            Ok(_) => panic!("live lock owner must remain protected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("timed out acquiring auth lock"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn crashed_auth_lock_owner_is_recovered() {
+        let directory = tempfile::tempdir().expect("temporary auth directory");
+        let path = directory.path().join("auth.json");
+        let storage = AuthStorage::new(path).expect("auth storage");
+        let mut owner = current_lock_owner();
+        owner.pid = u32::MAX;
+        owner.process_start = Some("1".to_owned());
+        write_lock_owner(&storage, &owner);
+
+        let lock = AuthFileLock::acquire(&storage, short_test_lock_options())
+            .await
+            .expect("crashed owner lock recovery");
+        drop(lock);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn reused_pid_auth_lock_owner_is_recovered() {
+        let directory = tempfile::tempdir().expect("temporary auth directory");
+        let path = directory.path().join("auth.json");
+        let storage = AuthStorage::new(path).expect("auth storage");
+        let mut owner = current_lock_owner();
+        owner.process_start = Some(format!(
+            "{}-reused",
+            owner.process_start.as_deref().unwrap()
+        ));
+        write_lock_owner(&storage, &owner);
+
+        let lock = AuthFileLock::acquire(&storage, short_test_lock_options())
+            .await
+            .expect("reused PID lock recovery");
+        drop(lock);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn prior_boot_auth_lock_owner_is_recovered() {
+        let directory = tempfile::tempdir().expect("temporary auth directory");
+        let path = directory.path().join("auth.json");
+        let storage = AuthStorage::new(path).expect("auth storage");
+        let mut owner = current_lock_owner();
+        owner.boot_id = Some(format!("{}-prior", owner.boot_id.as_deref().unwrap()));
+        write_lock_owner(&storage, &owner);
+
+        let lock = AuthFileLock::acquire(&storage, short_test_lock_options())
+            .await
+            .expect("prior boot lock recovery");
+        drop(lock);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn foreign_host_auth_lock_owner_is_never_stolen() {
+        // A dead PID on a different host must never be declared stale: the
+        // same-host gate fails closed so a lock written elsewhere survives
+        // even when its recorded PID is gone on this machine.
+        let directory = tempfile::tempdir().expect("temporary auth directory");
+        let path = directory.path().join("auth.json");
+        let storage = AuthStorage::new(path).expect("auth storage");
+        let mut owner = current_lock_owner();
+        owner.host_fingerprint = Some("foreign-host-fingerprint".to_owned());
+        owner.pid = u32::MAX;
+        owner.process_start = Some("1".to_owned());
+        write_lock_owner(&storage, &owner);
+        let error = match AuthFileLock::acquire(&storage, short_test_lock_options()).await {
+            Ok(_) => panic!("foreign-host lock must not be stolen"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("timed out acquiring auth lock"),
+            "expected timeout, got {error}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn concurrent_stale_claim_recovery_is_race_safe() {
+        // Two recoverers race on the same stale lock. The hard-link claim
+        // protocol must guarantee the lock is removed at most once (no live
+        // lock is unlinked), both recoverers complete without error, and no
+        // stray `*.claim` files leak in the storage directory.
+        let directory = tempfile::tempdir().expect("temporary auth directory");
+        let path = directory.path().join("auth.json");
+        let storage = AuthStorage::new(path).expect("auth storage");
+        let mut owner = current_lock_owner();
+        owner.pid = u32::MAX;
+        owner.process_start = Some("1".to_owned());
+        write_lock_owner(&storage, &owner);
+
+        let relative = auth_lock_relative(&storage.file_name);
+        let current = AuthLockOwner::current();
+        let parent1 = storage.parent.clone();
+        let parent2 = storage.parent.clone();
+        let rel1 = relative.clone();
+        let rel2 = relative.clone();
+        let cur1 = current.clone();
+        let cur2 = current.clone();
+
+        let handle1 = std::thread::spawn(move || remove_stale_auth_lock(&parent1, &rel1, &cur1));
+        let handle2 = std::thread::spawn(move || remove_stale_auth_lock(&parent2, &rel2, &cur2));
+        let removed1 = handle1
+            .join()
+            .expect("recoverer 1 thread")
+            .expect("recoverer 1 result");
+        let removed2 = handle2
+            .join()
+            .expect("recoverer 2 thread")
+            .expect("recoverer 2 result");
+
+        assert!(
+            removed1 || removed2,
+            "at least one recoverer must report the stale lock removed"
+        );
+        match read_auth_lock_owner(&storage.parent, &relative).expect("read owner after race") {
+            LockOwnerRead::Missing => {}
+            _ => panic!("stale lock must be absent after concurrent recovery"),
+        }
+
+        let leaked_claims = fs::read_dir(directory.path())
+            .expect("list storage directory")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".claim"))
+            .count();
+        assert_eq!(
+            leaked_claims, 0,
+            "no stray claim files may leak after recovery"
+        );
+
+        // A fresh acquirer must be able to take the lock now that it is free.
+        let lock = AuthFileLock::acquire(&storage, short_test_lock_options())
+            .await
+            .expect("fresh acquire after recovery");
+        drop(lock);
+    }
 
     #[tokio::test]
     async fn concurrent_stores_preserve_different_providers() {
         let directory = tempfile::tempdir().expect("temporary auth directory");
         let path = directory.path().join("auth.json");
-        let mut first = AuthStorage::new(path.clone());
+        let mut first = AuthStorage::new(path.clone()).expect("first auth storage");
         first.lock_options = long_test_lock_options();
-        let mut second = AuthStorage::new(path.clone());
+        let mut second = AuthStorage::new(path.clone()).expect("second auth storage");
         second.lock_options = long_test_lock_options();
         let (first_ready, first_entered) = tokio::sync::oneshot::channel();
         let (release_first, wait_for_release) = tokio::sync::oneshot::channel();
@@ -1811,126 +2131,33 @@ mod tests {
                 .await
         });
         first_entered.await.expect("first updater entered");
-        assert!(auth_lock_path(&path).exists(), "first updater must own the lock");
 
         let second_store = tokio::spawn(async move {
             second
-                .modify("provider-b", None, |_| async { Ok(Some(api_key("secret-b"))) })
+                .modify("provider-b", None, |_| async {
+                    Ok(Some(api_key("secret-b")))
+                })
                 .await
         });
-        while !auth_lock_path(&path).exists() {
-            tokio::task::yield_now().await;
-        }
         assert!(
             !second_store.is_finished(),
             "second store must wait for the first process lock"
         );
         release_first.send(()).expect("release first updater");
 
-        first_store.await.expect("first store task").expect("first store");
-        second_store.await.expect("second store task").expect("second store");
+        first_store
+            .await
+            .expect("first store task")
+            .expect("first store");
+        second_store
+            .await
+            .expect("second store task")
+            .expect("second store");
 
         let stored = load_credentials(&path).expect("load merged credentials");
         assert_eq!(stored.len(), 2);
         assert!(stored.contains_key("provider-a"));
         assert!(stored.contains_key("provider-b"));
-        assert!(
-            !auth_lock_path(&path).exists(),
-            "RAII must clean up the lock file"
-        );
-    }
-
-    #[tokio::test]
-    async fn live_lock_owner_times_out_without_exposing_owner_data() {
-        let directory = tempfile::tempdir().expect("temporary auth directory");
-        let path = directory.path().join("auth.json");
-        let lock_path = auth_lock_path(&path);
-        let owner = AuthLockOwner::current();
-        create_auth_lock_file(&lock_path, &owner).expect("create live lock");
-
-        let error = AuthFileLock::acquire(&path, test_lock_options())
-            .await
-            .err()
-            .expect("live owner must force a bounded timeout");
-        let message = format!("{error:#}");
-        assert!(message.contains("timed out acquiring auth lock"), "{message}");
-        assert!(!message.contains(&owner.token), "owner token leaked: {message}");
-        assert!(lock_path.exists(), "contender must not delete a live lock");
-    }
-
-    #[tokio::test]
-    async fn stale_same_host_lock_is_recovered() {
-        let directory = tempfile::tempdir().expect("temporary auth directory");
-        let path = directory.path().join("auth.json");
-        let lock_path = auth_lock_path(&path);
-        let mut stale = AuthLockOwner::current();
-        stale.pid = u32::MAX;
-        stale.process_start = Some("not-a-live-process".to_owned());
-        stale.token = "stale-owner-token".to_owned();
-        assert!(stale.host_fingerprint.is_some(), "test requires a local host identity");
-        create_auth_lock_file(&lock_path, &stale).expect("create stale lock");
-
-        let lock = AuthFileLock::acquire(&path, test_lock_options())
-            .await
-            .expect("recover stale same-host lock");
-        let replacement: AuthLockOwner = serde_json::from_slice(
-            &fs::read(&lock_path).expect("read replacement lock owner"),
-        )
-        .expect("parse replacement lock owner");
-        assert_ne!(replacement.token, stale.token);
-        drop(lock);
-        assert!(!lock_path.exists(), "recovered lock must clean up on drop");
-    }
-
-    #[tokio::test]
-    async fn stale_previous_boot_lock_is_recovered() {
-        let directory = tempfile::tempdir().expect("temporary auth directory");
-        let path = directory.path().join("auth.json");
-        let lock_path = auth_lock_path(&path);
-        let mut stale = AuthLockOwner::current();
-
-        assert!(stale.host_fingerprint.is_some(), "test requires a local host identity");
-        assert!(stale.boot_id.is_some(), "test requires a boot identity");
-        stale.boot_id = Some("previous-boot".to_owned());
-        stale.token = "previous-boot-token".to_owned();
-        create_auth_lock_file(&lock_path, &stale).expect("create previous-boot lock");
-
-        let lock = AuthFileLock::acquire(&path, test_lock_options())
-            .await
-            .expect("recover previous-boot same-host lock");
-        drop(lock);
-        assert!(!lock_path.exists(), "recovered lock must clean up on drop");
-    }
-    #[cfg(unix)]
-    #[test]
-    fn stale_claim_identity_distinguishes_replacement_live_lock() {
-        let directory = tempfile::tempdir().expect("temporary auth directory");
-        let path = directory.path().join("auth.json");
-        let lock_path = auth_lock_path(&path);
-        let mut stale = AuthLockOwner::current();
-        stale.pid = u32::MAX;
-        stale.process_start = Some("not-a-live-process".to_owned());
-        stale.token = "stale-owner-token".to_owned();
-        assert!(stale.host_fingerprint.is_some(), "test requires a local host identity");
-        create_auth_lock_file(&lock_path, &stale).expect("create stale lock");
-
-        let claim = stale_claim_path(&lock_path);
-        fs::hard_link(&lock_path, &claim).expect("claim stale lock inode");
-        fs::remove_file(&lock_path).expect("remove stale path");
-        let live = AuthLockOwner::current();
-        create_auth_lock_file(&lock_path, &live).expect("install replacement live lock");
-
-        let path_identity = file_identity(&lock_path).expect("read live identity");
-        let claim_identity = file_identity(&claim).expect("read claimed identity");
-        assert_ne!(path_identity, claim_identity);
-        assert!(lock_path.exists(), "identity mismatch must preserve live lock");
-        let LockOwnerRead::Owner(remaining) =
-            read_auth_lock_owner(&lock_path).expect("read replacement owner")
-        else {
-            panic!("replacement owner must remain valid");
-        };
-        assert_eq!(remaining.token, live.token);
-        fs::remove_file(&claim).expect("remove stale claim");
     }
 
     #[tokio::test]
@@ -1942,9 +2169,9 @@ mod tests {
             &BTreeMap::from([("remove-me".to_owned(), api_key("old-secret"))]),
         )
         .expect("write initial credential");
-        let mut updater = AuthStorage::new(path.clone());
+        let mut updater = AuthStorage::new(path.clone()).expect("updater auth storage");
         updater.lock_options = long_test_lock_options();
-        let mut deleter = AuthStorage::new(path.clone());
+        let mut deleter = AuthStorage::new(path.clone()).expect("deleter auth storage");
         deleter.lock_options = long_test_lock_options();
         let (updater_ready, wait_for_updater) = tokio::sync::oneshot::channel();
         let (release_updater, wait_for_release) = tokio::sync::oneshot::channel();
@@ -1959,19 +2186,169 @@ mod tests {
                 .await
         });
         wait_for_updater.await.expect("updater entered");
-        assert!(auth_lock_path(&path).exists(), "updater must own the file lock");
         let delete_task = tokio::spawn(async move { deleter.delete("remove-me", None).await });
         tokio::task::yield_now().await;
-        assert!(!delete_task.is_finished(), "delete must wait for the file lock");
+        assert!(
+            !delete_task.is_finished(),
+            "delete must wait for the file lock"
+        );
         release_updater.send(()).expect("release updater");
 
-        store_task.await.expect("store task").expect("store credential");
-        assert!(delete_task.await.expect("delete task").expect("delete credential"));
+        store_task
+            .await
+            .expect("store task")
+            .expect("store credential");
+        assert!(
+            delete_task
+                .await
+                .expect("delete task")
+                .expect("delete credential")
+        );
         let stored = load_credentials(&path).expect("load credentials after delete");
         assert!(stored.contains_key("keep-me"));
         assert!(!stored.contains_key("remove-me"));
     }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auth_storage_modify_preserves_live_leaf_symlink_and_replaces_private_target() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
+        let directory = tempfile::tempdir().expect("temporary auth directory");
+        let target = directory.path().join("auth-target.json");
+        let path = directory.path().join("auth.json");
+        fs::write(
+            &target,
+            serde_json::to_vec(&BTreeMap::from([(
+                "existing".to_owned(),
+                api_key("kept-secret"),
+            )]))
+            .expect("serialize initial credentials"),
+        )
+        .expect("write initial target");
+        symlink("auth-target.json", &path).expect("create auth symlink");
+        let link_before = fs::symlink_metadata(&path).expect("auth link metadata");
+        let link_target = fs::read_link(&path).expect("auth link target");
+
+        let storage = AuthStorage::new(path.clone()).expect("auth storage");
+        storage
+            .modify("added", None, |_| async { Ok(Some(api_key("new-secret"))) })
+            .await
+            .expect("modify symlinked auth storage");
+
+        let link_after = fs::symlink_metadata(&path).expect("auth link metadata after write");
+        assert!(
+            link_after.file_type().is_symlink(),
+            "auth path remains a symlink"
+        );
+        assert_eq!(
+            link_after.dev(),
+            link_before.dev(),
+            "link device remains unchanged"
+        );
+        assert_eq!(
+            link_after.ino(),
+            link_before.ino(),
+            "link inode remains unchanged"
+        );
+        assert_eq!(
+            fs::read_link(&path).expect("auth link target after write"),
+            link_target
+        );
+        assert_eq!(
+            storage
+                .read("added", None)
+                .await
+                .expect("read through preserved auth symlink"),
+            Some(api_key("new-secret"))
+        );
+        let target_bytes = fs::read(&target).expect("read replaced auth target bytes");
+        let credentials =
+            parse_credentials(&target_bytes, &target).expect("parse auth target bytes");
+        assert_eq!(credentials.get("existing"), Some(&api_key("kept-secret")));
+        assert_eq!(credentials.get("added"), Some(&api_key("new-secret")));
+        let mode = fs::metadata(&target)
+            .expect("auth target metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "resolved auth target must be mode 0600"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_auth_leaf_symlink_fails_closed_without_creating_target() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+
+        let directory = tempfile::tempdir().expect("temporary auth directory");
+        let target = directory.path().join("missing-target.json");
+        let path = directory.path().join("auth.json");
+        symlink("missing-target.json", &path).expect("create dangling auth symlink");
+        let link_before = fs::symlink_metadata(&path).expect("dangling link metadata");
+        let error = write_credentials_atomic(
+            &path,
+            &BTreeMap::from([("provider".to_owned(), api_key("secret"))]),
+        )
+        .expect_err("dangling auth symlink must fail closed");
+        assert!(
+            !error.to_string().is_empty(),
+            "failure must remain actionable"
+        );
+        let link_after = fs::symlink_metadata(&path).expect("dangling link after failure");
+        assert!(
+            link_after.file_type().is_symlink(),
+            "dangling link must remain"
+        );
+        assert_eq!(link_after.dev(), link_before.dev());
+        assert_eq!(link_after.ino(), link_before.ino());
+        assert_eq!(
+            fs::read_link(&path).expect("dangling link target"),
+            Path::new("missing-target.json")
+        );
+        assert!(!target.exists(), "dangling target must not be created");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_storage_rejects_symlinked_parent_directory() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary auth directory");
+        let actual_parent = directory.path().join("actual-parent");
+        fs::create_dir(&actual_parent).expect("create actual parent");
+        let linked_parent = directory.path().join("linked-parent");
+        symlink(&actual_parent, &linked_parent).expect("create linked parent");
+        let error = match AuthStorage::new(linked_parent.join("auth.json")) {
+            Ok(_) => panic!("symlinked auth parent must remain rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            !error.to_string().is_empty(),
+            "failure must remain actionable"
+        );
+        assert!(!actual_parent.join("auth.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_replacement_remains_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary auth directory");
+        let path = directory.path().join("auth.json");
+        write_credentials_atomic(
+            &path,
+            &BTreeMap::from([("provider".to_owned(), api_key("secret"))]),
+        )
+        .expect("write private auth file");
+        let mode = fs::metadata(&path)
+            .expect("auth metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "auth.json must reject group/other access");
+    }
 
     #[test]
     fn one_off_reader_returns_raw_credential_and_swallows_invalid_storage() {
@@ -2010,7 +2387,11 @@ mod tests {
         exact.extend(std::iter::repeat_n(b' ', exact_padding));
         exact.push(b'}');
         fs::write(&path, &exact).expect("write exact-boundary auth file");
-        assert!(load_credentials(&path).expect("load exact-boundary auth file").is_empty());
+        assert!(
+            load_credentials(&path)
+                .expect("load exact-boundary auth file")
+                .is_empty()
+        );
 
         let oversized = vec![b' '; usize::try_from(MAX_AUTH_FILE_BYTES + 1).expect("test size")];
         fs::write(&path, oversized).expect("write oversized auth file");
@@ -2043,9 +2424,7 @@ mod tests {
         };
         assert_eq!(key.as_deref(), Some("legacy-key"));
         assert_eq!(
-            extra
-                .get("futureField")
-                .and_then(|value| value.get("kept")),
+            extra.get("futureField").and_then(|value| value.get("kept")),
             Some(&Value::Bool(true)),
             "unknown fields must survive parsing"
         );
@@ -2202,12 +2581,16 @@ mod tests {
             .expect("default")
             .expect("entry");
         assert_eq!(default.scope, None);
-        assert!(select_scoped_credential("p", &[], None)
-            .expect("empty")
-            .is_none());
-        assert!(select_scoped_credential("p", &[], Some("work"))
-            .expect("empty with scope")
-            .is_none());
+        assert!(
+            select_scoped_credential("p", &[], None)
+                .expect("empty")
+                .is_none()
+        );
+        assert!(
+            select_scoped_credential("p", &[], Some("work"))
+                .expect("empty with scope")
+                .is_none()
+        );
 
         let scoped_only = vec![ScopedCredential::scoped(api_key("work-key"), "work")];
         let error = select_scoped_credential("p", &scoped_only, None)
@@ -2276,7 +2659,7 @@ mod tests {
     async fn storage_slots_read_modify_delete_per_scope() {
         let directory = tempfile::tempdir().expect("temporary auth directory");
         let path = directory.path().join("auth.json");
-        let storage = AuthStorage::new(path.clone());
+        let storage = AuthStorage::new(path.clone()).expect("auth storage");
         storage
             .modify("p", Some("work"), |_| async {
                 Ok(Some(api_key("work-key")))
@@ -2284,9 +2667,7 @@ mod tests {
             .await
             .expect("store scoped");
         storage
-            .modify("p", None, |_| async {
-                Ok(Some(api_key("default-key")))
-            })
+            .modify("p", None, |_| async { Ok(Some(api_key("default-key"))) })
             .await
             .expect("store unscoped");
 
@@ -2299,20 +2680,42 @@ mod tests {
             Some(api_key("default-key"))
         );
         assert_eq!(
-            storage.read("p", Some("missing")).await.expect("read missing scope"),
+            storage
+                .read("p", Some("missing"))
+                .await
+                .expect("read missing scope"),
             None
         );
 
-        assert!(storage.delete("p", Some("work")).await.expect("delete work"));
         assert!(
-            storage.read("p", Some("work")).await.expect("work gone").is_none(),
+            storage
+                .delete("p", Some("work"))
+                .await
+                .expect("delete work")
+        );
+        assert!(
+            storage
+                .read("p", Some("work"))
+                .await
+                .expect("work gone")
+                .is_none(),
             "scoped slot must be removed"
         );
         assert!(
-            storage.read("p", None).await.expect("default survives").is_some(),
+            storage
+                .read("p", None)
+                .await
+                .expect("default survives")
+                .is_some(),
             "unscoped slot must survive scoped delete"
         );
-        assert!(storage.delete("p", Some("work")).await.expect("idempotent delete") == false);
+        assert!(
+            storage
+                .delete("p", Some("work"))
+                .await
+                .expect("idempotent delete")
+                == false
+        );
         assert!(storage.delete("p", None).await.expect("delete default"));
         assert!(load_credentials(&path).expect("empty file").is_empty());
     }

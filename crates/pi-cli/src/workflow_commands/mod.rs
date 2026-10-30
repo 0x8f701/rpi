@@ -11,8 +11,7 @@ use pi_coding::{
 };
 
 /// Canonical usage advertised by the builtin registry and parse errors.
-pub const WORKFLOW_USAGE: &str =
-    "/workflow [list|show [id|name]|create <objective>|create <name> <objective>|pause|resume|cancel|integrate|remove]";
+pub const WORKFLOW_USAGE: &str = "/workflow [list|show [id|name]|create <objective>|create <name> <objective>|pause|resume|cancel|integrate|remove]";
 
 /// Selector accepted by show/lifecycle subcommands (`id` or `name`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,7 +80,10 @@ impl From<&WorkflowSnapshot> for WorkflowSummary {
             branch: snapshot.branch.clone(),
             supervisor_agent_id: snapshot.supervisor_agent_id.clone(),
             generation: snapshot.generation,
-            failure: snapshot.failure.as_ref().map(|failure| failure.message.clone()),
+            failure: snapshot
+                .failure
+                .as_ref()
+                .map(|failure| failure.message.clone()),
             integration: format_integration(&snapshot.integration),
         }
     }
@@ -174,7 +176,9 @@ impl WorkflowCommandPort for ManagerWorkflowPort {
     }
 
     async fn get(&self, selector: &str) -> Result<WorkflowSummary> {
-        Ok(WorkflowSummary::from(self.resolve_snapshot(Some(selector))?))
+        Ok(WorkflowSummary::from(
+            self.resolve_snapshot(Some(selector))?,
+        ))
     }
 
     async fn selected(&self) -> Result<Option<WorkflowSummary>> {
@@ -239,9 +243,7 @@ impl WorkflowCommandPort for ManagerWorkflowPort {
 ///
 /// Requires `Application::attach_workflow_manager` (architect cutover). Fails closed
 /// when no manager is attached — never invents status or opens a shadow store.
-pub fn application_workflow_port(
-    application: &Application,
-) -> Result<ManagerWorkflowPort> {
+pub fn application_workflow_port(application: &Application) -> Result<ManagerWorkflowPort> {
     Ok(ManagerWorkflowPort::new(application.workflow_manager()?))
 }
 
@@ -436,10 +438,7 @@ pub fn format_workflows_header(active: usize, total: usize) -> String {
 /// Count active workflows for the compact header.
 #[must_use]
 pub fn count_active_workflows(items: &[WorkflowSummary]) -> usize {
-    items
-        .iter()
-        .filter(|item| item.status.is_active())
-        .count()
+    items.iter().filter(|item| item.status.is_active()).count()
 }
 
 #[must_use]

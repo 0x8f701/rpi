@@ -21,7 +21,6 @@
 //! not required), and the STT endpoint is a local loopback server.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::time::Duration;
 
 use pi_ai::providers::{FauxProviderOptions, FauxResponse, register_faux_provider};
@@ -30,7 +29,10 @@ use pi_coding::live::{
     CaptureBackend, PttControl, PttSessionEvent, SttClient, is_delegation_candidate,
     run_ptt_session,
 };
-use pi_coding::{Application, LiveRuntimeSettings, Session, SessionOptions};
+use pi_coding::{
+    Application, LiveRuntimeSettings, ResourceDiscovery, ResourceManager, ResourceManagerOptions,
+    Session, SessionOptions,
+};
 use tempfile::TempDir;
 
 /// A capture backend that yields scripted speech chunks (amplitude above the
@@ -52,7 +54,9 @@ impl CaptureBackend for ScriptedCapture {
 /// 4800 samples @ 16 kHz = 0.3 s, above `MIN_UTTERANCE` on its own and
 /// carrying speech amplitude.
 fn speech_chunk() -> Vec<i16> {
-    std::iter::repeat(2_000i16).take(4_800).collect::<Vec<i16>>()
+    std::iter::repeat(2_000i16)
+        .take(4_800)
+        .collect::<Vec<i16>>()
 }
 
 /// Serve one STT request on a dedicated blocking thread and reply with the
@@ -121,13 +125,15 @@ fn live_settings(base: &str) -> LiveRuntimeSettings {
 /// Per-process isolated native session root so `start_new_recording()` never
 /// writes into the real `~/.pi/agent/sessions` tree (Web sidebar source).
 fn test_sessions_root() -> std::path::PathBuf {
-    static ROOT: std::sync::LazyLock<tempfile::TempDir> = std::sync::LazyLock::new(|| {
-        tempfile::tempdir().expect("test sessions root")
-    });
+    static ROOT: std::sync::LazyLock<tempfile::TempDir> =
+        std::sync::LazyLock::new(|| tempfile::tempdir().expect("test sessions root"));
     ROOT.path().to_path_buf()
 }
 
-fn session_with_reply(reply: &str) -> (Session, pi_ai::providers::FauxProviderRegistration) {
+fn session_with_reply(
+    reply: &str,
+    cwd: &std::path::Path,
+) -> (Session, pi_ai::providers::FauxProviderRegistration) {
     let suffix = uuid::Uuid::now_v7().to_string();
     let api = format!("live-delegation-api-{suffix}");
     let provider = format!("live-delegation-provider-{suffix}");
@@ -145,24 +151,63 @@ fn session_with_reply(reply: &str) -> (Session, pi_ai::providers::FauxProviderRe
         chunk_size: 1,
     });
     registration.set_responses(vec![FauxResponse::text(reply)]);
-    let session = Session::new(SessionOptions {
-        model,
-        cwd: std::env::current_dir().expect("current directory"),
-        system_prompt: String::new(),
-        thinking_level: pi_agent::ThinkingLevel::Off,
-        api_key: String::new(),
-        compaction: None,
-        stream_options: Default::default(),
-        tools: Some(Vec::new()),
-        before_tool_call: None,
-        after_tool_call: None,
-        stream_fn: None,
-        auth_resolver: None,
-    })
+    let session = Session::new_with_additional_tools_filtered_and_discovery(
+        SessionOptions {
+            model,
+            cwd: cwd.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: pi_agent::ThinkingLevel::Off,
+            api_key: "faux".to_owned(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+            auth_manager: None,
+        },
+        Vec::new(),
+        Default::default(),
+        ResourceDiscovery::Disabled,
+    )
     .expect("build session");
     session.set_session_dir(test_sessions_root());
     session.start_new_recording().expect("start recording");
     (session, registration)
+}
+
+async fn application_with_reply(
+    reply: &str,
+) -> (
+    TempDir,
+    TempDir,
+    Application,
+    pi_ai::providers::FauxProviderRegistration,
+) {
+    let workspace = tempfile::tempdir().expect("test workspace");
+    let (session, registration) = session_with_reply(reply, workspace.path());
+    let agent_dir = tempfile::tempdir().expect("test agent directory");
+    std::fs::write(
+        agent_dir.path().join("settings.json"),
+        r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+    )
+    .expect("sandbox settings");
+    let mut options = ResourceManagerOptions::new(session.cwd());
+    options.agent_dir = agent_dir.path().to_path_buf();
+    options.project_trust_override = Some(true);
+    options.disable_extensions = true;
+    options.disable_skills = true;
+    options.disable_prompt_templates = true;
+    options.disable_themes = true;
+    options.disable_context_files = true;
+    let resources = ResourceManager::new(options).expect("resource manager");
+    session
+        .attach_resources(resources)
+        .await
+        .expect("attach resources");
+    let application = Application::new(session).await;
+    (workspace, agent_dir, application, registration)
 }
 
 /// Contract: the full live delegation chain — scripted speech capture,
@@ -174,7 +219,10 @@ fn session_with_reply(reply: &str) -> (Session, pi_ai::providers::FauxProviderRe
 async fn transcribed_coding_task_delegates_through_application_and_replies() {
     let base = serve_stt_once("fix the bug in parser.rs");
     let settings = live_settings(&base);
-    let stt = SttClient::new().expect("stt client");
+    let (_workspace, _agent_dir, application, registration) =
+        application_with_reply("delegated work done").await;
+    let stt =
+        SttClient::new_with_executor(application.http_executor(pi_coding::HostHttpClass::LiveStt));
     let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut chunks = VecDeque::new();
@@ -220,8 +268,6 @@ async fn transcribed_coding_task_delegates_through_application_and_replies() {
 
     // The delegation runs as an ordinary agent turn through the standard
     // prompt path and the reply lands in the session transcript.
-    let (session, registration) = session_with_reply("delegated work done");
-    let application = Application::new(session).await;
     application
         .prompt(transcript.clone(), Vec::new(), None)
         .await
@@ -272,7 +318,9 @@ async fn transcribed_coding_task_delegates_through_application_and_replies() {
 async fn plain_chat_transcript_is_not_a_delegation_candidate() {
     let base = serve_stt_once("what is the weather like");
     let settings = live_settings(&base);
-    let stt = SttClient::new().expect("stt client");
+    let (_workspace, _agent_dir, application, registration) = application_with_reply("").await;
+    let stt =
+        SttClient::new_with_executor(application.http_executor(pi_coding::HostHttpClass::LiveStt));
     let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut chunks = VecDeque::new();
@@ -307,4 +355,6 @@ async fn plain_chat_transcript_is_not_a_delegation_candidate() {
         !is_delegation_candidate(&transcript),
         "plain chat must not be a delegation candidate"
     );
+    application.cleanup().await;
+    registration.unregister();
 }

@@ -1,5 +1,5 @@
-use pi_ai::*;
 use pi_ai::providers::{PiMessagesOptions, stream_pi_messages};
+use pi_ai::*;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -258,10 +258,7 @@ async fn redacts_api_key_and_overridden_authorization_from_http_errors() {
         Context::default(),
         StreamOptions {
             api_key: Some("default-secret".into()),
-            headers: HashMap::from([(
-                "Authorization".into(),
-                "Bearer override-secret".into(),
-            )]),
+            headers: HashMap::from([("Authorization".into(), "Bearer override-secret".into())]),
             ..Default::default()
         }
         .into(),
@@ -400,7 +397,10 @@ async fn async_provider_hooks_transform_request_headers_and_observe_public_respo
         .expect("response hook called");
     assert_eq!(response.status, 200);
     assert_eq!(
-        response.headers.get("x-public-observed").map(String::as_str),
+        response
+            .headers
+            .get("x-public-observed")
+            .map(String::as_str),
         Some("yes")
     );
     assert!(!response.headers.contains_key("set-cookie"));

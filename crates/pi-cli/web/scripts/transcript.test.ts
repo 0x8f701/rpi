@@ -13,12 +13,17 @@
 // turns to display:true customs with the clean prompt; orchestration IRC
 // customs arrive display:true with the raw `<orchestration-message>` XML in
 // `content` and the clean fields in `details`).
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server.browser';
+import { TaskToolCardBody, ToastList, ToolCard, BashCard } from '../src/App.tsx';
+import { redactedClipboardText } from '../src/ansi.ts';
 import {
   messagesToItems,
   boundOutput,
   customToItem,
   orchestrationIrcView,
   applyToolSnapshot,
+  applyToolStartToItems,
   applyToolResultToItems,
   toolMedia,
   userImages,
@@ -26,9 +31,15 @@ import {
   parseImageAnalysis,
   mergeAuthoritativeItems,
   applyJobUpdated,
+  applyJobSnapshot,
+  taskJobIds,
   applyMessageDelivered,
+  applyAgentUpdated,
   resolveTaskCardView,
+  taskCardStatus,
   parseTaskCardArgs,
+  firstLinePreview,
+  taskChildActionLine,
   resolveTodoCardView,
   parseTodoPhases,
   parseEditCard,
@@ -36,11 +47,26 @@ import {
   parseCommandCardArgs,
   parseProcessCardArgs,
   parseWriteCardArgs,
-  parseReadCardArgs,
+  parseReadCard,
   parseHubCard,
   parseHeading,
   diffLines,
   shouldRestoreStreamingAssistant,
+  planReconnectTurn,
+  planStreamStallReconcile,
+  planSettledStreamRefillRequest,
+  planStreamWatchdogTick,
+  STREAM_WATCHDOG_MS,
+  withoutSessionWatchdogTimer,
+  createStreamWatchdog,
+  reduceStreamStall,
+  planStreamStallChrome,
+  planLiveSequenceGap,
+  planLiveGapCatchUp,
+  planStreamCatchUpToast,
+  messagesFromCatchUpResponse,
+  planGapCatchUpMergeStreaming,
+  liveHasStreamingAssistant,
   finalizeStreamingAssistant,
   shouldNormalizeThinkingNewlines,
   normalizeThinkingNewlines,
@@ -54,7 +80,15 @@ import {
   TOOL_OUTPUT_LINE_LIMIT,
   IRC_BODY_LINE_LIMIT,
   IRC_COMPACT_LINE_LIMIT,
+  transcriptPathContext,
 } from '../src/transcript.ts';
+import {
+  activityStripView,
+  applyActivityStripEvent,
+  emptyActivityStripState,
+} from '../src/activityStrip.ts';
+import { isBusyCapacityError } from '../src/types.ts';
+
 // The hub tool card renders body/note through the shared markdown renderer;
 // the renderer's behavior for hub-shaped bodies is asserted in
 // markdown.test.ts (that bundle aliases mermaid), so this file keeps the
@@ -65,10 +99,68 @@ function check(name, cond, detail) {
   ran += 1;
   if (!cond) failures.push(`${name}${detail ? `: ${detail}` : ''}`);
 }
+const transportToastMarkup = renderToStaticMarkup(createElement(ToastList, {
+  toasts: [{ id: 'transport-outage', message: 'connection closed, reconnecting…', error: true, kind: 'transport' }],
+  dismiss: () => {},
+}));
+check(
+  'transport toast exposes typed DOM authority',
+  transportToastMarkup.includes('data-toast-kind="transport"'),
+  transportToastMarkup,
+);
 
 // ---- limits match the TUI compact tool-card fold ----
 check('BASH_OUTPUT_LINE_LIMIT == 10 (TUI BASH_CARD_OUTPUT_LIMIT)', BASH_OUTPUT_LINE_LIMIT === 10);
 check('TOOL_OUTPUT_LINE_LIMIT == 6 (TUI DEFAULT_CARD_OUTPUT_LIMIT)', TOOL_OUTPUT_LINE_LIMIT === 6);
+
+{
+  const context = transcriptPathContext([
+    {
+      kind: 'toolCard',
+      id: 'grep',
+      toolCallId: 'call-grep',
+      toolName: 'grep',
+      args: {},
+      status: 'done',
+      result: 'src/runtime/process_block.rs:472:fn handle(',
+    },
+    {
+      kind: 'assistant',
+      id: 'cite',
+      status: 'final',
+      blocks: [{ type: 'text', text: 'see `process_block.rs:472-480`' }],
+    },
+  ]);
+  check(
+    'transcriptPathContext includes grep then the assistant cite',
+    context.includes('src/runtime/process_block.rs:472:fn handle(')
+      && context.includes('see `process_block.rs:472-480`'),
+    context,
+  );
+  const fromArgs = transcriptPathContext([
+    {
+      kind: 'toolCard',
+      id: 'read',
+      toolCallId: 'call-read',
+      toolName: 'read',
+      args: { path: 'src/runtime/process_block.rs' },
+      status: 'done',
+      result: 'fn handle() {',
+    },
+    {
+      kind: 'assistant',
+      id: 'cite-after-read',
+      status: 'final',
+      blocks: [{ type: 'text', text: 'see `process_block.rs:472-480`' }],
+    },
+  ]);
+  check(
+    'transcriptPathContext keeps a tool-card args path',
+    fromArgs.includes('src/runtime/process_block.rs')
+      && fromArgs.includes('see `process_block.rs:472-480`'),
+    fromArgs,
+  );
+}
 
 // ---- boundOutput: tail kept, leading hint, edge cases ----
 {
@@ -106,6 +198,68 @@ check('TOOL_OUTPUT_LINE_LIMIT == 6 (TUI DEFAULT_CARD_OUTPUT_LIMIT)', TOOL_OUTPUT
   check('final snapshot preserves bound and status', finished.kind === 'toolCard' && finished.status === 'error' && finished.result === card.result, JSON.stringify(finished));
 }
 
+// ---- missing Command arguments settle the running card immediately ----
+{
+  const running = [{
+    kind: 'toolCard', id: 'command-card', toolCallId: 'command-call', toolName: 'bash', args: {}, status: 'running', result: '',
+  }];
+  const settled = applyToolSnapshot(
+    running,
+    'command-call',
+    'missing required argument: command',
+    'error',
+  )[0];
+  check(
+    'empty Command settles as explicit schema error',
+    settled.kind === 'toolCard'
+      && settled.status === 'error'
+      && settled.result.includes('missing required argument')
+      && settled.result.includes('command'),
+    JSON.stringify(settled),
+  );
+}
+
+// ---- duplicate start/end/toolResult frames reconcile by toolCallId ----
+{
+  const wait = {
+    kind: 'toolCard', id: 'wait-card', toolCallId: 'wait-call', toolName: 'hub',
+    args: { op: 'wait' }, status: 'running', result: '',
+  };
+  const duplicateStart = applyToolStartToItems(applyToolStartToItems([], wait), {
+    ...wait,
+    id: 'late-duplicate-card',
+  });
+  check(
+    'duplicate tool start keeps one logical card',
+    duplicateStart.filter((item) => item.kind === 'toolCard' && item.toolCallId === 'wait-call').length === 1,
+    JSON.stringify(duplicateStart),
+  );
+  const ended = applyToolSnapshot(
+    duplicateStart,
+    'wait-call',
+    'orchestration shut down',
+    'error',
+    { status: 'failed' },
+  );
+  const duplicatedResult = applyToolResultToItems(
+    [...ended, { ...wait, id: 'restored-duplicate', status: 'error', result: 'orchestration shut down' }],
+    'wait-call',
+    'orchestration shut down',
+    { status: 'failed' },
+  );
+  const waitCards = duplicatedResult.filter(
+    (item) => item.kind === 'toolCard' && item.toolCallId === 'wait-call',
+  );
+  check('duplicate tool end/result collapses to one card', waitCards.length === 1, JSON.stringify(duplicatedResult));
+  check(
+    'duplicate tool end/result preserves terminal error',
+    waitCards[0]?.kind === 'toolCard'
+      && waitCards[0].status === 'error'
+      && waitCards[0].result === 'orchestration shut down',
+    JSON.stringify(waitCards[0]),
+  );
+}
+
 // ---- authoritative snapshots keep live tool cards until history catches up ----
 {
   const live = [
@@ -130,6 +284,20 @@ check('TOOL_OUTPUT_LINE_LIMIT == 6 (TUI DEFAULT_CARD_OUTPUT_LIMIT)', TOOL_OUTPUT
   const settled = mergeAuthoritativeItems(durableHistory, live, false);
   check('settled authoritative snapshot drops stale optimistic and streaming items', !settled.some((item) => item.id === 'optimistic' || item.id === 'streaming'), JSON.stringify(settled));
   check('settled authoritative snapshot still preserves not-yet-durable tool cards', settled.some((item) => item.kind === 'toolCard' && item.toolCallId === 'read-call'), JSON.stringify(settled));
+
+  const routed = { kind: 'summary', id: 'todo-route-receipt-1', label: 'todo', text: 'Routed to Todo · child-1' };
+  const restoredRoute = mergeAuthoritativeItems(durableHistory, [...live, routed], false);
+  check(
+    'settled authoritative restore preserves the live durable Todo route receipt projection',
+    restoredRoute.filter((item) => item.kind === 'summary' && item.id === routed.id).length === 1,
+    JSON.stringify(restoredRoute),
+  );
+  const dedupedRoute = mergeAuthoritativeItems([...durableHistory, routed], [...live, routed], false);
+  check(
+    'authoritative Todo route projection deduplicates by durable receipt identity',
+    dedupedRoute.filter((item) => item.kind === 'summary' && item.id === routed.id).length === 1,
+    JSON.stringify(dedupedRoute),
+  );
 }
 
 {
@@ -170,6 +338,49 @@ check('TOOL_OUTPUT_LINE_LIMIT == 6 (TUI DEFAULT_CARD_OUTPUT_LIMIT)', TOOL_OUTPUT
     mergeAuthoritativeItems([], emptyIdLive, true).length === 1
       && mergeAuthoritativeItems([], emptyIdLive, false).length === 0,
   );
+  const runningHistoryOnly = {
+    kind: 'toolCard' as const,
+    id: 'tc-hist',
+    toolCallId: 'task-hist-call',
+    toolName: 'task',
+    args: { agent: 'reviewer', name: 'Hist', task: 'historical work' },
+    status: 'running' as const,
+    result: '',
+    details: [{ index: 0, jobId: 'job-old', agentId: 'Alpha', agent: 'reviewer', status: 'running' }],
+  };
+  const coldRunningHistory = mergeAuthoritativeItems([runningHistoryOnly], [], false);
+  check(
+    'running-only history is kept when live has no durable items',
+    coldRunningHistory.length === 1 && coldRunningHistory[0]?.id === 'tc-hist',
+    JSON.stringify(coldRunningHistory.map((item) => item.id)),
+  );
+  const lastGood = [
+    { kind: 'user' as const, id: 'u-keep', text: 'hello', optimistic: false },
+    {
+      kind: 'assistant' as const,
+      id: 'a-keep',
+      status: 'final' as const,
+      blocks: [{ type: 'text', text: 'world' }],
+    },
+  ];
+  const emptySettled = mergeAuthoritativeItems([], lastGood, false);
+  check(
+    'empty settled reconnect history keeps last-good durable turns',
+    emptySettled.some((item) => item.id === 'u-keep') && emptySettled.some((item) => item.id === 'a-keep'),
+    JSON.stringify(emptySettled),
+  );
+  const emptyColdFull = mergeAuthoritativeItems(
+    [],
+    [...lastGood, { kind: 'assistant' as const, id: 'stream', status: 'streaming' as const, blocks: [] }],
+    true,
+  );
+  check(
+    'empty cold-full snapshot keeps last-good durable turns and the streaming assistant',
+    emptyColdFull.some((item) => item.id === 'u-keep')
+      && emptyColdFull.some((item) => item.id === 'a-keep')
+      && emptyColdFull.some((item) => item.id === 'stream'),
+    JSON.stringify(emptyColdFull),
+  );
 }
 
 // ---- restored: legitimate user/assistant turns remain ----
@@ -184,6 +395,57 @@ check('TOOL_OUTPUT_LINE_LIMIT == 6 (TUI DEFAULT_CARD_OUTPUT_LIMIT)', TOOL_OUTPUT
   check('restored assistant block remains', asst && asst.blocks.length === 1, JSON.stringify(asst));
 }
 
+
+{
+  const items = messagesToItems([
+    { id: 'entry-user', message: { role: 'user', content: [{ type: 'text', text: 'stable user' }] } },
+    { id: 'entry-assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'stable assistant' }] } },
+  ]);
+  check('recorder entry id owns restored user item', items[0]?.id === 'entry-user', JSON.stringify(items));
+  check('recorder entry id owns restored assistant item', items[1]?.id === 'entry-assistant', JSON.stringify(items));
+}
+// ---- restored: a failed turn surfaces its persisted errorMessage (never an empty hole) ----
+{
+  const items = messagesToItems([
+    { id: 'entry-fail', message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: 'session HTTP transport failed', timestamp: 3 } },
+  ]);
+  check(
+    'restored empty-content error turn keeps an assistant item with errorMessage',
+    items.length === 1 && items[0].kind === 'assistant' && items[0].errorMessage === 'session HTTP transport failed',
+    JSON.stringify(items),
+  );
+}
+{
+  const items = messagesToItems([
+    { id: 'entry-fail-empty-text', message: { role: 'assistant', content: [{ type: 'text', text: '' }], stopReason: 'error', errorMessage: 'mock upstream failed', timestamp: 3 } },
+  ]);
+  check(
+    'restored empty-text error turn becomes a failure row without an empty bubble',
+    items.length === 1 && items[0].kind === 'assistant' && items[0].blocks.length === 0
+      && items[0].errorMessage === 'mock upstream failed',
+    JSON.stringify(items),
+  );
+}
+{
+  const items = messagesToItems([
+    { id: 'entry-abort', message: { role: 'assistant', content: [], stopReason: 'aborted', errorMessage: 'Request was aborted', timestamp: 3 } },
+  ]);
+  check(
+    'restored aborted turns stay off the transcript (TUI reserved status-row contract)',
+    items.length === 0,
+    JSON.stringify(items),
+  );
+}
+{
+  const items = messagesToItems([
+    { id: 'entry-partial', message: { role: 'assistant', content: [{ type: 'text', text: 'partial answer' }], stopReason: 'error', errorMessage: 'OpenAI stream ended without finish_reason', timestamp: 3 } },
+  ]);
+  check(
+    'restored partial-content error turn renders its blocks without an error row (TUI parity)',
+    items.length === 1 && items[0].kind === 'assistant' && items[0].blocks.length === 1 && items[0].errorMessage === undefined,
+    JSON.stringify(items),
+  );
+}
 // ---- restored: bashExecution reads top-level command/output (not nested) ----
 {
   const items = messagesToItems([
@@ -259,7 +521,7 @@ check('TOOL_OUTPUT_LINE_LIMIT == 6 (TUI DEFAULT_CARD_OUTPUT_LIMIT)', TOOL_OUTPUT
     : undefined;
   check('mixed assistant keeps visible blocks but removes toolCall block', assistant?.kind === 'assistant' && assistant.blocks.length === 1 && assistant.blocks[0]?.type === 'text', JSON.stringify(assistant));
   check('generic card metadata comes from matching assistant toolCall', card?.kind === 'toolCard' && card.toolCallId === 'generic-call' && card.toolName === 'read' && genericPath === 'fixture.txt', JSON.stringify(card));
-  check('generic card completes with six-line bounded result', card?.kind === 'toolCard' && card.status === 'done' && card.result.startsWith('\u2026 2 more lines\ngeneric-tail-3') && card.result.endsWith('\ngeneric-tail-8'), JSON.stringify(card));
+  check('read card retains full upstream-bounded result', card?.kind === 'toolCard' && card.status === 'done' && card.result === output, JSON.stringify(card));
 }
 
 
@@ -279,6 +541,292 @@ check(
     content: [{ type: 'toolCall', id: 'call', name: 'read', arguments: {} }],
   }]),
 );
+
+{
+  const streaming = { kind: 'assistant' as const, id: 'msg-server', status: 'streaming' as const, blocks: [] };
+  const midTurn = planReconnectTurn({
+    isStreaming: true,
+    liveItems: [streaming],
+    activeAssistantId: 'msg-server',
+  });
+  check('mid-turn reconnect keeps the server assistant id',
+    midTurn.kind === 'streaming' && midTurn.assistantId === 'msg-server');
+  const noShell = planReconnectTurn({
+    isStreaming: true,
+    liveItems: [{ kind: 'user', id: 'u1', text: 'go', optimistic: false }],
+    activeAssistantId: undefined,
+  });
+  check('mid-turn reconnect never mints a client-only assistant id',
+    noShell.kind === 'streaming' && noShell.assistantId === null);
+  const settled = planReconnectTurn({
+    isStreaming: false,
+    liveItems: [streaming],
+    activeAssistantId: 'msg-server',
+  });
+  check('finished turn reconnect is settled history',
+    settled.kind === 'settled');
+  check('idle snapshot with a streaming assistant is a settled refill',
+    planStreamStallReconcile({ snapshotStreaming: false, liveHasStreamingAssistant: true }) === 'refill-settled');
+  check('still-streaming snapshot does not refill',
+    planStreamStallReconcile({ snapshotStreaming: true, liveHasStreamingAssistant: true }) === 'idle');
+  check('settled snapshot without a streaming assistant is idle',
+    planStreamStallReconcile({ snapshotStreaming: false, liveHasStreamingAssistant: false }) === 'idle');
+  check('omitted streaming flag does not refill',
+    planStreamStallReconcile({ snapshotStreaming: undefined, liveHasStreamingAssistant: true }) === 'idle');
+  check('watchdog settlement requests refill while another session reconnect-refills',
+    planSettledStreamRefillRequest({
+      snapshotStreaming: false,
+      liveHasStreamingAssistant: true,
+      reconnectRefillSessionId: 'alpha',
+      targetSessionId: 'beta',
+    }) === 'request');
+  check('same-session reconnect refill owns the settled snapshot',
+    planSettledStreamRefillRequest({
+      snapshotStreaming: false,
+      liveHasStreamingAssistant: true,
+      reconnectRefillSessionId: 'alpha',
+      targetSessionId: 'alpha',
+    }) === 'idle');
+  check('settled stall without a reconnect refill still requests',
+    planSettledStreamRefillRequest({
+      snapshotStreaming: false,
+      liveHasStreamingAssistant: true,
+      reconnectRefillSessionId: null,
+      targetSessionId: 'beta',
+    }) === 'request');
+  check('still-streaming snapshot does not request a settled refill',
+    planSettledStreamRefillRequest({
+      snapshotStreaming: true,
+      liveHasStreamingAssistant: true,
+      reconnectRefillSessionId: 'alpha',
+      targetSessionId: 'beta',
+    }) === 'idle');
+  check('watchdog SLA is one 5s heartbeat-stability window', STREAM_WATCHDOG_MS === 5000);
+  check('watchdog stays idle while deltas are fresh',
+    planStreamWatchdogTick({ streaming: true, lastEventAt: 1000, now: 1000 + STREAM_WATCHDOG_MS - 1, watchdogMs: STREAM_WATCHDOG_MS }) === 'idle');
+  check('watchdog get_state after silence with streaming still on',
+    planStreamWatchdogTick({ streaming: true, lastEventAt: 1000, now: 1000 + STREAM_WATCHDOG_MS, watchdogMs: STREAM_WATCHDOG_MS }) === 'get_state');
+  check('watchdog stays idle when the turn already settled',
+    planStreamWatchdogTick({ streaming: false, lastEventAt: 0, now: 1000 + STREAM_WATCHDOG_MS, watchdogMs: STREAM_WATCHDOG_MS }) === 'idle');
+  check('two sessions tick independently from their own lastEventAt',
+    planStreamWatchdogTick({ streaming: true, lastEventAt: 0, now: 9000, watchdogMs: STREAM_WATCHDOG_MS }) === 'get_state'
+    && planStreamWatchdogTick({ streaming: true, lastEventAt: 8000, now: 9000, watchdogMs: STREAM_WATCHDOG_MS }) === 'idle');
+  const twoTimers = { alpha: 1, beta: 2 };
+  const afterAlpha = withoutSessionWatchdogTimer(twoTimers, 'alpha');
+  check('dropping one session watchdog timer leaves the other',
+    afterAlpha.beta === 2 && afterAlpha.alpha === undefined && twoTimers.alpha === 1);
+  check('dropping a missing session watchdog timer does not delete siblings',
+    withoutSessionWatchdogTimer({ beta: 2 }, 'alpha').beta === 2);
+  {
+    let now = 0;
+    let nextTimerId = 1;
+    const pending: { id: number; at: number; fn: () => void }[] = [];
+    const streaming: Record<string, boolean> = { alpha: true, beta: true };
+    const silenced: string[] = [];
+    const watchdog = createStreamWatchdog({
+      watchdogMs: STREAM_WATCHDOG_MS,
+      now: () => now,
+      schedule: (fn, ms) => {
+        const id = nextTimerId;
+        nextTimerId += 1;
+        pending.push({ id, at: now + ms, fn });
+        return id;
+      },
+      cancel: (id) => {
+        const index = pending.findIndex((timer) => timer.id === id);
+        if (index >= 0) pending.splice(index, 1);
+      },
+      isStreaming: (sid) => streaming[sid] === true,
+      onSilence: (sid) => { silenced.push(sid); },
+    });
+    const fireDue = (): void => {
+      pending.sort((left, right) => left.at - right.at);
+      while (pending.length > 0 && pending[0].at <= now) {
+        const timer = pending.shift();
+        if (timer) timer.fn();
+      }
+    };
+    watchdog.arm('alpha');
+    now = 1000;
+    watchdog.arm('beta');
+    now = STREAM_WATCHDOG_MS;
+    fireDue();
+    check('watchdog get_state fires only for the silent session',
+      silenced.length === 1 && silenced[0] === 'alpha' && pending.length === 1);
+    streaming.alpha = false;
+    watchdog.clear('alpha');
+    now = 1000 + STREAM_WATCHDOG_MS;
+    fireDue();
+    check('clearing alpha leaves beta silence and does not re-fire alpha',
+      silenced.length === 2 && silenced[1] === 'beta' && pending.length === 0);
+    now += STREAM_WATCHDOG_MS;
+    fireDue();
+    check('invalidated alpha does not get_state after beta silence',
+      silenced.length === 2 && silenced[0] === 'alpha' && silenced[1] === 'beta');
+    streaming.gamma = true;
+    watchdog.arm('gamma');
+    now += STREAM_WATCHDOG_MS / 2;
+    watchdog.arm('gamma');
+    now += STREAM_WATCHDOG_MS / 2;
+    fireDue();
+    check('a live re-arm delays get_state past the first silence window',
+      silenced.length === 2 && pending.length === 1);
+    now += STREAM_WATCHDOG_MS / 2;
+    fireDue();
+    check('re-armed session get_state after a full silent window',
+      silenced.length === 3 && silenced[2] === 'gamma' && pending.length === 0);
+    streaming.delta = false;
+    watchdog.arm('delta');
+    now += STREAM_WATCHDOG_MS;
+    fireDue();
+    check('arm on a non-streaming session never schedules get_state',
+      silenced.length === 3 && pending.length === 0);
+    streaming.wake = true;
+    now = 12_000;
+    watchdog.arm('wake');
+    now = 12_000 + STREAM_WATCHDOG_MS;
+    watchdog.probe('wake');
+    check('wake probe fires silence without waiting for the timer',
+      silenced.length === 4 && silenced[3] === 'wake');
+    now = 20_000;
+    watchdog.arm('wake');
+    now = 20_000 + STREAM_WATCHDOG_MS - 1;
+    watchdog.probe('wake');
+    check('wake probe before the 5s window does not fire',
+      silenced.length === 4);
+  }
+  {
+    const sid = 'stall-session';
+    const working = applyActivityStripEvent(emptyActivityStripState(sid), { type: 'turn_started', turnId: 'turn-stall' }, sid);
+    let stalled = false;
+    check('live streaming has Working chrome, not Reconnecting',
+      activityStripView(working, 'on', stalled)?.state === 'working'
+      && planStreamStallChrome(stalled) === 'hidden');
+    check('a quiet stretch alone never paints Reconnecting (subagent waits are healthy)',
+      reduceStreamStall(false, { type: 'watchdog_probe_alive' }) === false);
+    stalled = reduceStreamStall(stalled, { type: 'watchdog_probe_failed' });
+    const silentPulse = activityStripView(working, 'on', stalled);
+    check('a failed silence probe pulses Reconnecting while connState stays on',
+      stalled === true
+      && planStreamStallChrome(stalled) === 'pulse'
+      && silentPulse?.state === 'reconnecting'
+      && silentPulse?.text === 'Reconnecting…');
+    check('the next successful probe clears the stall (probe answered = transport alive)',
+      reduceStreamStall(stalled, { type: 'watchdog_probe_alive' }) === false);
+    stalled = reduceStreamStall(stalled, { type: 'socket_drop', streaming: true });
+    const dropPulse = activityStripView(working, 'reconnecting', stalled);
+    check('socket drop keeps the Reconnecting pulse',
+      stalled === true
+      && dropPulse?.state === 'reconnecting'
+      && planStreamStallChrome(stalled) === 'pulse');
+    const reconnectOn = activityStripView(working, 'on', stalled);
+    check('connState on during refill still pulses until refill finishes',
+      reconnectOn?.state === 'reconnecting'
+      && planStreamStallChrome(stalled) === 'pulse');
+    stalled = reduceStreamStall(stalled, { type: 'refill_finished' });
+    const settled = applyActivityStripEvent(working, { type: 'turn_terminal', turnId: 'turn-stall', status: 'succeeded' }, sid);
+    check('refill finish clears pulse and the strip',
+      stalled === false
+      && planStreamStallChrome(stalled) === 'hidden'
+      && activityStripView(settled, 'on', stalled) === null);
+    stalled = reduceStreamStall(true, { type: 'live_event' });
+    check('live tokens clear stall chrome',
+      stalled === false && planStreamStallChrome(stalled) === 'hidden');
+    stalled = reduceStreamStall(true, { type: 'abort' });
+    check('abort clears stall chrome', stalled === false);
+    check('idle snapshot without refill clears stall',
+      reduceStreamStall(true, { type: 'snapshot_idle', refill: 'idle' }) === false);
+    check('idle snapshot that requests refill keeps stall',
+      reduceStreamStall(true, { type: 'snapshot_idle', refill: 'request' }) === true);
+  }
+  {
+    const failedItems = [{
+      kind: 'toolCard',
+      id: 'tc-fail',
+      toolCallId: 'task-fail-call',
+      toolName: 'task',
+      args: { context: '# Goal\nreview', tasks: [{ name: 'child-1', agent: 'glm', task: 'audit the realm' }] },
+      status: 'running',
+      result: '',
+      details: [{ index: 0, jobId: 'job-f1', agentId: 'child-1', agent: 'glm', status: 'running' }],
+    }];
+    const afterFail = applyJobUpdated(failedItems, {
+      job: {
+        id: 'job-f1',
+        agentId: 'child-1',
+        agent: 'glm',
+        status: 'failed',
+        result: {
+          output: '调查完成（只读）。以下逐条裁定……',
+          error: 'subagent exited without calling yield tool',
+        },
+      },
+    });
+    const failedChild = resolveTaskCardView(afterFail[0].args, afterFail[0].details)?.children[0];
+    check('failed child keeps its partial output as result',
+      !!failedChild && failedChild.result === '调查完成（只读）。以下逐条裁定……', JSON.stringify(failedChild));
+    check('failed child carries the failure reason separately',
+      !!failedChild && failedChild.error === 'subagent exited without calling yield tool', JSON.stringify(failedChild));
+    const failDom = renderToStaticMarkup(createElement(TaskToolCardBody, {
+      item: afterFail[0],
+      taskView: resolveTaskCardView(afterFail[0].args, afterFail[0].details),
+    }));
+    check('failed child renders a red error line, never FAILED with no explanation',
+      failDom.includes('tool-card__child-error')
+        && failDom.includes('subagent exited without calling yield tool'),
+      failDom.slice(0, 500));
+  }
+  check('liveHasStreamingAssistant detects a streaming bubble',
+    liveHasStreamingAssistant([streaming]) === true
+      && liveHasStreamingAssistant([{ kind: 'assistant', id: 'done', status: 'final', blocks: [] }]) === false);
+  check('in-order sequence applies', planLiveSequenceGap({ cursor: 4, sequence: 5 }) === 'apply');
+  check('duplicate sequence is ignored', planLiveSequenceGap({ cursor: 7, sequence: 7 }) === 'duplicate');
+  check('skipped sequence is a gap', planLiveSequenceGap({ cursor: 10, sequence: 12 }) === 'gap');
+  check('first live gap starts catch-up', planLiveGapCatchUp({ recoveryInFlight: false }) === 'start');
+  check('later live gaps coalesce onto the in-flight catch-up', planLiveGapCatchUp({ recoveryInFlight: true }) === 'coalesce');
+  check('busy_capacity catch-up stays silent', planStreamCatchUpToast({
+    toastOwned: false,
+    transport: false,
+    busyCapacity: true,
+  }) === 'silent');
+  check('owned or transport catch-up stays silent', planStreamCatchUpToast({
+    toastOwned: true,
+    transport: false,
+    busyCapacity: false,
+  }) === 'silent'
+    && planStreamCatchUpToast({
+      toastOwned: false,
+      transport: true,
+      busyCapacity: false,
+    }) === 'silent');
+  check('other catch-up failures still toast', planStreamCatchUpToast({
+    toastOwned: false,
+    transport: false,
+    busyCapacity: false,
+  }) === 'toast');
+  check('catch-up merge uses snapshot streaming, not a stale local flag',
+    planGapCatchUpMergeStreaming(false) === false
+      && planGapCatchUpMergeStreaming(true) === true
+      && planGapCatchUpMergeStreaming(undefined) === false);
+  check('valid catch-up messages pass through',
+    JSON.stringify(messagesFromCatchUpResponse({ messages: [{ role: 'user' }] }))
+      === JSON.stringify([{ role: 'user' }]));
+  let missingMessages = false;
+  try { messagesFromCatchUpResponse({}); } catch (error) {
+    missingMessages = error instanceof Error && error.message === 'messages response missing messages';
+  }
+  let nonArrayMessages = false;
+  try { messagesFromCatchUpResponse({ messages: 'nope' }); } catch (error) {
+    nonArrayMessages = error instanceof Error && error.message === 'messages response missing messages';
+  }
+  check('malformed catch-up messages fail closed', missingMessages && nonArrayMessages);
+  check('capacity-like prose without typed rpcCode still toasts',
+    planStreamCatchUpToast({
+      toastOwned: false,
+      transport: false,
+      busyCapacity: isBusyCapacityError(new Error('too many concurrent RPC commands (limit 16)')),
+    }) === 'toast');
+}
 
 // ---- restored: display:false custom (raw system-reminder) is hidden ----
 {
@@ -431,7 +979,7 @@ check(
 // ---- toolResult/toolCard dedupe parity (host suppression; collab parity) ----
 {
   const doneCard = {
-    kind: 'toolCard', id: 'tc', toolCallId: 'call-x', toolName: 'read',
+    kind: 'toolCard', id: 'tc', toolCallId: 'call-x', toolName: 'edit',
     args: { path: 'a' }, status: 'done', result: 'from end', details: { diff: 'x' },
   };
   const matchedNoDetails = applyToolResultToItems([doneCard], 'call-x', 'from message', undefined);
@@ -440,7 +988,7 @@ check(
   check('fold never overwrites existing card details/result', matchedDetails[0].kind === 'toolCard' && matchedDetails[0].details.diff === 'x' && matchedDetails[0].result === 'from end' && matchedDetails.length === 1, JSON.stringify(matchedDetails));
 
   const bareCard = {
-    kind: 'toolCard', id: 'tc2', toolCallId: 'call-y', toolName: 'read',
+    kind: 'toolCard', id: 'tc2', toolCallId: 'call-y', toolName: 'edit',
     args: { path: 'b' }, status: 'running', result: '',
   };
   const folded = applyToolResultToItems([bareCard], 'call-y', 'the result', { diff: 'd' });
@@ -450,6 +998,41 @@ check(
   check('unmatched toolResult stays readable as a toolResult row', unmatched.length === 2 && unmatched[1].kind === 'toolResult' && unmatched[1].text === 'orphan output', JSON.stringify(unmatched));
   const emptyId = applyToolResultToItems([doneCard], '', 'no id', undefined);
   check('empty toolCallId appends a readable row (never drops output)', emptyId.length === 2 && emptyId[1].kind === 'toolResult' && emptyId[1].text === 'no id', JSON.stringify(emptyId));
+  const distinctCallIds = applyToolResultToItems(
+    applyToolResultToItems([doneCard], 'orphan-a', 'identical output', undefined),
+    'orphan-b',
+    'identical output',
+    undefined,
+  );
+  check(
+    'distinct unmatched toolCallIds preserve identical result text separately',
+    distinctCallIds.filter((item) => item.kind === 'toolResult' && item.text === 'identical output').length === 2,
+    JSON.stringify(distinctCallIds),
+  );
+  const duplicateCallId = applyToolResultToItems(distinctCallIds, 'orphan-a', 'changed duplicate frame', undefined);
+  check(
+    'same unmatched toolCallId remains idempotent regardless of result text',
+    duplicateCallId.length === distinctCallIds.length,
+    JSON.stringify(duplicateCallId),
+  );
+  const emptyIds = applyToolResultToItems(
+    applyToolResultToItems([doneCard], '', 'identical empty-id output', undefined),
+    '',
+    'identical empty-id output',
+    undefined,
+  );
+  check(
+    'empty toolCallIds never collapse identical result text',
+    emptyIds.filter((item) => item.kind === 'toolResult' && item.text === 'identical empty-id output').length === 2,
+    JSON.stringify(emptyIds),
+  );
+
+  const readCard = {
+    kind: 'toolCard', id: 'tc3', toolCallId: 'call-r', toolName: 'read',
+    args: { path: 'c' }, status: 'running', result: '',
+  };
+  const foldedRead = applyToolResultToItems([readCard], 'call-r', 'the result', { media: [{ kind: 'video' }] });
+  check('read fold strips generic details', foldedRead[0].kind === 'toolCard' && foldedRead[0].details === undefined && foldedRead[0].result === 'the result', JSON.stringify(foldedRead));
 }
 
 // ---- tool result media: safe image/video projection, hostile rejection ----
@@ -475,14 +1058,18 @@ check(
 
   const card = { kind: 'toolCard', id: 'media', toolCallId: 'media-call', toolName: 'read', args: { path: 'image.png' }, status: 'running', result: '' };
   const completed = applyToolSnapshot([card], 'media-call', 'Read image', 'done', {}, image)[0];
-  check('live tool end retains media on card', completed.kind === 'toolCard' && completed.media?.length === 1, JSON.stringify(completed));
+  check('live read end retains validated image media', completed.kind === 'toolCard'
+    && completed.media?.length === 1 && completed.media[0].kind === 'image'
+    && completed.result === 'Read image', JSON.stringify(completed));
 
   const restored = messagesToItems([
     { role: 'assistant', content: [{ type: 'toolCall', id: 'media-restored', name: 'read', arguments: { path: 'image.png' } }] },
     { role: 'toolResult', toolCallId: 'media-restored', content: [{ type: 'text', text: 'Read image' }, { type: 'image', mimeType: 'image/png', data: png }], details: {}, isError: false },
   ]);
   const restoredCard = restored.find((item) => item.kind === 'toolCard');
-  check('restored tool result retains image media', restoredCard?.kind === 'toolCard' && restoredCard.media?.length === 1, JSON.stringify(restoredCard));
+  check('restored read result retains validated image media', restoredCard?.kind === 'toolCard'
+    && restoredCard.media?.length === 1 && restoredCard.media[0].mimeType === 'image/png'
+    && restoredCard.result === 'Read image', JSON.stringify(restoredCard));
 }
 
 // ---- user message images: extraction, allowlist, order, restore ----
@@ -686,7 +1273,7 @@ check(
     ],
   };
   const spawns = [
-    { index: 0, jobId: 'job-a', agentId: 'Alpha', agent: 'reviewer', status: 'queued' },
+    { index: 0, jobId: 'job-a', agentId: 'Alpha', agent: 'runtime-reviewer', status: 'queued' },
     { index: 1, jobId: 'job-b', agentId: 'Beta', agent: 'task', status: 'queued' },
   ];
   const view = resolveTaskCardView(args, spawns);
@@ -712,6 +1299,8 @@ check(
       id: 'job-a',
       agentId: 'Alpha',
       agent: 'reviewer',
+      parentId: 'Main',
+      todoTaskId: 'todo-a',
       status: 'completed',
       result: { output: 'Adapter review looks good.', error: null },
     },
@@ -723,7 +1312,134 @@ check(
   check('task child result sentence from job_updated', !!live && live.children[0].result === 'Adapter review looks good.', JSON.stringify(live?.children?.[0]));
   check('task child activity from message_delivered', !!live && live.children[0].activity === 'halfway through review', JSON.stringify(live?.children?.[0]));
   check('task child status updated from job', !!live && live.children[0].status === 'completed', JSON.stringify(live?.children?.[0]));
+  check('task child projects authoritative parent and Todo provenance', !!live
+    && live.children[0].parentId === 'Main'
+    && live.children[0].todoTaskId === 'todo-a', JSON.stringify(live?.children?.[0]));
+  check('live Task snapshot preserves authored name/agent/target', !!live
+    && live.children[0].name === 'Alpha'
+    && live.children[0].agent === 'reviewer'
+    && live.children[0].target.includes('Review the adapter'), JSON.stringify(live?.children?.[0]));
+  const allSettled = applyJobUpdated(afterJob, {
+    job: { id: 'job-b', agentId: 'Beta', agent: 'task', status: 'completed' },
+  });
+  check('task parent settles when every authoritative child settles', taskCardStatus(allSettled[0]) === 'done', JSON.stringify(allSettled[0]));
+  const restoredSettled = applyJobSnapshot(items, [{
+    id: 'job-a',
+    agentId: 'Alpha',
+    agent: 'reviewer',
+    status: 'completed',
+    result: { output: 'restored output', error: null },
+  }, {
+    id: 'job-b',
+    agentId: 'Beta',
+    agent: 'task',
+    status: 'completed',
+  }]);
+  const restoredView = resolveTaskCardView(restoredSettled[0].args, restoredSettled[0].details);
+  check('task job_list snapshot reconciles restored queued children', !!restoredView
+    && restoredView.children.every((child) => child.status === 'completed')
+    && restoredView.children[0].result === 'restored output'
+    && taskCardStatus(restoredSettled[0]) === 'done', JSON.stringify(restoredView));
+  const runningBeforeReconnect = applyJobUpdated(items, {
+    job: { id: 'job-a', agentId: 'Alpha', agent: 'reviewer', status: 'running' },
+  });
+  const cancelledOnReconnect = applyJobSnapshot(runningBeforeReconnect, [{
+    id: 'job-a',
+    agentId: 'Alpha',
+    agent: 'reviewer',
+    status: 'cancelled',
+    result: { output: '', error: 'task cancelled' },
+  }, {
+    id: 'job-b',
+    agentId: 'Beta',
+    agent: 'task',
+    status: 'completed',
+  }]);
+  const cancelledView = resolveTaskCardView(cancelledOnReconnect[0].args, cancelledOnReconnect[0].details);
+  check('reconnect job_list removes stale Running child state', !!cancelledView
+    && cancelledView.children[0].status === 'cancelled'
+    && cancelledView.children[0].result === 'task cancelled'
+    && taskCardStatus(cancelledOnReconnect[0]) === 'cancelled', JSON.stringify(cancelledView));
+  const staleRunningSnapshot = applyJobSnapshot(cancelledOnReconnect, [{
+    id: 'job-a',
+    agentId: 'Alpha',
+    agent: 'reviewer',
+    status: 'running',
+  }]);
+  const monotonicView = resolveTaskCardView(staleRunningSnapshot[0].args, staleRunningSnapshot[0].details);
+  check('stale reconnect snapshot cannot regress terminal Task child to Running', !!monotonicView
+    && monotonicView.children[0].status === 'cancelled'
+    && taskCardStatus(staleRunningSnapshot[0]) === 'cancelled', JSON.stringify(monotonicView));
+  const mixedRunning = applyJobUpdated(items, {
+    job: { id: 'job-a', agentId: 'Alpha', agent: 'reviewer', status: 'completed' },
+  });
+  check('task parent remains running while another authoritative child is queued', taskCardStatus(mixedRunning[0]) === 'running', JSON.stringify(mixedRunning[0]));
+  const failed = applyJobUpdated(items, {
+    job: { id: 'job-a', agentId: 'Alpha', agent: 'reviewer', status: 'failed' },
+  });
+  const failedSettled = applyJobUpdated(failed, {
+    job: { id: 'job-b', agentId: 'Beta', agent: 'task', status: 'completed' },
+  });
+  check('task parent errors when any settled child failed', taskCardStatus(failedSettled[0]) === 'error', JSON.stringify(failedSettled[0]));
+
+  const completedAndCancelled = applyJobUpdated(afterJob, {
+    job: { id: 'job-b', agentId: 'Beta', agent: 'task', status: 'cancelled' },
+  });
+  check('task parent cancellation is explicit for completed plus cancelled children', taskCardStatus(completedAndCancelled[0]) === 'cancelled', JSON.stringify(completedAndCancelled[0]));
+
+  const renamedWithoutStatusMutation = applyAgentUpdated(runningBeforeReconnect, {
+    agent: { id: 'Alpha', displayName: 'Alpha revived', status: 'idle' },
+  });
+  const renamed = resolveTaskCardView(renamedWithoutStatusMutation[0].args, renamedWithoutStatusMutation[0].details);
+  check('agent_updated changes Task display name without settling its job',
+    renamed?.children[0].name === 'Alpha revived' && renamed.children[0].status === 'running',
+    JSON.stringify(renamed?.children[0]));
+
+  const exactInvalidArgs = {
+    name: 'final-rollback-review',
+    agent: 'reviewer',
+    context: 'Review the complete rollback design against source.',
+    task: 'Perform the meticulous final review with exact evidence and corrections.',
+    outputSchema: {
+      type: 'object',
+      properties: { findings: { type: 'array', items: { type: 'object' } } },
+      required: ['findings', 'summary'],
+      summary: { type: 'string' },
+    },
+    schemaMode: 'strict',
+  };
+  const exactError = 'task.outputSchema required property "summary" is missing from $.properties';
+  const rejected = { ...items[0], args: exactInvalidArgs, status: 'error', result: exactError, details: undefined };
+  const rejectedView = resolveTaskCardView(rejected.args, rejected.details, rejected.status);
+  check('exact invalid Goal Task hides args-only running reviewer', !!rejectedView && rejectedView.children.length === 0, JSON.stringify(rejectedView));
+  check('exact invalid Goal Task retains actionable preflight error', rejected.result === exactError && boundOutput(rejected.result, 6).text === rejected.result, rejected.result);
+  const partialRejected = { ...rejected, details: [spawns[0]] };
+  const partialView = resolveTaskCardView(partialRejected.args, partialRejected.details, partialRejected.status);
+  check('task rejection retains only authoritative partial spawn evidence', !!partialView && partialView.children.length === 1 && partialView.children[0].jobId === 'job-a', JSON.stringify(partialView));
+  const rejectedDom = {
+    kind: 'toolCard' as const,
+    id: 'task-rejected',
+    toolCallId: 'task-rejected-call',
+    toolName: 'task',
+    args: exactInvalidArgs,
+    status: 'error' as const,
+    result: exactError,
+  };
+  const taskView = resolveTaskCardView(rejectedDom.args, undefined, rejectedDom.status);
+  const html = taskView ? renderToStaticMarkup(createElement(TaskToolCardBody, { item: rejectedDom, taskView })) : '';
+  check('rejected Task DOM renders exact bounded schema error', html.includes('task.outputSchema required property &quot;summary&quot; is missing from $.properties'), html);
+  check('rejected Task DOM renders zero reviewer child rows', !html.includes('class="tool-card__child"'), html);
+  const previewView = resolveTaskCardView(rejectedDom.args, undefined);
+  check('preview view still carries args-only children before parent status', !!previewView && previewView.children.length === 1, JSON.stringify(previewView));
+  const settledHtml = previewView
+    ? renderToStaticMarkup(createElement(TaskToolCardBody, { item: rejectedDom, taskView: previewView }))
+    : '';
+  check('TaskToolCardBody settles unrelated error through item status/result, not preview children',
+    settledHtml.includes('task.outputSchema required property &quot;summary&quot; is missing from $.properties')
+      && !settledHtml.includes('class="tool-card__child"'),
+    settledHtml);
 }
+
 
 // ---- Task card: long-Chinese delegation (Goal/Constraints/Contract + DeepSeek child) ----
 // Mirrors the user's real delegation structure: three ATX sections with dense
@@ -804,6 +1520,29 @@ check(
   });
   const withActivity = resolveTaskCardView(afterMessage[0].args, afterMessage[0].details);
   check('zh child activity line from message_delivered', !!withActivity && withActivity.children[0].activity === '已完成桌面验证，正在检查 390px mobile 渲染。', JSON.stringify(withActivity?.children?.[0]));
+  const zhCard = {
+    kind: 'toolCard',
+    id: 'tc-zh-fold',
+    toolCallId: 'task-zh-fold',
+    toolName: 'task',
+    args,
+    status: 'running',
+    result: '',
+    details: [{ index: 0, jobId: 'job-zh', agentId: 'DeepSeek', agent: 'deepseek', status: 'running' }],
+  };
+  const zhView = resolveTaskCardView(zhCard.args, zhCard.details, zhCard.status);
+  const zhHtml = zhView ? renderToStaticMarkup(createElement(TaskToolCardBody, { item: zhCard, taskView: zhView })) : '';
+  check('zh Goal folds to a one-line preview by default',
+    zhHtml.includes('tool-card__section-preview')
+      && zhHtml.includes('tool-card__section-summary')
+      && zhHtml.includes(firstLinePreview(view.sections.goal))
+      && zhHtml.includes('tool-card__child-action'),
+    zhHtml.slice(0, 400));
+  check('zh child action line is the assignment preview until activity arrives',
+    !!zhView && taskChildActionLine(zhView.children[0]) === firstLinePreview(target));
+  check('activity wins the child action line over the assignment',
+    !!withActivity && taskChildActionLine(withActivity.children[0]) === '已完成桌面验证，正在检查 390px mobile 渲染。');
+
 }
 
 // ---- Edit details.diff semantic lines + redaction surface ----
@@ -833,14 +1572,14 @@ check(
       {
         name: 'Build',
         tasks: [
-          { id: 't-1', content: 'compile', status: 'in_progress', dependsOn: [], ready: true, blockedBy: [] },
+          { id: 't-1', content: 'compile', status: 'in_progress', dependsOn: [], ready: true, waitingOn: [] },
           {
             id: 't-2',
             content: 'test',
             status: 'pending',
             dependsOn: ['t-1'],
             ready: false,
-            blockedBy: [{ taskId: 't-1', content: 'compile', status: 'in_progress' }],
+            waitingOn: [{ taskId: 't-1', content: 'compile', status: 'in_progress' }],
           },
         ],
       },
@@ -851,7 +1590,7 @@ check(
   const result = [
     'Remaining items (2):',
     '  - compile [in_progress] (Build) id=t-1 ready',
-    '  - test [pending] (Build) id=t-2 blocked by compile (t-1)',
+    '  - test [pending] (Build) id=t-2 waiting on compile (t-1)',
     'Overall: 0/2 done, 2 open.',
     'Active phase 1/1 "Build" (0/2).',
   ].join('\n');
@@ -863,7 +1602,7 @@ check(
       && tasks[0].content === 'compile' && tasks[0].status === 'in_progress'
       && tasks[1].content === 'test' && tasks[1].status === 'pending';
   })(), JSON.stringify(view.phases));
-  check('todo card surfaces blocking by content, never ids', view.phases[0]?.tasks[1]?.blockedBy.length === 1 && view.phases[0].tasks[1].blockedBy[0] === 'compile', JSON.stringify(view.phases[0]?.tasks[1]));
+  check('todo card surfaces dependency waiting by content, never ids', view.phases[0]?.tasks[1]?.waitingOn.length === 1 && view.phases[0].tasks[1].waitingOn[0] === 'compile', JSON.stringify(view.phases[0]?.tasks[1]));
   check('todo card op from args', view.op === 'init', JSON.stringify(view));
   check('todo card hides the summary prose when phases exist', view.fallback === '', JSON.stringify(view));
   check('todo card never leaks ids/ready into the view model', !JSON.stringify(view).includes('t-1') && !JSON.stringify(view).includes('"ready"'), JSON.stringify(view));
@@ -879,13 +1618,13 @@ check(
         {
           name: 'Design',
           tasks: [
-            { id: 'd1', content: 'sketch', status: 'completed', blockedBy: [] },
-            { id: 'd2', content: 'review', status: 'abandoned', blockedBy: [] },
+            { id: 'd1', content: 'sketch', status: 'completed', waitingOn: [] },
+            { id: 'd2', content: 'review', status: 'abandoned', waitingOn: [] },
           ],
         },
         {
           name: 'Verify',
-          tasks: [{ id: 'v1', content: 'test suite', status: 'in_progress', blockedBy: [] }],
+          tasks: [{ id: 'v1', content: 'test suite', status: 'in_progress', waitingOn: [] }],
         },
       ],
       storage: 'session',
@@ -906,7 +1645,7 @@ check(
   const view = resolveTodoCardView(
     { op: 'start', task: 'missing' },
     {
-      phases: [{ name: 'Build', tasks: [{ id: 't1', content: 'compile', status: 'pending', blockedBy: [] }] }],
+      phases: [{ name: 'Build', tasks: [{ id: 't1', content: 'compile', status: 'pending', waitingOn: [] }] }],
       storage: 'session',
       completedTasks: [],
     },
@@ -963,9 +1702,9 @@ check(
           {
             name: 'Build',
             tasks: [
-              { id: 't1', content: 'compile', status: 'in_progress', blockedBy: [] },
-              { id: 't2', content: 'test', status: 'pending', blockedBy: [] },
-              { id: 't3', content: 'lint', status: 'pending', blockedBy: [] },
+              { id: 't1', content: 'compile', status: 'in_progress', waitingOn: [] },
+              { id: 't2', content: 'test', status: 'pending', waitingOn: [] },
+              { id: 't3', content: 'lint', status: 'pending', waitingOn: [] },
             ],
           },
         ],
@@ -981,7 +1720,7 @@ check(
   check('restored todo card op from args', !!view && view.op === 'append', JSON.stringify(view));
   const long = resolveTodoCardView(
     { op: 'view' },
-    { phases: [{ name: 'P', tasks: [{ id: 'x', content: 'x'.repeat(300), status: 'pending', blockedBy: [] }] }] },
+    { phases: [{ name: 'P', tasks: [{ id: 'x', content: 'x'.repeat(300), status: 'pending', waitingOn: [] }] }] },
     '',
     'done',
   );
@@ -994,18 +1733,18 @@ check(
   check('parseTodoPhases null for empty array', parseTodoPhases([]) === null);
   const skipped = parseTodoPhases([
     { name: 'P', tasks: [
-      { id: 'ok', content: 'fine', status: 'pending', blockedBy: [] },
-      { id: 'empty', content: '   ', status: 'pending', blockedBy: [] },
+      { id: 'ok', content: 'fine', status: 'pending', waitingOn: [] },
+      { id: 'empty', content: '   ', status: 'pending', waitingOn: [] },
       'garbage',
       null,
     ] },
     'not-a-phase',
   ]);
   check('parseTodoPhases skips malformed entries', skipped !== null && skipped.length === 1 && skipped[0].tasks.length === 1 && skipped[0].tasks[0].content === 'fine', JSON.stringify(skipped));
-  const unknownStatus = parseTodoPhases([{ name: 'P', tasks: [{ id: 'u', content: 'weird', status: 'bloop', blockedBy: [] }] }]);
+  const unknownStatus = parseTodoPhases([{ name: 'P', tasks: [{ id: 'u', content: 'weird', status: 'bloop', waitingOn: [] }] }]);
   check('parseTodoPhases unknown status normalizes to pending', unknownStatus?.[0]?.tasks[0]?.status === 'pending', JSON.stringify(unknownStatus));
-  const blockedByGarbage = parseTodoPhases([{ name: 'P', tasks: [{ id: 'b', content: 'task', status: 'pending', blockedBy: [{ taskId: 'x', content: 'blocker' }, 'junk', null] }] }]);
-  check('parseTodoPhases ignores malformed blockedBy entries', blockedByGarbage?.[0]?.tasks[0]?.blockedBy.length === 1 && blockedByGarbage[0].tasks[0].blockedBy[0] === 'blocker', JSON.stringify(blockedByGarbage));
+  const waitingOnGarbage = parseTodoPhases([{ name: 'P', tasks: [{ id: 'b', content: 'task', status: 'pending', waitingOn: [{ taskId: 'x', content: 'dependency', status: 'in_progress' }, 'junk', null] }] }]);
+  check('parseTodoPhases ignores malformed waitingOn entries', waitingOnGarbage?.[0]?.tasks[0]?.waitingOn.length === 1 && waitingOnGarbage[0].tasks[0].waitingOn[0] === 'dependency', JSON.stringify(waitingOnGarbage));
 }
 
 // ---- robust heading parse + generic bounds unchanged ----
@@ -1013,7 +1752,7 @@ check(
   check('parseHeading accepts ATX with trailing hashes', parseHeading('## Goal ##')?.title === 'Goal');
   check('parseHeading rejects missing space after hashes', parseHeading('##Goal') === null);
   const generic = applyToolSnapshot(
-    [{ kind: 'toolCard', id: 'g', toolCallId: 'g1', toolName: 'read', args: { path: 'a' }, status: 'running', result: '' }],
+    [{ kind: 'toolCard', id: 'g', toolCallId: 'g1', toolName: 'grep', args: { pattern: 'TODO' }, status: 'running', result: '' }],
     'g1',
     Array.from({ length: 12 }, (_, i) => `g-${i + 1}`).join('\n'),
     'done',
@@ -1055,18 +1794,236 @@ check('compactToolArgs null → empty', compactToolArgs(null) === '');
   check('parseCommandCardArgs null when no command field', noCmd === null, JSON.stringify(noCmd));
 }
 
+// ---- command copy: both render paths, redaction, clipboard success/failure ----
+{
+  const multiline = 'cargo test -- --nocapture\n--features foo';
+  const secretCmd = 'export token = supersecret';
+  const hostileCmd = '<img src=x onerror=alert(1)> echo ok';
+  const outputSecret = 'stdout sk-ABCDEFGHIJKLMNOPQRST';
+  const parsed = parseCommandCardArgs({ command: multiline });
+  check(
+    'command copy uses the parsed command string, not clamped DOM text',
+    parsed !== null && parsed.command === multiline,
+    JSON.stringify(parsed),
+  );
+  check(
+    'multiline command copy payload is exact',
+    redactedClipboardText(multiline) === multiline,
+  );
+  check(
+    'secret command copy payload is redacted, never the raw secret',
+    redactedClipboardText(secretCmd) === 'export token=[REDACTED]'
+      && !redactedClipboardText(secretCmd).includes('supersecret'),
+  );
+  check(
+    'ToolCard commandView and BashCard command share the same redacted payload',
+    parsed !== null
+      && redactedClipboardText(parsed.command) === redactedClipboardText(multiline),
+  );
+  check(
+    'output-only copy redacts secrets and is not used for command copy',
+    redactedClipboardText(outputSecret) === 'stdout [REDACTED]'
+      && redactedClipboardText(multiline) !== redactedClipboardText(outputSecret),
+  );
+
+  const bashToolItem = {
+    kind: 'toolCard',
+    id: 'bash-copy-1',
+    toolCallId: 'bash-copy-call',
+    toolName: 'bash',
+    args: { command: secretCmd },
+    status: 'done',
+    result: outputSecret,
+  };
+  const toolHtml = renderToStaticMarkup(createElement(ToolCard, { item: bashToolItem }));
+  check(
+    'ToolCard bash commandView markup includes command-copy with Copy command',
+    toolHtml.includes('class="tool-card__command-copy"')
+      && toolHtml.includes('aria-label="Copy command"')
+      && toolHtml.includes('aria-live="polite"')
+      && toolHtml.includes('type="button"')
+      && toolHtml.includes('>copy</button>'),
+    toolHtml,
+  );
+  check(
+    'ToolCard command copy sits in the head, not on the output',
+    toolHtml.indexOf('tool-card__command-copy') < toolHtml.indexOf('tool-card__output')
+      && toolHtml.includes('class="tool-card__head"'),
+    toolHtml,
+  );
+  check(
+    'ToolCard visible command is safeText, never the raw secret or output',
+    toolHtml.includes('export token=[REDACTED]')
+      && !toolHtml.includes('supersecret')
+      && toolHtml.includes('Command')
+      && toolHtml.includes('$'),
+    toolHtml,
+  );
+
+  const multilineItem = { ...bashToolItem, id: 'bash-copy-ml', args: { command: multiline }, result: outputSecret };
+  const multilineHtml = renderToStaticMarkup(createElement(ToolCard, { item: multilineItem }));
+  check(
+    'ToolCard multiline command renders both lines in the command text',
+    multilineHtml.includes('cargo test -- --nocapture')
+      && multilineHtml.includes('--features foo')
+      && !multilineHtml.includes('sk-ABCDEFGHIJKLMNOPQRST'),
+    multilineHtml,
+  );
+
+  const hostileItem = { ...bashToolItem, id: 'bash-copy-h', args: { command: hostileCmd }, result: 'ok' };
+  const hostileHtml = renderToStaticMarkup(createElement(ToolCard, { item: hostileItem }));
+  check(
+    'ToolCard hostile command stays inert text',
+    hostileHtml.includes('&lt;img src=x onerror=alert(1)&gt; echo ok')
+      && !hostileHtml.includes('<img src=x'),
+    hostileHtml,
+  );
+
+  const writeItem = {
+    kind: 'toolCard',
+    id: 'write-1',
+    toolCallId: 'write-call',
+    toolName: 'write',
+    args: { path: 'a.rs', content: 'fn main() {}' },
+    status: 'done',
+    result: 'wrote a.rs',
+  };
+  const writeHtml = renderToStaticMarkup(createElement(ToolCard, { item: writeItem }));
+  check(
+    'ToolCard non-bash has no command-copy button',
+    !writeHtml.includes('tool-card__command-copy') && !writeHtml.includes('aria-label="Copy command"'),
+    writeHtml,
+  );
+
+  const bashCardHtml = renderToStaticMarkup(createElement(BashCard, {
+    command: secretCmd,
+    output: outputSecret,
+    status: 'done',
+  }));
+  check(
+    'BashCard with command includes bash-copy Copy command and $ + safe command',
+    bashCardHtml.includes('class="bash-copy"')
+      && bashCardHtml.includes('aria-label="Copy command"')
+      && bashCardHtml.includes('aria-live="polite"')
+      && bashCardHtml.includes('class="bash-cmd bash-cmd--title">Command</span>')
+      && bashCardHtml.includes('class="bash-prompt">$</span>')
+      && bashCardHtml.includes('export token=[REDACTED]')
+      && !bashCardHtml.includes('supersecret'),
+    bashCardHtml,
+  );
+  check(
+    'BashCard command copy does not use the output as the button label payload',
+    bashCardHtml.includes('>copy</button>')
+      && bashCardHtml.indexOf('bash-copy') < bashCardHtml.indexOf('bash-output'),
+    bashCardHtml,
+  );
+
+  const outputOnlyHtml = renderToStaticMarkup(createElement(BashCard, {
+    label: 'tool output',
+    output: outputSecret,
+  }));
+  check(
+    'BashCard without command keeps Copy output aria-label',
+    outputOnlyHtml.includes('class="bash-copy"')
+      && outputOnlyHtml.includes('aria-label="Copy output"')
+      && !outputOnlyHtml.includes('aria-label="Copy command"')
+      && !outputOnlyHtml.includes('bash-command-text')
+      && outputOnlyHtml.includes('tool output'),
+    outputOnlyHtml,
+  );
+
+  const bashHostileHtml = renderToStaticMarkup(createElement(BashCard, {
+    command: hostileCmd,
+    output: 'ok',
+  }));
+  check(
+    'BashCard hostile command stays inert text',
+    bashHostileHtml.includes('&lt;img src=x onerror=alert(1)&gt; echo ok')
+      && !bashHostileHtml.includes('<img src=x'),
+    bashHostileHtml,
+  );
+}
+
+
 // ---- parseProcessCardArgs: argv/label projection (with and without op) ----
 {
   const start = parseProcessCardArgs({ op: 'start', argv: ['echo', 'hello', 'world'] });
-  check('process start joins argv', start !== null && start.label === 'echo hello world', JSON.stringify(start));
+  check('process start renders simple argv', start !== null && start.label === 'echo hello world', JSON.stringify(start));
+  check('process start command preserves simple argv', start !== null && start.command === 'echo hello world', JSON.stringify(start));
+  const quoted = parseProcessCardArgs({
+    op: 'start',
+    argv: ['printf', '%s', 'hello world', '', `a'b`, '$(dangerous)', 'x;y', 'line\nbreak'],
+  });
+  const quotedCommand = `printf %s 'hello world' '' 'a'"'"'b' '$(dangerous)' 'x;y' 'line\nbreak'`;
+  check('process start shell-quotes spaces, empty argv, quotes, metacharacters, and newlines', quoted?.command === quotedCommand, JSON.stringify(quoted));
+  check('process start label mirrors the safe copyable command', quoted?.label === quotedCommand, JSON.stringify(quoted));
+  const malformedStart = parseProcessCardArgs({ op: 'start', argv: ['echo', 42] });
+  check('process start rejects non-string argv without stringifying it', malformedStart?.command === 'process start', JSON.stringify(malformedStart));
+  const emptyStart = parseProcessCardArgs({ op: 'start', argv: [] });
+  check('process start empty argv uses the bounded fallback', emptyStart?.command === 'process start', JSON.stringify(emptyStart));
+  check('bare empty argv stays unrecognized', parseProcessCardArgs({ argv: [] }) === null);
   const noOp = parseProcessCardArgs({ argv: ['pi-web-screenshot-http'], label: 'pi-web-screenshot-http' });
   check('process without op joins argv', noOp !== null && noOp.label === 'pi-web-screenshot-http', JSON.stringify(noOp));
+  check('process without op command is the argv join', noOp !== null && noOp.command === 'pi-web-screenshot-http', JSON.stringify(noOp));
   const labelOnly = parseProcessCardArgs({ label: 'pi-web-screenshot-http' });
   check('process label-only fallback', labelOnly !== null && labelOnly.label === 'pi-web-screenshot-http', JSON.stringify(labelOnly));
+  check('process label-only command is the label', labelOnly !== null && labelOnly.command === 'pi-web-screenshot-http', JSON.stringify(labelOnly));
   const stop = parseProcessCardArgs({ op: 'stop', id: 'abc123' });
   check('process stop surfaces op+id', stop !== null && stop.label === 'process stop abc123', JSON.stringify(stop));
+  check('process stop command is the op+id invocation', stop !== null && stop.command === 'process stop abc123', JSON.stringify(stop));
   const bare = parseProcessCardArgs({ foo: 'bar' });
   check('process null for unrecognised args', bare === null, JSON.stringify(bare));
+}
+
+// ---- process card copy: ToolCard renders the process-copy action ----
+{
+  const processItem = {
+    kind: 'toolCard',
+    id: 'process-copy-1',
+    toolCallId: 'process-copy-call',
+    toolName: 'process',
+    args: { op: 'start', argv: ['echo', 'hello', 'world'] },
+    status: 'done',
+    result: 'Process started: abc123 (visible in /ps)',
+  };
+  const processHtml = renderToStaticMarkup(createElement(ToolCard, { item: processItem }));
+  check(
+    'ToolCard process card includes process-copy with Copy command',
+    processHtml.includes('class="tool-card__process-copy"')
+      && processHtml.includes('aria-label="Copy command"')
+      && processHtml.includes('aria-live="polite"')
+      && processHtml.includes('type="button"')
+      && processHtml.includes('>copy</button>'),
+    processHtml,
+  );
+  check(
+    'ToolCard process copy sits in the head, not on the output',
+    processHtml.indexOf('tool-card__process-copy') < processHtml.indexOf('tool-card__output')
+      && processHtml.includes('class="tool-card__head"'),
+    processHtml,
+  );
+  check(
+    'ToolCard process card shows the argv join label in the summary line',
+    processHtml.includes('class="tool-card__summary-line">echo hello world'),
+    processHtml,
+  );
+
+  const processStopItem = {
+    kind: 'toolCard',
+    id: 'process-copy-2',
+    toolCallId: 'process-copy-call-2',
+    toolName: 'process',
+    args: { op: 'stop', id: 'abc123' },
+    status: 'done',
+    result: 'stopped',
+  };
+  const processStopHtml = renderToStaticMarkup(createElement(ToolCard, { item: processStopItem }));
+  check(
+    'ToolCard process stop card copies the op+id invocation',
+    processStopHtml.includes('class="tool-card__process-copy"')
+      && processStopHtml.includes('process stop abc123'),
+    processStopHtml,
+  );
 }
 
 // ---- parseWriteCardArgs: path + success/error summary ----
@@ -1084,14 +2041,14 @@ check('compactToolArgs null → empty', compactToolArgs(null) === '');
   check('write null when no path', noPath === null, JSON.stringify(noPath));
 }
 
-// ---- parseReadCardArgs: path extraction (result renders as output body) ----
+// ---- parseReadCard: typed compact/expanded projection ----
 {
-  const read = parseReadCardArgs({ path: 'README.md' });
-  check('parseReadCardArgs extracts path', read !== null && read.path === 'README.md', JSON.stringify(read));
-  const fileKey = parseReadCardArgs({ file: 'config.toml' });
-  check('parseReadCardArgs uses file key alias', fileKey !== null && fileKey.path === 'config.toml', JSON.stringify(fileKey));
-  const noPath = parseReadCardArgs({ offset: 0 });
-  check('parseReadCardArgs null when no path', noPath === null, JSON.stringify(noPath));
+  const read = parseReadCard({ path: 'README.md' }, 'hello');
+  check('parseReadCard extracts path', read !== null && read.path === 'README.md', JSON.stringify(read));
+  const fileKey = parseReadCard({ file: 'config.toml' }, 'x');
+  check('parseReadCard uses file key alias', fileKey !== null && fileKey.path === 'config.toml', JSON.stringify(fileKey));
+  const noPath = parseReadCard({ offset: 0 }, 'x');
+  check('parseReadCard null when no path', noPath === null, JSON.stringify(noPath));
 }
 
 // ---- parseHubCard: wait running — fixed human title, no raw envelope ----
@@ -1348,7 +2305,7 @@ check('compactToolArgs null → empty', compactToolArgs(null) === '');
     { role: 'bashExecution', command: 'sleep 30', output: '', cancelled: true, timestamp: 3 },
   ]);
   const bash = items.find((i) => i.kind === 'bash');
-  check('bashExecution cancelled → error status', bash?.kind === 'bash' && bash.status === 'error', JSON.stringify(bash));
+  check('bashExecution cancelled → cancelled status', bash?.kind === 'bash' && bash.status === 'cancelled', JSON.stringify(bash));
 }
 {
   const items = messagesToItems([
@@ -1373,11 +2330,11 @@ check('compactToolArgs null → empty', compactToolArgs(null) === '');
 check('compactToolArgs never returns JSON', !compactToolArgs({ command: 'x' }).startsWith('{'));
 check('parseCommandCardArgs returns command not JSON', parseCommandCardArgs({ command: 'x' })?.command === 'x');
 check('parseWriteCardArgs returns path+summary not content JSON', (() => { const w = parseWriteCardArgs({ path: 'f', content: 'big' }, 'ok', 'done'); return w !== null && !w.summary.includes('big'); })());
-check('parseReadCardArgs returns path not path JSON', (() => { const r = parseReadCardArgs({ path: 'f' }); return r !== null && r.path === 'f'; })());
+check('parseReadCard returns path not path JSON', (() => { const r = parseReadCard({ path: 'f' }, 'ok'); return r !== null && r.path === 'f'; })());
 check('resolveTodoCardView returns phases not raw args JSON', (() => {
   const v = resolveTodoCardView(
     { op: 'init', list: [{ phase: 'P', items: ['a'] }] },
-    { phases: [{ name: 'P', tasks: [{ id: 't1', content: 'a', status: 'pending', blockedBy: [] }] }], storage: 'session', completedTasks: [] },
+    { phases: [{ name: 'P', tasks: [{ id: 't1', content: 'a', status: 'pending', waitingOn: [] }] }], storage: 'session', completedTasks: [] },
     'Remaining items (1):\n  - a [pending] (P) id=t1 ready',
     'done',
   );
@@ -1554,6 +2511,519 @@ check('resolveTodoCardView returns phases not raw args JSON', (() => {
   const users = merged.filter((i) => i.kind === 'user');
   check('optimistic dedups against durable twin (analysis on durable does not block dedup)', users.length === 1 && !users.some((i) => i.id === 'l-1'), JSON.stringify(merged));
   check('merged keeps the durable item with its analysis', users.some((i) => i.kind === 'user' && i.id === 'h-1' && i.analysis?.model === 'vm'), JSON.stringify(merged));
+}
+
+// ---- typed Read projection: compact+expanded, media stripped, internal URIs, live/restored parity ----
+{
+  const body = Array.from({ length: 10 }, (_, n) => `line-${n + 1}`).join('\n');
+  const truncated = `${body}\n\n[4320 more lines in file. Use offset=3885 to continue.]`;
+  const ordinary = parseReadCard({ path: 'big.txt' }, truncated);
+  check('ordinary read keeps path vocabulary', ordinary !== null && ordinary.path === 'big.txt' && ordinary.kind === 'file' && ordinary.title === 'Read', JSON.stringify(ordinary));
+  check('ordinary read headline uses path/range/count', ordinary !== null && ordinary.headline === 'big.txt · lines 1-3884 · 10 returned', ordinary?.headline);
+  check('ordinary compact is six-row tail with omission marker', ordinary !== null && ordinary.compactBody === ['… 4 more lines', 'line-5', 'line-6', 'line-7', 'line-8', 'line-9', 'line-10'].join('\n'), ordinary?.compactBody);
+  check('ordinary expanded retains full bounded source', ordinary !== null && ordinary.expandedBody === body, ordinary?.expandedBody);
+  check('ordinary compact omits four lines', ordinary !== null && ordinary.omitted === 4, String(ordinary?.omitted));
+  check('ordinary expanded has no offset notice', ordinary !== null && !ordinary.expandedBody.includes('Use offset='), ordinary?.expandedBody);
+
+  const skillSource = '---\nname: research\ndescription: "Deep-dive codebase researcher. Produces structured docs."\n---\n# Research\n\nBody line.';
+  const skill = parseReadCard({ path: 'skill://research' }, skillSource);
+  check('bare skill uses name title', skill !== null && skill.kind === 'skill' && skill.title === 'research' && skill.path === 'research', JSON.stringify(skill));
+  check('skill description is first paragraph', skill !== null && skill.skill?.description === 'Deep-dive codebase researcher. Produces structured docs.', skill?.skill?.description);
+  check('skill body follows description', skill !== null && skill.expandedBody.includes('# Research') && skill.expandedBody.includes('Body line.'), skill?.expandedBody);
+  check('skill compact is head-first body', skill !== null && skill.compactBody.split('\n')[0] === '# Research', skill?.compactBody);
+  check('skill YAML never renders', skill !== null && !skill.compactBody.includes('name:') && !skill.expandedBody.includes('description:') && !skill.expandedBody.includes('---'), skill?.expandedBody);
+
+  const longBody = Array.from({ length: 20 }, (_, n) => `body-${n + 1}`).join('\n');
+  const longSkill = parseReadCard({ path: 'skill://long' }, `---\nname: long\ndescription: "Lead description."\n---\n${longBody}`);
+  check('long skill compact keeps description, head body, and omission marker', longSkill !== null && longSkill.skill?.description === 'Lead description.' && longSkill.compactBody.startsWith('body-1') && longSkill.compactBody.endsWith('… 14 more lines') && !longSkill.compactBody.includes('body-20'), longSkill?.compactBody);
+  check('long skill expanded retains full body', longSkill !== null && longSkill.expandedBody.includes('body-20') && longSkill.omitted === 14, `${longSkill?.omitted}:${longSkill?.expandedBody}`);
+
+  const folded = parseReadCard({ path: 'skill://folded' }, '---\nname: folded\ndescription: >\n  Folded line one\n  folds into a\n  single line\n---\n# Folded\n\nBody.');
+  check('folded skill description joins spaces', folded !== null && folded.skill?.description === 'Folded line one folds into a single line', folded?.skill?.description);
+  const literal = parseReadCard({ path: 'skill://literal' }, '---\nname: literal\ndescription: |\n  Literal line one\n  keeps the newline\n---\n# Literal\n\nBody.');
+  check('literal skill description keeps newlines', literal !== null && literal.skill?.description === 'Literal line one\nkeeps the newline', literal?.skill?.description);
+
+  const sub = parseReadCard({ path: 'skill://research/asset.md' }, '---\nname: asset\ndescription: "not the skill"\n---\nasset body');
+  check('skill subresource stays raw file', sub !== null && sub.kind === 'file' && sub.title === 'Read' && sub.expandedBody.includes('name: asset'), JSON.stringify(sub));
+  const missing = parseReadCard({ path: 'skill://missing' }, 'not found');
+  check('frontmatter-less skill stays raw', missing !== null && missing.kind === 'skill' && missing.title === 'Read' && missing.expandedBody === 'not found' && missing.skill === undefined, JSON.stringify(missing));
+
+  const agent = parseReadCard({ path: 'agent://DeepSeek' }, 'child output');
+  check('agent URI classifies without opaque key', agent !== null && agent.kind === 'agent' && agent.path === 'DeepSeek' && !agent.path.includes('agent://') && !agent.headline.includes('agent://'), JSON.stringify(agent));
+  const history = parseReadCard({ path: 'history://aa0e8c2e-4b1a-4d3f-9c7e-1f2a3b4c5d6e' }, 'history body');
+  check('history UUID key is omitted', history !== null && history.kind === 'history' && history.path === 'History' && !history.path.includes('history://') && !history.headline.includes('aa0e8c2e'), JSON.stringify(history));
+  const artifact = parseReadCard({ path: 'artifact://aa0e8c2e-4b1a-4d3f-9c7e-1f2a3b4c5d6e' }, 'artifact body');
+  check('artifact UUID key is omitted', artifact !== null && artifact.kind === 'artifact' && artifact.path === 'Artifact' && !artifact.headline.includes('artifact://'), JSON.stringify(artifact));
+
+  const sentinel = 'binary-payload-sentinel'.repeat(8);
+  const live = applyToolSnapshot(
+    [{ kind: 'toolCard', id: 'tc1', toolCallId: 'media', toolName: 'read', args: { path: 'clip.mp4' }, status: 'running', result: '' }],
+    'media',
+    'Video attachment loaded',
+    'done',
+    { media: [{ kind: 'video', mimeType: 'video/mp4', data: sentinel, name: 'clip.mp4', sizeBytes: 12 }] },
+    [{ kind: 'video', mimeType: 'video/mp4', data: sentinel, alt: 'clip.mp4' }],
+  )[0];
+  check('live read snapshot retains bounded video media', live.kind === 'toolCard'
+    && live.media?.length === 1 && live.details === undefined
+    && live.result === 'Video attachment loaded', JSON.stringify(live));
+  const liveView = live.kind === 'toolCard' ? parseReadCard(live.args, live.result) : null;
+  check('live read view has no sentinel in text body', liveView !== null
+    && liveView.expandedBody === 'Video attachment loaded'
+    && !JSON.stringify(liveView).includes(sentinel), JSON.stringify(liveView));
+
+  const restored = messagesToItems([
+    { role: 'assistant', content: [{ type: 'toolCall', id: 'read-1', name: 'read', arguments: { path: 'big.txt' } }] },
+    { role: 'toolResult', toolCallId: 'read-1', content: [{ type: 'text', text: truncated }], details: { media: [{ kind: 'video', mimeType: 'video/mp4', data: sentinel, name: 'clip.mp4', sizeBytes: 12 }] } },
+  ]);
+  const restoredCard = restored.find((item) => item.kind === 'toolCard');
+  check('restored read keeps full bounded result', restoredCard?.kind === 'toolCard' && restoredCard.result === truncated, restoredCard && restoredCard.kind === 'toolCard' ? restoredCard.result : '');
+  check('restored read strips details but keeps validated media', restoredCard?.kind === 'toolCard' && restoredCard.details === undefined, JSON.stringify(restoredCard));
+  const restoredView = restoredCard?.kind === 'toolCard' ? parseReadCard(restoredCard.args, restoredCard.result) : null;
+  check('live/restored compact parity', restoredView !== null && ordinary !== null && restoredView.compactBody === ordinary.compactBody && restoredView.expandedBody === ordinary.expandedBody, restoredView?.compactBody);
+  check('restored projection has no sentinel or URI key', restoredView !== null && !JSON.stringify(restoredView).includes(sentinel) && !JSON.stringify(restored).includes('data:') && !JSON.stringify(restoredView).includes('agent://'), JSON.stringify(restoredView));
+
+  const skillRestored = messagesToItems([
+    { role: 'assistant', content: [{ type: 'toolCall', id: 's', name: 'read', arguments: { path: 'skill://research' } }] },
+    { role: 'toolResult', toolCallId: 's', content: [{ type: 'text', text: skillSource }] },
+  ]);
+  const skillCard = skillRestored.find((item) => item.kind === 'toolCard');
+  const skillRestoredView = skillCard?.kind === 'toolCard' ? parseReadCard(skillCard.args, skillCard.result) : null;
+  check('restored skill matches live projection', skillRestoredView !== null && skill !== null && skillRestoredView.title === skill.title && skillRestoredView.expandedBody === skill.expandedBody && skillRestoredView.compactBody === skill.compactBody, JSON.stringify(skillRestoredView));
+}
+
+// ---- Rejected Task card: cross-call identity contamination is impossible ----
+// A rejected/no-spawn Task card (terminal `error`, no spawn details) carries
+// only args-preview children (name/agent/task — no jobId/agentId). Correlation
+// must require an authoritative spawn identity with exact jobId, so an
+// unrelated same-agent job_updated / job_list snapshot / message_delivered /
+// agent_updated can never latch onto the rejected card, flip its terminal
+// status, or fabricate children. The card stays byte-for-byte terminal with
+// zero projected children. A successful card with authoritative spawn details
+// carrying an exact jobId still correlates and updates normally.
+{
+  // The exact reported rejected args: agent/name/task, status error, no details.
+  const rejected = {
+    kind: 'toolCard' as const,
+    id: 'rejected-glm',
+    toolCallId: 'rejected-glm-call',
+    toolName: 'task',
+    args: { agent: 'glm', name: 'glm', task: 'bad' },
+    status: 'error' as const,
+    result: 'rejected: a batch tasks[] call requires a context briefing',
+    details: undefined,
+  };
+  const snapshot = (item) => ({
+    kind: item.kind, id: item.id, toolCallId: item.toolCallId, toolName: item.toolName,
+    args: item.args, status: item.status, result: item.result, details: item.details,
+  });
+  const before = snapshot(rejected);
+
+  // (1) Unrelated same-agent job_updated (running) must NOT attach.
+  const afterJob = applyJobUpdated([rejected], {
+    job: { id: 'job-second', agentId: 'glm', agent: 'glm', status: 'running' },
+  });
+  check('rejected card unchanged by unrelated same-agent job_updated (byte-for-byte)', JSON.stringify(snapshot(afterJob[0])) === JSON.stringify(before), JSON.stringify(snapshot(afterJob[0])));
+  check('rejected card status stays error after unrelated job_updated', afterJob[0].status === 'error', JSON.stringify(afterJob[0].status));
+  check('rejected card keeps no spawn details after unrelated job_updated', afterJob[0].details === undefined, JSON.stringify(afterJob[0].details));
+  const jobView = resolveTaskCardView(afterJob[0].args, afterJob[0].details, afterJob[0].status);
+  check('rejected card projects zero children after unrelated job_updated', !!jobView && jobView.children.length === 0, JSON.stringify(jobView));
+  check('rejected card taskCardStatus stays error after unrelated job_updated', taskCardStatus(afterJob[0]) === 'error', JSON.stringify(taskCardStatus(afterJob[0])));
+
+  // (2) Reconnect snapshot (multiple same-agent jobs) must NOT attach either.
+  const afterSnap = applyJobSnapshot([rejected], [
+    { id: 'job-second', agentId: 'glm', agent: 'glm', status: 'running' },
+    { id: 'job-third', agentId: 'glm', agent: 'glm', status: 'completed', result: { output: 'unrelated', error: null } },
+  ]);
+  check('rejected card unchanged by same-agent job_list snapshot (byte-for-byte)', JSON.stringify(snapshot(afterSnap[0])) === JSON.stringify(before), JSON.stringify(snapshot(afterSnap[0])));
+  check('rejected card status stays error after snapshot', afterSnap[0].status === 'error', JSON.stringify(afterSnap[0].status));
+  const snapView = resolveTaskCardView(afterSnap[0].args, afterSnap[0].details, afterSnap[0].status);
+  check('rejected card projects zero children after snapshot', !!snapView && snapView.children.length === 0, JSON.stringify(snapView));
+
+  // name/agent/task never authorize attachment across every update channel.
+  const afterMsg = applyMessageDelivered([rejected], {
+    message: { from: 'glm', body: 'unrelated child→Main body', to: 'Main' },
+  });
+  check('rejected card unchanged by same-name message_delivered', JSON.stringify(snapshot(afterMsg[0])) === JSON.stringify(before), JSON.stringify(snapshot(afterMsg[0])));
+  check('rejected card status stays error after message_delivered', afterMsg[0].status === 'error', JSON.stringify(afterMsg[0].status));
+
+  const afterAgent = applyAgentUpdated([rejected], {
+    agent: { id: 'glm', displayName: 'GLM Agent', status: 'running' },
+  });
+  check('rejected card unchanged by same-name agent_updated', JSON.stringify(snapshot(afterAgent[0])) === JSON.stringify(before), JSON.stringify(snapshot(afterAgent[0])));
+  check('rejected card status stays error after agent_updated', afterAgent[0].status === 'error', JSON.stringify(afterAgent[0].status));
+
+  // (3) Authoritative spawn details carrying the exact jobId DO correlate:
+  // a matching job_updated updates the child status/result and settles parent.
+  const spawned = {
+    ...rejected,
+    status: 'running' as const,
+    result: '',
+    details: [{ index: 0, jobId: 'job-real', agentId: 'glm', agent: 'glm', status: 'queued' }],
+  };
+  const afterReal = applyJobUpdated([spawned], {
+    job: { id: 'job-real', agentId: 'glm', agent: 'glm', status: 'completed', result: { output: 'real child output', error: null } },
+  });
+  const realView = resolveTaskCardView(afterReal[0].args, afterReal[0].details, afterReal[0].status);
+  check('authoritative spawn correlates with exact jobId (one child)', !!realView && realView.children.length === 1, JSON.stringify(realView));
+  check('authoritative child keeps exact jobId after matching job_updated', !!realView && realView.children[0].jobId === 'job-real', JSON.stringify(realView?.children?.[0]));
+  check('authoritative child status updated from matching job_updated', !!realView && realView.children[0].status === 'completed', JSON.stringify(realView?.children?.[0]));
+  check('authoritative child result sentence from matching job_updated', !!realView && realView.children[0].result === 'real child output', JSON.stringify(realView?.children?.[0]));
+  check('authoritative parent settles to done after matching job_updated', taskCardStatus(afterReal[0]) === 'done', JSON.stringify(taskCardStatus(afterReal[0])));
+
+  // An unrelated job with the SAME agentId but a DIFFERENT jobId must NOT
+  // attach to the spawned card: name/agent never authorizes, only exact jobId.
+  const spawnedBefore = snapshot(spawned);
+  const afterUnrelated = applyJobUpdated([spawned], {
+    job: { id: 'job-other', agentId: 'glm', agent: 'glm', status: 'running' },
+  });
+  check('spawned card unchanged by same-agent different-jobId job_updated', JSON.stringify(snapshot(afterUnrelated[0])) === JSON.stringify(spawnedBefore), JSON.stringify(snapshot(afterUnrelated[0])));
+  check('spawned card status stays running after unrelated job_updated', afterUnrelated[0].status === 'running', JSON.stringify(afterUnrelated[0].status));
+  const unrelatedView = resolveTaskCardView(afterUnrelated[0].args, afterUnrelated[0].details, afterUnrelated[0].status);
+  check('spawned card projects the original queued child after unrelated job_updated', !!unrelatedView && unrelatedView.children.length === 1 && unrelatedView.children[0].jobId === 'job-real' && unrelatedView.children[0].status === 'queued', JSON.stringify(unrelatedView));
+}
+
+// ---- job_list snapshot: empty is authoritative, undefined/non-array is a no-op ----
+// Missing/malformed jobs must never mass-cancel (RPC failure). An array,
+// including `[]`, is authoritative: listed jobs patch by exact jobId, then
+// every spawned queued/running child absent from that set is cancelled
+// without inventing a result. name/agent/task never attach. Rejected cards
+// and terminal children stay byte-for-byte.
+{
+  const snapshot = (item) => ({
+    kind: item.kind, id: item.id, toolCallId: item.toolCallId, toolName: item.toolName,
+    args: item.args, status: item.status, result: item.result, details: item.details,
+  });
+  const spawnedRunning = {
+    kind: 'toolCard',
+    id: 'tc-snap',
+    toolCallId: 'task-snap',
+    toolName: 'task',
+    args: { agent: 'reviewer', name: 'Alpha', task: 'Review the adapter' },
+    status: 'running',
+    result: '',
+    details: [{ index: 0, jobId: 'job-a', agentId: 'Alpha', agent: 'reviewer', status: 'running' }],
+  };
+  const before = snapshot(spawnedRunning);
+
+  const emptySnap = applyJobSnapshot([spawnedRunning], []);
+  const emptyView = resolveTaskCardView(emptySnap[0].args, emptySnap[0].details, emptySnap[0].status);
+  check('empty authoritative job_list cancels omitted queued/running spawned children',
+    !!emptyView && emptyView.children.length === 1 && emptyView.children[0].jobId === 'job-a'
+    && emptyView.children[0].status === 'cancelled' && emptyView.children[0].result === undefined
+    && taskCardStatus(emptySnap[0]) === 'cancelled', JSON.stringify(emptyView));
+
+  // Reconnect omission-cancel must keep the child's DOM provenance. Real
+  // frame sequence: task_spawn receipt (TaskSpawn wire carries only
+  // index/jobId/agentId/agent/status) -> live job_updated with the full
+  // JobSnapshot (parentId/todoTaskId, runtime.rs publish_job) -> backend
+  // killed without WS close -> reconnect job_list omits the job -> the card
+  // settles Cancelled while every identity attribute remains on the element.
+  const spawnedRecon = {
+    kind: 'toolCard',
+    id: 'tc-recon',
+    toolCallId: 'task-recon-call',
+    toolName: 'task',
+    args: { agent: 'reviewer', name: 'Recon', task: 'reconnect work' },
+    status: 'running',
+    result: '',
+    details: [{ index: 0, jobId: 'job-r1', agentId: 'Alpha', agent: 'reviewer', status: 'queued' }],
+  };
+  const withProvenance = applyJobUpdated([spawnedRecon], {
+    job: { id: 'job-r1', agentId: 'Alpha', agent: 'reviewer', parentId: 'Main', todoTaskId: 'todo-r1', status: 'running' },
+  });
+  const reconCut = taskJobIds(withProvenance);
+  const reconCancelled = applyJobSnapshot(withProvenance, [], reconCut);
+  const reconView = resolveTaskCardView(reconCancelled[0].args, reconCancelled[0].details, reconCancelled[0].status);
+  const reconHtml = reconView
+    ? renderToStaticMarkup(createElement(TaskToolCardBody, { item: reconCancelled[0], taskView: reconView }))
+    : '';
+  check('omission-cancelled child keeps DOM provenance and settles Cancelled',
+    reconCut.has('job-r1')
+    && !!reconView && reconView.children[0].jobId === 'job-r1' && reconView.children[0].status === 'cancelled'
+    && taskCardStatus(reconCancelled[0]) === 'cancelled'
+    && reconHtml.includes('data-job-id="job-r1"')
+    && reconHtml.includes('data-agent-id="Alpha"')
+    && reconHtml.includes('data-parent-id="Main"')
+    && reconHtml.includes('data-todo-task-id="todo-r1"')
+    && reconHtml.includes('data-status="cancelled"'), reconHtml);
+  // A child that never received a job_updated (backend died between spawn
+  // receipt and first publish) still settles Cancelled with the identity it
+  // provably has (jobId/agentId); unknown parent identity renders no attr.
+  const bareCut = taskJobIds([spawnedRecon]);
+  const bareCancelled = applyJobSnapshot([spawnedRecon], [], bareCut);
+  const bareView = resolveTaskCardView(bareCancelled[0].args, bareCancelled[0].details, bareCancelled[0].status);
+  const bareHtml = bareView
+    ? renderToStaticMarkup(createElement(TaskToolCardBody, { item: bareCancelled[0], taskView: bareView }))
+    : '';
+  check('omission-cancelled child without prior job_updated keeps jobId/agentId and settles Cancelled',
+    bareCut.has('job-r1')
+    && !!bareView && bareView.children[0].jobId === 'job-r1' && bareView.children[0].agentId === 'Alpha'
+    && bareView.children[0].status === 'cancelled'
+    && taskCardStatus(bareCancelled[0]) === 'cancelled'
+    && bareHtml.includes('data-job-id="job-r1"')
+    && bareHtml.includes('data-agent-id="Alpha"')
+    && !bareHtml.includes('data-parent-id')
+    && !bareHtml.includes('data-todo-task-id'), bareHtml);
+
+  const undefSnap = applyJobSnapshot([spawnedRunning], undefined);
+  check('undefined job_list is a no-op (no mass-cancel on RPC failure)',
+    JSON.stringify(snapshot(undefSnap[0])) === JSON.stringify(before)
+    && resolveTaskCardView(undefSnap[0].args, undefSnap[0].details, undefSnap[0].status)?.children[0].status === 'running',
+    JSON.stringify(snapshot(undefSnap[0])));
+  const malformedSnap = applyJobSnapshot([spawnedRunning], { jobs: [] });
+  check('non-array job_list is a no-op',
+    JSON.stringify(snapshot(malformedSnap[0])) === JSON.stringify(before), JSON.stringify(snapshot(malformedSnap[0])));
+
+  const unrelatedSnap = applyJobSnapshot([spawnedRunning], [
+    { id: 'job-other', agentId: 'Alpha', agent: 'reviewer', status: 'running' },
+  ]);
+  const unrelatedView = resolveTaskCardView(unrelatedSnap[0].args, unrelatedSnap[0].details, unrelatedSnap[0].status);
+  check('unrelated job_list does not attach by agent/name/task',
+    !!unrelatedView && unrelatedView.children.length === 1 && unrelatedView.children[0].jobId === 'job-a'
+    && unrelatedView.children[0].status === 'cancelled', JSON.stringify(unrelatedView));
+
+  const rejected = {
+    kind: 'toolCard',
+    id: 'rejected-snap',
+    toolCallId: 'rejected-snap-call',
+    toolName: 'task',
+    args: { agent: 'glm', name: 'glm', task: 'bad' },
+    status: 'error',
+    result: 'rejected: a batch tasks[] call requires a context briefing',
+    details: undefined,
+  };
+  const rejectedBefore = snapshot(rejected);
+  const rejectedEmpty = applyJobSnapshot([rejected], []);
+  check('rejected card unchanged by empty authoritative job_list (byte-for-byte)',
+    JSON.stringify(snapshot(rejectedEmpty[0])) === JSON.stringify(rejectedBefore), JSON.stringify(snapshot(rejectedEmpty[0])));
+  const rejectedUnrelated = applyJobSnapshot([rejected], [
+    { id: 'job-second', agentId: 'glm', agent: 'glm', status: 'running' },
+  ]);
+  check('rejected card unchanged by unrelated job_list (byte-for-byte)',
+    JSON.stringify(snapshot(rejectedUnrelated[0])) === JSON.stringify(rejectedBefore), JSON.stringify(snapshot(rejectedUnrelated[0])));
+
+  const provenanced = applyJobSnapshot([spawnedRunning], [{
+    id: 'job-a',
+    agentId: 'Alpha',
+    agent: 'reviewer',
+    parentId: 'Main',
+    todoTaskId: 'todo-a',
+    status: 'completed',
+    result: { output: 'ok', error: null },
+  }]);
+  const provenancedView = resolveTaskCardView(provenanced[0].args, provenanced[0].details, provenanced[0].status);
+  const provenancedHtml = provenancedView
+    ? renderToStaticMarkup(createElement(TaskToolCardBody, { item: provenanced[0], taskView: provenancedView }))
+    : '';
+  check('successful snapshot provenance is DOM-ready (job/parent/todo data attrs)',
+    provenancedHtml.includes('data-job-id="job-a"')
+    && provenancedHtml.includes('data-agent-id="Alpha"')
+    && provenancedHtml.includes('data-parent-id="Main"')
+    && provenancedHtml.includes('data-todo-task-id="todo-a"')
+    && provenancedHtml.includes('data-status="completed"'), provenancedHtml);
+  const terminalEmpty = applyJobSnapshot(provenanced, []);
+  const terminalView = resolveTaskCardView(terminalEmpty[0].args, terminalEmpty[0].details, terminalEmpty[0].status);
+  check('empty snapshot preserves terminal Task child (no cancel of completed)',
+    !!terminalView && terminalView.children[0].status === 'completed' && terminalView.children[0].jobId === 'job-a',
+    JSON.stringify(terminalView));
+
+  const failedRead = parseReadCard({ path: '/tmp/missing.txt' }, 'ENOENT: no such file or directory', 'error');
+  check('failed Read headline is the redacted path and never says returned',
+    failedRead !== null && failedRead.headline === '/tmp/missing.txt' && failedRead.linesReturned === 0
+    && !failedRead.headline.includes('returned') && !failedRead.compactBody.includes('returned')
+    && !failedRead.expandedBody.includes('returned'), JSON.stringify(failedRead));
+  check('failed Read retains the actionable body',
+    failedRead !== null && failedRead.expandedBody.includes('ENOENT: no such file or directory')
+    && failedRead.compactBody.includes('ENOENT: no such file or directory'), JSON.stringify(failedRead));
+  const cancelledRead = parseReadCard({ path: 'secret.txt' }, 'read cancelled', 'cancelled');
+  check('cancelled Read headline is the path with zero returned lines',
+    cancelledRead !== null && cancelledRead.headline === 'secret.txt' && cancelledRead.linesReturned === 0
+    && !cancelledRead.headline.includes('returned') && cancelledRead.expandedBody === 'read cancelled',
+    JSON.stringify(cancelledRead));
+  const oneLine = parseReadCard({ path: 'one.txt' }, 'only line', 'done');
+  check('successful one-line read reports 1 returned',
+    oneLine !== null && oneLine.headline === 'one.txt · 1 returned' && oneLine.linesReturned === 1
+    && oneLine.expandedBody === 'only line', JSON.stringify(oneLine));
+}
+
+// ---- job_list request-window cut: only request-time jobIds omission-settle ----
+// A Task spawn/job_updated landing between the job_list request and its
+// response is authoritative and must NOT be cancelled by the older list.
+// Children captured at the request cut still omission-settle; listed jobs
+// patch regardless of cut membership.
+{
+  const taskCard = (id, children) => ({
+    kind: 'toolCard',
+    id,
+    toolCallId: `${id}-call`,
+    toolName: 'task',
+    args: { agent: 'reviewer', name: id, task: 'work' },
+    status: 'running',
+    result: '',
+    details: children,
+  });
+  const oldCard = taskCard('tc-old', [
+    { index: 0, jobId: 'job-old', agentId: 'Alpha', agent: 'reviewer', status: 'running' },
+  ]);
+  const newCard = taskCard('tc-new', [
+    { index: 0, jobId: 'job-new', agentId: 'Beta', agent: 'reviewer', status: 'running' },
+  ]);
+  // Cut captured at request time: only job-old known. job-new arrives inside
+  // the request window (live job_updated), then the older job_list (which
+  // never saw either job as settled) answers with an unrelated listing.
+  const cut = taskJobIds([oldCard]);
+  check('taskJobIds captures exact request-time Task jobIds',
+    cut.size === 1 && cut.has('job-old') && !cut.has('job-new'), JSON.stringify([...cut]));
+  const reconciled = applyJobSnapshot([oldCard, newCard], [
+    { id: 'job-other', agentId: 'Gamma', agent: 'reviewer', status: 'running' },
+  ], cut);
+  const oldView = resolveTaskCardView(reconciled[0].args, reconciled[0].details, reconciled[0].status);
+  const newView = resolveTaskCardView(reconciled[1].args, reconciled[1].details, reconciled[1].status);
+  check('request-cut child absent from job_list is omission-settled',
+    !!oldView && oldView.children[0].jobId === 'job-old' && oldView.children[0].status === 'cancelled',
+    JSON.stringify(oldView));
+  check('request-window child absent from job_list stays authoritative (not cancelled)',
+    !!newView && newView.children[0].jobId === 'job-new' && newView.children[0].status === 'running'
+    && taskCardStatus(reconciled[1]) !== 'cancelled', JSON.stringify(newView));
+  // Listed jobs patch by exact jobId even without cut membership.
+  const patched = applyJobSnapshot([newCard], [
+    { id: 'job-new', agentId: 'Beta', agent: 'reviewer', status: 'completed', result: { output: 'done', error: null } },
+  ], new Set());
+  const patchedView = resolveTaskCardView(patched[0].args, patched[0].details, patched[0].status);
+  check('listed job patches by exact jobId regardless of cut membership',
+    !!patchedView && patchedView.children[0].status === 'completed' && patchedView.children[0].result === 'done',
+    JSON.stringify(patchedView));
+  // Legacy two-arg behavior (no cut) still omission-settles every
+  // queued/running child.
+  const legacy = applyJobSnapshot([oldCard, newCard], []);
+  const legacyNewView = resolveTaskCardView(legacy[1].args, legacy[1].details, legacy[1].status);
+  check('no cut preserves legacy omission-settle for all queued/running children',
+    !!legacyNewView && legacyNewView.children[0].status === 'cancelled', JSON.stringify(legacyNewView));
+}
+
+// ---- App cold-cache bootstrap integration: historical child settles on reconnect ----
+// Simulates the exact App bootstrap ordering (streaming preserveInflight=true
+// and settled false branches): the mirror starts EMPTY (cold cache), the
+// received authoritative history is materialized into the mirror BEFORE the
+// request cut is captured, an in-window spawn lands between request and
+// response, and job_list=[] then omission-settles only the cut member. A cut
+// captured from the pre-merge cold mirror (the regression) would be empty and
+// leave the historical child Running forever.
+{
+  const historyCard = {
+    kind: 'toolCard',
+    id: 'tc-hist',
+    toolCallId: 'task-hist-call',
+    toolName: 'task',
+    args: { agent: 'reviewer', name: 'Hist', task: 'historical work' },
+    status: 'running',
+    result: '',
+    details: [{ index: 0, jobId: 'job-old', agentId: 'Alpha', agent: 'reviewer', status: 'running' }],
+  };
+  const windowCard = {
+    kind: 'toolCard',
+    id: 'tc-window',
+    toolCallId: 'task-window-call',
+    toolName: 'task',
+    args: { agent: 'reviewer', name: 'Window', task: 'in-window work' },
+    status: 'running',
+    result: '',
+    details: [{ index: 0, jobId: 'job-new', agentId: 'Beta', agent: 'reviewer', status: 'running' }],
+  };
+  for (const preserveInflight of [true, false]) {
+    const branch = preserveInflight ? 'streaming' : 'settled';
+    // Cold cache: no items for the target session before bootstrap.
+    let mirrorItems = [];
+    // Bootstrap step 1: materialize the received authoritative history.
+    mirrorItems = mergeAuthoritativeItems([historyCard], mirrorItems, preserveInflight);
+    // Bootstrap step 2: capture the request cut from the exact merged state.
+    const cut = taskJobIds(mirrorItems);
+    check(`${branch} cold-cache cut includes the historical running child`,
+      cut.size === 1 && cut.has('job-old'), JSON.stringify([...cut]));
+    // In-window spawn between request issue and response.
+    mirrorItems = [...mirrorItems, windowCard];
+    // Response: merge history again (window events retained) and reconcile.
+    const merged = mergeAuthoritativeItems([historyCard], mirrorItems, preserveInflight);
+    check(`${branch} bootstrap merge keeps history and in-window Task cards`,
+      merged.length === 2 && merged[0]?.id === 'tc-hist' && merged[1]?.id === 'tc-window',
+      JSON.stringify(merged.map((item) => item.id)));
+    const reconciled = applyJobSnapshot(merged, [], cut);
+    check(`${branch} bootstrap job_list=[] keeps both Task cards`,
+      reconciled.length === 2,
+      JSON.stringify(reconciled.map((item) => item.id)));
+    const oldView = resolveTaskCardView(reconciled[0]?.args, reconciled[0]?.details, reconciled[0]?.status);
+    const newView = resolveTaskCardView(reconciled[1]?.args, reconciled[1]?.details, reconciled[1]?.status);
+    check(`${branch} bootstrap omission-settles the historical child (job_list=[])`,
+      !!oldView && oldView.children[0].jobId === 'job-old' && oldView.children[0].status === 'cancelled',
+      JSON.stringify(oldView));
+    check(`${branch} bootstrap keeps the in-window child authoritative`,
+      !!newView && newView.children[0].jobId === 'job-new' && newView.children[0].status === 'running',
+      JSON.stringify(newView));
+  }
+}
+
+// ---- Lifecycle switch: history merge must not resurrect a settled child ----
+// Simulates the exact switch_session defect: a live projection already
+// omission-settled job-old to cancelled (authoritative job_list=[] from an
+// earlier generation), then a switch merges disk history whose recorder
+// still carries queued/running. The merge must keep the terminal projection;
+// a follow-up authoritative job_list=[] then leaves it byte-for-byte.
+{
+  const historyCard = {
+    kind: 'toolCard',
+    id: 'tc-hist',
+    toolCallId: 'task-hist-call',
+    toolName: 'task',
+    args: { agent: 'reviewer', name: 'Hist', task: 'historical work' },
+    status: 'running',
+    result: '',
+    details: [{ index: 0, jobId: 'job-old', agentId: 'Alpha', agent: 'reviewer', status: 'running' }],
+  };
+  const settledCard = {
+    ...historyCard,
+    details: [{ index: 0, jobId: 'job-old', agentId: 'Alpha', agent: 'reviewer', status: 'cancelled' }],
+  };
+  for (const preserveInflight of [true, false]) {
+    const branch = preserveInflight ? 'streaming' : 'settled';
+    const resurrected = mergeAuthoritativeItems([historyCard], [settledCard], preserveInflight);
+    const view = resolveTaskCardView(resurrected[0].args, resurrected[0].details, resurrected[0].status);
+    check(`${branch} lifecycle merge keeps an already-settled child terminal`,
+      !!view && view.children[0].jobId === 'job-old' && view.children[0].status === 'cancelled',
+      JSON.stringify(view));
+    const reconciled = applyJobSnapshot(resurrected, [], taskJobIds(resurrected));
+    const reconciledView = resolveTaskCardView(reconciled[0].args, reconciled[0].details, reconciled[0].status);
+    check(`${branch} authoritative empty job_list keeps the settled child terminal`,
+      !!reconciledView && reconciledView.children[0].status === 'cancelled',
+      JSON.stringify(reconciledView));
+  }
+  // A genuinely running child (no terminal projection) still merges as
+  // running; the guard only blocks regression.
+  const stillRunning = mergeAuthoritativeItems([historyCard], [historyCard], false);
+  const runningView = resolveTaskCardView(stillRunning[0].args, stillRunning[0].details, stillRunning[0].status);
+  check('merge keeps a running child running when no terminal projection exists',
+    !!runningView && runningView.children[0].status === 'running', JSON.stringify(runningView));
+}
+
+// ---- session handoff divider: customType 'handoff' + data.text ----
+{
+  const doc = '<handoff-context>\nSession: alpha\nGoal: ship it\n</handoff-context>';
+  const divider = customToItem({ role: 'custom', customType: 'handoff', data: { text: doc } });
+  check('handoff divider renders from data.text', divider !== null && divider.kind === 'handoff-divider' && divider.text === doc, JSON.stringify(divider));
+  // The backend record may omit display — the divider renders regardless
+  // (the backend mints it deliberately as the new session's first record).
+  const withoutDisplay = customToItem({ role: 'custom', customType: 'handoff', data: { text: doc }, display: false });
+  check('handoff divider ignores the display flag', withoutDisplay !== null && withoutDisplay.kind === 'handoff-divider' && withoutDisplay.text === doc);
+  const items = messagesToItems([{ role: 'custom', customType: 'handoff', data: { text: doc }, timestamp: 9 }]);
+  const restored = items.find((i) => i.kind === 'handoff-divider');
+  check('messagesToItems restores the handoff divider from data.text', restored !== undefined && restored.kind === 'handoff-divider' && restored.text === doc, JSON.stringify(items));
+  const fallback = customToItem({ role: 'custom', customType: 'handoff', content: [{ type: 'text', text: 'plain fallback doc' }] });
+  check('handoff divider falls back to content when data.text is absent', fallback !== null && fallback.kind === 'handoff-divider' && fallback.text === 'plain fallback doc', JSON.stringify(fallback));
+  // Non-handoff customs keep their existing shapes.
+  const plain = customToItem({ role: 'custom', customType: 'notice', content: 'hello', display: true });
+  check('non-handoff customs stay plain labeled customs', plain !== null && plain.kind === 'custom' && plain.label === 'notice');
+  const loop = customToItem({ role: 'custom', customType: 'loop_scheduled_turn', content: '<system-reminder>x</system-reminder>', display: false });
+  check('display:false non-handoff customs stay hidden', loop === null);
 }
 
 console.log(`\ntranscript.test: ${ran} assertions, ${failures.length} failure(s)`);

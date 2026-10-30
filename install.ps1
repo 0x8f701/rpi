@@ -6,11 +6,11 @@
 #
 # Usage:
 #   irm https://raw.githubusercontent.com/0x8f701/rpi/master/install.ps1 | iex
-#   powershell -ExecutionPolicy Bypass -File install.ps1 -Version v0.2.11
+#   powershell -ExecutionPolicy Bypass -File install.ps1 -Version v1.0.0
 #
 # Environment:
-#   PI_HOME                install root (default: %USERPROFILE%\.rpi)
-#   PI_UPDATE_BASE_URL     GitHub-Releases-shaped API base (default:
+#   RPI_HOME                install root (default: %USERPROFILE%\.rpi)
+#   RPI_UPDATE_BASE_URL     GitHub-Releases-shaped API base (default:
 #                          https://api.github.com/repos/0x8f701/rpi/releases)
 #   GITHUB_TOKEN           authenticate the fixed GitHub API endpoint (default:
 #                          none; never sent to release-asset hosts)
@@ -26,6 +26,16 @@ Set-StrictMode -Version Latest
 function Fail([string]$Message) {
     Write-Error "install.ps1: error: $Message"
     exit 1
+}
+
+# Legacy names are intentionally not aliased. Reject them with an actionable
+# message before any network request or filesystem change so users do not
+# silently install into the wrong root or leak credentials to the wrong endpoint.
+if ($env:PI_HOME) {
+    Fail "legacy PI_HOME is no longer supported; set RPI_HOME instead (current PI_HOME=$env:PI_HOME)"
+}
+if ($env:PI_UPDATE_BASE_URL) {
+    Fail "legacy PI_UPDATE_BASE_URL is no longer supported; set RPI_UPDATE_BASE_URL instead"
 }
 
 function Get-CandidateIdentityFailure([string]$Path, [string]$ExpectedVersion) {
@@ -159,8 +169,8 @@ $ERR_SHARING_VIOLATION = 32
 $ERR_ACCESS_DENIED = 5
 
 $Repo = "0x8f701/rpi"
-$ApiBase = if ($env:PI_UPDATE_BASE_URL) { $env:PI_UPDATE_BASE_URL } else { "https://api.github.com/repos/$Repo/releases" }
-$PiHome = if ($env:PI_HOME) { $env:PI_HOME } else { Join-Path $env:USERPROFILE ".rpi" }
+$ApiBase = if ($env:RPI_UPDATE_BASE_URL) { $env:RPI_UPDATE_BASE_URL } else { "https://api.github.com/repos/$Repo/releases" }
+$PiHome = if ($env:RPI_HOME) { $env:RPI_HOME } else { Join-Path $env:USERPROFILE ".rpi" }
 $Triple = "x86_64-pc-windows-msvc"
 
 # ── Platform gate ────────────────────────────────────────────────────────────
@@ -189,7 +199,7 @@ $Headers = @{ "User-Agent" = "rpi-install"; "Accept" = "application/vnd.github+j
 # Optional GITHUB_TOKEN support, mirroring install.sh and the built-in updater:
 # the token authenticates only the fixed GitHub API endpoint (avoiding the
 # unauthenticated rate limit) and is never sent to release-asset hosts or a
-# custom PI_UPDATE_BASE_URL endpoint.
+# custom RPI_UPDATE_BASE_URL endpoint.
 $GitHubApiBase = "https://api.github.com/repos/$Repo/releases"
 $ApiHeaders = $Headers
 if ($env:GITHUB_TOKEN -and $ApiBase -eq $GitHubApiBase) {
@@ -345,7 +355,7 @@ try {
     $StateJson = ($State | ConvertTo-Json) + [Environment]::NewLine
     [IO.File]::WriteAllText($StateTmp, $StateJson, $Utf8NoBom)
 
-    # Serialize concurrent installs over PI_HOME. Downloads run concurrently,
+    # Serialize concurrent installs over RPI_HOME. Downloads run concurrently,
     # but activation is guarded by a named mutex with the same 30-second bound
     # as the self-updater. An abandoned mutex transfers ownership safely.
     $MutexName = "Local\rpi-install-" + ($PiHome -replace '[\\/:]', '_')

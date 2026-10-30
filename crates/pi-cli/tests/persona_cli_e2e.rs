@@ -7,11 +7,14 @@
 //! - **Discovery (CLI view)**: `/persona` lists the discovered persona.
 //! - **Show / Current / Clear**: render details, the no-selection state, and
 //!   clear the persisted preferred-agent setting.
-//! - **Reset containment**: `/persona reset <name> --yes` clears `memory/` and
-//!   `sessions/` under the persona root but keeps `persona.md`.
+//! - **Reset containment**: `/persona reset <name> --yes` clears `memory/`,
+//!   `sessions/`, and `skills/` under the persona root but keeps `persona.md`.
+//! - **Persona run (durable spawn)**: `/persona run` spawns a durable child
+//!   carrying the persona's preseeded memory, skill, and declared tools, with
+//!   no disallowed plumbing and no leakage into ordinary children.
 //! - **Remove containment**: `/persona remove <name> --yes` deletes `persona.md`
-//!   but keeps `memory/` and `sessions/`, then reloads so the persona leaves
-//!   the catalog.
+//!   but keeps `memory/`, `sessions/`, and `skills/`, then reloads so the
+//!   persona leaves the catalog.
 //! - **Purge containment**: `/persona remove <name> --purge --yes` deletes the
 //!   whole persona root, then reloads so the persona leaves the catalog.
 //! - **--yes confirmation**: destructive ops without `--yes` are rejected by the
@@ -24,14 +27,15 @@ use pi_cli::interactive_commands::{
     execute_interactive_persona_command, parse_interactive_persona_command,
 };
 use pi_coding::{
-    Application, ResourceManager, ResourceManagerOptions, Session, SessionOptions,
+    AgentCatalog, Application, ApplicationRuntimeCandidate, ChildSessionFactory,
+    OrchestrationConfig, OrchestrationRuntime, ResourceManager, ResourceManagerOptions, Session,
+    SessionOptions, TaskItem,
 };
 /// Per-process isolated native session root so `start_new_recording()` never
 /// writes into the real `~/.pi/agent/sessions` tree (Web sidebar source).
 fn test_sessions_root() -> std::path::PathBuf {
-    static ROOT: std::sync::LazyLock<tempfile::TempDir> = std::sync::LazyLock::new(|| {
-        tempfile::tempdir().expect("test sessions root")
-    });
+    static ROOT: std::sync::LazyLock<tempfile::TempDir> =
+        std::sync::LazyLock::new(|| tempfile::tempdir().expect("test sessions root"));
     ROOT.path().to_path_buf()
 }
 
@@ -40,14 +44,28 @@ fn persona_dir(agent_dir: &std::path::Path, name: &str) -> std::path::PathBuf {
     std::fs::create_dir_all(&dir).expect("persona root dir");
     std::fs::write(
         dir.join("persona.md"),
-        format!("---\nname: {name}\ndescription: durable {name}\n---\n{name} prompt"),
+        format!(
+            "---\nname: {name}\ndescription: durable {name}\ntools: [read, grep, find, ls, glob, bash, edit, write, web_search, browser]\n---\n{name} prompt"
+        ),
     )
     .expect("persona.md");
     dir
 }
 
-/// Seeds a persona root with a memory entry and a session archive so reset vs
-/// remove containment is observable.
+const PERSONA_SKILL_NAME: &str = "release-audit";
+
+fn seed_persona_skill(persona_root: &std::path::Path, name: &str, instructions: &str) {
+    let skill = persona_root.join("skills").join(name);
+    std::fs::create_dir_all(&skill).expect("persona skill dir");
+    std::fs::write(
+        skill.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: persona-local {name}\n---\n\n{instructions}\n"),
+    )
+    .expect("persona SKILL.md");
+}
+
+/// Seeds a persona root with a memory entry, a session archive, and a
+/// persona-local skill so reset vs remove containment is observable.
 fn seed_persona_state(persona_root: &std::path::Path) {
     let memory = persona_root.join("memory");
     std::fs::create_dir_all(&memory).expect("memory dir");
@@ -59,9 +77,20 @@ fn seed_persona_state(persona_root: &std::path::Path) {
     let sessions = persona_root.join("sessions");
     std::fs::create_dir_all(&sessions).expect("sessions dir");
     std::fs::write(sessions.join("Mentor.jsonl"), "{}\n").expect("archive");
+    seed_persona_skill(
+        persona_root,
+        PERSONA_SKILL_NAME,
+        "Check the release notes against the merged commits.",
+    );
 }
 
 fn faux_session() -> (Session, pi_ai::providers::FauxProviderRegistration) {
+    faux_session_in(std::env::current_dir().expect("cwd"))
+}
+
+fn faux_session_in(
+    cwd: std::path::PathBuf,
+) -> (Session, pi_ai::providers::FauxProviderRegistration) {
     let suffix = uuid::Uuid::now_v7().simple().to_string();
     let api = format!("persona-cli-api-{suffix}");
     let provider = format!("persona-cli-provider-{suffix}");
@@ -85,7 +114,7 @@ fn faux_session() -> (Session, pi_ai::providers::FauxProviderRegistration) {
     }]);
     let session = Session::new(SessionOptions {
         model,
-        cwd: std::env::current_dir().expect("cwd"),
+        cwd,
         system_prompt: String::new(),
         thinking_level: pi_agent::ThinkingLevel::Off,
         api_key: String::new(),
@@ -96,6 +125,7 @@ fn faux_session() -> (Session, pi_ai::providers::FauxProviderRegistration) {
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: None,
+        auth_manager: None,
     })
     .expect("session");
     session.set_session_dir(test_sessions_root());
@@ -156,7 +186,10 @@ async fn persona_cli_lists_shows_current_and_clears() {
     )
     .await
     .expect("list");
-    assert!(list.contains("mentor"), "list must name the persona: {list}");
+    assert!(
+        list.contains("mentor"),
+        "list must name the persona: {list}"
+    );
 
     let show = execute_interactive_persona_command(
         application,
@@ -164,7 +197,10 @@ async fn persona_cli_lists_shows_current_and_clears() {
     )
     .await
     .expect("show");
-    assert!(show.contains("mentor"), "show must name the persona: {show}");
+    assert!(
+        show.contains("mentor"),
+        "show must name the persona: {show}"
+    );
     assert!(
         show.to_lowercase().contains("persona"),
         "show must identify it as a persona: {show}"
@@ -201,9 +237,13 @@ async fn persona_cli_reset_clears_state_keeps_definition() {
     let persona_root = app.persona_root.clone();
     assert!(persona_root.join("memory").exists(), "memory seeded");
     assert!(persona_root.join("sessions").exists(), "sessions seeded");
+    assert!(
+        persona_root.join("skills").join(PERSONA_SKILL_NAME).is_dir(),
+        "persona-local skill seeded"
+    );
 
-    let command = parse_interactive_persona_command(Some("reset mentor --yes"))
-        .expect("reset parse");
+    let command =
+        parse_interactive_persona_command(Some("reset mentor --yes")).expect("reset parse");
     let outcome = execute_interactive_persona_command(&app.application, command)
         .await
         .expect("reset execute");
@@ -224,6 +264,10 @@ async fn persona_cli_reset_clears_state_keeps_definition() {
         !persona_root.join("sessions").exists(),
         "reset must clear the persona sessions directory"
     );
+    assert!(
+        !persona_root.join("skills").exists(),
+        "reset must clear the persona skills directory"
+    );
     app.application.cleanup().await;
 }
 
@@ -232,8 +276,8 @@ async fn persona_cli_remove_deletes_definition_keeps_state() {
     let app = persona_app(true).await;
     let persona_root = app.persona_root.clone();
 
-    let command = parse_interactive_persona_command(Some("remove mentor --yes"))
-        .expect("remove parse");
+    let command =
+        parse_interactive_persona_command(Some("remove mentor --yes")).expect("remove parse");
     let outcome = execute_interactive_persona_command(&app.application, command)
         .await
         .expect("remove execute");
@@ -253,6 +297,10 @@ async fn persona_cli_remove_deletes_definition_keeps_state() {
     assert!(
         persona_root.join("sessions").exists(),
         "remove must keep the persona sessions directory"
+    );
+    assert!(
+        persona_root.join("skills").join(PERSONA_SKILL_NAME).is_dir(),
+        "remove must keep the persona skills directory"
     );
 
     // After reload the persona leaves the catalog.
@@ -323,8 +371,8 @@ async fn persona_cli_destructive_requires_yes_and_rejects_unknown() {
     );
 
     // An unknown persona name fails closed.
-    let command = parse_interactive_persona_command(Some("reset nope --yes"))
-        .expect("parse unknown reset");
+    let command =
+        parse_interactive_persona_command(Some("reset nope --yes")).expect("parse unknown reset");
     let error = execute_interactive_persona_command(&app.application, command)
         .await
         .expect_err("unknown persona must fail");
@@ -332,5 +380,361 @@ async fn persona_cli_destructive_requires_yes_and_rejects_unknown() {
         error.to_string().contains("unknown persona"),
         "expected unknown-persona error: {error}"
     );
+    app.application.cleanup().await;
+}
+
+struct CapturedChild {
+    agent: String,
+    tool_names: Vec<String>,
+    system_prompt: String,
+    session: Session,
+}
+
+struct SpawnApp {
+    application: Application,
+    persona_root: std::path::PathBuf,
+    children: tokio::sync::mpsc::UnboundedReceiver<CapturedChild>,
+    _registration: pi_ai::providers::FauxProviderRegistration,
+    _root: tempfile::TempDir,
+}
+
+fn seed_spawn_persona(
+    agent_dir: &std::path::Path,
+    name: &str,
+    tools: &str,
+    disallowed: Option<&str>,
+) -> std::path::PathBuf {
+    let root = agent_dir.join("personas").join(name);
+    std::fs::create_dir_all(&root).expect("persona root");
+    let mut persona = format!("---\nname: {name}\ndescription: durable {name}\ntools: {tools}\n");
+    if let Some(disallowed) = disallowed {
+        persona.push_str(&format!("disallowedTools: {disallowed}\n"));
+    }
+    persona.push_str(&format!("capabilityCeiling: [read, write]\n---\n{name} prompt"));
+    std::fs::write(root.join("persona.md"), persona).expect("persona.md");
+    seed_persona_state(&root);
+    root
+}
+
+/// Durable-bound application whose real child factory captures every built child.
+async fn spawn_app(tools: &str, disallowed: Option<&str>) -> SpawnApp {
+    let root = tempfile::tempdir().expect("root");
+    let agent_dir = root.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+    )
+    .expect("settings");
+    let persona_root = seed_spawn_persona(&agent_dir, "mentor", tools, disallowed);
+    let agents = agent_dir.join("agents");
+    std::fs::create_dir_all(&agents).expect("agents dir");
+    std::fs::write(
+        agents.join("reviewer.md"),
+        "---\nname: reviewer\ndescription: Ordinary agent\ntools: [read, grep, learn_skill]\n---\nReview code.",
+    )
+    .expect("reviewer.md");
+
+    let cwd = root.path().join("project");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    let mut options = ResourceManagerOptions::new(&cwd);
+    options.agent_dir = agent_dir;
+    options.disable_extensions = true;
+    options.disable_skills = true;
+    options.disable_prompt_templates = true;
+    options.disable_themes = true;
+    options.disable_context_files = true;
+    let resources = ResourceManager::new(options).expect("resources");
+    let snapshot = resources.snapshot();
+    let (session, registration) = faux_session_in(cwd.clone());
+    session
+        .attach_resources(resources)
+        .await
+        .expect("attach resources");
+    let mut config = OrchestrationConfig::new(
+        AgentCatalog::from_agents(snapshot.agents.clone()),
+        cwd.join("artifacts"),
+    );
+    config.idle_ttl = None;
+    config.parent_model = session.model().expect("parent model");
+
+    let (sender, children) = tokio::sync::mpsc::unbounded_channel();
+    let inner =
+        OrchestrationRuntime::child_factory_from_snapshot(session.child_session_options_snapshot());
+    let factory: ChildSessionFactory = std::sync::Arc::new(move |request| {
+        let inner = inner.clone();
+        let sender = sender.clone();
+        Box::pin(async move {
+            let agent = request.definition.name.clone();
+            let child = inner(request).await?;
+            let captured = CapturedChild {
+                agent,
+                tool_names: child.get_active_tool_names(),
+                system_prompt: child.system_prompt().await,
+                session: child.clone(),
+            };
+            let _ = sender.send(captured);
+            Ok(child)
+        })
+    });
+    let runtime = OrchestrationRuntime::new(config, factory).expect("orchestration runtime");
+    let application = Application::from_runtime_candidate(
+        ApplicationRuntimeCandidate::new(session).with_orchestration(runtime),
+    )
+    .await
+    .expect("durable persona application");
+    SpawnApp {
+        application,
+        persona_root,
+        children,
+        _registration: registration,
+        _root: root,
+    }
+}
+
+fn tool_call_context(arguments: serde_json::Value) -> pi_agent::ToolCallContext {
+    let (controller, abort) = pi_agent::AbortController::new();
+    std::mem::forget(controller);
+    let on_update: pi_agent::ToolUpdateFn = std::sync::Arc::new(|_: pi_agent::AgentToolResult| {});
+    pi_agent::ToolCallContext {
+        tool_call_id: "persona-cli-e2e".to_owned(),
+        arguments,
+        on_update,
+        abort,
+        model: None,
+        approval_token: None,
+    }
+}
+
+fn tool_text(result: &pi_agent::AgentToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            pi_ai::ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn persona_run(application: &Application, assignment: &str) -> String {
+    execute_interactive_persona_command(
+        application,
+        parse_interactive_persona_command(Some(&format!("run mentor {assignment}")))
+            .expect("run parse"),
+    )
+    .await
+    .expect("persona run")
+}
+
+async fn captured_child(
+    children: &mut tokio::sync::mpsc::UnboundedReceiver<CapturedChild>,
+    agent: &str,
+) -> CapturedChild {
+    loop {
+        let child = tokio::time::timeout(std::time::Duration::from_secs(30), children.recv())
+            .await
+            .expect("the spawned child factory must build a session")
+            .expect("captured child channel");
+        if child.agent == agent {
+            return child;
+        }
+    }
+}
+
+#[tokio::test]
+async fn persona_run_spawns_durable_child_with_preseeded_state() {
+    let mut app = spawn_app("[memory, learn_skill]", None).await;
+
+    let message = persona_run(&app.application, "draft the release plan").await;
+    assert!(message.contains("Persona mentor started"), "{message}");
+    assert!(message.contains("job:"), "{message}");
+    assert!(message.contains("agent:"), "{message}");
+
+    let child = captured_child(&mut app.children, "mentor").await;
+    assert!(
+        child.system_prompt.contains(PERSONA_SKILL_NAME),
+        "the persona-local skill must be visible to the spawned child: {}",
+        child.system_prompt
+    );
+    assert!(
+        child
+            .system_prompt
+            .contains(&format!("skill://{PERSONA_SKILL_NAME}")),
+        "the persona-local skill must be addressable as skill://: {}",
+        child.system_prompt
+    );
+    assert!(
+        child
+            .system_prompt
+            .contains("Check the release notes against the merged commits."),
+        "the on-disk skill bytes must reach the child prompt: {}",
+        child.system_prompt
+    );
+    assert!(
+        child.tool_names.iter().any(|name| name == "memory"),
+        "the declared memory tool must reach the child: {:?}",
+        child.tool_names
+    );
+    assert!(
+        child.tool_names.iter().any(|name| name == "learn_skill"),
+        "the declared learn_skill tool must reach the child: {:?}",
+        child.tool_names
+    );
+
+    let memory = child
+        .session
+        .active_tools()
+        .into_iter()
+        .find(|tool| tool.name == "memory")
+        .expect("the child holds the persona memory tool");
+    let listed = (memory.execute)(tool_call_context(serde_json::json!({"op": "list"})))
+        .await
+        .expect("persona memory list");
+    assert!(
+        tool_text(&listed).contains("persona-memory-note"),
+        "the preseeded persona memory entry must be readable by the child: {}",
+        tool_text(&listed)
+    );
+
+    app.application.cleanup().await;
+}
+
+#[tokio::test]
+async fn persona_run_child_excludes_disallowed_plumbing_and_keeps_yield() {
+    let mut app = spawn_app(
+        "[read, grep, find, glob, ls, memory, learn_skill]",
+        Some("[todo, process, task, hub, goal]"),
+    )
+    .await;
+
+    let message = persona_run(&app.application, "audit the release notes").await;
+    assert!(message.contains("Persona mentor started"), "{message}");
+
+    let child = captured_child(&mut app.children, "mentor").await;
+    for removed in ["todo", "process", "task", "hub", "goal"] {
+        assert!(
+            !child.tool_names.iter().any(|name| name == removed),
+            "disallowedTools must remove {removed:?}: {:?}",
+            child.tool_names
+        );
+    }
+    assert_eq!(
+        child
+            .tool_names
+            .iter()
+            .filter(|name| name.as_str() == "yield")
+            .count(),
+        1,
+        "the mandatory yield tool must survive disallowedTools exactly once: {:?}",
+        child.tool_names
+    );
+    for declared in ["read", "grep", "find", "glob", "ls", "memory", "learn_skill"] {
+        assert!(
+            child.tool_names.iter().any(|name| name == declared),
+            "the declared persona tool {declared:?} must reach the child: {:?}",
+            child.tool_names
+        );
+    }
+    let warnings = app
+        .application
+        .orchestration_runtime()
+        .expect("orchestration runtime")
+        .unknown_tool_warnings();
+    assert!(
+        warnings.is_empty(),
+        "a librarian-shaped persona declares no unknown tool: {warnings:?}"
+    );
+
+    let mut control = spawn_app("[read, grep, find, glob, ls, memory, learn_skill]", None).await;
+    persona_run(&control.application, "audit the release notes").await;
+    let control_child = captured_child(&mut control.children, "mentor").await;
+    for plumbing in ["task", "hub"] {
+        assert!(
+            control_child.tool_names.iter().any(|name| name == plumbing),
+            "control: {plumbing:?} is injected unless disallowedTools removes it: {:?}",
+            control_child.tool_names
+        );
+    }
+
+    app.application.cleanup().await;
+    control.application.cleanup().await;
+}
+
+#[tokio::test]
+async fn persona_run_state_is_isolated_from_ordinary_agents() {
+    let mut app = spawn_app("[read, grep, memory, learn_skill]", None).await;
+    let definition = std::fs::read(app.persona_root.join("persona.md")).expect("persona.md");
+
+    persona_run(&app.application, "draft the release plan").await;
+    let persona_child = captured_child(&mut app.children, "mentor").await;
+    assert!(
+        persona_child
+            .system_prompt
+            .contains(&format!("skill://{PERSONA_SKILL_NAME}")),
+        "the persona child sees its own skill: {}",
+        persona_child.system_prompt
+    );
+    assert!(
+        persona_child
+            .tool_names
+            .iter()
+            .any(|name| name == "learn_skill"),
+        "the persona child holds learn_skill: {:?}",
+        persona_child.tool_names
+    );
+
+    let runtime = app
+        .application
+        .orchestration_runtime()
+        .expect("orchestration runtime");
+    let spawns = runtime
+        .spawn_tasks(
+            "Main",
+            0,
+            vec![TaskItem {
+                index: 0,
+                id: "reviewer".to_owned(),
+                agent: "reviewer".to_owned(),
+                assignment: "review the release notes".to_owned(),
+                ..Default::default()
+            }],
+        )
+        .expect("ordinary spawn");
+    assert_eq!(spawns.len(), 1, "the ordinary child must spawn");
+
+    let ordinary = captured_child(&mut app.children, "reviewer").await;
+    assert!(
+        !ordinary.system_prompt.contains(PERSONA_SKILL_NAME),
+        "a persona-local skill must never reach an ordinary child: {}",
+        ordinary.system_prompt
+    );
+    assert!(
+        !ordinary.system_prompt.contains("skill://"),
+        "an ordinary child must see no skill locations at all: {}",
+        ordinary.system_prompt
+    );
+    assert!(
+        !ordinary.system_prompt.contains("<available_skills>"),
+        "an ordinary child gets no skill catalog: {}",
+        ordinary.system_prompt
+    );
+    assert!(
+        !ordinary.tool_names.iter().any(|name| name == "learn_skill"),
+        "learn_skill stays persona-only even when an ordinary agent declares it: {:?}",
+        ordinary.tool_names
+    );
+    assert!(
+        ordinary.tool_names.iter().any(|name| name == "read"),
+        "the ordinary child still receives its declared tools: {:?}",
+        ordinary.tool_names
+    );
+
+    assert_eq!(
+        std::fs::read(app.persona_root.join("persona.md")).expect("persona.md after the run"),
+        definition,
+        "spawning must not rewrite the persona definition"
+    );
+
     app.application.cleanup().await;
 }

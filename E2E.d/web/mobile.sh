@@ -3,18 +3,12 @@
 #
 # Spawns the real `rpi --listen` binary with a token file and the loopback
 # mock provider (--scenario steering; request 1 streams slowly), opens `/web`
-# in a real browser at a 375×667 phone viewport, and asserts:
-#   1. the core flow works at phone width: connect, prompt round-trip, panel
-#      open
-#   2. while the run streams: the unified action switches to Stop, stays
-#      >= 44px, with no horizontal overflow and composer on-screen
-#   3. no horizontal page overflow (page itself, and with the drawer open)
-#   4. the drawer is full-screen width (== viewport)
-#   5. the composer sits above the fold (bottom <= innerHeight)
-#   6. idle composer: the unified action returns to Send, the textarea is
-#      dominant (usable width >= 240px, height >= 44px)
-#   7. shell touch targets are >= 44px
-#   8. #thinking-select is hidden at phone width (CSS media query)
+# in a real browser, and asserts at 320/375/430px:
+#   1. the composer is exactly two rows in idle Send and streaming Stop states
+#   2. textarea owns row one; Command/upload/mic/action share row two
+#   3. every composer control is >=44px with no toolbar wrap/page overflow
+#   4. core prompt, drawer, full-screen panel, and return flows still work
+#   5. #thinking-select is visible at phone width (header has room)
 #
 # Browser driver: playwright via npm (ephemeral install in the scenario work
 # dir) with a system Chrome/Chromium binary or playwright's bundled chromium.
@@ -40,7 +34,7 @@ main() {
     case "${1:-run}" in
         list|--list|--dry-run)
             printf '%s\n' \
-                'web-mobile - 375x667 viewport: core flow, unified Send/Stop action, no overflow, full-screen drawer, dominant idle textarea, 44px targets, thinking-select hidden (playwright, hard gate)'
+                'web-mobile - 320/375/430px: exact two-row Send/Stop composer geometry, no toolbar/page overflow, >=44px controls, drawer/panel/core flow (playwright, hard gate)'
             return 0
             ;;
         run|all) ;;
@@ -64,7 +58,7 @@ main() {
     web_run_playwright "$url" "$evidence" "$root/playwright" "$SCRIPT_DIR/mobile_test.mjs" \
         RPI_SLOW_TAIL="$SLOW_TAIL" || pw_status=$?
     if [ "$pw_status" -eq 0 ]; then
-        printf 'playwright: mobile core flow + viewport contract: PASSED\n' | tee "$evidence/playwright-summary.txt"
+        printf 'playwright: 320/375/430 two-row Send/Stop composer + mobile shell: PASSED\n' | tee "$evidence/playwright-summary.txt"
     elif [ "$pw_status" -eq 1 ]; then
         fail "$SCENARIO: playwright SETUP FAILED (node/chromium/npm unavailable)"
     else

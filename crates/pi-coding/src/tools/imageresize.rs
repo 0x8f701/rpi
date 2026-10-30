@@ -170,7 +170,8 @@ fn base_mime(mime_type: &str) -> String {
 fn convert_image_bytes_to_png(data: &[u8]) -> Option<Vec<u8>> {
     let img = image::load_from_memory(data).ok()?;
     let mut buf = Vec::new();
-    img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png).ok()?;
+    img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+        .ok()?;
     Some(buf)
 }
 
@@ -186,7 +187,11 @@ fn conversion_hint(from: &str, to: &str) -> String {
 /// A faithful port of pi's `processImage` (utils/image-process.ts). Normalizes
 /// the image to a supported inline mime type (converting BMP→PNG), optionally
 /// auto-resizes it below the inline limit, and reports processing hints.
-pub(crate) fn process_image(data: &[u8], mime_type: &str, auto_resize_images: bool) -> ProcessImageResult {
+pub(crate) fn process_image(
+    data: &[u8],
+    mime_type: &str,
+    auto_resize_images: bool,
+) -> ProcessImageResult {
     let mut normalized_mime = normalize_supported_image_mime_type(mime_type);
     let mut norm_bytes = data.to_vec();
     let mut converted_from = String::new();
@@ -197,8 +202,9 @@ pub(crate) fn process_image(data: &[u8], mime_type: &str, auto_resize_images: bo
                 data: Vec::new(),
                 mime_type: String::new(),
                 hints: Vec::new(),
-                message: "[Image omitted: could not be converted to a supported inline image format.]"
-                    .to_string(),
+                message:
+                    "[Image omitted: could not be converted to a supported inline image format.]"
+                        .to_string(),
             };
         };
         norm_bytes = png_bytes;
@@ -273,7 +279,9 @@ fn to_fixed2(x: f64) -> String {
 
 fn encode_under_limit(img: &DynamicImage) -> Option<(Vec<u8>, String)> {
     let mut buf = Vec::new();
-    if img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png).is_ok()
+    if img
+        .write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+        .is_ok()
         && base64_size(buf.len()) < IMG_MAX_BASE64_BYTES
     {
         return Some((buf, "image/png".to_string()));
@@ -364,8 +372,9 @@ fn webp_orientation(data: &[u8]) -> u32 {
     let mut off = 12;
     while off + 8 <= data.len() {
         let chunk_id = &data[off..off + 4];
-        let chunk_size = u32::from_le_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]])
-            as usize;
+        let chunk_size =
+            u32::from_le_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]])
+                as usize;
         let data_start = off + 8;
         if chunk_id == b"EXIF" {
             if data_start + chunk_size > data.len() {
@@ -508,10 +517,19 @@ mod tests {
 
     #[test]
     fn normalize_supported_mime() {
-        assert_eq!(normalize_supported_image_mime_type("image/png"), "image/png");
-        assert_eq!(normalize_supported_image_mime_type("image/jpg"), "image/jpeg");
+        assert_eq!(
+            normalize_supported_image_mime_type("image/png"),
+            "image/png"
+        );
+        assert_eq!(
+            normalize_supported_image_mime_type("image/jpg"),
+            "image/jpeg"
+        );
         assert_eq!(normalize_supported_image_mime_type("image/bmp"), "");
-        assert_eq!(normalize_supported_image_mime_type("image/png; foo"), "image/png");
+        assert_eq!(
+            normalize_supported_image_mime_type("image/png; foo"),
+            "image/png"
+        );
     }
 
     #[test]
@@ -519,7 +537,8 @@ mod tests {
         // A tiny in-memory PNG stays within limits → returned unchanged.
         let img = image::DynamicImage::new_rgba8(2, 2);
         let mut buf = Vec::new();
-        img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png).unwrap();
+        img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+            .unwrap();
         let r = resize_image(&buf, "image/png").expect("small image should pass through");
         assert!(!r.was_resized);
         assert_eq!(r.data, buf);
@@ -550,13 +569,18 @@ mod tests {
         let r = process_image(&bmp, "image/bmp", false);
         assert!(r.ok);
         assert_eq!(r.mime_type, "image/png");
-        assert!(r.hints.iter().any(|h| h.contains("converted from image/bmp")));
+        assert!(
+            r.hints
+                .iter()
+                .any(|h| h.contains("converted from image/bmp"))
+        );
     }
 
     fn make_tiny_bmp() -> Vec<u8> {
         let img = image::DynamicImage::new_rgba8(2, 2);
         let mut buf = Vec::new();
-        img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Bmp).unwrap();
+        img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Bmp)
+            .unwrap();
         buf
     }
 }

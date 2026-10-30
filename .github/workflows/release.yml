@@ -1,12 +1,18 @@
 name: Release
 
 # On tag push v*, validate the release identity, build the embedded web bundle
-# once, build the `rpi` binary for the five supported native targets, package
-# per-target archives named rpi-<version>-<target-triple>.{tar.gz|zip} (each
-# containing a root rpi/rpi.exe plus LICENSE), generate SHA256SUMS, and publish
-# as a GitHub Release. Tests run independently on master and pull requests;
-# this workflow validates the tag, builds native artifacts, verifies them, and
-# publishes the release.
+# once, and publish three products:
+#   CLI: rpi-<version>-<target>.{tar.gz|zip} for the five native targets
+#     (x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu,
+#     aarch64-apple-darwin, x86_64-apple-darwin, x86_64-pc-windows-msvc).
+#   Desktop: Linux amd64/arm64 .deb, macOS arm64/x86_64 .zip, and Windows
+#     x86_64 .zip. Each bundles the matching CLI binary. Packages are unsigned.
+#   Mobile: one Android APK, rpi-chat-<version>-android.apk, containing
+#     armeabi-v7a, arm64-v8a, x86, and x86_64. Signed from Actions secrets
+#     ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS,
+#     and ANDROID_KEY_PASSWORD. iOS is not published.
+# Publication requires the static sandbox contracts plus Linux, macOS x64/arm64,
+# and Windows runtime proofs, as well as every CLI, desktop, and Android asset.
 
 on:
   push:
@@ -60,11 +66,11 @@ jobs:
 
       # crates/pi-cli/build.rs embeds crates/pi-cli/web/dist (vite-plugin-singlefile
       # output). dist/ is generated build output and not tracked by git, so the
-      # bundle is built ONCE here from the clean checkout and uploaded;
-      # build-linux and build-native download it into their workspaces before
-      # cargo build — every build job embeds the same deterministic bundle
-      # without repeating the npm install (and without setup-node inside the
-      # Ubuntu 20.04 container).
+      # bundle is built ONCE here from the clean checkout, stamped against the
+      # exact production inputs, and uploaded; build-linux and build-native
+      # download it into their workspaces before cargo build — every build job
+      # embeds the same deterministic bundle without repeating the npm install
+      # (and without setup-node inside the Ubuntu 20.04 container).
       - name: Set up Node for Web build
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -76,13 +82,17 @@ jobs:
           cd crates/pi-cli/web
           npm ci --no-audit --no-fund
           npm run build
+          python3 ../../../E2E.d/web/lib/web_dist_fingerprint.py stamp "$PWD" "$PWD/dist"
+
 
       - name: Upload embedded Web bundle
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: web-dist
-          path: crates/pi-cli/web/dist/index.html
+          path: crates/pi-cli/web/dist/
           if-no-files-found: error
+          # stamp is dist/.rpi-web-source.sha256; v6 drops dotfiles unless opted in
+          include-hidden-files: true
 
 
   build-linux:
@@ -442,9 +452,487 @@ jobs:
           path: ${{ env.ARCHIVE }}
           if-no-files-found: error
 
+
+  package-desktop:
+    name: package desktop (${{ matrix.asset_arch }})
+    needs: [validate-release, build-linux, build-native]
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            kind: deb
+            asset_arch: amd64
+            expected_arch: x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            kind: deb
+            asset_arch: arm64
+            expected_arch: aarch64
+          - os: macos-15
+            target: aarch64-apple-darwin
+            kind: mac
+            asset_arch: aarch64-apple-darwin
+            expected_arch: arm64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            kind: mac
+            asset_arch: x86_64-apple-darwin
+            expected_arch: x86_64
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            kind: win
+            asset_arch: x86_64-pc-windows-msvc
+            expected_arch: AMD64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Set up Node for the desktop shell
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+
+      - name: Name the matching CLI archive
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          case "$version" in
+            ''|*' '*|*'/'*) echo "Release version is not a single path segment" >&2; exit 1 ;;
+          esac
+          ext="tar.gz"
+          if [ "${{ matrix.kind }}" = "win" ]; then ext="zip"; fi
+          {
+            echo "RELEASE_VERSION=$version"
+            echo "CLI_ARCHIVE=rpi-${version}-${{ matrix.target }}.${ext}"
+          } >> "$GITHUB_ENV"
+
+      - name: Download the matching CLI archive
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: ${{ env.CLI_ARCHIVE }}
+          path: cli-archive
+
+      - name: Install the bundled runner
+        shell: bash
+        run: |
+          actual_arch="$(uname -m)"
+          if [ "${{ runner.os }}" = "Windows" ]; then actual_arch="$PROCESSOR_ARCHITECTURE"; fi
+          if [ "$actual_arch" != "${{ matrix.expected_arch }}" ]; then
+            echo "Expected native ${{ matrix.expected_arch }} execution" >&2
+            exit 1
+          fi
+          if [ "${{ matrix.kind }}" = "deb" ]; then
+            sudo apt-get update
+            sudo apt-get install -y file unzip
+          fi
+          mkdir -p target/release-dist
+          archive="cli-archive/${CLI_ARCHIVE}"
+          [ -f "$archive" ] || { echo "CLI archive missing: $archive" >&2; exit 1; }
+          if [ "${{ matrix.kind }}" = "win" ]; then
+            unzip -q "$archive" -d target/release-dist
+            [ -f target/release-dist/rpi.exe ] || { echo "Windows archive has no rpi.exe" >&2; exit 1; }
+          else
+            tar -xzf "$archive" -C target/release-dist
+            [ -f target/release-dist/rpi ] || { echo "Archive has no rpi" >&2; exit 1; }
+            chmod 0755 target/release-dist/rpi
+            case "${{ matrix.kind }}:${{ matrix.expected_arch }}" in
+              deb:x86_64) file target/release-dist/rpi | grep -q 'x86-64' ;;
+              deb:aarch64) file target/release-dist/rpi | grep -qi 'aarch64' ;;
+              mac:arm64) file target/release-dist/rpi | grep -q 'arm64' ;;
+              mac:x86_64) file target/release-dist/rpi | grep -q 'x86_64' ;;
+              *) echo "No binary architecture check for this desktop package" >&2; exit 1 ;;
+            esac
+          fi
+
+      - name: Install desktop dependencies
+        working-directory: crates/pi-cli/desktop
+        shell: bash
+        run: npm ci
+
+      - name: Package Linux deb
+        if: matrix.kind == 'deb'
+        shell: bash
+        run: |
+          export VERSION="$RELEASE_VERSION"
+          bash crates/pi-cli/desktop/package-deb.sh "$RUNNER_TEMP/desktop-deb"
+          asset="rpi-desktop-${RELEASE_VERSION}-${{ matrix.asset_arch }}.deb"
+          cp "$RUNNER_TEMP/desktop-deb/rpi-desktop_${RELEASE_VERSION}_${{ matrix.asset_arch }}.deb" "$asset"
+          sha256sum "$asset"
+          echo "ARCHIVE=$asset" >> "$GITHUB_ENV"
+
+      - name: Package macOS zip
+        if: matrix.kind == 'mac'
+        shell: bash
+        run: |
+          export VERSION="$RELEASE_VERSION"
+          export RPI_BINARY="$GITHUB_WORKSPACE/target/release-dist/rpi"
+          asset="rpi-desktop-${RELEASE_VERSION}-${{ matrix.asset_arch }}.zip"
+          bash crates/pi-cli/desktop/package-mac.sh "$asset"
+          shasum -a 256 "$asset"
+          echo "ARCHIVE=$asset" >> "$GITHUB_ENV"
+
+      - name: Package Windows zip
+        if: matrix.kind == 'win'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:VERSION = $env:RELEASE_VERSION
+          $env:RPI_BINARY = Join-Path $env:GITHUB_WORKSPACE 'target\release-dist\rpi.exe'
+          $asset = "rpi-desktop-$env:RELEASE_VERSION-${{ matrix.asset_arch }}.zip"
+          & ./crates/pi-cli/desktop/package-win.ps1 $asset
+          if ($LASTEXITCODE -ne 0) { throw "package-win.ps1 exited $LASTEXITCODE" }
+          Get-FileHash -Algorithm SHA256 $asset
+          Add-Content -Path $env:GITHUB_ENV -Value "ARCHIVE=$asset"
+
+      - name: Upload desktop package
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  package-android:
+    name: package Android APK
+    needs: [validate-release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Set up Node for the Android bundle
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+
+      - name: Install mobile dependencies
+        working-directory: mobile
+        run: npm ci
+
+      - name: Install JDK 17 and Android SDK packages
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openjdk-17-jdk
+          echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$GITHUB_ENV"
+          echo "/usr/lib/jvm/java-17-openjdk-amd64/bin" >> "$GITHUB_PATH"
+          export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+          export PATH="$JAVA_HOME/bin:$PATH"
+          java_version="$(java -version 2>&1 | awk -F '[".]' '/version/ {print $2; exit}')"
+          case "$java_version" in
+            17) ;;
+            *) echo "Expected JDK 17, found major ${java_version:-unknown}" >&2; exit 1 ;;
+          esac
+          sdk="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [ -z "$sdk" ] || [ ! -d "$sdk" ]; then
+            echo "ANDROID_SDK_ROOT or ANDROID_HOME must point at the runner Android SDK" >&2
+            exit 1
+          fi
+          sdkmanager="$(find "$sdk" -type f -path '*/cmdline-tools/*/bin/sdkmanager' | sort | tail -n 1)"
+          [ -n "$sdkmanager" ] && [ -x "$sdkmanager" ] || { echo "sdkmanager is missing under $sdk/cmdline-tools" >&2; exit 1; }
+          {
+            echo "ANDROID_SDK_ROOT=$sdk"
+            echo "ANDROID_HOME=$sdk"
+          } >> "$GITHUB_ENV"
+          timeout 180 yes | "$sdkmanager" --licenses >/dev/null || true
+          "$sdkmanager" --install \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "ndk;26.1.10909125"
+
+      - name: Write the release keystore from Actions secrets
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          python3 - <<'PY'
+          import base64, binascii, os, pathlib
+          def prop(value: str) -> str:
+              out = []
+              for ch in value:
+                  if ch in "\\ #!=" or ord(ch) < 32:
+                      out.append("\\u%04x" % ord(ch))
+                  else:
+                      out.append(ch)
+              return "".join(out)
+          required = [
+              "ANDROID_KEYSTORE_BASE64",
+              "ANDROID_KEYSTORE_PASSWORD",
+              "ANDROID_KEY_ALIAS",
+              "ANDROID_KEY_PASSWORD",
+          ]
+          missing = [name for name in required if not os.environ.get(name)]
+          if missing:
+              raise SystemExit("Android release signing secrets are missing: " + ", ".join(missing))
+          try:
+              keystore = base64.b64decode("".join(os.environ["ANDROID_KEYSTORE_BASE64"].split()), validate=True)
+          except binascii.Error:
+              raise SystemExit("ANDROID_KEYSTORE_BASE64 is not valid base64")
+          if not keystore:
+              raise SystemExit("ANDROID_KEYSTORE_BASE64 decoded empty")
+          dest = pathlib.Path("mobile/android/app/release.keystore")
+          dest.write_bytes(keystore)
+          dest.chmod(0o600)
+          props = pathlib.Path("mobile/android/keystore.properties")
+          props.write_text(
+              "storeFile=app/release.keystore\n"
+              f"storePassword={prop(os.environ['ANDROID_KEYSTORE_PASSWORD'])}\n"
+              f"keyAlias={prop(os.environ['ANDROID_KEY_ALIAS'])}\n"
+              f"keyPassword={prop(os.environ['ANDROID_KEY_PASSWORD'])}\n",
+              encoding="utf-8",
+          )
+          props.chmod(0o600)
+          PY
+
+      - name: Assemble the release APK
+        working-directory: mobile/android
+        shell: bash
+        run: |
+          printf 'sdk.dir=%s\n' "$ANDROID_SDK_ROOT" > local.properties
+          chmod 0600 local.properties
+          ./gradlew :app:assembleRelease --no-daemon
+          mapfile -t built < <(find app/build/outputs/apk/release -maxdepth 1 -type f -name 'rpi-chat-*.apk' | sort)
+          if [ "${#built[@]}" -ne 1 ] || [ ! -s "${built[0]}" ]; then
+            echo "Expected one nonempty release APK" >&2
+            exit 1
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          asset="$GITHUB_WORKSPACE/rpi-chat-${version}-android.apk"
+          cp "${built[0]}" "$asset"
+          sha256sum "$asset"
+          echo "ARCHIVE=rpi-chat-${version}-android.apk" >> "$GITHUB_ENV"
+
+      - name: Upload Android APK
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  sandbox-static-release:
+    name: sandbox static release gates
+    needs: [validate-release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Install Rust 1.88.0
+        shell: bash
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustc_version="$(rustc +1.88.0 --version)"
+          echo "$rustc_version"
+          case "$rustc_version" in
+            "rustc 1.88.0 "*) ;;
+            *) echo "Expected rustc 1.88.0" >&2; exit 1 ;;
+          esac
+
+      - name: Run sandbox static release gates
+        shell: bash
+        run: |
+          cargo +1.88.0 test --locked -p pi-coding --test raw_spawn_gate
+          cargo +1.88.0 test --locked -p pi-coding --test sandbox_spawn_families
+          cargo +1.88.0 test --locked -p pi-coding --test policy_fs
+          cargo +1.88.0 test --locked -p pi-coding --test host_network
+          cargo +1.88.0 test --locked -p pi-coding --test application_generation
+
+  sandbox-linux-release:
+    name: sandbox Linux release proof (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Install Rust 1.88.0
+        shell: bash
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustc_version="$(rustc +1.88.0 --version)"
+          echo "$rustc_version"
+          case "$rustc_version" in
+            "rustc 1.88.0 "*) ;;
+            *) echo "Expected rustc 1.88.0" >&2; exit 1 ;;
+          esac
+
+
+      - name: Build and verify bubblewrap 0.10.0
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential meson ninja-build libcap-dev
+          bwrap_source="$RUNNER_TEMP/bubblewrap"
+          git init "$bwrap_source"
+          git -C "$bwrap_source" remote add origin https://github.com/containers/bubblewrap.git
+          git -C "$bwrap_source" fetch --depth=1 origin dc63ec667e6546f34e0b6c088cdf8ae7c7dea0f3
+          git -C "$bwrap_source" checkout --detach FETCH_HEAD
+          [ "$(git -C "$bwrap_source" rev-parse HEAD)" = dc63ec667e6546f34e0b6c088cdf8ae7c7dea0f3 ]
+          meson setup "$bwrap_source/build" "$bwrap_source" --buildtype=release --prefix=/usr
+          ninja -C "$bwrap_source/build"
+          sudo ninja -C "$bwrap_source/build" install
+          [ "$(bwrap --version)" = "bubblewrap 0.10.0" ]
+          E2E.d/ci/orchestration.sh __bubblewrap-fd-probe
+
+      - name: Set up Node for Chromium
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+
+      - name: Install Playwright Chromium
+        shell: bash
+        run: |
+          playwright_dir="$RUNNER_TEMP/sandbox-playwright"
+          mkdir -p "$playwright_dir"
+          cd "$playwright_dir"
+          npm install --no-save --no-audit --no-fund playwright@1.55.0
+          npx playwright install --with-deps chromium
+          chrome_path="$(node -e "process.stdout.write(require('playwright').chromium.executablePath())")"
+          [ -x "$chrome_path" ]
+          echo "CHROME_PATH=$chrome_path" >> "$GITHUB_ENV"
+
+      - name: Run Linux sandbox release proofs
+        shell: bash
+        run: |
+          cargo +1.88.0 test --locked -p pi-sandbox --test linux_backend
+          cargo +1.88.0 test --locked -p pi-sandbox --lib spawn::tests::owned_spawn_parts_are_consumed_exactly_once -- --nocapture
+          cargo +1.88.0 test --locked -p pi-sandbox --lib unix::tests::wrapper_exec_preserves_only_declared_transport_fds -- --nocapture
+          cargo +1.88.0 test --locked -p pi-sandbox --lib prepare::linux::tests::every_bwrap_argv_fd_survives_wrapper_exec -- --nocapture
+          cargo +1.88.0 test --locked -p pi-sandbox --lib child::tests::linux_descriptor_exec_uses_prepared_inode_after_path_replacement -- --nocapture
+          cargo +1.88.0 test --locked -p pi-sandbox --lib child::tests::all_governed_mappings_survive_and_sources_close_after_install -- --nocapture
+          cargo +1.88.0 test --locked -p pi-sandbox --lib child::tests::status_eof_follows_exec_armed_frame_and_target_exec -- --nocapture
+          cargo +1.88.0 test --locked -p pi-sandbox --lib unix::tests::wrapper_and_child_error_channels_have_distinct_close_owners -- --nocapture
+          cargo +1.88.0 test --locked -p pi-sandbox --lib unix::tests::unrelated_fd_does_not_cross_wrapper_or_target_exec -- --nocapture
+          cargo +1.88.0 test --locked -p pi-sandbox --lib spawn::tests::browser_target_fd_contract_is_exact -- --nocapture
+          cargo +1.88.0 test --locked -p pi-sandbox --lib prepare::linux::tests::target_resolution_pins_inode -- --nocapture
+          cargo +1.88.0 test --locked -p pi-sandbox --lib prepare::linux::tests::current_binary_uses_proc_self_exe_fd -- --nocapture
+          cargo +1.88.0 test --locked -p pi-sandbox --lib bwrap::tests::argv_has_empty_root_and_literal_order -- --nocapture
+          cargo +1.88.0 test --locked -p pi-sandbox --lib bwrap::tests::every_mount_source_is_fd_backed -- --nocapture
+          cargo +1.88.0 test --locked -p pi-sandbox --lib launcher::tests::exec_uses_opened_bwrap_identity -- --nocapture
+          cargo +1.88.0 test --locked -p pi-sandbox --lib prepare::linux::tests::prepared_plan_owns_duplicated_launcher -- --nocapture
+          cargo +1.88.0 test --locked -p pi-sandbox --lib child::tests::child_request_rejects_zero_and_above_default_limits -- --nocapture
+          cargo +1.88.0 test --locked -p pi-sandbox --lib child::tests::hidden_child_applies_limits_nnp_seccomp_then_exec -- --nocapture
+          cargo +1.88.0 test --locked -p pi-sandbox --test pty_launcher -- --nocapture
+          cargo +1.88.0 test --locked -p pi-coding --test browser_native_sandbox governed_debugging_pipe_returns_browser_version -- --nocapture
+
+  sandbox-macos-release:
+    name: sandbox macOS release proof (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Install Rust 1.88.0
+        shell: bash
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustc_version="$(rustc +1.88.0 --version)"
+          echo "$rustc_version"
+          case "$rustc_version" in
+            "rustc 1.88.0 "*) ;;
+            *) echo "Expected rustc 1.88.0" >&2; exit 1 ;;
+          esac
+          test -x /usr/bin/sandbox-exec
+
+
+      - name: Set up Node for Chromium
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+
+      - name: Install Playwright Chromium
+        shell: bash
+        run: |
+          playwright_dir="$RUNNER_TEMP/sandbox-playwright"
+          mkdir -p "$playwright_dir"
+          cd "$playwright_dir"
+          npm install --no-save --no-audit --no-fund playwright@1.55.0
+          npx playwright install --with-deps chromium
+          chrome_path="$(node -e "process.stdout.write(require('playwright').chromium.executablePath())")"
+          [ -x "$chrome_path" ]
+          echo "CHROME_PATH=$chrome_path" >> "$GITHUB_ENV"
+
+      - name: Run macOS sandbox release proofs
+        shell: bash
+        run: |
+          cargo +1.88.0 test --locked -p pi-sandbox --test macos_backend
+          cargo +1.88.0 test --locked -p pi-sandbox --lib prepare::macos::tests::pinned_target_fd_survives_sandbox_exec_and_path_replacement -- --nocapture
+          cargo +1.88.0 test --locked -p pi-sandbox --lib seatbelt::tests::descriptor_process_exec_representation_is_exact -- --nocapture
+          cargo +1.88.0 test --locked -p pi-sandbox --lib unix::tests::wrapper_and_child_error_channels_have_distinct_close_owners -- --nocapture
+          cargo +1.88.0 test --locked -p pi-coding --test browser_native_sandbox governed_debugging_pipe_returns_browser_version -- --nocapture
+
+  sandbox-windows-release:
+    name: sandbox Windows release proof
+    needs: [validate-release, build-web]
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Download embedded Web bundle
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: web-dist
+          path: crates/pi-cli/web/dist
+
+      - name: Install Rust 1.88.0
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          $rustcVersion = rustc +1.88.0 --version
+          Write-Host $rustcVersion
+          if (-not $rustcVersion.StartsWith('rustc 1.88.0 ')) { throw 'Expected rustc 1.88.0' }
+
+
+      - name: Run Windows sandbox release proofs
+        shell: pwsh
+        run: |
+          cargo +1.88.0 test --locked -p pi-cli --test windows_confined_unsupported
+          cargo +1.88.0 test --locked -p pi-coding --test browser_native_sandbox windows_browser_is_rejected_before_approval -- --nocapture
+          cargo +1.88.0 test --locked -p pi-coding --test policy_fs windows_file_identity_preserves_all_128_bits -- --nocapture
+          cargo +1.88.0 test --locked -p pi-coding --test policy_fs windows_enumerated_and_opened_high_bits_cannot_collide -- --nocapture
+          cargo +1.88.0 test --locked -p pi-coding --test policy_fs windows_replacement_rejects_high_bits_identity_swap -- --nocapture
+
   release:
     name: publish GitHub Release
-    needs: [validate-release, build-linux, build-native]
+    needs:
+      - validate-release
+      - sandbox-static-release
+      - build-linux
+      - build-native
+      - package-desktop
+      - package-android
+      - sandbox-linux-release
+      - sandbox-macos-release
+      - sandbox-windows-release
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -453,10 +941,10 @@ jobs:
       group: release-publication
       cancel-in-progress: false
     steps:
-      # Download the five platform archives only. `web-dist` (the embedded
-      # web bundle shared into the build jobs) must NOT land in the release
-      # staging dir — the exact-inventory check below requires exactly the
-      # five archives.
+      # Download every CLI, desktop, and Android release file. `web-dist`
+      # (the embedded web bundle shared into the build jobs) must NOT land in
+      # the release staging dir. The exact-inventory check below requires the
+      # eleven product files and nothing else.
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           path: dist
@@ -482,12 +970,18 @@ jobs:
             "rpi-${version}-x86_64-apple-darwin.tar.gz"
             "rpi-${version}-x86_64-pc-windows-msvc.zip"
             "rpi-${version}-x86_64-unknown-linux-gnu.tar.gz"
+            "rpi-desktop-${version}-aarch64-apple-darwin.zip"
+            "rpi-desktop-${version}-amd64.deb"
+            "rpi-desktop-${version}-arm64.deb"
+            "rpi-desktop-${version}-x86_64-apple-darwin.zip"
+            "rpi-desktop-${version}-x86_64-pc-windows-msvc.zip"
+            "rpi-chat-${version}-android.apk"
           )
 
           printf '%s\n' "${expected[@]}" | LC_ALL=C sort > "$RUNNER_TEMP/expected-assets.txt"
           find . -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort > "$RUNNER_TEMP/actual-assets.txt"
           if ! diff -u "$RUNNER_TEMP/expected-assets.txt" "$RUNNER_TEMP/actual-assets.txt"; then
-            echo "Local release inventory is not exactly the five expected archives" >&2
+            echo "Local release inventory is not exactly the eleven expected product files" >&2
             exit 1
           fi
 
@@ -551,7 +1045,13 @@ jobs:
           body: |
             ## rpi `${{ github.ref_name }}`
 
-            ### Install
+            Checksums for every file below are in `SHA256SUMS`.
+
+            ### CLI
+
+            Platforms: Linux x86_64, Linux aarch64, macOS arm64, macOS x86_64, Windows x86_64.
+
+            Archives are `rpi-<version>-<target-triple>.tar.gz` (Windows is `.zip`). Each contains `rpi` or `rpi.exe` plus `LICENSE`.
 
             ```sh
             # macOS / Linux — installer source pinned to this release commit; candidate pinned to this release tag
@@ -562,6 +1062,16 @@ jobs:
             # Windows PowerShell — installer source pinned to this release commit; candidate pinned to this release tag
             & ([scriptblock]::Create((irm https://raw.githubusercontent.com/0x8f701/rpi/${{ github.sha }}/install.ps1))) -Version ${{ github.ref_name }}
             ```
+
+            ### Desktop
+
+            Platforms: Linux amd64 `.deb`, Linux arm64 `.deb`, macOS arm64 `.zip`, macOS x86_64 `.zip`, Windows x86_64 `.zip`.
+
+            Each desktop package bundles the CLI binary for that same platform. Linux: `dpkg -i rpi-desktop-<version>-amd64.deb` or `dpkg -i rpi-desktop-<version>-arm64.deb`. macOS: unzip `rpi-desktop-<version>-aarch64-apple-darwin.zip` or the x86_64 zip and open `rpi-desktop.app`. Windows: unzip `rpi-desktop-<version>-x86_64-pc-windows-msvc.zip` and run `rpi-desktop\electron.exe`. These desktop packages are not code-signed or notarized.
+
+            ### Mobile
+
+            Android: `rpi-chat-<version>-android.apk` is one sideload APK containing `armeabi-v7a`, `arm64-v8a`, `x86`, and `x86_64`. It is signed with the release keystore supplied to Actions. The application id is `com.rpichat`, versionName `1.0.0`, versionCode `5`. iOS is not published.
 
       - name: Verify remote draft inventory
         env:
@@ -576,6 +1086,12 @@ jobs:
             "rpi-${version}-x86_64-apple-darwin.tar.gz"
             "rpi-${version}-x86_64-pc-windows-msvc.zip"
             "rpi-${version}-x86_64-unknown-linux-gnu.tar.gz"
+            "rpi-desktop-${version}-aarch64-apple-darwin.zip"
+            "rpi-desktop-${version}-amd64.deb"
+            "rpi-desktop-${version}-arm64.deb"
+            "rpi-desktop-${version}-x86_64-apple-darwin.zip"
+            "rpi-desktop-${version}-x86_64-pc-windows-msvc.zip"
+            "rpi-chat-${version}-android.apk"
           )
           release_id="${{ steps.draft_release.outputs.id }}"
           case "$release_id" in
@@ -588,16 +1104,16 @@ jobs:
 
           if ! jq -e --arg tag "$GITHUB_REF_NAME" --arg ispre "$IS_PRERELEASE" \
             '(.tag_name == $tag) and (.draft == true) and (.prerelease == ($ispre == "true")) and
-             (.assets | length == 6) and all(.assets[]; .size > 0)' \
+             (.assets | length == 12) and all(.assets[]; .size > 0)' \
             <<< "$release_json" >/dev/null; then
-            echo "Remote release is not a draft with six nonempty assets" >&2
+            echo "Remote release is not a draft with twelve nonempty assets" >&2
             exit 1
           fi
 
           printf '%s\n' "${expected[@]}" | LC_ALL=C sort > "$RUNNER_TEMP/expected-remote-assets.txt"
           jq -r '.assets[].name' <<< "$release_json" | LC_ALL=C sort > "$RUNNER_TEMP/actual-remote-assets.txt"
           if ! diff -u "$RUNNER_TEMP/expected-remote-assets.txt" "$RUNNER_TEMP/actual-remote-assets.txt"; then
-            echo "Remote draft inventory is not exactly the five archives plus SHA256SUMS" >&2
+            echo "Remote draft inventory is not exactly the eleven product files plus SHA256SUMS" >&2
             exit 1
           fi
 

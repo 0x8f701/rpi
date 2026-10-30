@@ -24,13 +24,13 @@ use pi_ai::{
     MAX_IMAGE_GEN_PROMPT_CHARS,
 };
 
+use crate::WorkspaceRoots;
 use crate::redact::redact_secrets;
 use crate::resolve::resolve_model;
 use crate::tools::paths::resolve_scoped_path;
 use crate::truncate::format_size;
-use crate::WorkspaceRoots;
 
-use ::image as image;
+use ::image;
 use image::ImageFormat;
 
 /// Maximum prompt characters echoed back in the tool result (bounded output).
@@ -44,6 +44,7 @@ pub struct ImageGenConfig {
     pub model: pi_ai::Model,
     pub base_url: Option<String>,
     pub api_key: Option<String>,
+    pub env: std::collections::HashMap<String, String>,
 }
 
 impl std::fmt::Debug for ImageGenConfig {
@@ -54,8 +55,12 @@ impl std::fmt::Debug for ImageGenConfig {
             .field("base_url", &self.base_url)
             .field(
                 "has_api_key",
-                &self.api_key.as_ref().is_some_and(|key| !key.trim().is_empty()),
+                &self
+                    .api_key
+                    .as_ref()
+                    .is_some_and(|key| !key.trim().is_empty()),
             )
+            .field("env_count", &self.env.len())
             .finish()
     }
 }
@@ -65,8 +70,9 @@ impl std::fmt::Debug for ImageGenConfig {
 /// resolver. The optional spec (the tool's `model` argument) overrides the
 /// resolved model. `None` on standalone construction: the tool then falls back
 /// to the turn's model and env-resolved credentials.
-pub type ImageGenConfigFn =
-    std::sync::Arc<dyn Fn(Option<String>) -> pi_agent::BoxFuture<Result<ImageGenConfig>> + Send + Sync>;
+pub type ImageGenConfigFn = std::sync::Arc<
+    dyn Fn(Option<String>) -> pi_agent::BoxFuture<Result<ImageGenConfig>> + Send + Sync,
+>;
 
 /// Builds the `generate_image` tool rooted at `cwd` (workspace-contained).
 pub(crate) fn generate_image_tool(cwd: &str, resolver: Option<ImageGenConfigFn>) -> AgentTool {
@@ -129,21 +135,53 @@ pub(crate) fn generate_image_tool_for_workspace(
         MAX_IMAGE_GEN_N,
         IMAGE_GEN_SIZES.join(", ")
     );
-    AgentTool::new("generate_image", description, params, move |ctx: ToolCallContext| {
-        let workspace = workspace.clone();
-        let resolver = resolver.clone();
-        async move {
-            run_generate_image(&workspace, resolver.as_ref(), ctx.model.as_ref(), ctx.arguments, ctx.abort)
-                .await
-        }
-    })
+    AgentTool::new(
+        "generate_image",
+        description,
+        params,
+        move |_ctx: ToolCallContext| async move {
+            Err(anyhow!("generate_image requires an application generation"))
+        },
+    )
     .with_capability(ToolCapability::Write)
     .with_prompt_guidelines(vec![
         "Use generate_image to create images; it returns workspace file paths, not image bytes."
             .to_string(),
-        "Keep prompts concise and specific; the tool caps prompts at 4096 characters."
-            .to_string(),
+        "Keep prompts concise and specific; the tool caps prompts at 4096 characters.".to_string(),
     ])
+}
+
+pub(crate) fn generate_image_tool_for_workspace_with_generation(
+    workspace: WorkspaceRoots,
+    resolver: Option<ImageGenConfigFn>,
+    capture: crate::tools::GenerationCaptureFn,
+) -> AgentTool {
+    let mut tool = generate_image_tool_for_workspace(workspace.clone(), resolver.clone());
+    tool.execute = std::sync::Arc::new(move |ctx: ToolCallContext| {
+        let workspace = workspace.clone();
+        let resolver = resolver.clone();
+        let capture = capture.clone();
+        Box::pin(async move {
+            let generation = capture()?;
+            let fs = generation.sandbox().fs().confined()?.clone();
+            run_generate_image(
+                &workspace,
+                resolver.as_ref(),
+                ctx.model.as_ref(),
+                ctx.arguments,
+                ctx.abort,
+                Some(
+                    generation
+                        .sandbox()
+                        .http()
+                        .executor(pi_sandbox::HostHttpClass::ImageGeneration),
+                ),
+                Some(fs),
+            )
+            .await
+        })
+    });
+    tool
 }
 
 /// Resolves the model/config: session resolver first, then a standalone
@@ -171,6 +209,7 @@ async fn resolve_gen_config(
         model,
         base_url: None,
         api_key: None,
+        env: std::collections::HashMap::new(),
     })
 }
 
@@ -183,6 +222,8 @@ async fn run_generate_image(
     turn_model: Option<&pi_ai::Model>,
     args: serde_json::Value,
     abort: AbortSignal,
+    http_executor: Option<pi_ai::SharedHttpExecutor>,
+    policy_fs: Option<std::sync::Arc<crate::fs::PolicyFs>>,
 ) -> Result<AgentToolResult> {
     super::check_aborted(&abort)?;
 
@@ -252,7 +293,7 @@ async fn run_generate_image(
         ));
     }
 
-    let save_target = SaveTarget::new(workspace, &path_arg)?;
+    let save_target = SaveTarget::new(workspace, &path_arg, policy_fs.as_deref())?;
 
     let options = ImageGenerationOptions {
         prompt: prompt.clone(),
@@ -260,6 +301,8 @@ async fn run_generate_image(
         size,
         base_url: config.base_url,
         api_key: config.api_key,
+        env: config.env,
+        http_executor,
         ..ImageGenerationOptions::default()
     };
     let result = pi_ai::generate_image(config.model.clone(), options)
@@ -281,7 +324,10 @@ async fn run_generate_image(
         // Format + 16 MP header pre-check BEFORE saving (mirrors inspect_image):
         // a hostile payload cannot exceed the decoded-memory bound.
         let (format, width, height) = inspect_image(&image.data).map_err(|error| {
-            anyhow!("Generated image {} is not a supported image: {error}", index + 1)
+            anyhow!(
+                "Generated image {} is not a supported image: {error}",
+                index + 1
+            )
         })?;
         if u64::from(width) * u64::from(height) > MAX_IMAGE_GEN_PIXELS {
             return Err(anyhow!(
@@ -292,7 +338,7 @@ async fn run_generate_image(
             ));
         }
         let abs = save_target.resolve(format, n, index)?;
-        save_image_bytes(workspace, &abs, &image.data)?;
+        save_image_bytes(policy_fs.as_deref(), &abs, &image.data)?;
         out.push_str(&format!(
             "  {} ({}x{}, {})\n",
             display_path(workspace, &abs),
@@ -378,31 +424,30 @@ impl SaveTarget {
     /// The default `<cwd>/images` goes through the same scoped-path
     /// resolution as explicit paths, so a pre-existing `images` symlink
     /// pointing outside the workspace is rejected instead of followed.
-    fn new(workspace: &WorkspaceRoots, path: &str) -> Result<Self> {
+    fn new(
+        workspace: &WorkspaceRoots,
+        path: &str,
+        fs: Option<&crate::fs::PolicyFs>,
+    ) -> Result<Self> {
+        let fs =
+            fs.ok_or_else(|| anyhow!("generate_image requires captured filesystem authority"))?;
         let path = path.trim();
-        if path.is_empty() {
-            let resolved = resolve_scoped_path("images", workspace)?;
-            let dir = PathBuf::from(resolved);
-            std::fs::create_dir_all(&dir).map_err(|error| {
-                anyhow!("Could not create image output directory {}: {}", dir.display(), error)
-            })?;
-            return Ok(Self::Dir(dir));
-        }
-        let resolved = resolve_scoped_path(path, workspace)?;
+        let resolved =
+            resolve_scoped_path(if path.is_empty() { "images" } else { path }, workspace)?;
         if has_image_extension(path) {
             let file = PathBuf::from(&resolved);
-            if let Some(parent) = file.parent().filter(|p| !p.as_os_str().is_empty()) {
-                std::fs::create_dir_all(parent).map_err(|error| {
-                    anyhow!("Could not create image output directory {}: {}", parent.display(), error)
-                })?;
+            if let Some(parent) = file
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                fs.create_dir_all(parent, crate::fs::FileMode::Shared)?;
             }
-            return Ok(Self::File(file));
+            Ok(Self::File(file))
+        } else {
+            let dir = PathBuf::from(&resolved);
+            fs.create_dir_all(&dir, crate::fs::FileMode::Shared)?;
+            Ok(Self::Dir(dir))
         }
-        let dir = PathBuf::from(&resolved);
-        std::fs::create_dir_all(&dir).map_err(|error| {
-            anyhow!("Could not create image output directory {}: {}", dir.display(), error)
-        })?;
-        Ok(Self::Dir(dir))
     }
 
     /// The absolute path for image `index` (0-based) of `n`.
@@ -422,7 +467,11 @@ impl SaveTarget {
                     .and_then(|e| e.to_str())
                     .unwrap_or_default()
                     .to_ascii_lowercase();
-                let expected = if user_ext == "jpeg" { "jpg" } else { user_ext.as_str() };
+                let expected = if user_ext == "jpeg" {
+                    "jpg"
+                } else {
+                    user_ext.as_str()
+                };
                 if expected != ext {
                     return Err(anyhow!(
                         "The endpoint returned a {ext} image but {} names a .{user_ext} file.",
@@ -443,54 +492,22 @@ impl SaveTarget {
     }
 }
 
-/// Saves image bytes to `abs` with a symlink-swap guard. The parent
-/// directory is re-canonicalized and re-checked against the workspace roots
-/// at write time (a symlink swapped in after [`SaveTarget::new`] validated
-/// the location resolves outside and is rejected), and the final component
-/// is opened with `O_NOFOLLOW` so an existing or racing symlink at the file
-/// itself cannot redirect the write outside the workspace.
-fn save_image_bytes(workspace: &WorkspaceRoots, abs: &Path, data: &[u8]) -> Result<()> {
-    let parent = abs.parent().ok_or_else(|| {
-        anyhow!(
-            "Could not save generated image {}: path has no parent directory.",
-            abs.display()
-        )
+fn save_image_bytes(fs: Option<&crate::fs::PolicyFs>, abs: &Path, data: &[u8]) -> Result<()> {
+    let fs = fs.ok_or_else(|| anyhow!("generate_image requires captured filesystem authority"))?;
+    let expected = match fs.metadata(abs) {
+        Ok(metadata) => Some(metadata.identity),
+        Err(crate::fs::FsError::System {
+            kind: std::io::ErrorKind::NotFound,
+            ..
+        }) => None,
+        Err(error) => return Err(error.into()),
+    };
+    fs.replace_file(crate::fs::PolicyReplacement {
+        path: abs.to_path_buf(),
+        expected,
+        bytes: data.to_vec(),
+        mode: crate::fs::FileMode::Shared,
     })?;
-    let canonical_parent = std::fs::canonicalize(parent).map_err(|error| {
-        anyhow!("Could not save generated image {}: {}", abs.display(), error)
-    })?;
-    if !workspace.roots().iter().any(|root| canonical_parent.starts_with(root)) {
-        return Err(anyhow!(
-            "Refusing to save generated image {}: the output directory now resolves outside \
-             the workspace (symlink swap?).",
-            abs.display()
-        ));
-    }
-    let name = abs.file_name().ok_or_else(|| {
-        anyhow!("Could not save generated image {}: path has no file name.", abs.display())
-    })?;
-    let final_path = canonical_parent.join(name);
-    if std::fs::symlink_metadata(&final_path).is_ok_and(|meta| meta.file_type().is_symlink()) {
-        return Err(anyhow!(
-            "Refusing to save generated image {}: the target is a symlink.",
-            final_path.display()
-        ));
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).write(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        // O_NOFOLLOW closes the race between the symlink_metadata check
-        // above and the open: a symlink landing here makes the open fail.
-        options.custom_flags(nix::libc::O_NOFOLLOW);
-    }
-    let mut file = options
-        .open(&final_path)
-        .map_err(|error| anyhow!("Could not save generated image {}: {}", abs.display(), error))?;
-    use std::io::Write as _;
-    file.write_all(data)
-        .map_err(|error| anyhow!("Could not save generated image {}: {}", abs.display(), error))?;
     Ok(())
 }
 

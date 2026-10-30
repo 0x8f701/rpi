@@ -19,9 +19,8 @@ static REGISTRY_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 /// Per-process isolated native session root so `start_new_recording()` never
 /// writes into the real `~/.pi/agent/sessions` tree (Web sidebar source).
 fn test_sessions_root() -> PathBuf {
-    static ROOT: LazyLock<tempfile::TempDir> = LazyLock::new(|| {
-        tempfile::tempdir().expect("test sessions root")
-    });
+    static ROOT: LazyLock<tempfile::TempDir> =
+        LazyLock::new(|| tempfile::tempdir().expect("test sessions root"));
     ROOT.path().to_path_buf()
 }
 
@@ -58,10 +57,40 @@ fn make_session(
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: None,
+        auth_manager: None,
     })
     .expect("session");
     session.set_session_dir(test_sessions_root());
     (session, registration)
+}
+
+async fn publish_governed_session(
+    session: &Session,
+) -> (pi_coding::Application, tempfile::TempDir) {
+    let agent_root = tempfile::tempdir().expect("facade agent root");
+    let agent_dir = agent_root.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).expect("facade agent dir");
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+    )
+    .expect("facade settings");
+    let mut options = pi_coding::ResourceManagerOptions::new(session.cwd());
+    options.agent_dir = agent_dir;
+    options.disable_extensions = true;
+    options.disable_skills = true;
+    options.disable_prompt_templates = true;
+    options.disable_themes = true;
+    options.disable_context_files = true;
+    options.project_trust_override = Some(true);
+    session
+        .attach_resources(
+            pi_coding::ResourceManager::new(options).expect("facade resources"),
+        )
+        .await
+        .expect("attach facade resources");
+    let application = pi_coding::Application::new(session.clone()).await;
+    (application, agent_root)
 }
 
 fn configure_fast_retry(session: &Session, enabled: bool, max_retries: usize) {
@@ -95,10 +124,14 @@ async fn persistent_subscription_observes_multiple_runs_and_prompt_bytes_are_pre
     session.run("  first\n", vec![]).await.expect("first");
     session.run("second", vec![]).await.expect("second");
     assert_eq!(*starts.lock().expect("lock"), 2);
-    let first = session.history().into_iter().find_map(|message| match message {
-        Message::User(user) => Some(user),
-        _ => None,
-    }).expect("user");
+    let first = session
+        .history()
+        .into_iter()
+        .find_map(|message| match message {
+            Message::User(user) => Some(user),
+            _ => None,
+        })
+        .expect("user");
     assert!(matches!(&first.content[0], ContentBlock::Text { text, .. } if text == "  first\n"));
     registration.unregister();
 }
@@ -265,6 +298,7 @@ fn dropped_run_survives_owning_runtime_shutdown_and_session_reuses() {
         after_tool_call: None,
         stream_fn: Some(stream_fn),
         auth_resolver: None,
+        auth_manager: None,
     })
     .expect("session");
     let thread_session = session.clone();
@@ -298,9 +332,13 @@ fn dropped_run_survives_owning_runtime_shutdown_and_session_reuses() {
 async fn direct_bash_streams_persists_and_respects_context_exclusion() {
     let _guard = REGISTRY_LOCK.lock().expect("registry lock");
     let (session, registration) = make_session(Vec::new());
+    let _governed = publish_governed_session(&session).await;
     let mut events = session.subscribe_session_events();
     session.start_new_recording().expect("start recorder");
-    let result = session.execute_bash("printf visible", false).await.expect("visible bash");
+    let result = session
+        .execute_bash("printf visible", false)
+        .await
+        .expect("visible bash");
     assert_eq!(result.exit_code, Some(0));
     assert_eq!(result.output, "visible");
     // Production streams arbitrary raw pipe-read chunks (each `read()` is one
@@ -320,13 +358,25 @@ async fn direct_bash_streams_persists_and_respects_context_exclusion() {
         }
     };
     assert_eq!(streamed, "visible");
-    assert!(matches!(end, SessionEvent::BashExecutionEnd { ref message } if message.command == "printf visible" && message.exit_code == Some(0) && message.exclude_from_context.is_none()));
-    let excluded = session.execute_bash("printf hidden", true).await.expect("excluded bash");
+    assert!(
+        matches!(end, SessionEvent::BashExecutionEnd { ref message } if message.command == "printf visible" && message.exit_code == Some(0) && message.exclude_from_context.is_none())
+    );
+    let excluded = session
+        .execute_bash("printf hidden", true)
+        .await
+        .expect("excluded bash");
     assert_eq!(excluded.output, "hidden");
     let history = session.history();
-    assert!(matches!(&history[history.len() - 2], Message::BashExecution(message) if message.output == "visible" && message.exclude_from_context.is_none()));
-    assert!(matches!(&history[history.len() - 1], Message::BashExecution(message) if message.output == "hidden" && message.exclude_from_context == Some(true)));
-    let entries = session.session_entries(None).expect("session entries").entries;
+    assert!(
+        matches!(&history[history.len() - 2], Message::BashExecution(message) if message.output == "visible" && message.exclude_from_context.is_none())
+    );
+    assert!(
+        matches!(&history[history.len() - 1], Message::BashExecution(message) if message.output == "hidden" && message.exclude_from_context == Some(true))
+    );
+    let entries = session
+        .session_entries(None)
+        .expect("session entries")
+        .entries;
     assert!(entries.iter().any(|entry| matches!(&entry.message, Some(Message::BashExecution(message)) if message.command == "printf visible" && message.output == "visible")));
     assert!(entries.iter().any(|entry| matches!(&entry.message, Some(Message::BashExecution(message)) if message.command == "printf hidden" && message.exclude_from_context == Some(true))));
     registration.unregister();
@@ -336,21 +386,33 @@ async fn direct_bash_streams_persists_and_respects_context_exclusion() {
 async fn direct_bash_nonzero_and_abort_are_semantic_results() {
     let _guard = REGISTRY_LOCK.lock().expect("registry lock");
     let (session, registration) = make_session(Vec::new());
-    let nonzero = session.execute_bash("exit 7", false).await.expect("nonzero bash");
+    let _governed = publish_governed_session(&session).await;
+    let nonzero = session
+        .execute_bash("exit 7", false)
+        .await
+        .expect("nonzero bash");
     assert_eq!(nonzero.exit_code, Some(7));
     assert!(!nonzero.cancelled);
     let running = session.clone();
     let task = tokio::spawn(async move { running.execute_bash("sleep 30", false).await });
     for _ in 0..100 {
-        if session.is_bash_running() { break; }
+        if session.is_bash_running() {
+            break;
+        }
         tokio::task::yield_now().await;
     }
     assert!(session.is_bash_running());
     session.abort_bash();
-    let aborted = tokio::time::timeout(std::time::Duration::from_secs(3), task).await.expect("abort timeout").expect("bash task").expect("aborted result");
+    let aborted = tokio::time::timeout(std::time::Duration::from_secs(3), task)
+        .await
+        .expect("abort timeout")
+        .expect("bash task")
+        .expect("aborted result");
     assert!(aborted.cancelled);
     assert_eq!(aborted.exit_code, None);
-    assert!(matches!(session.history().last(), Some(Message::BashExecution(message)) if message.cancelled));
+    assert!(
+        matches!(session.history().last(), Some(Message::BashExecution(message)) if message.cancelled)
+    );
     registration.unregister();
 }
 
@@ -358,6 +420,7 @@ async fn direct_bash_nonzero_and_abort_are_semantic_results() {
 async fn dropped_direct_bash_aborts_and_releases_the_session_slot() {
     let _guard = REGISTRY_LOCK.lock().expect("registry lock");
     let (session, registration) = make_session(Vec::new());
+    let _governed = publish_governed_session(&session).await;
     let mut bash = Box::pin(session.execute_bash("sleep 30", false));
     tokio::select! {
         result = &mut bash => panic!("bash completed before drop: {result:?}"),
@@ -366,7 +429,10 @@ async fn dropped_direct_bash_aborts_and_releases_the_session_slot() {
     assert!(session.is_bash_running());
     drop(bash);
     assert!(!session.is_bash_running());
-    let reused = session.execute_bash("printf reused", false).await.expect("reused bash");
+    let reused = session
+        .execute_bash("printf reused", false)
+        .await
+        .expect("reused bash");
     assert_eq!(reused.output, "reused");
     registration.unregister();
 }
@@ -375,7 +441,12 @@ async fn dropped_direct_bash_aborts_and_releases_the_session_slot() {
 async fn session_stats_aggregate_history_usage_cost_and_tool_calls() {
     let _guard = REGISTRY_LOCK.lock().expect("registry lock");
     let (session, registration) = make_session(Vec::new());
-    let tool_call = ToolCall { id: "call".into(), name: "read".into(), arguments: json!({"path":"x"}), thought_signature: None };
+    let tool_call = ToolCall {
+        id: "call".into(),
+        name: "read".into(),
+        arguments: json!({"path":"x"}),
+        thought_signature: None,
+    };
     let mut assistant = AssistantMessage::pending(&session.model().expect("model"));
     assistant.content = vec![ContentBlock::ToolCall(tool_call)];
     assistant.stop_reason = StopReason::ToolUse;
@@ -385,10 +456,19 @@ async fn session_stats_aggregate_history_usage_cost_and_tool_calls() {
         cache_read: 2,
         cache_write: 1,
         total_tokens: 18,
-        cost: pi_ai::CostBreakdown { total: 0.25, ..Default::default() },
+        cost: pi_ai::CostBreakdown {
+            total: 0.25,
+            ..Default::default()
+        },
         ..Default::default()
     };
-    session.load_history(vec![Message::user_text("question", 1), Message::Assistant(assistant)]).await.expect("load history");
+    session
+        .load_history(vec![
+            Message::user_text("question", 1),
+            Message::Assistant(assistant),
+        ])
+        .await
+        .expect("load history");
     let stats = session.session_stats();
     assert_eq!(stats.user_messages, 1);
     assert_eq!(stats.assistant_messages, 1);
@@ -443,17 +523,24 @@ async fn hidden_custom_message_reaches_provider_as_user_but_stays_typed_in_histo
         after_tool_call: None,
         stream_fn: Some(stream_fn),
         auth_resolver: None,
-    }).expect("session");
-    session.run_messages(vec![Message::Custom(pi_ai::CustomMessage {
-        custom_type: "loop_scheduled_turn".into(),
-        content: "<system-reminder>internal</system-reminder>\n\necho hello".into(),
-        display: false,
-        details: Some(json!({"prompt":"echo hello"})),
-        timestamp: 1,
-    })]).await.expect("run custom message");
+        auth_manager: None,
+    })
+    .expect("session");
+    session
+        .run_messages(vec![Message::Custom(pi_ai::CustomMessage {
+            custom_type: "loop_scheduled_turn".into(),
+            content: "<system-reminder>internal</system-reminder>\n\necho hello".into(),
+            display: false,
+            details: Some(json!({"prompt":"echo hello"})),
+            timestamp: 1,
+        })])
+        .await
+        .expect("run custom message");
     assert!(matches!(session.history().first(), Some(Message::Custom(custom)) if !custom.display));
     let contexts = contexts.lock().expect("contexts");
-    assert!(matches!(contexts[0].messages.first(), Some(Message::User(user)) if matches!(&user.content[0], ContentBlock::Text { text, .. } if text.contains("system-reminder"))));
+    assert!(
+        matches!(contexts[0].messages.first(), Some(Message::User(user)) if matches!(&user.content[0], ContentBlock::Text { text, .. } if text.contains("system-reminder")))
+    );
 }
 
 #[tokio::test]
@@ -479,18 +566,38 @@ async fn next_turn_custom_message_is_delivered_once_after_user_prompt() {
         .expect("queue next-turn message");
     assert!(session.history().is_empty());
 
-    session.run("first prompt", Vec::new()).await.expect("first run");
-    session.run("second prompt", Vec::new()).await.expect("second run");
+    session
+        .run("first prompt", Vec::new())
+        .await
+        .expect("first run");
+    session
+        .run("second prompt", Vec::new())
+        .await
+        .expect("second run");
     let history = session.history();
-    let user_index = history.iter().position(|message| matches!(message, Message::User(user)
-        if matches!(&user.content[0], ContentBlock::Text { text, .. } if text == "first prompt")))
+    let user_index = history
+        .iter()
+        .position(|message| {
+            matches!(message, Message::User(user)
+        if matches!(&user.content[0], ContentBlock::Text { text, .. } if text == "first prompt"))
+        })
         .expect("first user prompt");
-    let custom_index = history.iter().position(|message| matches!(message, Message::Custom(custom)
-        if custom.custom_type == "extension.context" && !custom.display))
+    let custom_index = history
+        .iter()
+        .position(|message| {
+            matches!(message, Message::Custom(custom)
+        if custom.custom_type == "extension.context" && !custom.display)
+        })
         .expect("next-turn custom message");
     assert!(user_index < custom_index);
-    assert_eq!(history.iter().filter(|message| matches!(message, Message::Custom(custom)
-        if custom.custom_type == "extension.context")).count(), 1);
+    assert_eq!(
+        history
+            .iter()
+            .filter(|message| matches!(message, Message::Custom(custom)
+        if custom.custom_type == "extension.context"))
+            .count(),
+        1
+    );
     registration.unregister();
 }
 
@@ -504,27 +611,75 @@ async fn auto_retry_schedules_then_succeeds_without_duplicate_user_message() {
     configure_fast_retry(&session, true, 3);
     session.start_new_recording().expect("start retry recorder");
     let mut events = session.subscribe_session_events();
-    let result = session.run("retry me", vec![]).await.expect("retry succeeds");
+    let result = session
+        .run("retry me", vec![])
+        .await
+        .expect("retry succeeds");
     assert_eq!(result.text, "recovered");
-    assert_eq!(session.history().iter().filter(|message| matches!(message, Message::User(_))).count(), 1);
-    assert_eq!(session.history().iter().filter(|message| matches!(message, Message::Assistant(_))).count(), 1);
-    let recorded = session.session_entries(None).expect("retry session entries").entries;
-    assert_eq!(recorded.iter().filter(|entry| matches!(&entry.message, Some(Message::User(_)))).count(), 1);
-    assert_eq!(recorded.iter().filter(|entry| matches!(&entry.message, Some(Message::Assistant(_)))).count(), 2);
+    assert_eq!(
+        session
+            .history()
+            .iter()
+            .filter(|message| matches!(message, Message::User(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        session
+            .history()
+            .iter()
+            .filter(|message| matches!(message, Message::Assistant(_)))
+            .count(),
+        1
+    );
+    let recorded = session
+        .session_entries(None)
+        .expect("retry session entries")
+        .entries;
+    assert_eq!(
+        recorded
+            .iter()
+            .filter(|entry| matches!(&entry.message, Some(Message::User(_))))
+            .count(),
+        1
+    );
+    assert_eq!(
+        recorded
+            .iter()
+            .filter(|entry| matches!(&entry.message, Some(Message::Assistant(_))))
+            .count(),
+        2
+    );
     let mut start = None;
     let mut end = None;
     while start.is_none() || end.is_none() {
-        match tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await.expect("retry event timeout").expect("retry event") {
-            SessionEvent::AutoRetryStart { attempt, max_attempts, delay_ms, error_message } => {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .expect("retry event timeout")
+            .expect("retry event")
+        {
+            SessionEvent::AutoRetryStart {
+                attempt,
+                max_attempts,
+                delay_ms,
+                error_message,
+            } => {
                 start = Some((attempt, max_attempts, delay_ms, error_message));
             }
-            SessionEvent::AutoRetryEnd { success, attempt, final_error } => {
+            SessionEvent::AutoRetryEnd {
+                success,
+                attempt,
+                final_error,
+            } => {
                 end = Some((success, attempt, final_error));
             }
             _ => {}
         }
     }
-    assert_eq!(start, Some((1, 3, 10, "503 Service unavailable".to_owned())));
+    assert_eq!(
+        start,
+        Some((1, 3, 10, "503 Service unavailable".to_owned()))
+    );
     assert_eq!(end, Some((true, 1, None)));
     registration.unregister();
 }
@@ -532,13 +687,19 @@ async fn auto_retry_schedules_then_succeeds_without_duplicate_user_message() {
 #[tokio::test]
 async fn auto_retry_disabled_does_not_schedule_and_exhaustion_is_bounded() {
     let _guard = REGISTRY_LOCK.lock().expect("registry lock");
-    let (disabled, disabled_registration) = make_session(vec![FauxResponse::error("503 Service unavailable")]);
+    let (disabled, disabled_registration) =
+        make_session(vec![FauxResponse::error("503 Service unavailable")]);
     configure_fast_retry(&disabled, true, 3);
     disabled.set_auto_retry_enabled(false);
     assert!(!disabled.auto_retry_enabled());
     let mut disabled_events = disabled.subscribe_session_events();
-    disabled.run("no retry", vec![]).await.expect_err("disabled retry returns provider failure");
-    while let Ok(Ok(event)) = tokio::time::timeout(std::time::Duration::from_millis(30), disabled_events.recv()).await {
+    disabled
+        .run("no retry", vec![])
+        .await
+        .expect_err("disabled retry returns provider failure");
+    while let Ok(Ok(event)) =
+        tokio::time::timeout(std::time::Duration::from_millis(30), disabled_events.recv()).await
+    {
         assert!(!matches!(event, SessionEvent::AutoRetryStart { .. }));
     }
     disabled_registration.unregister();
@@ -550,39 +711,73 @@ async fn auto_retry_disabled_does_not_schedule_and_exhaustion_is_bounded() {
     ]);
     configure_fast_retry(&exhausted, true, 2);
     let mut events = exhausted.subscribe_session_events();
-    exhausted.run("exhaust", vec![]).await.expect_err("exhausted retries return provider failure");
+    exhausted
+        .run("exhaust", vec![])
+        .await
+        .expect_err("exhausted retries return provider failure");
     let mut starts = Vec::new();
     let mut terminal = None;
     while terminal.is_none() {
-        match tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await.expect("retry event timeout").expect("retry event") {
-            SessionEvent::AutoRetryStart { attempt, delay_ms, .. } => starts.push((attempt, delay_ms)),
-            SessionEvent::AutoRetryEnd { success, attempt, final_error } if !success => terminal = Some((attempt, final_error)),
+        match tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .expect("retry event timeout")
+            .expect("retry event")
+        {
+            SessionEvent::AutoRetryStart {
+                attempt, delay_ms, ..
+            } => starts.push((attempt, delay_ms)),
+            SessionEvent::AutoRetryEnd {
+                success,
+                attempt,
+                final_error,
+            } if !success => terminal = Some((attempt, final_error)),
             _ => {}
         }
     }
     assert_eq!(starts, [(1, 10), (2, 20)]);
-    assert_eq!(terminal, Some((2, Some("503 first | 503 second | 503 final".to_owned()))));
+    assert_eq!(
+        terminal,
+        Some((2, Some("503 first | 503 second | 503 final".to_owned())))
+    );
     exhausted_registration.unregister();
 }
 
 #[tokio::test]
 async fn abort_retry_interrupts_scheduled_sleep() {
     let _guard = REGISTRY_LOCK.lock().expect("registry lock");
-    let (session, registration) = make_session(vec![FauxResponse::error("503 Service unavailable")]);
-    session.set_retry_settings(RetrySettings { enabled: true, max_retries: 3, base_delay_ms: 30_000 , ..Default::default() });
+    let (session, registration) =
+        make_session(vec![FauxResponse::error("503 Service unavailable")]);
+    session.set_retry_settings(RetrySettings {
+        enabled: true,
+        max_retries: 3,
+        base_delay_ms: 30_000,
+        ..Default::default()
+    });
     let mut events = session.subscribe_session_events();
     let running = session.clone();
     let task = tokio::spawn(async move { running.run("abort retry", vec![]).await });
     loop {
-        if matches!(events.recv().await.expect("retry event"), SessionEvent::AutoRetryStart { .. }) {
+        if matches!(
+            events.recv().await.expect("retry event"),
+            SessionEvent::AutoRetryStart { .. }
+        ) {
             break;
         }
     }
     session.abort_retry();
-    let error = tokio::time::timeout(std::time::Duration::from_secs(2), task).await.expect("abort timeout").expect("retry task").expect_err("retry cancelled");
+    let error = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+        .await
+        .expect("abort timeout")
+        .expect("retry task")
+        .expect_err("retry cancelled");
     assert!(error.to_string().contains("Retry cancelled"));
     let end = loop {
-        if let SessionEvent::AutoRetryEnd { success, attempt, final_error } = events.recv().await.expect("retry end") {
+        if let SessionEvent::AutoRetryEnd {
+            success,
+            attempt,
+            final_error,
+        } = events.recv().await.expect("retry end")
+        {
             break (success, attempt, final_error);
         }
     };
@@ -620,7 +815,10 @@ async fn resolved_auth_stays_request_scoped_and_out_of_model_serialization() {
             Ok(pi_coding::RequestAuth {
                 api_key: "request-api-secret".to_owned(),
                 headers: std::collections::HashMap::from([
-                    ("Authorization".to_owned(), "Bearer request-secret".to_owned()),
+                    (
+                        "Authorization".to_owned(),
+                        "Bearer request-secret".to_owned(),
+                    ),
                     ("X-Probe".to_owned(), "probe-secret".to_owned()),
                 ]),
                 env: std::collections::HashMap::from([(
@@ -652,6 +850,7 @@ async fn resolved_auth_stays_request_scoped_and_out_of_model_serialization() {
         after_tool_call: None,
         stream_fn: Some(stream_fn),
         auth_resolver: Some(resolver),
+        auth_manager: None,
     })
     .expect("session");
 
@@ -672,6 +871,15 @@ async fn resolved_auth_stays_request_scoped_and_out_of_model_serialization() {
         assert!(!debug.contains(secret));
     }
     assert_eq!(public_model, model);
+    // Application bootstrap derives session HTTP authorities from the registered
+    // provider. This test's model is not a catalog api, so register a hermetic
+    // resolver before publish.
+    let _auth_provider = register_faux_provider(FauxProviderOptions {
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+        models: vec![model.clone()],
+        chunk_size: 1,
+    });
     let application = pi_coding::Application::new(session.clone()).await;
     let application_state = application.state().await;
     let state_serialized =
@@ -693,18 +901,38 @@ async fn resolved_auth_stays_request_scoped_and_out_of_model_serialization() {
         .expect("capture lock")
         .take()
         .expect("captured provider request");
-    assert!(request_model.headers.as_ref().is_none_or(std::collections::HashMap::is_empty));
-    assert_eq!(request_options.stream.api_key.as_deref(), Some("request-api-secret"));
+    assert!(
+        request_model
+            .headers
+            .as_ref()
+            .is_none_or(std::collections::HashMap::is_empty)
+    );
     assert_eq!(
-        request_options.stream.headers.get("Authorization").map(String::as_str),
+        request_options.stream.api_key.as_deref(),
+        Some("request-api-secret")
+    );
+    assert_eq!(
+        request_options
+            .stream
+            .headers
+            .get("Authorization")
+            .map(String::as_str),
         Some("Bearer request-secret")
     );
     assert_eq!(
-        request_options.stream.headers.get("X-Probe").map(String::as_str),
+        request_options
+            .stream
+            .headers
+            .get("X-Probe")
+            .map(String::as_str),
         Some("probe-secret")
     );
     assert_eq!(
-        request_options.stream.env.get("REQUEST_AUTH_ENV").map(String::as_str),
+        request_options
+            .stream
+            .env
+            .get("REQUEST_AUTH_ENV")
+            .map(String::as_str),
         Some("env-secret")
     );
 }

@@ -29,6 +29,7 @@ import { chromium } from 'playwright';
 import fs from 'node:fs';
 import path from 'node:path';
 import WebSocket from 'ws';
+import { assertSidebarNewActionAbsent, createFreshSessionViaManage } from './lib/session-lifecycle.mjs';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
@@ -40,9 +41,173 @@ const fastReply = process.env.RPI_FAST_REPLY || 'steering-followup-reply';
 const slowTail = process.env.RPI_SLOW_TAIL || 'chunk-four-done';
 const abortedTail = '-done';
 
-const executed = new Set();
+const executed = new Map(); // id -> exact execution count (per-ID ledger, no Set erasure)
+// The documented contract this driver must execute EXACTLY once — IN THE
+// ACTUAL ASSERTION-SITE (runtime) ORDER. The coverage matrix requires the
+// published ledger's executed array to equal the documented array IN ORDER,
+// so the documented list tracks the real site order (assertId/record/
+// wireTitleJourney call sites) instead of a hand-grouped narrative order.
+const DOCUMENTED_IDS = [
+  'auth.no-token-probe',
+  'auth.wrong-token-toast',
+  'auth.good-token-connect',
+  'app.primary-action-send',
+  'prompt.slow-stream-full',
+  'prompt.fast-roundtrip',
+  'app.primary-action-stop',
+  'abort.early-preserves-text',
+  'abort.no-tail-render',
+  'abort.neutral-toast',
+  'abort.no-error-toast',
+  'prompt.new-message-count',
+  'md.table-rendered',
+  'md.task-list-glyph',
+  'mermaid.svg-rendered',
+  'katex.rendered',
+  'md.no-fence-leak',
+  'md.no-separator-leak',
+  'md.fence-rendered',
+  'md.fence-copy',
+  'md.link-safe',
+  'md.link-blocked',
+  'md.image-safe',
+  'md.image-blocked',
+  'md.extra-blockquote',
+  'md.extra-hr',
+  'md.extra-ol',
+  'md.extra-nested-list',
+  'md.extra-fence-langs',
+  'md.extra-mermaid-empty',
+  'md.extra-mermaid-error',
+  'md.extra-mermaid-no-residue',
+  'md.extra-currency',
+  'md.extra-image-relative',
+  'md.extra-url-policy',
+  'app.tool-card',
+  'app.tool-card-done',
+  'app.tool-card-settled',
+  'app.tool-card-web-search',
+  'app.tool-card-edit',
+  'realtime.overlay-visible',
+  'realtime.proxy-alpha-header',
+  'realtime.session-update-transcription',
+  'realtime.transcript-delta',
+  'realtime.transcript-segment',
+  'realtime.transcript-commit',
+  'realtime.composer-final-screenshot',
+  'realtime.transcript-dedup',
+  'realtime.transcription-failed-toast',
+  'realtime.error-toast',
+  'realtime.delegation',
+  'realtime.stop',
+  'reconnect.pill',
+  'reconnect.auto-on',
+  'reconnect.transcript-survives',
+  'app.tool-card-reconnect',
+  'reconnect.roundtrip',
+  'switch.model-roundtrip',
+  'switch.thinking-roundtrip',
+  'todo.create-row',
+  'todo.complete-status',
+  'todo.counts-done',
+  'todo.reopen-status',
+  'todo.detail-pane',
+  'todo.add-via-enter',
+  'todo.dep-link',
+  'todo.dep-unlink',
+  'todo.detail-complete',
+  'todo.detail-reopen',
+  'todo.clear-selection',
+  'todo.all-rows-counts-converged',
+  'goal.empty-state',
+  'goal.create',
+  'goal.budget-usage',
+  'goal.pin',
+  'concurrency.second-ws-rpc',
+  'concurrency.live-event-reflect',
+  'goal.pause-live',
+  'goal.resume',
+  'goal.journal-order',
+  'workflow.create-row',
+  'workflow.live-status',
+  'workflow.select-row',
+  'workflow.pause',
+  'workflow.resume',
+  'workflow.cancel-status',
+  'workflow.remove',
+  'workflow.create-via-enter',
+  'workflow.integrate',
+  'settings.browse-category',
+  'settings.secret-redacted-readonly',
+  'settings.draft-dirty',
+  'settings.apply-persisted',
+  'settings.refresh',
+  'settings.typed-boolean',
+  'settings.typed-enum',
+  'settings.typed-number',
+  'settings.typed-json',
+  'settings.reset',
+  'settings.cancel-draft',
+  'settings.close',
+  'slash.snapcompact',
+  'slash.compact-llm',
+  'slash.compact-bare',
+  'slash.snapcompact-tail',
+  'slash.skill-usage-error',
+  'slash.skill-rpc',
+  'slash.code-review-open',
+  'slash.code-review-close',
+  'slash.code-review-range',
+  'slash.code-review-base',
+  'slash.code-review-usage-error',
+  'slash.unknown-falls-through',
+  'session.sidebar-list',
+  'session.rename-panel-sidebar',
+  'nav.header-no-duplicate-session',
+  'session.history-listed',
+  'session.switch-new-id',
+  'session.transcript-cleared',
+  'subagent.spawn-live',
+  'subagent.activity-line',
+  'subagent.hub-send',
+  'subagent.output-view',
+  'subagent.cancel',
+  'subagent.spawn-via-enter',
+  'subagent.message-via-enter',
+  'sidechat.default-tab',
+  'sidechat.new-tab',
+  'sidechat.tab-activated',
+  'sidechat.prompt-reply',
+  'mobile.sidebar-toggle-visible',
+  'mobile.drawer-opens',
+  'mobile.viewport-no-hscroll',
+  'mobile.composer-above-fold',
+  'mobile.touch-targets-44',
+  'mobile.thinking-hidden',
+  'mobile.header-no-duplicate-session',
+  'concurrency.second-page-connects',
+  'nav.panel-open-close',
+  'realtime.conn-state-connected',
+  'realtime.session-update',
+  'realtime.error-message-only',
+  'realtime.error-code-only',
+  'realtime.error-bare',
+  'realtime.dc-error',
+  'realtime.conn-disconnected',
+  'realtime.conn-failed-teardown',
+  'wire.bash-done',
+  'wire.bash-empty',
+  'wire.bash-error',
+  'wire.bash-bound-tail',
+  'wire.title-snake',
+  'wire.title-acronym',
+  'wire.title-kebab',
+  'wire.tool-error-card',
+  'wire.todo-card-running',
+  'wire.todo-structured-view',
+];
 function record(id) {
-  executed.add(id);
+  executed.set(id, (executed.get(id) || 0) + 1);
   console.log(`[web-cov:assert] ${id}`);
 }
 
@@ -74,14 +239,14 @@ async function lastAssistantText(page) {
 
 // Wait until the main session is user-visibly idle. Enter during an active
 // stream is mapped to steer (not a new prompt), so sequential NEW prompts must
-// only be issued after #stream-badge clears.
+// only be issued after the unified composer action returns to Send.
 async function waitForIdle(page, label, timeoutMs = 30000) {
   await waitFor(
     page,
-    () => {
-      const badge = document.getElementById('stream-badge');
-      return !badge || badge.hidden === true;
-    },
+    // Production streaming gate (App.tsx): activeStreaming flips the
+    // #send-btn aria-label. Missing element fails the gate — never passes
+    // on a torn render.
+    () => document.getElementById('send-btn')?.getAttribute('aria-label') === 'Send message',
     label,
     timeoutMs
   );
@@ -144,14 +309,141 @@ function rpcClient(wsUrl) {
   };
 }
 
+const LIVE_WORKFLOW_STATUSES = new Set(['queued', 'planning', 'running', 'paused', 'integrating']);
+const DELIVERY_OUTCOMES = new Set(['queued', 'woken', 'revived', 'processed', 'failed']);
+
+function requireWorkflowSnapshot(value, expectedName, label) {
+  if (!value || typeof value !== 'object') fail(`${label}: backend returned no workflow snapshot`);
+  if (typeof value.workflowId !== 'string' || value.workflowId === '') fail(`${label}: workflowId missing`);
+  if (value.name !== expectedName) fail(`${label}: expected name ${expectedName}, got ${JSON.stringify(value.name)}`);
+  if (!Number.isSafeInteger(value.generation) || value.generation < 1) fail(`${label}: generation must be a positive integer`);
+  if (typeof value.worktree !== 'string' || value.worktree === '') fail(`${label}: projected worktree missing`);
+  if (typeof value.branch !== 'string' || value.branch === '') fail(`${label}: projected branch missing`);
+  if (value.worktree.startsWith('/') || value.worktree.startsWith('\\')) fail(`${label}: absolute worktree leaked`);
+  if (!value.branch.includes(value.workflowId)) fail(`${label}: branch does not carry workflowId: ${value.branch}`);
+  if (!LIVE_WORKFLOW_STATUSES.has(value.status)) fail(`${label}: workflow is not live: ${value.status}`);
+  return value;
+}
+
+async function waitForWorkflowSnapshot(rpc, workflowId, expectedName, label) {
+  const deadline = Date.now() + 30000;
+  let last = 'snapshot missing';
+  while (Date.now() < deadline) {
+    try {
+      const snapshot = await rpc.call({ type: 'workflow_get', workflowId });
+      if (
+        snapshot?.workflowId === workflowId && snapshot.name === expectedName &&
+        Number.isSafeInteger(snapshot.generation) && snapshot.generation > 0 &&
+        typeof snapshot.worktree === 'string' && snapshot.worktree !== '' &&
+        typeof snapshot.branch === 'string' && snapshot.branch !== '' &&
+        LIVE_WORKFLOW_STATUSES.has(snapshot.status)
+      ) return requireWorkflowSnapshot(snapshot, expectedName, label);
+      last = JSON.stringify(snapshot);
+    } catch (err) {
+      last = err instanceof Error ? err.message : String(err);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+  fail(`${label}: workflow never returned live with worktree evidence: ${last}`);
+}
+
+function requireTypedReceipt(value, workflow, recipient, expectedOutcome, label) {
+  if (value?.workflowId !== workflow.workflowId || value?.generation !== workflow.generation || value?.recipient !== recipient) {
+    fail(`${label}: receipt envelope identity mismatch: ${JSON.stringify(value)}`);
+  }
+  if (!Array.isArray(value.receipts) || value.receipts.length !== 1) fail(`${label}: expected one receipt`);
+  const receipt = value.receipts[0];
+  if (typeof receipt.to !== 'string' || !DELIVERY_OUTCOMES.has(receipt.outcome)) fail(`${label}: untyped receipt ${JSON.stringify(receipt)}`);
+  if (typeof receipt.messageId !== 'string' || receipt.messageId === '') fail(`${label}: receipt messageId missing`);
+  if (expectedOutcome === 'delivered' && receipt.outcome === 'failed') fail(`${label}: delivery failed ${JSON.stringify(receipt)}`);
+  if (expectedOutcome === 'failed' && (receipt.outcome !== 'failed' || typeof receipt.error !== 'string' || receipt.error === '')) {
+    fail(`${label}: failed receipt omitted visible error ${JSON.stringify(receipt)}`);
+  }
+  return receipt;
+}
+
+async function requireRpcFailure(promise, label) {
+  try {
+    await promise;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (!message.includes('stale') || !message.includes('generation')) {
+      fail(`${label}: wrong error ${JSON.stringify(message)}`);
+    }
+    return;
+  }
+  fail(`${label}: RPC unexpectedly succeeded`);
+}
+
+async function waitForWorkflowDetail(rpc, workflow, label) {
+  const deadline = Date.now() + 30000;
+  let last = 'detail missing';
+  while (Date.now() < deadline) {
+    try {
+      const detail = await rpc.call({ type: 'workflow_detail', workflowId: workflow.workflowId });
+      const tasks = Array.isArray(detail.todo)
+        ? detail.todo.flatMap((phase) => Array.isArray(phase?.tasks) ? phase.tasks : [])
+        : [];
+      if (
+        detail.id === workflow.workflowId && detail.generation === workflow.generation &&
+        detail.name === workflow.name && detail.objective === workflow.objective &&
+        LIVE_WORKFLOW_STATUSES.has(detail.status) &&
+        detail.worktree?.label === workflow.worktree && detail.worktree?.branch === workflow.branch &&
+        typeof detail.supervisor?.name === 'string' && detail.supervisor.name !== '' &&
+        Array.isArray(detail.planningActivity) && detail.planningActivity.length > 0 &&
+        tasks.length > 0 && Array.isArray(detail.subagents) && detail.subagents.length > 0 &&
+        Array.isArray(detail.jobs) && detail.jobs.length > 0
+      ) return detail;
+      last = JSON.stringify(detail);
+    } catch (err) {
+      last = err instanceof Error ? err.message : String(err);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+  fail(`${label}: supervisor/workers/tasks/planning detail never converged: ${last}`);
+}
+
+async function waitForWorkflowIrc(rpc, workflow, text, label) {
+  const deadline = Date.now() + 30000;
+  let last = 'detail missing';
+  while (Date.now() < deadline) {
+    try {
+      const detail = await rpc.call({ type: 'workflow_detail', workflowId: workflow.workflowId });
+      const identityMatches = detail.id === workflow.workflowId && detail.generation === workflow.generation;
+      const messages = Array.isArray(detail.recentIrc) ? detail.recentIrc : [];
+      if (identityMatches && (text === null || messages.some((message) => message.text.includes(text)))) return detail;
+      last = JSON.stringify(detail);
+    } catch (err) {
+      last = err instanceof Error ? err.message : String(err);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+  fail(`${label}: exact workflow IRC detail never appeared: ${last}`);
+}
+
+function requireWorkflowDetailIsolation(alpha, beta, alphaDetail, betaDetail) {
+  const alphaEncoded = JSON.stringify(alphaDetail);
+  const betaEncoded = JSON.stringify(betaDetail);
+  for (const marker of [beta.workflowId, beta.name, beta.objective, beta.worktree, beta.branch]) {
+    if (alphaEncoded.includes(marker)) fail(`alpha detail crossed with beta marker ${marker}`);
+  }
+  for (const marker of [alpha.workflowId, alpha.name, alpha.objective, alpha.worktree, alpha.branch]) {
+    if (betaEncoded.includes(marker)) fail(`beta detail crossed with alpha marker ${marker}`);
+  }
+  const alphaJobs = new Set(alphaDetail.jobs.map((job) => job.jobId));
+  for (const job of betaDetail.jobs) if (alphaJobs.has(job.jobId)) fail(`workflow job crossed A/B ownership: ${job.jobId}`);
+  if (`${alpha.workflowId}@${alpha.generation}` === `${beta.workflowId}@${beta.generation}`) fail('workflow identity tuples collided');
+}
+
 async function connectPage(page) {
   if (token) {
     await page.addInitScript((t) => { window.localStorage.setItem('rpi-web-token', t); }, token);
   }
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
   await waitFor(page, () => document.title === 'rpi web', 'page title missing');
-  await waitFor(page, () => document.querySelector('#conn-state') !== null, 'conn-state missing');
-  await waitFor(page, () => document.getElementById('conn-state').dataset.state === 'on', 'WS did not reach "connected"');
+  // No #conn-state element: the Send button enables only after the reconnect
+  // bootstrap completes (connState on).
+  await waitFor(page, () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true, 'WS did not reach "connected"');
 }
 
 async function main() {
@@ -283,31 +575,33 @@ async function main() {
     });
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await waitFor(page, () => document.title === 'rpi web', 'page title missing');
-    await waitFor(page, () => document.querySelector('#conn-state') !== null, 'conn-state missing');
 
-    // 1. No token: silent boot probe -> reconnecting, never connected, no error toast.
-    let everOn = false;
-    const stateWatch = setInterval(async () => {
+    // 1. No token: silent boot probe -> never connected, no error toast. The
+    //    empty-hint is the authoritative witness (the #conn-state element is
+    //    removed): "Connecting to the control plane…" while disconnected,
+    //    flipping to "Send a prompt" only after a successful connect.
+    let everConnected = false;
+    const hintWatch = setInterval(async () => {
       try {
-        const state = await page.evaluate(() => document.getElementById('conn-state')?.dataset.state || '');
-        if (state === 'on') everOn = true;
+        const hint = await page.evaluate(() => document.querySelector('.empty-hint')?.textContent || '');
+        if (hint.includes('Send a prompt to start the session.')) everConnected = true;
       } catch {
         /* page mid-navigation */
       }
     }, 100);
     await waitFor(
       page,
-      () => document.getElementById('conn-state').dataset.state === 'reconnecting',
-      'no-token boot probe never reached reconnecting',
+      () => (document.querySelector('.empty-hint')?.textContent || '').includes('Connecting to the control plane'),
+      'no-token boot probe never settled into the not-connected empty hint',
       20000
     );
     await page.waitForTimeout(3500);
-    clearInterval(stateWatch);
+    clearInterval(hintWatch);
     const noTokenToast = await page.evaluate(() =>
       Array.from(document.querySelectorAll('#toasts .toast')).some((t) => t.textContent.includes('connection failed'))
     );
     if (noTokenToast) fail('no-token boot probe should be silent, but an error toast appeared');
-    if (everOn) fail('WS reached "connected" without a token');
+    if (everConnected) fail('WS reached "connected" without a token');
     record('auth.no-token-probe');
 
     // 2. Wrong token: explicit Connect -> error toast, never connected.
@@ -324,7 +618,7 @@ async function main() {
         ),
       'wrong-token error toast never appeared'
     );
-    const wrongOn = await page.evaluate(() => document.getElementById('conn-state').dataset.state === 'on');
+    const wrongOn = await page.evaluate(() => (document.querySelector('.empty-hint')?.textContent || '').includes('Send a prompt to start the session.'));
     if (wrongOn) fail('WS reached "connected" with a wrong token');
     record('auth.wrong-token-toast');
 
@@ -336,7 +630,7 @@ async function main() {
     await page.click('#settings-close-btn');
     await waitFor(
       page,
-      () => document.getElementById('conn-state').dataset.state === 'on',
+      () => (document.querySelector('.empty-hint')?.textContent || '').includes('Send a prompt to start the session.'),
       'WS did not reach "connected" with the good token'
     );
     record('auth.good-token-connect');
@@ -346,11 +640,7 @@ async function main() {
     await page.fill('#prompt-input', 'hello from the web e2e');
     await page.press('#prompt-input', 'Enter');
     await waitFor(page, (tail) => document.body.textContent.includes(tail), 'full slow reply never streamed into the DOM', 30000, slowTail);
-    await waitFor(page, () => document.getElementById('stream-badge').hidden === true, 'streaming badge did not clear after the reply completed');
-    const idleActionLabel = await page.getAttribute('#send-btn', 'aria-label');
-    if (idleActionLabel !== 'Send message') {
-      fail(`unified action did not return to Send while idle: "${idleActionLabel}"`);
-    }
+    await waitFor(page, () => document.getElementById('send-btn')?.getAttribute('aria-label') === 'Send message', 'unified action did not return to Send after the reply completed');
     record('app.primary-action-send');
     record('prompt.slow-stream-full');
 
@@ -368,13 +658,9 @@ async function main() {
     await waitFor(page, () => document.body.textContent.includes('steer-3-'), 'third stream never started');
     await waitFor(
       page,
-      () => document.getElementById('stream-badge').hidden === false,
-      'streaming badge never appeared for the third stream'
+      () => document.getElementById('send-btn')?.getAttribute('aria-label') === 'Stop generating',
+      'unified action never switched to Stop for the third stream'
     );
-    const streamingActionLabel = await page.getAttribute('#send-btn', 'aria-label');
-    if (streamingActionLabel !== 'Stop generating') {
-      fail(`unified action did not switch to Stop while streaming: "${streamingActionLabel}"`);
-    }
     record('app.primary-action-stop');
     // Dismiss every toast accumulated by earlier phases (e.g. the Phase A
     // wrong-token "connection failed" error toast, which auto-dismisses only
@@ -385,7 +671,7 @@ async function main() {
     });
     await waitFor(page, () => document.querySelectorAll('#toasts .toast').length === 0, 'stale toasts did not clear before the abort');
     await page.click('#send-btn');
-    await waitFor(page, () => document.getElementById('stream-badge').hidden === true, 'streaming badge did not clear after abort');
+    await waitFor(page, () => document.getElementById('send-btn')?.getAttribute('aria-label') === 'Send message', 'unified action did not return to Send after abort');
     const preserved = await lastAssistantText(page);
     if (!preserved.includes('steer-3-')) fail(`aborted message lost the streamed text: "${preserved}"`);
     if (preserved.includes(abortedTail)) fail(`aborted message rendered chunks past the abort: "${preserved}"`);
@@ -451,7 +737,7 @@ async function main() {
           const nodes = [...document.querySelectorAll('.msg--assistant .assistant-text')];
           if (nodes.length <= b) return false;
           if (document.querySelector('table.md-table')) return true;
-          return document.getElementById('stream-badge')?.hidden === true;
+          return document.getElementById('send-btn')?.getAttribute('aria-label') === 'Send message';
         },
         'rich prompt never produced a reply',
         30000,
@@ -585,11 +871,24 @@ async function main() {
       'md.extra: invalid mermaid never errored',
       15000
     );
-    const mermaidErrorSource = await page.evaluate(
-      () => document.querySelector('#transcript .md-mermaid-host--error .md-mermaid-error__source')?.textContent || ''
-    );
-    if (!mermaidErrorSource.includes('bad token here')) {
-      fail(`md.extra: mermaid error source missing: ${mermaidErrorSource.slice(0, 120)}`);
+    const mermaidError = await page.evaluate(() => {
+      const host = document.querySelector('#transcript .md-mermaid-host--error');
+      const style = host ? getComputedStyle(host) : null;
+      return {
+        source: host?.querySelector('.md-mermaid-error__source')?.textContent || '',
+        borderLeftWidth: style?.borderLeftWidth || '',
+        borderLeftStyle: style?.borderLeftStyle || '',
+        paddingLeft: style?.paddingLeft || '',
+      };
+    });
+    if (!mermaidError.source.includes('bad token here')) {
+      fail(`md.extra: mermaid error source missing: ${mermaidError.source.slice(0, 120)}`);
+    }
+    if (mermaidError.borderLeftStyle !== 'none' && mermaidError.borderLeftWidth !== '0px') {
+      fail(`md.extra: mermaid fallback retained a left border: ${JSON.stringify(mermaidError)}`);
+    }
+    if (mermaidError.paddingLeft !== '0px') {
+      fail(`md.extra: mermaid fallback retained left padding: ${JSON.stringify(mermaidError)}`);
     }
     record('md.extra-mermaid-error');
     // mermaid 11.16.1's render() appends a temporary wrapper
@@ -713,7 +1012,7 @@ async function main() {
 
     await waitFor(
       page,
-      () => document.getElementById('stream-badge').hidden === true,
+      () => document.getElementById('send-btn')?.getAttribute('aria-label') === 'Send message',
       'tool-card turn never settled',
       30000,
     );
@@ -824,18 +1123,52 @@ async function main() {
     if (rtCallMeta.authPresent !== true) {
       fail(`realtime: create-call proxy did not send the Bearer token (got ${JSON.stringify(rtCallMeta)})`);
     }
+    if (rtCallMeta.sessionPresent !== true || rtCallMeta.sessionValid !== true
+      || rtCallMeta.sessionInputOmitted !== true) {
+      fail(`realtime: create-call proxy did not send the AVAS-compatible session object (got ${JSON.stringify(rtCallMeta)})`);
+    }
     record('realtime.proxy-alpha-header');
-    // Drive an input-transcript delta over the data channel: overlay text
+    const sessionUpdate = await page.evaluate(() => {
+      const sent = (window.__rtStub.dc?.sent || []).map((raw) => {
+        try { return JSON.parse(raw); } catch { return null; }
+      });
+      return sent.find((frame) => frame?.type === 'session.update') || null;
+    });
+    if (!sessionUpdate) fail('realtime: no session.update frame sent on the oai-events channel');
+    if ('input' in (sessionUpdate.session?.audio || {})
+      || 'model' in sessionUpdate.session || 'type' in sessionUpdate.session) {
+      fail(`realtime: session.update sent a rejected field (${JSON.stringify(sessionUpdate.session)})`);
+    }
+    record('realtime.session-update-transcription');
+    // Drive a GA input-transcript delta over the data channel: overlay text
     // grows without a React re-render (direct node write).
-    await page.evaluate(() => window.__rtStub.sendFrame({ type: 'transcript.delta', delta: 'realtime hello ' }));
+    await page.evaluate(() =>
+      window.__rtStub.sendFrame({ type: 'conversation.item.input_audio_transcription.delta', delta: 'realtime ' })
+    );
     await waitFor(
       page,
-      () => (document.querySelector('.realtime-transcript__text')?.textContent || '').includes('realtime hello'),
+      () => (document.querySelector('.realtime-transcript__text')?.textContent || '').includes('realtime'),
       'realtime: transcript delta never reached the overlay',
       10000
     );
     record('realtime.transcript-delta');
-    // A V1 final event commits the utterance to the composer.
+    // A GA segment event carries the FULL interim segment text: it SUPERSEDES
+    // the running preview (Hyper dictation parity) instead of appending.
+    await page.evaluate(() =>
+      window.__rtStub.sendFrame({
+        type: 'conversation.item.input_audio_transcription.segment',
+        text: 'realtime segment preview',
+      })
+    );
+    await waitFor(
+      page,
+      () => (document.querySelector('.realtime-transcript__text')?.textContent || '').trim() === 'realtime segment preview',
+      'realtime: segment event never superseded the overlay preview',
+      10000
+    );
+    record('realtime.transcript-segment');
+    // A GA final event commits the whole utterance to the composer.
+    const userBubblesBeforeFinal = await page.evaluate(() => document.querySelectorAll('.msg--user').length);
     await page.evaluate(() =>
       window.__rtStub.sendFrame({
         type: 'conversation.item.input_audio_transcription.completed',
@@ -849,7 +1182,17 @@ async function main() {
       10000
     );
     record('realtime.transcript-commit');
-    // The second V1 final variant for the same utterance must be deduped.
+    // NO auto-send: the final lands as a DRAFT only — the composer still holds
+    // the text, no user bubble was dispatched, and the preview cleared.
+    const userBubblesAfterFinal = await page.evaluate(() => document.querySelectorAll('.msg--user').length);
+    if (userBubblesAfterFinal !== userBubblesBeforeFinal) {
+      fail(`realtime: final transcript auto-sent a message (${userBubblesBeforeFinal} -> ${userBubblesAfterFinal} user bubbles)`);
+    }
+    const previewCleared = await page.evaluate(() => (document.querySelector('.realtime-transcript__text')?.textContent || '') === '');
+    if (!previewCleared) fail('realtime: preview overlay was not cleared after the final commit');
+    await page.screenshot({ path: `${evidence}/realtime-composer-final.png`, fullPage: true });
+    record('realtime.composer-final-screenshot');
+    // The V1 final alias for the same utterance must be deduped.
     await page.evaluate(() =>
       window.__rtStub.sendFrame({ type: 'conversation.input_transcript.done', transcript: 'realtime hello world' })
     );
@@ -859,6 +1202,25 @@ async function main() {
     );
     if (committedOnce !== 1) fail(`realtime: final transcript double-committed (count ${committedOnce})`);
     record('realtime.transcript-dedup');
+    // A GA transcription failure surfaces a bounded toast through
+    // realtimeErrorMessage, commits NOTHING, and clears the stale preview.
+    await page.evaluate(() =>
+      window.__rtStub.sendFrame({
+        type: 'conversation.item.input_audio_transcription.failed',
+        error: { message: 'mock asr rejected', code: 'asr_down' },
+      })
+    );
+    await waitFor(
+      page,
+      () => document.body.textContent.includes('realtime error [asr_down]: mock asr rejected'),
+      'realtime: transcription.failed never surfaced a bounded toast',
+      10000
+    );
+    const failedDidNotCommit = await page.evaluate(
+      () => (document.getElementById('prompt-input')?.value.match(/realtime hello world/g) || []).length === 1
+    );
+    if (!failedDidNotCommit) fail('realtime: transcription.failed mutated the composer');
+    record('realtime.transcription-failed-toast');
     // An error frame surfaces a bounded toast through realtimeErrorMessage.
     await page.evaluate(() =>
       window.__rtStub.sendFrame({ type: 'error', error: { message: 'realtime boom', code: 'E-2' } })
@@ -900,11 +1262,11 @@ async function main() {
     const upMarker = path.join(work, 'server-up.marker');
     fs.rmSync(killMarker, { force: true });
     fs.rmSync(upMarker, { force: true });
-    let sawReconnecting = false;
-    const pillWatch = setInterval(async () => {
+    let sawTransportToast = false;
+    const toastWatch = setInterval(async () => {
       try {
-        if ((await page.evaluate(() => document.getElementById('conn-state')?.dataset.state || '')) === 'reconnecting') {
-          sawReconnecting = true;
+        if ((await page.evaluate(() => document.querySelectorAll('#toasts .toast[data-toast-kind="transport"]').length)) >= 1) {
+          sawTransportToast = true;
         }
       } catch {
         /* page mid-navigation / closed */
@@ -916,12 +1278,12 @@ async function main() {
       await new Promise((r) => setTimeout(r, 200));
     }
     if (!fs.existsSync(upMarker)) fail('lane never respawned the listener (server-up.marker missing)');
-    clearInterval(pillWatch);
-    if (!sawReconnecting) fail('conn-state never entered "reconnecting" after the server was killed');
+    clearInterval(toastWatch);
+    if (!sawTransportToast) fail('no transport outage toast after the server was killed');
     record('reconnect.pill');
     await waitFor(
       page,
-      () => document.getElementById('conn-state').dataset.state === 'on',
+      () => document.querySelectorAll('#toasts .toast[data-toast-kind="transport"]').length === 0,
       'client never auto-reconnected after the listener came back'
     );
     record('reconnect.auto-on');
@@ -981,9 +1343,17 @@ async function main() {
     );
     record('switch.thinking-roundtrip');
 
-    // ==================== Phase E: todo panel ====================
-    await page.click('#todos-toggle-btn');
-    await waitFor(page, () => document.getElementById('todo-panel') !== null, 'todo panel did not open');
+    // ==================== Phase E: unified Todo module ====================
+    await page.click('#todo-toggle-btn');
+    await waitFor(page, () => {
+      const panels = document.querySelectorAll('#todo-panel');
+      const panel = panels.length === 1 ? panels[0] : null;
+      return panel !== null
+        && panel.querySelector('.todo-panel__tasks') !== null
+        && panel.querySelector('.todo-child-section') !== null;
+    }, 'Unified Todo module did not open with task and child sections');
+    if (await page.$('#todos-toggle-btn')) fail('legacy todos-toggle-btn rendered');
+    if (await page.$('#todo-child-toggle-btn')) fail('legacy todo-child-toggle-btn rendered');
     await page.fill('#todo-add-phase', 'Plan');
     await page.fill('#todo-add-content', 'web e2e task');
     await page.click('#todo-add-btn');
@@ -1137,12 +1507,100 @@ async function main() {
     await page.click('.todo-detail__head .todo-panel__close');
     await waitFor(page, () => document.getElementById('todo-detail') === null, 'detail pane did not clear');
     record('todo.clear-selection');
+    // ---- todo convergence: complete every remaining task through real UI
+    // actions, then assert the authoritative live projection converges to
+    // zero open/active/waiting with an exact done count. Rows and counters
+    // derive from the same phases, so a stale counter, a hidden incomplete
+    // row, or a phase/global mismatch fails ----
+    // The dependency target is still open; complete it via its row action.
+    await page.evaluate(() => {
+      const rows = [...document.querySelectorAll('.todo-task')];
+      const row = rows.find((r) => r.textContent.includes('dep target task'));
+      if (!row) throw new Error('dep target task row missing');
+      const btn = row.querySelector('.todo-task__action[data-action="complete"]');
+      if (!btn) throw new Error('dep target task complete button missing');
+      btn.click();
+    });
+    await waitFor(
+      page,
+      () => {
+        const rows = [...document.querySelectorAll('.todo-task')];
+        const row = rows.find((r) => r.textContent.includes('dep target task'));
+        return !!row && row.querySelector('.todo-task__bullet')?.getAttribute('aria-label') === 'completed';
+      },
+      'dep target task never reached completed status'
+    );
+    // The first task was reopened by the detail-pane Reopen coverage; complete
+    // it again through its row action.
+    await page.evaluate(() => {
+      const rows = [...document.querySelectorAll('.todo-task')];
+      const row = rows.find((r) => r.textContent.includes('web e2e task'));
+      if (!row) throw new Error('web e2e task row missing');
+      const btn = row.querySelector('.todo-task__action[data-action="complete"]');
+      if (!btn) throw new Error('web e2e task complete button missing');
+      btn.click();
+    });
+    await waitFor(
+      page,
+      () => {
+        const rows = [...document.querySelectorAll('.todo-task')];
+        const row = rows.find((r) => r.textContent.includes('web e2e task'));
+        return !!row && row.querySelector('.todo-task__bullet')?.getAttribute('aria-label') === 'completed';
+      },
+      'web e2e task never reached completed status'
+    );
+    // Authoritative live projection: every rendered task row is terminal
+    // completed, the global counts show zero open/active/waiting with the
+    // exact done count, and every phase header reports its own 0 open · N done.
+    await assertId(
+      page,
+      'todo.all-rows-counts-converged',
+      () => {
+        const rows = [...document.querySelectorAll('.todo-task')];
+        if (rows.length !== 2) return false;
+        const expectedTasks = ['dep target task', 'web e2e task'];
+        const taskNames = rows.map(
+          (row) => (row.querySelector('.todo-task__content')?.textContent || '').trim()
+        ).sort();
+        if (taskNames.some((name, index) => name !== expectedTasks[index])) return false;
+        const allCompleted = rows.every(
+          (row) => row.querySelector('.todo-task__bullet')?.getAttribute('aria-label') === 'completed'
+        );
+        if (!allCompleted) return false;
+        const items = [...document.querySelectorAll('#todo-counts .todo-panel__counts-item')].map(
+          (el) => (el.textContent || '').trim()
+        );
+        const globalOk =
+          items.length === 4 &&
+          items[0] === '0 open' &&
+          items[1] === '0 active' &&
+          items[2] === '0 waiting' &&
+          items[3] === '2 done';
+        if (!globalOk) return false;
+        const phases = [...document.querySelectorAll('.todo-phase')];
+        if (phases.length === 0) return false;
+        return phases.every((phase) => {
+          const phaseRows = [...phase.querySelectorAll('.todo-task')];
+          if (phaseRows.length === 0) return false;
+          const phaseDone = phaseRows.filter(
+            (row) => row.querySelector('.todo-task__bullet')?.getAttribute('aria-label') === 'completed'
+          ).length;
+          if (phaseDone !== phaseRows.length) return false;
+          const countsText = phase.querySelector('.todo-phase__counts')?.textContent || '';
+          const m = countsText.match(/^0 open · (\d+) done$/);
+          return !!m && Number(m[1]) === phaseDone;
+        });
+      },
+      'todo rows/counters never converged to exactly two completed fixture rows with done=2'
+    );
 
     // ==================== Phase F: goal panel ====================
-    await page.click('#todo-close-btn');
-    await waitFor(page, () => document.getElementById('todo-panel') === null, 'todo panel did not close');
     await page.click('#goal-panel-btn');
-    await waitFor(page, () => document.getElementById('goal-panel') !== null, 'goal panel missing');
+    await waitFor(
+      page,
+      () => document.getElementById('todo-panel') === null && document.getElementById('goal-panel') !== null,
+      'Todo module did not close when goal panel opened'
+    );
     await waitFor(
       page,
       () => document.getElementById('goal-panel').dataset.hasGoal === 'false',
@@ -1186,6 +1644,10 @@ async function main() {
     // panel purely from the pushed event.
     const wsUrl = url.replace(/^http/, 'ws').replace(/\/web\/?$/, '/ws');
     rpc = rpcClient(wsUrl);
+    const workflowSessionId = await page.evaluate(
+      () => document.querySelector('.session-sidebar__row--active .session-sidebar__switch')?.dataset.sessionId || ''
+    );
+    if (!workflowSessionId) fail('active sessionId missing for workflow acceptance');
     const paused = await rpc.call({ type: 'goal_pause' });
     if (!paused || paused.lifecycle !== 'paused') fail(`raw goal_pause returned ${JSON.stringify(paused)}`);
     record('concurrency.second-ws-rpc');
@@ -1225,184 +1687,318 @@ async function main() {
     }
     record('goal.journal-order');
 
-    // ==================== Phase G: workflow panel ====================
+    // ==================== Phase G: strict concurrent workflow panel ====================
     await page.click('#goal-close-btn');
     await waitFor(page, () => document.getElementById('goal-panel') === null, 'goal panel did not close');
     await page.click('#workflow-toggle-btn');
     await waitFor(page, () => document.getElementById('workflow-panel') !== null, 'workflow panel did not open');
-    await page.fill('#workflow-create-name', 'web-e2e-workflow');
-    await page.fill('#workflow-create-objective', 'created from the browser e2e');
-    await page.click('#workflow-create-btn');
+    const [alphaCreated, betaCreated] = await Promise.all([
+      rpc.call({ type: 'workflow_create', sessionId: workflowSessionId, name: 'web-e2e-workflow-alpha', objective: 'alpha coverage workflow objective' }),
+      rpc.call({ type: 'workflow_create', sessionId: workflowSessionId, name: 'web-e2e-workflow-beta', objective: 'beta coverage workflow objective' }),
+    ]);
+    if (!alphaCreated?.workflowId || !betaCreated?.workflowId) fail('concurrent workflow create response omitted workflowId');
+    const workflowRpc = { call: (command) => rpc.call({ ...command, sessionId: workflowSessionId }) };
+    const [alpha, beta] = await Promise.all([
+      waitForWorkflowSnapshot(workflowRpc, alphaCreated.workflowId, 'web-e2e-workflow-alpha', 'workflow alpha create'),
+      waitForWorkflowSnapshot(workflowRpc, betaCreated.workflowId, 'web-e2e-workflow-beta', 'workflow beta create'),
+    ]);
+    if (alpha.workflowId === beta.workflowId) fail(`workflowId collision: ${alpha.workflowId}`);
+    if (`${alpha.workflowId}@${alpha.generation}` === `${beta.workflowId}@${beta.generation}`) fail('workflow identity tuple collision');
+    if (alpha.worktree === beta.worktree) fail(`worktree collision: ${alpha.worktree}`);
+    if (alpha.branch === beta.branch) fail(`branch collision: ${alpha.branch}`);
+    record('workflow.create-row');
+
     await waitFor(
       page,
-      () => [...document.querySelectorAll('.workflow-row')].some((row) => row.textContent.includes('web-e2e-workflow')),
-      'created workflow never appeared in the workflow list',
-      30000
+      (names) => names.every((name) => {
+        const row = [...document.querySelectorAll('.workflow-row')].find((candidate) =>
+          (candidate.querySelector('.workflow-row__name')?.textContent || '') === name
+        );
+        return !!row && ['queued', 'planning', 'running', 'paused', 'integrating'].includes(row.dataset.status || '');
+      }),
+      'two workflows were not simultaneously live in the panel',
+      30000,
+      [alpha.name, beta.name]
     );
-    record('workflow.create-row');
-    const workflowStatus = await page.evaluate(() => {
-      const rows = [...document.querySelectorAll('.workflow-row')];
-      const row = rows.find((r) => r.textContent.includes('web-e2e-workflow'));
-      return row ? row.getAttribute('data-status') || '' : '';
-    });
-    if (!['queued', 'planning', 'running', 'paused', 'integrating'].includes(workflowStatus)) {
-      fail(`created workflow must be live (queued/planning/running/paused/integrating), got "${workflowStatus}"`);
+    const listed = await workflowRpc.call({ type: 'workflow_list' });
+    const listedById = new Map((listed.workflows || []).map((workflow) => [workflow.workflowId, workflow]));
+    for (const workflow of [alpha, beta]) {
+      const row = listedById.get(workflow.workflowId);
+      if (!row || row.generation !== workflow.generation || row.worktree !== workflow.worktree || row.branch !== workflow.branch) {
+        fail(`workflow list lost exact identity for ${workflow.name}: ${JSON.stringify(row)}`);
+      }
+      if (!LIVE_WORKFLOW_STATUSES.has(row.status)) fail(`${workflow.name} was not live in backend list: ${row.status}`);
     }
     record('workflow.live-status');
-    await page.click('#workflow-cancel-btn');
+
+    const [alphaDetail, betaDetail] = await Promise.all([
+      waitForWorkflowDetail(workflowRpc, alpha, 'workflow alpha detail'),
+      waitForWorkflowDetail(workflowRpc, beta, 'workflow beta detail'),
+    ]);
+    requireWorkflowDetailIsolation(alpha, beta, alphaDetail, betaDetail);
+    await page.evaluate((workflowId) => {
+      const row = document.querySelector(`[data-workflow-id="${workflowId}"]`);
+      if (!row) throw new Error(`workflow row ${workflowId} missing`);
+      row.click();
+    }, alpha.workflowId);
+    await waitFor(
+      page,
+      (identity) => {
+        const meta = document.querySelector('.workflow-detail__meta')?.textContent || '';
+        return meta.includes(identity.workflowId) && meta.includes(`gen ${identity.generation}`)
+          && document.querySelector('[aria-label="Supervisor"] .workflow-actor') !== null
+          && document.querySelector('#workflow-detail-activity .workflow-feed__item') !== null
+          && document.querySelector('#workflow-detail-tasks .workflow-task') !== null
+          && document.querySelector('#workflow-detail-workers .workflow-worker') !== null;
+      },
+      'alpha live supervisor/planning/tasks/workers detail never rendered',
+      30000,
+      alpha
+    );
+    record('workflow.select-row');
+    const foldableBefore = await page.evaluate(() => document.querySelectorAll('.workflow-actor__activity').length);
+    await page.click('.workflow-actor.is-foldable .workflow-actor__row');
+    await waitFor(
+      page,
+      (before) => document.querySelectorAll('.workflow-actor__activity').length !== before,
+      'workflow actor activity feed never toggled',
+      10000,
+      foldableBefore
+    );
+
+    requireTypedReceipt(
+      await workflowRpc.call({
+        type: 'workflow_hub_send', workflowId: alpha.workflowId, generation: alpha.generation,
+        recipient: alphaDetail.supervisor.name, body: 'alpha coverage receipt',
+      }),
+      alpha, alphaDetail.supervisor.name, 'delivered', 'alpha workflow send'
+    );
+    const alphaAfterIrc = await waitForWorkflowIrc(
+      workflowRpc, alpha, 'alpha coverage receipt', 'workflow alpha detail after IRC'
+    );
+    const betaAfterAlphaIrc = await waitForWorkflowIrc(
+      workflowRpc, beta, null, 'workflow beta detail after alpha IRC'
+    );
+    if (!(alphaAfterIrc.recentIrc || []).some((message) => message.text.includes('alpha coverage receipt'))) {
+      fail('workflow alpha detail omitted its delivered IRC');
+    }
+    if ((betaAfterAlphaIrc.recentIrc || []).some((message) => message.text.includes('alpha coverage receipt'))) {
+      fail('workflow alpha IRC crossed into beta detail');
+    }
+    await requireRpcFailure(
+      workflowRpc.call({
+        type: 'workflow_hub_send', workflowId: alpha.workflowId, generation: alpha.generation + 1,
+        recipient: alphaDetail.supervisor.name, body: 'stale generation must fail',
+      }),
+      'stale workflow send'
+    );
+    requireTypedReceipt(
+      await workflowRpc.call({
+        type: 'workflow_hub_send', workflowId: alpha.workflowId, generation: alpha.generation,
+        recipient: 'missing-workflow-recipient', body: 'must fail visibly',
+      }),
+      alpha, 'missing-workflow-recipient', 'failed', 'failed workflow send'
+    );
+    await waitFor(
+      page,
+      (body) => [...document.querySelectorAll('.workflow-irc__item')].some((item) => (item.textContent || '').includes(body)),
+      'workflow IRC did not render backend-delivered alpha message',
+      30000,
+      'alpha coverage receipt'
+    );
+    await page.evaluate(() => {
+      const select = document.querySelector('.workflow-irc__recipient');
+      if (!select) throw new Error('workflow recipient select missing');
+      const option = document.createElement('option');
+      option.value = 'missing-workflow-recipient';
+      option.textContent = 'missing-workflow-recipient';
+      select.append(option);
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'value').set;
+      setter.call(select, option.value);
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await page.fill('.workflow-irc__body', 'visible failed receipt');
+    await waitFor(page, () => document.querySelector('.workflow-irc__send')?.disabled === false, 'failed workflow send did not enable');
+    await page.click('.workflow-irc__send');
     await waitFor(
       page,
       () => {
-        const rows = [...document.querySelectorAll('.workflow-row')];
-        const row = rows.find((r) => r.textContent.includes('web-e2e-workflow'));
-        return !!row && row.getAttribute('data-status') === 'cancelled';
+        const receipt = document.querySelector('.workflow-irc__receipt--failed');
+        return !!receipt && (receipt.querySelector('.workflow-irc__receipt-error')?.textContent || '').trim() !== '';
       },
-      'cancel never applied (status never reached cancelled)',
+      'workflow panel did not show the typed failed receipt error',
       30000
     );
-    record('workflow.cancel-status');
+    await waitFor(
+      page,
+      (state) => {
+        const liveRows = state.names.every((name) => {
+          const row = [...document.querySelectorAll('.workflow-row')].find((candidate) =>
+            (candidate.querySelector('.workflow-row__name')?.textContent || '') === name
+          );
+          return !!row && ['queued', 'planning', 'running', 'paused', 'integrating'].includes(row.dataset.status || '');
+        });
+        const detailMeta = document.querySelector('.workflow-detail__meta')?.textContent || '';
+        return liveRows && detailMeta.includes(state.workflowId)
+          && document.querySelector('#workflow-detail-workers .workflow-worker') !== null
+          && document.querySelector('.workflow-irc__item') !== null
+          && document.querySelector('.workflow-irc__receipt--failed .workflow-irc__receipt-error') !== null;
+      },
+      'coverage screenshot state lost dual-live detail/worker/IRC evidence',
+      30000,
+      { names: [alpha.name, beta.name], workflowId: alpha.workflowId }
+    );
+    const workflowEvidenceName = 'coverage-workflow-concurrent-live-detail-workers-irc.png';
+    await page.screenshot({ path: `${evidence}/${workflowEvidenceName}`, fullPage: true });
+    console.log(`web-cov: workflow concurrent evidence=${workflowEvidenceName}`);
 
-    // ---- workflow lifecycle coverage: create via Enter, row select,
-    // pause/resume/integrate/remove, actor activity toggle ----
-    // Create a second workflow via Enter (covers the objective onKeyDown).
-    await page.fill('#workflow-create-name', 'web-e2e-workflow-2');
-    await page.fill('#workflow-create-objective', 'lifecycle coverage workflow');
-    await page.press('#workflow-create-objective', 'Enter');
-    await waitFor(
-      page,
-      () => [...document.querySelectorAll('.workflow-row')].some((row) => row.textContent.includes('web-e2e-workflow-2')),
-      'second workflow (created via Enter) never appeared',
-      30000
-    );
-    record('workflow.create-via-enter');
-    // Click the row to select it (covers the row onClick -> selectWorkflow).
-    await page.evaluate(() => {
-      const rows = [...document.querySelectorAll('.workflow-row')];
-      const row = rows.find((r) => r.textContent.includes('web-e2e-workflow-2'));
-      if (!row) throw new Error('workflow-2 row missing');
-      row.click();
-    });
-    await waitFor(
-      page,
-      () => (document.querySelector('.workflow-detail__name')?.textContent || '').includes('web-e2e-workflow-2'),
-      'selecting the workflow row never rendered its detail pane'
-    );
-    record('workflow.select-row');
-    // Pause -> paused (covers the pause onClick).
     await page.click('#workflow-pause-btn');
     await waitFor(
       page,
-      () => {
-        const rows = [...document.querySelectorAll('.workflow-row')];
-        const row = rows.find((r) => r.textContent.includes('web-e2e-workflow-2'));
-        return !!row && row.getAttribute('data-status') === 'paused';
-      },
-      'pause never reached paused',
-      30000
+      (workflowId) => document.querySelector(`[data-workflow-id="${workflowId}"]`)?.getAttribute('data-status') === 'paused',
+      'alpha workflow never paused',
+      30000,
+      alpha.workflowId
     );
     record('workflow.pause');
-    // Resume -> live again (covers the resume onClick).
     await page.click('#workflow-resume-btn');
     await waitFor(
       page,
-      () => {
-        const rows = [...document.querySelectorAll('.workflow-row')];
-        const row = rows.find((r) => r.textContent.includes('web-e2e-workflow-2'));
-        return !!row && ['running', 'planning', 'integrating'].includes(row.getAttribute('data-status') || '');
+      (workflowId) => {
+        const status = document.querySelector(`[data-workflow-id="${workflowId}"]`)?.getAttribute('data-status') || '';
+        return ['planning', 'running', 'integrating'].includes(status);
       },
-      'resume never returned the workflow to a live state',
-      30000
+      'alpha workflow never resumed live',
+      30000,
+      alpha.workflowId
     );
     record('workflow.resume');
-    // Best-effort actor activity toggle (covers ActorRow onClick when an actor
-    // has activity). Skipped silently if no foldable actor appears in time.
-    const actorToggleOk = await page
-      .waitForFunction(
-        () => document.querySelector('.workflow-actor.is-foldable') !== null,
-        { timeout: 6000 }
-      )
-      .then(() => true)
-      .catch(() => false);
-    if (actorToggleOk) {
-      const expandedBefore = await page.evaluate(() => document.querySelectorAll('.workflow-actor__activity').length);
-      await page.click('.workflow-actor.is-foldable .workflow-actor__row');
-      await waitFor(
-        page,
-        (b) => document.querySelectorAll('.workflow-actor__activity').length !== b,
-        'actor activity feed never toggled',
-        10000,
-        expandedBefore
-      );
-      // Best-effort: no record() — the actor feed is non-deterministic, so it
-      // is not a matrix-gated assertion; the click still exercises ActorRow's
-      // onClick for coverage when a foldable actor is present.
-    }
-    // Remove workflow-2 (covers the remove onClick) — deterministic: the row
-    // leaves the list (the manager cancels non-terminal workflows first).
-    await page.click('#workflow-remove-btn');
+    await workflowRpc.call({ type: 'workflow_cancel', workflowId: alpha.workflowId });
     await waitFor(
       page,
-      () => [...document.querySelectorAll('.workflow-row')].every((r) => !r.textContent.includes('web-e2e-workflow-2')),
-      'remove never dropped the workflow-2 row',
-      30000
+      (workflowId) => document.querySelector(`[data-workflow-id="${workflowId}"]`)?.getAttribute('data-status') === 'cancelled',
+      'alpha workflow cancel never reached cancelled',
+      30000,
+      alpha.workflowId
+    );
+    record('workflow.cancel-status');
+    const betaAfterCancel = await waitForWorkflowSnapshot(
+      workflowRpc, beta.workflowId, beta.name, 'beta after alpha cancel'
+    );
+    if (betaAfterCancel.generation !== beta.generation) fail('beta generation changed after alpha cancel');
+    requireTypedReceipt(
+      await workflowRpc.call({
+        type: 'workflow_hub_send', workflowId: beta.workflowId, generation: beta.generation,
+        recipient: betaDetail.supervisor.name, body: 'beta survives alpha cancel',
+      }),
+      beta, betaDetail.supervisor.name, 'delivered', 'beta after alpha cancel'
+    );
+    await workflowRpc.call({ type: 'workflow_remove', workflowId: alpha.workflowId });
+    await waitFor(
+      page,
+      (workflowId) => document.querySelector(`[data-workflow-id="${workflowId}"]`) === null,
+      'alpha workflow row remained after remove',
+      30000,
+      alpha.workflowId
     );
     record('workflow.remove');
-    // Integrate (covers the integrate onClick) on a fresh workflow. Pause so
-    // the button is enabled, click it, and accept any observable outcome
-    // (integration element, detail error, status transition, or row removal).
-    // The click fires the handler for coverage regardless; integrate on a
-    // worktree with no new commits may no-op, so the outcome wait is bounded
-    // and non-fatal — but the panel vanishing still fails the lane.
-    await page.fill('#workflow-create-name', 'web-e2e-workflow-3');
-    await page.fill('#workflow-create-objective', 'integrate coverage workflow');
-    await page.click('#workflow-create-btn');
+    const betaAfterRemove = await waitForWorkflowSnapshot(
+      workflowRpc, beta.workflowId, beta.name, 'beta after alpha remove'
+    );
+    if (betaAfterRemove.generation !== beta.generation) fail('beta generation changed after alpha remove');
+    requireTypedReceipt(
+      await workflowRpc.call({
+        type: 'workflow_hub_send', workflowId: beta.workflowId, generation: beta.generation,
+        recipient: betaDetail.supervisor.name, body: 'beta survives alpha remove',
+      }),
+      beta, betaDetail.supervisor.name, 'delivered', 'beta after alpha remove'
+    );
+
+    await page.fill('#workflow-create-name', 'web-e2e-workflow-integrate');
+    await page.fill('#workflow-create-objective', 'integrate coverage workflow objective');
+    await page.press('#workflow-create-objective', 'Enter');
     await waitFor(
       page,
-      () => [...document.querySelectorAll('.workflow-row')].some((row) => row.textContent.includes('web-e2e-workflow-3')),
-      'third workflow never appeared for integrate',
+      () => [...document.querySelectorAll('.workflow-row')].some((row) =>
+        (row.querySelector('.workflow-row__name')?.textContent || '') === 'web-e2e-workflow-integrate'
+      ),
+      'workflow created via Enter never appeared',
       30000
     );
-    await page.evaluate(() => {
-      const rows = [...document.querySelectorAll('.workflow-row')];
-      const row = rows.find((r) => r.textContent.includes('web-e2e-workflow-3'));
-      if (!row) throw new Error('workflow-3 row missing');
-      row.click();
-    });
-    await waitFor(
-      page,
-      () => (document.querySelector('.workflow-detail__name')?.textContent || '').includes('web-e2e-workflow-3'),
-      'workflow-3 detail never rendered'
+    const integrateList = await workflowRpc.call({ type: 'workflow_list' });
+    const integrateCreated = (integrateList.workflows || []).find((workflow) => workflow.name === 'web-e2e-workflow-integrate');
+    if (!integrateCreated?.workflowId) fail('workflow created via Enter missing from backend list');
+    const integrateWorkflow = await waitForWorkflowSnapshot(
+      workflowRpc, integrateCreated.workflowId, 'web-e2e-workflow-integrate', 'workflow created via Enter'
     );
+    record('workflow.create-via-enter');
+    await page.evaluate((workflowId) => {
+      const row = document.querySelector(`[data-workflow-id="${workflowId}"]`);
+      if (!row) throw new Error(`workflow row ${workflowId} missing`);
+      row.click();
+    }, integrateWorkflow.workflowId);
+    await waitFor(page, () => document.getElementById('workflow-integrate-btn')?.disabled === true, 'live integrate workflow button unexpectedly enabled');
     await page.click('#workflow-pause-btn');
     await waitFor(
       page,
-      () => {
-        const rows = [...document.querySelectorAll('.workflow-row')];
-        const row = rows.find((r) => r.textContent.includes('web-e2e-workflow-3'));
-        return !!row && row.getAttribute('data-status') === 'paused';
-      },
-      'workflow-3 pause never reached paused before integrate',
-      30000
+      (workflowId) => document.querySelector(`[data-workflow-id="${workflowId}"]`)?.getAttribute('data-status') === 'paused',
+      'workflow never paused before integrate',
+      30000,
+      integrateWorkflow.workflowId
     );
     await page.click('#workflow-integrate-btn');
-    const integrateOutcome = await page
-      .waitForFunction(
-        () => {
-          const rows = [...document.querySelectorAll('.workflow-row')];
-          const row = rows.find((r) => r.textContent.includes('web-e2e-workflow-3'));
-          const status = row ? row.getAttribute('data-status') || '' : 'removed';
-          const detailError = document.querySelector('#workflow-detail .workflow-panel__error') !== null;
-          const integration = document.querySelector('.workflow-detail__integration') !== null;
-          return detailError || integration || status === 'removed' || ['integrating', 'completed', 'conflicted', 'cancelled'].includes(status);
-        },
-        { timeout: 12000 }
-      )
-      .then(() => true)
-      .catch(() => false);
-    if (!integrateOutcome) {
-      const panelOk = await page.evaluate(() => document.getElementById('workflow-panel') !== null);
-      if (!panelOk) fail('workflow panel vanished after integrate (no observable outcome)');
+    const integrateDeadline = Date.now() + 30000;
+    let integrateSnapshot;
+    let lastIntegrate = 'snapshot missing';
+    while (Date.now() < integrateDeadline) {
+      try {
+        const snapshot = await workflowRpc.call({ type: 'workflow_get', workflowId: integrateWorkflow.workflowId });
+        if (snapshot?.workflowId !== integrateWorkflow.workflowId) {
+          fail(`workflow integrate snapshot identity mismatch: ${JSON.stringify(snapshot)}`);
+        }
+        if (snapshot.generation !== integrateWorkflow.generation) {
+          fail(`workflow integrate generation changed: ${JSON.stringify(snapshot)}`);
+        }
+        if (['completed', 'conflicted', 'failed'].includes(snapshot.status)) {
+          if (snapshot.status === 'completed') {
+            if (
+              typeof snapshot.integration !== 'string' ||
+              !snapshot.integration.startsWith('applied:') ||
+              snapshot.integration.length <= 'applied:'.length
+            ) {
+              fail(`workflow integrate completed without applied commit: ${JSON.stringify(snapshot)}`);
+            }
+            if (snapshot.failure) {
+              fail(`workflow integrate completed with failure: ${JSON.stringify(snapshot)}`);
+            }
+          } else if (snapshot.status === 'conflicted') {
+            if (
+              typeof snapshot.integration !== 'string' ||
+              !snapshot.integration.startsWith('conflicted:') ||
+              snapshot.integration.length <= 'conflicted:'.length
+            ) {
+              fail(`workflow integrate conflicted without conflict details: ${JSON.stringify(snapshot)}`);
+            }
+          } else if (typeof snapshot.failure !== 'string' || snapshot.failure === '') {
+            fail(`workflow integrate failed without failure: ${JSON.stringify(snapshot)}`);
+          }
+          integrateSnapshot = snapshot;
+          break;
+        }
+        lastIntegrate = JSON.stringify(snapshot);
+      } catch (err) {
+        fail(`workflow integrate RPC failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 150));
     }
+    if (!integrateSnapshot) fail(`workflow integrate never reached a terminal backend status: ${lastIntegrate}`);
+    await waitFor(
+      page,
+      (expected) => document.querySelector(`[data-workflow-id="${expected.workflowId}"]`)?.getAttribute('data-status') === expected.status,
+      'workflow integrate UI row did not project the terminal backend status',
+      30000,
+      { workflowId: integrateSnapshot.workflowId, status: integrateSnapshot.status }
+    );
     record('workflow.integrate');
 
     // ==================== Phase H: settings panel ====================
@@ -1515,9 +2111,9 @@ async function main() {
     // ============ Phase H2: slash command dispatch ============
     // Web-supported slash surface (commands.ts parseSupportedCommand +
     // slashDispatch.ts resolveSlashAction): /compact (llm RPC), /compact
-    // --snap (snapcompact RPC), /skill <name>, bare /skill (usage toast),
-    // /code-review (panel), /code-review <from> <to> (range args),
-    // /code-review <one arg> (usage toast), and an unknown /slash that
+    // --snap, /skill, /code-review (panel), /code-review <from> <to>
+    // (range args), /code-review <one arg> (base→working tree),
+    // /code-review a b c (usage toast), and an unknown /slash that
     // falls through as a NORMAL prompt (user bubble + assistant reply).
     // Every intercepted command renders a labeled summary bubble (or the
     // usage toast) — never an optimistic user bubble.
@@ -1694,9 +2290,25 @@ async function main() {
       () => document.getElementById('code-review-panel') === null,
       'slash: code-review range panel never closed'
     );
-
-    // /code-review <one arg> -> usage error toast (zero or two revisions).
+    // /code-review <one arg> -> panel opens as base→working tree.
     await page.fill('#prompt-input', '/code-review HEAD');
+    await page.press('#prompt-input', 'Enter');
+    await waitFor(
+      page,
+      () => document.getElementById('code-review-panel') !== null,
+      'slash: one-arg /code-review never opened the review panel',
+      30000
+    );
+    record('slash.code-review-base');
+    await page.click('.code-review__close.panel-close');
+    await waitFor(
+      page,
+      () => document.getElementById('code-review-panel') === null,
+      'slash: one-arg code-review panel never closed'
+    );
+
+    // /code-review a b c -> usage error toast (zero, one, or two revisions).
+    await page.fill('#prompt-input', '/code-review a b c');
     await page.press('#prompt-input', 'Enter');
     await waitFor(
       page,
@@ -1704,7 +2316,7 @@ async function main() {
         Array.from(document.querySelectorAll('.toast--error')).some((t) =>
           t.textContent.includes('usage: /code-review')
         ),
-      'slash: one-arg /code-review never produced the usage error toast',
+      'slash: three-arg /code-review never produced the usage error toast',
       10000
     );
     record('slash.code-review-usage-error');
@@ -1727,7 +2339,7 @@ async function main() {
     record('slash.unknown-falls-through');
     await waitFor(
       page,
-      () => document.getElementById('stream-badge').hidden === true,
+      () => document.getElementById('send-btn')?.getAttribute('aria-label') === 'Send message',
       'slash: unknown-/slash prompt never finished streaming before the next phase',
       30000
     );
@@ -1751,52 +2363,55 @@ async function main() {
       () => document.querySelector('[data-testid="session-name-value"]')?.textContent === 'web e2e session',
       'session rename never reflected in the panel'
     );
+    // The header no longer duplicates the session name beside the model
+    // selector: the rename proves itself via the Session panel value above
+    // and the sidebar row title below; the header must never render
+    // `session: <name>` again (desktop and mobile).
     await waitFor(
       page,
-      () => (document.getElementById('session-name')?.textContent || '').includes('web e2e session'),
-      'session rename never reflected in the header'
+      () => {
+        const header = document.getElementById('model-select')?.closest('header');
+        return document.getElementById('session-name') === null
+          && header !== null
+          && !header.textContent.includes('session:');
+      },
+      'header still renders a duplicate session label after the rename'
     );
-    record('session.rename-panel-header');
-    record('nav.header-session-name');
-    await waitFor(
-      page,
-      () => document.querySelectorAll('.session-row').length >= 1,
-      'no saved sessions listed in the session panel'
-    );
-    record('session.history-listed');
-    const sessionIdBefore = await page.evaluate(() => {
-      const dts = [...document.querySelectorAll('#session-panel dl dt')];
-      const idx = dts.findIndex((dt) => dt.textContent === 'Session id');
-      return idx >= 0 ? dts[idx]?.nextElementSibling?.textContent || '' : '';
-    });
-    if (!sessionIdBefore) fail('current session id never rendered');
-    const msgsBeforeSwitch = await page.$$eval('#transcript .msg', (els) => els.length);
-    if (msgsBeforeSwitch === 0) fail('no transcript messages before the switch — the clear would be unobservable');
-    await page.click('#session-new-btn');
-    const newIdOk = await page
-      .waitForFunction(
-        (b) => {
-          const dts = [...document.querySelectorAll('#session-panel dl dt')];
-          const idx = dts.findIndex((dt) => dt.textContent === 'Session id');
-          const dd = idx >= 0 ? dts[idx].nextElementSibling : null;
-          const id = dd ? dd.textContent || '' : '';
-          return id !== '' && id !== b;
-        },
-        sessionIdBefore,
-        { timeout: 25000 }
-      )
-      .then(() => true)
-      .catch(() => false);
-    if (!newIdOk) fail('new session never produced a different session id');
-    record('session.switch-new-id');
     await waitFor(
       page,
       () =>
-        document.querySelectorAll('#transcript .msg').length === 0 &&
-        document.querySelector('#transcript .empty-hint') !== null,
+        document.querySelector('.session-sidebar__row--active .session-sidebar__switch .session-sidebar__name')
+          ?.textContent?.trim() === 'web e2e session',
+      'session rename never reflected in the active sidebar row title',
+      25000
+    );
+    record('session.rename-panel-sidebar');
+    record('nav.header-no-duplicate-session');
+    await page.screenshot({ path: `${evidence}/session-renamed.png`, fullPage: true });
+    await waitFor(
+      page,
+      () => document.querySelectorAll('.session-sidebar__row').length >= 1,
+      'no saved sessions listed in the session sidebar',
+    );
+    record('session.history-listed');
+    await assertSidebarNewActionAbsent(page, 'session coverage: obsolete sidebar New action rendered');
+    const msgsBeforeSwitch = await page.$$eval('#transcript .msg', (els) => els.length);
+    if (msgsBeforeSwitch === 0) fail('no transcript messages before the switch — the clear would be unobservable');
+    await createFreshSessionViaManage(page, waitFor, 'session coverage', {
+      closePanel: false,
+      timeoutMs: 25000,
+    });
+    record('session.switch-new-id');
+    await waitFor(
+      page,
+      () => {
+        const active = document.querySelector('#transcript .transcript-surface:not([hidden])');
+        if (!active) return false;
+        return active.querySelectorAll('.msg').length === 0 && active.querySelector('.empty-hint') !== null;
+      },
       'session switch never cleared the old transcript (empty new-session view missing)'
     );
-    const staleTranscript = await page.evaluate(() => document.getElementById('transcript')?.textContent || '');
+    const staleTranscript = await page.evaluate(() => document.querySelector('#transcript .transcript-surface:not([hidden])')?.textContent || '');
     if (staleTranscript.includes('hello from the web e2e')) {
       fail('session switch retained the old session messages in the transcript');
     }
@@ -2038,7 +2653,6 @@ async function main() {
         return (
           nodes.length > before &&
           (nodes[nodes.length - 1]?.textContent || '').trim() !== '' &&
-          document.getElementById('stream-badge')?.hidden === true &&
           document.getElementById('send-btn')?.getAttribute('aria-label') === 'Send message'
         );
       },
@@ -2090,7 +2704,7 @@ async function main() {
       };
       const footer = rect('.app-main > footer');
       const ta = rect('#prompt-input');
-      const targets = ['#send-btn', '#settings-toggle-btn', '#todos-toggle-btn'].map((sel) => ({
+      const targets = ['#send-btn', '#settings-toggle-btn', '#todo-toggle-btn'].map((sel) => ({
         sel,
         height: rect(sel) ? rect(sel).height : -1,
       }));
@@ -2129,25 +2743,62 @@ async function main() {
       if (t.height < 44) fail(`touch target ${t.sel} is ${t.height}px (must be >= 44px)`);
     }
     record('mobile.touch-targets-44');
-    if (metrics.thinkingDisplay !== 'none') {
-      fail(`#thinking-select should be hidden at phone width, computed display = ${metrics.thinkingDisplay}`);
+    if (metrics.thinkingDisplay === 'none' || metrics.thinkingDisplay === 'missing') {
+      fail(`#thinking-select must be visible at phone width (header has room), computed display = ${metrics.thinkingDisplay}`);
     }
-    record('mobile.thinking-hidden');
+    record('mobile.thinking-visible');
+    // Mobile rename: same panel-positive + header-absence contract at phone
+    // width. The panel toggles live inside the sidebar drawer on phones, so
+    // the drawer opens first.
+    await mobile.click('#sidebar-toggle-btn');
+    await waitFor(
+      mobile,
+      () => document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open'),
+      'mobile sidebar drawer never opened for the session panel rename'
+    );
+    await mobile.click('#session-toggle-btn');
+    await waitFor(mobile, () => document.getElementById('session-panel') !== null, 'mobile session panel did not open');
+    await mobile.fill('#session-rename-input', 'web e2e session');
+    await mobile.click('#session-rename-btn');
+    await waitFor(
+      mobile,
+      () => document.querySelector('[data-testid="session-name-value"]')?.textContent === 'web e2e session',
+      'mobile session rename never reflected in the panel'
+    );
+    await waitFor(
+      mobile,
+      () => {
+        const header = document.getElementById('model-select')?.closest('header');
+        return document.getElementById('session-name') === null
+          && header !== null
+          && !header.textContent.includes('session:');
+      },
+      'mobile header still renders a duplicate session label after the rename'
+    );
+    record('mobile.header-no-duplicate-session');
+    await mobile.screenshot({ path: `${evidence}/session-renamed-mobile.png`, fullPage: true });
+    await mobile.click('#session-close-btn');
 
     // ================ Phase N: second page concurrency ================
     const second = await browser.newPage();
     await connectPage(second);
-    const bothOn = await page.evaluate(() => document.getElementById('conn-state').dataset.state === 'on');
+    const bothOn = await page.evaluate(() => document.getElementById('send-btn')?.hasAttribute('disabled') !== true);
     if (!bothOn) fail('first page dropped its connection while the second page connected');
-    await second.close();
     record('concurrency.second-page-connects');
+    // The first page remains connected while the second page joins.
 
     // ============ Phase O: desktop panel navigation ============
-    // nav.panel-open-close: header toggles open/close a panel round-trip.
-    await page.click('#todos-toggle-btn');
-    await waitFor(page, () => document.getElementById('todo-panel') !== null, 'todo panel did not open (nav)');
+    // nav.panel-open-close: feature nav opens the unified module and its panel control closes it.
+    await page.click('#todo-toggle-btn');
+    await waitFor(page, () => {
+      const panels = document.querySelectorAll('#todo-panel');
+      const panel = panels.length === 1 ? panels[0] : null;
+      return panel !== null
+        && panel.querySelector('.todo-panel__tasks') !== null
+        && panel.querySelector('.todo-child-section') !== null;
+    }, 'Unified Todo module did not open with task and child sections (nav)');
     await page.click('#todo-close-btn');
-    await waitFor(page, () => document.getElementById('todo-panel') === null, 'todo panel did not close (nav)');
+    await waitFor(page, () => document.getElementById('todo-panel') === null, 'Todo module did not close (nav)');
     record('nav.panel-open-close');
 
     // ---- realtime call #2: ICE-gather event path, session.update, error
@@ -2184,11 +2835,8 @@ async function main() {
       20000
     );
     record('realtime.conn-state-connected');
-    // Opening the data channel re-advertises the full V1 quicksilver session
-    // config (buildRealtimeSessionConfig) — the SAME shape the create-call
-    // POST body carries, with voice nested under audio.output.
     await page.evaluate(() => window.__rtStub.openChannel());
-    const sessionUpdate = await page.evaluate(() => {
+    const sessionUpdateFrame = await page.evaluate(() => {
       const dc = window.__rtStub.dc;
       if (!dc) return null;
       for (const data of dc.sent) {
@@ -2202,12 +2850,13 @@ async function main() {
       return null;
     });
     if (
-      !sessionUpdate ||
-      sessionUpdate.session?.type !== 'quicksilver' ||
-      sessionUpdate.session.audio?.input?.format?.rate !== 24000 ||
-      !sessionUpdate.session.audio?.output?.voice
+      !sessionUpdateFrame
+      || 'input' in (sessionUpdateFrame.session?.audio || {})
+      || 'model' in sessionUpdateFrame.session
+      || 'type' in sessionUpdateFrame.session
+      || !sessionUpdateFrame.session.audio?.output?.voice
     ) {
-      fail(`realtime#2: session.update frame missing the quicksilver config: ${JSON.stringify(sessionUpdate)}`);
+      fail(`realtime#2: session.update frame is not AVAS-compatible: ${JSON.stringify(sessionUpdateFrame)}`);
     }
     record('realtime.session-update');
     // Error-frame variants hit realtimeErrorMessage's fallback branches:
@@ -2374,7 +3023,7 @@ async function main() {
     const wireTitleJourney = async (marker, toolName, expectedTitle, id) => {
       await waitFor(
         page,
-        () => document.getElementById('stream-badge').hidden === true,
+        () => document.getElementById('send-btn')?.getAttribute('aria-label') === 'Send message',
         `wire: session not idle before ${toolName}`,
         30000
       );
@@ -2466,7 +3115,7 @@ async function main() {
     // status markers — never the raw args JSON as the default view.
     await waitFor(
       page,
-      () => document.getElementById('stream-badge').hidden === true,
+      () => document.getElementById('send-btn')?.getAttribute('aria-label') === 'Send message',
       'wire: session not idle before the todo card journey',
       30000
     );
@@ -2524,10 +3173,34 @@ async function main() {
       fail(`wire: todo card task statuses wrong: ${JSON.stringify(todoTaskStatuses)}`);
     }
     record('wire.todo-structured-view');
-
     // ---- evidence ----
+    // Exact per-ID ledger gate BEFORE any write: every documented id must
+    // have executed EXACTLY once, nothing undocumented may execute, and the
+    // published executed array is the documented order (the matrix requires
+    // ordered equality — never a sorted-set comparison).
     fs.mkdirSync(evidence, { recursive: true });
-    fs.writeFileSync(path.join(evidence, 'coverage-assertions.json'), JSON.stringify({ executed: [...executed] }, null, 2));
+    const missing = DOCUMENTED_IDS.filter((id) => !executed.has(id));
+    if (missing.length > 0) {
+      fail(`coverage evidence incomplete: ${missing.join(', ')} never executed (coverage matrix contract)`);
+    }
+    const overExecuted = [...executed.keys()].filter((id) => !DOCUMENTED_IDS.includes(id));
+    if (overExecuted.length > 0) {
+      fail(`coverage evidence drift: executed-but-undocumented ids: ${overExecuted.join(', ')}`);
+    }
+    const repeatedIds = [...executed].filter(([, count]) => count !== 1).map(([id]) => id);
+    if (repeatedIds.length > 0) {
+      fail(`coverage evidence exact-once violation: ${repeatedIds.join(', ')}`);
+    }
+    // Publish the REAL ledger: executed is the Map's insertion order (actual
+    // execution order — never a reconstruction of DOCUMENTED_IDS) and counts
+    // the real per-ID ledger. The gate above proved documented == executed
+    // as exact-once sets; the matrix's ordered gate additionally proves the
+    // runtime order matches the documented order.
+    fs.writeFileSync(path.join(evidence, 'coverage-assertions.json'), JSON.stringify({
+      documented: [...DOCUMENTED_IDS],
+      executed: [...executed.keys()],
+      counts: Object.fromEntries(executed),
+    }, null, 2));
     console.log(`web-cov: PASSED (${executed.size} assertions) — evidence at ${path.join(evidence, 'coverage-assertions.json')}`);
   } finally {
     if (rpc) rpc.close();

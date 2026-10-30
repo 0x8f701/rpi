@@ -14,8 +14,8 @@ fn run(agent_dir: &Path, cwd: &Path, args: &[&str]) -> (bool, String, String) {
         .env("PI_CODING_AGENT_DIR", agent_dir)
         .env("HOME", agent_dir)
         .env("USERPROFILE", agent_dir)
-        .env("PI_SKIP_VERSION_CHECK", "1")
-        .env_remove("PI_OFFLINE")
+        .env("RPI_SKIP_VERSION_CHECK", "1")
+        .env_remove("RPI_OFFLINE")
         .env_remove("PI_PROFILE")
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("OPENAI_API_KEY")
@@ -43,8 +43,8 @@ fn list_previews_local_resource_changes_without_applying_them() {
     let package = sandbox.path().join("local-package");
     fs::create_dir_all(&agent_dir).unwrap();
     fs::create_dir_all(&cwd).unwrap();
-    fs::create_dir_all(package.join("skills")).unwrap();
-    fs::write(package.join("skills/review.md"), "initial\n").unwrap();
+    fs::create_dir_all(package.join("skills/review")).unwrap();
+    fs::write(package.join("skills/review/SKILL.md"), "initial\n").unwrap();
 
     let source = package.to_str().unwrap();
     let (installed, _, install_error) = run(&agent_dir, &cwd, &["install", source]);
@@ -59,7 +59,8 @@ fn list_previews_local_resource_changes_without_applying_them() {
     assert!(initial.contains("installed"));
     assert!(!initial.contains("update-available"));
 
-    fs::write(package.join("skills/added.md"), "new\n").unwrap();
+    fs::create_dir_all(package.join("skills/added")).unwrap();
+    fs::write(package.join("skills/added/SKILL.md"), "new\n").unwrap();
     let (previewed, output, preview_error) = run(&agent_dir, &cwd, &["list"]);
     assert!(previewed, "preview list succeeds: {preview_error}");
     assert!(output.contains("installed update-available"), "{output}");

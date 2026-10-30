@@ -11,14 +11,16 @@
  * (d) compose the draft text for a selection (trailing space iff the backend
  * marks `requiresArguments`), and (e) parse a submitted input line back into a
  * supported command + argument tail for Main's dispatch wiring. No second
- * command catalog is hardcoded — only the 6-name Web-execution surface
- * (compact/skill/code-review/loop/goal/ps).
+ * command catalog is hardcoded — the Web execution surface is the 10-name
+ * builtin allowlist (compact/skill/code-review/commit/loop/goal/ps/jobs/irc/
+ * todo) plus loaded skill candidates and trusted `source === "extension"`
+ * commands.
  */
 
 /** One normalized command from the `get_commands` wire response. The backend
  *  projects `{name, description, source, argumentHint, requiresArguments, skillName}`;
  *  `source` is one of `builtin | prompt | skill | extension`. `argumentHint`
- *  is the usage placeholder (e.g. `<name>`, `[<from> <to>]`) and
+ *  is the usage placeholder (e.g. `<name>`, `[<base> | <from> <to>]`) and
  *  `requiresArguments` is true only for commands that cannot run bare. Skill
  *  entries carry `name: "skill:<bare>"` (the stable wire dispatch name) plus a
  *  bare `skillName` so the Web composer can compose `/skill <name>` without
@@ -33,15 +35,19 @@ export interface CommandEntry {
 }
 
 /** The only slash commands the Web composer can execute. The picker filters
- *  the backend catalog to this surface so every shown item is dispatchable
- *  (Main wires real dispatch for these six). Static literal → Record. */
+ * the backend catalog to this surface so every shown item is dispatchable.
+ * `/todo` is the sole public Todo root. Static literal → Record. */
 export const WEB_SUPPORTED_COMMANDS: Record<string, true> = {
   compact: true,
   skill: true,
   'code-review': true,
+  commit: true,
   loop: true,
   goal: true,
   ps: true,
+  jobs: true,
+  irc: true,
+  todo: true,
 };
 
 /** Coerce an `unknown` field to `string` — non-strings become `''` so a
@@ -92,14 +98,16 @@ export function normalizeCommands(data: unknown): CommandEntry[] {
 }
 
 /** Filter a normalized catalog to the Web-executable surface, preserving
- *  backend order. The picker shows the WEB_SUPPORTED_COMMANDS builtins
- *  (compact/skill/code-review/loop/goal/ps) PLUS loaded skill candidates
- *  (`source === "skill"`) so `/skill` can drill into the real loaded skills.
- *  Prompt and extension dynamic commands stay executable on the backend but
- *  never enter the Web picker surface (their dispatch is not wired here). */
+ * backend order. The picker shows the WEB_SUPPORTED_COMMANDS builtins plus
+ * loaded skill candidates (`source === "skill"`) and trusted extension
+ * commands (`source === "extension"`). Prompt templates stay out: the
+ * composer has no prompt-dispatch wiring. */
 export function filterSupportedCommands(commands: CommandEntry[]): CommandEntry[] {
   return commands.filter(
-    (command) => command.name in WEB_SUPPORTED_COMMANDS || isSkillCandidate(command),
+    (command) =>
+      command.name in WEB_SUPPORTED_COMMANDS
+      || isSkillCandidate(command)
+      || isExtensionCandidate(command),
   );
 }
 
@@ -111,16 +119,25 @@ export function isSkillCandidate(command: CommandEntry): boolean {
   return command.source === 'skill' && !!command.skillName;
 }
 
+/** True when `command` is a trusted installed extension command. */
+export function isExtensionCandidate(command: CommandEntry): boolean {
+  return command.source === 'extension';
+}
+
+/** Names of trusted extension commands from a normalized catalog. */
+export function extensionCommandNames(commands: CommandEntry[]): string[] {
+  return commands.filter(isExtensionCandidate).map((command) => command.name);
+}
+
 /** The skill candidates from a normalized+filtered catalog, in backend order.
  *  The picker switches to this list when the user selects/types `/skill`. */
 export function skillCandidates(commands: CommandEntry[]): CommandEntry[] {
   return commands.filter(isSkillCandidate);
 }
 
-/** The primary Web-executable builtins (compact/skill/code-review/loop/goal/
- *  ps) from a normalized+filtered catalog, in backend order. The picker shows
- *  this list first; selecting the `/skill` parent switches to
- *  [`skillCandidates`]. */
+/** The primary Web-executable commands from a normalized+filtered catalog,
+ * in backend order. The picker shows this list first (builtins + extension
+ * commands); selecting the `/skill` parent switches to [`skillCandidates`]. */
 export function primaryCommands(commands: CommandEntry[]): CommandEntry[] {
   return commands.filter((command) => !isSkillCandidate(command));
 }
@@ -182,6 +199,18 @@ export function appendDraft(current: string, draft: string): string {
   return `${current}${separator}${draft}`;
 }
 
+/** Parse a submitted composer line into a slash name + argument tail, or
+ *  `null` when the text is not a `/name` invocation. Does not consult the
+ *  Web builtin allowlist — callers decide whether `name` is dispatchable. */
+export function parseSlashLine(text: string): { name: string; args: string } | null {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('/')) return null;
+  const rest = trimmed.slice(1);
+  const match = rest.match(/^(\S+)\s*([\s\S]*)$/);
+  if (!match) return null;
+  return { name: match[1], args: match[2].trim() };
+}
+
 /** Parse a submitted composer input line into a supported Web command + its
  *  argument tail, or `null` when the text is not one of the supported slash
  *  commands. Exposed so Main can wire real command dispatch off the textarea
@@ -190,14 +219,19 @@ export function appendDraft(current: string, draft: string): string {
  *  `{name:'compact', args:''}`; `/skill foo bar` yields
  *  `{name:'skill', args:'foo bar'}`. */
 export function parseSupportedCommand(text: string): { name: string; args: string } | null {
-  const trimmed = text.trim();
-  if (!trimmed.startsWith('/')) return null;
-  const rest = trimmed.slice(1);
-  // First non-space run is the command name; the remainder (trimmed) is the
-  // argument tail. A bare `/` or `/ ` is not a supported command.
-  const match = rest.match(/^(\S+)\s*(.*)$/);
-  if (!match) return null;
-  const name = match[1];
-  if (!(name in WEB_SUPPORTED_COMMANDS)) return null;
-  return { name, args: match[2].trim() };
+  const parsed = parseSlashLine(text);
+  if (!parsed) return null;
+  if (!(parsed.name in WEB_SUPPORTED_COMMANDS)) return null;
+  return parsed;
+}
+
+/** Visible summary for a `run` RPC result. A JSON-null/absent `value` means
+ *  the extension returned nothing; strings render as-is; other JSON values
+ *  stringify. */
+export function formatExtensionResult(data: unknown, name: string): string {
+  if (!data || typeof data !== 'object') return `Ran /${name}`;
+  const value = 'value' in data ? data.value : undefined;
+  if (value === null || value === undefined) return `Ran /${name}`;
+  if (typeof value === 'string') return value;
+  return JSON.stringify(value);
 }

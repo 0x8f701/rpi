@@ -8,6 +8,7 @@
 //! - a second overflow fails with an actionable error
 //! - manual compact leaves a usable prompt path
 
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, LazyLock, Mutex, MutexGuard,
     atomic::{AtomicUsize, Ordering},
@@ -22,8 +23,9 @@ use pi_ai::{
     new_assistant_message_event_stream,
 };
 use pi_coding::{
-    Application, ApplicationEvent, CompactionReason, CompactionSettings, GoalLifecycle,
-    ResourceDiscovery, Session, SessionEvent, SessionOptions, TodoInitPhase, TodoOp, ToolSelection,
+    Application, ApplicationEvent, ApplicationRuntimeCandidate, CompactionReason,
+    CompactionSettings, GoalLifecycle, ResourceDiscovery, ResourceManager, ResourceManagerOptions,
+    Session, SessionEvent, SessionOptions, TodoInitPhase, TodoOp, ToolSelection,
 };
 
 static REGISTRY_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -36,6 +38,74 @@ fn registry_guard() -> MutexGuard<'static, ()> {
 
 /// Canonical overflow phrasing that matches CONTEXT_OVERFLOW_PATTERNS.
 const OVERFLOW_ERROR: &str = "input exceeds the context window";
+const DANGER_SETTINGS: &str = r#"{"sandbox":{"mode":"danger-full-access"}}"#;
+
+struct HermeticApplicationFixture {
+    _root: tempfile::TempDir,
+    workspace: PathBuf,
+    session_dir: PathBuf,
+    resources: ResourceManager,
+    compaction: Option<CompactionSettings>,
+}
+
+impl HermeticApplicationFixture {
+    fn new(compaction: Option<CompactionSettings>) -> Self {
+        let root = tempfile::tempdir().expect("fixture root");
+        let workspace = root.path().join("workspace");
+        let agent_dir = root.path().join("agent");
+        let session_dir = root.path().join("sessions");
+        std::fs::create_dir_all(&workspace).expect("fixture workspace");
+        std::fs::create_dir_all(&agent_dir).expect("fixture agent dir");
+        std::fs::create_dir_all(&session_dir).expect("fixture session dir");
+        std::fs::write(agent_dir.join("settings.json"), DANGER_SETTINGS)
+            .expect("fixture danger settings");
+
+        let mut options = ResourceManagerOptions::new(&workspace);
+        options.agent_dir = agent_dir;
+        options.project_trust_override = Some(true);
+        options.disable_extensions = true;
+        options.disable_skills = true;
+        options.disable_prompt_templates = true;
+        options.disable_themes = true;
+        options.disable_context_files = true;
+        let resources = ResourceManager::new(options).expect("fixture resources");
+
+        Self {
+            _root: root,
+            workspace,
+            session_dir,
+            resources,
+            compaction,
+        }
+    }
+
+    fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+
+    fn session_dir(&self) -> &Path {
+        &self.session_dir
+    }
+
+    async fn publish(&self, session: &Session) -> Application {
+        session
+            .attach_resources(self.resources.clone())
+            .await
+            .expect("attach fixture resources");
+        let application =
+            Application::from_runtime_candidate(ApplicationRuntimeCandidate::new(session.clone()))
+                .await
+                .expect("publish application generation");
+        // Publication applies runtime settings from the hermetic agent config.
+        // Reapply the test's deliberately tiny compaction window afterward so
+        // these tests continue to exercise overflow/manual compaction rather
+        // than the product defaults.
+        if let Some(settings) = self.compaction {
+            session.enable_compaction(settings);
+        }
+        application
+    }
+}
 
 fn unique_model(prefix: &str) -> Model {
     let suffix = uuid::Uuid::now_v7();
@@ -83,7 +153,11 @@ fn session_with_responses(
     model: Model,
     responses: Vec<FauxResponse>,
     compaction: Option<CompactionSettings>,
-) -> (Session, FauxProviderRegistration, tempfile::TempDir) {
+) -> (
+    Session,
+    FauxProviderRegistration,
+    HermeticApplicationFixture,
+) {
     let registration = register_faux_provider(FauxProviderOptions {
         api: model.api.clone(),
         provider: model.provider.clone(),
@@ -91,13 +165,13 @@ fn session_with_responses(
         chunk_size: 32,
     });
     registration.set_responses(responses);
-    let cwd = tempfile::tempdir().expect("temporary working directory");
+    let fixture = HermeticApplicationFixture::new(compaction);
     // Disable resource discovery so deterministic skill selection cannot inject
     // selection_recommendations into provider contexts under test.
     let session = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
             model,
-            cwd: cwd.path().to_path_buf(),
+            cwd: fixture.workspace().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
             api_key: "faux".into(),
@@ -108,13 +182,15 @@ fn session_with_responses(
             after_tool_call: None,
             stream_fn: None,
             auth_resolver: None,
+            auth_manager: None,
         },
         Vec::new(),
         ToolSelection::default(),
         ResourceDiscovery::Disabled,
     )
     .expect("build session");
-    (session, registration, cwd)
+    session.set_session_dir(fixture.session_dir().to_path_buf());
+    (session, registration, fixture)
 }
 
 fn session_with_context_capture(
@@ -122,7 +198,11 @@ fn session_with_context_capture(
     responses: Vec<FauxResponse>,
     contexts: Arc<Mutex<Vec<Context>>>,
     compaction: Option<CompactionSettings>,
-) -> (Session, FauxProviderRegistration, tempfile::TempDir) {
+) -> (
+    Session,
+    FauxProviderRegistration,
+    HermeticApplicationFixture,
+) {
     let registration = register_faux_provider(FauxProviderOptions {
         api: model.api.clone(),
         provider: model.provider.clone(),
@@ -140,11 +220,11 @@ fn session_with_context_capture(
             pi_ai::stream_simple(model, context, options).await
         })
     });
-    let cwd = tempfile::tempdir().expect("temporary working directory");
+    let fixture = HermeticApplicationFixture::new(compaction);
     let session = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
             model,
-            cwd: cwd.path().to_path_buf(),
+            cwd: fixture.workspace().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
             api_key: "faux".into(),
@@ -155,13 +235,15 @@ fn session_with_context_capture(
             after_tool_call: None,
             stream_fn: Some(stream_fn),
             auth_resolver: None,
+            auth_manager: None,
         },
         Vec::new(),
         ToolSelection::default(),
         ResourceDiscovery::Disabled,
     )
     .expect("build context-capturing session");
-    (session, registration, cwd)
+    session.set_session_dir(fixture.session_dir().to_path_buf());
+    (session, registration, fixture)
 }
 
 fn context_text_blobs(context: &Context) -> Vec<String> {
@@ -186,7 +268,9 @@ fn context_text_blobs(context: &Context) -> Vec<String> {
         .collect()
 }
 
-fn drain_session_events(rx: &mut tokio::sync::broadcast::Receiver<SessionEvent>) -> Vec<SessionEvent> {
+fn drain_session_events(
+    rx: &mut tokio::sync::broadcast::Receiver<SessionEvent>,
+) -> Vec<SessionEvent> {
     let mut events = Vec::new();
     while let Ok(event) = rx.try_recv() {
         events.push(event);
@@ -340,9 +424,18 @@ async fn overflow_triggers_exactly_one_compact_and_retry_without_duplicate_user_
             )
         })
         .count();
-    assert_eq!(starts, 1, "expected exactly one overflow CompactionStart: {lifecycle:?}");
-    assert_eq!(ends, 1, "expected exactly one overflow CompactionEnd(will_retry): {lifecycle:?}");
-    assert!(!session.is_compacting(), "activity flag must clear after recovery");
+    assert_eq!(
+        starts, 1,
+        "expected exactly one overflow CompactionStart: {lifecycle:?}"
+    );
+    assert_eq!(
+        ends, 1,
+        "expected exactly one overflow CompactionEnd(will_retry): {lifecycle:?}"
+    );
+    assert!(
+        !session.is_compacting(),
+        "activity flag must clear after recovery"
+    );
 
     registration.unregister();
 }
@@ -412,7 +505,9 @@ async fn overflow_retry_provider_context_retains_coherent_tail() {
     let retry_blobs = context_text_blobs(&captured[2]);
     let retry_text = retry_blobs.join("\n");
     assert!(
-        retry_blobs.iter().any(|text| text.contains("tail checkpoint")),
+        retry_blobs
+            .iter()
+            .any(|text| text.contains("tail checkpoint")),
         "retry context must project the compaction summary: {retry_text}"
     );
     assert!(
@@ -450,7 +545,7 @@ async fn overflow_retry_provider_context_retains_coherent_tail() {
 async fn application_projects_overflow_compact_lifecycle_without_internal_reminders() {
     let _guard = registry_guard();
     let model = unique_model("app-overflow-lifecycle");
-    let (session, registration, _cwd) = session_with_responses(
+    let (session, registration, fixture) = session_with_responses(
         model,
         vec![
             FauxResponse::error(OVERFLOW_ERROR),
@@ -463,7 +558,7 @@ async fn application_projects_overflow_compact_lifecycle_without_internal_remind
         .load_history(overflow_history_minimal())
         .await
         .expect("load history");
-    let application = Application::new(session).await;
+    let application = fixture.publish(&session).await;
     let mut events = application.subscribe();
 
     application
@@ -478,7 +573,10 @@ async fn application_projects_overflow_compact_lifecycle_without_internal_remind
     );
     let state = application.state().await;
     assert!(!state.is_streaming, "must be idle after recovery");
-    assert!(!state.is_compacting, "must not remain compacting after recovery");
+    assert!(
+        !state.is_compacting,
+        "must not remain compacting after recovery"
+    );
     assert!(
         state.auto_compaction_enabled,
         "overflow session keeps auto-compaction enabled"
@@ -511,8 +609,14 @@ async fn application_projects_overflow_compact_lifecycle_without_internal_remind
             )
         })
         .count();
-    assert_eq!(starts, 1, "TUI projection missing CompactionStart: {lifecycle:?}");
-    assert_eq!(ends, 1, "TUI projection missing CompactionEnd: {lifecycle:?}");
+    assert_eq!(
+        starts, 1,
+        "TUI projection missing CompactionStart: {lifecycle:?}"
+    );
+    assert_eq!(
+        ends, 1,
+        "TUI projection missing CompactionEnd: {lifecycle:?}"
+    );
 
     let blob = serialized_event_blob(&lifecycle);
     for forbidden in [
@@ -546,7 +650,7 @@ async fn application_projects_overflow_compact_lifecycle_without_internal_remind
 async fn overflow_recovery_preserves_active_goal_and_todo_state() {
     let _guard = registry_guard();
     let model = unique_model("overflow-goal-todo");
-    let (session, registration, _cwd) = session_with_responses(
+    let (session, registration, fixture) = session_with_responses(
         model,
         vec![
             FauxResponse::error(OVERFLOW_ERROR),
@@ -559,7 +663,7 @@ async fn overflow_recovery_preserves_active_goal_and_todo_state() {
         .load_history(overflow_history_minimal())
         .await
         .expect("load history");
-    let application = Application::new(session).await;
+    let application = fixture.publish(&session).await;
 
     let goal = application
         .goal_create("keep shipping through compaction", Some(250))
@@ -583,7 +687,11 @@ async fn overflow_recovery_preserves_active_goal_and_todo_state() {
     let goal_before = application.goal_state();
 
     application
-        .prompt("recover while goal and todos stay live".into(), Vec::new(), None)
+        .prompt(
+            "recover while goal and todos stay live".into(),
+            Vec::new(),
+            None,
+        )
         .await
         .expect("prompt");
     application.wait_for_idle().await;
@@ -594,7 +702,10 @@ async fn overflow_recovery_preserves_active_goal_and_todo_state() {
     );
     let goal_after = application.goal_state();
     assert_eq!(
-        goal_after.current.as_ref().map(|goal| goal.objective.as_str()),
+        goal_after
+            .current
+            .as_ref()
+            .map(|goal| goal.objective.as_str()),
         goal_before
             .current
             .as_ref()
@@ -605,8 +716,7 @@ async fn overflow_recovery_preserves_active_goal_and_todo_state() {
         Some(GoalLifecycle::Active)
     );
     assert_eq!(
-        goal_after.revision,
-        goal_before.revision,
+        goal_after.revision, goal_before.revision,
         "overflow recovery must not rewrite goal revision"
     );
 
@@ -615,7 +725,11 @@ async fn overflow_recovery_preserves_active_goal_and_todo_state() {
     let state = application.state().await;
     assert_eq!(state.todo_phases, todos_before.phases);
     assert_eq!(
-        state.goal.current.as_ref().map(|goal| goal.objective.as_str()),
+        state
+            .goal
+            .current
+            .as_ref()
+            .map(|goal| goal.objective.as_str()),
         Some("keep shipping through compaction")
     );
 
@@ -657,7 +771,10 @@ async fn second_overflow_fails_with_actionable_error_and_clears_compacting() {
         message.contains("Reduce the prompt or start a new session"),
         "error must give an actionable next step: {message}"
     );
-    assert!(!session.is_compacting(), "failed recovery must clear compacting");
+    assert!(
+        !session.is_compacting(),
+        "failed recovery must clear compacting"
+    );
 
     let lifecycle = drain_session_events(&mut events);
     assert!(
@@ -684,7 +801,10 @@ async fn second_overflow_fails_with_actionable_error_and_clears_compacting() {
             )
         })
         .count();
-    assert_eq!(starts, 1, "second overflow must not re-enter compaction: {lifecycle:?}");
+    assert_eq!(
+        starts, 1,
+        "second overflow must not re-enter compaction: {lifecycle:?}"
+    );
 
     registration.unregister();
 }
@@ -695,7 +815,7 @@ async fn second_overflow_fails_with_actionable_error_and_clears_compacting() {
 async fn application_second_overflow_emits_actionable_run_failed() {
     let _guard = registry_guard();
     let model = unique_model("app-overflow-second");
-    let (session, registration, _cwd) = session_with_responses(
+    let (session, registration, fixture) = session_with_responses(
         model,
         vec![
             FauxResponse::error(OVERFLOW_ERROR),
@@ -708,7 +828,7 @@ async fn application_second_overflow_emits_actionable_run_failed() {
         .load_history(overflow_history_minimal())
         .await
         .expect("load history");
-    let application = Application::new(session).await;
+    let application = fixture.publish(&session).await;
     let mut events = application.subscribe();
 
     application
@@ -771,7 +891,7 @@ async fn manual_compact_then_prompt_is_usable_and_preserves_goal_todo() {
         keep_recent_tokens: 20,
         snap_keep_turns: 10,
     };
-    let (session, registration, session_dir) = session_with_context_capture(
+    let (session, registration, fixture) = session_with_context_capture(
         model.clone(),
         vec![
             FauxResponse::text("manual usable checkpoint"),
@@ -782,10 +902,10 @@ async fn manual_compact_then_prompt_is_usable_and_preserves_goal_todo() {
     );
 
     let recorder = pi_coding::start_session_in(
-        session_dir.path(),
+        fixture.workspace(),
         Some(&model),
         Some("off"),
-        Some(session_dir.path()),
+        Some(fixture.session_dir()),
         Some("manual-compact-usable"),
         None,
     )
@@ -798,7 +918,7 @@ async fn manual_compact_then_prompt_is_usable_and_preserves_goal_todo() {
     session.record(recorder).expect("attach recorder");
     session.load_history(history).await.expect("load history");
 
-    let application = Application::new(session).await;
+    let application = fixture.publish(&session).await;
     let mut events = application.subscribe();
 
     application
@@ -827,7 +947,10 @@ async fn manual_compact_then_prompt_is_usable_and_preserves_goal_todo() {
         "summary must include faux checkpoint text: {}",
         result.summary
     );
-    assert!(result.tokens_before > 0, "tokens_before must reflect pre-compact size");
+    assert!(
+        result.tokens_before > 0,
+        "tokens_before must reflect pre-compact size"
+    );
     assert!(
         history_has_compaction_summary(&application.messages()),
         "manual compact must install CompactionSummary at head"
@@ -988,44 +1111,50 @@ async fn application_is_compacting_only_while_manual_summary_runs() {
         })
     };
 
-    let model = Model {
-        id: format!("gated-compact-{}", uuid::Uuid::now_v7()),
-        name: "Gated Compact".into(),
-        context_window: 200_000,
-        max_tokens: 32,
-        ..Model::default()
+    let mut model = unique_model("gated-compact");
+    model.name = "Gated Compact".into();
+    model.context_window = 200_000;
+    let registration = register_faux_provider(FauxProviderOptions {
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+        models: vec![model.clone()],
+        chunk_size: 1,
+    });
+    model.max_tokens = 32;
+    let settings = CompactionSettings {
+        enabled: true,
+        reserve_tokens: 20,
+        keep_recent_tokens: 20,
+        snap_keep_turns: 10,
     };
-    let cwd = tempfile::tempdir().expect("cwd");
+    let fixture = HermeticApplicationFixture::new(Some(settings));
     let session = Session::new_with_additional_tools_filtered_and_discovery(
         SessionOptions {
             model: model.clone(),
-            cwd: cwd.path().to_path_buf(),
+            cwd: fixture.workspace().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
             api_key: String::new(),
-            compaction: Some(CompactionSettings {
-                enabled: true,
-                reserve_tokens: 20,
-                keep_recent_tokens: 20,
-                snap_keep_turns: 10,
-            }),
+            compaction: Some(settings),
             stream_options: Default::default(),
             tools: Some(Vec::new()),
             before_tool_call: None,
             after_tool_call: None,
             stream_fn: Some(stream_fn),
             auth_resolver: None,
+            auth_manager: None,
         },
         Vec::new(),
         ToolSelection::default(),
         ResourceDiscovery::Disabled,
     )
     .expect("session");
+    session.set_session_dir(fixture.session_dir().to_path_buf());
     session
         .load_history(overflow_history_with_tail(&model))
         .await
         .expect("history");
-    let application = Application::new(session).await;
+    let application = fixture.publish(&session).await;
 
     let running = application.clone();
     let compact = tokio::spawn(async move { running.compact(None).await });
@@ -1042,5 +1171,6 @@ async fn application_is_compacting_only_while_manual_summary_runs() {
         "Application.state must clear compacting after manual compact"
     );
 
+    registration.unregister();
     application.cleanup().await;
 }

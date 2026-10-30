@@ -6,7 +6,7 @@
 use std::borrow::Cow;
 
 use pi_ai::{ContentBlock, CustomMessage};
-use pi_coding::{orchestration_message_view, ORCHESTRATION_MESSAGE_TYPE};
+use pi_coding::{ORCHESTRATION_MESSAGE_TYPE, orchestration_message_view};
 use serde_json::Value;
 
 pub use pi_coding::ORCHESTRATION_MESSAGE_TYPE as ORCHESTRATION_IRC_TYPE;
@@ -41,7 +41,6 @@ impl OrchestrationIrcView<'_> {
             .as_ref()
             .map(|reply_to| format!("reply to {reply_to}"))
     }
-
 }
 
 /// Prefer the coding-crate view helper (plain body, no XML wrapper).
@@ -227,12 +226,16 @@ mod tests {
         // tool card instead.
         assert!(orchestration_irc_view_from_json(&serde_json::Value::Null).is_none());
         assert!(orchestration_irc_view_from_json(&serde_json::json!({"id": "x"})).is_none());
-        assert!(orchestration_irc_view_from_json(&serde_json::json!({"id": "", "from": "Main"})).is_none());
+        assert!(
+            orchestration_irc_view_from_json(&serde_json::json!({"id": "", "from": "Main"}))
+                .is_none()
+        );
 
         // Empty replyTo is dropped (no spurious "reply to " metadata row).
         let no_reply = orchestration_irc_view_from_json(&serde_json::json!({
             "id": "m-2", "from": "Alpha", "to": "Beta", "body": "hi", "replyTo": "",
-        })).expect("view without reply");
+        }))
+        .expect("view without reply");
         assert!(no_reply.reply_to.is_none());
     }
 }

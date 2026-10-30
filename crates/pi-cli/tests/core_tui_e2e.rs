@@ -27,8 +27,8 @@ use std::time::{Duration, Instant};
 use nix::pty::{Winsize, openpty};
 use nix::sys::termios::Termios;
 use serde_json::Value;
-use unicode_width::UnicodeWidthChar;
 use tempfile::TempDir;
+use unicode_width::UnicodeWidthChar;
 
 const HIDE_CURSOR: &str = "\x1b[?25l";
 const SHOW_CURSOR: &str = "\x1b[?25h";
@@ -150,12 +150,7 @@ impl PtyProbe {
         Self::spawn_with(args, 36, 120, |_, _| {})
     }
 
-    fn spawn_seeded(
-        args: &[&str],
-        rows: u16,
-        cols: u16,
-        seed: impl FnOnce(&Path, &Path),
-    ) -> Self {
+    fn spawn_seeded(args: &[&str], rows: u16, cols: u16, seed: impl FnOnce(&Path, &Path)) -> Self {
         Self::spawn_with(args, rows, cols, seed)
     }
 
@@ -165,12 +160,7 @@ impl PtyProbe {
         Self::spawn_with_dirs(args, rows, cols, home, cwd, |_, _| {})
     }
 
-    fn spawn_with(
-        args: &[&str],
-        rows: u16,
-        cols: u16,
-        seed: impl FnOnce(&Path, &Path),
-    ) -> Self {
+    fn spawn_with(args: &[&str], rows: u16, cols: u16, seed: impl FnOnce(&Path, &Path)) -> Self {
         let home = TempDir::new().expect("temp HOME");
         let cwd = TempDir::new().expect("temp cwd");
         Self::spawn_with_dirs(args, rows, cols, home, cwd, seed)
@@ -202,8 +192,8 @@ impl PtyProbe {
         cmd.env("HOME", home.path());
         cmd.env("PATH", std::env::var("PATH").unwrap_or_default());
         cmd.env("TERM", "xterm-256color");
-        cmd.env("PI_OFFLINE", "1");
-        cmd.env("PI_SKIP_VERSION_CHECK", "1");
+        cmd.env("RPI_OFFLINE", "1");
+        cmd.env("RPI_SKIP_VERSION_CHECK", "1");
         // Keep git from picking up user identity/hooks when code-review shells out.
         cmd.env("GIT_CONFIG_NOSYSTEM", "1");
         cmd.env(
@@ -288,6 +278,9 @@ impl PtyProbe {
         bytes.extend_from_slice(payload.as_bytes());
         bytes.extend_from_slice(BRACKETED_PASTE_END.as_bytes());
         self.send(&bytes);
+    }
+    fn raw_input(&mut self, payload: &str) {
+        self.send(payload.as_bytes());
     }
 
     /// Retained output tail (may omit a dropped prefix of the full stream).
@@ -683,26 +676,34 @@ fn any_overlay_open(live: &str) -> bool {
     OVERLAY_MARKERS.iter().any(|marker| live.contains(marker))
 }
 
-fn write_legacy_agent_settings(home: &Path) {
-    let agent = home.join(".pi").join("agent");
+fn write_danger_full_settings(home: &Path) {
+    let agent = home.join(".rpi");
+    std::fs::create_dir_all(&agent).expect("agent dir");
+    std::fs::write(
+        agent.join("settings.json"),
+        r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+    )
+    .expect("seed sandbox settings");
+}
+
+fn write_agent_override_settings(home: &Path) {
+    let agent = home.join(".rpi");
     std::fs::create_dir_all(&agent).expect("agent dir");
     std::fs::write(
         agent.join("settings.json"),
         r#"{
-  "subagents": {
-    "agentOverrides": {
-      "reviewer": { "enabled": false, "model": "faux/faux-1" }
-    }
+  "agents": {
+    "reviewer": { "enabled": false, "model": "faux/faux-1" }
   }
 }
 "#,
     )
-    .expect("seed legacy settings");
+    .expect("seed agent settings");
     let agents = agent.join("agents");
     std::fs::create_dir_all(&agents).expect("agents dir");
     std::fs::write(
         agents.join("reviewer.md"),
-        "---\nname: reviewer\ndescription: legacy migration probe\n---\nReview carefully.\n",
+        "---\nname: reviewer\ndescription: agent settings probe\n---\nReview carefully.\n",
     )
     .expect("seed reviewer definition");
 }
@@ -818,7 +819,11 @@ fn init_git_repo_with_diff(cwd: &Path) {
 
     fs::create_dir_all(cwd.join("src").join("nested")).expect("src dirs");
     fs::write(cwd.join("README.md"), "hello\n").expect("readme");
-    fs::write(cwd.join("src").join("main.rs"), "fn main() {\n    old();\n}\n").expect("main");
+    fs::write(
+        cwd.join("src").join("main.rs"),
+        "fn main() {\n    old();\n}\n",
+    )
+    .expect("main");
     fs::write(
         cwd.join("src").join("nested").join("deep.rs"),
         "pub fn deep() {}\n",
@@ -987,9 +992,10 @@ fn select_sibling_branch_entry(probe: &mut PtyProbe) {
     for _ in 0..6 {
         let live = probe.live_screen();
         // Selected row uses the › cursor glyph from render_tree_panel.
-        if live.lines().any(|line| {
-            line.contains('›') && line.contains("sibling-branch-beta")
-        }) {
+        if live
+            .lines()
+            .any(|line| line.contains('›') && line.contains("sibling-branch-beta"))
+        {
             return;
         }
         probe.send(b"\x1b[B"); // Down
@@ -997,11 +1003,59 @@ fn select_sibling_branch_entry(probe: &mut PtyProbe) {
     }
     let live = probe.live_screen();
     assert!(
-        live.lines().any(|line| {
-            line.contains('›') && line.contains("sibling-branch-beta")
-        }) || live.contains("sibling-branch-beta"),
+        live.lines()
+            .any(|line| { line.contains('›') && line.contains("sibling-branch-beta") })
+            || live.contains("sibling-branch-beta"),
         "must select non-root sibling branch entry before label edit: {live}"
     );
+}
+
+/// Contract: an unmarked two-line terminal burst is retained as composer text
+/// and does not start a turn; a later lone Enter still submits the draft.
+#[test]
+fn pty_unmarked_multiline_burst_stays_in_composer_until_lone_enter() {
+    let mut probe = PtyProbe::spawn(&["--model", "faux/faux-1"]);
+    assert!(
+        await_entered(&probe),
+        "TUI did not enter: {}",
+        probe.snapshot()
+    );
+
+    let burst_start = probe.len();
+    probe.raw_input("raw-burst-first\nraw-burst-second");
+    assert!(
+        probe
+            .wait_for_live_after(burst_start, Duration::from_secs(8), |live| {
+                live.contains("raw-burst-first") && live.contains("raw-burst-second")
+            })
+            .is_some(),
+        "two-line raw burst must stay visible in the composer: {}",
+        probe.live_screen()
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    let before_submit = probe.snapshot();
+    assert!(
+        !before_submit.contains("Working…") && !before_submit.contains("⟲ working"),
+        "raw multiline burst must not start a turn: {before_submit}"
+    );
+
+    let submit_start = probe.len();
+    probe.raw_input("\r");
+    assert!(
+        probe
+            .wait_for_live_after(submit_start, Duration::from_secs(15), |live| {
+                let first = live.find("raw-burst-first");
+                let composer = live.find("╭── π");
+                first
+                    .zip(composer)
+                    .is_some_and(|(first, composer)| first < composer)
+                    && live.contains("raw-burst-second")
+            })
+            .is_some(),
+        "a later lone Enter must move the retained multiline draft into the transcript: {}",
+        probe.live_screen()
+    );
+    probe.quit_cleanly();
 }
 
 /// Contract: `/settings` opens the schema panel; Enter opens a typed value
@@ -1321,14 +1375,62 @@ fn pty_todo_overview_detail_navigation() {
     );
 }
 
-/// Contract: `subagents.agentOverrides` migration is silent — the TUI starts
-/// without a deprecation warning toast, and the composer is immediately
-/// usable. (Previously the warning was shown and dismissed with Esc; now the
-/// migration runs silently per the silenced-deprecated-warnings change.)
 #[test]
-fn pty_silent_legacy_migration_keeps_override_and_composer_usable() {
+fn pty_todo_hud_redraw_keeps_interleaved_final_printable() {
+    let mut probe = PtyProbe::spawn(&["--model", "faux/faux-1"]);
+    assert!(
+        await_entered(&probe),
+        "TUI must start: {}",
+        probe.snapshot()
+    );
+    thread::sleep(Duration::from_millis(400));
+
+    let todo = "/todo - [/] redraw composer";
+    probe.bracketed_paste(todo);
+    probe.send(b"\r");
+    assert!(
+        probe
+            .wait_for_live(Duration::from_secs(15), |live| {
+                live.contains("redraw composer") || live.contains("Todo:")
+            })
+            .is_some(),
+        "todo HUD must become visible: {}",
+        probe.live_screen()
+    );
+
+    let marker = "queued-printable-z";
+    for _ in 0..25 {
+        probe.clear_composer();
+        probe.send(marker.as_bytes());
+        if probe
+            .wait_for_live(Duration::from_millis(250), |live| live.contains(marker))
+            .is_some()
+        {
+            break;
+        }
+    }
+    assert!(
+        probe.live_screen().contains(marker),
+        "the final printable queued beside a HUD redraw must reach the composer: {}",
+        probe.live_screen()
+    );
+
+    probe.clear_composer();
+    probe.quit_cleanly();
+    assert!(
+        probe.wait_exit(Duration::from_secs(20)).is_some(),
+        "TUI must exit after queued printable regression: {}",
+        probe.snapshot()
+    );
+}
+
+/// Contract: a seeded top-level `agents.reviewer` override is picked up
+/// silently — no deprecation noise on the stream — and the Agents panel
+/// resolves the reviewer row while the composer stays usable.
+#[test]
+fn pty_agent_settings_keep_override_and_composer_usable() {
     let mut probe = PtyProbe::spawn_seeded(&["--model", "faux/faux-1"], 28, 100, |home, _cwd| {
-        write_legacy_agent_settings(home);
+        write_agent_override_settings(home);
     });
     assert!(
         await_entered(&probe),
@@ -1337,17 +1439,17 @@ fn pty_silent_legacy_migration_keeps_override_and_composer_usable() {
     );
 
     // Silence covers the complete PTY stream, not only the final screen after
-    // ratatui has repainted over any pre-TUI stderr output.
+    // ratatui has repainted over any pre-TUI stderr output: no stray
+    // deprecation or settings warnings may reach the user.
     let snapshot = probe.snapshot();
     assert!(
-        !snapshot.contains("deprecated subagents.agentOverrides")
-            && !snapshot.contains("subagents.agentOverrides"),
-        "agentOverrides migration is silent on the complete PTY stream: {snapshot}"
+        !snapshot.contains("deprecated")
+            && !snapshot.contains("agentOverrides"),
+        "seeded agent settings start silently on the complete PTY stream: {snapshot}"
     );
 
-    // The migrated override still takes effect: the Agents panel resolves the
-    // reviewer row through the configured faux model instead of merely hiding
-    // the old warning while dropping the legacy data.
+    // The seeded override takes effect: the Agents panel resolves the
+    // reviewer row through the configured faux model.
     let agents_start = probe.len();
     probe.type_chars("/agents");
     probe.send(b"\r");
@@ -1362,7 +1464,7 @@ fn pty_silent_legacy_migration_keeps_override_and_composer_usable() {
                     })
             })
             .is_some(),
-        "silent migration must feed the seeded reviewer definition: {}",
+        "seeded override must feed the reviewer definition: {}",
         probe.live_screen()
     );
     probe.send(&[ESC]);
@@ -1405,7 +1507,9 @@ fn pty_silent_legacy_migration_keeps_override_and_composer_usable() {
 /// does not become composer draft or a user transcript turn.
 #[test]
 fn pty_direct_attach_input_secrecy_and_detach() {
-    let mut probe = PtyProbe::spawn(&["--model", "faux/faux-1"]);
+    let mut probe = PtyProbe::spawn_seeded(&["--model", "faux/faux-1"], 36, 120, |home, _| {
+        write_danger_full_settings(home)
+    });
     assert!(
         await_entered(&probe),
         "TUI must start: {}",
@@ -1415,16 +1519,11 @@ fn pty_direct_attach_input_secrecy_and_detach() {
 
     let secret = "PTY_DIRECT_INPUT_e2e_9c4b";
     let start = probe.len();
-    probe.send(
-        format!("/process start --tty sh -c \"read line; echo CHILD:$line; sleep 30\"\r")
-            .as_bytes(),
-    );
+    probe.send(b"/process start --tty cat\r");
     assert!(
         probe
             .wait_for_live_after(start, Duration::from_secs(20), |live| {
-                live.contains("running")
-                    || live.contains("Running")
-                    || live.contains("sh -c")
+                live.contains("running") || live.contains("Running") || live.contains("cat")
             })
             .is_some(),
         "PTY process must start on the live screen: {}",
@@ -1467,7 +1566,7 @@ fn pty_direct_attach_input_secrecy_and_detach() {
     assert!(
         probe
             .wait_for_live_after(input_at, Duration::from_secs(12), |live| {
-                live.contains(&format!("CHILD:{secret}"))
+                live.contains(secret)
             })
             .is_some(),
         "child must echo secret into the attachment overlay on the live screen: {}",
@@ -1616,18 +1715,12 @@ fn pty_code_review_tree_mouse_lifecycle() {
     // monotonic terminal control sequence, so the raw stream is the right place
     // to confirm the enable set was emitted.
     assert!(
-        probe.wait_for(MOUSE_ENABLE_SGR, Duration::from_secs(10))
-            && {
-                let snap = probe.snapshot();
-                mouse_capture_enabled(&snap) || snap.contains(MOUSE_ENABLE_NORMAL)
-            },
+        probe.wait_for(MOUSE_ENABLE_SGR, Duration::from_secs(10)) && {
+            let snap = probe.snapshot();
+            mouse_capture_enabled(&snap) || snap.contains(MOUSE_ENABLE_NORMAL)
+        },
         "code-review must enable mouse capture (was_enabled_before={mouse_before}): {}",
-        probe
-            .snapshot()
-            .chars()
-            .rev()
-            .take(400)
-            .collect::<String>()
+        probe.snapshot().chars().rev().take(400).collect::<String>()
     );
     let mouse_open_at = probe
         .rfind_absolute(MOUSE_ENABLE_SGR)
@@ -1874,7 +1967,6 @@ fn pty_code_review_two_revision_range() {
         "exit must restore terminal ownership after two-revision code-review"
     );
 }
-
 
 // Failure-exit cleanup after `/btw` (commit/draw/input error once the side
 // controller is live) is NOT covered here. The only TUI test-only fault seam
@@ -2285,9 +2377,7 @@ fn pty_session_tree_label_edit_clear_jsonl_round_trip() {
         clear_labels.len() >= 2,
         "JSONL must append a clear record after the set record for {target_id}: {records_after_clear:?}"
     );
-    let last_clear = clear_labels
-        .last()
-        .expect("clear label records");
+    let last_clear = clear_labels.last().expect("clear label records");
     assert!(
         last_clear.get("label").is_none()
             || last_clear
@@ -2313,8 +2403,7 @@ fn pty_session_tree_label_edit_clear_jsonl_round_trip() {
         probe
             .wait_for_live_after(final_at, Duration::from_secs(12), |live| {
                 live.contains("Session Tree")
-                    && (live.contains("sibling-branch-beta")
-                        || live.contains("branch-root-alpha"))
+                    && (live.contains("sibling-branch-beta") || live.contains("branch-root-alpha"))
             })
             .is_some(),
         "final resume must open session tree on the live screen: {}",

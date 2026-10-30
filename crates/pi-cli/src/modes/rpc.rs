@@ -1,9 +1,11 @@
 use crate::code_review::{
-    DiffFile, DiffHunk, DiffLineKind, FileDiff, FileDiffPage, HunkIdentity, ReviewScope,
-    ReviewSnapshot, MAX_FILE_PAGE_LINES, load_review_snapshot_for,
+    DiffFile, DiffHunk, DiffLineKind, FileContextBlobs, FileDiff, FileDiffPage, HunkIdentity,
+    MAX_CONTEXT_EXPAND_LINES, MAX_FILE_PAGE_LINES, MAX_FILE_RENDER_LINES, ReviewPagingState,
+    ReviewScope, ReviewSnapshot, load_review_snapshot_capture,
 };
 use crate::code_review_panel::{
-    CodeReviewController, CommentSubmitResult, MAX_PENDING_COMMENTS, ReviewCommentRole,
+    AutoReviewStart, CodeReviewController, CommentSubmitResult, HunkReviewResult, MAX_COMMENT_BYTES,
+    MAX_PENDING_COMMENTS, ReviewCommentRole, ReviewStopOperation, fork_model_display,
 };
 use crate::{
     args::Cli,
@@ -18,7 +20,8 @@ use pi_ai::{ContentBlock, Message, Model};
 use pi_coding::{
     Application, ApplicationEvent, ApplicationState, GoalState, GoalUsageDelta, LoopCreateRequest,
     LoopUpdateRequest, ProcessId, ProcessKey, ProcessSignal, ProcessSpawnSpec, ProcessTerminalSize,
-    StreamingBehavior, TodoOp, TodoPhase,
+    SessionAlreadyProcessing, StreamingBehavior, TodoChildAddTaskRequest, TodoChildCreateRequest,
+    TodoOp, TodoPhase, TranscriptUnavailable, TranscriptRow, validate_review_language,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -30,22 +33,328 @@ use std::{
     sync::{Arc, Mutex as StdMutex},
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{Semaphore, mpsc};
 pub(crate) const MAX_RPC_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_WS_MESSAGE_BYTES: usize = 24 * 1024 * 1024;
+pub(crate) const MAX_WS_OUTBOUND_MESSAGE_BYTES: usize = 240 * 1024 * 1024;
+pub(crate) const MAX_FORK_MESSAGES_RESPONSE_BYTES: usize = 256 * 1024;
+
+/// Exact live-runtime identity. Continuity, subscribe state, and unload
+/// matching use both components; neither is a capability.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RuntimeIdentity {
+    pub session_id: String,
+    pub runtime_incarnation: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RuntimeUnloadReason {
+    Lru,
+    Closed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum SubscriptionCutReason {
+    ColdFull,
+    WarmContinuity,
+    Resync,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ResyncRequiredReason {
+    Overflow,
+    Gap,
+    Lag,
+    Budget,
+}
+
+impl RuntimeIdentity {
+    pub(crate) fn new(session_id: impl Into<String>, runtime_incarnation: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            runtime_incarnation: runtime_incarnation.into(),
+        }
+    }
+}
+
+/// Recursive size walk for replay/window admission. Avoids a second
+/// `to_vec` on every live event; completed snapshots and outbound frames
+/// still charge `serde_json::to_string` length.
+pub(crate) fn estimate_value_bytes(value: &Value) -> usize {
+    match value {
+        Value::Null | Value::Bool(_) => 8,
+        Value::Number(_) => 16,
+        Value::String(text) => text.len().saturating_add(8),
+        Value::Array(items) => items
+            .iter()
+            .map(estimate_value_bytes)
+            .fold(8usize, usize::saturating_add),
+        Value::Object(map) => map.iter().fold(8usize, |total, (key, child)| {
+            total
+                .saturating_add(key.len())
+                .saturating_add(estimate_value_bytes(child))
+        }),
+    }
+}
+
 const JSONL_CHANNEL_CAPACITY: usize = 8;
 pub(crate) const MAX_CONCURRENT_COMMANDS: usize = 16;
 /// Default transcript lines for `agent_history` when `lines` is omitted.
 /// Bounded by the core `pi_coding::MAX_HISTORY_LINES` cap.
 const DEFAULT_RPC_HISTORY_LINES: usize = 80;
 
-#[derive(Clone, Debug, Deserialize)]
+/// Deserialize an OPTIONAL sequence field leniently for legacy/foreign/null
+/// payloads: an explicit `null` (a common client shape that always carries
+/// the key) decodes to the same empty `Vec` as an absent field, a real array
+/// decodes normally, and any non-array scalar/object is rejected — so a
+/// required-array contract is never silently widened. Apply ONLY to fields
+/// that already carry `#[serde(default)]` (absent ⇒ empty); required arrays
+/// keep plain `Vec` deserialization so `null` stays a hard error there.
+fn null_default_vec<'de, D, T>(deserializer: D) -> std::result::Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+/// Deserialize an OPTIONAL scalar field fail-closed about explicit `null`:
+/// a missing field (via `#[serde(default)]`) stays `None`, a real value
+/// decodes to `Some`, and an explicit `null` is a hard parse error instead
+/// of silently collapsing into "absent". Use where `null` and absence must
+/// stay distinct (e.g. an operand whose presence selects a review scope).
+fn non_null_option<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Ok(Some(T::deserialize(deserializer)?))
+}
+/// Strict `conversationId` shape: a non-UUID is a malformed request, rejected at parse time.
+fn deserialize_conversation_id<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    if is_uuid(&raw) {
+        Ok(raw)
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "conversationId must be a UUID, got {raw:?}"
+        )))
+    }
+}
+fn selection_preserving_null<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Value::deserialize(deserializer)?))
+}
+
+/// Canonical 8-4-4-4-12 hexadecimal UUID shape (any case).
+fn is_uuid(value: &str) -> bool {
+    let mut parts = value.split('-');
+    for expected_len in [8, 4, 4, 4, 12] {
+        match parts.next() {
+            Some(part)
+                if part.len() == expected_len
+                    && part.chars().all(|c| c.is_ascii_hexdigit()) => {}
+            _ => return false,
+        }
+    }
+    parts.next().is_none()
+}
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub enum SubscribeHandoffV1 {
+    #[serde(rename = "subscribe-handoff-v1")]
+    SubscribeHandoffV1,
+}
+
+/// Canonical source of a negotiated switch's clicked catalog row. Wire values
+/// arrive from `session_list` rows, so the historical labels (`native`,
+/// `primary`, `grok-hyper`, `grok/hyper`) normalize onto the strict set the
+/// Web control plane uses: `rpi | pi | omp | codex | grok`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CatalogSwitchSource {
+    Rpi,
+    Pi,
+    Omp,
+    Codex,
+    Grok,
+}
+
+impl CatalogSwitchSource {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "rpi" | "native" | "primary" | "nativepi" | "native_pi" => Some(Self::Rpi),
+            "pi" => Some(Self::Pi),
+            "omp" => Some(Self::Omp),
+            "codex" => Some(Self::Codex),
+            "grok" | "grok-hyper" | "grok/hyper" | "hyper" => Some(Self::Grok),
+            _ => None,
+        }
+    }
+
+    /// Catalog authority the tuple resolves against.
+    pub(crate) const fn session_kind(self) -> pi_coding::SessionSourceKind {
+        match self {
+            Self::Rpi => pi_coding::SessionSourceKind::Rpi,
+            Self::Pi => pi_coding::SessionSourceKind::Pi,
+            Self::Omp => pi_coding::SessionSourceKind::Omp,
+            Self::Codex => pi_coding::SessionSourceKind::Codex,
+            Self::Grok => pi_coding::SessionSourceKind::Grok,
+        }
+    }
+
+    /// Strict wire form echoed back in the handoff.
+    pub(crate) const fn wire(self) -> &'static str {
+        match self {
+            Self::Rpi => "rpi",
+            Self::Pi => "pi",
+            Self::Omp => "omp",
+            Self::Codex => "codex",
+            Self::Grok => "grok",
+        }
+    }
+}
+
+/// Native/foreign classification of the clicked catalog row, matching the
+/// `session_list` wire projection (`status.is_native()`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CatalogSwitchStatus {
+    Native,
+    Foreign,
+}
+
+impl CatalogSwitchStatus {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "native" => Some(Self::Native),
+            "foreign" => Some(Self::Foreign),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn wire(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Foreign => "foreign",
+        }
+    }
+}
+
+/// Validated catalog identity of a negotiated Web session switch. The three
+/// wire fields (`catalogSource`, `catalogSessionId`, `catalogStatus`) travel
+/// together or not at all; construction is the only way in, so every holder
+/// carries a normalized, fully-populated tuple. It is request-scoped: it is
+/// carried alongside the runtime to the handoff response, never stored.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CatalogSwitchIdentity {
+    source: CatalogSwitchSource,
+    session_id: String,
+    status: CatalogSwitchStatus,
+}
+
+impl CatalogSwitchIdentity {
+    /// Strict construction: both enums parse from their wire vocabularies and
+    /// the session id must be non-empty.
+    pub(crate) fn parse(
+        source: &str,
+        session_id: &str,
+        status: &str,
+    ) -> Option<CatalogSwitchIdentity> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return None;
+        }
+        Some(Self {
+            source: CatalogSwitchSource::parse(source)?,
+            session_id: session_id.to_owned(),
+            status: CatalogSwitchStatus::parse(status)?,
+        })
+    }
+
+    pub(crate) const fn source(&self) -> CatalogSwitchSource {
+        self.source
+    }
+
+    pub(crate) const fn status(&self) -> CatalogSwitchStatus {
+        self.status
+    }
+
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Native rows must resolve to the exact catalog session id on the opened
+    /// runtime; foreign rows import into a distinct native identity.
+    pub(crate) const fn is_native(&self) -> bool {
+        matches!(self.status, CatalogSwitchStatus::Native)
+    }
+}
+
+/// Why a `switch_session` catalog tuple failed validation. The message is the
+/// entire user-visible text: bounded, fixed, and free of any echoed input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SwitchCatalogIdentityError {
+    /// Exactly one or two of the three negotiated fields were provided.
+    Incomplete,
+    /// A provided field failed strict validation or the id was empty.
+    Invalid,
+}
+
+impl SwitchCatalogIdentityError {
+    pub(crate) const fn message(self) -> &'static str {
+        match self {
+            Self::Incomplete => {
+                "catalogSource, catalogSessionId, and catalogStatus must be provided together"
+            }
+            Self::Invalid => "catalog identity is invalid",
+        }
+    }
+
+    /// Stable machine code attached to negotiated switch failures.
+    pub(crate) const fn code(self) -> &'static str {
+        "invalid_request"
+    }
+}
+
+/// Validated catalog tuple of a `switch_session`, when the client sent one.
+/// All three fields are required together; absent keeps the legacy path-only
+/// internal flow. Wire aliases (`native`, `primary`, `grok-hyper`,
+/// `grok/hyper`) normalize here so the backend and the echoed handoff always
+/// use the strict canonical set.
+pub(crate) fn switch_catalog_identity(
+    catalog_source: Option<&str>,
+    catalog_session_id: Option<&str>,
+    catalog_status: Option<&str>,
+) -> Result<Option<CatalogSwitchIdentity>, SwitchCatalogIdentityError> {
+    match (catalog_source, catalog_session_id, catalog_status) {
+        (None, None, None) => Ok(None),
+        (Some(source), Some(session_id), Some(status)) => CatalogSwitchIdentity::parse(
+            source,
+            session_id,
+            status,
+        )
+        .map(Some)
+        .ok_or(SwitchCatalogIdentityError::Invalid),
+        _ => Err(SwitchCatalogIdentityError::Incomplete),
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RpcCommand {
     Prompt {
         #[serde(default)]
         id: Option<String>,
         message: String,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "null_default_vec")]
         images: Vec<ContentBlock>,
         #[serde(default, rename = "streamingBehavior")]
         streaming_behavior: Option<StreamingBehavior>,
@@ -54,14 +363,14 @@ pub enum RpcCommand {
         #[serde(default)]
         id: Option<String>,
         message: String,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "null_default_vec")]
         images: Vec<ContentBlock>,
     },
     FollowUp {
         #[serde(default)]
         id: Option<String>,
         message: String,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "null_default_vec")]
         images: Vec<ContentBlock>,
     },
     Abort {
@@ -73,6 +382,8 @@ pub enum RpcCommand {
         id: Option<String>,
         #[serde(default, rename = "parentSession")]
         parent_session: Option<String>,
+        #[serde(default)]
+        cwd: Option<String>,
     },
     GetState {
         #[serde(default)]
@@ -167,26 +478,70 @@ pub enum RpcCommand {
         id: Option<String>,
         #[serde(default, rename = "outputPath")]
         output_path: Option<String>,
+        #[serde(default, rename = "sessionPath")]
+        session_path: Option<String>,
     },
     SwitchSession {
         #[serde(default)]
         id: Option<String>,
         #[serde(rename = "sessionPath")]
         session_path: String,
+        /// Negotiated catalog identity of the clicked row
+        /// (`responseMode: "subscribe-handoff-v1"`). All three fields are
+        /// required together and validated against the exact current catalog
+        /// row before any import or spawn; absent keeps the legacy path-only
+        /// flow.
+        #[serde(default, rename = "catalogSource")]
+        catalog_source: Option<String>,
+        #[serde(default, rename = "catalogSessionId")]
+        catalog_session_id: Option<String>,
+        #[serde(default, rename = "catalogStatus")]
+        catalog_status: Option<String>,
+        /// Explicit opt-in for the lightweight Web subscribe handoff. Missing
+        /// preserves the legacy full snapshot on every transport. Request JSON:
+        /// `{"type":"switch_session","sessionPath":"…","responseMode":"subscribe-handoff-v1"}`.
+        #[serde(default, rename = "responseMode")]
+        response_mode: Option<SubscribeHandoffV1>,
+    },
+    /// OMP-parity `session.handoff()`: summarize the CURRENT session into a
+    /// handoff document, create a NEW session in the SAME cwd whose first
+    /// record is the handoff message, and answer with the same
+    /// subscribe-handoff-v1 switch envelope the web switch consumes (the web
+    /// switches like a catalog switch and renders the handoff divider).
+    /// Request JSON:
+    /// `{"type":"session_handoff","customInstructions":"…","responseMode":"subscribe-handoff-v1"}`.
+    SessionHandoff {
+        #[serde(default)]
+        id: Option<String>,
+        /// Operator instructions carried verbatim into the handoff document.
+        #[serde(default, rename = "customInstructions")]
+        custom_instructions: Option<String>,
+        #[serde(default, rename = "responseMode")]
+        response_mode: Option<SubscribeHandoffV1>,
     },
     Fork {
         #[serde(default)]
         id: Option<String>,
         #[serde(rename = "entryId")]
         entry_id: String,
+        #[serde(default, rename = "sessionPath")]
+        session_path: Option<String>,
     },
     Clone {
         #[serde(default)]
         id: Option<String>,
+        #[serde(default, rename = "sessionPath")]
+        session_path: Option<String>,
     },
     GetForkMessages {
         #[serde(default)]
         id: Option<String>,
+        #[serde(default, rename = "sessionPath")]
+        session_path: Option<String>,
+        #[serde(default)]
+        cursor: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
     },
     GetEntries {
         #[serde(default)]
@@ -206,6 +561,52 @@ pub enum RpcCommand {
         #[serde(default)]
         id: Option<String>,
         name: String,
+        #[serde(default, rename = "sessionPath")]
+        session_path: Option<String>,
+    },
+    /// Fork the latest nonempty user message of a saved session by path.
+    /// Wire: `{ "type": "session_fork_latest", "id"?: string, "sessionPath": string }`.
+    SessionForkLatest {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "sessionPath")]
+        session_path: String,
+    },
+    /// Archive a saved native session. Rejects the current session and busy
+    /// loaded secondaries; idle loaded secondaries are closed then archived.
+    /// Wire: `{ "type": "session_delete", "id"?: string, "sessionPath": string }`.
+    SessionDelete {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "sessionPath")]
+        session_path: String,
+    },
+    /// Restore a session archived by `session_delete` within its undo window.
+    /// Wire: `{ "type": "session_restore", "id"?: string, "undoToken": string }`.
+    SessionRestore {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "undoToken")]
+        undo_token: String,
+    },
+    /// Render a saved session's full context as a bounded, sanitized,
+    /// pasteable text artifact. Manager-level on the Web control plane; the
+    /// selected session is prepared read-only and never activated.
+    /// Wire: `{ "type": "session_copy_context", "id"?: string, "sessionPath": string }`.
+    SessionCopyContext {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "sessionPath")]
+        session_path: String,
+    },
+    /// Wire: `{ "type": "session_move", "id"?: string, "sessionPath": string, "targetCwd": string }`.
+    SessionMove {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "sessionPath")]
+        session_path: String,
+        #[serde(rename = "targetCwd")]
+        target_cwd: String,
     },
     GetMessages {
         #[serde(default)]
@@ -504,6 +905,21 @@ pub enum RpcCommand {
         #[serde(rename = "workflowId")]
         workflow_id: String,
     },
+    /// Send a message from the workflow child's main agent to a recipient in
+    /// that exact workflowId+generation runtime. Wire:
+    /// `{ "type": "workflow_hub_send", "id"?: string, "workflowId": string,
+    ///    "generation": number, "recipient": string, "body": string, "replyTo"?: string }`.
+    WorkflowHubSend {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "workflowId")]
+        workflow_id: String,
+        generation: u64,
+        recipient: String,
+        body: String,
+        #[serde(default, rename = "replyTo")]
+        reply_to: Option<String>,
+    },
     /// Open a new named side-chat tab (the `/btw new <name>` mirror). Each
     /// tab is a detached parallel agent forked from the main conversation.
     /// Returns the full side-chat snapshot.
@@ -532,10 +948,16 @@ pub enum RpcCommand {
         #[serde(default)]
         id: Option<String>,
         message: String,
+        #[serde(default, deserialize_with = "null_default_vec")]
+        images: Vec<ContentBlock>,
     },
     /// Snapshot every side-chat tab: names, streaming state, and per-tab
     /// transcript rows.
     SideChatList {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    SideChatAbort {
         #[serde(default)]
         id: Option<String>,
     },
@@ -570,8 +992,19 @@ pub enum RpcCommand {
         #[serde(default)]
         id: Option<String>,
     },
-    /// Cancel (drain) every queued steering/follow-up prompt (`/queue cancel`).
+    /// Cancel queued prompts. `scope` defaults to all queues (`/queue cancel`).
+    /// `steering` drains only the steering tray; `index` removes one steering
+    /// row from the current snapshot.
     QueueCancel {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        scope: QueueCancelScope,
+        #[serde(default)]
+        index: Option<usize>,
+    },
+    /// Combine remaining steering prompts and inject them immediately.
+    QueueSendNow {
         #[serde(default)]
         id: Option<String>,
     },
@@ -594,7 +1027,7 @@ pub enum RpcCommand {
     JobCancel {
         #[serde(default)]
         id: Option<String>,
-        #[serde(default, rename = "jobIds")]
+        #[serde(default, rename = "jobIds", deserialize_with = "null_default_vec")]
         job_ids: Vec<String>,
     },
     /// Send a message from the main agent to a subagent (`hub send` mirror).
@@ -660,15 +1093,13 @@ pub enum RpcCommand {
     },
     /// Exchange a WebRTC SDP offer for a Codex Live realtime call by proxying
     /// `POST {realtimeBaseUrl}/v1/realtime/calls` on the backend (avoids CORS
-    /// and keeps the API key server-side). The POST body is
-    /// `{ "sdp": offer, "session": { type, audio: { input, output } } }` —
-    /// the create-call session is the Quicksilver shape WITHOUT `model`, which
-    /// Codex realtime rejects with 400 (`Field session.model is not allowed`).
-    /// The configured `model` is delivered over the `oai-events` data
-    /// channel's `session.update` instead, where it IS accepted. The upstream
-    /// answer is a bare SDP body with the call id in the `Location` header. Returns
-    /// `{ "sdp": "<answer>", "callId": "<call id>" }` for the browser's
-    /// `RTCPeerConnection` and the `oai-events` data channel.
+    /// and keeps the API key server-side). The JSON body carries the offer and
+    /// frameless session configuration: empty instructions, configured output
+    /// voice, and client delegation. `session.model` and `audio.input` remain
+    /// absent so the configured proxy can inject its authoritative upstream
+    /// model and AVAS accepts the session data. The upstream answer is a bare
+    /// SDP body with the call id in the `Location` header. Returns
+    /// `{ "sdp": "<answer>", "callId": "<call id>" }` for the browser.
     /// Wire shape: `{ "type": "realtime_create_call", "id"?: string, "sdpOffer": string }`.
     RealtimeCreateCall {
         #[serde(default)]
@@ -703,19 +1134,61 @@ pub enum RpcCommand {
         #[serde(rename = "mimeType")]
         mime_type: String,
     },
-    /// Open a bounded HEAD→working-tree or two-revision Git diff snapshot
-    /// for code review, forking a read-only review agent. `from`/`to` must
-    /// both be present (two-revision) or both absent (working tree); any
-    /// other combination is rejected. Returns the full review snapshot plus
-    /// controller thread/streaming state.
-    /// Wire shape: `{ "type": "code_review_open", "id"?: string, "from"?: string, "to"?: string }`.
+    /// Open a bounded Git diff snapshot for code review, forking a review
+    /// agent with the owning Main session's exact active tool set and
+    /// governed permissions.
+    ///
+    /// Wire shapes:
+    /// - `{ "type": "code_review_open" }` — HEAD→working tree
+    /// - `{ "type": "code_review_open", "commit": "<revision>" }` — one
+    ///   pinned commit: parent→commit (a root commit diffs from the empty
+    ///   tree, a merge from its first parent), resolved once and pinned to
+    ///   that hash for later refreshes. Mutually exclusive with `from`,
+    ///   `to`, and `includeWorkingTree` (explicit `false` counts as
+    ///   supplied); an empty commit is rejected.
+    /// - `{ "type": "code_review_open", "from": "<base>", "includeWorkingTree": true }`
+    ///   — `<base>`→working tree (committed since base + staged + unstaged +
+    ///   bounded untracked). `to` and `commit` must be omitted.
+    /// - `{ "type": "code_review_open", "from": "<from>", "to": "<to>" }` —
+    ///   exact commit-to-commit comparison. `includeWorkingTree` must be
+    ///   absent/false and `commit` must be absent.
+    /// A lone `from` without `includeWorkingTree` is rejected so partial
+    /// from/to is never overloaded.
+    ///
+    /// `null` handling is exact and fail-closed for the scope-selecting
+    /// operands: an explicit `"commit": null` or
+    /// `"includeWorkingTree": null` is a parse-time rejection, never a
+    /// silent collapse into "absent". `from`/`to` keep the legacy
+    /// null-means-absent baseline: an explicit `null` decodes exactly as
+    /// if the operand were omitted (so `{ "commit": "x", "from": null }`
+    /// is a pure commit scope).
+    /// Returns the full review snapshot plus controller thread/streaming state.
     CodeReviewOpen {
         #[serde(default)]
         id: Option<String>,
+        #[serde(default, deserialize_with = "non_null_option")]
+        commit: Option<String>,
         #[serde(default)]
         from: Option<String>,
         #[serde(default)]
         to: Option<String>,
+        #[serde(default, rename = "includeWorkingTree", deserialize_with = "non_null_option")]
+        include_working_tree: Option<bool>,
+    },
+    /// List recent commits (newest first, first-parent history) for the
+    /// `/commit` picker. The optional `limit` (default 100) is clamped by
+    /// the core lister to 1..=100. Read-only: no stage, checkout, or
+    /// worktree write; the open review session is untouched.
+    /// Wire shape: `{ "type": "code_review_commits", "id"?: string, "limit"?: u32 }`.
+    /// Response: `{ "commits": [{ "commit": string, "parentCommit": string | null, "parentCount": u32, "subject": string, "author": string, "authorDate": string }], "truncated": bool }`
+    /// — `parentCommit` is the first parent (null on a root commit, whose
+    /// `parentCount` is 0) and `authorDate` is git's strict ISO 8601 `%aI`
+    /// timestamp.
+    CodeReviewCommits {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        limit: Option<u32>,
     },
     /// Re-project the currently open review snapshot and controller state.
     /// Errors when no review is open. Wire shape:
@@ -734,9 +1207,12 @@ pub enum RpcCommand {
     /// Attach a comment to a specific hunk in the current snapshot. The
     /// full hunk identity (`snapshotId`, `path`, old/new ranges, and
     /// `contentHash`) must match the current snapshot exactly, else the
-    /// comment is rejected as stale.
+    /// comment is rejected as stale. Optional `images` are image content
+    /// blocks (max 8; mime image/png|jpeg|webp|gif; 2 MiB decoded per image;
+    /// 3.5 MiB total wire) validated before the comment is accepted; the
+    /// blocks ride the review prompt before its text block.
     /// Wire shape:
-    /// `{ "type": "code_review_comment", "id"?: string, "snapshotId": string, "path": string, "oldStart": u32, "oldCount": u32, "newStart": u32, "newCount": u32, "contentHash": string, "comment": string }`.
+    /// `{ "type": "code_review_comment", "id"?: string, "snapshotId": string, "path": string, "oldStart": u32, "oldCount": u32, "newStart": u32, "newCount": u32, "contentHash": string, "comment": string, "images"?: [{ "type": "image", "data": string, "mimeType": string }] }`.
     CodeReviewComment {
         #[serde(default)]
         id: Option<String>,
@@ -754,6 +1230,75 @@ pub enum RpcCommand {
         #[serde(rename = "contentHash")]
         content_hash: String,
         comment: String,
+        #[serde(default, deserialize_with = "null_default_vec")]
+        images: Vec<ContentBlock>,
+    },
+    /// Swap the open review's reply model. `modelId` resolves against the
+    /// session's public model catalog (the same source the main composer's
+    /// model list uses) by its `provider/model-id` identity; an unknown id
+    /// fails closed with a typed error.
+    /// Connection material (api/provider/base_url/headers) always comes from
+    /// the catalog, never from the wire. The swap affects comment replies
+    /// that start afterwards; in-flight replies are unaffected.
+    /// Wire shape:
+    /// `{ "type": "code_review_set_model", "id"?: string, "modelId": string }`.
+    /// Response: `{ "ok": true, "model": "<display name>" }`.
+    CodeReviewSetModel {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "modelId")]
+        model_id: String,
+    },
+    /// Start one Auto Review batch over the open review: every comment-ready
+    /// hunk of the open snapshot (in snapshot order, capped at
+    /// `MAX_AUTO_REVIEW_HUNKS`) receives an auto comment through the existing
+    /// per-hunk comment pipeline, streaming a reply into its own thread. The
+    /// optional `modelId` resolves exactly like `code_review_set_model`
+    /// (catalog, fail-closed); absent keeps the fork model. A second batch
+    /// while one is live or pending is a typed reject.
+    /// Wire shape:
+    /// `{ "type": "code_review_auto_review", "id"?: string, "modelId"?: string, "language"?: string }`.
+    /// Response: `{ "ok": true, "state": "triaging", "batchId": N }` — the
+    /// immediate start ACK; the batch state/counts then arrive on snapshots.
+    CodeReviewAutoReview {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default, rename = "modelId")]
+        model_id: Option<String>,
+        #[serde(default)]
+        language: Option<String>,
+    },
+    /// Run one focused Highlight call over the open snapshot: a single model
+    /// call (never per-hunk) on the review fork agent that returns at most 20
+    /// hunk identities with category. The result is transient — it resets
+    /// on the next snapshot and is never persisted.
+    /// Wire shape: `{ "type": "code_review_highlight", "id"?: string }`.
+    /// Response: `{ "ok": true, "state": "running", "highlightGeneration": N, "reviewFindings": [...] }`.
+    CodeReviewHighlight {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    /// Start one Code Review TLDR over the current pinned snapshot. Optional
+    /// `language` resolves like Auto Review. The controller owns the single
+    /// operation slot; this command only starts it.
+    /// Wire: `{ "type": "code_review_tldr", "id"?: string, "language"?: string }`.
+    /// ACK: `{ "ok": true, "state": "running", "tldrGeneration": N }`.
+    CodeReviewTldr {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        language: Option<String>,
+    },
+    /// Stop one in-flight review generation (`autoReview`, `highlight`, or `tldr`)
+    /// without closing the review or cancelling a manual hunk reply.
+    /// Wire shape: `{ "type": "code_review_stop", "id"?: string, "operation": "autoReview"|"highlight"|"tldr" }`.
+    /// ACK: `{ "ok": true, "operation": ... }` — ok even when the review
+    /// vanished during the unlocked abort (the retired agents clean up by
+    /// their own drop); `operation` echoes the targeted one.
+    CodeReviewStop {
+        #[serde(default)]
+        id: Option<String>,
+        operation: ReviewStopOperation,
     },
     /// Abort the in-flight review agent turn for a specific hunk. The full
     /// hunk identity must match the current snapshot exactly (same fields as
@@ -779,10 +1324,23 @@ pub enum RpcCommand {
     },
     /// Close the open code review: shut down the review agent and drop the
     /// snapshot/threads. Wire shape:
-    /// `{ "type": "code_review_close", "id"?: string }`.
+    /// `{ "type": "code_review_close", "id"?: string, "reviewId"?: string }`.
+    /// A `reviewId` that differs from the open controller's identity is a
+    /// no-op (`{ "closed": false, "staleReview": true }`): a retired panel's
+    /// cleanup can never kill a controller opened after it, and neither a
+    /// stale nor a missing-session close bumps the authority, so an
+    /// in-flight open/refresh keeps winning. A stamped close invalidates
+    /// the pending capture only while that review still owns the installed
+    /// generation; a close of a review already replaced by a reserved open
+    /// shuts down the old controller and leaves the newer capture valid. A
+    /// legacy unstamped close always invalidates the pending capture. With
+    /// nothing open the close is the typed `code_review_not_open`
+    /// rejection.
     CodeReviewClose {
         #[serde(default)]
         id: Option<String>,
+        #[serde(default, rename = "reviewId")]
+        review_id: Option<String>,
     },
     /// Load one bounded page of a single file's full diff for the currently
     /// open review. The `snapshotId` must match the live snapshot (else the
@@ -807,6 +1365,168 @@ pub enum RpcCommand {
         #[serde(default)]
         max_lines: Option<usize>,
     },
+    /// Load a bounded window of unchanged file context for the open review.
+    /// `oldStart`/`newStart` are 1-based; 0 means that side is absent (added
+    /// or deleted). `count` 0 returns line counts only. Snapshot identity and
+    /// path containment match `code_review_file_diff`.
+    /// Wire:
+    /// `{ "type":"code_review_file_context","id"?:string,"snapshotId":string,"path":string,"oldStart"?:u32,"newStart"?:u32,"count"?:u32 }`.
+    CodeReviewFileContext {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "snapshotId")]
+        snapshot_id: String,
+        path: String,
+        #[serde(default, rename = "oldStart")]
+        old_start: u32,
+        #[serde(default, rename = "newStart")]
+        new_start: u32,
+        #[serde(default)]
+        count: Option<u32>,
+    },
+    /// List one workspace-relative directory through the captured filesystem
+    /// policy. Wire: `{ "type":"file_explorer_list", "id"?:string, "path"?:string }`.
+    FileExplorerList {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        path: Option<String>,
+    },
+    /// Read one bounded page of a workspace-relative text file.
+    /// Wire: `{ "type":"file_explorer_read", "id"?:string, "path":string, "cursor"?:number, "maxLines"?:number }`.
+    FileExplorerRead {
+        #[serde(default)]
+        id: Option<String>,
+        path: String,
+        #[serde(default)]
+        cursor: usize,
+        #[serde(default, rename = "maxLines")]
+        max_lines: Option<usize>,
+    },
+    /// List worktree changes relative to HEAD.
+    FileExplorerChanges {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    /// Read one bounded page of a per-file unified worktree diff.
+    FileExplorerDiff {
+        #[serde(default)]
+        id: Option<String>,
+        path: String,
+        #[serde(default)]
+        cursor: usize,
+        #[serde(default, rename = "maxLines")]
+        max_lines: Option<usize>,
+    },
+    /// Attribute one inclusive 1-based source selection.
+    /// Wire: `{ "type":"file_explorer_blame", "id"?:string, "path":string, "startLine":number, "endLine":number }`.
+    FileExplorerBlame {
+        #[serde(default)]
+        id: Option<String>,
+        path: String,
+        #[serde(rename = "startLine")]
+        start_line: usize,
+        #[serde(rename = "endLine")]
+        end_line: usize,
+    },
+    /// Delete a workspace file or directory (recursive).
+    /// Wire: `{ "type": "file_explorer_delete", "id"?: string, "path": string }`.
+    FileExplorerDelete {
+        #[serde(default)]
+        id: Option<String>,
+        path: String,
+    },
+    /// Stage one bounded workspace file for the existing one-shot download
+    /// route. The listen session manager owns the staged capability.
+    FileExplorerStageDownload {
+        #[serde(default)]
+        id: Option<String>,
+        path: String,
+    },
+    /// One-hop dependency map for one workspace-relative path. Blocking
+    /// generation runs on the existing explorer `spawn_blocking` boundary
+    /// and calls `crate::dependency_map::dependency_map`. No RPC-owned map
+    /// state. Wire: `{ "type": "file_explorer_map", "id"?: string, "path": string }`.
+    FileExplorerMap {
+        #[serde(default)]
+        id: Option<String>,
+        path: String,
+    },
+    /// Complete one user-typed path for the frontend path fields (session
+    /// cwd, project cwd). Lists ONE parent directory through the captured
+    /// filesystem policy: relative inputs resolve against the current
+    /// session cwd, absolute inputs are accepted only beneath an authorized
+    /// workspace root (cwd or an additional root), and creation paths are
+    /// still validated upstream. Returns
+    /// `{ base, prefix, entries: [{ name, path, kind }], truncated }` where
+    /// `base` is the normalized parent in the input's own form domain and
+    /// each `entry.path` is `base/name` in that same domain. The optional
+    /// top-level `sessionId` runtime selector is stripped by the transport
+    /// before deserialization and is not part of this variant.
+    /// Wire: `{ "type":"path_complete", "id"?:string, "path":string, "kind":"directory"|"file"|"any", "limit"?:number }`.
+    PathComplete {
+        #[serde(default)]
+        id: Option<String>,
+        path: String,
+        kind: crate::file_explorer::CompletionKind,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// Wire: `{ "type":"file_conversation_open", "id"?:string, "conversationId":string, "path":string }`.
+    FileConversationOpen {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(
+            rename = "conversationId",
+            deserialize_with = "deserialize_conversation_id"
+        )]
+        conversation_id: String,
+        path: String,
+    },
+    /// Wire: `{ "type":"file_conversation_prompt", "id"?:string, "conversationId":string, "message":string, "selection"?:{"startLine":number,"endLine":number} }`.
+    /// Absent `selection` means none; an explicit `null` is a typed `file_conversation_selection_invalid` rejection.
+    FileConversationPrompt {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(
+            rename = "conversationId",
+            deserialize_with = "deserialize_conversation_id"
+        )]
+        conversation_id: String,
+        message: String,
+        #[serde(default, deserialize_with = "selection_preserving_null")]
+        selection: Option<Value>,
+    },
+    /// Wire: `{ "type":"file_conversation_snapshot", "id"?:string, "conversationId":string }`.
+    FileConversationSnapshot {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(
+            rename = "conversationId",
+            deserialize_with = "deserialize_conversation_id"
+        )]
+        conversation_id: String,
+    },
+    /// Wire: `{ "type":"file_conversation_abort", "id"?:string, "conversationId":string }`.
+    FileConversationAbort {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(
+            rename = "conversationId",
+            deserialize_with = "deserialize_conversation_id"
+        )]
+        conversation_id: String,
+    },
+    /// Wire: `{ "type":"file_conversation_close", "id"?:string, "conversationId":string }`.
+    FileConversationClose {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(
+            rename = "conversationId",
+            deserialize_with = "deserialize_conversation_id"
+        )]
+        conversation_id: String,
+    },
     /// Render a loaded skill's frontmatter summary (the `/skill <name>`
     /// mirror). Rejects an empty or unknown name. Returns `{ name, summary }`.
     /// Wire shape: `{ "type": "skill", "id"?: string, "name": string }`.
@@ -814,6 +1534,15 @@ pub enum RpcCommand {
         #[serde(default)]
         id: Option<String>,
         name: String,
+    },
+    /// Invoke one trusted installed extension command (TUI `/name` and `/run`).
+    /// Wire: `{ "type": "run", "id"?: string, "name": string, "args"?: string }`.
+    Run {
+        #[serde(default)]
+        id: Option<String>,
+        name: String,
+        #[serde(default)]
+        args: String,
     },
     /// List loaded persistent personas (the bare `/persona` mirror) with
     /// bounded contract summaries and memory/session state counts. Never
@@ -915,8 +1644,291 @@ pub enum RpcCommand {
         #[serde(default)]
         id: Option<String>,
     },
+    TodoChildCreate {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(flatten)]
+        request: TodoChildCreateRequest,
+    },
+    TodoChildList {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "parentSessionId")]
+        parent_session_id: String,
+    },
+    TodoChildSelect {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "parentSessionId")]
+        parent_session_id: String,
+        #[serde(rename = "childSessionId")]
+        child_session_id: String,
+    },
+    TodoChildSend {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "parentSessionId")]
+        parent_session_id: String,
+        #[serde(default, rename = "childSessionId")]
+        child_session_id: Option<String>,
+        message: String,
+    },
+    TodoChildStatus {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "parentSessionId")]
+        parent_session_id: String,
+        #[serde(default, rename = "childSessionId")]
+        child_session_id: Option<String>,
+    },
+    TodoChildStop {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "parentSessionId")]
+        parent_session_id: String,
+        #[serde(default, rename = "childSessionId")]
+        child_session_id: Option<String>,
+    },
+    TodoChildPause {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "parentSessionId")]
+        parent_session_id: String,
+        #[serde(default, rename = "childSessionId")]
+        child_session_id: Option<String>,
+    },
+    TodoChildResume {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "parentSessionId")]
+        parent_session_id: String,
+        #[serde(default, rename = "childSessionId")]
+        child_session_id: Option<String>,
+    },
+    TodoChildCancel {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "parentSessionId")]
+        parent_session_id: String,
+        #[serde(default, rename = "childSessionId")]
+        child_session_id: Option<String>,
+    },
+    TodoChildArchive {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "parentSessionId")]
+        parent_session_id: String,
+        #[serde(rename = "childSessionId")]
+        child_session_id: String,
+    },
+    TodoChildRemove {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "parentSessionId")]
+        parent_session_id: String,
+        #[serde(rename = "childSessionId")]
+        child_session_id: String,
+    },
+    TodoChildAddTask {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "parentSessionId")]
+        parent_session_id: String,
+        #[serde(rename = "childSessionId")]
+        child_session_id: String,
+        #[serde(flatten)]
+        request: TodoChildAddTaskRequest,
+    },
+    TodoChildDetail {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "parentSessionId")]
+        parent_session_id: String,
+        #[serde(rename = "childSessionId")]
+        child_session_id: String,
+    },
+    TodoChildHubSend {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "parentSessionId")]
+        parent_session_id: String,
+        #[serde(rename = "childSessionId")]
+        child_session_id: String,
+        to: String,
+        body: String,
+        #[serde(default, rename = "replyTo")]
+        reply_to: Option<String>,
+    },
+    /// Server-side persistence for the /chat LAN mapping document.
+    /// Wire: `{ "type": "chat_mapping_get", "id"?: string }`.
+    ChatMappingGet {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    /// Wire: `{ "type": "chat_mapping_put", "id"?: string, "document": object,
+    /// "baseRevision"?: number }`. A stale base returns `conflict: true` with
+    /// the server copy instead of writing.
+    ChatMappingPut {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "document")]
+        document: Value,
+        #[serde(default, rename = "baseRevision")]
+        base_revision: Option<u64>,
+    },
+    TeamList {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    TeamCreate {
+        #[serde(default)]
+        id: Option<String>,
+        name: String,
+        #[serde(default, rename = "projectLabel")]
+        project_label: Option<String>,
+        #[serde(default, rename = "projectCwd")]
+        project_cwd: Option<String>,
+    },
+    TeamRemove {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "teamId")]
+        team_id: String,
+    },
+    TeamJoin {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "teamId")]
+        team_id: String,
+        origin: String,
+        /// Runner credential; consumed by the registry, never echoed back.
+        token: String,
+        #[serde(default)]
+        label: Option<String>,
+        #[serde(default)]
+        role: Option<String>,
+    },
+    TeamLeave {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "teamId")]
+        team_id: String,
+        #[serde(rename = "runnerId")]
+        runner_id: String,
+    },
+    TeamStatus {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "teamId")]
+        team_id: String,
+    },
+    TeamRun {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "teamId")]
+        team_id: String,
+        #[serde(rename = "runnerId")]
+        runner_id: String,
+        command: crate::team::TeamRunnerCommand,
+    },
+    TeamBroadcast {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "teamId")]
+        team_id: String,
+        command: crate::team::TeamRunnerCommand,
+    },
+    GetDiscoveredRunners {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    TmuxListSessions {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    TmuxPaneSnapshot {
+        #[serde(default)]
+        id: Option<String>,
+        session: String,
+        #[serde(default)]
+        lines: Option<u32>,
+    },
+    TmuxSendKeys {
+        #[serde(default)]
+        id: Option<String>,
+        session: String,
+        #[serde(default)]
+        text: Option<String>,
+        #[serde(default)]
+        key: Option<String>,
+    },
+    TmuxSessionCreate {
+        #[serde(default)]
+        id: Option<String>,
+        session: String,
+    },
+    TmuxSessionDelete {
+        #[serde(default)]
+        id: Option<String>,
+        session: String,
+    },
+    TmuxTerminalAttach {
+        #[serde(default)]
+        id: Option<String>,
+        session: String,
+        cols: u32,
+        rows: u32,
+        #[serde(default, rename = "fullHistory")]
+        full_history: bool,
+        #[serde(default, rename = "cachedHistoryKey")]
+        cached_history_key: Option<String>,
+    },
+    TmuxTerminalInput {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "terminalId")]
+        terminal_id: String,
+        data: String,
+    },
+    TmuxTerminalResize {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "terminalId")]
+        terminal_id: String,
+        cols: u32,
+        rows: u32,
+        #[serde(default, rename = "fitWindow")]
+        fit_window: bool,
+    },
+    TmuxTerminalDetach {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "terminalId")]
+        terminal_id: String,
+    },
 }
 impl RpcCommand {
+    /// Validated catalog tuple of a `switch_session`, when the client sent
+    /// one. All three fields are required together; absent keeps the legacy
+    /// path-only internal flow. Wire aliases (`native`, `primary`,
+    /// `grok-hyper`, `grok/hyper`) normalize to the strict canonical set.
+    pub(crate) fn switch_catalog_identity(
+        &self,
+    ) -> Result<Option<CatalogSwitchIdentity>, SwitchCatalogIdentityError> {
+        match self {
+            Self::SwitchSession {
+                catalog_source,
+                catalog_session_id,
+                catalog_status,
+                ..
+            } => switch_catalog_identity(
+                catalog_source.as_deref(),
+                catalog_session_id.as_deref(),
+                catalog_status.as_deref(),
+            ),
+            _ => Ok(None),
+        }
+    }
     pub(crate) fn id(&self) -> Option<String> {
         match self {
             Self::Prompt { id, .. }
@@ -928,9 +1940,9 @@ impl RpcCommand {
             | Self::SetModel { id, .. }
             | Self::CycleModel { id }
             | Self::GetAvailableModels { id }
+            | Self::GetAvailableThinkingLevels { id }
             | Self::SetThinkingLevel { id, .. }
             | Self::CycleThinkingLevel { id }
-            | Self::GetAvailableThinkingLevels { id }
             | Self::SetSteeringMode { id, .. }
             | Self::SetFollowUpMode { id, .. }
             | Self::Compact { id, .. }
@@ -944,12 +1956,18 @@ impl RpcCommand {
             | Self::ExportHtml { id, .. }
             | Self::SwitchSession { id, .. }
             | Self::Fork { id, .. }
-            | Self::Clone { id }
-            | Self::GetForkMessages { id }
+            | Self::Clone { id, .. }
+            | Self::GetForkMessages { id, .. }
             | Self::GetEntries { id, .. }
             | Self::GetTree { id }
             | Self::GetLastAssistantText { id }
             | Self::SetSessionName { id, .. }
+            | Self::SessionForkLatest { id, .. }
+            | Self::SessionHandoff { id, .. }
+            | Self::SessionMove { id, .. }
+            | Self::SessionDelete { id, .. }
+            | Self::SessionRestore { id, .. }
+            | Self::SessionCopyContext { id, .. }
             | Self::GetMessages { id }
             | Self::GetCommands { id }
             | Self::SetTodos { id, .. }
@@ -964,6 +1982,9 @@ impl RpcCommand {
             | Self::ProcessDescribe { id, .. }
             | Self::ProcessLogs { id, .. }
             | Self::ProcessWrite { id, .. }
+            | Self::ChatMappingGet { id }
+            | Self::ChatMappingPut { id, .. }
+            | Self::GoalJournal { id }
             | Self::ProcessKeys { id, .. }
             | Self::ProcessResize { id, .. }
             | Self::ProcessSignal { id, .. }
@@ -997,16 +2018,19 @@ impl RpcCommand {
             | Self::WorkflowCancel { id, .. }
             | Self::WorkflowIntegrate { id, .. }
             | Self::WorkflowRemove { id, .. }
+            | Self::WorkflowHubSend { id, .. }
             | Self::SideChatNew { id, .. }
             | Self::SideChatSwitch { id, .. }
             | Self::SideChatClose { id, .. }
             | Self::SideChatPrompt { id, .. }
             | Self::SideChatList { id }
+            | Self::SideChatAbort { id }
             | Self::SnapCompact { id }
             | Self::Rewind { id, .. }
             | Self::Handoff { id, .. }
             | Self::QueueList { id }
-            | Self::QueueCancel { id }
+            | Self::QueueCancel { id, .. }
+            | Self::QueueSendNow { id }
             | Self::JobList { id }
             | Self::TaskSpawn { id, .. }
             | Self::JobCancel { id, .. }
@@ -1020,14 +2044,36 @@ impl RpcCommand {
             | Self::RealtimeStop { id }
             | Self::SttTranscribe { id, .. }
             | Self::CodeReviewOpen { id, .. }
+            | Self::CodeReviewCommits { id, .. }
             | Self::CodeReviewSnapshot { id }
             | Self::CodeReviewRefresh { id }
             | Self::CodeReviewComment { id, .. }
+            | Self::CodeReviewSetModel { id, .. }
+            | Self::CodeReviewAutoReview { id, .. }
+            | Self::CodeReviewHighlight { id, .. }
+            | Self::CodeReviewTldr { id, .. }
+            | Self::CodeReviewStop { id, .. }
             | Self::CodeReviewAbort { id, .. }
-            | Self::CodeReviewClose { id }
+            | Self::CodeReviewClose { id, .. }
             | Self::CodeReviewFileDiff { id, .. }
+            | Self::CodeReviewFileContext { id, .. }
+            | Self::FileExplorerList { id, .. }
+            | Self::FileExplorerRead { id, .. }
+            | Self::FileExplorerChanges { id }
+            | Self::FileExplorerDiff { id, .. }
+            | Self::FileExplorerBlame { id, .. }
+            | Self::FileExplorerDelete { id, .. }
+            | Self::FileExplorerStageDownload { id, .. }
+            | Self::FileExplorerMap { id, .. }
+            | Self::PathComplete { id, .. }
+            | Self::FileConversationOpen { id, .. }
+            | Self::FileConversationPrompt { id, .. }
+            | Self::FileConversationSnapshot { id, .. }
+            | Self::FileConversationAbort { id, .. }
+            | Self::FileConversationClose { id, .. }
             | Self::CloseSession { id }
             | Self::Skill { id, .. }
+            | Self::Run { id, .. }
             | Self::PersonaList { id }
             | Self::PersonaGet { id, .. }
             | Self::PersonaCreate { id, .. }
@@ -1036,7 +2082,41 @@ impl RpcCommand {
             | Self::PersonaPurge { id, .. }
             | Self::PersonaSelect { id, .. }
             | Self::PersonaClear { id }
-            | Self::PersonaCurrent { id } => id.clone(),
+            | Self::PersonaCurrent { id }
+            | Self::TodoChildCreate { id, .. }
+            | Self::TodoChildList { id, .. }
+            | Self::TodoChildSelect { id, .. }
+            | Self::TodoChildSend { id, .. }
+            | Self::TodoChildStatus { id, .. }
+            | Self::TodoChildStop { id, .. }
+            | Self::TodoChildPause { id, .. }
+            | Self::TodoChildResume { id, .. }
+            | Self::TodoChildCancel { id, .. }
+            | Self::TodoChildArchive { id, .. }
+            | Self::TodoChildRemove { id, .. }
+            | Self::TodoChildAddTask { id, .. }
+            | Self::TodoChildDetail { id, .. }
+            | Self::TodoChildHubSend { id, .. }
+            | Self::TeamList { id }
+            | Self::TeamCreate { id, .. }
+            | Self::TeamRemove { id, .. }
+            | Self::TeamJoin { id, .. }
+            | Self::TeamLeave { id, .. }
+            | Self::TeamStatus { id, .. }
+            | Self::TeamRun { id, .. }
+            | Self::TeamBroadcast { id, .. }
+            | Self::GetDiscoveredRunners { id }
+            | Self::TmuxListSessions { id }
+            | Self::TmuxPaneSnapshot { id, .. }
+            | Self::TmuxSendKeys { id, .. }
+            | Self::TmuxSessionCreate { id, .. }
+            | Self::TmuxSessionDelete { id, .. }
+            | Self::TmuxTerminalAttach { id, .. }
+            | Self::TmuxTerminalInput { id, .. }
+            | Self::TmuxTerminalResize { id, .. }
+            | Self::TmuxTerminalDetach { id, .. }
+            | Self::ChatMappingGet { id }
+            | Self::ChatMappingPut { id, .. } => id.clone(),
         }
     }
     pub(crate) const fn command_name(&self) -> &'static str {
@@ -1050,9 +2130,9 @@ impl RpcCommand {
             Self::SetModel { .. } => "set_model",
             Self::CycleModel { .. } => "cycle_model",
             Self::GetAvailableModels { .. } => "get_available_models",
+            Self::GetAvailableThinkingLevels { .. } => "get_available_thinking_levels",
             Self::SetThinkingLevel { .. } => "set_thinking_level",
             Self::CycleThinkingLevel { .. } => "cycle_thinking_level",
-            Self::GetAvailableThinkingLevels { .. } => "get_available_thinking_levels",
             Self::SetSteeringMode { .. } => "set_steering_mode",
             Self::SetFollowUpMode { .. } => "set_follow_up_mode",
             Self::Compact { .. } => "compact",
@@ -1072,6 +2152,12 @@ impl RpcCommand {
             Self::GetTree { .. } => "get_tree",
             Self::GetLastAssistantText { .. } => "get_last_assistant_text",
             Self::SetSessionName { .. } => "set_session_name",
+            Self::SessionForkLatest { .. } => "session_fork_latest",
+            Self::SessionDelete { .. } => "session_delete",
+            Self::SessionRestore { .. } => "session_restore",
+            Self::SessionHandoff { .. } => "session_handoff",
+            Self::SessionCopyContext { .. } => "session_copy_context",
+            Self::SessionMove { .. } => "session_move",
             Self::GetMessages { .. } => "get_messages",
             Self::GetCommands { .. } => "get_commands",
             Self::SetTodos { .. } => "set_todos",
@@ -1088,6 +2174,8 @@ impl RpcCommand {
             Self::ProcessWrite { .. } => "process_write",
             Self::ProcessKeys { .. } => "process_keys",
             Self::ProcessResize { .. } => "process_resize",
+            Self::ChatMappingGet { .. } => "chat_mapping_get",
+            Self::ChatMappingPut { .. } => "chat_mapping_put",
             Self::ProcessSignal { .. } => "process_signal",
             Self::ProcessStop { .. } => "process_stop",
             Self::ProcessWait { .. } => "process_wait",
@@ -1119,16 +2207,19 @@ impl RpcCommand {
             Self::WorkflowCancel { .. } => "workflow_cancel",
             Self::WorkflowIntegrate { .. } => "workflow_integrate",
             Self::WorkflowRemove { .. } => "workflow_remove",
+            Self::WorkflowHubSend { .. } => "workflow_hub_send",
             Self::SideChatNew { .. } => "side_chat_new",
             Self::SideChatSwitch { .. } => "side_chat_switch",
             Self::SideChatClose { .. } => "side_chat_close",
             Self::SideChatPrompt { .. } => "side_chat_prompt",
             Self::SideChatList { .. } => "side_chat_list",
+            Self::SideChatAbort { .. } => "side_chat_abort",
             Self::SnapCompact { .. } => "snapcompact",
             Self::Rewind { .. } => "rewind",
             Self::Handoff { .. } => "handoff",
             Self::QueueList { .. } => "queue_list",
             Self::QueueCancel { .. } => "queue_cancel",
+            Self::QueueSendNow { .. } => "queue_send_now",
             Self::JobList { .. } => "job_list",
             Self::TaskSpawn { .. } => "task_spawn",
             Self::JobCancel { .. } => "job_cancel",
@@ -1143,13 +2234,35 @@ impl RpcCommand {
             Self::RealtimeStop { .. } => "realtime_stop",
             Self::SttTranscribe { .. } => "stt_transcribe",
             Self::CodeReviewOpen { .. } => "code_review_open",
+            Self::CodeReviewCommits { .. } => "code_review_commits",
             Self::CodeReviewSnapshot { .. } => "code_review_snapshot",
             Self::CodeReviewRefresh { .. } => "code_review_refresh",
             Self::CodeReviewComment { .. } => "code_review_comment",
             Self::CodeReviewAbort { .. } => "code_review_abort",
+            Self::CodeReviewAutoReview { .. } => "code_review_auto_review",
+            Self::CodeReviewHighlight { .. } => "code_review_highlight",
+            Self::CodeReviewTldr { .. } => "code_review_tldr",
+            Self::CodeReviewStop { .. } => "code_review_stop",
+            Self::CodeReviewSetModel { .. } => "code_review_set_model",
             Self::CodeReviewClose { .. } => "code_review_close",
             Self::CodeReviewFileDiff { .. } => "code_review_file_diff",
+            Self::CodeReviewFileContext { .. } => "code_review_file_context",
+            Self::FileExplorerList { .. } => "file_explorer_list",
+            Self::FileExplorerRead { .. } => "file_explorer_read",
+            Self::FileExplorerChanges { .. } => "file_explorer_changes",
+            Self::FileExplorerDiff { .. } => "file_explorer_diff",
+            Self::FileExplorerBlame { .. } => "file_explorer_blame",
+            Self::FileExplorerDelete { .. } => "file_explorer_delete",
+            Self::FileExplorerStageDownload { .. } => "file_explorer_stage_download",
+            Self::FileExplorerMap { .. } => "file_explorer_map",
+            Self::PathComplete { .. } => "path_complete",
+            Self::FileConversationOpen { .. } => "file_conversation_open",
+            Self::FileConversationPrompt { .. } => "file_conversation_prompt",
+            Self::FileConversationSnapshot { .. } => "file_conversation_snapshot",
+            Self::FileConversationAbort { .. } => "file_conversation_abort",
+            Self::FileConversationClose { .. } => "file_conversation_close",
             Self::Skill { .. } => "skill",
+            Self::Run { .. } => "run",
             Self::PersonaList { .. } => "persona_list",
             Self::PersonaGet { .. } => "persona_get",
             Self::PersonaCreate { .. } => "persona_create",
@@ -1159,6 +2272,40 @@ impl RpcCommand {
             Self::PersonaSelect { .. } => "persona_select",
             Self::PersonaClear { .. } => "persona_clear",
             Self::PersonaCurrent { .. } => "persona_current",
+            Self::TodoChildCreate { .. } => "todo_child_create",
+            Self::TodoChildList { .. } => "todo_child_list",
+            Self::TodoChildSelect { .. } => "todo_child_select",
+            Self::TodoChildSend { .. } => "todo_child_send",
+            Self::TodoChildStatus { .. } => "todo_child_status",
+            Self::TodoChildStop { .. } => "todo_child_stop",
+            Self::TodoChildPause { .. } => "todo_child_pause",
+            Self::TodoChildResume { .. } => "todo_child_resume",
+            Self::TodoChildCancel { .. } => "todo_child_cancel",
+            Self::TodoChildArchive { .. } => "todo_child_archive",
+            Self::TodoChildRemove { .. } => "todo_child_remove",
+            Self::TodoChildAddTask { .. } => "todo_child_add_task",
+            Self::TodoChildDetail { .. } => "todo_child_detail",
+            Self::TodoChildHubSend { .. } => "todo_child_hub_send",
+            Self::TeamList { .. } => "team_list",
+            Self::TeamCreate { .. } => "team_create",
+            Self::TeamRemove { .. } => "team_remove",
+            Self::TeamJoin { .. } => "team_join",
+            Self::TeamLeave { .. } => "team_leave",
+            Self::TeamStatus { .. } => "team_status",
+            Self::TeamRun { .. } => "team_run",
+            Self::TeamBroadcast { .. } => "team_broadcast",
+            Self::GetDiscoveredRunners { .. } => "get_discovered_runners",
+            Self::TmuxListSessions { .. } => "tmux_list_sessions",
+            Self::TmuxPaneSnapshot { .. } => "tmux_pane_snapshot",
+            Self::TmuxSendKeys { .. } => "tmux_send_keys",
+            Self::TmuxSessionCreate { .. } => "tmux_session_create",
+            Self::TmuxSessionDelete { .. } => "tmux_session_delete",
+            Self::TmuxTerminalAttach { .. } => "tmux_terminal_attach",
+            Self::TmuxTerminalInput { .. } => "tmux_terminal_input",
+            Self::TmuxTerminalResize { .. } => "tmux_terminal_resize",
+            Self::TmuxTerminalDetach { .. } => "tmux_terminal_detach",
+            Self::ChatMappingGet { .. } => "chat_mapping_get",
+            Self::ChatMappingPut { .. } => "chat_mapping_put",
         }
     }
 
@@ -1168,6 +2315,23 @@ impl RpcCommand {
             Self::CollabStart { .. } | Self::CollabStatus { .. } | Self::CollabStop { .. }
         )
     }
+
+    pub(crate) const fn is_listen_local(&self) -> bool {
+        self.is_collab_lifecycle()
+            || matches!(
+                self,
+                Self::GetDiscoveredRunners { .. }
+                    | Self::TmuxListSessions { .. }
+                    | Self::TmuxPaneSnapshot { .. }
+                    | Self::TmuxSendKeys { .. }
+                    | Self::TmuxSessionCreate { .. }
+                    | Self::TmuxSessionDelete { .. }
+                    | Self::TmuxTerminalAttach { .. }
+                    | Self::TmuxTerminalInput { .. }
+                    | Self::TmuxTerminalResize { .. }
+                    | Self::TmuxTerminalDetach { .. }
+            )
+    }
 }
 
 impl RpcCommand {
@@ -1176,6 +2340,12 @@ impl RpcCommand {
             self,
             Self::Abort { .. }
                 | Self::AbortRetry { .. }
+                // Steer/follow_up append to the pending queue in O(1); the
+                // stdio gate must exempt them exactly like the Web bypass
+                // (bypasses_command_slots) so a saturated command list can
+                // never silently drop the user's steering.
+                | Self::Steer { .. }
+                | Self::FollowUp { .. }
                 | Self::AbortBash { .. }
                 | Self::LoopCancel { .. }
                 | Self::ProcessSignal { .. }
@@ -1199,22 +2369,51 @@ impl RpcCommand {
                 | Self::WorkflowCancel { .. }
                 | Self::WorkflowIntegrate { .. }
                 | Self::WorkflowRemove { .. }
+                | Self::WorkflowHubSend { .. }
                 | Self::SideChatNew { .. }
                 | Self::SideChatSwitch { .. }
                 | Self::SideChatClose { .. }
                 | Self::SideChatPrompt { .. }
                 | Self::SideChatList { .. }
+                | Self::SideChatAbort { .. }
                 | Self::QueueList { .. }
                 | Self::QueueCancel { .. }
+                | Self::QueueSendNow { .. }
                 | Self::CollabStart { .. }
                 | Self::CollabStatus { .. }
                 | Self::CollabStop { .. }
+                | Self::GetDiscoveredRunners { .. }
                 | Self::CloseSession { .. }
-                | Self::RealtimeStop { .. }
-                | Self::CodeReviewSnapshot { .. }
+                | Self::SessionDelete { .. }
+                | Self::SessionRestore { .. }
+                | Self::SessionForkLatest { .. }
+                | Self::CodeReviewAutoReview { .. }
+                | Self::CodeReviewHighlight { .. }
+                | Self::CodeReviewTldr { .. }
+                | Self::CodeReviewStop { .. }
                 | Self::CodeReviewComment { .. }
+                | Self::CodeReviewSetModel { .. }
+                | Self::CodeReviewSnapshot { .. }
                 | Self::CodeReviewAbort { .. }
                 | Self::CodeReviewClose { .. }
+                | Self::TodoChildCreate { .. }
+                | Self::TodoChildList { .. }
+                | Self::TodoChildSelect { .. }
+                | Self::TodoChildSend { .. }
+                | Self::TodoChildStatus { .. }
+                | Self::TodoChildStop { .. }
+                | Self::TodoChildPause { .. }
+                | Self::TodoChildResume { .. }
+                | Self::TodoChildArchive { .. }
+                | Self::TodoChildRemove { .. }
+                | Self::TodoChildAddTask { .. }
+                | Self::TodoChildDetail { .. }
+                | Self::TodoChildHubSend { .. }
+                | Self::FileConversationOpen { .. }
+                | Self::FileConversationPrompt { .. }
+                | Self::FileConversationSnapshot { .. }
+                | Self::FileConversationAbort { .. }
+                | Self::FileConversationClose { .. }
         )
     }
 
@@ -1224,13 +2423,64 @@ impl RpcCommand {
             Self::Abort { .. }
                 | Self::AbortRetry { .. }
                 | Self::AbortBash { .. }
+                // Queue user operations append to or drain the pending queue
+                // in O(1) and must never die on slot saturation (observed: a
+                // long process_wait + watchdog probes filled all 16 slots and
+                // silently dropped the user's steering).
+                | Self::Steer { .. }
+                | Self::FollowUp { .. }
+                | Self::QueueCancel { .. }
+                | Self::QueueSendNow { .. }
                 | Self::LoopCancel { .. }
                 | Self::ProcessSignal { .. }
                 | Self::ProcessStop { .. }
                 | Self::CloseSession { .. }
+                | Self::SessionDelete { .. }
+                | Self::SessionRestore { .. }
                 | Self::RealtimeStop { .. }
                 | Self::CodeReviewAbort { .. }
+                | Self::CodeReviewStop { .. }
                 | Self::CodeReviewClose { .. }
+                | Self::SideChatAbort { .. }
+                | Self::TodoChildList { .. }
+                | Self::TodoChildStatus { .. }
+                | Self::TodoChildSelect { .. }
+                | Self::TodoChildDetail { .. }
+                | Self::TmuxTerminalInput { .. }
+                | Self::TmuxTerminalResize { .. }
+                | Self::TmuxTerminalDetach { .. }
+                | Self::TmuxSessionCreate { .. }
+                | Self::TmuxSessionDelete { .. }
+                | Self::FileConversationAbort { .. }
+                | Self::FileConversationClose { .. }
+        )
+    }
+
+    /// Read-only session-control commands must remain responsive while an
+    /// ordinary command is awaiting external I/O. Interactive user-control
+    /// commands (prompt / set_model / set_thinking_level) are also admitted
+    /// directly: turn admission (`turn_admission` / the turn gate) serializes
+    /// turn starts, and `set_model` is proven safe beside a live turn
+    /// (applies to the next turn only), so none of them may starve behind one
+    /// long-running ordinary command at the FIFO head.
+    pub(crate) const fn bypasses_ordinary_fifo(&self) -> bool {
+        matches!(
+            self,
+            Self::GetState { .. }
+                | Self::GetSessionStats { .. }
+                | Self::SessionList { .. }
+                | Self::GetForkMessages { .. }
+                | Self::Prompt { .. }
+                | Self::SetModel { .. }
+                | Self::SetThinkingLevel { .. }
+                | Self::TodoChildList { .. }
+                | Self::FileConversationOpen { .. }
+                | Self::FileConversationPrompt { .. }
+                | Self::FileConversationSnapshot { .. }
+                | Self::FileConversationAbort { .. }
+                | Self::FileConversationClose { .. }
+                | Self::TodoChildStatus { .. }
+                | Self::TodoChildDetail { .. }
         )
     }
 }
@@ -1245,7 +2495,15 @@ pub(crate) struct RpcExtensionUiResponse {
     #[serde(default)]
     cancelled: Option<bool>,
 }
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueCancelScope {
+    #[default]
+    All,
+    Steering,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RpcSessionListScope {
     #[default]
@@ -1257,6 +2515,7 @@ pub enum RpcSessionListScope {
 
 pub struct RpcSessionState {
     pub model: Option<Model>,
+    pub active_turn_model: Option<Model>,
     pub thinking_level: ThinkingLevel,
     pub is_streaming: bool,
     pub is_compacting: bool,
@@ -1269,31 +2528,47 @@ pub struct RpcSessionState {
     pub auto_compaction_enabled: bool,
     pub message_count: usize,
     pub pending_message_count: usize,
+    #[serde(default)]
+    pub skipped_idless: usize,
+    #[serde(default)]
+    pub undecodable_messages: usize,
+    #[serde(default)]
+    pub queued_steering: Vec<String>,
     pub todo_phases: Vec<TodoPhase>,
+    pub todo_execution_status: pi_coding::TodoDagExecutionStatus,
+    pub todo_failure_reason: Option<pi_coding::TodoDagFailureReason>,
     pub goal: GoalState,
     pub runtime_settings: pi_coding::RuntimeSettingsState,
 }
 impl RpcSessionState {
     pub(crate) fn from_application(
         s: ApplicationState,
+        active_turn_model: Option<Model>,
         runtime_settings: pi_coding::RuntimeSettingsState,
         cwd: &Path,
+        session_id_override: Option<String>,
     ) -> Self {
         Self {
             model: s.model.map(public_model),
+            active_turn_model: active_turn_model.map(public_model),
             thinking_level: s.thinking_level,
             is_streaming: s.is_streaming,
             is_compacting: s.is_compacting,
             steering_mode: s.steering_mode,
             follow_up_mode: s.follow_up_mode,
             session_file: s.session_file,
-            session_id: s.session_id,
+            session_id: session_id_override.or(s.session_id),
             session_name: s.session_name,
             cwd: cwd.to_string_lossy().into_owned(),
             auto_compaction_enabled: s.auto_compaction_enabled,
             message_count: s.message_count,
             pending_message_count: s.pending_message_count,
+            skipped_idless: s.skipped_idless,
+            undecodable_messages: s.undecodable_messages,
+            queued_steering: s.queued_steering,
             todo_phases: s.todo_phases,
+            todo_execution_status: s.todo_execution_status,
+            todo_failure_reason: s.todo_failure_reason,
             goal: s.goal,
             runtime_settings,
         }
@@ -1315,7 +2590,19 @@ pub struct RpcSessionListRow {
     pub path: String,
     pub size: u64,
     pub message_count: Option<usize>,
+    /// `native` | `foreign` | `already_imported`. An `already_imported` row
+    /// is a foreign source whose native imported copy also exists (both stay
+    /// listed — product decision); the sidebar badges it and resolves the
+    /// copy via `nativePath`.
     pub status: String,
+    /// The native imported copy's path, carried only by `already_imported`
+    /// rows so the frontend can resolve/badge the import.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_path: Option<String>,
+    /// The native imported copy's authoritative session id. Present only with
+    /// `already_imported`; unlike the file name, this is the runtime identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_session_id: Option<String>,
     /// True when the row is an unnamed, tiny, native Pi session whose cwd
     /// sits lexically under the OS temp root (historical test-harness
     /// shape). The Web sidebar hides such rows by default but keeps them
@@ -1324,12 +2611,27 @@ pub struct RpcSessionListRow {
     /// Web AllProjects scope; Current-scope rows always report false (the
     /// current workspace is by definition in active use).
     pub temporary: bool,
+    pub agent_session: bool,
+    pub bootstrap_only: bool,
+    pub session_kind: &'static str,
 }
 
 impl RpcSessionListRow {
-    fn from_resume_row(row: crate::resume_catalog::ResumeSelectorRow, temporary: bool) -> Self {
+    pub(crate) fn from_resume_row(row: crate::resume_catalog::ResumeSelectorRow, temporary: bool) -> Self {
+        let (status, native_path, native_session_id) = match &row.status {
+            pi_coding::CatalogRowStatus::Native => ("native", None, None),
+            pi_coding::CatalogRowStatus::Foreign => ("foreign", None, None),
+            pi_coding::CatalogRowStatus::AlreadyImported {
+                native_id,
+                native_path,
+            } => (
+                "already_imported",
+                Some(native_path.to_string_lossy().into_owned()),
+                Some(native_id.clone()),
+            ),
+        };
         Self {
-            source: row.source.label(),
+            source: row.source.as_str(),
             session_id: row.session_id,
             name: row.name,
             cwd: row.cwd.to_string_lossy().into_owned(),
@@ -1339,35 +2641,97 @@ impl RpcSessionListRow {
             path: row.path.to_string_lossy().into_owned(),
             size: row.size,
             message_count: row.message_count,
-            status: row.status.is_native().then_some("native").unwrap_or("foreign").to_owned(),
+            status: status.to_owned(),
+            native_path,
+            native_session_id,
             temporary,
+            agent_session: row.agent_session,
+            bootstrap_only: row.bootstrap_only,
+            session_kind: row.session_kind.header_value(),
         }
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 pub struct RpcResponse {
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    #[serde(rename = "type")]
     pub record_type: &'static str,
     pub command: String,
+    pub session_id: Option<String>,
     pub success: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Pre-validated JSON for `data`, bypassing the recursive `Value` tree.
+    /// When present, `data` must be `None`; the manual `Serialize` impl emits
+    /// this value verbatim as `"data"` without recursive `Value` construction.
+    pub raw_data: Option<Box<serde_json::value::RawValue>>,
 }
+
+impl Serialize for RpcResponse {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(id) = &self.id {
+            map.serialize_entry("id", id)?;
+        }
+        map.serialize_entry("type", self.record_type)?;
+        map.serialize_entry("command", &self.command)?;
+        if let Some(session_id) = &self.session_id {
+            map.serialize_entry("sessionId", session_id)?;
+        }
+        map.serialize_entry("success", &self.success)?;
+        if self.raw_data.is_some() && self.data.is_some() {
+            return Err(serde::ser::Error::custom(
+                "RPC response cannot contain both typed and raw data",
+            ));
+        }
+        if let Some(raw) = &self.raw_data {
+            map.serialize_entry("data", raw)?;
+        } else if let Some(data) = &self.data {
+            map.serialize_entry("data", data)?;
+        }
+        if let Some(error) = &self.error {
+            map.serialize_entry("error", error)?;
+        }
+        map.end()
+    }
+}
+
 impl RpcResponse {
-    pub(crate) fn success(id: Option<String>, command: impl Into<String>, data: Option<Value>) -> Self {
+    pub(crate) fn success(
+        id: Option<String>,
+        command: impl Into<String>,
+        data: Option<Value>,
+    ) -> Self {
         Self {
             id,
             record_type: "response",
             command: command.into(),
+            session_id: None,
             success: true,
             data,
             error: None,
+            raw_data: None,
         }
+    }
+    pub(crate) fn success_raw(
+        id: Option<String>,
+        command: impl Into<String>,
+        raw_json: String,
+    ) -> serde_json::Result<Self> {
+        Ok(Self {
+            id,
+            record_type: "response",
+            command: command.into(),
+            session_id: None,
+            success: true,
+            data: None,
+            error: None,
+            raw_data: Some(serde_json::value::RawValue::from_string(raw_json)?),
+        })
     }
     pub fn failure(
         id: Option<String>,
@@ -1378,10 +2742,36 @@ impl RpcResponse {
             id,
             record_type: "response",
             command: command.into(),
+            session_id: None,
             success: false,
             data: None,
             error: Some(error.into()),
+            raw_data: None,
         }
+    }
+
+    pub(crate) fn with_error_code(mut self, code: &'static str) -> Self {
+        self.data = Some(json!({ "code": code }));
+        self
+    }
+
+    pub(crate) fn slot_overload(
+        id: Option<String>,
+        command: impl Into<String>,
+        error: impl Into<String>,
+    ) -> Self {
+        Self::failure(id, command, error).with_error_code("busy_capacity")
+    }
+
+    pub(crate) fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+    pub(crate) fn is_transient_slot_overload(&self) -> bool {
+        !self.success
+            && self.data.as_ref().is_some_and(|data| {
+                data.get("code").and_then(|code| code.as_str()) == Some("busy_capacity")
+            })
     }
 }
 #[derive(Clone, Debug, Serialize)]
@@ -1393,6 +2783,8 @@ pub(crate) struct RpcExtensionUiRequest {
     /// by the session runtime manager's fan-in forwarder.
     #[serde(rename = "sessionId", skip_serializing_if = "Option::is_none")]
     pub(crate) session_id: Option<String>,
+    #[serde(rename = "runtimeIncarnation", skip_serializing_if = "Option::is_none")]
+    pub(crate) runtime_incarnation: Option<String>,
     #[serde(flatten)]
     request: Value,
 }
@@ -1403,8 +2795,26 @@ impl RpcExtensionUiRequest {
     pub(crate) fn error_notice(session_id: Option<String>, message: String) -> Self {
         Self {
             record_type: "extension_ui_request",
-            id: uuid::Uuid::new_v4().to_string(),
+            id: uuid::Uuid::now_v7().to_string(),
             session_id,
+            runtime_incarnation: None,
+            request: json!({
+                "method": "notify",
+                "message": message,
+                "notifyType": "error",
+            }),
+        }
+    }
+
+    pub(crate) fn error_notice_with_identity(
+        identity: Option<RuntimeIdentity>,
+        message: String,
+    ) -> Self {
+        Self {
+            record_type: "extension_ui_request",
+            id: uuid::Uuid::now_v7().to_string(),
+            session_id: identity.as_ref().map(|identity| identity.session_id.clone()),
+            runtime_incarnation: identity.map(|identity| identity.runtime_incarnation),
             request: json!({
                 "method": "notify",
                 "message": message,
@@ -1431,19 +2841,72 @@ pub(crate) enum RpcInput {
 }
 
 #[derive(Clone)]
-pub(crate) struct RpcDispatcher {
+pub struct RpcDispatcher {
     application: Application,
     settings: crate::settings_rpc::SettingsRpcState,
     workflows: crate::workflow_rpc::WorkflowRpcState,
     command_slots: Arc<Semaphore>,
     side_chat: SideChatRpcState,
     code_review: CodeReviewRpcState,
+    file_conversations: FileConversationRpcState,
     session_storage: Option<crate::session_run::SessionStorage>,
+}
+
+pub(crate) async fn handle_tmux_command(command: RpcCommand) -> RpcResponse {
+    let id = command.id();
+    let name = command.command_name();
+    let result = tokio::task::spawn_blocking(move || execute_tmux_command(command)).await;
+    match result {
+        Ok(Ok(data)) => RpcResponse::success(id, name, Some(data)),
+        Ok(Err(error)) => RpcResponse::failure(id, name, error),
+        Err(error) if error.is_cancelled() => {
+            RpcResponse::failure(id, name, "tmux operation was cancelled")
+        }
+        Err(_) => RpcResponse::failure(id, name, "tmux operation failed"),
+    }
+}
+
+fn execute_tmux_command(command: RpcCommand) -> Result<Value, String> {
+    match command {
+        RpcCommand::TmuxListSessions { .. } => {
+            crate::modes::tmux::list_sessions().and_then(|data| {
+                serde_json::to_value(data)
+                    .map_err(|error| format!("tmux list-sessions serialize failed: {error}"))
+            })
+        }
+        RpcCommand::TmuxPaneSnapshot {
+            session, lines, ..
+        } => crate::modes::tmux::pane_snapshot(&session, lines).and_then(|data| {
+            serde_json::to_value(data)
+                .map_err(|error| format!("tmux pane snapshot serialize failed: {error}"))
+        }),
+        RpcCommand::TmuxSendKeys {
+            session, text, key, ..
+        } => crate::modes::tmux::send_keys(&session, text.as_deref(), key.as_deref()).and_then(
+            |data| {
+                serde_json::to_value(data)
+                    .map_err(|error| format!("tmux send-keys serialize failed: {error}"))
+            },
+        ),
+        RpcCommand::TmuxSessionCreate { session, .. } => {
+            crate::modes::tmux::create_session(&session).and_then(|data| {
+                serde_json::to_value(data)
+                    .map_err(|error| format!("tmux session create serialize failed: {error}"))
+            })
+        }
+        RpcCommand::TmuxSessionDelete { session, .. } => {
+            crate::modes::tmux::delete_session(&session).and_then(|data| {
+                serde_json::to_value(data)
+                    .map_err(|error| format!("tmux session delete serialize failed: {error}"))
+            })
+        }
+        _ => Err("tmux command routing mismatch".to_owned()),
+    }
 }
 
 impl RpcDispatcher {
     #[must_use]
-    pub(crate) fn new(application: Application) -> Self {
+    pub fn new(application: Application) -> Self {
         Self::new_with_session_storage(application, None)
     }
 
@@ -1459,18 +2922,42 @@ impl RpcDispatcher {
             command_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_COMMANDS)),
             side_chat: SideChatRpcState::default(),
             code_review: CodeReviewRpcState::default(),
+            file_conversations: FileConversationRpcState::default(),
             session_storage,
         }
     }
 
-    pub(crate) fn application(&self) -> &Application {
+    pub fn application(&self) -> &Application {
         &self.application
     }
     /// Dispatch a command with this dispatcher's full state. Side-chat and
     /// code-review commands live outside the settings/workflows handler
     /// because their controller state is owned by the RPC session, not by the
     /// application.
-    pub(crate) async fn dispatch_inner(&self, command: RpcCommand) -> RpcResponse {
+    pub async fn dispatch_inner(&self, command: RpcCommand) -> RpcResponse {
+        if matches!(
+            command,
+            RpcCommand::TmuxListSessions { .. }
+                | RpcCommand::TmuxPaneSnapshot { .. }
+                | RpcCommand::TmuxSendKeys { .. }
+                | RpcCommand::TmuxSessionCreate { .. }
+                | RpcCommand::TmuxSessionDelete { .. }
+        ) {
+            return handle_tmux_command(command).await;
+        }
+        if matches!(
+            command,
+            RpcCommand::TmuxTerminalAttach { .. }
+                | RpcCommand::TmuxTerminalInput { .. }
+                | RpcCommand::TmuxTerminalResize { .. }
+                | RpcCommand::TmuxTerminalDetach { .. }
+        ) {
+            return RpcResponse::failure(
+                command.id(),
+                command.command_name(),
+                "tmux terminal commands require the listen control plane",
+            );
+        }
         if matches!(
             command,
             RpcCommand::SideChatNew { .. }
@@ -1478,20 +2965,77 @@ impl RpcDispatcher {
                 | RpcCommand::SideChatClose { .. }
                 | RpcCommand::SideChatPrompt { .. }
                 | RpcCommand::SideChatList { .. }
+                | RpcCommand::SideChatAbort { .. }
         ) {
             return handle_side_chat_command(&self.application, &self.side_chat, command).await;
         }
         if matches!(
             command,
             RpcCommand::CodeReviewOpen { .. }
+                | RpcCommand::CodeReviewCommits { .. }
                 | RpcCommand::CodeReviewSnapshot { .. }
                 | RpcCommand::CodeReviewRefresh { .. }
+                | RpcCommand::CodeReviewAutoReview { .. }
+                | RpcCommand::CodeReviewHighlight { .. }
+                | RpcCommand::CodeReviewTldr { .. }
+                | RpcCommand::CodeReviewStop { .. }
                 | RpcCommand::CodeReviewComment { .. }
+                | RpcCommand::CodeReviewSetModel { .. }
                 | RpcCommand::CodeReviewAbort { .. }
                 | RpcCommand::CodeReviewClose { .. }
                 | RpcCommand::CodeReviewFileDiff { .. }
+                | RpcCommand::CodeReviewFileContext { .. }
         ) {
             return handle_code_review_command(&self.application, &self.code_review, command).await;
+        }
+        if matches!(
+            command,
+            RpcCommand::FileExplorerList { .. }
+                | RpcCommand::FileExplorerRead { .. }
+                | RpcCommand::FileExplorerChanges { .. }
+                | RpcCommand::FileExplorerDiff { .. }
+                | RpcCommand::FileExplorerBlame { .. }
+                | RpcCommand::FileExplorerDelete { .. }
+                | RpcCommand::FileExplorerMap { .. }
+                | RpcCommand::PathComplete { .. }
+        ) {
+            return handle_file_explorer_command(&self.application, command).await;
+        }
+        if matches!(
+            command,
+            RpcCommand::FileConversationOpen { .. }
+                | RpcCommand::FileConversationPrompt { .. }
+                | RpcCommand::FileConversationSnapshot { .. }
+                | RpcCommand::FileConversationAbort { .. }
+                | RpcCommand::FileConversationClose { .. }
+        ) {
+            return handle_file_conversation_command(
+                &self.application,
+                &self.file_conversations,
+                command,
+            )
+            .await;
+        }
+        // stdio runtime-owner replacement (new_session/switch_session/fork/clone):
+        // hold the collection mutex across the whole dispatch, tearing the
+        // conversations down first so no open can capture an owner or fork mid-swap.
+        if matches!(
+            command,
+            RpcCommand::NewSession { .. }
+                | RpcCommand::SwitchSession { .. }
+                | RpcCommand::Fork { .. }
+                | RpcCommand::Clone { .. }
+        ) {
+            let mut file_conversation_fence = self.file_conversations.lock().await;
+            file_conversation_fence.shutdown().await;
+            return handle_command_with_session_storage(
+                &self.application,
+                &self.settings,
+                &self.workflows,
+                self.session_storage.as_ref(),
+                command,
+            )
+            .await;
         }
         handle_command_with_session_storage(
             &self.application,
@@ -1510,13 +3054,27 @@ impl RpcDispatcher {
         let id = command.id();
         let name = command.command_name();
         let Ok(_slot) = self.command_slots.clone().try_acquire_owned() else {
-            return RpcResponse::failure(
+            return RpcResponse::slot_overload(
                 id,
                 name,
                 format!("too many concurrent RPC commands (limit {MAX_CONCURRENT_COMMANDS})"),
             );
         };
         self.dispatch_inner(command).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn acquire_all_command_slots_for_test(
+        &self,
+    ) -> Vec<tokio::sync::OwnedSemaphorePermit> {
+        (0..MAX_CONCURRENT_COMMANDS)
+            .map(|_| {
+                self.command_slots
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("command slot")
+            })
+            .collect()
     }
 
     /// Shut down the RPC-owned side-chat tab container (session close /
@@ -1537,10 +3095,27 @@ impl RpcDispatcher {
         self.code_review.shutdown().await;
     }
 
-    /// Whether the RPC-owned code-review controller has an in-flight review
-    /// turn (part of the conservative close busy check).
+    /// Whether the RPC-owned code-review controller still owns cancellable
+    /// work (part of the conservative close busy check).
     pub(crate) async fn code_review_busy(&self) -> bool {
-        self.code_review.is_streaming().await
+        self.code_review.is_busy().await
+    }
+
+    pub(crate) async fn file_conversation_busy(
+        &self,
+    ) -> Result<bool, crate::file_conversation::FileConversationError> {
+        let mut engine = self.file_conversations.lock().await;
+        FileConversationRpcState::busy_with(&mut engine, &self.application).await
+    }
+
+    pub(crate) async fn lock_file_conversations(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, crate::file_conversation::FileConversationEngine> {
+        self.file_conversations.lock().await
+    }
+
+    pub(crate) async fn shutdown_file_conversations(&self) {
+        self.file_conversations.lock().await.shutdown().await;
     }
 }
 
@@ -1613,28 +3188,122 @@ impl SideChatRpcState {
     }
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct FileConversationRpcState {
+    engine: Arc<tokio::sync::Mutex<crate::file_conversation::FileConversationEngine>>,
+}
+
+impl FileConversationRpcState {
+    pub(crate) async fn lock(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, crate::file_conversation::FileConversationEngine> {
+        self.engine.lock().await
+    }
+    pub(crate) async fn busy_with(
+        engine: &mut crate::file_conversation::FileConversationEngine,
+        application: &Application,
+    ) -> Result<bool, crate::file_conversation::FileConversationError> {
+        engine.is_busy(application).await
+    }
+}
+
+/// Strict selection: absent means none; an explicit `null` or non-conforming object
+/// is a typed `file_conversation_selection_invalid` rejection (unknown fields ignored).
+fn parse_file_conversation_selection(
+    selection: &Option<Value>,
+) -> Result<Option<crate::file_conversation::FileConversationLineRange>,
+    crate::file_conversation::FileConversationError>
+{
+    use crate::file_conversation::{FileConversationError, FileConversationLineRange};
+    let Some(value) = selection else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Err(FileConversationError::SelectionInvalid {
+            start_line: 0,
+            end_line: 0,
+        });
+    }
+    let start_line = value.get("startLine").and_then(Value::as_u64);
+    let end_line = value.get("endLine").and_then(Value::as_u64);
+    let (Some(start_line), Some(end_line)) = (start_line, end_line) else {
+        return Err(FileConversationError::SelectionInvalid {
+            start_line: 0,
+            end_line: 0,
+        });
+    };
+    if start_line == 0 || end_line < start_line {
+        return Err(FileConversationError::SelectionInvalid {
+            start_line: usize::try_from(start_line).unwrap_or(usize::MAX),
+            end_line: usize::try_from(end_line).unwrap_or(usize::MAX),
+        });
+    }
+    Ok(Some(FileConversationLineRange {
+        start_line: usize::try_from(start_line).unwrap_or(usize::MAX),
+        end_line: usize::try_from(end_line).unwrap_or(usize::MAX),
+    }))
+}
+
+async fn handle_file_conversation_command(
+    app: &Application,
+    state: &FileConversationRpcState,
+    c: RpcCommand,
+) -> RpcResponse {
+    let id = c.id();
+    let name = c.command_name();
+    let conversation_id = match &c {
+        RpcCommand::FileConversationOpen { conversation_id, .. }
+        | RpcCommand::FileConversationPrompt { conversation_id, .. }
+        | RpcCommand::FileConversationSnapshot { conversation_id, .. }
+        | RpcCommand::FileConversationAbort { conversation_id, .. }
+        | RpcCommand::FileConversationClose { conversation_id, .. } => conversation_id.clone(),
+        _ => return RpcResponse::failure(id, name, "file_conversation command routing mismatch"),
+    };
+    let mut engine = state.lock().await;
+    let result = match c {
+        RpcCommand::FileConversationOpen { path, .. } => engine
+            .open(app, &conversation_id, &path)
+            .await
+            .map(|snapshot| snapshot.to_wire_json()),
+        RpcCommand::FileConversationPrompt {
+            message, selection, ..
+        } => match parse_file_conversation_selection(&selection) {
+            Ok(selection) => engine
+                .prompt(app, &conversation_id, &message, selection)
+                .await
+                .map(|ack| ack.to_wire_json()),
+            Err(error) => Err(error),
+        },
+        RpcCommand::FileConversationSnapshot { .. } => engine
+            .snapshot(app, &conversation_id)
+            .await
+            .map(|snapshot| snapshot.to_wire_json()),
+        RpcCommand::FileConversationAbort { .. } => engine
+            .abort(app, &conversation_id)
+            .await
+            .map(|snapshot| snapshot.to_wire_json()),
+        RpcCommand::FileConversationClose { .. } => engine.close(app, &conversation_id).await,
+        _ => return RpcResponse::failure(id, name, "file_conversation command routing mismatch"),
+    };
+    match result {
+        Ok(data) => RpcResponse::success(id, name, Some(data)),
+        Err(error) => {
+            let mut response = RpcResponse::failure(id, name, error.message());
+            response.data = Some(error.failure_data(&conversation_id));
+            response
+        }
+    }
+}
+
 /// Build the wire snapshot of the whole tab container.
 fn side_chat_snapshot(tabs: &crate::side_chat::SideChatTabs) -> Value {
-    use crate::side_chat::SideChatRole;
     let tab_values = tabs
         .tabs()
         .map(|(name, controller)| {
             let entries = controller
                 .entries()
                 .iter()
-                .map(|entry| {
-                    json!({
-                        "role": match entry.role {
-                            SideChatRole::User => "user",
-                            SideChatRole::Assistant => "assistant",
-                            SideChatRole::Tool => "tool",
-                            SideChatRole::System => "system",
-                        },
-                        "text": entry.text,
-                        "isError": entry.is_error,
-                        "isPartial": entry.is_partial,
-                    })
-                })
+                .map(|entry| entry.to_wire_json())
                 .collect::<Vec<_>>();
             json!({
                 "name": name,
@@ -1674,15 +3343,19 @@ async fn handle_side_chat_command(
                 side_chat.snapshot(app).await
             }
             RpcCommand::SideChatSwitch { name, .. } => {
-                side_chat.with_tabs(app, |tabs| tabs.switch_to(&name)).await?;
+                side_chat
+                    .with_tabs(app, |tabs| tabs.switch_to(&name))
+                    .await?;
                 side_chat.snapshot(app).await
             }
             RpcCommand::SideChatClose { name, .. } => {
                 let target = match &name {
                     Some(name) => name.clone(),
-                    None => side_chat
-                        .with_tabs(app, |tabs| Ok(tabs.active_name().to_owned()))
-                        .await?,
+                    None => {
+                        side_chat
+                            .with_tabs(app, |tabs| Ok(tabs.active_name().to_owned()))
+                            .await?
+                    }
                 };
                 {
                     let mut guard = side_chat.lock_tabs(app).await?;
@@ -1694,13 +3367,13 @@ async fn handle_side_chat_command(
                 }
                 side_chat.snapshot(app).await
             }
-            RpcCommand::SideChatPrompt { message, .. } => {
+            RpcCommand::SideChatPrompt { message, images, .. } => {
                 let accepted = side_chat
                     .with_tabs(app, |tabs| {
                         if tabs.is_streaming() {
                             return Ok(false);
                         }
-                        tabs.submit_prompt(&message);
+                        tabs.submit_prompt(&message, images);
                         Ok(true)
                     })
                     .await?;
@@ -1711,6 +3384,17 @@ async fn handle_side_chat_command(
                 }
                 Ok(snapshot)
             }
+            RpcCommand::SideChatAbort { .. } => {
+                {
+                    let mut guard = side_chat.lock_tabs(app).await?;
+                    guard
+                        .as_mut()
+                        .expect("side-chat tabs initialized")
+                        .abort_streaming()
+                        .await;
+                }
+                side_chat.snapshot(app).await
+            }
             _ => unreachable!("dispatch_inner only routes side_chat_* commands here"),
         }
     }
@@ -1720,102 +3404,466 @@ async fn handle_side_chat_command(
         Err(e) => RpcResponse::failure(id, name, e.to_string()),
     }
 }
+const FILE_DIFF_CACHE_MAX_ENTRIES: usize = 32;
+const FILE_DIFF_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+const FILE_DIFF_CACHE_ENTRY_OVERHEAD_BYTES: usize = 64;
+
+/// Weighted LRU capped by entry count and byte budget; an oversize diff is never stored (served uncached).
+struct FileDiffCache {
+    entries: HashMap<String, FileDiffCacheEntry>,
+    bytes: usize,
+    next_recency: u64,
+    max_entries: usize,
+    max_bytes: usize,
+}
+
+struct FileDiffCacheEntry {
+    recency: u64,
+    bytes: usize,
+    diff: Arc<FileDiff>,
+}
+
+impl Default for FileDiffCache {
+    fn default() -> Self {
+        Self::new(FILE_DIFF_CACHE_MAX_ENTRIES, FILE_DIFF_CACHE_MAX_BYTES)
+    }
+}
+
+impl FileDiffCache {
+    fn new(max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            bytes: 0,
+            next_recency: 0,
+            max_entries,
+            max_bytes,
+        }
+    }
+
+    fn get(&mut self, path: &str) -> Option<Arc<FileDiff>> {
+        let entry = self.entries.get_mut(path)?;
+        self.next_recency = self.next_recency.wrapping_add(1);
+        entry.recency = self.next_recency;
+        Some(entry.diff.clone())
+    }
+
+    fn peek(&self, path: &str) -> Option<&Arc<FileDiff>> {
+        self.entries.get(path).map(|entry| &entry.diff)
+    }
+
+    fn put(&mut self, path: String, diff: Arc<FileDiff>) -> bool {
+        let bytes =
+            diff.estimated_heap_bytes() + path.capacity() + FILE_DIFF_CACHE_ENTRY_OVERHEAD_BYTES;
+        if bytes > self.max_bytes {
+            return false;
+        }
+        if let Some(old) = self.entries.remove(&path) {
+            self.bytes = self.bytes.saturating_sub(old.bytes);
+        }
+        self.next_recency = self.next_recency.wrapping_add(1);
+        self.entries.insert(
+            path,
+            FileDiffCacheEntry {
+                recency: self.next_recency,
+                bytes,
+                diff,
+            },
+        );
+        self.bytes += bytes;
+        while self.entries.len() > self.max_entries || self.bytes > self.max_bytes {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.recency)
+                .map(|(path, _)| path.clone())
+            else {
+                break;
+            };
+            if let Some(entry) = self.entries.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(entry.bytes);
+            }
+        }
+        true
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+        self.next_recency = 0;
+    }
+}
+
 /// RPC-owned code-review controller + snapshot state.
 ///
-/// `/code-review` is fullscreen TUI controller state (forked read-only agent
-/// + per-hunk threads), so the RPC session owns a lazily-created
+/// `/code-review` is fullscreen controller state (Main-equivalent governed
+/// tools + per-hunk threads), so the RPC session owns a lazily-created
 /// [`CodeReviewController`] paired with the last loaded [`ReviewSnapshot`].
-/// Every code-review command serializes through one mutex; the review agent
-/// never touches the main session, mirroring the TUI surface exactly. State
-/// is per-`RpcDispatcher` (per-session), so two Web sessions never share a
-/// review controller.
+/// Controller mutations serialize through one mutex; blocking Git capture
+/// runs outside it so snapshot and teardown observe the authoritative state.
+/// State is per-`RpcDispatcher` (per-session), so two Web sessions never
+/// share a review controller.
 struct CodeReviewSession {
     controller: CodeReviewController,
     snapshot: ReviewSnapshot,
-    /// Per-path single-file diff cache for the paging RPC. Built lazily on
-    /// first `code_review_file_diff` for a path; cleared on open/refresh so a
-    /// stale snapshot never serves cached pages from an older capture.
-    file_diff_cache: HashMap<String, Arc<FileDiff>>,
+    paging: ReviewPagingState,
+    file_diff_cache: FileDiffCache,
+    file_diff_inflight: HashMap<String, Arc<FileDiffLoadFlight>>,
+    file_context_cache: HashMap<String, Arc<FileContextBlobs>>,
+    comment_authority: CommentAuthority,
+}
+
+/// Retained-record bound per open review; an overflowing path fails closed
+/// ([`CommentAuthority::record`]) with every served page hunk complete=false.
+const MAX_COMMENT_AUTHORITY_HUNKS: usize = 4_096;
+
+#[derive(Debug)]
+struct HunkAuthorityRecord {
+    old_start: u32,
+    old_count: u32,
+    new_start: u32,
+    new_count: u32,
+    content_hash: String,
+    comment_ready: bool,
+}
+
+#[derive(Default)]
+struct CommentAuthority {
+    records: HashMap<String, Vec<HunkAuthorityRecord>>,
+    overflow: std::collections::HashSet<String>,
+    total: usize,
+}
+
+impl CommentAuthority {
+    fn record(&mut self, path: &str, diff: &FileDiff) -> bool {
+        if self.overflow.contains(path) {
+            return false;
+        }
+        let old = self.records.remove(path);
+        if let Some(old) = &old {
+            self.total -= old.len();
+        }
+        if self.total + diff.hunks.len() > MAX_COMMENT_AUTHORITY_HUNKS {
+            self.overflow.insert(path.to_owned());
+            return false;
+        }
+        let records: Vec<HunkAuthorityRecord> = diff
+            .hunks
+            .iter()
+            .enumerate()
+            .map(|(index, hunk)| HunkAuthorityRecord {
+                old_start: hunk.old_start,
+                old_count: hunk.old_count,
+                new_start: hunk.new_start,
+                new_count: hunk.new_count,
+                content_hash: HunkIdentity::new("", path, hunk).content_hash,
+                comment_ready: diff.hunk_is_comment_ready(index),
+            })
+            .collect();
+        self.total += records.len();
+        self.records.insert(path.to_owned(), records);
+        true
+    }
+
+    fn lookup(&self, path: &str) -> Option<&[HunkAuthorityRecord]> {
+        self.records.get(path).map(Vec::as_slice)
+    }
+
+    fn overflowed(&self, path: &str) -> bool {
+        self.overflow.contains(path)
+    }
+}
+
+struct ServedFileDiff {
+    diff: Arc<FileDiff>,
+    authority_complete: bool,
+}
+
+/// Per-path single-flight slot: the owner publishes exactly one terminal
+/// outcome that every queued joiner consumes instead of re-running the load.
+struct FileDiffLoadFlight {
+    slot: tokio::sync::Mutex<()>,
+    outcome: tokio::sync::OnceCell<anyhow::Result<ServedFileDiff>>,
+}
+#[derive(Default)]
+struct CodeReviewState {
+    session: Option<CodeReviewSession>,
+    /// Pending-capture token. Open/refresh reserve the next value before
+    /// capture. A later open/refresh, an unstamped close, session shutdown,
+    /// or a stamped close that still owns `installed_authority` advances it
+    /// so that capture cannot install. A stamped close of a review whose
+    /// generation is no longer installed leaves this token alone.
+    authority: u64,
+    /// Generation owned by the controller currently in `session`. A pending
+    /// open reserves a newer `authority` without taking this generation
+    /// until cutover, so closing the still-installed review cannot cancel it.
+    installed_authority: u64,
+}
+
+#[cfg(test)]
+struct ReviewCaptureGate {
+    captured: tokio::sync::Notify,
+    released: std::sync::Mutex<bool>,
+    release: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl ReviewCaptureGate {
+    fn hold_capture(&self) {
+        self.captured.notify_one();
+        let mut released = self
+            .released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !*released {
+            released = self
+                .release
+                .wait(released)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn release(&self) {
+        *self
+            .released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        self.release.notify_all();
+    }
+}
+
+#[cfg(test)]
+struct FileDiffLoadGate {
+    loaded: tokio::sync::Barrier,
+    release: tokio::sync::Barrier,
 }
 
 #[derive(Clone, Default)]
 pub(crate) struct CodeReviewRpcState {
-    session: Arc<tokio::sync::Mutex<Option<CodeReviewSession>>>,
+    state: Arc<tokio::sync::Mutex<CodeReviewState>>,
+    #[cfg(test)]
+    review_capture_gate: Arc<tokio::sync::Mutex<Option<Arc<ReviewCaptureGate>>>>,
+    #[cfg(test)]
+    file_diff_load_gate: Arc<tokio::sync::Mutex<Option<Arc<FileDiffLoadGate>>>>,
+    #[cfg(test)]
+    file_diff_load_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl CodeReviewRpcState {
-    /// Open a bounded HEAD→working-tree or two-revision diff snapshot and
-    /// fork a fresh read-only review agent. Any previously open review is
-    /// shut down first (clean cutover, no leaked controller). `from`/`to`
-    /// must both be present or both absent.
+    /// Open a bounded HEAD→working-tree, base→working-tree, two-revision, or
+    /// pinned-commit diff snapshot and fork a fresh review agent with the
+    /// owning Main session's exact active governed tools. Any previously
+    /// open review remains authoritative during capture and shuts down
+    /// after the validated cutover.
     async fn open(
         &self,
         app: &Application,
+        commit: Option<String>,
         from: Option<String>,
         to: Option<String>,
+        include_working_tree: Option<bool>,
     ) -> Result<Value> {
-        let scope = match (from, to) {
-            (None, None) => ReviewScope::WorkingTree,
-            (Some(from), Some(to)) => ReviewScope::Revisions { from, to },
-            _ => bail!("code_review_open requires `from` and `to` together, or neither"),
+        let scope = match (commit, from, to, include_working_tree) {
+            (Some(commit), None, None, None) => {
+                if commit.trim().is_empty() {
+                    bail!("code_review_open `commit` must be a non-empty revision");
+                }
+                // The capture resolves the revision once and fills the
+                // label; refreshes reuse that resolved hash.
+                ReviewScope::Commit {
+                    commit,
+                    label: String::new(),
+                }
+            }
+            (Some(_), _, _, _) => bail!(
+                "code_review_open commit excludes from, to, and includeWorkingTree"
+            ),
+            (None, None, None, None | Some(false)) => ReviewScope::WorkingTree,
+            (None, Some(base), None, Some(true)) => ReviewScope::BaseToWorkingTree { base },
+            (None, Some(from), Some(to), None | Some(false)) => {
+                ReviewScope::Revisions { from, to }
+            }
+            (None, Some(_), None, _) | (None, None, Some(_), _) => bail!(
+                "code_review_open requires `from` and `to` together, `from` with includeWorkingTree, or neither"
+            ),
+            (None, Some(_), Some(_), _) | (None, None, None, Some(true)) => bail!(
+                "code_review_open includeWorkingTree requires `from` alone (no `to`)"
+            ),
         };
-        let mut guard = self.session.lock().await;
+        // Reserve the pending-capture token before capture while leaving the
+        // previous session installed and responsive. A later open/refresh, an
+        // unstamped close, shutdown, or a close of the review that still owns
+        // the installed generation makes this capture stale. Closing the
+        // review this reservation replaces does not.
+        let authority = {
+            let mut state = self.state.lock().await;
+            state.authority = state.authority.wrapping_add(1);
+            state.authority
+        };
         let cwd = app.session().cwd().to_path_buf();
+        #[cfg(test)]
+        let capture_gate = self.review_capture_gate.lock().await.clone();
         // Git acquisition is blocking and must run off the async runtime.
-        let snapshot = tokio::task::spawn_blocking(move || load_review_snapshot_for(&cwd, scope))
-            .await
-            .map_err(|e| anyhow!("code review snapshot load failed: {e}"))?;
-        let mut controller = CodeReviewController::fork_from(app).await?;
-        controller.reconcile_snapshot(&snapshot);
-        if let Some(mut old) = guard.take() {
+        let (snapshot, paging) = tokio::task::spawn_blocking(move || {
+            let captured = load_review_snapshot_capture(&cwd, scope);
+            #[cfg(test)]
+            if let Some(gate) = capture_gate {
+                gate.hold_capture();
+            }
+            captured
+        })
+        .await
+        .map_err(|e| anyhow!("code review snapshot load failed: {e}"))?;
+        let mut controller = Some(CodeReviewController::fork_from(app).await?);
+        controller
+            .as_mut()
+            .expect("fresh controller")
+            .reconcile_snapshot(&snapshot)
+            .await?;
+        let cutover = {
+            let mut state = self.state.lock().await;
+            if state.authority != authority {
+                None
+            } else {
+                state.installed_authority = authority;
+                let old = state.session.replace(CodeReviewSession {
+                    controller: controller.take().expect("fresh controller"),
+                    snapshot,
+                    paging,
+                    file_diff_cache: FileDiffCache::default(),
+                    file_diff_inflight: HashMap::new(),
+                    file_context_cache: HashMap::new(),
+                    comment_authority: CommentAuthority::default(),
+                });
+                let session = state.session.as_ref().expect("code review session stored");
+                Some((
+                    old,
+                    code_review_projection(&session.snapshot, &session.controller),
+                ))
+            }
+        };
+        let Some((old, projection)) = cutover else {
+            controller.expect("stale fresh controller").shutdown().await;
+            bail!("code review open was superseded while its snapshot was loading");
+        };
+        if let Some(mut old) = old {
             old.controller.shutdown().await;
         }
-        *guard = Some(CodeReviewSession {
-            controller,
-            snapshot,
-            file_diff_cache: HashMap::new(),
-        });
-        let session = guard.as_ref().expect("code review session stored");
-        Ok(code_review_projection(&session.snapshot, &session.controller))
+        Ok(projection)
+    }
+
+    /// List recent commits for the `/commit` picker: a read-only bounded
+    /// git log that never touches review controller state. The git call
+    /// runs on the blocking pool like every other code-review git
+    /// acquisition.
+    async fn commits(&self, app: &Application, limit: Option<u32>) -> Result<Value> {
+        let cwd = app.session().cwd().to_path_buf();
+        let listed = tokio::task::spawn_blocking(move || {
+            crate::code_review::list_recent_commits(&cwd, limit.unwrap_or(100) as usize)
+        })
+        .await
+        .map_err(|error| anyhow!("code review commit list failed: {error}"))?
+        .map_err(anyhow::Error::msg)?;
+        Ok(json!({
+            "commits": listed
+                .commits
+                .iter()
+                .map(|entry| {
+                    json!({
+                        "commit": entry.commit,
+                        "parentCommit": entry.parent_commit,
+                        "parentCount": entry.parent_count,
+                        "subject": entry.subject,
+                        "author": entry.author,
+                        "authorDate": entry.author_date,
+                    })
+                })
+                .collect::<Vec<_>>(),
+            "truncated": listed.truncated,
+        }))
     }
 
     /// Re-project the currently open review snapshot and controller state.
     async fn snapshot(&self) -> Result<Value> {
-        let mut guard = self.session.lock().await;
-        let Some(session) = guard.as_mut() else {
-            bail!("no open code review; call code_review_open first");
+        let mut state = self.state.lock().await;
+        let Some(session) = state.session.as_mut() else {
+            return Err(CodeReviewRpcError::ReviewNotOpen.into());
         };
         session.controller.poll_events();
-        Ok(code_review_projection(&session.snapshot, &session.controller))
+        Ok(code_review_projection(
+            &session.snapshot,
+            &session.controller,
+        ))
     }
 
     /// Reload the review snapshot (re-run the bounded git acquisition) and
     /// reconcile existing threads onto the new hunk identities.
     async fn refresh(&self, app: &Application) -> Result<Value> {
-        let mut guard = self.session.lock().await;
-        let Some(session) = guard.as_mut() else {
-            bail!("no open code review; call code_review_open first");
+        // First pass: reserve the pending-capture token and the installed
+        // review's generation, then release the mutex before the blocking
+        // Git work. The previous snapshot stays authoritative until cutover.
+        // A close of that same review, a later capture, or shutdown
+        // invalidates this reservation; a close of any other review does not.
+        let (authority, installed_authority, expected_snapshot_id, scope) = {
+            let mut state = self.state.lock().await;
+            let Some(session) = state.session.as_ref() else {
+                return Err(CodeReviewRpcError::ReviewNotOpen.into());
+            };
+            let expected_snapshot_id = session.snapshot.snapshot_id.clone();
+            let scope = session.snapshot.scope.clone();
+            state.authority = state.authority.wrapping_add(1);
+            (
+                state.authority,
+                state.installed_authority,
+                expected_snapshot_id,
+                scope,
+            )
         };
-        let scope = session.snapshot.scope.clone();
         let cwd = app.session().cwd().to_path_buf();
-        let snapshot = tokio::task::spawn_blocking(move || load_review_snapshot_for(&cwd, scope))
-            .await
-            .map_err(|e| anyhow!("code review snapshot reload failed: {e}"))?;
+        #[cfg(test)]
+        let capture_gate = self.review_capture_gate.lock().await.clone();
+        let (snapshot, paging) = tokio::task::spawn_blocking(move || {
+            let captured = load_review_snapshot_capture(&cwd, scope);
+            #[cfg(test)]
+            if let Some(gate) = capture_gate {
+                gate.hold_capture();
+            }
+            captured
+        })
+        .await
+        .map_err(|e| anyhow!("code review snapshot reload failed: {e}"))?;
+        let mut state = self.state.lock().await;
+        if state.authority != authority || state.installed_authority != installed_authority {
+            bail!("code review refresh was superseded while its snapshot was loading");
+        }
+        let Some(session) = state.session.as_ref() else {
+            bail!("code review refresh targets a closed review");
+        };
+        if session.snapshot.snapshot_id != expected_snapshot_id {
+            bail!("code review refresh targets a replaced review");
+        }
+        state.installed_authority = authority;
+        let session = state
+            .session
+            .as_mut()
+            .expect("refresh session checked before claiming its generation");
         session.controller.poll_events();
-        session.controller.reconcile_snapshot(&snapshot);
+        session.controller.reconcile_snapshot(&snapshot).await?;
         session.snapshot = snapshot;
+        session.paging = paging;
         session.file_diff_cache.clear();
-        Ok(code_review_projection(&session.snapshot, &session.controller))
+        session.file_diff_inflight.clear();
+        session.file_context_cache.clear();
+        session.comment_authority = CommentAuthority::default();
+        Ok(code_review_projection(
+            &session.snapshot,
+            &session.controller,
+        ))
     }
 
-    /// Attach a comment to a specific hunk. The full hunk identity must match
-    /// the current snapshot exactly (or, once the per-file diff for the path
-    /// is loaded, the authoritative cached hunks — which carry the exact
-    /// identities the paging RPC projected); a stale snapshot/path/range/
-    /// contentHash or a byte-capped incomplete hunk is rejected before the
-    /// review agent is ever prompted.
     async fn comment(
         &self,
+        app: &Application,
         snapshot_id: &str,
         path: &str,
         old_start: u32,
@@ -1824,55 +3872,255 @@ impl CodeReviewRpcState {
         new_count: u32,
         content_hash: &str,
         comment: &str,
+        images: Vec<ContentBlock>,
     ) -> Result<Value> {
-        let mut guard = self.session.lock().await;
-        let Some(session) = guard.as_mut() else {
-            bail!("no open code review; call code_review_open first");
+        // Fail closed before any state lookup: a violating image never
+        // reaches the controller or its prompt.
+        let images = validate_comment_images(&images)?;
+        let normalized = crate::code_review::normalize_repo_path(path);
+        {
+            let mut state = self.state.lock().await;
+            let Some(session) = state.session.as_mut() else {
+                return Err(CodeReviewRpcError::ReviewNotOpen.into());
+            };
+            session.controller.poll_events();
+            let target = resolve_comment_target(
+                &session.snapshot,
+                Some(&session.file_diff_cache),
+                Some(&session.comment_authority),
+                snapshot_id,
+                &normalized,
+                old_start,
+                old_count,
+                new_start,
+                new_count,
+                content_hash,
+            )?;
+            if !matches!(target, ResolvedHunk::Authority { .. }) {
+                let result = match target {
+                    ResolvedHunk::Snapshot { file, hunk_index } => session
+                        .controller
+                        .submit_comment_with_images(
+                            &session.snapshot,
+                            file,
+                            hunk_index,
+                            comment,
+                            images.clone(),
+                        ),
+                    ResolvedHunk::Loaded {
+                        file,
+                        diff,
+                        hunk_index,
+                    } => session.controller.submit_loaded_comment_with_images(
+                        &session.snapshot,
+                        file,
+                        &diff,
+                        hunk_index,
+                        comment,
+                        images.clone(),
+                    ),
+                    ResolvedHunk::Authority { .. } => unreachable!("matched above"),
+                };
+                comment_submit_result(result)?;
+                return Ok(code_review_projection(
+                    &session.snapshot,
+                    &session.controller,
+                ));
+            }
+        }
+        let served = self.load_file_diff(app, snapshot_id, &normalized).await?;
+        let mut state = self.state.lock().await;
+        let Some(session) = state.session.as_mut() else {
+            return Err(CodeReviewRpcError::ReviewNotOpen.into());
         };
         session.controller.poll_events();
-        let target = resolve_comment_target(
-            &session.snapshot,
-            Some(&session.file_diff_cache),
-            snapshot_id,
-            path,
-            old_start,
-            old_count,
-            new_start,
-            new_count,
-            content_hash,
-        )?;
-        let result = match &target {
-            ResolvedHunk::Snapshot { file, hunk } => {
-                session
-                    .controller
-                    .submit_comment(&session.snapshot, file, hunk, comment)
-            }
-            ResolvedHunk::Loaded {
-                file,
-                diff,
-                hunk_index,
-            } => session
-                .controller
-                .submit_comment(&session.snapshot, file, &diff.hunks[*hunk_index], comment),
-        };
-        match result {
-            CommentSubmitResult::Accepted => {}
-            CommentSubmitResult::Empty => {
-                bail!("code review comment was not accepted (comment is empty)");
-            }
-            CommentSubmitResult::QueueFull => bail!(
-                "code review comment was not accepted (this hunk has {MAX_PENDING_COMMENTS} replies queued; wait for a reply to settle or abort the review)"
-            ),
-            CommentSubmitResult::Failed => bail!(
-                "code review comment was not accepted (the review agent could not be started)"
-            ),
+        if session.snapshot.snapshot_id != snapshot_id {
+            bail!("comment targets a stale snapshot; refresh the code review");
         }
-        Ok(code_review_projection(&session.snapshot, &session.controller))
+        let file = session
+            .snapshot
+            .files
+            .iter()
+            .find(|file| file.path == normalized)
+            .ok_or_else(|| anyhow!("comment targets an unknown file {normalized:?}"))?;
+        let hunk_index = served
+            .diff
+            .hunks
+            .iter()
+            .position(|hunk| {
+                hunk.old_start == old_start
+                    && hunk.old_count == old_count
+                    && hunk.new_start == new_start
+                    && hunk.new_count == new_count
+            })
+            .ok_or_else(|| {
+                anyhow!("comment targets an unknown hunk in the loaded diff {normalized:?}")
+            })?;
+        if !served.diff.hunk_is_comment_ready(hunk_index) {
+            bail!(
+                "comment targets an incomplete hunk in {normalized:?}; the per-file body was cut by the size limit"
+            );
+        }
+        let identity = HunkIdentity::new(snapshot_id, &file.path, &served.diff.hunks[hunk_index]);
+        if identity.content_hash != content_hash {
+            bail!("comment targets a stale hunk; the diff content has changed");
+        }
+        let result = session.controller.submit_loaded_comment_with_images(
+            &session.snapshot,
+            file,
+            &served.diff,
+            hunk_index,
+            comment,
+            images,
+        );
+        comment_submit_result(result)?;
+        Ok(code_review_projection(
+            &session.snapshot,
+            &session.controller,
+        ))
+    }
+    /// Resolve `modelId` against the session's public model catalog and swap
+    /// the open review's fork model. `modelId` is the `provider/model-id`
+    /// identity the wire's option values carry. Fail closed on unknown ids
+    /// and catalog load failures; the raw catalog entry
+    /// (api/provider/base_url/headers) supplies all connection material —
+    /// the wire only ever names the model, never a display label.
+    async fn set_model(&self, model_id: &str) -> Result<Value> {
+        let catalog = available_models().await?;
+        let listed = resolve_catalog_model(&catalog, model_id)
+            .ok_or_else(|| CodeReviewRpcError::UnknownModel(model_id.to_owned()))?;
+        let model = pi_ai::get_model(&listed.provider, &listed.id).ok_or_else(|| {
+            CodeReviewRpcError::UnknownModel(format!("{}/{}", listed.provider, listed.id))
+        })?;
+        let display = fork_model_display(&model);
+        {
+            let mut state = self.state.lock().await;
+            let session = state
+                .session
+                .as_mut()
+                .ok_or(CodeReviewRpcError::ReviewNotOpen)?;
+            session.controller.set_model(model);
+        }
+        Ok(json!({
+            "ok": true,
+            "model": display,
+        }))
     }
 
-    /// Abort the in-flight review agent turn for a specific hunk identity.
-    /// Resolves the target against the live snapshot / authoritative loaded
-    /// hunks first so a stale identity never reaches the controller.
+    /// Start one Auto Review batch (see
+    /// [`RpcCommand::CodeReviewAutoReview`]): model resolution and batch
+    /// accounting live on the controller; unknown model ids and a running
+    /// batch surface as typed errors.
+    async fn auto_review(&self, model_id: Option<&str>, language: Option<&str>) -> Result<Value> {
+        let mut state = self.state.lock().await;
+        let Some(session) = state.session.as_mut() else {
+            return Err(CodeReviewRpcError::ReviewNotOpen.into());
+        };
+        session.controller.poll_events();
+        match session
+            .controller.start_auto_review(&session.snapshot, model_id, language)
+            .await?
+        {
+            AutoReviewStart::Started { .. } => {
+                let batch_id = session.controller.auto_review_batch_id();
+                Ok(json!({
+                    "ok": true,
+                    "state": "triaging",
+                    "batchId": batch_id,
+                }))
+            }
+            AutoReviewStart::AlreadyRunning => Err(CodeReviewRpcError::AutoRunning.into()),
+            AutoReviewStart::UnknownModel(model_id) => {
+                Err(CodeReviewRpcError::UnknownModel(model_id).into())
+            }
+            AutoReviewStart::UnsupportedSchema => Err(CodeReviewRpcError::UnsupportedSchema.into()),
+        }
+    }
+
+    /// Run one Highlight call (see [`RpcCommand::CodeReviewHighlight`]).
+    /// Returns immediately: the accepted start ACK carries the running state
+    /// plus the projected `highlightGeneration` identity; the single model
+    /// call runs on a detached fork agent and its result arrives on later
+    /// snapshots. No review pipeline state is held across the RPC.
+    async fn highlight(&self) -> Result<Value> {
+        let mut state = self.state.lock().await;
+        let Some(session) = state.session.as_mut() else {
+            return Err(CodeReviewRpcError::ReviewNotOpen.into());
+        };
+        session.controller.poll_events();
+        match session.controller.start_highlight(&session.snapshot) {
+            crate::code_review_panel::HighlightStart::Started => Ok(json!({
+                "ok": true,
+                "state": "running",
+                "highlightGeneration": session.controller.highlight_batch_id(),
+                "reviewFindings": review_findings_projection(&session.controller),
+            })),
+            crate::code_review_panel::HighlightStart::AlreadyRunning => {
+                Err(CodeReviewRpcError::HighlightRunning.into())
+            }
+        }
+    }
+    /// Start one TLDR over the pinned snapshot (see [`RpcCommand::CodeReviewTldr`]).
+    /// Returns the running ACK only. Snapshot fields stay on the existing
+    /// review projection; this method holds no TLDR state.
+    async fn tldr(&self, language: &str) -> Result<Value> {
+        let mut state = self.state.lock().await;
+        let Some(session) = state.session.as_mut() else {
+            return Err(CodeReviewRpcError::ReviewNotOpen.into());
+        };
+        session.controller.poll_events();
+        match session.controller.start_tldr(&session.snapshot, Some(language)) {
+            Ok(generation) => Ok(json!({
+                "ok": true,
+                "state": "running",
+                "tldrGeneration": generation,
+            })),
+            Err(error) if error.downcast_ref::<crate::code_review_panel::TldrError>()
+                == Some(&crate::code_review_panel::TldrError::AlreadyRunning) =>
+            {
+                Err(CodeReviewRpcError::TldrRunning.into())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn stop(&self, operation: ReviewStopOperation) -> Result<Value> {
+        let (mut pending, review_id) = {
+            let mut state = self.state.lock().await;
+            let Some(session) = state.session.as_mut() else {
+                return Err(CodeReviewRpcError::ReviewNotOpen.into());
+            };
+            session.controller.poll_events();
+            (
+                session.controller.begin_stop_operation(operation),
+                session.controller.review_id().to_owned(),
+            )
+        };
+        if let Some(pending) = pending.as_mut() {
+            // The agent aborts/waits run with the state mutex released so
+            // other code-review commands stay responsive during a held abort.
+            pending.abort().await;
+        }
+        {
+            let mut state = self.state.lock().await;
+            if let Some(session) = state.session.as_mut() {
+                // A refresh/reopen replaced the controller while the abort
+                // ran: the extracted agents belong to the retired review and
+                // are cleaned by the pending's drop, never finalized here.
+                if session.controller.review_id() == review_id
+                    && let Some(pending) = pending
+                {
+                    session.controller.finish_stop_operation(pending).await;
+                }
+                session.controller.poll_events();
+            }
+        }
+        Ok(json!({
+            "ok": true,
+            "operation": operation,
+        }))
+    }
+
     async fn abort(
         &self,
         snapshot_id: &str,
@@ -1883,16 +4131,18 @@ impl CodeReviewRpcState {
         new_count: u32,
         content_hash: &str,
     ) -> Result<Value> {
-        let mut guard = self.session.lock().await;
-        let Some(session) = guard.as_mut() else {
-            bail!("no open code review; call code_review_open first");
+        let normalized = crate::code_review::normalize_repo_path(path);
+        let mut state = self.state.lock().await;
+        let Some(session) = state.session.as_mut() else {
+            return Err(CodeReviewRpcError::ReviewNotOpen.into());
         };
         session.controller.poll_events();
         let target = resolve_comment_target(
             &session.snapshot,
             Some(&session.file_diff_cache),
+            Some(&session.comment_authority),
             snapshot_id,
-            path,
+            &normalized,
             old_start,
             old_count,
             new_start,
@@ -1900,23 +4150,59 @@ impl CodeReviewRpcState {
             content_hash,
         )?;
         let identity = match &target {
-            ResolvedHunk::Snapshot { file, hunk } => session.snapshot.hunk_identity(file, hunk),
+            ResolvedHunk::Snapshot { file, hunk_index } => {
+                session.snapshot.hunk_identity(file, &file.hunks[*hunk_index])
+            }
             ResolvedHunk::Loaded {
                 file,
                 diff,
                 hunk_index,
-            } => HunkIdentity::new(&session.snapshot.snapshot_id, &file.path, &diff.hunks[*hunk_index]),
+            } => HunkIdentity::new(
+                &session.snapshot.snapshot_id,
+                &file.path,
+                &diff.hunks[*hunk_index],
+            ),
+            ResolvedHunk::Authority { file, record } => HunkIdentity {
+                snapshot_id: snapshot_id.to_owned(),
+                path: file.path.clone(),
+                old_start: record.old_start,
+                old_count: record.old_count,
+                new_start: record.new_start,
+                new_count: record.new_count,
+                content_hash: record.content_hash.clone(),
+            },
         };
         session.controller.abort_hunk(&identity).await;
         session.controller.poll_events();
-        Ok(code_review_projection(&session.snapshot, &session.controller))
+        Ok(code_review_projection(
+            &session.snapshot,
+            &session.controller,
+        ))
     }
-
-    /// Close the open review: shut down the review agent and drop state.
-    async fn close(&self) -> Result<Value> {
-        let mut guard = self.session.lock().await;
-        let Some(mut session) = guard.take() else {
-            bail!("no open code review; call code_review_open first");
+    async fn close(&self, review_id: Option<&str>) -> Result<Value> {
+        let mut session = {
+            let mut state = self.state.lock().await;
+            // Nothing to close: a typed no-open reject that never bumps the
+            // authority, so an in-flight open/refresh keeps winning. A
+            // stamped close may only take the controller whose identity it
+            // observed; a mismatch is a no-op reject.
+            let Some(session) = state.session.as_ref() else {
+                return Err(CodeReviewRpcError::ReviewNotOpen.into());
+            };
+            if review_id.is_some_and(|expected| session.controller.review_id() != expected) {
+                return Ok(json!({"closed": false, "staleReview": true}));
+            }
+            // Unstamped close, and a stamped close that still owns the
+            // installed generation, invalidate the pending capture. A stamp
+            // for a review already replaced by a reserved open shuts that
+            // controller down without touching the newer token.
+            if review_id.is_none() || state.installed_authority == state.authority {
+                state.authority = state.authority.wrapping_add(1);
+            }
+            state
+                .session
+                .take()
+                .ok_or(CodeReviewRpcError::ReviewNotOpen)?
         };
         session.controller.shutdown().await;
         Ok(json!({"closed": true}))
@@ -1925,30 +4211,28 @@ impl CodeReviewRpcState {
     /// Shut down any open review controller (RPC session exit / listener
     /// shutdown). Never errors: a missing review is a no-op.
     async fn shutdown(&self) {
-        let mut guard = self.session.lock().await;
-        if let Some(mut session) = guard.take() {
+        let session = {
+            let mut state = self.state.lock().await;
+            state.authority = state.authority.wrapping_add(1);
+            state.installed_authority = state.authority;
+            state.session.take()
+        };
+        if let Some(mut session) = session {
             session.controller.shutdown().await;
         }
     }
 
-    /// Whether a review turn is in flight (close busy check). Drains pending
-    /// events first so a just-finished turn is not misclassified as busy.
-    async fn is_streaming(&self) -> bool {
-        let mut guard = self.session.lock().await;
-        let Some(session) = guard.as_mut() else {
+    /// Whether a review still owns cancellable work (close/LRU busy check).
+    /// A terminal response may remain owner-held until its task is joined.
+    async fn is_busy(&self) -> bool {
+        let mut state = self.state.lock().await;
+        let Some(session) = state.session.as_mut() else {
             return false;
         };
         session.controller.poll_events();
-        session.controller.is_streaming()
+        session.controller.is_busy()
     }
-    /// Load one bounded page of a single file's full diff. The `snapshotId`
-    /// must match the live snapshot (stale guard), `path` must be one of the
-    /// snapshot's files (containment), and `cursor` is a 0-based line offset.
-    /// The full per-file diff is loaded off the async runtime on first request
-    /// for a path and cached on the session; subsequent pages slice from the
-    /// cache without re-running git. The cache is cleared on open/refresh. If
-    /// the snapshot is refreshed while a load is in flight, the loaded diff is
-    /// discarded (not cached) and the caller sees a stale-snapshot error.
+
     async fn file_diff(
         &self,
         app: &Application,
@@ -1957,14 +4241,119 @@ impl CodeReviewRpcState {
         cursor: usize,
         max_lines: Option<usize>,
     ) -> Result<Value> {
+        let served = self.load_file_diff(app, snapshot_id, path).await?;
+        let max = max_lines.unwrap_or(MAX_FILE_PAGE_LINES);
+        let mut page = served
+            .diff
+            .slice_page(snapshot_id, cursor, max)
+            .map_err(anyhow::Error::msg)?;
+        if !served.authority_complete {
+            for hunk in &mut page.hunks {
+                hunk.complete = false;
+            }
+        }
+        Ok(file_diff_projection(&page))
+    }
+
+    async fn file_context(
+        &self,
+        app: &Application,
+        snapshot_id: &str,
+        path: &str,
+        old_start: u32,
+        new_start: u32,
+        count: Option<u32>,
+    ) -> Result<Value> {
         let normalized = crate::code_review::normalize_repo_path(path);
-        // First pass: validate snapshot id + path containment under the lock
-        // and return a cache hit if present. The lock is released before the
-        // spawn_blocking git call so snapshot polls are not blocked.
-        let (file_clone, scope, cached) = {
-            let mut guard = self.session.lock().await;
-            let Some(session) = guard.as_mut() else {
-                bail!("no open code review; call code_review_open first");
+        // Spec bound: one expand click loads at most MAX_CONTEXT_EXPAND_LINES
+        // rows; the cumulative whole-file budget is enforced by the render cap
+        // on top of these bounded requests, never by a single oversized call.
+        let count = count
+            .unwrap_or(MAX_CONTEXT_EXPAND_LINES)
+            .min(MAX_CONTEXT_EXPAND_LINES);
+        let (file, paging, cached) = {
+            let mut state = self.state.lock().await;
+            let Some(session) = state.session.as_mut() else {
+                return Err(CodeReviewRpcError::ReviewNotOpen.into());
+            };
+            if session.snapshot.snapshot_id != snapshot_id {
+                bail!("code_review_file_context targets a stale snapshot; refresh the code review");
+            }
+            let file = session
+                .snapshot
+                .files
+                .iter()
+                .find(|f| f.path == normalized)
+                .ok_or_else(|| anyhow!("code_review_file_context targets an unknown file {path:?}"))?
+                .clone();
+            if file.binary || file.status == crate::code_review::FileStatus::Binary {
+                bail!("binary files cannot expand context");
+            }
+            let cached = session.file_context_cache.get(&normalized).cloned();
+            (
+                file,
+                session.paging.clone(),
+                cached,
+            )
+        };
+        let blobs = if let Some(blobs) = cached {
+            blobs
+        } else {
+            let cwd = app.session().cwd().to_path_buf();
+            let loaded = tokio::task::spawn_blocking(move || {
+                FileContextBlobs::load(&cwd, &paging, &file)
+            })
+            .await
+            .map_err(|e| anyhow!("code review file context load failed: {e}"))?
+            .map_err(anyhow::Error::msg)?;
+            let arc = Arc::new(loaded);
+            let mut state = self.state.lock().await;
+            let Some(session) = state.session.as_mut() else {
+                bail!("code_review_file_context targets a stale snapshot; refresh the code review");
+            };
+            if session.snapshot.snapshot_id != snapshot_id {
+                bail!("code_review_file_context targets a stale snapshot; refresh the code review");
+            }
+            session
+                .file_context_cache
+                .entry(normalized.clone())
+                .or_insert_with(|| arc.clone());
+            session
+                .file_context_cache
+                .get(&normalized)
+                .cloned()
+                .unwrap_or(arc)
+        };
+        let slice = blobs
+            .slice(old_start, new_start, count)
+            .map_err(anyhow::Error::msg)?;
+        Ok(file_context_projection(snapshot_id, &normalized, &slice))
+    }
+
+    async fn load_file_diff(
+        &self,
+        app: &Application,
+        snapshot_id: &str,
+        path: &str,
+    ) -> Result<ServedFileDiff> {
+        let normalized = crate::code_review::normalize_repo_path(path);
+        {
+            let mut state = self.state.lock().await;
+            if let Some(session) = state.session.as_mut() {
+                if session.snapshot.snapshot_id == snapshot_id {
+                    if let Some(cached) = session.file_diff_cache.get(&normalized) {
+                        return Ok(ServedFileDiff {
+                            diff: cached,
+                            authority_complete: !session.comment_authority.overflowed(&normalized),
+                        });
+                    }
+                }
+            }
+        }
+        let (file_clone, scope, paging, flight) = {
+            let mut state = self.state.lock().await;
+            let Some(session) = state.session.as_mut() else {
+                return Err(CodeReviewRpcError::ReviewNotOpen.into());
             };
             if session.snapshot.snapshot_id != snapshot_id {
                 bail!("code_review_file_diff targets a stale snapshot; refresh the code review");
@@ -1974,77 +4363,134 @@ impl CodeReviewRpcState {
                 .files
                 .iter()
                 .find(|f| f.path == normalized)
-                .ok_or_else(|| anyhow!("code_review_file_diff targets an unknown file {path:?}"))?;
-            (
-                file.clone(),
-                session.snapshot.scope.clone(),
-                session.file_diff_cache.get(&normalized).cloned(),
-            )
-        };
-
-        let arc = if let Some(cached) = cached {
-            cached
-        } else {
-            let cwd = app.session().cwd().to_path_buf();
-            let file_for_load = file_clone.clone();
-            let diff = tokio::task::spawn_blocking(move || FileDiff::load(&cwd, &scope, &file_for_load))
-                .await
-                .map_err(|e| anyhow!("code review file diff load failed: {e}"))?;
-            let arc = Arc::new(diff);
-            // Re-lock to store; discard if the snapshot changed meanwhile so a
-            // stale capture never poisons the cache.
-            let mut guard = self.session.lock().await;
-            if let Some(session) = guard.as_mut() {
-                if session.snapshot.snapshot_id == snapshot_id {
-                    session.file_diff_cache.insert(normalized.clone(), arc.clone());
-                }
+                .ok_or_else(|| anyhow!("code_review_file_diff targets an unknown file {path:?}"))?
+                .clone();
+            if let Some(cached) = session.file_diff_cache.get(&normalized) {
+                return Ok(ServedFileDiff {
+                    diff: cached,
+                    authority_complete: !session.comment_authority.overflowed(&normalized),
+                });
             }
-            arc
+            let flight = match session.file_diff_inflight.get(&normalized) {
+                Some(flight) => flight.clone(),
+                None => {
+                    let flight = Arc::new(FileDiffLoadFlight {
+                        slot: tokio::sync::Mutex::new(()),
+                        outcome: tokio::sync::OnceCell::new(),
+                    });
+                    session
+                        .file_diff_inflight
+                        .insert(normalized.clone(), flight.clone());
+                    flight
+                }
+            };
+            (file, session.snapshot.scope.clone(), session.paging.clone(), flight)
         };
 
-        let max = max_lines.unwrap_or(MAX_FILE_PAGE_LINES);
-        let page = arc.slice_page(snapshot_id, cursor, max).map_err(anyhow::Error::msg)?;
-        Ok(file_diff_projection(&page))
+        let _owner = flight.slot.lock().await;
+        #[cfg(test)]
+        let load_gate = self.file_diff_load_gate.lock().await.clone();
+        let fast = {
+            let mut state = self.state.lock().await;
+            let Some(session) = state.session.as_mut() else {
+                bail!("code_review_file_diff targets a stale snapshot; refresh the code review");
+            };
+            if session.snapshot.snapshot_id != snapshot_id {
+                bail!("code_review_file_diff targets a stale snapshot; refresh the code review");
+            }
+            if let Some(cached) = session.file_diff_cache.get(&normalized) {
+                Some(Ok(ServedFileDiff {
+                    diff: cached,
+                    authority_complete: !session.comment_authority.overflowed(&normalized),
+                }))
+            } else {
+                flight.outcome.get().map(|shared| {
+                    shared
+                        .as_ref()
+                        .map(|served| ServedFileDiff {
+                            diff: Arc::clone(&served.diff),
+                            authority_complete: served.authority_complete,
+                        })
+                        .map_err(|e| anyhow!("{e}"))
+                })
+            }
+        };
+        if let Some(served) = fast {
+            return served;
+        }
+
+        let cwd = app.session().cwd().to_path_buf();
+        let diff = tokio::task::spawn_blocking(move || {
+            FileDiff::load_snapshot_file(&cwd, &scope, &paging, &file_clone)
+        })
+        .await
+        .map_err(|e| anyhow!("code review file diff load failed: {e}"))?;
+        // Gate waits must run with no state lock held: a racing refresh needs
+        // that mutex to reach the release barrier.
+        #[cfg(test)]
+        if let Some(gate) = &load_gate {
+            self.file_diff_load_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            gate.loaded.wait().await;
+            gate.release.wait().await;
+        }
+
+        let served = {
+            let mut state = self.state.lock().await;
+            let Some(session) = state.session.as_mut() else {
+                bail!("code_review_file_diff targets a stale snapshot; refresh the code review");
+            };
+            if session.snapshot.snapshot_id != snapshot_id {
+                bail!("code_review_file_diff targets a stale snapshot; refresh the code review");
+            }
+            let arc = Arc::new(diff);
+            let authority_complete = if arc.error.is_none() {
+                session.file_diff_cache.put(normalized.clone(), arc.clone());
+                session.comment_authority.record(&normalized, arc.as_ref())
+            } else {
+                true
+            };
+            let _ = flight.outcome.set(Ok(ServedFileDiff {
+                diff: arc.clone(),
+                authority_complete,
+            }));
+            if session
+                .file_diff_inflight
+                .get(&normalized)
+                .is_some_and(|entry| Arc::ptr_eq(entry, &flight))
+            {
+                session.file_diff_inflight.remove(&normalized);
+            }
+            ServedFileDiff {
+                diff: arc,
+                authority_complete,
+            }
+        };
+        Ok(served)
     }
 }
 
-/// Where a validated comment target lives. Once the per-file diff for a path
-/// is cached, it is the AUTHORITATIVE hunk source for that path: snapshot
-/// placeholder/partial hunks are never resolvable, so a comment can only
-/// attach to a hunk identity that exists in the loaded per-file data (or, for
-/// a path never loaded, in the snapshot itself when the hunk is complete).
 #[derive(Debug)]
 enum ResolvedHunk<'a> {
-    /// Hunk in the snapshot (no per-file cache for this path yet).
     Snapshot {
         file: &'a DiffFile,
-        hunk: &'a DiffHunk,
+        hunk_index: usize,
     },
-    /// Hunk in the authoritative per-file cache for this path. The `file`
-    /// catalog entry still comes from the snapshot (stats/provenance are
-    /// preserved); the hunk body and identity come from the loaded diff.
     Loaded {
         file: &'a DiffFile,
         diff: Arc<FileDiff>,
         hunk_index: usize,
     },
+    Authority {
+        file: &'a DiffFile,
+        record: &'a HunkAuthorityRecord,
+    },
 }
 
-/// Validate that a comment request targets a real, COMPLETE hunk with a
-/// matching identity. Returns the resolved target so the caller can submit
-/// the comment. A mismatched `snapshotId`, unknown path/range, changed
-/// `contentHash`, or a byte-capped incomplete hunk is rejected as stale —
-/// this is the deterministic core (no agent, no network) exercised by unit
-/// tests.
-///
-/// The cached per-file diff (when present and error-free) is the only hunk
-/// source for its path: loaded hunk identities are exactly the identities
-/// the paging RPC projected (both derive from the same cached [`FileDiff`]
-/// via [`HunkIdentity::new`]), so whatever the frontend selected from a page
-/// resolves here, and snapshot partial/placeholder identities are rejected.
 fn resolve_comment_target<'a>(
     snapshot: &'a ReviewSnapshot,
-    file_diff_cache: Option<&'a HashMap<String, Arc<FileDiff>>>,
+    file_diff_cache: Option<&'a FileDiffCache>,
+    comment_authority: Option<&'a CommentAuthority>,
     snapshot_id: &str,
     path: &str,
     old_start: u32,
@@ -2061,7 +4507,14 @@ fn resolve_comment_target<'a>(
         .iter()
         .find(|file| file.path == path)
         .ok_or_else(|| anyhow!("comment targets an unknown file {path:?}"))?;
-    if let Some(loaded) = file_diff_cache.and_then(|cache| cache.get(path)) {
+    if let Some(authority) = comment_authority {
+        if authority.overflowed(path) {
+            bail!(
+                "comment targets a hunk in {path:?} beyond the retained comment authority bound; refresh the code review"
+            );
+        }
+    }
+    if let Some(loaded) = file_diff_cache.and_then(|cache| cache.peek(path)) {
         if loaded.error.is_none() {
             let hunk_index = loaded
                 .hunks
@@ -2072,14 +4525,15 @@ fn resolve_comment_target<'a>(
                         && hunk.new_start == new_start
                         && hunk.new_count == new_count
                 })
-                .ok_or_else(|| anyhow!("comment targets an unknown hunk in the loaded diff {path:?}"))?;
-            let hunk = &loaded.hunks[hunk_index];
-            if !hunk.is_complete() {
+                .ok_or_else(|| {
+                    anyhow!("comment targets an unknown hunk in the loaded diff {path:?}")
+                })?;
+            if !loaded.hunk_is_comment_ready(hunk_index) {
                 bail!(
                     "comment targets an incomplete hunk in {path:?}; the per-file body was cut by the size limit"
                 );
             }
-            let identity = HunkIdentity::new(snapshot_id, &file.path, hunk);
+            let identity = HunkIdentity::new(snapshot_id, &file.path, &loaded.hunks[hunk_index]);
             if identity.content_hash != content_hash {
                 bail!("comment targets a stale hunk; the diff content has changed");
             }
@@ -2090,30 +4544,210 @@ fn resolve_comment_target<'a>(
             });
         }
     }
-    // No authoritative loaded diff for this path: resolve against the
-    // snapshot hunks, still requiring a COMPLETE hunk — a globally truncated
-    // patch's partial last hunk has a bogus identity and is rejected.
-    let hunk = file
+    if let Some(authority) = comment_authority {
+        if let Some(records) = authority.lookup(path) {
+            let record = records
+                .iter()
+                .find(|record| {
+                    record.old_start == old_start
+                        && record.old_count == old_count
+                        && record.new_start == new_start
+                        && record.new_count == new_count
+                })
+                .ok_or_else(|| {
+                    anyhow!("comment targets an unknown hunk in the loaded diff {path:?}")
+                })?;
+            if !record.comment_ready {
+                bail!(
+                    "comment targets an incomplete hunk in {path:?}; the per-file body was cut by the size limit"
+                );
+            }
+            if record.content_hash != content_hash {
+                bail!("comment targets a stale hunk; the diff content has changed");
+            }
+            return Ok(ResolvedHunk::Authority { file, record });
+        }
+    }
+    let hunk_index = file
         .hunks
         .iter()
-        .find(|hunk| {
+        .position(|hunk| {
             hunk.old_start == old_start
                 && hunk.old_count == old_count
                 && hunk.new_start == new_start
                 && hunk.new_count == new_count
         })
         .ok_or_else(|| anyhow!("comment targets an unknown hunk in {path:?}"))?;
-    if !hunk.is_complete() {
-        bail!(
-            "comment targets an incomplete hunk in {path:?}; the diff body was truncated"
-        );
+    if !file.hunk_is_comment_ready(hunk_index) {
+        bail!("comment targets an incomplete hunk in {path:?}; the diff body was truncated");
     }
-    let identity = snapshot.hunk_identity(file, hunk);
+    let identity = snapshot.hunk_identity(file, &file.hunks[hunk_index]);
     if identity.content_hash != content_hash {
         bail!("comment targets a stale hunk; the diff content has changed");
     }
-    Ok(ResolvedHunk::Snapshot { file, hunk })
+    Ok(ResolvedHunk::Snapshot { file, hunk_index })
 }
+
+fn comment_submit_result(result: CommentSubmitResult) -> Result<()> {
+    match result {
+        CommentSubmitResult::Accepted => Ok(()),
+        CommentSubmitResult::Empty => {
+            bail!("code review comment was not accepted (comment is empty)")
+        }
+        CommentSubmitResult::QueueFull => bail!(
+            "code review comment was not accepted (this hunk has {MAX_PENDING_COMMENTS} replies queued; wait for a reply to settle or abort the review)"
+        ),
+        CommentSubmitResult::TooLarge => bail!(
+            "code review comment was not accepted (it exceeds the {MAX_COMMENT_BYTES}-byte limit; shorten the comment and resubmit)"
+        ),
+        CommentSubmitResult::IncompleteHunk => bail!(
+            "code review comment was not accepted (the snapshot hunk is incomplete; load the full file diff first)"
+        ),
+        CommentSubmitResult::Failed => bail!(
+            "code review comment was not accepted (the review agent could not be started)"
+        ),
+    }
+}
+
+/// Bounded image attachment budget for review comments. Per image: base64
+/// must decode and stay within the decoded cap. In total: the base64 wire
+/// footprint stays under 3.5 MiB, comfortably inside the 4 MiB RPC frame
+/// ([`MAX_RPC_MESSAGE_BYTES`]).
+const MAX_COMMENT_IMAGES: usize = 8;
+const MAX_COMMENT_IMAGE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_COMMENT_IMAGES_WIRE_BYTES: usize =
+    3 * 1024 * 1024 + 512 * 1024;
+
+fn resolve_review_language(explicit: Option<&str>, default: Option<&str>) -> Result<String> {
+    let tag = explicit.or(default).unwrap_or(crate::code_review_panel::DEFAULT_REVIEW_LANGUAGE);
+    validate_review_language(tag)
+        .map(str::to_owned)
+        .map_err(|_| CodeReviewRpcError::InvalidLanguage.into())
+}
+
+/// Resolve a review model against the public catalog by its `provider/model-id`
+/// identity — exactly the value the wire's option values carry. The first
+/// `/` separates provider from the id (model ids may themselves contain
+/// slashes); a bare id or a display label never resolves.
+pub(crate) fn resolve_catalog_model<'a>(
+    catalog: &'a [pi_ai::Model],
+    model_id: &str,
+) -> Option<&'a pi_ai::Model> {
+    let (provider, id) = model_id.split_once('/')?;
+    catalog
+        .iter()
+        .find(|model| model.provider == provider && model.id == id)
+}
+
+/// Typed code-review RPC rejection categories.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CodeReviewRpcError {
+    ReviewNotOpen,
+    UnknownModel(String),
+    AutoRunning,
+    HighlightRunning,
+    TldrRunning,
+    UnsupportedSchema,
+    TooManyImages,
+    UnsupportedImageType,
+    InvalidImageData,
+    ImagesTooLarge,
+    InvalidLanguage,
+}
+
+impl CodeReviewRpcError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::ReviewNotOpen => "code_review_not_open",
+            Self::UnknownModel(_) => "code_review_unknown_model",
+            Self::AutoRunning => "code_review_auto_running",
+            Self::HighlightRunning => "code_review_highlight_running",
+            Self::TldrRunning => "code_review_tldr_running",
+            Self::UnsupportedSchema => "code_review_unsupported_schema",
+            Self::InvalidLanguage => "code_review_invalid_language",
+            Self::TooManyImages => "code_review_too_many_images",
+            Self::UnsupportedImageType => "code_review_unsupported_image_type",
+            Self::InvalidImageData => "code_review_invalid_image_data",
+            Self::ImagesTooLarge => "code_review_images_too_large",
+        }
+    }
+}
+
+impl std::fmt::Display for CodeReviewRpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReviewNotOpen => f.write_str("no open code review; call code_review_open first"),
+            Self::UnknownModel(_) => write!(f, "code review model switch was not accepted (unknown model id)"),
+            Self::InvalidLanguage => f.write_str("Review language must be 1–32 printable ASCII characters"),
+            Self::AutoRunning => write!(
+                f,
+                "code review auto review was not accepted (a batch is already running; wait for it to settle or abort its hunks)"
+            ),
+            Self::HighlightRunning => f.write_str(
+                "code review highlight was not accepted (a highlight call is already running; wait for it to settle)",
+            ),
+            Self::TldrRunning => f.write_str(
+                "code review TLDR was not accepted (a TLDR call is already running; wait for it to settle)",
+            ),
+            Self::UnsupportedSchema => f.write_str(
+                "code review auto review requires a model with strict JSON schema output",
+            ),
+            Self::TooManyImages => write!(
+                f,
+                "code review comment was not accepted (more than {MAX_COMMENT_IMAGES} images)"
+            ),
+            Self::UnsupportedImageType => write!(
+                f,
+                "code review comment was not accepted (image mime must be image/png, image/jpeg, image/webp, or image/gif)"
+            ),
+            Self::InvalidImageData => write!(
+                f,
+                "code review comment was not accepted (an image is not valid base64 or exceeds the {MAX_COMMENT_IMAGE_BYTES}-byte decoded limit)"
+            ),
+            Self::ImagesTooLarge => write!(
+                f,
+                "code review comment was not accepted (images exceed the {MAX_COMMENT_IMAGES_WIRE_BYTES}-byte total wire limit)"
+            ),
+        }
+    }
+}
+
+/// Validate comment image attachments against the typed budget. Only image
+/// content blocks are accepted; every image must decode as standard base64
+/// and stay within the per-image decoded cap, and the combined base64 wire
+/// footprint must stay within the total cap.
+fn validate_comment_images(images: &[ContentBlock]) -> Result<Vec<ContentBlock>> {
+    if images.len() > MAX_COMMENT_IMAGES {
+        return Err(CodeReviewRpcError::TooManyImages.into());
+    }
+    let mut validated = Vec::with_capacity(images.len());
+    let mut total_wire = 0usize;
+    for image in images {
+        let ContentBlock::Image { data, mime_type } = image else {
+            return Err(CodeReviewRpcError::UnsupportedImageType.into());
+        };
+        if !matches!(
+            mime_type.as_str(),
+            "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+        ) {
+            return Err(CodeReviewRpcError::UnsupportedImageType.into());
+        }
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(data.as_bytes())
+            .map_err(|_| CodeReviewRpcError::InvalidImageData)?;
+        if decoded.len() > MAX_COMMENT_IMAGE_BYTES {
+            return Err(CodeReviewRpcError::InvalidImageData.into());
+        }
+        total_wire = total_wire.saturating_add(data.len());
+        if total_wire > MAX_COMMENT_IMAGES_WIRE_BYTES {
+            return Err(CodeReviewRpcError::ImagesTooLarge.into());
+        }
+        validated.push(image.clone());
+    }
+    Ok(validated)
+}
+
+impl std::error::Error for CodeReviewRpcError {}
 
 /// Build the wire projection of a review snapshot + controller. The absolute
 /// repository `root` is NEVER included — only repo-relative paths leave the
@@ -2163,9 +4797,9 @@ fn code_review_projection(snapshot: &ReviewSnapshot, controller: &CodeReviewCont
                 "path": file.path,
                 "status": file.status.label(),
                 "binary": file.binary,
-                "insertions": file.insertions,
-                "deletions": file.deletions,
-                "truncated": file.truncated,
+                "insertions": file.displayed_change_stats().0,
+                "deletions": file.displayed_change_stats().1,
+                "bodyState": file.body_state(),
                 "hunks": hunks,
             });
             if let Some(previous_path) = &file.previous_path {
@@ -2182,7 +4816,7 @@ fn code_review_projection(snapshot: &ReviewSnapshot, controller: &CodeReviewCont
         .threads()
         .values()
         .map(|thread| {
-            json!({
+            let mut thread_obj = json!({
                 "identity": hunk_identity_projection(&thread.identity),
                 "comments": thread.comments.iter().map(|comment| {
                     let mut obj = json!({
@@ -2190,32 +4824,118 @@ fn code_review_projection(snapshot: &ReviewSnapshot, controller: &CodeReviewCont
                         "text": comment.text,
                         "partial": comment.partial,
                     });
+                    if comment.auto {
+                        obj["auto"] = json!(true);
+                    }
                     if let Some(model) = comment.model.as_deref() {
                         obj["model"] = json!(model);
+                    }
+                    if let Some(thinking) = comment
+                        .thinking
+                        .as_deref()
+                        .filter(|thinking| !thinking.is_empty())
+                    {
+                        obj["thinking"] = json!(thinking);
                     }
                     obj
                 }).collect::<Vec<_>>(),
                 "streamingText": thread.streaming_text,
+                "streamingThinking": thread.streaming_thinking,
                 "error": thread.error,
                 "stale": thread.stale,
-                "isStreaming": thread.is_streaming,
+                "isStreaming": thread.reply_status.is_live(),
+                "isCancellable": controller.is_hunk_cancellable(&thread.identity),
                 "model": thread.model,
-            })
+                "generation": thread.generation,
+                "replyId": thread.reply_id,
+                "replyStatus": thread.reply_status.as_str(),
+                "toolCalls": thread.tool_calls.iter().map(|tool| {
+                    json!({
+                        "id": tool.id,
+                        "name": tool.name,
+                        "status": tool.status.as_str(),
+                    })
+                }).collect::<Vec<_>>(),
+            });
+            thread_obj
         })
         .collect::<Vec<_>>();
 
     json!({
         "comparisonLabel": snapshot.comparison_label(),
         "snapshotId": snapshot.snapshot_id,
+        "reviewId": controller.review_id(),
+        "generation": controller.generation(),
+        "revision": controller.revision(),
+        "highlightState": controller.highlight_state().as_str(),
+        "reviewFindings": review_findings_projection(controller),
+        "highlightError": controller.highlight_error().map(ToString::to_string),
+        "highlightGeneration": controller.highlight_batch_id(),
+        "tldrState": controller.tldr_state().as_str(),
+        "tldrGeneration": controller.tldr_generation(),
+        "tldrSnapshotId": controller.tldr_snapshot_id(),
+        "tldrError": controller.tldr_error(),
+        "tldrMarkdown": controller.tldr_markdown(),
         "truncated": snapshot.truncated,
+        "totalsComplete": snapshot.summary_complete,
         "error": snapshot.error,
         "totalInsertions": snapshot.total_insertions(),
         "totalDeletions": snapshot.total_deletions(),
         "files": files,
         "threads": threads,
         "isStreaming": controller.is_streaming(),
+        "internalBusy": controller.is_busy(),
         "activeCount": controller.active_count(),
+        "autoReviewState": controller.auto_review_state().as_str(),
+        "reviewLanguageDefault": controller.review_language_default(),
+        "reviewModelId": controller.fork_model_id(),
+        "reviewModelProvider": controller.fork_model_provider(),
+        "reviewModelLabel": controller.fork_model_display_name(),
+        "autoReviewError": controller
+            .auto_review_error()
+            .map(auto_review_error_projection),
+        "autoReviewBatchId": controller.auto_review_batch_id(),
+        "autoReviewCounts": {
+            "submitted": controller.auto_review_counts().submitted,
+            "completed": controller.auto_review_counts().completed,
+            "failed": controller.auto_review_counts().failed,
+        },
     })
+}
+
+/// Typed wire shape of the latest Auto Review failure: a stable machine code
+/// plus the bounded display copy. `cancelled` is the exact user-Stop terminal
+/// category (the Web treats it as the only quiet terminal); every other code
+/// is a business failure with a toast owner.
+fn auto_review_error_projection(
+    error: &crate::code_review_panel::AutoReviewError,
+) -> Value {
+    let code = match error {
+        crate::code_review_panel::AutoReviewError::Cancelled => "cancelled",
+        crate::code_review_panel::AutoReviewError::InvalidTriage => "invalid-triage",
+        crate::code_review_panel::AutoReviewError::UnsupportedSchema => "unsupported-schema",
+        crate::code_review_panel::AutoReviewError::PromptTooLarge => "prompt-too-large",
+        crate::code_review_panel::AutoReviewError::LaunchRejected => "launch-rejected",
+        crate::code_review_panel::AutoReviewError::Provider { category, .. } => category.as_str(),
+    };
+    json!({
+        "message": error.to_string(),
+        "code": code,
+    })
+}
+
+fn review_findings_projection(controller: &CodeReviewController) -> Value {
+    json!(controller.review_findings().iter().map(|(identity, findings)| json!({
+        "identity": hunk_identity_projection(identity),
+        "findings": findings.iter().map(|finding| json!({
+            "category": finding.category.as_str(),
+            "side": finding.side.as_str(),
+            "startLine": finding.start_line,
+            "endLine": finding.end_line,
+            "summary": finding.summary,
+            "evidence": finding.evidence,
+        })).collect::<Vec<_>>(),
+    })).collect::<Vec<_>>())
 }
 
 /// Wire projection of a [`crate::code_review::HunkIdentity`].
@@ -2240,13 +4960,6 @@ fn diff_line_kind_str(kind: DiffLineKind) -> &'static str {
     }
 }
 
-/// Wire projection of a single [`FileDiffPage`]. Hunks preserve their order
-/// across pages; each descriptor carries the COMPLETE hunk identity (header,
-/// ranges, content hash over the full hunk) plus the in-page line subset and
-/// its hunk-local offset, so a page-split hunk keeps one stable identity and
-/// the frontend merges deterministically by index. `nextCursor` is absent on
-/// the final page. Output stays well under the WS frame limit — the page is
-/// bounded by line count and bytes in [`FileDiff::slice_page`].
 fn file_diff_projection(page: &FileDiffPage) -> Value {
     let line_projection = |line: &crate::code_review::DiffLine| {
         let mut obj = json!({
@@ -2290,7 +5003,7 @@ fn file_diff_projection(page: &FileDiffPage) -> Value {
         "hasMore": page.has_more,
         "totalLines": page.total_lines,
         "hunkCount": page.hunk_count,
-        "truncated": page.truncated,
+        "byteCapped": page.byte_capped,
     });
     if let Some(previous_path) = &page.previous_path {
         out["previousPath"] = json!(previous_path);
@@ -2299,6 +5012,38 @@ fn file_diff_projection(page: &FileDiffPage) -> Value {
         out["nextCursor"] = json!(next_cursor);
     }
     out
+}
+
+fn file_context_projection(
+    snapshot_id: &str,
+    path: &str,
+    slice: &crate::code_review::FileContextSlice,
+) -> Value {
+    let lines: Vec<Value> = slice
+        .lines
+        .iter()
+        .map(|line| {
+            let mut obj = json!({
+                "kind": diff_line_kind_str(line.kind),
+                "text": line.text,
+            });
+            if let Some(old_no) = line.old_no {
+                obj["oldNo"] = json!(old_no);
+            }
+            if let Some(new_no) = line.new_no {
+                obj["newNo"] = json!(new_no);
+            }
+            obj
+        })
+        .collect();
+    json!({
+        "snapshotId": snapshot_id,
+        "path": path,
+        "oldLineCount": slice.old_line_count,
+        "newLineCount": slice.new_line_count,
+        "binary": slice.binary,
+        "lines": lines,
+    })
 }
 
 fn review_role_str(role: ReviewCommentRole) -> &'static str {
@@ -2319,9 +5064,18 @@ async fn handle_code_review_command(
     let name = c.command_name();
     let result: Result<Value> = async {
         match c {
-            RpcCommand::CodeReviewOpen { from, to, .. } => {
-                code_review.open(app, from, to).await
+            RpcCommand::CodeReviewOpen {
+                commit,
+                from,
+                to,
+                include_working_tree,
+                ..
+            } => {
+                code_review
+                    .open(app, commit, from, to, include_working_tree)
+                    .await
             }
+            RpcCommand::CodeReviewCommits { limit, .. } => code_review.commits(app, limit).await,
             RpcCommand::CodeReviewSnapshot { .. } => code_review.snapshot().await,
             RpcCommand::CodeReviewRefresh { .. } => code_review.refresh(app).await,
             RpcCommand::CodeReviewComment {
@@ -2333,10 +5087,12 @@ async fn handle_code_review_command(
                 new_count,
                 content_hash,
                 comment,
+                images,
                 ..
             } => {
                 code_review
                     .comment(
+                        app,
                         &snapshot_id,
                         &path,
                         old_start,
@@ -2345,8 +5101,12 @@ async fn handle_code_review_command(
                         new_count,
                         &content_hash,
                         &comment,
+                        images,
                     )
                     .await
+            }
+            RpcCommand::CodeReviewSetModel { model_id, .. } => {
+                code_review.set_model(&model_id).await
             }
             RpcCommand::CodeReviewAbort {
                 snapshot_id,
@@ -2370,7 +5130,19 @@ async fn handle_code_review_command(
                     )
                     .await
             }
-            RpcCommand::CodeReviewClose { .. } => code_review.close().await,
+            RpcCommand::CodeReviewHighlight { .. } => code_review.highlight().await,
+            RpcCommand::CodeReviewTldr { language, .. } => {
+                let default = app.settings_manager()?.settings().review_language;
+                let language = resolve_review_language(language.as_deref(), default.as_deref())?;
+                code_review.tldr(&language).await
+            }
+            RpcCommand::CodeReviewStop { operation, .. } => code_review.stop(operation).await,
+            RpcCommand::CodeReviewClose { review_id, .. } => code_review.close(review_id.as_deref()).await,
+            RpcCommand::CodeReviewAutoReview { model_id, language, .. } => {
+                let default = app.settings_manager()?.settings().review_language;
+                let language = resolve_review_language(language.as_deref(), default.as_deref())?;
+                code_review.auto_review(model_id.as_deref(), Some(&language)).await
+            }
             RpcCommand::CodeReviewFileDiff {
                 snapshot_id,
                 path,
@@ -2382,32 +5154,128 @@ async fn handle_code_review_command(
                     .file_diff(app, &snapshot_id, &path, cursor, max_lines)
                     .await
             }
+            RpcCommand::CodeReviewFileContext {
+                snapshot_id,
+                path,
+                old_start,
+                new_start,
+                count,
+                ..
+            } => {
+                code_review
+                    .file_context(app, &snapshot_id, &path, old_start, new_start, count)
+                    .await
+            }
             _ => unreachable!("dispatch_inner only routes code_review_* commands here"),
         }
     }
     .await;
     match result {
         Ok(data) => RpcResponse::success(id, name, Some(data)),
-        Err(e) => RpcResponse::failure(id, name, e.to_string()),
+        Err(error) => {
+            let mut response = RpcResponse::failure(id, name, error.to_string());
+            if let Some(typed) = error.downcast_ref::<CodeReviewRpcError>() {
+                response.data = Some(json!({ "code": typed.code() }));
+            } else if error.downcast_ref::<crate::code_review_panel::AutoReviewError>().is_some() {
+                response.data = Some(json!({ "code": "code_review_auto_failed" }));
+            }
+            response
+        }
+    }
+}
+
+async fn handle_file_explorer_command(app: &Application, c: RpcCommand) -> RpcResponse {
+    let id = c.id();
+    let name = c.command_name();
+    let app = app.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<Value> {
+        let value = match c {
+            RpcCommand::FileExplorerList { path, .. } => {
+                serde_json::to_value(crate::file_explorer::list(
+                    &app,
+                    path.as_deref().unwrap_or(""),
+                )?)?
+            }
+            RpcCommand::FileExplorerRead {
+                path,
+                cursor,
+                max_lines,
+                ..
+            } => serde_json::to_value(crate::file_explorer::read(
+                &app, &path, cursor, max_lines,
+            )?)?,
+            RpcCommand::FileExplorerChanges { .. } => {
+                serde_json::to_value(crate::file_explorer::changes(&app)?)?
+            }
+            RpcCommand::FileExplorerDiff {
+                path,
+                cursor,
+                max_lines,
+                ..
+            } => serde_json::to_value(crate::file_explorer::diff(
+                &app, &path, cursor, max_lines,
+            )?)?,
+            RpcCommand::FileExplorerBlame {
+                path,
+                start_line,
+                end_line,
+                ..
+            } => serde_json::to_value(crate::file_explorer::blame(
+                &app, &path, start_line, end_line,
+            )?)?,
+            RpcCommand::FileExplorerDelete { path, .. } => {
+                serde_json::to_value(crate::file_explorer::delete_path(
+                    &app, &path,
+                )?)?
+            }
+            RpcCommand::FileExplorerMap { path, .. } => {
+                serde_json::to_value(crate::dependency_map::dependency_map(&app, &path)?)?
+            }
+            RpcCommand::PathComplete {
+                path,
+                kind,
+                limit,
+                ..
+            } => serde_json::to_value(crate::file_explorer::complete_path(
+                &app, &path, kind, limit,
+            )?)?,
+            _ => unreachable!("dispatch_inner only routes file_explorer read commands here"),
+        };
+        Ok(value)
+    })
+    .await;
+    match result {
+        Ok(Ok(data)) => RpcResponse::success(id, name, Some(data)),
+        Ok(Err(error)) => {
+            let mut response = RpcResponse::failure(id, name, error.to_string());
+            if let Some(typed) = error.downcast_ref::<crate::file_explorer::FileExplorerError>() {
+                response.data = Some(json!({ "code": typed }));
+            }
+            response
+        }
+        Err(error) if error.is_cancelled() => {
+            RpcResponse::failure(id, name, "file explorer operation was cancelled")
+        }
+        Err(_) => RpcResponse::failure(id, name, "file explorer operation failed"),
     }
 }
 
 pub(crate) fn project_application_event(event: ApplicationEvent) -> Result<Value> {
     match event {
-        ApplicationEvent::Agent(pi_agent::AgentEvent::MessageStart { message }) => {
-            Ok(serde_json::to_value(ApplicationEvent::Agent(
-                pi_agent::AgentEvent::MessageStart {
-                    message: public_message(message),
-                },
-            ))?)
-        }
-        ApplicationEvent::Agent(pi_agent::AgentEvent::MessageEnd { message }) => {
-            Ok(serde_json::to_value(ApplicationEvent::Agent(
-                pi_agent::AgentEvent::MessageEnd {
-                    message: public_message(message),
-                },
-            ))?)
-        }
+        ApplicationEvent::Agent(pi_agent::AgentEvent::MessageStart { message })
+        | ApplicationEvent::AgentPublished {
+            event: pi_agent::AgentEvent::MessageStart { message },
+            ..
+        } => Ok(serde_json::to_value(pi_agent::AgentEvent::MessageStart {
+            message: public_message(message),
+        })?),
+        ApplicationEvent::Agent(pi_agent::AgentEvent::MessageEnd { message })
+        | ApplicationEvent::AgentPublished {
+            event: pi_agent::AgentEvent::MessageEnd { message },
+            ..
+        } => Ok(serde_json::to_value(pi_agent::AgentEvent::MessageEnd {
+            message: public_message(message),
+        })?),
         ApplicationEvent::Workflow(event) => Ok(serde_json::to_value(
             crate::workflow_rpc::project_workflow_event(&event),
         )?),
@@ -2428,7 +5296,6 @@ pub(crate) fn project_application_event(event: ApplicationEvent) -> Result<Value
     }
 }
 
-
 pub(crate) fn project_extension_ui_event(
     event: ExtensionUiEvent,
 ) -> Result<Option<RpcExtensionUiRequest>> {
@@ -2446,15 +5313,18 @@ pub async fn run(cli: &Cli) -> Result<()> {
     let session_run::RunSession {
         application,
         extension_ui,
+        todo_child_service,
         ..
     } = session_run::build_session(cli).await?;
-    run_with_io_and_extension_ui(
+    let result = run_with_io_and_extension_ui_and_todo(
         application,
         extension_ui.expect("RPC has UI adapter"),
         tokio::io::stdin(),
         io::stdout(),
+        Some(todo_child_service),
     )
-    .await
+    .await;
+    result
 }
 pub async fn run_with_io<R, W>(application: Application, input: R, output: W) -> Result<()>
 where
@@ -2473,6 +5343,20 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: Write + Send + 'static,
 {
+    run_with_io_and_extension_ui_and_todo(application, extension_ui, input, output, None).await
+}
+
+async fn run_with_io_and_extension_ui_and_todo<R, W>(
+    application: Application,
+    extension_ui: ExtensionUiAdapter,
+    input: R,
+    output: W,
+    todo_child_service: Option<Arc<pi_coding::TodoChildService>>,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: Write + Send + 'static,
+{
     extension_ui.set_canonical_queries_supported(false);
     let mut events = application.subscribe();
     let mut ui_events = extension_ui.subscribe();
@@ -2480,108 +5364,126 @@ where
     let reader = tokio::spawn(read_jsonl(input, lines_tx));
     let output = Arc::new(StdMutex::new(output));
     let dispatcher = RpcDispatcher::new(application.clone());
-    let mut commands = tokio::task::JoinSet::new();
-    let mut input_open = true;
-    loop {
-        if !input_open && commands.is_empty() {
-            break;
-        }
-        tokio::select! {
-            line = lines_rx.recv(), if input_open => {
-                match line {
-                    Some(JsonlFrame::Line(line)) => match parse_input(&line) {
-                        Ok(RpcInput::Command { command, session_id }) => {
-                            // The stdio RPC transport keeps single-Application
-                            // semantics: sessionId routing exists only on the
-                            // Web control plane manager.
-                            if let Some(session_id) = session_id {
-                                let response = RpcResponse::failure(
-                                    command.id(),
-                                    command.command_name(),
-                                    format!(
-                                        "sessionId is only supported on the Web control plane (unknown session {session_id})"
-                                    ),
-                                );
-                                write_shared_json(&output, &response)?;
-                                continue;
-                            }
-                            if command.runs_inline() {
-                                let response = dispatcher.dispatch_inner(command).await;
-                                write_shared_json(&output, &response)?;
-                            } else if commands.len() >= MAX_CONCURRENT_COMMANDS {
-                                let response = RpcResponse::failure(
-                                    command.id(),
-                                    command.command_name(),
-                                    format!("too many concurrent RPC commands (limit {MAX_CONCURRENT_COMMANDS})"),
-                                );
-                                write_shared_json(&output, &response)?;
-                            } else {
-                                let dispatcher = dispatcher.clone();
-                                let output = output.clone();
-                                commands.spawn(async move {
+    let result = async {
+        let mut commands = tokio::task::JoinSet::new();
+        let mut input_open = true;
+        loop {
+            if !input_open && commands.is_empty() {
+                break;
+            }
+            tokio::select! {
+                line = lines_rx.recv(), if input_open => {
+                    match line {
+                        Some(JsonlFrame::Line(line)) => match parse_input(&line) {
+                            Ok(RpcInput::Command { command, session_id }) => {
+                                if let Some(session_id) = session_id {
+                                    let response = RpcResponse::failure(
+                                        command.id(),
+                                        command.command_name(),
+                                        format!(
+                                            "sessionId is only supported on the Web control plane (unknown session {session_id})"
+                                        ),
+                                    );
+                                    write_shared_json(&output, &response)?;
+                                    continue;
+                                }
+                                if command.runs_inline() {
                                     let response = dispatcher.dispatch_inner(command).await;
-                                    write_shared_json(&output, &response)
-                                });
+                                    write_shared_json(&output, &response)?;
+                                } else if commands.len() >= MAX_CONCURRENT_COMMANDS {
+                                    let response = RpcResponse::slot_overload(
+                                        command.id(),
+                                        command.command_name(),
+                                        format!("too many concurrent RPC commands (limit {MAX_CONCURRENT_COMMANDS})"),
+                                    );
+                                    write_shared_json(&output, &response)?;
+                                } else {
+                                    let dispatcher = dispatcher.clone();
+                                    let output = output.clone();
+                                    commands.spawn(async move {
+                                        let response = dispatcher.dispatch_inner(command).await;
+                                        write_shared_json(&output, &response)
+                                    });
+                                }
                             }
-                        }
-                        Ok(RpcInput::ExtensionUiResponse(response)) => {
-                            if let Err(error) = handle_ui_response(&extension_ui, response) {
-                                write_shared_json(
-                                    &output,
-                                    &RpcResponse::failure(None, "extension_ui_response", error.to_string()),
-                                )?;
+                            Ok(RpcInput::ExtensionUiResponse(response)) => {
+                                if let Err(error) = handle_ui_response(&extension_ui, response) {
+                                    write_shared_json(
+                                        &output,
+                                        &RpcResponse::failure(None, "extension_ui_response", error.to_string()),
+                                    )?;
+                                }
                             }
-                        }
-                        Err(response) => write_shared_json(&output, &response)?,
-                    },
-                    Some(JsonlFrame::Oversized) => write_shared_json(
-                        &output,
-                        &RpcResponse::failure(
-                            None,
-                            "parse",
-                            format!("RPC frame exceeds {MAX_RPC_MESSAGE_BYTES} bytes"),
-                        ),
-                    )?,
-                    Some(JsonlFrame::Unterminated) => write_shared_json(
-                        &output,
-                        &RpcResponse::failure(None, "parse", "RPC frame must end with LF"),
-                    )?,
-                    None => input_open = false,
-                }
-            }
-            completed = commands.join_next(), if !commands.is_empty() => {
-                match completed {
-                    Some(Ok(result)) => result?,
-                    Some(Err(error)) => return Err(anyhow!("RPC command task failed: {error}")),
-                    None => {}
-                }
-            }
-            event = events.recv() => match event {
-                Ok(event) => write_shared_json(&output, &project_application_event(event)?)?,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => write_shared_json(
-                    &output,
-                    &RpcResponse::failure(None, "events", format!("application event stream lagged by {count} records")),
-                )?,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            },
-            event = ui_events.recv() => match event {
-                Ok(event) => {
-                    if let Some(request) = project_extension_ui_event(event)? {
-                        write_shared_json(&output, &request)?;
+                            Err(response) => write_shared_json(&output, &response)?,
+                        },
+                        Some(JsonlFrame::Oversized) => write_shared_json(
+                            &output,
+                            &RpcResponse::failure(
+                                None,
+                                "parse",
+                                format!("RPC frame exceeds {MAX_RPC_MESSAGE_BYTES} bytes"),
+                            ),
+                        )?,
+                        Some(JsonlFrame::Unterminated) => write_shared_json(
+                            &output,
+                            &RpcResponse::failure(None, "parse", "RPC frame must end with LF"),
+                        )?,
+                        None => input_open = false,
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => write_shared_json(
-                    &output,
-                    &RpcResponse::failure(None, "extension_ui", format!("extension UI event stream lagged by {count} records")),
-                )?,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            },
+                completed = commands.join_next(), if !commands.is_empty() => {
+                    match completed {
+                        Some(Ok(result)) => result?,
+                        Some(Err(error)) => return Err(anyhow!("RPC command task failed: {error}")),
+                        None => {}
+                    }
+                }
+                event = events.recv() => match event {
+                    Ok(event) => write_shared_json(&output, &project_application_event(event)?)?,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => write_shared_json(
+                        &output,
+                        &RpcResponse::failure(None, "events", format!("application event stream lagged by {count} records")),
+                    )?,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+                event = ui_events.recv() => match event {
+                    Ok(event) => {
+                        if let Some(request) = project_extension_ui_event(event)? {
+                            write_shared_json(&output, &request)?;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => write_shared_json(
+                        &output,
+                        &RpcResponse::failure(None, "extension_ui", format!("extension UI event stream lagged by {count} records")),
+                    )?,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+            }
         }
+        reader.await.context("joining JSONL reader")??;
+        dispatcher.side_chat.shutdown().await;
+        Ok(())
     }
-    reader.await.context("joining JSONL reader")??;
-    dispatcher.side_chat.shutdown().await;
+    .await;
+    // Unconditional file-conversation teardown: owned controllers must never outlive the process exit path.
+    dispatcher.shutdown_file_conversations().await;
+    let shutdown = if let Some(service) = todo_child_service {
+        service
+            .shutdown()
+            .await
+            .context("shutting down Todo child service")
+    } else {
+        Ok(())
+    };
     application.cleanup().await;
-    Ok(())
+    match (result, shutdown) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(shutdown_error)) => Err(error.context(format!(
+            "Todo child service shutdown also failed: {shutdown_error:#}"
+        ))),
+    }
 }
 fn write_shared_json<W: Write, T: Serialize>(output: &Arc<StdMutex<W>>, value: &T) -> Result<()> {
     let mut output = output
@@ -2683,6 +5585,38 @@ fn rpc_command_from_workflow(command: crate::workflow_rpc::WorkflowRpcCommand) -
         }
     }
 }
+/// Field-aware context for a command-frame deserialization error that hits a
+/// sequence (`Vec`) field. Serde's `from_value` error does not name the
+/// failing field, so the parse boundary maps the error back to the command
+/// variant whose sequence field is unambiguous (each command below exposes
+/// exactly one non-optional sequence). OPTIONAL sequence fields
+/// (`images`, `jobIds`) already route through [`null_default_vec`] and never
+/// reach this point, so a remaining `expected a sequence` error can only
+/// come from a REQUIRED array — which must stay rejected with a message that
+/// names the field so the frontend can render an actionable protocol error.
+/// No payload contents are ever echoed.
+fn sequence_field_hint(command: &str, error: &serde_json::Error) -> Option<String> {
+    if !error.to_string().contains("expected a sequence") {
+        return None;
+    }
+    let field = match command {
+        "set_todos" => Some("phases"),
+        "process_keys" => Some("keys"),
+        "process_spawn" => Some("spec.argv"),
+        _ => None,
+    }?;
+    Some(format!(
+        "field `{field}` must be an array — send an array or omit it if the field is optional"
+    ))
+}
+
+fn tag_parse_failure(response: RpcResponse, session_id: Option<&str>) -> RpcResponse {
+    match session_id {
+        Some(session_id) => response.with_session_id(session_id),
+        None => response,
+    }
+}
+
 pub(crate) fn parse_input(line: &[u8]) -> std::result::Result<RpcInput, RpcResponse> {
     let mut value: Value = serde_json::from_slice(line).map_err(|e| {
         RpcResponse::failure(None, "parse", format!("Failed to parse command: {e}"))
@@ -2699,7 +5633,7 @@ pub(crate) fn parse_input(line: &[u8]) -> std::result::Result<RpcInput, RpcRespo
                 id,
                 "parse",
                 "sessionId must be a string",
-            ))
+            ));
         }
     };
     if session_id.is_some()
@@ -2708,18 +5642,64 @@ pub(crate) fn parse_input(line: &[u8]) -> std::result::Result<RpcInput, RpcRespo
         object.remove("sessionId");
     }
     let Some(command) = value.get("type").and_then(Value::as_str).map(str::to_owned) else {
-        return Err(RpcResponse::failure(
-            id,
-            "parse",
-            "Failed to parse command: missing string field `type`",
+        return Err(tag_parse_failure(
+            RpcResponse::failure(
+                id,
+                "parse",
+                "Failed to parse command: missing string field `type`",
+            ),
+            session_id.as_deref(),
         ));
     };
     if command == "extension_ui_response" {
         return serde_json::from_value(value)
             .map(RpcInput::ExtensionUiResponse)
             .map_err(|e| {
-                RpcResponse::failure(id, command, format!("Invalid extension UI response: {e}"))
+                tag_parse_failure(
+                    RpcResponse::failure(
+                        id,
+                        command,
+                        format!("Invalid extension UI response: {e}"),
+                    ),
+                    session_id.as_deref(),
+                )
             });
+    }
+    // workflow_hub_send is Application-routed (not WorkflowRpcCommand) but
+    // still uses a deny_unknown_fields camelCase wire schema.
+    if command == "workflow_hub_send" {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WorkflowHubSendWire {
+            #[serde(default)]
+            id: Option<String>,
+            #[serde(rename = "type")]
+            _type: String,
+            #[serde(rename = "workflowId")]
+            workflow_id: String,
+            generation: u64,
+            recipient: String,
+            body: String,
+            #[serde(default, rename = "replyTo")]
+            reply_to: Option<String>,
+        }
+        return match serde_json::from_value::<WorkflowHubSendWire>(value) {
+            Ok(wire) => Ok(RpcInput::Command {
+                command: RpcCommand::WorkflowHubSend {
+                    id: wire.id,
+                    workflow_id: wire.workflow_id,
+                    generation: wire.generation,
+                    recipient: wire.recipient,
+                    body: wire.body,
+                    reply_to: wire.reply_to,
+                },
+                session_id,
+            }),
+            Err(error) => Err(tag_parse_failure(
+                RpcResponse::failure(id, command, format!("Invalid command: {error}")),
+                session_id.as_deref(),
+            )),
+        };
     }
     // Workflow commands use a deny_unknown_fields wire schema.
     if crate::workflow_rpc::WorkflowRpcCommand::is_workflow_type(&command) {
@@ -2728,22 +5708,29 @@ pub(crate) fn parse_input(line: &[u8]) -> std::result::Result<RpcInput, RpcRespo
                 command: rpc_command_from_workflow(workflow),
                 session_id,
             }),
-            Err(error) => Err(RpcResponse::failure(
-                id,
-                command,
-                format!("Invalid command: {error}"),
+            Err(error) => Err(tag_parse_failure(
+                RpcResponse::failure(id, command, format!("Invalid command: {error}")),
+                session_id.as_deref(),
             )),
         };
     }
     serde_json::from_value(value)
-        .map(|command| RpcInput::Command { command, session_id })
+        .map(|command| RpcInput::Command {
+            command,
+            session_id: session_id.clone(),
+        })
         .map_err(|e| {
             let message = if e.to_string().starts_with("unknown variant") {
                 format!("Unknown command: {command}")
+            } else if let Some(hint) = sequence_field_hint(&command, &e) {
+                format!("Invalid command {command}: {hint}")
             } else {
                 format!("Invalid command: {e}")
             };
-            RpcResponse::failure(id, command, message)
+            tag_parse_failure(
+                RpcResponse::failure(id, command, message),
+                session_id.as_deref(),
+            )
         })
 }
 fn handle_ui_response(adapter: &ExtensionUiAdapter, r: RpcExtensionUiResponse) -> Result<()> {
@@ -2889,11 +5876,7 @@ fn ui_event_request(event: ExtensionUiEvent) -> Result<Option<RpcExtensionUiRequ
             "extensionId": instance.extension_id,
             "generation": instance.generation,
         }),
-        ExtensionUiEvent::OverlayRowsChanged {
-            instance,
-            id,
-            rows,
-        } => json!({
+        ExtensionUiEvent::OverlayRowsChanged { instance, id, rows } => json!({
             "method": "overlay_rows_changed",
             "overlayId": id,
             "rows": rows,
@@ -2905,6 +5888,7 @@ fn ui_event_request(event: ExtensionUiEvent) -> Result<Option<RpcExtensionUiRequ
         record_type: "extension_ui_request",
         id,
         session_id: None,
+        runtime_incarnation: None,
         request,
     }))
 }
@@ -3006,9 +5990,36 @@ fn ui_request(id: String, request: pi_coding::ExtensionUiRequest) -> Result<RpcE
         record_type: "extension_ui_request",
         id,
         session_id: None,
+        runtime_incarnation: None,
         request,
     })
 }
+fn workflow_hub_send_response_data(
+    workflow_id: String,
+    generation: u64,
+    recipient: String,
+    receipts: Vec<pi_coding::DeliveryReceipt>,
+) -> Value {
+    let receipts = receipts
+        .into_iter()
+        .map(|receipt| {
+            json!({
+                "to": receipt.to,
+                "requested": receipt.requested,
+                "outcome": receipt.outcome,
+                "messageId": receipt.message_id,
+                "error": receipt.error,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "workflowId": workflow_id,
+        "generation": generation,
+        "recipient": recipient,
+        "receipts": receipts,
+    })
+}
+
 async fn handle_command(
     app: &Application,
     settings: &crate::settings_rpc::SettingsRpcState,
@@ -3027,10 +6038,78 @@ async fn handle_command_with_session_storage(
 ) -> RpcResponse {
     let id = c.id();
     let name = c.command_name();
-    match handle_command_inner(app, settings, workflows, session_storage, c).await {
-        Ok(data) => RpcResponse::success(id, name, data),
-        Err(e) => RpcResponse::failure(id, name, e.to_string()),
+    if matches!(c, RpcCommand::GetTree { .. }) {
+        let raw = app
+            .session_tree()
+            .and_then(|tree| tree.to_json_string().map_err(Into::into));
+        return match raw.and_then(|json| {
+            RpcResponse::success_raw(id.clone(), name.clone(), json).map_err(Into::into)
+        }) {
+            Ok(response) => response,
+            Err(error) => RpcResponse::failure(
+                id,
+                name,
+                format!("Failed to serialize session tree: {error}"),
+            ),
+        };
     }
+    if matches!(c, RpcCommand::GetForkMessages { .. }) {
+        return match Box::pin(handle_command_inner(app, settings, workflows, session_storage, c)).await {
+            Ok(data) => bounded_fork_messages_response(id, name, None, data),
+            Err(error) => RpcResponse::failure(id, name, error.to_string()),
+        };
+    }
+
+    match Box::pin(handle_command_inner(app, settings, workflows, session_storage, c)).await {
+        Ok(data) => RpcResponse::success(id, name, data),
+        Err(e) => {
+            let mut response = RpcResponse::failure(id, name, e.to_string());
+            attach_handle_command_error_code(&e, &mut response);
+            response
+        }
+    }
+}
+
+fn attach_handle_command_error_code(error: &anyhow::Error, response: &mut RpcResponse) {
+    if error.downcast_ref::<TranscriptUnavailable>().is_some() {
+        response.data = Some(json!({ "code": "transcript_unavailable" }));
+        return;
+    }
+    if let Some(typed) = error.downcast_ref::<SessionAlreadyProcessing>() {
+        response.data = Some(json!({ "code": typed.code() }));
+    }
+}
+
+pub(crate) fn bounded_fork_messages_response(
+    id: Option<String>,
+    name: impl Into<String>,
+    session_id: Option<String>,
+    data: Option<Value>,
+) -> RpcResponse {
+    let name = name.into();
+    let attach_session = |response: RpcResponse, owner: &Option<String>| match owner {
+        Some(owner) => response.with_session_id(owner.clone()),
+        None => response,
+    };
+    let response = attach_session(
+        RpcResponse::success(id.clone(), name.clone(), data),
+        &session_id,
+    );
+    if serde_json::to_vec(&response)
+        .is_ok_and(|encoded| encoded.len() <= MAX_FORK_MESSAGES_RESPONSE_BYTES)
+    {
+        return response;
+    }
+    let bounded_id = id.filter(|value| value.len() <= 4096);
+    let bounded_session_id = session_id.filter(|value| value.len() <= 4096);
+    attach_session(
+        RpcResponse::failure(
+            bounded_id,
+            name,
+            "fork message page exceeds the response byte limit",
+        ),
+        &bounded_session_id,
+    )
 }
 /// Upper bound for persona definition content returned over RPC. The core
 /// discovery bound (`MAX_AGENT_DEFINITION_BYTES`, 256 KiB) already caps every
@@ -3074,6 +6153,35 @@ fn persona_definitions(app: &Application) -> Option<Vec<pi_coding::AgentDefiniti
             .cloned()
             .collect::<Vec<_>>()
     })
+}
+
+/// Test seam for the `SessionList` off-worker contract.
+///
+/// The `SessionList` handler records, keyed by the command's RPC `id`, the
+/// id of the thread that actually runs `load_resume_catalog` from inside its
+/// `spawn_blocking` closure. Each regression test passes its own unique `id`
+/// and reads back its own entry, so parallel `SessionList` tests can never
+/// overwrite one another's record — a synchronous inline revert for one test
+/// cannot be masked by a concurrent test's `spawn_blocking` write. This is
+/// `cfg(test)`-gated, so it is compiled out of every production build and
+/// touches no wire shape, no public API, no type contract, and no runtime
+/// behavior — it only records a `ThreadId` while the test binary is running.
+#[cfg(test)]
+static SESSION_LIST_LOADER_THREADS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::thread::ThreadId>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+const SESSION_LIST_PANIC_SEAM_KEY: &str = "session-list-worker-panic";
+
+fn session_catalog_join_error(error: tokio::task::JoinError) -> anyhow::Error {
+    if error.is_cancelled() {
+        anyhow!("session catalog scan was cancelled")
+    } else if error.is_panic() {
+        anyhow!("session catalog scan worker panicked")
+    } else {
+        anyhow!("session catalog scan worker failed")
+    }
 }
 
 async fn handle_command_inner(
@@ -3169,10 +6277,11 @@ async fn handle_command_inner(
             images,
             streaming_behavior,
             ..
-        } => {
-            app.prompt(message, images, streaming_behavior).await?;
-            Ok(None)
-        }
+        } => Ok(app
+            .prompt(message, images, streaming_behavior)
+            .await?
+            .map(|accepted| serde_json::to_value(accepted))
+            .transpose()?),
         RpcCommand::Steer {
             message, images, ..
         } => {
@@ -3189,7 +6298,20 @@ async fn handle_command_inner(
             app.abort().await;
             Ok(None)
         }
-        RpcCommand::NewSession { parent_session, .. } => {
+        RpcCommand::NewSession {
+            parent_session,
+            cwd,
+            ..
+        } => {
+            if let Some(cwd) = cwd.as_deref().map(str::trim).filter(|cwd| !cwd.is_empty()) {
+                let path = Path::new(cwd);
+                if !path.is_absolute() {
+                    bail!("new session cwd must be absolute");
+                }
+                pi_coding::inspect_operator_directory(path)
+                    .context("validating new session cwd")?;
+                bail!("new_session cwd is only supported by the multi-session Web runtime");
+            }
             let outcome = app
                 .new_session_with_parent(parent_session.as_deref().map(Path::new))
                 .await?;
@@ -3203,8 +6325,10 @@ async fn handle_command_inner(
         RpcCommand::GetState { .. } => Ok(Some(serde_json::to_value(
             RpcSessionState::from_application(
                 app.state().await,
+                app.active_turn_model(),
                 app.runtime_settings_state(),
                 app.session().cwd(),
+                None,
             ),
         )?)),
         RpcCommand::SetModel {
@@ -3289,32 +6413,49 @@ async fn handle_command_inner(
             Ok(None)
         }
         RpcCommand::GetSessionStats { .. } => Ok(Some(serde_json::to_value(app.session_stats())?)),
-        RpcCommand::SessionList { scope, .. } => {
+        RpcCommand::SessionList { id: _id, scope, .. } => {
             let session = app.session();
             let catalog = match scope {
                 RpcSessionListScope::Current => pi_coding::SessionCatalog::from_env()?
                     .with_native_session_root(session.session_dir()),
                 RpcSessionListScope::AllProjects => session_storage
-                    .ok_or_else(|| anyhow!("all-project session catalog is unavailable outside the Web listener"))?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "all-project session catalog is unavailable outside the Web listener"
+                        )
+                    })?
                     .catalog()?,
             };
-            let cwd_scope = matches!(scope, RpcSessionListScope::Current)
-                .then(|| session.cwd().to_path_buf());
-            let rows = crate::resume_catalog::load_resume_catalog(
-                &catalog,
-                &crate::resume_catalog::ResumeCatalogRequest {
-                    sources: match scope {
-                        RpcSessionListScope::Current => {
-                            crate::resume_catalog::effective_resume_sources(app)
-                        }
-                        RpcSessionListScope::AllProjects => {
-                            crate::resume_catalog::web_resume_sources(app)
-                        }
-                    },
-                    cwd_scope,
-                    ..crate::resume_catalog::ResumeCatalogRequest::default()
-                },
-            )?;
+            let cwd_scope =
+                matches!(scope, RpcSessionListScope::Current).then(|| session.cwd().to_path_buf());
+            let sources = match scope {
+                RpcSessionListScope::Current => {
+                    crate::resume_catalog::effective_resume_sources(app)
+                }
+                RpcSessionListScope::AllProjects => crate::resume_catalog::web_resume_sources(app),
+            };
+            let request = crate::resume_catalog::ResumeCatalogRequest {
+                sources,
+                cwd_scope,
+                ..crate::resume_catalog::ResumeCatalogRequest::default()
+            };
+            #[cfg(test)]
+            let loader_key = _id.clone().unwrap_or_default();
+            let rows = tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                {
+                    SESSION_LIST_LOADER_THREADS
+                        .lock()
+                        .expect("loader thread seam")
+                        .insert(loader_key.clone(), std::thread::current().id());
+                    if loader_key == SESSION_LIST_PANIC_SEAM_KEY {
+                        panic!("session catalog worker panic seam");
+                    }
+                }
+                crate::resume_catalog::load_resume_catalog(&catalog, &request)
+            })
+            .await
+            .map_err(session_catalog_join_error)??;
             let rows = match scope {
                 RpcSessionListScope::Current => rows
                     .rows
@@ -3322,9 +6463,25 @@ async fn handle_command_inner(
                     .map(|row| (row, false))
                     .collect::<Vec<_>>(),
                 RpcSessionListScope::AllProjects => {
-                    let rows = crate::resume_catalog::filter_web_noise_rows(
-                        crate::resume_catalog::coalesce_web_import_rows(rows.rows),
-                    );
+                    // Imported foreign rows STAY VISIBLE next to their native
+                    // copy (product decision): the row carries its
+                    // AlreadyImported status + nativePath so the sidebar can
+                    // badge it; no coalescing drop.
+                    let unfiltered = rows.rows;
+                    let mut rows = crate::resume_catalog::filter_web_noise_rows(unfiltered.clone());
+                    // A brand-new session persists header-only (0 messages,
+                    // <10KiB), so the noise filter would hide the CURRENT
+                    // session's row after a reload. Re-union the live
+                    // recorder's row after filtering; the recorder identity
+                    // matches CatalogRow::session_id (see the live_name
+                    // overlay below).
+                    if let Some(live_id) = session.recorder_info().map(|(id, _)| id)
+                        && !rows.iter().any(|row| row.session_id == live_id)
+                        && let Some(recorder_row) =
+                            unfiltered.iter().find(|row| row.session_id == live_id)
+                    {
+                        rows.push(recorder_row.clone());
+                    }
                     let (regular, temporary) =
                         crate::resume_catalog::partition_web_noise_rows(rows);
                     regular
@@ -3338,20 +6495,15 @@ async fn handle_command_inner(
             // name is authoritative and may not have flushed yet, so overlay
             // it only onto the row for the same physical recorder.
             let live_name = session.session_name();
-            let live_identity = session.recorder_info().map(|(id, path)| {
-                (id, crate::modes::session_runtime_manager::canonical_session_path(&path))
-            });
+            let live_session_id = session.recorder_info().map(|(id, _)| id);
             let sessions = rows
                 .into_iter()
                 .map(|(row, temporary)| {
                     let mut row = RpcSessionListRow::from_resume_row(row, temporary);
-                    let row_path = crate::modes::session_runtime_manager::canonical_session_path(
-                        Path::new(&row.path),
-                    );
                     if live_name.is_some()
-                        && live_identity.as_ref().is_some_and(|(id, path)| {
-                            id == &row.session_id && path == &row_path
-                        })
+                        && live_session_id
+                            .as_ref()
+                            .is_some_and(|id| id == &row.session_id)
                     {
                         row.name = live_name.clone();
                     }
@@ -3360,11 +6512,40 @@ async fn handle_command_inner(
                 .collect::<Vec<_>>();
             Ok(Some(json!({"sessions": sessions})))
         }
-        RpcCommand::ExportHtml { output_path, .. } => Ok(Some(
-            json!({"path":app.export_html(output_path.as_deref().map(Path::new))?.to_string_lossy()}),
-        )),
-        RpcCommand::SwitchSession { session_path, .. } => {
-            let outcome = app.switch_session(Path::new(&session_path)).await?;
+        RpcCommand::ExportHtml {
+            output_path,
+            session_path,
+            ..
+        } => {
+            if session_path.is_some() {
+                bail!("sessionPath export is available only through the Web listener");
+            }
+            Ok(Some(
+                json!({"path":app.export_html(output_path.as_deref().map(Path::new))?.to_string_lossy()}),
+            ))
+        }
+        RpcCommand::SwitchSession {
+            session_path,
+            catalog_source,
+            catalog_session_id,
+            catalog_status,
+            ..
+        } => {
+            // The stdio transport has no negotiated handoff; a malformed or
+            // partial catalog tuple must fail closed instead of being
+            // silently ignored.
+            switch_catalog_identity(
+                catalog_source.as_deref(),
+                catalog_session_id.as_deref(),
+                catalog_status.as_deref(),
+            )
+            .map_err(|error| anyhow!(error.message()))?;
+            let catalog = pi_coding::SessionCatalog::from_env()?
+                .with_native_session_root(app.session().session_dir());
+            let prepared = catalog
+                .prepare_native_resume(&session_path)
+                .map_err(anyhow::Error::new)?;
+            let outcome = app.switch_prepared_session(prepared).await?;
             if !outcome.cancelled {
                 crate::session_run::rebind_workflows_for_active_session(&app)
                     .await
@@ -3372,28 +6553,63 @@ async fn handle_command_inner(
             }
             Ok(Some(json!({"cancelled":outcome.cancelled})))
         }
-        RpcCommand::Fork { entry_id, .. } => {
-            let outcome = app.fork_session(&entry_id).await?;
-            if !outcome.cancelled {
-                crate::session_run::rebind_workflows_for_active_session(&app)
-                    .await
-                    .context("rebinding workflow storage after session fork")?;
+        RpcCommand::Fork {
+            entry_id,
+            session_path,
+            ..
+        } => {
+            if let Some(session_path) = session_path {
+                Ok(Some(stdio_branch_saved_session(
+                    app,
+                    session_storage,
+                    &session_path,
+                    Some(entry_id.as_str()),
+                )?))
+            } else {
+                let outcome = app.fork_session(&entry_id).await?;
+                if !outcome.cancelled {
+                    crate::session_run::rebind_workflows_for_active_session(&app)
+                        .await
+                        .context("rebinding workflow storage after session fork")?;
+                }
+                Ok(Some(json!({
+                    "text": outcome.text,
+                    "cancelled": outcome.cancelled,
+                })))
             }
-            Ok(Some(json!({
-                "text": outcome.text,
-                "cancelled": outcome.cancelled,
-            })))
         }
-        RpcCommand::Clone { .. } => {
-            let outcome = app.clone_session().await?;
-            if !outcome.cancelled {
-                crate::session_run::rebind_workflows_for_active_session(&app)
-                    .await
-                    .context("rebinding workflow storage after session clone")?;
+        RpcCommand::Clone { session_path, .. } => {
+            if let Some(session_path) = session_path {
+                Ok(Some(stdio_branch_saved_session(
+                    app,
+                    session_storage,
+                    &session_path,
+                    None,
+                )?))
+            } else {
+                let outcome = app.clone_session().await?;
+                if !outcome.cancelled {
+                    crate::session_run::rebind_workflows_for_active_session(&app)
+                        .await
+                        .context("rebinding workflow storage after session clone")?;
+                }
+                Ok(Some(json!({"cancelled":outcome.cancelled})))
             }
-            Ok(Some(json!({"cancelled":outcome.cancelled})))
         }
-        RpcCommand::GetForkMessages { .. } => Ok(Some(json!({"messages":app.fork_messages()?}))),
+        RpcCommand::GetForkMessages {
+            session_path,
+            cursor,
+            limit,
+            ..
+        } => {
+            let page = if let Some(session_path) = session_path {
+                let prepared = stdio_prepare_saved_session(app, &session_path)?;
+                fork_messages_from_tree(prepared.tree(), cursor.as_deref(), limit)?
+            } else {
+                app.fork_messages(cursor.as_deref(), limit)?
+            };
+            Ok(Some(serde_json::to_value(page)?))
+        }
         RpcCommand::GetEntries { since, .. } => {
             let mut entries = app.session_entries(since.as_deref())?;
             for entry in &mut entries.entries {
@@ -3418,20 +6634,47 @@ async fn handle_command_inner(
             }
             Ok(Some(serde_json::to_value(entries)?))
         }
-        RpcCommand::GetTree { .. } => Ok(Some(serde_json::to_value(app.session_tree()?)?)),
+        RpcCommand::GetTree { .. } => bail!("GetTree must use the raw response path"),
         RpcCommand::GetLastAssistantText { .. } => {
             Ok(Some(json!({"text":app.last_assistant_text()})))
         }
-        RpcCommand::SetSessionName { name, .. } => {
+        RpcCommand::SetSessionName {
+            name, session_path, ..
+        } => {
             if name.trim().is_empty() {
                 bail!("Session name cannot be empty")
             }
-            app.set_session_name(name.trim())?;
+            if let Some(session_path) = session_path {
+                stdio_rename_saved_session(app, &session_path, name.trim())?;
+            } else {
+                app.set_session_name(name.trim())?;
+            }
             Ok(None)
         }
+        RpcCommand::SessionForkLatest { session_path, .. } => Ok(Some(stdio_branch_saved_session(
+            app,
+            session_storage,
+            &session_path,
+            Some("__latest__"),
+        )?)),
+        RpcCommand::SessionDelete { session_path, .. } => {
+            Ok(Some(stdio_delete_saved_session(app, &session_path)?))
+        }
+        RpcCommand::SessionRestore { .. } => {
+            bail!("session_restore is only supported on the Web control plane")
+        }
+        RpcCommand::SessionCopyContext { .. } => {
+            bail!("session_copy_context is available only through the Web listener")
+        }
+        RpcCommand::SessionHandoff { .. } => {
+            bail!("session_handoff is available only through the multi-session Web runtime")
+        }
+        RpcCommand::SessionMove { .. } => {
+            bail!("session_move is available only through the multi-session Web runtime")
+        }
         RpcCommand::GetMessages { .. } => {
-            let messages: Vec<Message> = app.messages().into_iter().map(public_message).collect();
-            Ok(Some(json!({"messages":messages})))
+            let rows = app.session().authoritative_transcript()?;
+            Ok(Some(json!({ "messages": public_transcript_rows(rows) })))
         }
         RpcCommand::GetCommands { .. } => {
             // Project the Application's collision-free executable catalog —
@@ -3465,6 +6708,15 @@ async fn handle_command_inner(
                 })
                 .collect::<Vec<_>>();
             Ok(Some(json!({"commands":commands})))
+        }
+        RpcCommand::Run { name, args, .. } => {
+            let name = name.trim();
+            if name.is_empty() {
+                bail!("run command name is required");
+            }
+            let value =
+                crate::interactive_commands::invoke_extension_command(app, name, args).await?;
+            Ok(Some(json!({ "name": name, "value": value })))
         }
         RpcCommand::Skill { name, .. } => {
             let name = name.trim();
@@ -3536,7 +6788,9 @@ async fn handle_command_inner(
             // FULL chain — including the frontmatter validation root cause —
             // is safe to surface on the wire.
             .map_err(|error| anyhow!("{}", format!("{error:#}")))?;
-            Ok(Some(json!({ "name": name, "created": true, "message": message })))
+            Ok(Some(
+                json!({ "name": name, "created": true, "message": message }),
+            ))
         }
         RpcCommand::PersonaEdit { name, content, .. } => {
             let message = crate::interactive_commands::commit_persona_definition(
@@ -3547,7 +6801,9 @@ async fn handle_command_inner(
             )
             .await
             .map_err(|error| anyhow!("{}", format!("{error:#}")))?;
-            Ok(Some(json!({ "name": name, "edited": true, "message": message })))
+            Ok(Some(
+                json!({ "name": name, "edited": true, "message": message }),
+            ))
         }
         RpcCommand::PersonaRemove { name, confirm, .. } => {
             if !confirm {
@@ -3557,10 +6813,14 @@ async fn handle_command_inner(
             }
             let message = crate::interactive_commands::execute_interactive_persona_command(
                 app,
-                crate::interactive_commands::InteractivePersonaCommand::Remove { name: name.clone() },
+                crate::interactive_commands::InteractivePersonaCommand::Remove {
+                    name: name.clone(),
+                },
             )
             .await?;
-            Ok(Some(json!({ "name": name, "removed": true, "message": message })))
+            Ok(Some(
+                json!({ "name": name, "removed": true, "message": message }),
+            ))
         }
         RpcCommand::PersonaPurge { name, confirm, .. } => {
             if !confirm {
@@ -3570,18 +6830,26 @@ async fn handle_command_inner(
             }
             let message = crate::interactive_commands::execute_interactive_persona_command(
                 app,
-                crate::interactive_commands::InteractivePersonaCommand::Purge { name: name.clone() },
+                crate::interactive_commands::InteractivePersonaCommand::Purge {
+                    name: name.clone(),
+                },
             )
             .await?;
-            Ok(Some(json!({ "name": name, "purged": true, "message": message })))
+            Ok(Some(
+                json!({ "name": name, "purged": true, "message": message }),
+            ))
         }
         RpcCommand::PersonaSelect { name, .. } => {
             let message = crate::interactive_commands::execute_interactive_persona_command(
                 app,
-                crate::interactive_commands::InteractivePersonaCommand::Select { name: name.clone() },
+                crate::interactive_commands::InteractivePersonaCommand::Select {
+                    name: name.clone(),
+                },
             )
             .await?;
-            Ok(Some(json!({ "name": name, "preferred": true, "message": message })))
+            Ok(Some(
+                json!({ "name": name, "preferred": true, "message": message }),
+            ))
         }
         RpcCommand::PersonaClear { .. } => {
             let message = crate::interactive_commands::execute_interactive_persona_command(
@@ -3589,7 +6857,9 @@ async fn handle_command_inner(
                 crate::interactive_commands::InteractivePersonaCommand::Clear,
             )
             .await?;
-            Ok(Some(json!({ "preferred": serde_json::Value::Null, "message": message })))
+            Ok(Some(
+                json!({ "preferred": serde_json::Value::Null, "message": message }),
+            ))
         }
         RpcCommand::PersonaCurrent { .. } => {
             let message = crate::interactive_commands::execute_interactive_persona_command(
@@ -3600,9 +6870,15 @@ async fn handle_command_inner(
             let name = crate::interactive_commands::current_preferred_agent(app);
             Ok(Some(json!({ "name": name, "message": message })))
         }
-        RpcCommand::SetTodos { workflow_id, phases, .. } => {
+        RpcCommand::SetTodos {
+            workflow_id,
+            phases,
+            ..
+        } => {
             let result = match workflow_id {
-                Some(workflow_id) => app.set_workflow_todos(&pi_coding::WorkflowId::new(workflow_id), phases)?,
+                Some(workflow_id) => {
+                    app.set_workflow_todos(&pi_coding::WorkflowId::new(workflow_id), phases)?
+                }
                 None => app.set_todos(phases)?,
             };
             Ok(Some(
@@ -3699,60 +6975,108 @@ async fn handle_command_inner(
             id,
             name,
             objective,
-        } => Ok(Some(workflows.dispatch(
-            crate::workflow_rpc::WorkflowRpcCommand::WorkflowCreate {
-                id,
-                name,
-                objective,
-            },
-        ).await?)),
-        RpcCommand::WorkflowList { id } => Ok(Some(workflows.dispatch(
-            crate::workflow_rpc::WorkflowRpcCommand::WorkflowList { id },
-        ).await?)),
+        } => Ok(Some(
+            workflows
+                .dispatch(crate::workflow_rpc::WorkflowRpcCommand::WorkflowCreate {
+                    id,
+                    name,
+                    objective,
+                })
+                .await?,
+        )),
+        RpcCommand::WorkflowList { id } => Ok(Some(
+            workflows
+                .dispatch(crate::workflow_rpc::WorkflowRpcCommand::WorkflowList { id })
+                .await?,
+        )),
         RpcCommand::WorkflowGet {
             id,
             workflow_id,
             name,
-        } => Ok(Some(workflows.dispatch(
-            crate::workflow_rpc::WorkflowRpcCommand::WorkflowGet {
-                id,
-                workflow_id,
-                name,
-            },
-        ).await?)),
+        } => Ok(Some(
+            workflows
+                .dispatch(crate::workflow_rpc::WorkflowRpcCommand::WorkflowGet {
+                    id,
+                    workflow_id,
+                    name,
+                })
+                .await?,
+        )),
         RpcCommand::WorkflowDetail {
             id,
             workflow_id,
             name,
-        } => Ok(Some(workflows.dispatch(
-            crate::workflow_rpc::WorkflowRpcCommand::WorkflowDetail {
-                id,
-                workflow_id,
-                name,
-            },
-        ).await?)),
-        RpcCommand::WorkflowPause { id, workflow_id } => Ok(Some(workflows.dispatch(
-            crate::workflow_rpc::WorkflowRpcCommand::WorkflowPause { id, workflow_id },
-        ).await?)),
-        RpcCommand::WorkflowResume { id, workflow_id } => Ok(Some(workflows.dispatch(
-            crate::workflow_rpc::WorkflowRpcCommand::WorkflowResume { id, workflow_id },
-        ).await?)),
-        RpcCommand::WorkflowCancel { id, workflow_id } => Ok(Some(workflows.dispatch(
-            crate::workflow_rpc::WorkflowRpcCommand::WorkflowCancel { id, workflow_id },
-        ).await?)),
-        RpcCommand::WorkflowIntegrate { id, workflow_id } => Ok(Some(workflows.dispatch(
-            crate::workflow_rpc::WorkflowRpcCommand::WorkflowIntegrate { id, workflow_id },
-        ).await?)),
-        RpcCommand::WorkflowRemove { id, workflow_id } => Ok(Some(workflows.dispatch(
-            crate::workflow_rpc::WorkflowRpcCommand::WorkflowRemove { id, workflow_id },
-        ).await?)),
-        RpcCommand::SnapCompact { .. } => Ok(Some(serde_json::to_value(
-            app.compact_snap().await?,
-        )?)),
-        RpcCommand::Rewind {
-            index,
-            checkpoint,
+        } => Ok(Some(
+            workflows
+                .dispatch(crate::workflow_rpc::WorkflowRpcCommand::WorkflowDetail {
+                    id,
+                    workflow_id,
+                    name,
+                })
+                .await?,
+        )),
+        RpcCommand::WorkflowPause { id, workflow_id } => Ok(Some(
+            workflows
+                .dispatch(crate::workflow_rpc::WorkflowRpcCommand::WorkflowPause {
+                    id,
+                    workflow_id,
+                })
+                .await?,
+        )),
+        RpcCommand::WorkflowResume { id, workflow_id } => Ok(Some(
+            workflows
+                .dispatch(crate::workflow_rpc::WorkflowRpcCommand::WorkflowResume {
+                    id,
+                    workflow_id,
+                })
+                .await?,
+        )),
+        RpcCommand::WorkflowCancel { id, workflow_id } => Ok(Some(
+            workflows
+                .dispatch(crate::workflow_rpc::WorkflowRpcCommand::WorkflowCancel {
+                    id,
+                    workflow_id,
+                })
+                .await?,
+        )),
+        RpcCommand::WorkflowIntegrate { id, workflow_id } => Ok(Some(
+            workflows
+                .dispatch(crate::workflow_rpc::WorkflowRpcCommand::WorkflowIntegrate {
+                    id,
+                    workflow_id,
+                })
+                .await?,
+        )),
+        RpcCommand::WorkflowRemove { id, workflow_id } => Ok(Some(
+            workflows
+                .dispatch(crate::workflow_rpc::WorkflowRpcCommand::WorkflowRemove {
+                    id,
+                    workflow_id,
+                })
+                .await?,
+        )),
+        RpcCommand::WorkflowHubSend {
+            workflow_id,
+            generation,
+            recipient,
+            body,
+            reply_to,
             ..
+        } => {
+            let receipts =
+                app.workflow_hub_send(&workflow_id, generation, &recipient, &body, reply_to)?;
+            Ok(Some(workflow_hub_send_response_data(
+                workflow_id,
+                generation,
+                recipient,
+                receipts,
+            )))
+        }
+        RpcCommand::SnapCompact { .. } => {
+            Ok(Some(serde_json::to_value(app.compact_snap().await?)?))
+        }
+        RpcCommand::Rewind {
+            index, checkpoint, ..
         } => {
             let target = match (index, checkpoint) {
                 (Some(_), Some(_)) => {
@@ -3770,7 +7094,7 @@ async fn handle_command_inner(
             let handoff = if prose {
                 app.generate_handoff_with_prose().await?
             } else {
-                app.generate_handoff()
+                app.generate_handoff()?
             };
             Ok(Some(json!({"text": handoff.render(), "prose": prose})))
         }
@@ -3784,14 +7108,33 @@ async fn handle_command_inner(
                 "total": steering.len() + follow_up.len(),
             })))
         }
-        RpcCommand::QueueCancel { .. } => {
-            let (steering, follow_up) = app.drain_queued_messages().await;
-            Ok(Some(json!({"cancelled": steering.len() + follow_up.len()})))
+        RpcCommand::QueueCancel { scope, index, .. } => match (index, scope) {
+            (Some(index), _) => {
+                let cancelled = if app.remove_steering_at(index).await.is_some() {
+                    1
+                } else {
+                    0
+                };
+                Ok(Some(json!({"cancelled": cancelled, "index": index})))
+            }
+            (None, QueueCancelScope::Steering) => {
+                let drained = app.drain_steering_messages().await;
+                Ok(Some(json!({"cancelled": drained.len()})))
+            }
+            (None, QueueCancelScope::All) => {
+                let (steering, follow_up) = app.drain_queued_messages().await;
+                Ok(Some(json!({"cancelled": steering.len() + follow_up.len()})))
+            }
+        },
+        RpcCommand::QueueSendNow { .. } => {
+            let result = app.send_queued_steering_now().await?;
+            Ok(Some(serde_json::to_value(result)?))
         }
         RpcCommand::JobList { .. } => {
             let Some(runtime) = app.orchestration_runtime() else {
                 return Ok(Some(json!({
                     "enabled": false,
+                    "groupId": null,
                     "jobs": [],
                     "agents": [],
                     "messages": [],
@@ -3813,6 +7156,7 @@ async fn handle_command_inner(
                 .collect::<Vec<_>>();
             Ok(Some(json!({
                 "enabled": true,
+                "groupId": runtime.group_id(),
                 "jobs": jobs,
                 "agents": agents,
                 "messages": messages,
@@ -3857,16 +7201,258 @@ async fn handle_command_inner(
                 .ok_or_else(|| anyhow!("no orchestration job with id {job_id:?}"))?;
             Ok(Some(json!({"job": job})))
         }
-        RpcCommand::AgentHistory { agent_id, lines, .. } => {
+        RpcCommand::AgentHistory {
+            agent_id, lines, ..
+        } => {
             let runtime = app
                 .orchestration_runtime()
                 .ok_or_else(|| anyhow!("orchestration is not enabled in this session"))?;
             let lines = lines.unwrap_or(DEFAULT_RPC_HISTORY_LINES);
             if !(1..=pi_coding::MAX_HISTORY_LINES).contains(&lines) {
-                bail!("lines must be between 1 and {}", pi_coding::MAX_HISTORY_LINES);
+                bail!(
+                    "lines must be between 1 and {}",
+                    pi_coding::MAX_HISTORY_LINES
+                );
             }
             let text = runtime.read_child_history(&agent_id, lines)?;
             Ok(Some(json!({"agentId": agent_id, "text": text})))
+        }
+        RpcCommand::TodoChildCreate { request, .. } => Ok(Some(serde_json::to_value(
+            app.todo_child_create(request).await?,
+        )?)),
+        RpcCommand::TodoChildList {
+            parent_session_id, ..
+        } => Ok(Some(serde_json::to_value(
+            app.todo_child_list(Some(&parent_session_id)).await?,
+        )?)),
+        RpcCommand::TodoChildSelect {
+            parent_session_id,
+            child_session_id,
+            ..
+        } => {
+            app.todo_child_select(Some(&parent_session_id), &child_session_id)
+                .await?;
+            Ok(Some(json!({})))
+        }
+        RpcCommand::TodoChildSend {
+            parent_session_id,
+            child_session_id,
+            message,
+            ..
+        } => Ok(Some(serde_json::to_value(
+            app.todo_child_send(
+                Some(&parent_session_id),
+                child_session_id.as_deref(),
+                message,
+            )
+            .await?,
+        )?)),
+        RpcCommand::TodoChildStatus {
+            parent_session_id,
+            child_session_id,
+            ..
+        } => Ok(Some(serde_json::to_value(
+            app.todo_child_status(Some(&parent_session_id), child_session_id.as_deref())
+                .await?,
+        )?)),
+        RpcCommand::TodoChildStop {
+            parent_session_id,
+            child_session_id,
+            ..
+        } => Ok(Some(serde_json::to_value(
+            app.todo_child_stop(Some(&parent_session_id), child_session_id.as_deref())
+                .await?,
+        )?)),
+        RpcCommand::TodoChildPause {
+            parent_session_id,
+            child_session_id,
+            ..
+        } => Ok(Some(serde_json::to_value(
+            app.todo_child_pause(Some(&parent_session_id), child_session_id.as_deref())
+                .await?,
+        )?)),
+        RpcCommand::TodoChildResume {
+            parent_session_id,
+            child_session_id,
+            ..
+        } => Ok(Some(serde_json::to_value(
+            app.todo_child_resume(Some(&parent_session_id), child_session_id.as_deref())
+                .await?,
+        )?)),
+        RpcCommand::TodoChildCancel {
+            parent_session_id,
+            child_session_id,
+            ..
+        } => Ok(Some(serde_json::to_value(
+            app.todo_child_cancel(Some(&parent_session_id), child_session_id.as_deref())
+                .await?,
+        )?)),
+        RpcCommand::TodoChildArchive {
+            parent_session_id,
+            child_session_id,
+            ..
+        } => {
+            app.todo_child_archive(Some(&parent_session_id), &child_session_id)
+                .await?;
+            Ok(Some(json!({})))
+        }
+        RpcCommand::TodoChildRemove {
+            parent_session_id,
+            child_session_id,
+            ..
+        } => {
+            app.todo_child_remove(Some(&parent_session_id), &child_session_id)
+                .await?;
+            Ok(Some(json!({})))
+        }
+        RpcCommand::TodoChildAddTask {
+            parent_session_id,
+            child_session_id,
+            request,
+            ..
+        } => Ok(Some(serde_json::to_value(
+            app.todo_child_add_task(Some(&parent_session_id), &child_session_id, request)
+                .await?,
+        )?)),
+        RpcCommand::TodoChildDetail {
+            parent_session_id,
+            child_session_id,
+            ..
+        } => Ok(Some(serde_json::to_value(
+            app.todo_child_detail(&parent_session_id, &child_session_id)
+                .await?,
+        )?)),
+        RpcCommand::TodoChildHubSend {
+            parent_session_id,
+            child_session_id,
+            to,
+            body,
+            reply_to,
+            ..
+        } => Ok(Some(serde_json::to_value(
+            app.todo_child_hub_send(&parent_session_id, &child_session_id, &to, &body, reply_to)
+                .await?,
+        )?)),
+        RpcCommand::ChatMappingGet { .. } => {
+            Ok(Some(crate::chat_sync::handle_get(&pi_coding::agent_dir_path())?))
+        }
+        RpcCommand::ChatMappingPut { document, base_revision, .. } => {
+            let wire = crate::chat_sync::ChatMappingPutWire {
+                document: document.clone(),
+                base_revision,
+            };
+            Ok(Some(crate::chat_sync::handle_put(&pi_coding::agent_dir_path(), &wire)?))
+        }
+        RpcCommand::TeamList { .. } => {
+            let registry = crate::team::TeamRegistry::open(&pi_coding::agent_dir_path())?;
+            Ok(Some(json!({ "teams": registry.list() })))
+        }
+        RpcCommand::TeamCreate {
+            name,
+            project_label,
+            project_cwd,
+            ..
+        } => {
+            let registry = crate::team::TeamRegistry::open(&pi_coding::agent_dir_path())?;
+            let team = registry.create_team(
+                &name,
+                project_label.as_deref().unwrap_or(&name),
+                project_cwd.as_deref().unwrap_or(""),
+            )?;
+            Ok(Some(json!({ "team": team })))
+        }
+        RpcCommand::TeamRemove { team_id, .. } => {
+            let registry = crate::team::TeamRegistry::open(&pi_coding::agent_dir_path())?;
+            registry.remove_team(&team_id)?;
+            Ok(Some(json!({ "removed": true })))
+        }
+        RpcCommand::TeamJoin {
+            team_id,
+            origin,
+            token,
+            label,
+            role,
+            ..
+        } => {
+            let registry = crate::team::TeamRegistry::open(&pi_coding::agent_dir_path())?;
+            let member = registry.join(
+                &team_id,
+                &origin,
+                &token,
+                label.as_deref().unwrap_or("runner"),
+                role.as_deref(),
+            )?;
+            Ok(Some(json!({ "member": member })))
+        }
+        RpcCommand::TeamLeave {
+            team_id, runner_id, ..
+        } => {
+            let registry = crate::team::TeamRegistry::open(&pi_coding::agent_dir_path())?;
+            registry.leave(&team_id, &runner_id)?;
+            Ok(Some(json!({ "left": true })))
+        }
+        RpcCommand::TeamStatus { team_id, .. } => {
+            let registry = crate::team::TeamRegistry::open(&pi_coding::agent_dir_path())?;
+            let team = registry.team(&team_id)?;
+            let mut members = Vec::new();
+            for (member, probe) in crate::team::team_status(&registry, &team).await {
+                let row = match probe {
+                    Ok(state) => json!({
+                        "member": member,
+                        "online": true,
+                        "sessionId": state.session_id,
+                        "cwd": state.cwd,
+                        "sessionCount": state.session_count,
+                    }),
+                    Err(error) => json!({
+                        "member": member,
+                        "online": false,
+                        "error": format!("{error:#}"),
+                    }),
+                };
+                members.push(row);
+            }
+            Ok(Some(json!({ "members": members })))
+        }
+        RpcCommand::TeamRun {
+            team_id,
+            runner_id,
+            command,
+            ..
+        } => {
+            let registry = crate::team::TeamRegistry::open(&pi_coding::agent_dir_path())?;
+            let (member, token) = registry.member_with_token(&team_id, &runner_id)?;
+            let command_id = format!("team-{}", uuid::Uuid::now_v7());
+            let data =
+                crate::team::run_runner_command(&member.origin, &token, &command, &command_id)
+                    .await?;
+            Ok(Some(json!({ "data": data })))
+        }
+        RpcCommand::TeamBroadcast {
+            team_id, command, ..
+        } => {
+            let registry = crate::team::TeamRegistry::open(&pi_coding::agent_dir_path())?;
+            let team = registry.team(&team_id)?;
+            let mut results = Vec::new();
+            for member in &team.members {
+                let token = registry.runner_token(&team_id, &member.runner_id)?;
+                let command_id = format!("team-{}", uuid::Uuid::now_v7());
+                let row = match crate::team::run_runner_command(
+                    &member.origin,
+                    &token,
+                    &command,
+                    &command_id,
+                )
+                .await
+                {
+                    Ok(data) => json!({ "runnerId": member.runner_id, "ok": true, "data": data }),
+                    Err(error) => {
+                        json!({ "runnerId": member.runner_id, "ok": false, "error": format!("{error:#}") })
+                    }
+                };
+                results.push(row);
+            }
+            Ok(Some(json!({ "results": results })))
         }
         // Side-chat commands never reach the settings/workflows handler:
         // RpcDispatcher::dispatch_inner routes them to
@@ -3875,27 +7461,69 @@ async fn handle_command_inner(
         | RpcCommand::SideChatSwitch { .. }
         | RpcCommand::SideChatClose { .. }
         | RpcCommand::SideChatPrompt { .. }
-        | RpcCommand::SideChatList { .. } => {
+        | RpcCommand::SideChatList { .. }
+        | RpcCommand::SideChatAbort { .. } => {
             unreachable!("side_chat_* commands must be routed by dispatch_inner")
         }
         // Code-review commands are RPC-session controller state and are
         // routed by dispatch_inner to handle_code_review_command; the
         // settings/workflows handler never sees them.
         RpcCommand::CodeReviewOpen { .. }
+        | RpcCommand::CodeReviewCommits { .. }
         | RpcCommand::CodeReviewSnapshot { .. }
         | RpcCommand::CodeReviewRefresh { .. }
         | RpcCommand::CodeReviewComment { .. }
+        | RpcCommand::CodeReviewSetModel { .. }
+        | RpcCommand::CodeReviewAutoReview { .. }
+        | RpcCommand::CodeReviewHighlight { .. }
+        | RpcCommand::CodeReviewTldr { .. }
+        | RpcCommand::CodeReviewStop { .. }
         | RpcCommand::CodeReviewAbort { .. }
         | RpcCommand::CodeReviewClose { .. }
-        | RpcCommand::CodeReviewFileDiff { .. } => {
+        | RpcCommand::CodeReviewFileDiff { .. }
+        | RpcCommand::CodeReviewFileContext { .. } => {
             unreachable!("code_review_* commands must be routed by dispatch_inner")
         }
-        // The listen transport intercepts collaboration lifecycle commands;
-        // stdio RPC has no room registry or reachable listener origin.
+        RpcCommand::FileExplorerList { .. }
+        | RpcCommand::FileExplorerRead { .. }
+        | RpcCommand::FileExplorerChanges { .. }
+        | RpcCommand::FileExplorerDiff { .. }
+        | RpcCommand::FileExplorerBlame { .. }
+        | RpcCommand::FileExplorerDelete { .. }
+        | RpcCommand::FileExplorerMap { .. }
+        | RpcCommand::PathComplete { .. } => {
+            unreachable!("file_explorer commands must be routed by dispatch_inner")
+        }
+        RpcCommand::FileConversationOpen { .. }
+        | RpcCommand::FileConversationPrompt { .. }
+        | RpcCommand::FileConversationSnapshot { .. }
+        | RpcCommand::FileConversationAbort { .. }
+        | RpcCommand::FileConversationClose { .. } => {
+            bail!("file_conversation commands must be routed by dispatch_inner")
+        }
+        RpcCommand::TmuxListSessions { .. }
+        | RpcCommand::TmuxPaneSnapshot { .. }
+        | RpcCommand::TmuxSendKeys { .. }
+        | RpcCommand::TmuxSessionCreate { .. }
+        | RpcCommand::TmuxSessionDelete { .. }
+        | RpcCommand::TmuxTerminalAttach { .. }
+        | RpcCommand::TmuxTerminalInput { .. }
+        | RpcCommand::TmuxTerminalResize { .. }
+        | RpcCommand::TmuxTerminalDetach { .. } => {
+            unreachable!("tmux commands must be routed by dispatch_inner")
+        }
+        RpcCommand::FileExplorerStageDownload { .. } => {
+            bail!("file downloads require the listen control plane")
+        }
+        // The listen transport intercepts collaboration lifecycle commands
+        // and LAN discovery; stdio RPC has no room registry or mDNS view.
         RpcCommand::CollabStart { .. }
         | RpcCommand::CollabStatus { .. }
         | RpcCommand::CollabStop { .. } => {
             bail!("collaboration room commands require the listen control plane")
+        }
+        RpcCommand::GetDiscoveredRunners { .. } => {
+            bail!("get_discovered_runners requires the listen control plane")
         }
         // Codex Live realtime proxy commands. The browser owns WebRTC and the
         // `oai-events` data channel; these only relay signaling/session HTTP
@@ -3903,16 +7531,26 @@ async fn handle_command_inner(
         // the frontend).
         RpcCommand::RealtimeCreateCall { sdp_offer, .. } => {
             let live = app.runtime_settings().live.clone();
-            Ok(Some(realtime_create_call(&live, &sdp_offer).await?))
+            let executor = app.http_executor(pi_coding::HostHttpClass::RealtimeApi);
+            Ok(Some(
+                realtime_create_call_with_executor(&live, &sdp_offer, executor).await?,
+            ))
         }
         RpcCommand::RealtimeStop { .. } => Ok(Some(json!({"stopped": true}))),
         // STT voice proxy (hold-to-talk): the browser sends ONLY the bounded
         // recording; the endpoint URL and bearer key stay in the server-held
         // live settings (never accepted from the client, never exposed to the
         // frontend).
-        RpcCommand::SttTranscribe { audio_base64, mime_type, .. } => {
+        RpcCommand::SttTranscribe {
+            audio_base64,
+            mime_type,
+            ..
+        } => {
             let live = app.runtime_settings().live.clone();
-            Ok(Some(stt_transcribe(&live, &audio_base64, &mime_type).await?))
+            let executor = app.http_executor(pi_coding::HostHttpClass::LiveStt);
+            Ok(Some(
+                stt_transcribe_with_executor(&live, &audio_base64, &mime_type, executor).await?,
+            ))
         }
         // The Web control plane's session runtime manager intercepts
         // close_session before any dispatcher sees it; stdio RPC has one
@@ -3991,14 +7629,10 @@ fn validate_realtime_proxy(settings: &pi_coding::LiveRuntimeSettings) -> Result<
     // Userinfo and query/fragment are never accepted: they can carry secrets,
     // and a query would swallow the appended API path.
     if !parsed.username().is_empty() || parsed.password().is_some() {
-        bail!(
-            "`Settings.live.realtimeBaseUrl` must not contain a username or password"
-        );
+        bail!("`Settings.live.realtimeBaseUrl` must not contain a username or password");
     }
     if parsed.query().is_some() || parsed.fragment().is_some() {
-        bail!(
-            "`Settings.live.realtimeBaseUrl` must not contain a query or fragment"
-        );
+        bail!("`Settings.live.realtimeBaseUrl` must not contain a query or fragment");
     }
     match parsed.scheme() {
         "https" => Ok(()),
@@ -4010,34 +7644,6 @@ fn validate_realtime_proxy(settings: &pi_coding::LiveRuntimeSettings) -> Result<
             "Unsupported `Settings.live.realtimeBaseUrl` scheme `{other}://` — use https:// (or http:// with `Settings.live.allowInsecure = true`)"
         ),
     }
-}
-
-/// Builds the CLIProxyAPI realtime session payload — the `session` object sent
-/// in the create-call POST. Codex realtime rejects `session.model` with 400
-/// (`Field session.model is not allowed for this Codex realtime session`), so
-/// the create-call session is the Quicksilver shape WITHOUT `model`:
-/// `{ type, audio: { input: { format: { type, rate } }, output: { voice } } }`.
-/// This is NOT the same object the web side sends as `session.update`: the
-/// data-channel shape (web `buildRealtimeSessionConfig`) additionally carries
-/// the configured `realtimeModel`, which is accepted there. `voice` keeps its
-/// correct nesting under `audio.output.voice` and is passed through unchanged
-/// (custom aliases are not hard-rejected here; the upstream surfaces any
-/// mismatch as a diagnostic error).
-fn realtime_session_payload(settings: &pi_coding::LiveRuntimeSettings) -> Value {
-    json!({
-        "type": "quicksilver",
-        "audio": {
-            "input": {
-                "format": {
-                    "type": "audio/pcm",
-                    "rate": 24000,
-                },
-            },
-            "output": {
-                "voice": settings.voice,
-            },
-        },
-    })
 }
 
 /// Parses a realtime call id from the last path segment of a `Location`
@@ -4112,56 +7718,24 @@ fn redact_realtime_diagnostics(
 /// oversized `Content-Length` before reading anything and bailing as soon as
 /// the cap is exceeded mid-stream. Read errors use fixed context — the
 /// upstream may echo credentials, so no raw body ever lands in them.
-async fn read_bounded_response_body(response: &mut reqwest::Response) -> Result<Vec<u8>> {
-    if let Some(len) = response.content_length() {
-        if len > REALTIME_BODY_LIMIT as u64 {
-            bail!(
-                "realtime_create_call: upstream response body exceeds the {} KiB bound",
-                REALTIME_BODY_LIMIT / 1024
-            );
-        }
-    }
-    let mut buf = Vec::new();
-    loop {
-        let chunk = response
-            .chunk()
-            .await
-            .context("realtime_create_call: reading upstream response body failed")?;
-        let Some(chunk) = chunk else {
-            break;
-        };
-        // checked_add keeps the bound arithmetic overflow-safe even in
-        // theory (the cap is far below usize::MAX in practice).
-        let total = buf
-            .len()
-            .checked_add(chunk.len())
-            .context("realtime_create_call: upstream response body length overflow")?;
-        if total > REALTIME_BODY_LIMIT {
-            bail!(
-                "realtime_create_call: upstream response body exceeds the {} KiB bound",
-                REALTIME_BODY_LIMIT / 1024
-            );
-        }
-        buf.extend_from_slice(&chunk);
-    }
-    Ok(buf)
-}
 
-/// Proxies `POST {realtimeBaseUrl}/v1/realtime/calls` as a JSON POST whose
-/// body is exactly `{ "sdp": <offer>, "session": <create-call session> }`
-/// with `Content-Type: application/json`. The create-call session is the
-/// Quicksilver shape WITHOUT `model` — Codex realtime rejects `session.model`
-/// with 400 — so the configured model is NOT sent here; it rides the web
-/// `session.update` frame over the `oai-events` data channel instead (where
-/// the model field IS accepted). Returns the bare SDP answer and call id as
-/// `{"sdp": ..., "callId": ...}` for the browser's
-/// `RTCPeerConnection` and `oai-events` data channel. Transport, status, and
-/// body errors use a fixed endpoint name and redact credential-like content;
-/// the configured base/URL and API key never surface, and both the SDP offer
-/// and the upstream answer are bounded to `REALTIME_BODY_LIMIT`.
-async fn realtime_create_call(
+
+/// Proxies `POST {realtimeBaseUrl}/v1/realtime/calls` as a JSON POST carrying
+/// the SDP offer and frameless session configuration. The create-call
+/// session carries empty instructions, the configured output voice, and
+/// client delegation. It omits `model` so the proxy can inject its
+/// authoritative upstream model. Returns the bare SDP answer and call id as
+/// `{"sdp": ..., "callId": ...}` for the browser's `RTCPeerConnection` and
+/// `oai-events` data channel. Transport, status, and body errors use a fixed
+/// endpoint name and redact credential-like content; the configured base/URL
+/// and API key never surface, and both the SDP offer and the upstream answer
+/// are bounded to `REALTIME_BODY_LIMIT`.
+/// `audio.input` is intentionally absent: AVAS rejects it as an unknown
+/// create-call session parameter.
+async fn realtime_create_call_with_executor(
     settings: &pi_coding::LiveRuntimeSettings,
     sdp_offer: &str,
+    executor: pi_ai::SharedHttpExecutor,
 ) -> Result<Value> {
     validate_realtime_proxy(settings)?;
     // The offer is bounded (and non-empty) so an oversized browser cannot
@@ -4176,45 +7750,60 @@ async fn realtime_create_call(
         );
     }
     let url = realtime_endpoint(&settings.realtime_base_url, "/realtime/calls");
-    let client = reqwest::Client::builder()
-        .timeout(REALTIME_PROXY_TIMEOUT)
-        .build()
-        .context("building realtime proxy client")?;
-    // Exact wire body: `{sdp, session}` and nothing else. The session object
-    // carries only the quicksilver create-call fields (type + audio, voice
-    // nested under audio.output) — never `model`, which Codex rejects; the
-    // configured model is sent via the data-channel session.update instead.
-    let body = json!({
+    let body = serde_json::to_vec(&json!({
         "sdp": sdp_offer,
-        "session": realtime_session_payload(settings),
-    });
-    let mut response = match client
-        .post(&url)
-        .bearer_auth(settings.realtime_api_key.trim())
-        .header("OpenAI-Alpha", "quicksilver=v2")
-        .json(&body)
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(err) => {
-            // Fixed endpoint name; reqwest embeds the request URL in its own
-            // error text, so the full chain is redacted before surfacing.
-            let detail = redact_realtime_diagnostics(settings, &url, &format!("{err}"));
-            bail!("realtime_create_call: POST to the realtime create-call endpoint failed: {detail}");
-        }
-    };
+        "session": {
+            "instructions": "",
+            "audio": { "output": { "voice": settings.voice } },
+            "delegation": { "type": "client" },
+        },
+    }))?;
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::AUTHORIZATION,
+        http::HeaderValue::from_str(&format!("Bearer {}", settings.realtime_api_key.trim()))?,
+    );
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    headers.insert(
+        http::header::ACCEPT,
+        http::HeaderValue::from_static("application/sdp"),
+    );
+    headers.insert(
+        http::HeaderName::from_static("openai-alpha"),
+        http::HeaderValue::from_static("quicksilver=v2"),
+    );
+    let request = pi_ai::request_from_url(
+        pi_ai::HttpMethod::Post,
+        &url,
+        &headers,
+        body,
+        &pi_ai::StreamOptions {
+            timeout_ms: Some(REALTIME_PROXY_TIMEOUT.as_millis() as u64),
+            ..Default::default()
+        },
+        REALTIME_BODY_LIMIT as u64,
+    )?;
+    let response = executor.execute(request).await.map_err(|_| {
+        anyhow!("realtime_create_call: POST to the realtime create-call endpoint failed")
+    })?;
     // Capture the Location header before consuming the body — the call id
     // lives there, not in the (bare SDP) response body.
-    let location = response.headers().get(reqwest::header::LOCATION).cloned();
+    let location = response.headers().get(http::header::LOCATION).cloned();
     let status = response.status();
-    let response_body = read_bounded_response_body(&mut response).await?;
+    let response_body = pi_ai::collect_response_body(response)
+        .await
+        .with_context(|| {
+            format!(
+                "realtime_create_call: upstream response exceeds the {} KiB bound",
+                REALTIME_BODY_LIMIT / 1024
+            )
+        })?;
     if !status.is_success() {
-        let detail = redact_realtime_diagnostics(
-            settings,
-            &url,
-            &String::from_utf8_lossy(&response_body),
-        );
+        let detail =
+            redact_realtime_diagnostics(settings, &url, &String::from_utf8_lossy(&response_body));
         bail!(
             "realtime_create_call: the realtime create-call endpoint returned {status}: {detail}"
         );
@@ -4260,10 +7849,11 @@ const STT_ALLOWED_MIME_TYPES: [&str; 1] = ["audio/wav"];
 /// realtime) is a UI concern; this RPC is an explicit STT request, so it
 /// validates as `stt` and lets `SttClient` enforce the security-relevant
 /// checks (enabled, base URL, key, scheme).
-async fn stt_transcribe(
+async fn stt_transcribe_with_executor(
     settings: &pi_coding::LiveRuntimeSettings,
     audio_base64: &str,
     mime_type: &str,
+    executor: pi_ai::SharedHttpExecutor,
 ) -> Result<Value> {
     let mime = mime_type.trim();
     if !STT_ALLOWED_MIME_TYPES
@@ -4296,11 +7886,166 @@ async fn stt_transcribe(
         );
     }
     let capture = pi_coding::live::parse_wav_capture(&wav)?;
-    let stt = pi_coding::live::SttClient::new().context("stt_transcribe: building STT client")?;
     let mut validated = settings.clone();
     validated.mode = "stt".to_owned();
+    let stt = pi_coding::live::SttClient::new_with_executor(executor);
     let text = stt.transcribe(&validated, &capture).await?;
     Ok(json!({ "text": text }))
+}
+
+pub(crate) fn user_message_text(message: &Message) -> Option<String> {
+    let Message::User(user) = message else {
+        return None;
+    };
+    let text: String = user
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    (!text.trim().is_empty()).then_some(text)
+}
+
+pub(crate) fn fork_messages_from_tree(
+    tree: &pi_coding::SessionTree,
+    cursor: Option<&str>,
+    limit: Option<usize>,
+) -> Result<pi_coding::ForkMessagePage> {
+    tree.fork_messages_page(cursor, limit)
+}
+
+pub(crate) fn last_nonempty_user_entry_id(tree: &pi_coding::SessionTree) -> Result<String> {
+    tree.branch(tree.active_leaf_id.as_deref())
+        .into_iter()
+        .rev()
+        .find_map(|entry| user_message_text(entry.message.as_ref()?).map(|_| entry.id.clone()))
+        .ok_or_else(|| anyhow!("session has no user message to fork from"))
+}
+
+fn stdio_prepare_saved_session(
+    app: &Application,
+    session_path: &str,
+) -> Result<pi_coding::PreparedSessionResume> {
+    let catalog = pi_coding::SessionCatalog::from_env()?
+        .with_native_session_root(app.session().session_dir());
+    catalog
+        .prepare_native_resume(session_path)
+        .map_err(anyhow::Error::new)
+}
+
+fn stdio_is_current_session(
+    app: &Application,
+    prepared: &pi_coding::PreparedSessionResume,
+) -> bool {
+    if app.session().session_file_identity() == Some(prepared.identity()) {
+        return true;
+    }
+    matches!(
+        app.session().recorder_info(),
+        Some((id, _)) if id == prepared.tree().header.id
+    )
+}
+
+fn stdio_target_session_dir(
+    app: &Application,
+    session_storage: Option<&crate::session_run::SessionStorage>,
+    recorded_cwd: &Path,
+) -> Result<PathBuf> {
+    if let Some(storage) = session_storage {
+        let session = app.session();
+        let cwd = if recorded_cwd.as_os_str().is_empty() {
+            session.cwd()
+        } else {
+            recorded_cwd
+        };
+        storage.session_dir_for(cwd)
+    } else {
+        Ok(app.session().session_dir())
+    }
+}
+
+fn stdio_branch_saved_session(
+    app: &Application,
+    session_storage: Option<&crate::session_run::SessionStorage>,
+    session_path: &str,
+    entry_id: Option<&str>,
+) -> Result<Value> {
+    let prepared = stdio_prepare_saved_session(app, session_path)?;
+    if stdio_is_current_session(app, &prepared) {
+        bail!(
+            "cannot fork or clone the current session by path; omit sessionPath or switch away first"
+        );
+    }
+    let leaf_id = match entry_id {
+        Some("__latest__") => last_nonempty_user_entry_id(prepared.tree())?,
+        Some(entry_id) => {
+            let selected = prepared
+                .tree()
+                .entries
+                .iter()
+                .find(|entry| entry.id == entry_id)
+                .ok_or_else(|| anyhow!("Invalid entry ID for forking"))?;
+            if selected
+                .message
+                .as_ref()
+                .and_then(user_message_text)
+                .is_none()
+            {
+                bail!("Invalid entry ID for forking");
+            }
+            entry_id.to_owned()
+        }
+        None => prepared
+            .tree()
+            .active_leaf_id
+            .clone()
+            .ok_or_else(|| anyhow!("cannot clone session: no current entry selected"))?,
+    };
+    let session_dir = stdio_target_session_dir(app, session_storage, prepared.target_cwd())?;
+    let source_path = prepared.path().to_path_buf();
+    let recorder = if entry_id.is_some() {
+        pi_coding::fork_prepared_session_at_user(prepared, &leaf_id, Some(&session_dir))?
+    } else {
+        pi_coding::create_branched_session_from_prepared(prepared, &leaf_id, Some(&session_dir))?
+    };
+    recorder.persist_now()?;
+    Ok(json!({
+        "sessionId": recorder.id(),
+        "path": recorder.path().to_string_lossy(),
+        "parentSession": source_path.to_string_lossy(),
+        "cancelled": false,
+    }))
+}
+
+fn stdio_rename_saved_session(app: &Application, session_path: &str, name: &str) -> Result<()> {
+    let prepared = stdio_prepare_saved_session(app, session_path)?;
+    if stdio_is_current_session(app, &prepared) {
+        app.set_session_name(name)?;
+        return Ok(());
+    }
+    let path = prepared.path().to_path_buf();
+    drop(prepared);
+    let recorder = pi_coding::resume_session(&path)?;
+    recorder.record_session_name(name)?;
+    recorder.close()?;
+    Ok(())
+}
+
+fn stdio_delete_saved_session(app: &Application, session_path: &str) -> Result<Value> {
+    let prepared = stdio_prepare_saved_session(app, session_path)?;
+    if stdio_is_current_session(app, &prepared) {
+        bail!("cannot delete the current session; switch away/close first");
+    }
+    let path = prepared.path().to_path_buf();
+    drop(prepared);
+    let outcome = pi_coding::archive_saved_session(&path)?;
+    Ok(json!({
+        "deleted": true,
+        "sessionId": outcome.session_id(),
+        "path": outcome.original_path().to_string_lossy(),
+    }))
 }
 
 pub(crate) fn public_message(message: Message) -> Message {
@@ -4317,6 +8062,18 @@ pub(crate) fn public_message(message: Message) -> Message {
         details: custom.details.clone(),
         timestamp: custom.timestamp,
     })
+}
+
+pub(crate) fn public_transcript_rows(rows: Vec<TranscriptRow>) -> Vec<Value> {
+    rows.into_iter()
+        .map(|row| {
+            let message = public_message(row.message);
+            match row.id {
+                Some(id) => json!({ "id": id, "message": message }),
+                None => json!({ "message": message }),
+            }
+        })
+        .collect()
 }
 
 fn public_model(mut model: Model) -> Model {
@@ -4345,7 +8102,7 @@ fn queued_message_texts(messages: Vec<Message>) -> Vec<String> {
         })
         .collect()
 }
-async fn available_models() -> Result<Vec<Model>> {
+pub(crate) async fn available_models() -> Result<Vec<Model>> {
     crate::models_config::load_custom_models()?;
     let mut providers = pi_ai::get_providers();
     providers.sort();
@@ -4356,7 +8113,7 @@ async fn available_models() -> Result<Vec<Model>> {
         models.extend(
             available
                 .into_iter()
-                .filter(crate::models_config::has_configured_auth),
+                .filter(crate::models_config::is_public_model),
         )
     }
     models.dedup_by(|a, b| a.provider == b.provider && a.id == b.id);
@@ -4421,7 +8178,252 @@ fn available_thinking_levels(model: &Model) -> Vec<ThinkingLevel> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_util::FutureExt as _;
+    #[test]
+    fn prompt_busy_error_attaches_session_processing_code() {
+        let mut response = RpcResponse::failure(None, "prompt", SessionAlreadyProcessing.to_string());
+        attach_handle_command_error_code(&anyhow!(SessionAlreadyProcessing), &mut response);
+        assert_eq!(response.data, Some(json!({"code": "session_processing"})));
+        assert_eq!(
+            response.error.as_deref(),
+            Some("session is already processing; choose steer or followUp")
+        );
+        let mut other = RpcResponse::failure(None, "prompt", "other");
+        attach_handle_command_error_code(&anyhow!("busy with no typed code"), &mut other);
+        assert_eq!(other.data, None);
+    }
+
+    #[test]
+    fn side_chat_entry_wire_carries_tool_and_thinking_fields() {
+        use crate::side_chat::{SideChatEntry, SideChatEntryKind, SideChatRole};
+        let tool = SideChatEntry {
+            id: "sc-1".into(),
+            kind: SideChatEntryKind::Tool,
+            role: SideChatRole::Tool,
+            text: "[bash] ok".into(),
+            tool_name: Some("bash".into()),
+            tool_args: Some(json!({"command": "ls"})),
+            output: Some("ok".into()),
+            thinking: None,
+            is_error: false,
+            is_partial: false,
+        };
+        let tool_wire = tool.to_wire_json();
+        assert_eq!(tool_wire["id"], "sc-1");
+        assert_eq!(tool_wire["kind"], "tool");
+        assert_eq!(tool_wire["toolName"], "bash");
+        assert_eq!(tool_wire["toolArgs"]["command"], "ls");
+        assert_eq!(tool_wire["output"], "ok");
+        assert_eq!(tool_wire["isError"], false);
+        assert_eq!(tool_wire["isPartial"], false);
+
+        let thinking = SideChatEntry {
+            id: "sc-2".into(),
+            kind: SideChatEntryKind::Thinking,
+            role: SideChatRole::Assistant,
+            text: "plan".into(),
+            tool_name: None,
+            tool_args: None,
+            output: None,
+            thinking: Some("plan".into()),
+            is_error: false,
+            is_partial: true,
+        };
+        let thinking_wire = thinking.to_wire_json();
+        assert_eq!(thinking_wire["id"], "sc-2");
+        assert_eq!(thinking_wire["kind"], "thinking");
+        assert_eq!(thinking_wire["thinking"], "plan");
+        assert_eq!(thinking_wire["isPartial"], true);
+
+        let live = SideChatEntry {
+            id: "sc-3".into(),
+            kind: SideChatEntryKind::Assistant,
+            role: SideChatRole::Assistant,
+            text: "Hel".into(),
+            tool_name: None,
+            tool_args: None,
+            output: None,
+            thinking: None,
+            is_error: false,
+            is_partial: true,
+        };
+        let live_wire = live.to_wire_json();
+        assert_eq!(live_wire["id"], "sc-3");
+        assert_eq!(live_wire["kind"], "assistant");
+        assert_eq!(live_wire["text"], "Hel");
+        assert_eq!(live_wire["isPartial"], true);
+    }
+
+    #[test]
+    fn review_language_resolution_and_validation() {
+        assert_eq!(resolve_review_language(Some(" zh-CN "), Some("en")).unwrap(), "zh-CN".to_owned());
+        assert_eq!(resolve_review_language(None, Some("en")).unwrap(), "en".to_owned());
+        assert_eq!(resolve_review_language(None, None).unwrap(), "zh".to_owned());
+        for invalid in ["", "  ", "en\nUS", "中文", "abcdefghijklmnopqrstuvwxyz1234567"] {
+            let error = resolve_review_language(Some(invalid), Some("en")).unwrap_err();
+            assert_eq!(error.downcast_ref::<CodeReviewRpcError>(), Some(&CodeReviewRpcError::InvalidLanguage));
+        }
+    }
+
+    #[test]
+    fn code_review_stop_parses_typed_operation() {
+        fn parse_command(value: Value) -> RpcCommand {
+            match parse_input(&serde_json::to_vec(&value).unwrap()).expect("command") {
+                RpcInput::Command { command, .. } => command,
+                RpcInput::ExtensionUiResponse(_) => panic!("expected command"),
+            }
+        }
+        assert!(matches!(
+            parse_command(json!({"type":"code_review_stop","operation":"autoReview"})),
+            RpcCommand::CodeReviewStop { operation: ReviewStopOperation::AutoReview, .. }
+        ));
+        assert!(matches!(
+            parse_command(json!({"type":"code_review_stop","operation":"highlight"})),
+            RpcCommand::CodeReviewStop { operation: ReviewStopOperation::Highlight, .. }
+        ));
+        assert!(matches!(
+            parse_command(json!({"type":"code_review_stop","operation":"tldr"})),
+            RpcCommand::CodeReviewStop { operation: ReviewStopOperation::Tldr, .. }
+        ));
+        assert!(parse_input(&serde_json::to_vec(&json!({"type":"code_review_stop","operation":"abort"})).unwrap()).is_err());
+    }
+
+    /// Test-only wrapper that routes the realtime create-call through the
+    /// same injected-executor production path used by the RPC dispatcher.
+    async fn realtime_create_call(
+        settings: &pi_coding::LiveRuntimeSettings,
+        sdp_offer: &str,
+    ) -> Result<Value> {
+        realtime_create_call_with_executor(settings, sdp_offer, test_http_executor()).await
+    }
+
+    /// Test-only wrapper that routes STT transcription through the same
+    /// injected-executor production path used by the RPC dispatcher.
+    async fn stt_transcribe(
+        settings: &pi_coding::LiveRuntimeSettings,
+        audio_base64: &str,
+        mime_type: &str,
+    ) -> Result<Value> {
+        stt_transcribe_with_executor(settings, audio_base64, mime_type, test_http_executor()).await
+    }
+
+    #[derive(Clone, Copy)]
+    struct TestHttpExecutor;
+
+    impl pi_ai::HttpExecutor for TestHttpExecutor {
+        fn execute<'a>(
+            &'a self,
+            request: pi_ai::HttpRequest,
+        ) -> futures_util::future::BoxFuture<'a, anyhow::Result<pi_ai::HttpResponse>> {
+            async move {
+                let parts = request.into_parts();
+                let scheme = match parts.authority.scheme() {
+                    pi_ai::ResolvedHttpScheme::Http => "http",
+                    pi_ai::ResolvedHttpScheme::Https => "https",
+                };
+                let host = match parts.authority.host() {
+                    pi_ai::ResolvedHttpHost::Dns(name) => name.clone(),
+                    pi_ai::ResolvedHttpHost::Ip(address) => address.to_string(),
+                };
+                let url = format!(
+                    "{scheme}://{host}:{}{}",
+                    parts.authority.port(),
+                    parts.path_and_query
+                );
+                let method = match parts.method {
+                    pi_ai::HttpMethod::Get => reqwest::Method::GET,
+                    pi_ai::HttpMethod::Post => reqwest::Method::POST,
+                    pi_ai::HttpMethod::Put => reqwest::Method::PUT,
+                    pi_ai::HttpMethod::Patch => reqwest::Method::PATCH,
+                    pi_ai::HttpMethod::Delete => reqwest::Method::DELETE,
+                };
+                let client = reqwest::Client::builder()
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()?;
+                let headers = parts.headers.into_iter().collect::<http::HeaderMap>();
+                let response = client
+                    .request(method, url)
+                    .headers(headers)
+                    .body(parts.body)
+                    .send()
+                    .await?;
+                let status = response.status();
+                let headers = response.headers().clone();
+                let body = response
+                    .bytes_stream()
+                    .map(|chunk| chunk.map(|bytes| bytes.to_vec()).map_err(Into::into));
+                Ok(pi_ai::HttpResponse::new(status, headers, Box::pin(body)))
+            }
+            .boxed()
+        }
+    }
+
+    fn test_http_executor() -> pi_ai::SharedHttpExecutor {
+        std::sync::Arc::new(TestHttpExecutor)
+    }
+
+    fn disabled_session(options: pi_coding::SessionOptions) -> Result<pi_coding::Session> {
+        pi_coding::Session::new_with_additional_tools_filtered_and_discovery(
+            options,
+            Vec::new(),
+            pi_coding::ToolSelection::default(),
+            pi_coding::ResourceDiscovery::Disabled,
+        )
+    }
+
+    fn faux_model() -> Model {
+        pi_ai::providers::register_default_faux();
+        pi_ai::get_model("faux", "faux-1").expect("registered faux model")
+    }
+
+    fn isolated_resources(cwd: &Path, agent_dir: &Path) -> pi_coding::ResourceManager {
+        std::fs::create_dir_all(agent_dir).expect("agent dir");
+        if !agent_dir.join("settings.json").exists() {
+            std::fs::write(
+                agent_dir.join("settings.json"),
+                r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+            )
+            .expect("isolated sandbox settings");
+        }
+        let mut options = pi_coding::ResourceManagerOptions::new(cwd);
+        options.agent_dir = agent_dir.to_path_buf();
+        options.project_trust_override = Some(true);
+        options.disable_extensions = true;
+        options.disable_skills = true;
+        options.disable_prompt_templates = true;
+        options.disable_themes = true;
+        options.disable_context_files = true;
+        pi_coding::ResourceManager::new(options).expect("resources")
+    }
+
+    async fn isolated_application(session: pi_coding::Session) -> Application {
+        let agent = tempfile::tempdir().expect("agent");
+        if let Some(compaction) = session.compaction_settings() {
+            std::fs::write(
+                agent.path().join("settings.json"),
+                format!(
+                    r#"{{"sandbox":{{"mode":"danger-full-access"}},"compaction":{{"enabled":{},"reserveTokens":{},"keepRecentTokens":{},"snapKeepTurns":{}}}}}"#,
+                    compaction.enabled,
+                    compaction.reserve_tokens,
+                    compaction.keep_recent_tokens,
+                    compaction.snap_keep_turns,
+                ),
+            )
+            .expect("isolated compaction settings");
+        }
+        if session.recorder_info().is_none() {
+            let session_dir = session.cwd().join(".pi-test-sessions");
+            std::fs::create_dir_all(&session_dir).expect("session dir");
+            session.set_session_dir(session_dir);
+        }
+        let resources = isolated_resources(session.cwd(), agent.path());
+        session
+            .attach_resources(resources)
+            .await
+            .expect("attach resources");
+        Application::new(session).await
+    }
+    use futures_util::{FutureExt as _, StreamExt as _};
     fn settings_state() -> crate::settings_rpc::SettingsRpcState {
         crate::settings_rpc::SettingsRpcState::default()
     }
@@ -4448,6 +8450,71 @@ mod tests {
         assert_eq!(projected["message"]["command"], "echo ok");
         assert_eq!(projected["message"]["output"], "ok");
         assert_eq!(projected["message"]["exitCode"], 0);
+    }
+
+    #[test]
+    fn queue_update_projects_web_event_shape() {
+        let projected = project_application_event(ApplicationEvent::Session(
+            pi_coding::SessionEvent::QueueUpdate {
+                steering: vec![pi_ai::Message::user_text("steer now", 1)],
+                follow_up: Vec::new(),
+            },
+        ))
+        .unwrap();
+        assert_eq!(projected["type"], "queue_update");
+        assert_eq!(projected["steering"][0]["role"], "user");
+        assert_eq!(projected["steering"][0]["content"][0]["text"], "steer now");
+        assert_eq!(projected["followUp"].as_array().map(Vec::len), Some(0));
+    }
+
+    #[test]
+    fn process_exited_projects_web_event_shape() {
+        let process = serde_json::from_value(json!({
+            "id": "proc-exit",
+            "ownerId": "owner",
+            "label": "sleep",
+            "state": "exited",
+            "tty": false,
+            "startedAtMs": 1,
+            "exitedAtMs": 2,
+            "exitCode": 0,
+            "outputStartCursor": 0,
+            "outputCursor": 0,
+        }))
+        .expect("process info");
+        let projected = project_application_event(ApplicationEvent::Process(
+            pi_coding::ProcessEvent::ProcessExited { process },
+        ))
+        .expect("project process exited");
+        assert_eq!(projected["type"], "process_exited");
+        assert_eq!(projected["process"]["id"], "proc-exit");
+        assert_eq!(projected["process"]["state"], "exited");
+    }
+
+    #[test]
+    fn outer_turn_lifecycle_projects_authoritative_events() {
+        let started = project_application_event(ApplicationEvent::TurnStarted {
+            turn_id: "turn-1".to_owned(),
+            model: Some(Model {
+                id: "initial".to_owned(),
+                provider: "fixture".to_owned(),
+                ..Model::default()
+            }),
+        })
+        .expect("project started");
+        assert_eq!(started["type"], "turn_started");
+        assert_eq!(started["turnId"], "turn-1");
+        assert_eq!(started["model"]["id"], "initial");
+
+        let terminal = project_application_event(ApplicationEvent::TurnTerminal {
+            turn_id: "turn-1".to_owned(),
+            status: pi_coding::TurnTerminalStatus::Succeeded,
+            message: None,
+        })
+        .expect("project terminal");
+        assert_eq!(terminal["type"], "turn_terminal");
+        assert_eq!(terminal["turnId"], "turn-1");
+        assert_eq!(terminal["status"], "succeeded");
     }
 
     fn workflows_state() -> crate::workflow_rpc::WorkflowRpcState {
@@ -4486,7 +8553,7 @@ mod tests {
             json!({"type":"steer","message":"x"}),
             json!({"type":"follow_up","message":"x"}),
             json!({"type":"abort"}),
-            json!({"type":"new_session","parentSession":"p"}),
+            json!({"type":"new_session","parentSession":"p","cwd":"<workspace>/project-a"}),
             json!({"type":"get_state"}),
             json!({"type":"set_model","provider":"p","modelId":"m"}),
             json!({"type":"cycle_model"}),
@@ -4505,6 +8572,7 @@ mod tests {
             json!({"type":"get_session_stats"}),
             json!({"type":"session_list"}),
             json!({"type":"export_html","outputPath":"o"}),
+            json!({"type":"export_html","sessionPath":"s"}),
             json!({"type":"switch_session","sessionPath":"s"}),
             json!({"type":"fork","entryId":"e"}),
             json!({"type":"clone"}),
@@ -4560,12 +8628,16 @@ mod tests {
             json!({"type":"workflow_cancel","workflowId":"wf-1"}),
             json!({"type":"workflow_integrate","workflowId":"wf-1"}),
             json!({"type":"workflow_remove","workflowId":"wf-1"}),
+            json!({"type":"workflow_hub_send","workflowId":"wf-1","generation":1,"recipient":"writer","body":"ping"}),
+            json!({"type":"workflow_hub_send","id":"whs-1","workflowId":"wf-1","generation":1,"recipient":"writer","body":"ping","replyTo":"msg-1"}),
             json!({"type":"side_chat_new","name":"research"}),
             json!({"type":"side_chat_switch","name":"research"}),
             json!({"type":"side_chat_close"}),
             json!({"type":"side_chat_close","name":"research"}),
             json!({"type":"side_chat_prompt","message":"summarize"}),
+            json!({"type":"side_chat_prompt","message":"summarize","images":[{"type":"image","data":"aW1n","mimeType":"image/png"}]}),
             json!({"type":"side_chat_list"}),
+            json!({"type":"side_chat_abort"}),
             json!({"type":"snapcompact"}),
             json!({"type":"rewind","index":4}),
             json!({"type":"rewind","checkpoint":"milestone"}),
@@ -4573,6 +8645,8 @@ mod tests {
             json!({"type":"handoff","prose":true}),
             json!({"type":"queue_list"}),
             json!({"type":"queue_cancel"}),
+            json!({"type":"queue_cancel","scope":"steering","index":0}),
+            json!({"type":"queue_send_now"}),
             json!({"type":"job_list"}),
             json!({"type":"task_spawn","args":{"task":"inspect source"}}),
             json!({"type":"task_spawn","args":{"context":"shared","tasks":[{"task":"one"}]}}),
@@ -4583,14 +8657,43 @@ mod tests {
             json!({"type":"agent_history","agentId":"writer","lines":80}),
             json!({"type":"code_review_open"}),
             json!({"type":"code_review_open","from":"HEAD","to":"feature"}),
+            json!({"type":"code_review_open","from":"HEAD","includeWorkingTree":true}),
+            json!({"type":"code_review_open","commit":"abc123"}),
+            json!({"type":"code_review_open","commit":"abc123","includeWorkingTree":false}),
+            json!({"type":"code_review_commits"}),
+            json!({"type":"code_review_commits","limit":5}),
             json!({"type":"code_review_snapshot"}),
             json!({"type":"code_review_refresh"}),
             json!({"type":"code_review_comment","snapshotId":"s1","path":"a.rs","oldStart":1,"oldCount":1,"newStart":1,"newCount":1,"contentHash":"h","comment":"looks good"}),
+            json!({"type":"code_review_comment","snapshotId":"s1","path":"a.rs","oldStart":1,"oldCount":1,"newStart":1,"newCount":1,"contentHash":"h","comment":"see this","images":[{"type":"image","data":"aW1n","mimeType":"image/png"}]}),
+            json!({"type":"code_review_set_model","modelId":"grok-4"}),
+            json!({"type":"code_review_auto_review"}),
+            json!({"type":"code_review_auto_review","modelId":"grok-4"}),
+            json!({"type":"code_review_highlight"}),
+            json!({"type":"code_review_tldr"}),
+            json!({"type":"code_review_tldr","id":"tldr-1","language":"en"}),
+            json!({"type":"code_review_stop","operation":"autoReview"}),
+            json!({"type":"code_review_stop","operation":"highlight"}),
+            json!({"type":"code_review_stop","operation":"tldr"}),
             json!({"type":"code_review_abort","snapshotId":"s1","path":"a.rs","oldStart":1,"oldCount":1,"newStart":1,"newCount":1,"contentHash":"h"}),
             json!({"type":"code_review_close"}),
             json!({"type":"code_review_file_diff","snapshotId":"s1","path":"a.rs"}),
             json!({"type":"code_review_file_diff","snapshotId":"s1","path":"a.rs","cursor":100,"maxLines":50}),
+            json!({"type":"code_review_file_context","snapshotId":"s1","path":"a.rs","oldStart":1,"newStart":1,"count":20}),
+            json!({"type":"file_explorer_list"}),
+            json!({"type":"file_explorer_list","path":"src"}),
+            json!({"type":"file_explorer_read","path":"src/lib.rs"}),
+            json!({"type":"file_explorer_read","path":"src/lib.rs","cursor":400,"maxLines":2000}),
+            json!({"type":"file_explorer_changes"}),
+            json!({"type":"file_explorer_diff","path":"src/lib.rs"}),
+            json!({"type":"file_explorer_blame","path":"src/lib.rs","startLine":10,"endLine":20}),
+            json!({"type":"file_explorer_stage_download","path":"src/lib.rs"}),
+            json!({"type":"file_explorer_map","id":"map-1","path":"src/lib.rs"}),
+            json!({"type":"path_complete","path":"src/","kind":"any"}),
+            json!({"type":"path_complete","path":"src/ma","kind":"directory","limit":20}),
             json!({"type":"skill","name":"research"}),
+            json!({"type":"run","name":"extension-only"}),
+            json!({"type":"run","name":"extension-only","args":"hello"}),
             json!({"type":"persona_list"}),
             json!({"type":"persona_get","name":"mentor"}),
             json!({"type":"persona_create","name":"guide","content":"---\nname: guide\ndescription: g\n---\nprompt"}),
@@ -4600,6 +8703,7 @@ mod tests {
             json!({"type":"persona_select","name":"mentor"}),
             json!({"type":"persona_clear"}),
             json!({"type":"persona_current"}),
+            json!({"type":"get_discovered_runners"}),
         ];
         for f in fixtures {
             assert!(
@@ -4610,6 +8714,497 @@ mod tests {
                 "{f}"
             );
         }
+    }
+
+    #[test]
+    fn path_complete_rejects_missing_kind_on_wire() {
+        // Wire contract: `kind` is required (`"directory"|"file"|"any"`);
+        // it is never defaulted for the client.
+        let missing_kind = json!({"type":"path_complete","path":"src/"});
+        assert!(
+            parse_input(&serde_json::to_vec(&missing_kind).unwrap()).is_err(),
+            "path_complete without kind must fail closed"
+        );
+    }
+
+    #[test]
+    fn file_explorer_blame_requires_exact_path_and_range() {
+        let parsed = parse_input(&serde_json::to_vec(&json!({
+            "type": "file_explorer_blame",
+            "id": "blame-1",
+            "path": "src/lib.rs",
+            "startLine": 10,
+            "endLine": 20,
+            "sessionId": "owner-session"
+        })).unwrap())
+        .expect("file_explorer_blame");
+        let RpcInput::Command { command, session_id } = parsed else {
+            panic!("expected a command");
+        };
+        assert_eq!(session_id.as_deref(), Some("owner-session"));
+        assert_eq!(command.command_name(), "file_explorer_blame");
+        assert_eq!(command.id().as_deref(), Some("blame-1"));
+        assert!(!command.runs_inline());
+        assert!(matches!(
+            command,
+            RpcCommand::FileExplorerBlame {
+                path,
+                start_line: 10,
+                end_line: 20,
+                ..
+            } if path == "src/lib.rs"
+        ));
+        for fixture in [
+            json!({"type":"file_explorer_blame","path":"src/lib.rs","endLine":20}),
+            json!({"type":"file_explorer_blame","path":"src/lib.rs","startLine":10}),
+            json!({"type":"file_explorer_blame","startLine":10,"endLine":20}),
+        ] {
+            assert!(
+                parse_input(&serde_json::to_vec(&fixture).unwrap()).is_err(),
+                "incomplete blame command must fail closed: {fixture}"
+            );
+        }
+    }
+    #[test]
+    fn code_review_tldr_parses_optional_language_and_runs_inline() {
+        let parsed = parse_input(
+            &serde_json::to_vec(&json!({
+                "type": "code_review_tldr",
+                "id": "tldr-1",
+                "language": "en"
+            }))
+            .unwrap(),
+        )
+        .expect("code_review_tldr");
+        let RpcInput::Command { command, .. } = parsed else {
+            panic!("expected a command");
+        };
+        assert_eq!(command.command_name(), "code_review_tldr");
+        assert_eq!(command.id().as_deref(), Some("tldr-1"));
+        assert!(command.runs_inline());
+        assert!(!command.bypasses_command_slots());
+        assert!(matches!(
+            command,
+            RpcCommand::CodeReviewTldr { language: Some(language), .. } if language == "en"
+        ));
+        let absent = parse_input(&serde_json::to_vec(&json!({"type":"code_review_tldr"})).unwrap())
+            .expect("language defaults to absent");
+        let RpcInput::Command { command, .. } = absent else {
+            panic!("expected a command");
+        };
+        assert!(matches!(
+            command,
+            RpcCommand::CodeReviewTldr { language: None, .. }
+        ));
+    }
+
+    #[test]
+    fn file_explorer_map_requires_path_and_blocks_on_a_slot() {
+        let parsed = parse_input(
+            &serde_json::to_vec(&json!({
+                "type": "file_explorer_map",
+                "id": "map-1",
+                "path": "src/lib.rs",
+                "sessionId": "owner-session"
+            }))
+            .unwrap(),
+        )
+        .expect("file_explorer_map");
+        let RpcInput::Command { command, session_id } = parsed else {
+            panic!("expected a command");
+        };
+        assert_eq!(session_id.as_deref(), Some("owner-session"));
+        assert_eq!(command.command_name(), "file_explorer_map");
+        assert_eq!(command.id().as_deref(), Some("map-1"));
+        assert!(!command.runs_inline());
+        assert!(!command.bypasses_command_slots());
+        assert!(matches!(
+            command,
+            RpcCommand::FileExplorerMap { path, .. } if path == "src/lib.rs"
+        ));
+        assert!(
+            parse_input(&serde_json::to_vec(&json!({"type":"file_explorer_map"})).unwrap()).is_err(),
+            "file_explorer_map without path must fail closed"
+        );
+    }
+    #[test]
+    fn path_complete_accepts_and_strips_top_level_session_id() {
+        let owned = json!({
+            "type":"path_complete",
+            "path":"src/ma",
+            "kind":"directory",
+            "limit":20,
+            "sessionId":"owner-session"
+        });
+        let parsed = parse_input(&serde_json::to_vec(&owned).unwrap())
+            .expect("path_complete with a top-level sessionId must parse");
+        let RpcInput::Command { command, session_id } = parsed else {
+            panic!("expected a command: {parsed:?}");
+        };
+        assert_eq!(session_id.as_deref(), Some("owner-session"));
+        assert!(matches!(
+            command,
+            RpcCommand::PathComplete { path, kind: crate::file_explorer::CompletionKind::Directory, limit: Some(20), .. }
+                if path == "src/ma"
+        ));
+    }
+    #[test]
+    fn switch_session_response_mode_is_explicitly_negotiated() {
+        let negotiated: RpcCommand = serde_json::from_value(json!({
+            "type": "switch_session",
+            "id": "warm",
+            "sessionPath": "session.jsonl",
+            "responseMode": "subscribe-handoff-v1"
+        }))
+        .expect("negotiated switch parses");
+        assert!(matches!(
+            negotiated,
+            RpcCommand::SwitchSession {
+                response_mode: Some(SubscribeHandoffV1::SubscribeHandoffV1),
+                ..
+            }
+        ));
+        let legacy: RpcCommand = serde_json::from_value(json!({
+            "type": "switch_session",
+            "sessionPath": "session.jsonl"
+        }))
+        .expect("legacy switch parses");
+        assert!(matches!(
+            legacy,
+            RpcCommand::SwitchSession {
+                response_mode: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn switch_session_catalog_tuple_parses_and_normalizes_aliases() {
+        let command = parse_input(
+            br#"{"type":"switch_session","id":"tuple","sessionPath":"row.jsonl","responseMode":"subscribe-handoff-v1","catalogSource":"primary","catalogSessionId":" row-id ","catalogStatus":"native"}"#,
+        )
+        .ok()
+        .and_then(|input| match input {
+            RpcInput::Command { command, .. } => Some(command),
+            _ => None,
+        })
+        .expect("negotiated switch with catalog tuple parses");
+        let identity = command
+            .switch_catalog_identity()
+            .expect("valid tuple")
+            .expect("tuple present");
+        assert_eq!(identity.source(), CatalogSwitchSource::Rpi);
+        assert_eq!(identity.status(), CatalogSwitchStatus::Native);
+        assert_eq!(identity.session_id(), "row-id");
+        assert!(identity.is_native());
+
+        let hyper = CatalogSwitchIdentity::parse("grok-hyper", "grok-id", "foreign")
+            .expect("grok alias normalizes");
+        assert_eq!(hyper.source(), CatalogSwitchSource::Grok);
+        assert_eq!(hyper.source().wire(), "grok");
+        let slash = CatalogSwitchIdentity::parse("grok/hyper", "grok-id", "foreign")
+            .expect("grok/hyper alias normalizes");
+        assert_eq!(slash.source(), CatalogSwitchSource::Grok);
+        assert!(!slash.is_native());
+    }
+
+    #[test]
+    fn switch_session_catalog_tuple_requires_all_three_fields() {
+        let command: RpcCommand = serde_json::from_value(json!({
+            "type": "switch_session",
+            "sessionPath": "row.jsonl",
+            "catalogSource": "codex",
+            "catalogSessionId": "codex-id"
+        }))
+        .expect("partial tuple still deserializes");
+        let error = command
+            .switch_catalog_identity()
+            .expect_err("partial tuple must fail closed");
+        assert_eq!(error, SwitchCatalogIdentityError::Incomplete);
+        assert_eq!(error.code(), "invalid_request");
+        assert!(!error.message().contains("codex"));
+    }
+
+    #[test]
+    fn switch_session_catalog_tuple_rejects_unknown_values() {
+        for (source, status) in [
+            ("claude", "native"),
+            ("codex", "imported"),
+            ("codex", ""),
+            ("", "foreign"),
+        ] {
+            assert_eq!(
+                switch_catalog_identity(Some(source), Some("id"), Some(status)),
+                Err(SwitchCatalogIdentityError::Invalid),
+                "{source}/{status} must be rejected"
+            );
+        }
+        assert_eq!(
+            switch_catalog_identity(Some("codex"), Some("   "), Some("foreign")),
+            Err(SwitchCatalogIdentityError::Invalid),
+            "empty catalog session id must be rejected"
+        );
+        // Absent tuple keeps the legacy path-only flow.
+        assert_eq!(switch_catalog_identity(None, None, None), Ok(None));
+    }
+
+    #[test]
+    fn export_html_session_path_is_optional_camel_case() {
+        let selected = parse_input(
+            br#"{"type":"export_html","id":"export-selected","sessionPath":"row-token"}"#,
+        )
+        .expect("selected export command");
+        assert!(matches!(
+            selected,
+            RpcInput::Command {
+                command: RpcCommand::ExportHtml {
+                    id: Some(id),
+                    output_path: None,
+                    session_path: Some(session_path),
+                },
+                ..
+            } if id == "export-selected" && session_path == "row-token"
+        ));
+
+        let legacy = parse_input(br#"{"type":"export_html","outputPath":"out.html"}"#)
+            .expect("legacy export command");
+        assert!(matches!(
+            legacy,
+            RpcInput::Command {
+                command: RpcCommand::ExportHtml {
+                    output_path: Some(output_path),
+                    session_path: None,
+                    ..
+                },
+                ..
+            } if output_path == "out.html"
+        ));
+    }
+
+    #[test]
+    fn session_copy_context_requires_session_path_and_parses_id() {
+        let selected = parse_input(
+            br#"{"type":"session_copy_context","id":"copy-selected","sessionPath":"row-token"}"#,
+        )
+        .expect("selected copy-context command");
+        assert!(matches!(
+            selected,
+            RpcInput::Command {
+                command: RpcCommand::SessionCopyContext {
+                    id: Some(id),
+                    session_path,
+                },
+                session_id: None,
+            } if id == "copy-selected" && session_path == "row-token"
+        ));
+
+        let bare = parse_input(br#"{"type":"session_copy_context","sessionPath":"s"}"#)
+            .expect("bare copy-context command");
+        assert!(matches!(
+            bare,
+            RpcInput::Command {
+                command: RpcCommand::SessionCopyContext {
+                    id: None,
+                    session_path,
+                },
+                ..
+            } if session_path == "s"
+        ));
+
+        let missing = parse_input(br#"{"type":"session_copy_context"}"#)
+            .expect_err("missing sessionPath must be rejected");
+        assert!(!missing.success);
+        assert_eq!(missing.command, "session_copy_context");
+        assert!(
+            missing
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("sessionPath")),
+            "{missing:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_copy_context_name_and_direct_reject() {
+        let parsed = parse_input(br#"{"type":"session_copy_context","sessionPath":"s"}"#)
+            .expect("copy-context command");
+        let RpcInput::Command { command, .. } = parsed else {
+            panic!("expected RPC command");
+        };
+        assert_eq!(command.command_name(), "session_copy_context");
+        assert_eq!(command.id(), None);
+
+        let app = build_todo_app("faux-rpc-copy-context-reject", "faux-rpc-copy-context-reject-api")
+            .await;
+        let response = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::SessionCopyContext {
+                id: Some("copy-direct".into()),
+                session_path: "row-token".into(),
+            },
+        )
+        .await;
+        assert!(!response.success, "{response:?}");
+        assert_eq!(response.command, "session_copy_context");
+        assert_eq!(
+            response.error.as_deref(),
+            Some("session_copy_context is available only through the Web listener")
+        );
+        assert!(
+            !response
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("row-token")),
+            "no requested path may leak into the rejection: {response:?}"
+        );
+        app.cleanup().await;
+    }
+
+    #[test]
+    fn session_move_requires_session_path_and_target_cwd() {
+        let selected = parse_input(
+            br#"{"type":"session_move","id":"move-selected","sessionPath":"row-token","targetCwd":"/tmp/target"}"#,
+        )
+        .expect("selected session_move command");
+        assert!(matches!(
+            selected,
+            RpcInput::Command {
+                command: RpcCommand::SessionMove {
+                    id: Some(id),
+                    session_path,
+                    target_cwd,
+                },
+                session_id: None,
+            } if id == "move-selected" && session_path == "row-token" && target_cwd == "/tmp/target"
+        ));
+
+        let bare =
+            parse_input(br#"{"type":"session_move","sessionPath":"s","targetCwd":"/tmp/t"}"#)
+                .expect("bare session_move command");
+        assert!(matches!(
+            bare,
+            RpcInput::Command {
+                command: RpcCommand::SessionMove {
+                    id: None,
+                    session_path,
+                    target_cwd,
+                },
+                ..
+            } if session_path == "s" && target_cwd == "/tmp/t"
+        ));
+
+        let missing_path = parse_input(br#"{"type":"session_move","targetCwd":"/tmp/t"}"#)
+            .expect_err("missing sessionPath must be rejected");
+        assert!(!missing_path.success);
+        assert_eq!(missing_path.command, "session_move");
+        assert!(
+            missing_path
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("sessionPath")),
+            "{missing_path:?}"
+        );
+
+        let missing_cwd = parse_input(br#"{"type":"session_move","sessionPath":"s"}"#)
+            .expect_err("missing targetCwd must be rejected");
+        assert!(!missing_cwd.success);
+        assert_eq!(missing_cwd.command, "session_move");
+        assert!(
+            missing_cwd
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("targetCwd")),
+            "{missing_cwd:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_move_name_and_direct_reject() {
+        let parsed =
+            parse_input(br#"{"type":"session_move","sessionPath":"s","targetCwd":"/tmp/t"}"#)
+                .expect("session_move command");
+        let RpcInput::Command { command, .. } = parsed else {
+            panic!("expected RPC command");
+        };
+        assert_eq!(command.command_name(), "session_move");
+        assert_eq!(command.id(), None);
+
+        let app = build_todo_app("faux-rpc-session-move-reject", "faux-rpc-session-move-reject-api")
+            .await;
+        let response = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::SessionMove {
+                id: Some("move-direct".into()),
+                session_path: "row-token".into(),
+                target_cwd: "/tmp/target".into(),
+            },
+        )
+        .await;
+        assert!(!response.success, "{response:?}");
+        assert_eq!(response.command, "session_move");
+        assert_eq!(
+            response.error.as_deref(),
+            Some("session_move is available only through the multi-session Web runtime")
+        );
+        assert!(
+            !response
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("row-token") || error.contains("/tmp/target")),
+            "no requested path may leak into the rejection: {response:?}"
+        );
+        app.cleanup().await;
+    }
+
+    fn new_session_cwd_parses_as_optional_camel_case_string() {
+        let explicit = parse_input(
+            br#"{"type":"new_session","id":"new-explicit","cwd":"<workspace>/project-a"}"#,
+        )
+        .expect("explicit cwd");
+        assert!(matches!(
+            explicit,
+            RpcInput::Command {
+                command: RpcCommand::NewSession {
+                    id: Some(id),
+                    parent_session: None,
+                    cwd: Some(cwd),
+                },
+                session_id: None,
+            } if id == "new-explicit" && cwd == "<workspace>/project-a"
+        ));
+
+        let inherited = parse_input(br#"{"type":"new_session"}"#).expect("inherited cwd");
+        assert!(matches!(
+            inherited,
+            RpcInput::Command {
+                command: RpcCommand::NewSession { cwd: None, .. },
+                ..
+            }
+        ));
+
+        let null_cwd = parse_input(br#"{"type":"new_session","cwd":null}"#)
+            .expect("null cwd preserves inheritance");
+        assert!(matches!(
+            null_cwd,
+            RpcInput::Command {
+                command: RpcCommand::NewSession { cwd: None, .. },
+                ..
+            }
+        ));
+
+        let invalid =
+            parse_input(br#"{"type":"new_session","cwd":7}"#).expect_err("non-string cwd rejected");
+        assert_eq!(invalid.command, "new_session");
+        assert!(
+            invalid
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Invalid command"))
+        );
     }
 
     #[test]
@@ -4681,7 +9276,10 @@ mod tests {
         assert!(matches!(
             current,
             RpcInput::Command {
-                command: RpcCommand::SessionList { scope: RpcSessionListScope::Current, .. },
+                command: RpcCommand::SessionList {
+                    scope: RpcSessionListScope::Current,
+                    ..
+                },
                 ..
             }
         ));
@@ -4690,9 +9288,180 @@ mod tests {
         assert!(matches!(
             all,
             RpcInput::Command {
-                command: RpcCommand::SessionList { scope: RpcSessionListScope::AllProjects, .. },
+                command: RpcCommand::SessionList {
+                    scope: RpcSessionListScope::AllProjects,
+                    ..
+                },
                 ..
             }
+        ));
+    }
+
+    /// Regression for the intermittent Web frontend error
+    /// `invalid type: null, expected a sequence`. RPC commands carry several
+    /// OPTIONAL sequence fields (`#[serde(default)]` ⇒ absent = empty). A
+    /// client that always serializes the key but emits `null` when there is
+    /// nothing to send (a common foreign/legacy shape) used to trip serde's
+    /// `Vec` deserializer on the explicit `null` — `#[serde(default)]` only
+    /// applies when the field is ABSENT, not when it is present-and-null —
+    /// so the whole frame was rejected. The fix routes those optional
+    /// sequences through [`null_default_vec`] (null ⇒ empty, array ⇒ vec,
+    /// anything else still errors). REQUIRED arrays keep plain `Vec`
+    /// deserialization so `null` stays a hard error there.
+    #[test]
+    fn optional_sequence_fields_accept_null_as_empty() {
+        // The exact pre-fix failure mode on the same field type: a plain
+        // `Vec<ContentBlock>` deserialized from an explicit `null` errors
+        // with the reported message. This is the contract the fix works
+        // around without weakening required arrays.
+        let pre_fix = serde_json::from_value::<Vec<ContentBlock>>(Value::Null)
+            .expect_err("plain Vec rejects null");
+        assert!(
+            pre_fix.to_string().contains("invalid type: null"),
+            "pre-fix error must mention null: {pre_fix}"
+        );
+        assert!(
+            pre_fix.to_string().contains("expected a sequence"),
+            "pre-fix error must mention a sequence: {pre_fix}"
+        );
+
+        let parse_command = |value: Value| match parse_input(
+            &serde_json::to_vec(&value).expect("serialize command fixture"),
+        )
+        .expect("parse command fixture")
+        {
+            RpcInput::Command { command, .. } => command,
+            RpcInput::ExtensionUiResponse(_) => panic!("expected RPC command"),
+        };
+
+        // OPTIONAL sequence fields: explicit null decodes to the same empty
+        // Vec as an absent field (prompt/steer/follow_up images, job_cancel
+        // jobIds). Absent and empty-array already worked; null now matches.
+        let prompt_null = parse_command(json!({"type":"prompt","message":"hi","images":null}));
+        let RpcCommand::Prompt { images, .. } = prompt_null else {
+            panic!("fixture must deserialize as prompt");
+        };
+        assert!(images.is_empty(), "null images -> empty");
+
+        let prompt_absent = parse_command(json!({"type":"prompt","message":"hi"}));
+        let RpcCommand::Prompt {
+            images: absent_images,
+            ..
+        } = prompt_absent
+        else {
+            panic!("absent fixture must deserialize as prompt");
+        };
+        assert!(absent_images.is_empty(), "absent images -> empty");
+
+        let steer_null = parse_command(json!({"type":"steer","message":"hi","images":null}));
+        let RpcCommand::Steer {
+            images: steer_images,
+            ..
+        } = steer_null
+        else {
+            panic!("fixture must deserialize as steer");
+        };
+        assert!(steer_images.is_empty(), "null steer images -> empty");
+
+        let follow_up_null =
+            parse_command(json!({"type":"follow_up","message":"hi","images":null}));
+        let RpcCommand::FollowUp {
+            images: follow_up_images,
+            ..
+        } = follow_up_null
+        else {
+            panic!("fixture must deserialize as follow_up");
+        };
+        assert!(
+            follow_up_images.is_empty(),
+            "null follow_up images -> empty"
+        );
+
+        let job_cancel_null = parse_command(json!({"type":"job_cancel","jobIds":null}));
+        let RpcCommand::JobCancel { job_ids, .. } = job_cancel_null else {
+            panic!("fixture must deserialize as job_cancel");
+        };
+        assert!(job_ids.is_empty(), "null jobIds -> empty");
+
+        // Normal array behavior is unchanged: a real array decodes verbatim.
+        let job_cancel_array =
+            parse_command(json!({"type":"job_cancel","jobIds":["job-1","job-2"]}));
+        let RpcCommand::JobCancel {
+            job_ids: array_ids, ..
+        } = job_cancel_array
+        else {
+            panic!("array fixture must deserialize as job_cancel");
+        };
+        assert_eq!(array_ids, vec!["job-1".to_owned(), "job-2".to_owned()]);
+
+        // OPTIONAL fields still reject malformed non-array, non-null values:
+        // a scalar/object is not a valid sequence and must not be silently
+        // coerced to empty (that would widen the contract).
+        let scalar_err = parse_input(br#"{"type":"job_cancel","jobIds":"job-1"}"#)
+            .expect_err("scalar jobIds must be rejected");
+        assert!(
+            scalar_err
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Invalid command"),
+            "scalar rejection must surface as a parse failure: {scalar_err:?}"
+        );
+        let object_err = parse_input(br#"{"type":"job_cancel","jobIds":{"a":1}}"#)
+            .expect_err("object jobIds must be rejected");
+        assert!(
+            object_err
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Invalid command"),
+            "object rejection must surface as a parse failure: {object_err:?}"
+        );
+
+        // REQUIRED sequence fields stay strict: `null` is NOT semantically
+        // valid for a required array and must remain a hard error — and the
+        // parse boundary must name the field so the frontend can render an
+        // actionable protocol error.
+        let set_todos_null = parse_input(br#"{"type":"set_todos","phases":null}"#)
+            .expect_err("null phases rejected");
+        let set_todos_message = set_todos_null.error.as_deref().unwrap_or("");
+        assert!(
+            set_todos_message.contains("Invalid command set_todos"),
+            "required phases null must be a field-aware parse error: {set_todos_message}"
+        );
+        assert!(
+            set_todos_message.contains("phases") && set_todos_message.contains("must be an array"),
+            "required phases null must name the field: {set_todos_message}"
+        );
+        let process_keys_null = parse_input(
+            br#"{"type":"process_keys","processId":"00000000-0000-7000-8000-000000000000","keys":null}"#,
+        )
+        .expect_err("null keys rejected");
+        let process_keys_message = process_keys_null.error.as_deref().unwrap_or("");
+        assert!(
+            process_keys_message.contains("Invalid command process_keys")
+                && process_keys_message.contains("`keys`")
+                && process_keys_message.contains("must be an array"),
+            "required keys null must name the field: {process_keys_message}"
+        );
+        // A scalar/object on a required array is still rejected too.
+        let process_keys_scalar = parse_input(
+            br#"{"type":"process_keys","processId":"00000000-0000-7000-8000-000000000000","keys":"a"}"#,
+        )
+        .expect_err("scalar keys rejected");
+        let process_keys_scalar_message = process_keys_scalar.error.as_deref().unwrap_or("");
+        assert!(
+            process_keys_scalar_message.contains("`keys`")
+                && process_keys_scalar_message.contains("must be an array"),
+            "required keys scalar must be a field-aware rejection: {process_keys_scalar_message}"
+        );
+        // A valid required array still parses normally.
+        let set_todos_array =
+            parse_input(br#"{"type":"set_todos","phases":[{"name":"Plan","tasks":[]}]}"#)
+                .expect("valid set_todos phases must parse");
+        assert!(matches!(
+            set_todos_array,
+            RpcInput::Command { command: RpcCommand::SetTodos { phases, .. }, .. } if phases.len() == 1
         ));
     }
 
@@ -4711,10 +9480,15 @@ mod tests {
             json!({"type":"abort"}),
             json!({"type":"abort_retry"}),
             json!({"type":"abort_bash"}),
+            json!({"type":"steer","message":"keep going"}),
+            json!({"type":"follow_up","message":"after this"}),
+            json!({"type":"queue_cancel","scope":"steering"}),
+            json!({"type":"queue_send_now"}),
             json!({"type":"loop_cancel","taskId":"loop-1"}),
             json!({"type":"process_signal","processId":"00000000-0000-7000-8000-000000000000","signal":"SIGTERM"}),
             json!({"type":"process_stop","processId":"00000000-0000-7000-8000-000000000000"}),
             json!({"type":"code_review_abort","snapshotId":"s1","path":"a.rs","oldStart":1,"oldCount":1,"newStart":1,"newCount":1,"contentHash":"h"}),
+            json!({"type":"code_review_stop","operation":"highlight"}),
             json!({"type":"code_review_close"}),
         ] {
             let command = parse_command(fixture.clone());
@@ -4725,12 +9499,13 @@ mod tests {
         }
 
         for fixture in [
-            json!({"type":"settings_apply","draftId":"draft"}),
             json!({"type":"workflow_create","name":"ship","objective":"bounded"}),
             json!({"type":"process_wait","processId":"00000000-0000-7000-8000-000000000000"}),
             json!({"type":"code_review_open"}),
             json!({"type":"code_review_open","from":"HEAD","to":"feature"}),
+            json!({"type":"code_review_open","from":"HEAD","includeWorkingTree":true}),
             json!({"type":"code_review_refresh"}),
+            json!({"type":"code_review_commits"}),
         ] {
             let command = parse_command(fixture.clone());
             assert!(
@@ -4744,23 +9519,150 @@ mod tests {
         assert!(settings.runs_inline() && workflow.runs_inline());
 
         // Code-review snapshot/comment/abort/close run inline (controller state
-        // reads and safety/teardown); open/refresh take a slot (spawn_blocking git).
+        // reads and safety/teardown); open/refresh/commits take a slot (spawn_blocking git).
         let snapshot = parse_command(json!({"type":"code_review_snapshot"}));
-        let comment = parse_command(json!({"type":"code_review_comment","snapshotId":"s","path":"a","oldStart":1,"oldCount":1,"newStart":1,"newCount":1,"contentHash":"h","comment":"x"}));
-        let abort = parse_command(json!({"type":"code_review_abort","snapshotId":"s","path":"a","oldStart":1,"oldCount":1,"newStart":1,"newCount":1,"contentHash":"h"}));
+        let comment = parse_command(
+            json!({"type":"code_review_comment","snapshotId":"s","path":"a","oldStart":1,"oldCount":1,"newStart":1,"newCount":1,"contentHash":"h","comment":"x"}),
+        );
+        let abort = parse_command(
+            json!({"type":"code_review_abort","snapshotId":"s","path":"a","oldStart":1,"oldCount":1,"newStart":1,"newCount":1,"contentHash":"h"}),
+        );
+        let stop = parse_command(json!({"type":"code_review_stop","operation":"autoReview"}));
         let close = parse_command(json!({"type":"code_review_close"}));
         let open = parse_command(json!({"type":"code_review_open"}));
         let refresh = parse_command(json!({"type":"code_review_refresh"}));
-        let file_diff = parse_command(json!({"type":"code_review_file_diff","snapshotId":"s","path":"a"}));
-        assert!(snapshot.runs_inline() && comment.runs_inline() && abort.runs_inline() && close.runs_inline());
+        let commits = parse_command(json!({"type":"code_review_commits"}));
+        let file_diff =
+            parse_command(json!({"type":"code_review_file_diff","snapshotId":"s","path":"a"}));
+        let explorer_read =
+            parse_command(json!({"type":"file_explorer_read","path":"src/lib.rs"}));
+        let explorer_diff =
+            parse_command(json!({"type":"file_explorer_diff","path":"src/lib.rs"}));
+        let explorer_blame = parse_command(
+            json!({"type":"file_explorer_blame","path":"src/lib.rs","startLine":10,"endLine":20}),
+        );
+        let explorer_stage = parse_command(
+            json!({"type":"file_explorer_stage_download","path":"src/lib.rs"}),
+        );
+        let tldr = parse_command(json!({"type":"code_review_tldr","language":"en"}));
+        let explorer_map = parse_command(json!({"type":"file_explorer_map","path":"src/lib.rs"}));
+        let tmux_list = parse_command(json!({"type":"tmux_list_sessions"}));
+        let tmux_snap = parse_command(json!({"type":"tmux_pane_snapshot","session":"s"}));
+        let tmux_send = parse_command(json!({
+            "type":"tmux_send_keys",
+            "session":"s",
+            "text":"x"
+        }));
+        let tmux_create = parse_command(json!({
+            "type":"tmux_session_create",
+            "session":"s"
+        }));
+        let tmux_delete = parse_command(json!({
+            "type":"tmux_session_delete",
+            "session":"s"
+        }));
+        let tmux_attach = parse_command(json!({
+            "type":"tmux_terminal_attach",
+            "session":"s",
+            "cols":80,
+            "rows":24
+        }));
+        let tmux_input = parse_command(json!({
+            "type":"tmux_terminal_input",
+            "terminalId":"t",
+            "data":"YQ=="
+        }));
+        let tmux_resize = parse_command(json!({
+            "type":"tmux_terminal_resize",
+            "terminalId":"t",
+            "cols":100,
+            "rows":30
+        }));
+        let tmux_detach = parse_command(json!({
+            "type":"tmux_terminal_detach",
+            "terminalId":"t"
+        }));
+        assert!(
+            snapshot.runs_inline()
+                && comment.runs_inline()
+                && abort.runs_inline()
+                && stop.runs_inline()
+                && close.runs_inline()
+                && tldr.runs_inline()
+        );
         // file_diff re-runs scoped git via spawn_blocking: it takes a slot like
         // open/refresh (NOT inline, NOT a bypass).
-        assert!(!open.runs_inline() && !refresh.runs_inline() && !file_diff.runs_inline());
-        assert!(abort.bypasses_command_slots() && close.bypasses_command_slots());
-        assert!(!open.bypasses_command_slots() && !refresh.bypasses_command_slots() && !snapshot.bypasses_command_slots() && !file_diff.bypasses_command_slots());
+        assert!(
+            !open.runs_inline()
+                && !refresh.runs_inline()
+                && !file_diff.runs_inline()
+                && !commits.runs_inline()
+                && !explorer_read.runs_inline()
+                && !explorer_diff.runs_inline()
+                && !explorer_blame.runs_inline()
+                && !explorer_stage.runs_inline()
+                && !explorer_map.runs_inline()
+                && !tmux_list.runs_inline()
+                && !tmux_snap.runs_inline()
+                && !tmux_send.runs_inline()
+                && !tmux_create.runs_inline()
+                && !tmux_delete.runs_inline()
+                && !tmux_attach.runs_inline()
+                && !tmux_input.runs_inline()
+                && !tmux_resize.runs_inline()
+                && !tmux_detach.runs_inline()
+        );
+        assert!(
+            !open.bypasses_command_slots()
+                && !refresh.bypasses_command_slots()
+                && !snapshot.bypasses_command_slots()
+                && !file_diff.bypasses_command_slots()
+                && !commits.bypasses_command_slots()
+                && !tldr.bypasses_command_slots()
+                && !explorer_map.bypasses_command_slots()
+        );
+
+        // The stdio gate (runs_inline) must exempt steer/follow_up exactly
+        // like the Web bypass: a saturated command list must never drop the
+        // user's steering with "too many concurrent RPC commands".
+        let steer = parse_command(json!({"type":"steer","message":"fix it"}));
+        let follow_up = parse_command(json!({"type":"follow_up","message":"next"}));
+        assert!(
+            steer.runs_inline() && follow_up.runs_inline(),
+            "steer/follow_up must run inline on the stdio gate"
+        );
+
+        // Interactive user-control commands bypass the ordinary FIFO so one
+        // long-running ordinary command cannot starve them; read-only
+        // get_messages still queues behind the ordinary FIFO.
+        let prompt = parse_command(json!({"type":"prompt","message":"go"}));
+        let set_model =
+            parse_command(json!({"type":"set_model","provider":"p","modelId":"m"}));
+        let set_thinking = parse_command(json!({"type":"set_thinking_level","level":"high"}));
+        let get_messages = parse_command(json!({"type":"get_messages"}));
+        assert!(
+            prompt.bypasses_ordinary_fifo()
+                && set_model.bypasses_ordinary_fifo()
+                && set_thinking.bypasses_ordinary_fifo(),
+            "interactive user-control commands must not starve behind the ordinary FIFO"
+        );
+        assert!(!get_messages.bypasses_ordinary_fifo());
+        let overload = RpcResponse::slot_overload(
+            Some("c1".into()),
+            "get_state",
+            format!("too many concurrent RPC commands (limit {MAX_CONCURRENT_COMMANDS})"),
+        );
+        assert_eq!(overload.data, Some(json!({ "code": "busy_capacity" })));
+        assert!(overload.is_transient_slot_overload());
+        let prose_only = RpcResponse::failure(
+            Some("c2".into()),
+            "get_state",
+            format!("too many concurrent RPC commands (limit {MAX_CONCURRENT_COMMANDS})"),
+        );
+        assert!(!prose_only.is_transient_slot_overload());
     }
-    #[test]
     fn public_models_never_serialize_headers() {
+
         let secret = "Bearer rpc-secret-must-not-leak";
         let model = Model {
             headers: Some(std::collections::HashMap::from([
@@ -4777,6 +9679,330 @@ mod tests {
             Value::Null
         );
     }
+    #[test]
+    fn resolve_catalog_model_matches_provider_identity_not_labels() {
+        let catalog = vec![
+            Model {
+                id: "m1".into(),
+                provider: "p1".into(),
+                name: "Label One".into(),
+                ..Default::default()
+            },
+            Model {
+                id: "m1".into(),
+                provider: "p2".into(),
+                name: "Label Two".into(),
+                ..Default::default()
+            },
+            Model {
+                id: "m2".into(),
+                provider: "p1".into(),
+                ..Default::default()
+            },
+            Model {
+                id: "m/3".into(),
+                provider: "p1".into(),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            resolve_catalog_model(&catalog, "p2/m1").map(|model| model.provider.as_str()),
+            Some("p2"),
+            "qualified provider/id identity resolves across duplicate ids"
+        );
+        assert_eq!(
+            resolve_catalog_model(&catalog, "p1/m2").map(|model| model.id.as_str()),
+            Some("m2"),
+        );
+        assert_eq!(
+            resolve_catalog_model(&catalog, "p1/m/3").map(|model| model.id.as_str()),
+            Some("m/3"),
+            "the first slash separates; a slash-containing id suffix is preserved"
+        );
+        assert!(
+            resolve_catalog_model(&catalog, "m2").is_none(),
+            "a bare id never resolves; the wire carries provider/id"
+        );
+        assert!(
+            resolve_catalog_model(&catalog, "m1").is_none(),
+            "an ambiguous bare id must fail closed"
+        );
+        assert!(
+            resolve_catalog_model(&catalog, "Label One").is_none(),
+            "display labels never resolve"
+        );
+        assert!(resolve_catalog_model(&catalog, "p1/nope").is_none());
+    }
+
+    #[tokio::test]
+    async fn code_review_stale_close_cannot_supersede_inflight_open() {
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(cwd.path().join("review.txt"), "base\n").expect("write baseline");
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "baseline"]).status.success());
+        std::fs::write(cwd.path().join("review.txt"), "first\n").expect("write first change");
+
+        let app = build_code_review_app(cwd.path()).await;
+        let code_review = CodeReviewRpcState::default();
+        let initial = code_review
+            .open(&app, None, None, None, None)
+            .await
+            .expect("initial open");
+        let gate = Arc::new(ReviewCaptureGate {
+            captured: tokio::sync::Notify::new(),
+            released: std::sync::Mutex::new(false),
+            release: std::sync::Condvar::new(),
+        });
+        *code_review.review_capture_gate.lock().await = Some(gate.clone());
+        std::fs::write(cwd.path().join("review.txt"), "second\n").expect("write second change");
+        let inflight = tokio::spawn({
+            let app = app.clone();
+            let state = code_review.clone();
+            async move { state.open(&app, None, None, None, None).await }
+        });
+        gate.captured.notified().await;
+        let stale = code_review
+            .close(Some("retired-review-identity"))
+            .await
+            .expect("stale close returns ok");
+        assert_eq!(stale["closed"], false, "{stale}");
+        assert_eq!(stale["staleReview"], true, "{stale}");
+        gate.release();
+        let opened = inflight
+            .await
+            .expect("open task")
+            .expect("in-flight open must not be superseded by a stale close");
+        assert_ne!(
+            opened["snapshotId"], initial["snapshotId"],
+            "the gated open must cut over to its own capture"
+        );
+        assert!(code_review.snapshot().await.is_ok());
+        // The complementary case: a matching (unstamped) close during a gated
+        // open bumps the authority, so that capture fails its cutover and no
+        // controller remains.
+        let gate = Arc::new(ReviewCaptureGate {
+            captured: tokio::sync::Notify::new(),
+            released: std::sync::Mutex::new(false),
+            release: std::sync::Condvar::new(),
+        });
+        *code_review.review_capture_gate.lock().await = Some(gate.clone());
+        std::fs::write(cwd.path().join("review.txt"), "third\n").expect("write third change");
+        let inflight = tokio::spawn({
+            let app = app.clone();
+            let state = code_review.clone();
+            async move { state.open(&app, None, None, None, None).await }
+        });
+        gate.captured.notified().await;
+        let closed = code_review
+            .close(None)
+            .await
+            .expect("matching close closes the live controller");
+        assert_eq!(closed["closed"], true, "{closed:?}");
+        gate.release();
+        let superseded = inflight
+            .await
+            .expect("open task")
+            .expect_err("a matching close must supersede the gated open capture");
+        assert!(superseded.to_string().contains("superseded"), "{superseded:#}");
+        assert!(
+            code_review.snapshot().await.is_err(),
+            "the matching close left no controller to cut over to"
+        );
+        app.cleanup().await;
+    }
+    /// Cleanup close of review A after open B has reserved, and before B
+    /// cuts over, must not invalidate that capture. Once B is installed, the
+    /// same retired stamp cannot close it. Unstamped close still supersedes
+    /// a reserved open; see the complementary case above.
+    #[tokio::test]
+    async fn code_review_close_of_retired_review_cannot_supersede_reserved_open() {
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(cwd.path().join("review.txt"), "base\n").expect("write baseline");
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "baseline"]).status.success());
+        std::fs::write(cwd.path().join("review.txt"), "first\n").expect("write first change");
+
+        let app = build_code_review_app(cwd.path()).await;
+        let code_review = CodeReviewRpcState::default();
+        let opened_a = code_review
+            .open(&app, None, None, None, None)
+            .await
+            .expect("open A");
+        let review_a = opened_a["reviewId"]
+            .as_str()
+            .expect("review A id")
+            .to_owned();
+        let gate = Arc::new(ReviewCaptureGate {
+            captured: tokio::sync::Notify::new(),
+            released: std::sync::Mutex::new(false),
+            release: std::sync::Condvar::new(),
+        });
+        *code_review.review_capture_gate.lock().await = Some(gate.clone());
+        std::fs::write(cwd.path().join("review.txt"), "second\n").expect("write second change");
+        let inflight_b = tokio::spawn({
+            let app = app.clone();
+            let state = code_review.clone();
+            async move { state.open(&app, None, None, None, None).await }
+        });
+        gate.captured.notified().await;
+        let retired = code_review
+            .close(Some(&review_a))
+            .await
+            .expect("closing the installed review A while B is reserved");
+        assert_eq!(
+            retired["closed"], true,
+            "the stamp still names the installed controller: {retired}"
+        );
+        assert!(retired.get("staleReview").is_none(), "{retired}");
+        gate.release();
+        *code_review.review_capture_gate.lock().await = None;
+        let opened_b = inflight_b
+            .await
+            .expect("open B task")
+            .expect("close of retired review A must not supersede open B reserved before cutover");
+        let review_b = opened_b["reviewId"]
+            .as_str()
+            .expect("review B id")
+            .to_owned();
+        assert_ne!(review_b, review_a, "open B must install its own controller");
+        assert_ne!(
+            opened_b["snapshotId"], opened_a["snapshotId"],
+            "open B must cut over to its own capture"
+        );
+        assert_eq!(
+            code_review.snapshot().await.expect("B is open")["reviewId"],
+            review_b,
+            "the reserved open must be the live controller"
+        );
+        let stale = code_review
+            .close(Some(&review_a))
+            .await
+            .expect("stale close of A after B cut over");
+        assert_eq!(stale["closed"], false, "{stale}");
+        assert_eq!(stale["staleReview"], true, "{stale}");
+        assert_eq!(
+            code_review.snapshot().await.expect("B survived stale close")["reviewId"],
+            review_b,
+            "a stale close of A must not close B"
+        );
+        let closed_b = code_review
+            .close(Some(&review_b))
+            .await
+            .expect("matching close of B");
+        assert_eq!(closed_b["closed"], true, "{closed_b:?}");
+        assert!(
+            code_review.snapshot().await.is_err(),
+            "a close stamped with the live review must still close it"
+        );
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn code_review_stale_close_cannot_supersede_inflight_refresh() {
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(cwd.path().join("review.txt"), "base\n").expect("write baseline");
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "baseline"]).status.success());
+        std::fs::write(cwd.path().join("review.txt"), "changed\n").expect("write change");
+
+        let app = build_code_review_app(cwd.path()).await;
+        let code_review = CodeReviewRpcState::default();
+        let initial = code_review
+            .open(&app, None, None, None, None)
+            .await
+            .expect("initial open");
+        let review_id = initial["reviewId"].as_str().expect("review id").to_owned();
+        let gate = Arc::new(ReviewCaptureGate {
+            captured: tokio::sync::Notify::new(),
+            released: std::sync::Mutex::new(false),
+            release: std::sync::Condvar::new(),
+        });
+        *code_review.review_capture_gate.lock().await = Some(gate.clone());
+        let refresh = tokio::spawn({
+            let app = app.clone();
+            let state = code_review.clone();
+            async move { state.refresh(&app).await }
+        });
+        gate.captured.notified().await;
+        let stale = code_review
+            .close(Some("retired-review-identity"))
+            .await
+            .expect("stale close returns ok");
+        assert_eq!(stale["closed"], false, "{stale}");
+        assert_eq!(stale["staleReview"], true, "{stale}");
+        gate.release();
+        let refreshed = refresh
+            .await
+            .expect("refresh task")
+            .expect("in-flight refresh must not be superseded by a stale close");
+        assert_eq!(
+            refreshed["reviewId"], review_id,
+            "refresh keeps the same controller identity"
+        );
+        assert!(code_review.snapshot().await.is_ok());
+        // The complementary case: a matching (unstamped) close during a gated
+        // refresh bumps the authority, so that capture fails its cutover and
+        // the controller is gone.
+        let gate = Arc::new(ReviewCaptureGate {
+            captured: tokio::sync::Notify::new(),
+            released: std::sync::Mutex::new(false),
+            release: std::sync::Condvar::new(),
+        });
+        *code_review.review_capture_gate.lock().await = Some(gate.clone());
+        let inflight = tokio::spawn({
+            let app = app.clone();
+            let state = code_review.clone();
+            async move { state.refresh(&app).await }
+        });
+        gate.captured.notified().await;
+        let closed = code_review
+            .close(None)
+            .await
+            .expect("matching close closes the live controller");
+        assert_eq!(closed["closed"], true, "{closed:?}");
+        gate.release();
+        let superseded = inflight
+            .await
+            .expect("refresh task")
+            .expect_err("a matching close must supersede the gated refresh capture");
+        assert!(superseded.to_string().contains("superseded"), "{superseded:#}");
+        assert!(
+            code_review.snapshot().await.is_err(),
+            "the matching close left no controller to cut over to"
+        );
+        app.cleanup().await;
+    }
+
     #[test]
     fn process_write_rejects_malformed_base64() {
         let command: RpcCommand = serde_json::from_value(json!({
@@ -4820,6 +10046,7 @@ mod tests {
             record_type: "extension_ui_request",
             id: "u".into(),
             session_id: None,
+            runtime_incarnation: None,
             request: json!({"method":"confirm"}),
         };
         assert!(serde_json::from_str::<Value>(&serde_json::to_string(&e).unwrap()).is_ok());
@@ -5016,7 +10243,11 @@ mod tests {
         let JsonlFrame::Line(first) = rx.recv().await.unwrap() else {
             panic!()
         };
-        let Ok(RpcInput::Command { command: RpcCommand::SetTodos { phases, .. }, .. }) = parse_input(&first) else {
+        let Ok(RpcInput::Command {
+            command: RpcCommand::SetTodos { phases, .. },
+            ..
+        }) = parse_input(&first)
+        else {
             panic!("first frame must parse to SetTodos")
         };
         assert!(phases.is_empty());
@@ -5076,7 +10307,7 @@ mod tests {
                 status: TodoStatus::InProgress,
                 depends_on: Vec::new(),
                 ready: true,
-                blocked_by: Vec::new(),
+                waiting_on: Vec::new(),
                 agent: None,
             }],
         }];
@@ -5086,38 +10317,50 @@ mod tests {
                 phase: "Plan".into(),
                 content: "x".into(),
             }],
+            execution_status: pi_coding::TodoDagExecutionStatus::Failed,
+            failure_reason: Some(pi_coding::TodoDagFailureReason::Reconcile {
+                message: "retry DAG execution".into(),
+            }),
         };
-        let v: Value = serde_json::from_str(&serde_json::to_string(&updated).unwrap()).unwrap();
+        let v = project_application_event(updated).expect("project todo update");
         assert_eq!(v["type"], "todo_updated");
         assert_eq!(v["phases"][0]["name"], "Plan");
         assert_eq!(v["phases"][0]["tasks"][0]["status"], "in_progress");
         assert_eq!(v["phases"][0]["tasks"][0]["id"], "task-x");
         assert_eq!(v["phases"][0]["tasks"][0]["dependsOn"], json!([]));
         assert_eq!(v["phases"][0]["tasks"][0]["ready"], true);
-        assert_eq!(v["phases"][0]["tasks"][0]["blockedBy"], json!([]));
+        assert_eq!(v["phases"][0]["tasks"][0]["waitingOn"], json!([]));
         assert_eq!(v["completed_tasks"][0]["phase"], "Plan");
-        let reminder = pi_coding::ApplicationEvent::TodoReminder { phases };
-        let v: Value = serde_json::from_str(&serde_json::to_string(&reminder).unwrap()).unwrap();
+        assert_eq!(v["executionStatus"], "failed");
+        assert_eq!(v["failureReason"]["kind"], "reconcile");
+        assert_eq!(v["failureReason"]["message"], "retry DAG execution");
+        let reminder = pi_coding::ApplicationEvent::TodoReminder {
+            phases,
+            execution_status: pi_coding::TodoDagExecutionStatus::Dormant,
+            failure_reason: None,
+        };
+        let v = project_application_event(reminder).expect("project todo reminder");
         assert_eq!(v["type"], "todo_reminder");
         assert_eq!(v["phases"][0]["name"], "Plan");
     }
     async fn build_todo_app(model_id: &str, api: &str) -> Application {
         use pi_ai::providers::{FauxProviderOptions, FauxResponse, register_faux_provider};
+
         let mut model = Model::default();
         model.id = model_id.into();
         model.name = model_id.into();
         model.api = api.into();
         model.provider = "faux".into();
         model.base_url = "http://localhost:0".into();
-        let reg = register_faux_provider(FauxProviderOptions {
+        let registration = register_faux_provider(FauxProviderOptions {
             api: api.into(),
             provider: "faux".into(),
             models: vec![model.clone()],
             chunk_size: 4,
         });
-        reg.set_responses(vec![FauxResponse::text("ok")]);
+        registration.set_responses(vec![FauxResponse::text("ok")]);
         let cwd = tempfile::tempdir().expect("tempdir");
-        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+        let session = disabled_session(pi_coding::SessionOptions {
             model,
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
@@ -5125,28 +10368,28 @@ mod tests {
             api_key: "faux".into(),
             compaction: None,
             stream_options: Default::default(),
-            tools: None,
+            tools: Some(Vec::new()),
             before_tool_call: None,
             after_tool_call: None,
             stream_fn: None,
             auth_resolver: None,
+            auth_manager: None,
         })
         .expect("session");
-        let app = Application::new(session).await;
-        reg.unregister();
-        app
+        let application = isolated_application(session).await;
+        registration.unregister();
+        application
     }
     async fn build_compact_app(
         model_id: &str,
         responses: Vec<pi_ai::providers::FauxResponse>,
     ) -> Application {
-        let mut model = Model::default();
+        let mut model = faux_model();
         model.id = model_id.into();
         model.name = model_id.into();
-        model.api = format!("{model_id}-api");
-        model.provider = "faux".into();
-        model.base_url = "http://localhost:0".into();
-        let responses = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(responses)));
+        let responses = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+            responses,
+        )));
         let stream_fn: pi_agent::StreamFn = Arc::new(move |model, _context, _options| {
             let responses = responses.clone();
             Box::pin(async move {
@@ -5177,7 +10420,8 @@ mod tests {
             })
         });
         let cwd = tempfile::tempdir().expect("tempdir");
-        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+        let session = disabled_session(pi_coding::SessionOptions {
+
             model,
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
@@ -5195,21 +10439,53 @@ mod tests {
             after_tool_call: None,
             stream_fn: Some(stream_fn),
             auth_resolver: None,
+            auth_manager: None,
         })
         .expect("session");
         let mut assistant = pi_ai::AssistantMessage::pending(&session.model().expect("model"));
         assistant.content = vec![ContentBlock::text("old answer")];
         assistant.stop_reason = pi_ai::StopReason::Stop;
         assistant.timestamp = 2;
-        session
-            .load_history(vec![
-                Message::user_text("old request ".repeat(20), 1),
-                Message::Assistant(assistant),
-                Message::user_text("recent request", 3),
-            ])
-            .await
-            .expect("load history");
-        Application::new(session).await
+        let padding = "old request ".repeat(1_000);
+        let mut history = Vec::new();
+        for turn in 0..4 {
+            history.push(Message::user_text(
+                format!("{turn}: {padding}"),
+                turn * 2 + 1,
+            ));
+            let mut prior = assistant.clone();
+            prior.timestamp = turn * 2 + 2;
+            history.push(Message::Assistant(prior));
+        }
+        history.push(Message::user_text("recent request", 10));
+        session.load_history(history).await.expect("load history");
+        isolated_application(session).await
+    }
+    #[test]
+    fn fork_message_response_enforces_full_wire_bound() {
+        let normal = bounded_fork_messages_response(
+            Some("request-1".into()),
+            "get_fork_messages",
+            Some("session-1".into()),
+            Some(json!({
+                "messages": [{ "entryId": "entry-1", "text": "preview" }],
+                "truncated": false,
+                "total": 1,
+            })),
+        );
+        assert!(normal.success);
+        assert!(serde_json::to_vec(&normal).expect("normal response").len() <= MAX_FORK_MESSAGES_RESPONSE_BYTES);
+
+        let oversized = bounded_fork_messages_response(
+            Some("request-2".into()),
+            "get_fork_messages",
+            Some("session-2".into()),
+            Some(json!({ "messages": [{ "entryId": "entry-2", "text": "x".repeat(MAX_FORK_MESSAGES_RESPONSE_BYTES) }] })),
+        );
+        assert!(!oversized.success);
+        assert_eq!(oversized.id.as_deref(), Some("request-2"));
+        assert_eq!(oversized.session_id.as_deref(), Some("session-2"));
+        assert!(serde_json::to_vec(&oversized).expect("bounded failure").len() <= MAX_FORK_MESSAGES_RESPONSE_BYTES);
     }
 
     #[tokio::test]
@@ -5235,9 +10511,16 @@ mod tests {
         assert_eq!(response.command, "compact");
         assert_eq!(response.error, None);
         let data = response.data.expect("compaction result");
-        assert!(data["summary"].as_str().is_some_and(|summary| summary.ends_with("rpc checkpoint")));
+        assert!(
+            data["summary"]
+                .as_str()
+                .is_some_and(|summary| summary.ends_with("rpc checkpoint"))
+        );
         assert!(data.get("apiKey").is_none());
-        assert!(matches!(app.messages().first(), Some(Message::CompactionSummary(_))));
+        assert!(matches!(
+            app.messages().first(),
+            Some(Message::CompactionSummary(_))
+        ));
 
         app.cleanup().await;
     }
@@ -5264,7 +10547,12 @@ mod tests {
         assert_eq!(response.id.as_deref(), Some("compact-error"));
         assert_eq!(response.command, "compact");
         assert!(response.data.is_none());
-        assert!(response.error.as_deref().is_some_and(|error| error.contains("summary rejected")));
+        assert!(
+            response
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("summary rejected"))
+        );
 
         app.cleanup().await;
     }
@@ -5285,7 +10573,10 @@ mod tests {
         }
 
         fn push(&self, frame: pi_coding::ExtensionFrame) {
-            self.frames.lock().expect("extension frame queue").push_back(Some(frame));
+            self.frames
+                .lock()
+                .expect("extension frame queue")
+                .push_back(Some(frame));
             self.ready.notify_one();
         }
     }
@@ -5324,13 +10615,11 @@ mod tests {
                     }
                     let value = match request {
                         pi_coding::ExtensionHostRequest::Invoke {
-                            invocation:
-                                pi_coding::ExtensionInvocation::Event { event },
+                            invocation: pi_coding::ExtensionInvocation::Event { event },
                             ..
                         } if event.name == "session_before_switch" => json!({"cancel":true}),
                         pi_coding::ExtensionHostRequest::Invoke {
-                            invocation:
-                                pi_coding::ExtensionInvocation::Event { event },
+                            invocation: pi_coding::ExtensionInvocation::Event { event },
                             ..
                         } if event.name == "session_before_fork" => json!({"cancel":true}),
                         _ => Value::Null,
@@ -5341,7 +10630,10 @@ mod tests {
                     });
                 }
                 pi_coding::ExtensionHostFrame::Shutdown { .. } => {
-                    self.frames.lock().expect("extension frame queue").push_back(None);
+                    self.frames
+                        .lock()
+                        .expect("extension frame queue")
+                        .push_back(None);
                     self.ready.notify_one();
                 }
                 pi_coding::ExtensionHostFrame::Response { .. }
@@ -5356,7 +10648,12 @@ mod tests {
             Box::pin(async move {
                 loop {
                     let notified = self.ready.notified();
-                    if let Some(frame) = self.frames.lock().expect("extension frame queue").pop_front() {
+                    if let Some(frame) = self
+                        .frames
+                        .lock()
+                        .expect("extension frame queue")
+                        .pop_front()
+                    {
                         return Ok(frame);
                     }
                     notified.await;
@@ -5377,7 +10674,8 @@ mod tests {
         fn launch(
             &self,
             _launch: pi_coding::ExtensionLaunch,
-        ) -> pi_coding::ExtensionFuture<'_, Result<Arc<dyn pi_coding::ExtensionTransport>>> {
+        ) -> pi_coding::ExtensionFuture<'_, Result<Arc<dyn pi_coding::ExtensionTransport>>>
+        {
             Box::pin(async {
                 Ok(Arc::new(LifecycleExtensionTransport::new())
                     as Arc<dyn pi_coding::ExtensionTransport>)
@@ -5386,10 +10684,14 @@ mod tests {
     }
 
     async fn build_lifecycle_app(cancel: bool) -> (tempfile::TempDir, Application) {
-        let cwd = tempfile::tempdir().expect("lifecycle cwd");
-        let session = pi_coding::Session::new(pi_coding::SessionOptions {
-            model: Model::default(),
-            cwd: cwd.path().to_path_buf(),
+        let root = tempfile::tempdir().expect("lifecycle root");
+        let cwd = root.path().join("workspace");
+        let agent_dir = root.path().join("agent");
+        std::fs::create_dir_all(&cwd).expect("lifecycle cwd");
+        std::fs::create_dir_all(&agent_dir).expect("lifecycle agent dir");
+        let session = disabled_session(pi_coding::SessionOptions {
+            model: faux_model(),
+            cwd: cwd.clone(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
             api_key: "test".to_owned(),
@@ -5400,26 +10702,52 @@ mod tests {
             after_tool_call: None,
             stream_fn: None,
             auth_resolver: None,
+            auth_manager: None,
         })
         .expect("lifecycle session");
-        let recorder = pi_coding::start_session_in(
-            cwd.path(),
-            None,
-            None,
-            Some(cwd.path()),
-            None,
-            None,
-        )
-        .expect("record lifecycle session");
+        let recorder = pi_coding::start_session_in(&cwd, None, None, Some(&cwd), None, None)
+            .expect("record lifecycle session");
         recorder
             .record_message(&Message::user_text("fork text", 1))
             .expect("record fork message");
         recorder.persist_now().expect("persist lifecycle session");
-        session.set_session_dir(cwd.path().to_path_buf());
+        session.set_session_dir(cwd.clone());
         session.record(recorder).expect("attach lifecycle recorder");
         if !cancel {
-            return (cwd, Application::new(session).await);
+            return (root, isolated_application(session).await);
         }
+        let extension_path = cwd.join("fixture-extension");
+        std::fs::write(&extension_path, "fixture").expect("lifecycle extension executable");
+        let manifest_path = cwd.join(pi_coding::PROCESS_EXTENSION_MANIFEST_FILE);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&json!({
+                "schemaVersion": 1,
+                "id": "rpc-lifecycle",
+                "runtime": "process",
+                "executable": "fixture-extension",
+                "capabilities": ["event_hooks"]
+            }))
+            .expect("lifecycle extension manifest"),
+        )
+        .expect("write lifecycle extension manifest");
+        let mut resource_options = pi_coding::ResourceManagerOptions::new(&cwd);
+        resource_options.agent_dir = agent_dir;
+        std::fs::write(
+            resource_options.agent_dir.join("settings.json"),
+            r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+        )
+        .expect("isolated sandbox settings");
+        resource_options.project_trust_override = Some(true);
+        resource_options.disable_skills = true;
+        resource_options.disable_prompt_templates = true;
+        resource_options.disable_themes = true;
+        resource_options.disable_context_files = true;
+        resource_options.explicit_extension_paths = vec![manifest_path];
+        session
+            .attach_resources(pi_coding::ResourceManager::new(resource_options).expect("resources"))
+            .await
+            .expect("attach resources");
         let permissions = pi_coding::ExtensionPermissionSet {
             capabilities: std::collections::BTreeSet::from([
                 pi_coding::ExtensionCapability::EventHooks,
@@ -5431,19 +10759,8 @@ mod tests {
             None,
             pi_coding::ExtensionRuntimeOptions::default(),
         );
-        let report = runtime
-            .load(vec![pi_coding::ExtensionSpec::new(
-                "rpc-lifecycle",
-                cwd.path().join("fixture-extension"),
-                cwd.path(),
-                pi_coding::ExtensionOrigin::Project,
-                true,
-                permissions.clone(),
-            )])
-            .await;
-        assert!(report.failures.is_empty(), "{:?}", report.failures);
         (
-            cwd,
+            root,
             Application::new_with_extensions(session, runtime, permissions).await,
         )
     }
@@ -5453,15 +10770,51 @@ mod tests {
         let (_cwd, app) = build_lifecycle_app(true).await;
         let before = app.state().await;
         let messages = app.messages();
-        let entry_id = app.fork_messages().expect("fork messages")[0].entry_id.clone();
+        let entry_id = app
+            .fork_messages(None, None)
+            .expect("fork messages")
+            .messages[0]
+            .entry_id
+            .clone();
         let switch_path = before.session_file.clone().expect("session file");
         for (command, expected) in [
-            (RpcCommand::NewSession { id: Some("new".into()), parent_session: None }, json!({"cancelled":true})),
-            (RpcCommand::SwitchSession { id: Some("switch".into()), session_path: switch_path.clone() }, json!({"cancelled":true})),
-            (RpcCommand::Fork { id: Some("fork".into()), entry_id: entry_id.clone() }, json!({"text":"","cancelled":true})),
-            (RpcCommand::Clone { id: Some("clone".into()) }, json!({"cancelled":true})),
+            (
+                RpcCommand::NewSession {
+                    id: Some("new".into()),
+                    parent_session: None,
+                    cwd: None,
+                },
+                json!({"cancelled":true}),
+            ),
+            (
+                RpcCommand::SwitchSession {
+                    id: Some("switch".into()),
+                    session_path: switch_path.clone(),
+                    catalog_source: None,
+                    catalog_session_id: None,
+                    catalog_status: None,
+                    response_mode: None,
+                },
+                json!({"cancelled":true}),
+            ),
+            (
+                RpcCommand::Fork {
+                    id: Some("fork".into()),
+                    entry_id: entry_id.clone(),
+                    session_path: None,
+                },
+                json!({"text":"","cancelled":true}),
+            ),
+            (
+                RpcCommand::Clone {
+                    id: Some("clone".into()),
+                    session_path: None,
+                },
+                json!({"cancelled":true}),
+            ),
         ] {
-            let response = handle_command(&app, &settings_state(), &workflows_state(), command).await;
+            let response =
+                handle_command(&app, &settings_state(), &workflows_state(), command).await;
             assert!(response.success, "{response:?}");
             assert_eq!(response.data, Some(expected));
             let after = app.state().await;
@@ -5480,7 +10833,14 @@ mod tests {
             &app,
             &settings_state(),
             &workflows_state(),
-            RpcCommand::SwitchSession { id: Some("switch".into()), session_path: switch_path },
+            RpcCommand::SwitchSession {
+                id: Some("switch".into()),
+                session_path: switch_path,
+                catalog_source: None,
+                catalog_session_id: None,
+                catalog_status: None,
+                response_mode: None,
+            },
         )
         .await;
         assert!(switched.success, "{switched:?}");
@@ -5490,27 +10850,88 @@ mod tests {
             &app,
             &settings_state(),
             &workflows_state(),
-            RpcCommand::NewSession { id: Some("new".into()), parent_session: None },
+            RpcCommand::NewSession {
+                id: Some("new".into()),
+                parent_session: None,
+                cwd: None,
+            },
         )
         .await;
         assert!(created.success, "{created:?}");
         assert_eq!(created.data, Some(json!({"cancelled":false})));
+
+        let empty = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::NewSession {
+                id: Some("new-empty".into()),
+                parent_session: None,
+                cwd: Some("   ".into()),
+            },
+        )
+        .await;
+        assert!(empty.success, "{empty:?}");
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn standalone_new_session_cwd_fails_closed_without_mutating_source() {
+        let (_cwd, app) = build_lifecycle_app(false).await;
+        let before = app.state().await;
+        let messages = app.messages();
+        let target = tempfile::tempdir().expect("target cwd");
+
+        let response = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::NewSession {
+                id: Some("new-target".into()),
+                parent_session: None,
+                cwd: Some(target.path().to_string_lossy().into_owned()),
+            },
+        )
+        .await;
+        assert!(!response.success);
+        assert!(
+            response
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("multi-session Web runtime"))
+        );
+        let after = app.state().await;
+        assert_eq!(after.session_id, before.session_id);
+        assert_eq!(after.session_file, before.session_file);
+        assert_eq!(app.messages(), messages);
         app.cleanup().await;
     }
 
     #[tokio::test]
     async fn fork_rpc_returns_selected_text_and_false_when_not_cancelled() {
         let (_cwd, app) = build_lifecycle_app(false).await;
-        let entry_id = app.fork_messages().expect("fork messages")[0].entry_id.clone();
+        let entry_id = app
+            .fork_messages(None, None)
+            .expect("fork messages")
+            .messages[0]
+            .entry_id
+            .clone();
         let response = handle_command(
             &app,
             &settings_state(),
             &workflows_state(),
-            RpcCommand::Fork { id: Some("fork".into()), entry_id },
+            RpcCommand::Fork {
+                id: Some("fork".into()),
+                entry_id,
+                session_path: None,
+            },
         )
         .await;
         assert!(response.success, "{response:?}");
-        assert_eq!(response.data, Some(json!({"text":"fork text","cancelled":false})));
+        assert_eq!(
+            response.data,
+            Some(json!({"text":"fork text","cancelled":false}))
+        );
         app.cleanup().await;
     }
 
@@ -5533,7 +10954,8 @@ mod tests {
         recorder
             .persist_now()
             .expect("persist clone source session");
-        app.session().set_session_dir(session_dir.path().to_path_buf());
+        app.session()
+            .set_session_dir(session_dir.path().to_path_buf());
         app.session().record(recorder).expect("attach recorder");
         let source_file = app.state().await.session_file.expect("source session file");
 
@@ -5543,6 +10965,7 @@ mod tests {
             &workflows_state(),
             RpcCommand::Clone {
                 id: Some("clone-1".into()),
+                session_path: None,
             },
         )
         .await;
@@ -5561,8 +10984,8 @@ mod tests {
     async fn session_list_rpc_lists_cwd_scoped_native_sessions_and_round_trips_rename() {
         let cwd = tempfile::tempdir().expect("cwd");
         let session_dir = tempfile::tempdir().expect("session dir");
-        let session = pi_coding::Session::new(pi_coding::SessionOptions {
-            model: Model::default(),
+        let session = disabled_session(pi_coding::SessionOptions {
+            model: faux_model(),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -5574,6 +10997,7 @@ mod tests {
             after_tool_call: None,
             stream_fn: None,
             auth_resolver: None,
+            auth_manager: None,
         })
         .expect("session");
         session.set_session_dir(session_dir.path().to_path_buf());
@@ -5591,7 +11015,7 @@ mod tests {
             .expect("record message");
         recorder.persist_now().expect("persist session");
         session.record(recorder).expect("attach recorder");
-        let app = Application::new(session).await;
+        let app = isolated_application(session).await;
 
         // A second recorder under a different cwd must be excluded by the
         // catalog's cwd scope (mirrors the TUI `/sessions` panel).
@@ -5617,7 +11041,10 @@ mod tests {
             &app,
             &settings_state(),
             &workflows_state(),
-            RpcCommand::SessionList { id: Some("list".into()), scope: RpcSessionListScope::Current },
+            RpcCommand::SessionList {
+                id: Some("list".into()),
+                scope: RpcSessionListScope::Current,
+            },
         )
         .await;
         assert!(response.success, "{response:?}");
@@ -5629,7 +11056,7 @@ mod tests {
             .iter()
             .find(|row| row["sessionId"].as_str() == Some(session_id.as_str()))
             .expect("current session row");
-        assert_eq!(row["source"], "pi");
+        assert_eq!(row["source"], "rpi");
         assert_eq!(row["status"], "native");
         assert_eq!(row["cwd"], cwd.path().to_string_lossy().as_ref());
         assert_eq!(row["messageCount"], 1);
@@ -5637,9 +11064,7 @@ mod tests {
         assert!(row["modifiedEpoch"].is_f64());
         assert!(row["displayTime"].as_str().is_some_and(|s| !s.is_empty()));
         assert!(
-            row["path"]
-                .as_str()
-                .is_some_and(|p| p.ends_with(".jsonl")),
+            row["path"].as_str().is_some_and(|p| p.ends_with(".jsonl")),
             "{row:?}"
         );
         assert!(row["name"].is_null());
@@ -5655,7 +11080,11 @@ mod tests {
             &app,
             &settings_state(),
             &workflows_state(),
-            RpcCommand::SetSessionName { id: Some("rename".into()), name: "web demo".into() },
+            RpcCommand::SetSessionName {
+                id: Some("rename".into()),
+                name: "web demo".into(),
+                session_path: None,
+            },
         )
         .await;
         assert!(renamed.success, "{renamed:?}");
@@ -5663,7 +11092,10 @@ mod tests {
             &app,
             &settings_state(),
             &workflows_state(),
-            RpcCommand::SessionList { id: Some("list2".into()), scope: RpcSessionListScope::Current },
+            RpcCommand::SessionList {
+                id: Some("list2".into()),
+                scope: RpcSessionListScope::Current,
+            },
         )
         .await;
         assert!(relisted.success, "{relisted:?}");
@@ -5689,9 +11121,7 @@ mod tests {
         let root = agent.path().join("sessions");
         let project_a = tempfile::tempdir().expect("project A");
         let project_b = tempfile::tempdir().expect("project B");
-        let storage = crate::session_run::SessionStorage::DefaultTree {
-            native_root: root,
-        };
+        let storage = crate::session_run::SessionStorage::DefaultTree { native_root: root };
         let dir_a = storage.session_dir_for(project_a.path()).expect("A dir");
         let dir_b = storage.session_dir_for(project_b.path()).expect("B dir");
         for (cwd, dir, message) in [
@@ -5700,23 +11130,45 @@ mod tests {
         ] {
             let recorder = pi_coding::start_session_in(cwd, None, None, Some(dir), None, None)
                 .expect("record session");
-            recorder.record_message(&Message::user_text(message, 1)).expect("message");
+            recorder
+                .record_message(&Message::user_text(message, 1))
+                .expect("message");
             recorder.persist_now().expect("persist");
         }
-        let session = pi_coding::Session::new(pi_coding::SessionOptions {
-            model: Model::default(), cwd: project_a.path().to_path_buf(), system_prompt: String::new(),
-            thinking_level: ThinkingLevel::Off, api_key: "test".to_owned(), compaction: None,
-            stream_options: Default::default(), tools: Some(Vec::new()), before_tool_call: None,
-            after_tool_call: None, stream_fn: None, auth_resolver: None,
-        }).expect("session");
+        let session = disabled_session(pi_coding::SessionOptions {
+            model: faux_model(),
+            cwd: project_a.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: "test".to_owned(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+            auth_manager: None,
+        })
+        .expect("session");
         session.set_session_dir(dir_a);
-        let app = Application::new(session).await;
+        let app = isolated_application(session).await;
         let response = handle_command_with_session_storage(
-            &app, &settings_state(), &workflows_state(), Some(&storage),
-            RpcCommand::SessionList { id: None, scope: RpcSessionListScope::AllProjects },
-        ).await;
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            Some(&storage),
+            RpcCommand::SessionList {
+                id: None,
+                scope: RpcSessionListScope::AllProjects,
+            },
+        )
+        .await;
         assert!(response.success, "{response:?}");
-        let rows = response.data.expect("catalog")["sessions"].as_array().expect("rows").clone();
+        let rows = response.data.expect("catalog")["sessions"]
+            .as_array()
+            .expect("rows")
+            .clone();
         // Both recorded sessions are unnamed, tiny native Pi sessions in temp
         // workspaces: the AllProjects pipeline keeps them (they carry real
         // messages) and flags them `temporary` — never backend-deleted. (The
@@ -5730,8 +11182,175 @@ mod tests {
             .iter()
             .find(|row| row["cwd"] == project_b.path().to_string_lossy().as_ref())
             .unwrap_or_else(|| panic!("project B row missing: {rows:?}"));
-        assert_eq!(row_a["temporary"], true, "temp-workspace row must be marked temporary: {row_a}");
-        assert_eq!(row_b["temporary"], true, "temp-workspace row must be marked temporary: {row_b}");
+        assert_eq!(
+            row_a["temporary"], true,
+            "temp-workspace row must be marked temporary: {row_a}"
+        );
+        assert_eq!(
+            row_b["temporary"], true,
+            "temp-workspace row must be marked temporary: {row_b}"
+        );
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn session_list_all_projects_loads_deep_omp_record_on_spawn_blocking_thread() {
+        // Unique RPC id keys this test's own off-worker seam entry, so a
+        // concurrent SessionList test (which records under its own id) can
+        // never overwrite or mask this test's record — the seam is
+        // per-invocation, not global last-writer.
+        const SEAM_KEY: &str = "off-worker-deep-omp";
+        SESSION_LIST_LOADER_THREADS
+            .lock()
+            .expect("loader thread seam")
+            .remove(SEAM_KEY);
+        let home = tempfile::tempdir().expect("hermetic catalog home");
+        let catalog = pi_coding::SessionCatalog::new(home.path());
+        let omp_root = catalog.root_for(pi_coding::SessionSourceKind::Omp).path;
+        std::fs::create_dir_all(omp_root.join("--rpc--")).expect("OMP project dir");
+        // Depth 120 stays under serde_json's default recursion limit (128) yet
+        // exercises a deeply-nested diagnostic through the real production
+        // catalog parse path. The fixture must load, not crash.
+        let nested = format!("{}null{}", "[".repeat(120), "]".repeat(120));
+        let omp_path = omp_root.join("--rpc--").join("deep-session.jsonl");
+        std::fs::write(
+            &omp_path,
+            format!(
+                concat!(
+                    r#"{{"type":"session","version":3,"id":"rpc-deep-omp","timestamp":"2026-01-01T00:00:00Z","cwd":"{cwd}"}}"#,
+                    "\n",
+                    r#"{{"type":"message","id":"u","parentId":null,"timestamp":"2026-01-01T00:00:01Z","message":{{"role":"user","content":"deep rpc prompt"}},"diagnostic":{nested}}}"#,
+                    "\n"
+                ),
+                cwd = home.path().join("workspace").display(),
+                nested = nested,
+            ),
+        )
+        .expect("deep OMP fixture");
+        let storage = crate::session_run::SessionStorage::Hermetic {
+            sessions_home: home.path().to_path_buf(),
+        };
+        let cwd = tempfile::tempdir().expect("app cwd");
+        let session = disabled_session(pi_coding::SessionOptions {
+            model: faux_model(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: "test".to_owned(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+            auth_manager: None,
+        })
+        .expect("session");
+        let app = isolated_application(session).await;
+
+        // Under the default current-thread `#[tokio::test]` runtime, the test
+        // body, the `.await` on `handle_command_with_session_storage`, and the
+        // call into `spawn_blocking` all run on this same OS thread — the
+        // async worker. `spawn_blocking` dispatches the closure onto a Tokio
+        // blocking-pool thread, which is always a distinct `ThreadId`. So
+        // capturing the worker id here and comparing it against the seam
+        // deterministically distinguishes `spawn_blocking` from a synchronous
+        // inline call (which would record this same thread id). No sleep, no
+        // timing: the join on `spawn_blocking` happens-before the read below.
+        let async_worker = std::thread::current().id();
+
+        let response = handle_command_with_session_storage(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            Some(&storage),
+            RpcCommand::SessionList {
+                id: Some(SEAM_KEY.to_owned()),
+                scope: RpcSessionListScope::AllProjects,
+            },
+        )
+        .await;
+        assert!(response.success, "{response:?}");
+        let rows = response.data.expect("catalog")["sessions"]
+            .as_array()
+            .expect("rows")
+            .clone();
+        let row = rows
+            .iter()
+            .find(|row| row["sessionId"] == "rpc-deep-omp")
+            .expect("deep OMP session row");
+        assert_eq!(row["summary"], "deep rpc prompt");
+        assert_eq!(row["messageCount"], 1);
+
+        // Off-worker contract: `load_resume_catalog` must have executed on a
+        // `spawn_blocking` thread, never on the async worker driving this test.
+        // Read under this test's unique `SEAM_KEY` so a concurrent SessionList
+        // test cannot overwrite the entry. Fails if `spawn_blocking` is
+        // replaced by a synchronous inline call (loader == async_worker), and
+        // fails if the seam write is removed entirely (no entry under the key
+        // after the `remove` above).
+        let loader = match SESSION_LIST_LOADER_THREADS
+            .lock()
+            .expect("loader thread seam")
+            .get(SEAM_KEY)
+            .copied()
+        {
+            Some(id) => id,
+            None => {
+                panic!("load_resume_catalog did not record its loader thread under `{SEAM_KEY}`")
+            }
+        };
+        assert_ne!(
+            loader, async_worker,
+            "load_resume_catalog must run off the async worker via spawn_blocking, \
+             not inline on the Tokio worker thread"
+        );
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn session_list_worker_panic_is_not_reported_as_cancellation() {
+        let home = tempfile::tempdir().expect("hermetic catalog home");
+        let storage = crate::session_run::SessionStorage::Hermetic {
+            sessions_home: home.path().to_path_buf(),
+        };
+        let cwd = tempfile::tempdir().expect("app cwd");
+        let session = disabled_session(pi_coding::SessionOptions {
+            model: faux_model(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: "test".to_owned(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+            auth_manager: None,
+        })
+        .expect("session");
+        let app = isolated_application(session).await;
+
+        let response = handle_command_with_session_storage(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            Some(&storage),
+            RpcCommand::SessionList {
+                id: Some(SESSION_LIST_PANIC_SEAM_KEY.to_owned()),
+                scope: RpcSessionListScope::AllProjects,
+            },
+        )
+        .await;
+
+        assert!(!response.success, "worker panic must fail the request");
+        assert_eq!(
+            response.error.as_deref(),
+            Some("session catalog scan worker panicked")
+        );
         app.cleanup().await;
     }
 
@@ -5745,9 +11364,9 @@ mod tests {
         assert_eq!(malformed.command, "goal_create");
 
         let created = handle_command(
-                &app,
-                &settings,
-                &workflows_state(),
+            &app,
+            &settings,
+            &workflows_state(),
             RpcCommand::GoalCreate {
                 id: Some("create".into()),
                 objective: "ship safely".into(),
@@ -5760,9 +11379,9 @@ mod tests {
         assert_eq!(created.data.expect("goal")["objective"], "ship safely");
 
         let charged = handle_command(
-                &app,
-                &settings,
-                &workflows_state(),
+            &app,
+            &settings,
+            &workflows_state(),
             RpcCommand::GoalUpdateUsage {
                 id: Some("usage".into()),
                 tokens: 10,
@@ -5772,9 +11391,9 @@ mod tests {
         .await;
         assert!(charged.success, "{charged:?}");
         let state = handle_command(
-                &app,
-                &settings,
-                &workflows_state(),
+            &app,
+            &settings,
+            &workflows_state(),
             RpcCommand::GoalGet {
                 id: Some("get".into()),
             },
@@ -5785,9 +11404,9 @@ mod tests {
         assert_eq!(data["current"]["pauseReason"], "budget_exhausted");
 
         let after_malformed = handle_command(
-                &app,
-                &settings,
-                &workflows_state(),
+            &app,
+            &settings,
+            &workflows_state(),
             RpcCommand::GetState {
                 id: Some("state".into()),
             },
@@ -5813,15 +11432,18 @@ mod tests {
             RpcInput::Command { command, .. } => command,
             RpcInput::ExtensionUiResponse(_) => panic!("expected goal_create command"),
         };
-        assert!(matches!(command, RpcCommand::GoalCreate { activate: true, .. }));
+        assert!(matches!(
+            command,
+            RpcCommand::GoalCreate { activate: true, .. }
+        ));
 
         // Default (activate absent/false) keeps the mutation-only contract:
         // the response is the GOAL wire, not an outcome.
         let app = build_todo_app("faux-rpc-goal-plain", "faux-rpc-goal-plain-api").await;
         let plain = handle_command(
-                &app,
-                &settings,
-                &workflows_state(),
+            &app,
+            &settings,
+            &workflows_state(),
             RpcCommand::GoalCreate {
                 id: Some("plain".into()),
                 objective: "mutation only".into(),
@@ -5833,7 +11455,10 @@ mod tests {
         assert!(plain.success, "{plain:?}");
         let goal = plain.data.expect("goal");
         assert_eq!(goal["objective"], "mutation only");
-        assert!(goal.get("id").is_some(), "mutation-only create resolves with the Goal wire");
+        assert!(
+            goal.get("id").is_some(),
+            "mutation-only create resolves with the Goal wire"
+        );
         app.cleanup().await;
 
         // activate:true mirrors TUI /goal create — create + start work.
@@ -5846,9 +11471,9 @@ mod tests {
             "unexpected activation outcome: {outcome:?}"
         );
         let state = handle_command(
-                &app,
-                &settings,
-                &workflows_state(),
+            &app,
+            &settings,
+            &workflows_state(),
             RpcCommand::GoalGet {
                 id: Some("get".into()),
             },
@@ -5860,20 +11485,22 @@ mod tests {
         assert_eq!(data["current"]["lifecycle"], "active");
 
         // activate:true resume mirrors TUI /goal resume — resume + one turn.
-        assert!(handle_command(
+        assert!(
+            handle_command(
                 &app,
                 &settings,
                 &workflows_state(),
-            RpcCommand::GoalPause {
-                id: Some("pause".into()),
-            },
-        )
-        .await
-        .success);
+                RpcCommand::GoalPause {
+                    id: Some("pause".into()),
+                },
+            )
+            .await
+            .success
+        );
         let resumed = handle_command(
-                &app,
-                &settings,
-                &workflows_state(),
+            &app,
+            &settings,
+            &workflows_state(),
             RpcCommand::GoalResume {
                 id: Some("resume".into()),
                 activate: true,
@@ -5892,8 +11519,8 @@ mod tests {
     #[tokio::test]
     async fn goal_pin_unpin_and_journal_rpc_replay_recorder_backed_session() {
         let cwd = tempfile::tempdir().expect("goal journal cwd");
-        let session = pi_coding::Session::new(pi_coding::SessionOptions {
-            model: Model::default(),
+        let session = disabled_session(pi_coding::SessionOptions {
+            model: faux_model(),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -5905,6 +11532,7 @@ mod tests {
             after_tool_call: None,
             stream_fn: None,
             auth_resolver: None,
+            auth_manager: None,
         })
         .expect("goal journal session");
         let recorder = pi_coding::start_session_in(
@@ -5918,7 +11546,7 @@ mod tests {
         .expect("record goal journal session");
         session.set_session_dir(cwd.path().to_path_buf());
         session.record(recorder).expect("attach recorder");
-        let app = Application::new(session).await;
+        let app = isolated_application(session).await;
         let settings = settings_state();
 
         let created = handle_command(
@@ -5948,8 +11576,8 @@ mod tests {
         assert!(pinned.success, "{pinned:?}");
         assert_eq!(pinned.data.expect("goal")["pins"][0], "stay calm");
 
-        let malformed = parse_input(br#"{"type":"goal_pin","text":7}"#)
-            .expect_err("malformed goal_pin");
+        let malformed =
+            parse_input(br#"{"type":"goal_pin","text":7}"#).expect_err("malformed goal_pin");
         assert!(!malformed.success);
         assert_eq!(malformed.command, "goal_pin");
 
@@ -5976,7 +11604,10 @@ mod tests {
         )
         .await;
         assert!(unpinned.success, "{unpinned:?}");
-        assert_eq!(unpinned.data.expect("goal")["pins"], json!(["double-check"]));
+        assert_eq!(
+            unpinned.data.expect("goal")["pins"],
+            json!(["double-check"])
+        );
 
         let bad_unpin = handle_command(
             &app,
@@ -6021,7 +11652,13 @@ mod tests {
             .collect();
         assert_eq!(
             kinds,
-            ["created", "pins_updated", "pins_updated", "pins_updated", "paused"]
+            [
+                "created",
+                "pins_updated",
+                "pins_updated",
+                "pins_updated",
+                "paused"
+            ]
         );
         assert_eq!(entries[1]["kind"]["pins"], json!(["stay calm"]));
         assert_eq!(
@@ -6046,10 +11683,7 @@ mod tests {
         .await;
         assert!(state.success);
         let state_data = state.data.as_ref().expect("state");
-        assert_eq!(
-            state_data["goal"]["current"]["lifecycle"],
-            "paused"
-        );
+        assert_eq!(state_data["goal"]["current"]["lifecycle"], "paused");
         assert_eq!(
             state_data["goal"]["current"]["pins"],
             json!(["double-check"])
@@ -6060,13 +11694,23 @@ mod tests {
 
     async fn build_settings_app() -> (tempfile::TempDir, Application) {
         let agent = tempfile::tempdir().expect("agent");
+        std::fs::write(
+            agent.path().join("settings.json"),
+            r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+        )
+        .expect("isolated sandbox settings");
         let cwd = tempfile::tempdir().expect("cwd");
         let mut resource_options = pi_coding::ResourceManagerOptions::new(cwd.path());
         resource_options.agent_dir = agent.path().to_path_buf();
         resource_options.project_trust_override = Some(true);
+        resource_options.disable_extensions = true;
+        resource_options.disable_skills = true;
+        resource_options.disable_prompt_templates = true;
+        resource_options.disable_themes = true;
+        resource_options.disable_context_files = true;
         let resources = pi_coding::ResourceManager::new(resource_options).expect("resources");
-        let session = pi_coding::Session::new(pi_coding::SessionOptions {
-            model: Model::default(),
+        let session = disabled_session(pi_coding::SessionOptions {
+            model: faux_model(),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -6078,12 +11722,16 @@ mod tests {
             after_tool_call: None,
             stream_fn: None,
             auth_resolver: None,
+            auth_manager: None,
         })
         .expect("session");
         session
             .attach_resources(resources)
             .await
             .expect("attach resources");
+        let session_dir = cwd.path().join("sessions");
+        std::fs::create_dir_all(&session_dir).expect("settings session dir");
+        session.set_session_dir(session_dir);
         (agent, Application::new(session).await)
     }
 
@@ -6092,9 +11740,9 @@ mod tests {
         let (agent, app) = build_settings_app().await;
         let settings = settings_state();
         let opened = handle_command(
-                &app,
-                &settings,
-                &workflows_state(),
+            &app,
+            &settings,
+            &workflows_state(),
             RpcCommand::SettingsOpenDraft {
                 id: Some("open".into()),
                 scope: pi_coding::SettingsScope::Global,
@@ -6107,9 +11755,9 @@ mod tests {
             .expect("draft id")
             .to_owned();
         let invalid = handle_command(
-                &app,
-                &settings,
-                &workflows_state(),
+            &app,
+            &settings,
+            &workflows_state(),
             RpcCommand::SettingsSet {
                 id: Some("invalid".into()),
                 draft_id: draft_id.clone(),
@@ -6120,9 +11768,9 @@ mod tests {
         .await;
         assert!(!invalid.success);
         let valid = handle_command(
-                &app,
-                &settings,
-                &workflows_state(),
+            &app,
+            &settings,
+            &workflows_state(),
             RpcCommand::SettingsSet {
                 id: Some("set".into()),
                 draft_id: draft_id.clone(),
@@ -6146,9 +11794,9 @@ mod tests {
             .success
         );
         let applied = handle_command(
-                &app,
-                &settings,
-                &workflows_state(),
+            &app,
+            &settings,
+            &workflows_state(),
             RpcCommand::SettingsApply {
                 id: Some("apply".into()),
                 draft_id,
@@ -6177,14 +11825,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settings_rpc_exposes_exact_sandbox_schema() {
+        let (_agent, app) = build_settings_app().await;
+        let response = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::SettingsInspect {
+                id: Some("sandbox-schema".into()),
+            },
+        )
+        .await;
+        assert!(response.success, "{response:?}");
+        let data = response.data.expect("catalog");
+        let keys = data["values"]
+            .as_array()
+            .expect("values")
+            .iter()
+            .filter_map(|value| value["definition"]["key"].as_str())
+            .collect::<Vec<_>>();
+        assert!(keys.contains(&"sandbox.mode"));
+        assert!(keys.contains(&"sandbox.hostHttp"));
+        assert!(!keys.contains(&"sandbox.enabled"));
+        assert!(!keys.contains(&"orchestration.sandboxed"));
+    }
+
+    #[tokio::test]
     async fn set_todos_round_trips_through_application() {
         use pi_coding::{TodoItem, TodoPhase, TodoStatus};
         let app = build_todo_app("faux-rpc-todo-set", "faux-rpc-todo-set-api").await;
         let phases = vec![TodoPhase {
             name: "Plan".into(),
             tasks: vec![
-                TodoItem { id: "task-root".into(), content: "root".into(), status: TodoStatus::InProgress, depends_on: Vec::new(), ready: true, blocked_by: Vec::new(), agent: None },
-                TodoItem { id: "task-do".into(), content: "do".into(), status: TodoStatus::Pending, depends_on: vec!["task-root".into()], ready: false, blocked_by: Vec::new(), agent: None },
+                TodoItem {
+                    id: "task-root".into(),
+                    content: "root".into(),
+                    status: TodoStatus::InProgress,
+                    depends_on: Vec::new(),
+                    ready: true,
+                    waiting_on: Vec::new(),
+                    agent: None,
+                },
+                TodoItem {
+                    id: "task-do".into(),
+                    content: "do".into(),
+                    status: TodoStatus::Pending,
+                    depends_on: vec!["task-root".into()],
+                    ready: false,
+                    waiting_on: Vec::new(),
+                    agent: None,
+                },
             ],
         }];
         let r = handle_command(
@@ -6206,9 +11896,15 @@ mod tests {
         assert_eq!(d["phases"][0]["tasks"][1]["content"], "do");
         assert_eq!(d["phases"][0]["tasks"][1]["status"], "pending");
         assert_eq!(d["phases"][0]["tasks"][1]["id"], "task-do");
-        assert_eq!(d["phases"][0]["tasks"][1]["dependsOn"], json!(["task-root"]));
+        assert_eq!(
+            d["phases"][0]["tasks"][1]["dependsOn"],
+            json!(["task-root"])
+        );
         assert_eq!(d["phases"][0]["tasks"][1]["ready"], false);
-        assert_eq!(d["phases"][0]["tasks"][1]["blockedBy"][0]["taskId"], "task-root");
+        assert_eq!(
+            d["phases"][0]["tasks"][1]["waitingOn"][0]["taskId"],
+            "task-root"
+        );
     }
     #[tokio::test]
     async fn todo_op_rpc_appends_completes_and_reopens_through_application() {
@@ -6237,7 +11933,10 @@ mod tests {
             .as_str()
             .expect("assigned task id")
             .to_owned();
-        assert!(task_id.starts_with("task-"), "append assigns a task id: {task_id}");
+        assert!(
+            task_id.starts_with("task-"),
+            "append assigns a task id: {task_id}"
+        );
 
         // Complete by id; the response carries the transition and new status.
         let done = handle_command(
@@ -6273,11 +11972,14 @@ mod tests {
         .await;
         assert!(reopen.success, "start must succeed: {:?}", reopen.error);
         let reopen_data = reopen.data.expect("reopen data");
-        assert_eq!(reopen_data["phases"][0]["tasks"][0]["status"], "in_progress");
+        assert_eq!(
+            reopen_data["phases"][0]["tasks"][0]["status"],
+            "in_progress"
+        );
 
-        // A blocked start is rejected and the application state is untouched:
-        // append a second task, wire it as a dependency of the first (which is
-        // still in_progress), then try to start it.
+        // Starting a task that is waiting on a dependency is rejected without
+        // mutating application state: append a second task, wire it to the
+        // first (which is still in progress), then try to start it.
         let other = handle_command(
             &app,
             &settings_state(),
@@ -6309,8 +12011,12 @@ mod tests {
             },
         )
         .await;
-        assert!(link.success, "add_dependency must succeed: {:?}", link.error);
-        let blocked = handle_command(
+        assert!(
+            link.success,
+            "add_dependency must succeed: {:?}",
+            link.error
+        );
+        let waiting = handle_command(
             &app,
             &settings_state(),
             &workflows_state(),
@@ -6320,8 +12026,13 @@ mod tests {
             },
         )
         .await;
-        assert!(!blocked.success, "start on a blocked task must fail");
-        assert!(blocked.error.as_deref().is_some_and(|e| e.contains("blocked")));
+        assert!(!waiting.success, "start on a waiting task must fail");
+        assert!(
+            waiting
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("waiting on"))
+        );
         let state = app.todo_state();
         assert_eq!(
             state.phases[0].tasks[1].status,
@@ -6331,23 +12042,43 @@ mod tests {
     }
     #[tokio::test]
     async fn set_todos_with_workflow_id_fails_without_mutating_parent_when_missing() {
-        let app = build_todo_app("faux-rpc-workflow-todo-missing", "faux-rpc-workflow-todo-missing-api").await;
+        let app = build_todo_app(
+            "faux-rpc-workflow-todo-missing",
+            "faux-rpc-workflow-todo-missing-api",
+        )
+        .await;
         let phases = vec![pi_coding::TodoPhase {
             name: "Workflow".into(),
             tasks: vec![pi_coding::TodoItem {
-                id: "scoped".into(), content: "scoped".into(), status: pi_coding::TodoStatus::Pending,
-                depends_on: Vec::new(), ready: true, blocked_by: Vec::new(), agent: None,
+                id: "scoped".into(),
+                content: "scoped".into(),
+                status: pi_coding::TodoStatus::Pending,
+                depends_on: Vec::new(),
+                ready: true,
+                waiting_on: Vec::new(),
+                agent: None,
             }],
         }];
         let response = handle_command(
             &app,
             &settings_state(),
             &workflows_state(),
-            RpcCommand::SetTodos { id: Some("scoped".into()), workflow_id: Some("missing".into()), phases },
-        ).await;
+            RpcCommand::SetTodos {
+                id: Some("scoped".into()),
+                workflow_id: Some("missing".into()),
+                phases,
+            },
+        )
+        .await;
         assert!(!response.success);
-        assert_eq!(response.error.as_deref(), Some("application workflow manager is not configured"));
-        assert!(app.todo_state().phases.is_empty(), "missing workflow must not fall back to parent");
+        assert_eq!(
+            response.error.as_deref(),
+            Some("application workflow manager is not configured")
+        );
+        assert!(
+            app.todo_state().phases.is_empty(),
+            "missing workflow must not fall back to parent"
+        );
     }
     #[tokio::test]
     async fn get_state_exposes_todo_phases() {
@@ -6361,7 +12092,7 @@ mod tests {
                 status: TodoStatus::InProgress,
                 depends_on: Vec::new(),
                 ready: true,
-                blocked_by: Vec::new(),
+                waiting_on: Vec::new(),
                 agent: None,
             }],
         }])
@@ -6382,6 +12113,9 @@ mod tests {
         assert_eq!(d["todoPhases"][0]["tasks"][0]["ready"], true);
         assert_eq!(d["todoPhases"][0]["name"], "Plan");
         assert_eq!(d["todoPhases"][0]["tasks"][0]["status"], "in_progress");
+        assert_eq!(d["todoPhases"][0]["tasks"][0]["waitingOn"], json!([]));
+        assert_eq!(d["todoExecutionStatus"], "dormant");
+        assert_eq!(d["todoFailureReason"], Value::Null);
     }
 
     #[test]
@@ -6430,7 +12164,9 @@ mod tests {
             "worktree must not be absolute: {worktree}"
         );
         let encoded = serde_json::to_string(&data).unwrap();
-        assert!(!crate::workflow_rpc::wire_json_leaks_absolute_path(&encoded));
+        assert!(!crate::workflow_rpc::wire_json_leaks_absolute_path(
+            &encoded
+        ));
 
         let listed = handle_command(
             &app,
@@ -6442,7 +12178,10 @@ mod tests {
         )
         .await;
         assert!(listed.success, "{listed:?}");
-        assert_eq!(listed.data.as_ref().unwrap()["workflows"][0]["workflowId"], workflow_id);
+        assert_eq!(
+            listed.data.as_ref().unwrap()["workflows"][0]["workflowId"],
+            workflow_id
+        );
 
         let got = handle_command(
             &app,
@@ -6456,7 +12195,10 @@ mod tests {
         )
         .await;
         assert!(got.success, "{got:?}");
-        assert_eq!(got.data.as_ref().unwrap()["objective"], "land multi-workflow foundation");
+        assert_eq!(
+            got.data.as_ref().unwrap()["objective"],
+            "land multi-workflow foundation"
+        );
 
         // Host-side absolute path redacted on event wire projection.
         let host = workflows
@@ -6468,17 +12210,18 @@ mod tests {
                 .is_some_and(|p| std::path::Path::new(p).is_absolute()),
             "host keeps absolute path internally for redaction"
         );
-        let event = crate::workflow_rpc::project_workflow_event(
-            &pi_coding::WorkflowEvent::Updated {
+        let event =
+            crate::workflow_rpc::project_workflow_event(&pi_coding::WorkflowEvent::Updated {
                 snapshot: host.clone(),
-            },
-        );
+            });
         let event_json = serde_json::to_value(&event).unwrap();
         assert_eq!(event_json["type"], "workflow_updated");
         assert_eq!(event_json["workflowId"], workflow_id);
         assert_eq!(event_json["generation"], host.generation);
         let event_encoded = serde_json::to_string(&event).unwrap();
-        assert!(!crate::workflow_rpc::wire_json_leaks_absolute_path(&event_encoded));
+        assert!(!crate::workflow_rpc::wire_json_leaks_absolute_path(
+            &event_encoded
+        ));
 
         // LF framing: response + event are one JSON object each.
         let mut buffer = Vec::new();
@@ -6497,12 +12240,14 @@ mod tests {
 
     #[tokio::test]
     async fn workflow_rpc_full_lifecycle_dispatches_pause_resume_cancel_and_remove() {
-        let app = build_todo_app("faux-rpc-workflow-lifecycle", "faux-rpc-workflow-lifecycle-api")
-            .await;
+        let app = build_todo_app(
+            "faux-rpc-workflow-lifecycle",
+            "faux-rpc-workflow-lifecycle-api",
+        )
+        .await;
         let settings = settings_state();
         let workflows = workflows_state();
-        let handle =
-            |command: RpcCommand| handle_command(&app, &settings, &workflows, command);
+        let handle = |command: RpcCommand| handle_command(&app, &settings, &workflows, command);
 
         // create -> queued
         let created = handle(RpcCommand::WorkflowCreate {
@@ -6512,10 +12257,7 @@ mod tests {
         })
         .await;
         assert!(created.success, "{created:?}");
-        let workflow_id = created
-            .data
-            .as_ref()
-            .expect("create data")["workflowId"]
+        let workflow_id = created.data.as_ref().expect("create data")["workflowId"]
             .as_str()
             .expect("workflowId")
             .to_owned();
@@ -6529,7 +12271,10 @@ mod tests {
         assert!(paused.success, "{paused:?}");
         assert_eq!(paused.data.as_ref().unwrap()["status"], "paused");
         assert!(
-            paused.data.as_ref().unwrap()["generation"].as_u64().unwrap() >= 2,
+            paused.data.as_ref().unwrap()["generation"]
+                .as_u64()
+                .unwrap()
+                >= 2,
             "pause must bump the generation"
         );
 
@@ -6581,10 +12326,7 @@ mod tests {
         .await;
         assert!(listed.success, "{listed:?}");
         assert!(
-            listed
-                .data
-                .as_ref()
-                .unwrap()["workflows"]
+            listed.data.as_ref().unwrap()["workflows"]
                 .as_array()
                 .expect("workflows array")
                 .is_empty(),
@@ -6596,8 +12338,7 @@ mod tests {
 
     #[tokio::test]
     async fn workflow_detail_dispatches_panel_projection_through_rpc() {
-        let app = build_todo_app("faux-rpc-workflow-detail", "faux-rpc-workflow-detail-api")
-            .await;
+        let app = build_todo_app("faux-rpc-workflow-detail", "faux-rpc-workflow-detail-api").await;
         let settings = settings_state();
         let workflows = workflows_state();
 
@@ -6613,10 +12354,7 @@ mod tests {
         )
         .await;
         assert!(created.success, "{created:?}");
-        let workflow_id = created
-            .data
-            .as_ref()
-            .expect("create data")["workflowId"]
+        let workflow_id = created.data.as_ref().expect("create data")["workflowId"]
             .as_str()
             .expect("workflowId")
             .to_owned();
@@ -6675,6 +12413,239 @@ mod tests {
         app.cleanup().await;
     }
 
+    #[test]
+    fn workflow_hub_send_parses_camel_case_and_rejects_unknown_fields() {
+        match parse_input(
+            br#"{"type":"workflow_hub_send","id":"whs-1","workflowId":"wf-1","generation":7,"recipient":"writer","body":"ping","replyTo":"msg-1"}"#,
+        )
+        .expect("parse")
+        {
+            RpcInput::Command {
+                command: RpcCommand::WorkflowHubSend {
+                    id,
+                    workflow_id,
+                    generation,
+                    recipient,
+                    body,
+                    reply_to,
+                },
+                ..
+            } => {
+                assert_eq!(id.as_deref(), Some("whs-1"));
+                assert_eq!(workflow_id, "wf-1");
+                assert_eq!(generation, 7);
+                assert_eq!(recipient, "writer");
+                assert_eq!(body, "ping");
+                assert_eq!(reply_to.as_deref(), Some("msg-1"));
+            }
+            other => panic!("expected WorkflowHubSend, got {other:?}"),
+        }
+
+        let err = parse_input(
+            br#"{"type":"workflow_hub_send","workflowId":"wf-1","generation":1,"recipient":"writer","body":"ping","from":"attacker"}"#,
+        )
+        .expect_err("arbitrary from must fail closed");
+        assert!(!err.success);
+        assert_eq!(err.command, "workflow_hub_send");
+        assert!(
+            err.error
+                .as_deref()
+                .is_some_and(|error| error.contains("unknown field") || error.contains("from")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_hub_send_rejects_unknown_stale_broadcast_and_empty_body() {
+        let app = build_todo_app("faux-rpc-workflow-hub", "faux-rpc-workflow-hub-api").await;
+        let settings = settings_state();
+        let workflows = workflows_state();
+        let handle = |command: RpcCommand| handle_command(&app, &settings, &workflows, command);
+
+        let created = handle(RpcCommand::WorkflowCreate {
+            id: Some("hub-create".into()),
+            name: "ship".into(),
+            objective: "land hub send".into(),
+        })
+        .await;
+        assert!(created.success, "{created:?}");
+        let workflow_id = created.data.as_ref().expect("create data")["workflowId"]
+            .as_str()
+            .expect("workflowId")
+            .to_owned();
+        let generation = created.data.as_ref().unwrap()["generation"]
+            .as_u64()
+            .expect("generation");
+
+        let unknown = handle(RpcCommand::WorkflowHubSend {
+            id: Some("hub-unknown".into()),
+            workflow_id: "missing-workflow".into(),
+            generation,
+            recipient: "writer".into(),
+            body: "ping".into(),
+            reply_to: None,
+        })
+        .await;
+        assert!(!unknown.success, "{unknown:?}");
+        assert_eq!(unknown.command, "workflow_hub_send");
+        assert_eq!(unknown.id.as_deref(), Some("hub-unknown"));
+        assert!(
+            unknown.error.as_deref().is_some_and(|error| {
+                error.contains("not found") || error.contains("not configured")
+            }),
+            "{unknown:?}"
+        );
+
+        let stale = handle(RpcCommand::WorkflowHubSend {
+            id: Some("hub-stale".into()),
+            workflow_id: workflow_id.clone(),
+            generation: generation.saturating_add(1),
+            recipient: "writer".into(),
+            body: "ping".into(),
+            reply_to: None,
+        })
+        .await;
+        assert!(!stale.success, "{stale:?}");
+        assert_eq!(stale.command, "workflow_hub_send");
+        assert!(
+            stale
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("stale")
+                    || error.contains("not found")
+                    || error.contains("not configured")),
+            "{stale:?}"
+        );
+
+        let broadcast = handle(RpcCommand::WorkflowHubSend {
+            id: Some("hub-broadcast".into()),
+            workflow_id: workflow_id.clone(),
+            generation,
+            recipient: "all".into(),
+            body: "ping".into(),
+            reply_to: None,
+        })
+        .await;
+        assert!(!broadcast.success, "{broadcast:?}");
+        assert_eq!(broadcast.command, "workflow_hub_send");
+        assert!(
+            broadcast
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("broadcast")),
+            "{broadcast:?}"
+        );
+
+        let empty = handle(RpcCommand::WorkflowHubSend {
+            id: Some("hub-empty".into()),
+            workflow_id,
+            generation,
+            recipient: "writer".into(),
+            body: "   ".into(),
+            reply_to: None,
+        })
+        .await;
+        assert!(!empty.success, "{empty:?}");
+        assert_eq!(empty.command, "workflow_hub_send");
+        assert!(
+            empty
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("body")),
+            "{empty:?}"
+        );
+
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn workflow_hub_send_runtime_unavailable_is_a_command_failure() {
+        let app = build_todo_app(
+            "faux-rpc-workflow-hub-unavailable",
+            "faux-rpc-workflow-hub-unavailable-api",
+        )
+        .await;
+        let settings = settings_state();
+        let workflows = workflows_state();
+        let created = handle_command(
+            &app,
+            &settings,
+            &workflows,
+            RpcCommand::WorkflowCreate {
+                id: Some("hub-unavailable-create".into()),
+                name: "ship".into(),
+                objective: "resident send".into(),
+            },
+        )
+        .await;
+        assert!(created.success, "{created:?}");
+        let workflow_id = created.data.as_ref().unwrap()["workflowId"]
+            .as_str()
+            .expect("workflowId")
+            .to_owned();
+        let generation = created.data.as_ref().unwrap()["generation"]
+            .as_u64()
+            .expect("generation");
+
+        let sent = handle_command(
+            &app,
+            &settings,
+            &workflows,
+            RpcCommand::WorkflowHubSend {
+                id: Some("hub-unavailable".into()),
+                workflow_id,
+                generation,
+                recipient: "Main".into(),
+                body: "status?".into(),
+                reply_to: None,
+            },
+        )
+        .await;
+        assert!(!sent.success, "{sent:?}");
+        assert_eq!(sent.command, "workflow_hub_send");
+        assert_eq!(sent.id.as_deref(), Some("hub-unavailable"));
+        assert!(
+            sent.error.as_deref().is_some_and(|error| {
+                error.contains("unavailable") || error.contains("not configured")
+            }),
+            "{sent:?}"
+        );
+        assert!(sent.data.is_none(), "{sent:?}");
+        app.cleanup().await;
+    }
+
+    #[test]
+    fn workflow_hub_send_wire_requires_clients_to_check_each_receipt() {
+        let data = workflow_hub_send_response_data(
+            "workflow-1".into(),
+            7,
+            "worker".into(),
+            vec![pi_coding::DeliveryReceipt {
+                to: "worker".into(),
+                outcome: pi_coding::DeliveryOutcome::Failed,
+                requested: None,
+                message_id: Some("message-1".into()),
+                error: Some("orchestration mailbox is full".into()),
+            }],
+        );
+        let response = RpcResponse::success(
+            Some("hub-failed-receipt".into()),
+            "workflow_hub_send",
+            Some(data),
+        );
+        assert!(
+            response.success,
+            "accepted dispatch is a successful RPC response"
+        );
+        assert!(response.error.is_none());
+        let receipt = &response.data.as_ref().unwrap()["receipts"][0];
+        assert_eq!(receipt["to"], "worker");
+        assert!(receipt["requested"].is_null(), "{receipt}");
+        assert_eq!(receipt["outcome"], "failed");
+        assert_eq!(receipt["messageId"], "message-1");
+        assert_eq!(receipt["error"], "orchestration mailbox is full");
+    }
+
     struct CatalogExtensionHost;
 
     struct CatalogExtensionTransport {
@@ -6691,7 +12662,10 @@ mod tests {
         }
 
         fn push(&self, frame: pi_coding::ExtensionFrame) {
-            self.frames.lock().expect("extension frame queue").push_back(Some(frame));
+            self.frames
+                .lock()
+                .expect("extension frame queue")
+                .push_back(Some(frame));
             self.ready.notify_one();
         }
     }
@@ -6733,13 +12707,24 @@ mod tests {
                             });
                         }
                     }
+                    let value = match request {
+                        pi_coding::ExtensionHostRequest::Invoke {
+                            invocation:
+                                pi_coding::ExtensionInvocation::Command { name, .. },
+                            ..
+                        } if name == "extension-only" => serde_json::Value::String("pong".to_owned()),
+                        _ => serde_json::Value::Null,
+                    };
                     self.push(pi_coding::ExtensionFrame::Response {
                         id: id.clone(),
-                        result: pi_coding::ProtocolResult::Success { value: Value::Null },
+                        result: pi_coding::ProtocolResult::Success { value },
                     });
                 }
                 pi_coding::ExtensionHostFrame::Shutdown { .. } => {
-                    self.frames.lock().expect("extension frame queue").push_back(None);
+                    self.frames
+                        .lock()
+                        .expect("extension frame queue")
+                        .push_back(None);
                     self.ready.notify_one();
                 }
                 pi_coding::ExtensionHostFrame::Response { .. }
@@ -6754,7 +12739,12 @@ mod tests {
             Box::pin(async move {
                 loop {
                     let notified = self.ready.notified();
-                    if let Some(frame) = self.frames.lock().expect("extension frame queue").pop_front() {
+                    if let Some(frame) = self
+                        .frames
+                        .lock()
+                        .expect("extension frame queue")
+                        .pop_front()
+                    {
                         return Ok(frame);
                     }
                     notified.await;
@@ -6775,7 +12765,8 @@ mod tests {
         fn launch(
             &self,
             _launch: pi_coding::ExtensionLaunch,
-        ) -> pi_coding::ExtensionFuture<'_, Result<Arc<dyn pi_coding::ExtensionTransport>>> {
+        ) -> pi_coding::ExtensionFuture<'_, Result<Arc<dyn pi_coding::ExtensionTransport>>>
+        {
             Box::pin(async {
                 Ok(Arc::new(CatalogExtensionTransport::new())
                     as Arc<dyn pi_coding::ExtensionTransport>)
@@ -6783,9 +12774,10 @@ mod tests {
         }
     }
 
-    async fn build_command_catalog_app() -> (tempfile::TempDir, Application) {
+    async fn build_command_catalog_app() -> (tempfile::TempDir, tempfile::TempDir, Application) {
         let cwd = tempfile::tempdir().expect("catalog cwd");
-        let prompt_dir = cwd.path().join(".pi/prompts");
+        let agent_dir = tempfile::tempdir().expect("catalog agent dir");
+        let prompt_dir = cwd.path().join(".rpi/prompts");
         std::fs::create_dir_all(&prompt_dir).expect("prompt directory");
         for (name, description) in [
             ("help", "Conflicts with builtin help"),
@@ -6798,16 +12790,31 @@ mod tests {
             )
             .expect("prompt template");
         }
-        let skill_dir = cwd.path().join(".pi/skills/catalog-skill");
+        let skill_dir = cwd.path().join(".rpi/skills/catalog-skill");
         std::fs::create_dir_all(&skill_dir).expect("skill directory");
         std::fs::write(
             skill_dir.join("SKILL.md"),
             "---\nname: catalog-skill\ndescription: Skill only command\n---\nskill body\n",
         )
         .expect("skill definition");
+        let extension_path = cwd.path().join("fixture-extension");
+        std::fs::write(&extension_path, "fixture").expect("catalog extension executable");
+        let manifest_path = cwd.path().join(pi_coding::PROCESS_EXTENSION_MANIFEST_FILE);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&json!({
+                "schemaVersion": 1,
+                "id": "rpc-catalog",
+                "runtime": "process",
+                "executable": "fixture-extension",
+                "capabilities": ["commands"]
+            }))
+            .expect("catalog extension manifest"),
+        )
+        .expect("write catalog extension manifest");
 
-        let session = pi_coding::Session::new(pi_coding::SessionOptions {
-            model: Model::default(),
+        let session = disabled_session(pi_coding::SessionOptions {
+            model: faux_model(),
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
@@ -6819,14 +12826,31 @@ mod tests {
             after_tool_call: None,
             stream_fn: None,
             auth_resolver: None,
+            auth_manager: None,
         })
         .expect("catalog session");
         let mut resource_options = pi_coding::ResourceManagerOptions::new(cwd.path());
+        resource_options.agent_dir = agent_dir.path().to_path_buf();
+        std::fs::create_dir_all(resource_options.agent_dir.join("agents"))
+            .expect("catalog global agents dir");
+        std::fs::create_dir_all(cwd.path().join(".rpi/agents"))
+            .expect("catalog project agents dir");
+        std::fs::write(
+            resource_options.agent_dir.join("settings.json"),
+            r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+        )
+        .expect("isolated sandbox settings");
         resource_options.project_trust_override = Some(true);
+        resource_options.disable_context_files = true;
+        resource_options.disable_themes = true;
+        resource_options.explicit_extension_paths = vec![manifest_path];
         session
             .attach_resources(pi_coding::ResourceManager::new(resource_options).expect("resources"))
             .await
             .expect("attach resources");
+        let session_dir = cwd.path().join("sessions");
+        std::fs::create_dir_all(&session_dir).expect("catalog session dir");
+        session.set_session_dir(session_dir);
 
         let permissions = pi_coding::ExtensionPermissionSet {
             capabilities: std::collections::BTreeSet::from([
@@ -6839,25 +12863,16 @@ mod tests {
             None,
             pi_coding::ExtensionRuntimeOptions::default(),
         );
-        let spec = pi_coding::ExtensionSpec::new(
-            "rpc-catalog",
-            cwd.path().join("fixture-extension"),
-            cwd.path(),
-            pi_coding::ExtensionOrigin::Project,
-            true,
-            permissions.clone(),
-        );
-        let report = runtime.load(vec![spec]).await;
-        assert!(report.failures.is_empty(), "{:?}", report.failures);
         (
             cwd,
+            agent_dir,
             Application::new_with_extensions(session, runtime, permissions).await,
         )
     }
 
     #[tokio::test]
     async fn get_commands_projects_executable_catalog_with_loaded_skills() {
-        let (_cwd, app) = build_command_catalog_app().await;
+        let (_cwd, _agent_dir, app) = build_command_catalog_app().await;
         let response = handle_command(
             &app,
             &settings_state(),
@@ -6934,7 +12949,10 @@ mod tests {
             .iter()
             .find(|command| command["name"] == "shared")
             .expect("shared winner present");
-        assert_eq!(shared["source"], "prompt", "prompt wins the dynamic collision");
+        assert_eq!(
+            shared["source"], "prompt",
+            "prompt wins the dynamic collision"
+        );
 
         // Dynamic prompt + extension commands are projected on the wire (the
         // Web picker filters its own executable surface) — but conflicts never
@@ -6987,8 +13005,30 @@ mod tests {
             .as_array()
             .cloned()
             .expect("commands array");
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command["name"] == "todo")
+                .count(),
+            1,
+            "expected exactly one todo command in {commands:?}"
+        );
         assert!(
-            commands.iter().any(|c| c["name"] == "workflow"),
+            !commands
+                .iter()
+                .any(|command| command["name"] == "todo-child"),
+            "todo-child must not be advertised in {commands:?}"
+        );
+        let todo = commands
+            .iter()
+            .find(|command| command["name"] == "todo")
+            .expect("unified todo command");
+        assert_eq!(
+            todo["argumentHint"],
+            "[list|new [label]|select <id>|send [id] <message>|add <id> [options] <task>|status [id]|pause [id]|resume [id]|stop [id]|cancel [id]|archive <id>|start <task>|done <task>|drop <task>|clear|<markdown>]"
+        );
+        assert!(
+            commands.iter().any(|command| command["name"] == "workflow"),
             "expected workflow in {commands:?}"
         );
         // Every command carries a lowercase source string.
@@ -7026,15 +13066,15 @@ mod tests {
         })
     }
 
-    async fn build_side_chat_app(model_id: &str) -> Application {
-        let mut model = Model::default();
+    async fn build_side_chat_app(
+        model_id: &str,
+        stream_fn: pi_agent::StreamFn,
+    ) -> (tempfile::TempDir, tempfile::TempDir, Application) {
+        let mut model = faux_model();
         model.id = model_id.into();
         model.name = model_id.into();
-        model.api = format!("{model_id}-api");
-        model.provider = "faux".into();
-        model.base_url = "http://localhost:0".into();
         let cwd = tempfile::tempdir().expect("tempdir");
-        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+        let session = disabled_session(pi_coding::SessionOptions {
             model,
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
@@ -7045,11 +13085,21 @@ mod tests {
             tools: Some(Vec::new()),
             before_tool_call: None,
             after_tool_call: None,
-            stream_fn: Some(reply_stream("side reply")),
+            stream_fn: Some(stream_fn),
             auth_resolver: None,
+            auth_manager: None,
         })
         .expect("session");
-        Application::new(session).await
+        let session_dir = cwd.path().join(".pi-test-sessions");
+        std::fs::create_dir_all(&session_dir).expect("session dir");
+        session.set_session_dir(session_dir);
+        let agent = tempfile::tempdir().expect("agent");
+        session
+            .attach_resources(isolated_resources(cwd.path(), agent.path()))
+            .await
+            .expect("attach resources");
+        let app = Application::new(session).await;
+        (cwd, agent, app)
     }
 
     /// Build an Application whose session cwd is `cwd` and whose provider stream
@@ -7057,13 +13107,25 @@ mod tests {
     /// `CodeReviewController::fork_from` forks the side-chat conversation (no
     /// provider call), and comment submissions resolve through `reply_stream`.
     async fn build_code_review_app(cwd: &Path) -> Application {
-        let mut model = Model::default();
+        build_code_review_app_with_stream(cwd, reply_stream("review reply")).await
+    }
+
+    async fn build_code_review_app_with_stream(cwd: &Path, stream_fn: pi_agent::StreamFn) -> Application {
+        let mut model = faux_model();
         model.id = "faux-rpc-code-review".into();
         model.name = "faux-rpc-code-review".into();
-        model.api = "faux-rpc-code-review-api".into();
-        model.provider = "faux".into();
-        model.base_url = "http://localhost:0".into();
-        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+        let agent_root = Arc::new(tempfile::tempdir().expect("review agent root"));
+        let retained_root = agent_root.clone();
+        let stream_fn: pi_agent::StreamFn = Arc::new(move |model, context, options| {
+            let retained_root = retained_root.clone();
+            let response = stream_fn(model, context, options);
+            Box::pin(async move {
+                let response = response.await;
+                drop(retained_root);
+                response
+            })
+        });
+        let session = disabled_session(pi_coding::SessionOptions {
             model,
             cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
@@ -7074,20 +13136,1100 @@ mod tests {
             tools: Some(Vec::new()),
             before_tool_call: None,
             after_tool_call: None,
-            stream_fn: Some(reply_stream("review reply")),
+            stream_fn: Some(stream_fn),
             auth_resolver: None,
+            auth_manager: None,
         })
         .expect("code-review session");
+        let resources = isolated_resources(cwd, agent_root.path());
+        let session_dir = cwd.join(".pi-test-sessions");
+        std::fs::create_dir_all(&session_dir).expect("review session dir");
+        session.set_session_dir(session_dir);
+        session.attach_resources(resources).await.expect("review resources");
         Application::new(session).await
+    }
+
+    async fn code_review_file_diff_cache_paths(
+        code_review: &CodeReviewRpcState,
+    ) -> Vec<String> {
+        let state = code_review.state.lock().await;
+        let Some(session) = state.session.as_ref() else {
+            return Vec::new();
+        };
+        let mut paths: Vec<String> =
+            session.file_diff_cache.entries.keys().cloned().collect();
+        paths.sort();
+        paths
+    }
+
+    fn file_diff_page_text(page: &Value) -> String {
+        page["hunks"]
+            .as_array()
+            .expect("page hunks")
+            .iter()
+            .flat_map(|hunk| hunk["lines"].as_array().expect("hunk lines"))
+            .filter_map(|line| line["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn synthetic_file_diff(path: &str, text_len: usize) -> Arc<FileDiff> {
+        use crate::code_review::{DiffLine, FileStatus};
+        Arc::new(FileDiff {
+            path: path.into(),
+            previous_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            hunks: vec![DiffHunk {
+                header: "@@ -1 +1,2 @@".into(),
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 2,
+                lines: vec![DiffLine {
+                    kind: DiffLineKind::Addition,
+                    old_no: None,
+                    new_no: Some(2),
+                    text: "x".repeat(text_len),
+                }],
+            }],
+            byte_capped: false,
+            error: None,
+        })
+    }
+
+    #[test]
+    fn file_diff_cache_evicts_lru_at_entry_cap_and_refreshes_on_hit() {
+        let mut cache = FileDiffCache::new(2, usize::MAX);
+        cache.put("a".into(), synthetic_file_diff("a", 10));
+        cache.put("b".into(), synthetic_file_diff("b", 10));
+        assert!(cache.get("a").is_some());
+        cache.put("c".into(), synthetic_file_diff("c", 10));
+        assert!(
+            cache.peek("a").is_some(),
+            "recently hit entry survives eviction"
+        );
+        assert!(cache.peek("c").is_some(), "newest entry survives eviction");
+        assert!(
+            cache.peek("b").is_none(),
+            "least-recently-used entry is evicted"
+        );
+    }
+
+    #[test]
+    fn file_diff_cache_bounds_bytes_and_never_caches_oversize_entries() {
+        let small = synthetic_file_diff("small", 10);
+        let large = synthetic_file_diff("large", 5000);
+        assert!(large.estimated_heap_bytes() > 5000);
+        assert!(
+            large.estimated_heap_bytes() >= small.estimated_heap_bytes() + 4990,
+            "line text bytes must dominate the estimate"
+        );
+
+        let small_estimate = small.estimated_heap_bytes();
+        let large_estimate = large.estimated_heap_bytes();
+        assert!(small_estimate > 0);
+        assert!(
+            small_estimate * 2 < large_estimate,
+            "fixture text sizes must dominate structural overhead"
+        );
+
+        let mut cache = FileDiffCache::new(usize::MAX, small_estimate * 2 - 1);
+        cache.put("large".into(), synthetic_file_diff("large", 5000));
+        assert!(
+            cache.peek("large").is_none(),
+            "oversize single value must be returned uncached"
+        );
+        assert_eq!(cache.entries.len(), 0);
+        assert_eq!(cache.bytes, 0);
+
+        cache.put("s1".into(), synthetic_file_diff("s1", 10));
+        cache.put("s2".into(), synthetic_file_diff("s2", 10));
+        assert_eq!(cache.entries.len(), 1, "byte cap evicts down to one entry");
+        assert!(
+            cache.bytes <= small_estimate * 2 - 1,
+            "cache must stay within its byte cap: {}",
+            cache.bytes
+        );
+        assert!(cache.peek("s2").is_some(), "most recent entry survives");
+        assert!(cache.peek("s1").is_none(), "LRU entry evicted on byte cap");
+    }
+
+    #[test]
+    fn file_diff_cache_entry_weight_charges_key_and_documented_overhead_exactly() {
+        let key = "k0".to_owned();
+        let diff = synthetic_file_diff(&key, 16);
+        let weight =
+            diff.estimated_heap_bytes() + key.capacity() + FILE_DIFF_CACHE_ENTRY_OVERHEAD_BYTES;
+
+        let mut cache = FileDiffCache::new(usize::MAX, weight);
+        cache.put(key, diff);
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.bytes, weight, "one entry weighs key + overhead + diff");
+
+        cache.put("k1".into(), synthetic_file_diff("k1", 16));
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.bytes, weight);
+        assert!(cache.peek("k1").is_some());
+        assert!(cache.peek("k0").is_none(), "LRU entry evicted at the exact cap");
+
+        let mut two = FileDiffCache::new(usize::MAX, 2 * weight);
+        two.put("k0".into(), synthetic_file_diff("k0", 16));
+        two.put("k1".into(), synthetic_file_diff("k1", 16));
+        assert_eq!(two.entries.len(), 2);
+        assert_eq!(two.bytes, 2 * weight);
+        two.put("k2".into(), synthetic_file_diff("k2", 16));
+        assert_eq!(two.entries.len(), 2);
+        assert_eq!(two.bytes, 2 * weight);
+        assert!(two.peek("k2").is_some());
+        assert!(two.peek("k1").is_some());
+        assert!(two.peek("k0").is_none());
+    }
+
+    #[test]
+    fn file_diff_cache_replacement_charges_the_retained_key_exactly() {
+        let diff = synthetic_file_diff("dup", 16);
+        let small = "dup".to_owned();
+        let mut big = String::with_capacity(4096);
+        big.push_str("dup");
+        let small_capacity = small.capacity();
+        let small_weight =
+            diff.estimated_heap_bytes() + small.capacity() + FILE_DIFF_CACHE_ENTRY_OVERHEAD_BYTES;
+        let big_weight =
+            diff.estimated_heap_bytes() + big.capacity() + FILE_DIFF_CACHE_ENTRY_OVERHEAD_BYTES;
+        let mut cache = FileDiffCache::new(usize::MAX, big_weight.max(small_weight) * 2);
+
+        cache.put(small, diff.clone());
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.bytes, small_weight);
+        assert_eq!(
+            cache.entries.get_key_value("dup").map(|(key, _)| key.capacity()),
+            Some(small_capacity),
+            "the map retains exactly the key it charged"
+        );
+
+        cache.put(big, synthetic_file_diff("dup", 16));
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(
+            cache.entries.get_key_value("dup").map(|(key, _)| key.capacity()),
+            Some(4096),
+            "replacement retains exactly the new key"
+        );
+        assert_eq!(cache.bytes, big_weight);
+
+        cache.put("dup".to_owned(), synthetic_file_diff("dup", 16));
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(
+            cache.entries.get_key_value("dup").map(|(key, _)| key.capacity()),
+            Some(small_capacity),
+            "replacement retains exactly the new key in the reverse direction"
+        );
+        assert_eq!(cache.bytes, small_weight);
+    }
+
+    #[tokio::test]
+    async fn code_review_file_diff_cache_clears_on_refresh() {
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(cwd.path().join("single.txt"), "base\n").expect("write base");
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "init"]).status.success());
+        std::fs::write(cwd.path().join("single.txt"), "base\nchanged\n").expect("write changed");
+        assert!(git(&["add", "single.txt"]).status.success());
+
+        let app = build_code_review_app(cwd.path()).await;
+        let code_review = CodeReviewRpcState::default();
+        let opened = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen {
+                id: None,
+                commit: None,
+                from: None,
+                to: None,
+                include_working_tree: None,
+            },
+        )
+        .await;
+        assert!(opened.success, "{opened:?}");
+        let snapshot_id = opened.data.as_ref().expect("open data")["snapshotId"]
+            .as_str()
+            .expect("snapshot id")
+            .to_owned();
+
+        let loaded = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewFileDiff {
+                id: None,
+                snapshot_id: snapshot_id.clone(),
+                path: "single.txt".into(),
+                cursor: 0,
+                max_lines: Some(25),
+            },
+        )
+        .await;
+        assert!(loaded.success, "{loaded:?}");
+        assert_eq!(
+            code_review_file_diff_cache_paths(&code_review).await,
+            vec!["single.txt".to_owned()],
+            "successful load must be cached"
+        );
+
+        std::fs::write(cwd.path().join("single.txt"), "base\nchanged2\n").expect("write changed2");
+        assert!(git(&["add", "single.txt"]).status.success());
+        let refreshed = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewRefresh { id: None },
+        )
+        .await;
+        assert!(refreshed.success, "{refreshed:?}");
+        assert!(
+            code_review_file_diff_cache_paths(&code_review).await.is_empty(),
+            "refresh must clear the file-diff cache"
+        );
+
+        let closed = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewClose { id: None, review_id: None },
+        )
+        .await;
+        assert!(closed.success);
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn code_review_refresh_pages_refreshed_pinned_authority() {
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(cwd.path().join("tracked.txt"), "v1\n").expect("write base");
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "init"]).status.success());
+        std::fs::write(cwd.path().join("untracked.txt"), "u1\n").expect("write untracked");
+
+        let app = build_code_review_app(cwd.path()).await;
+        let code_review = CodeReviewRpcState::default();
+        let opened = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen {
+                id: None,
+                commit: None,
+                from: None,
+                to: None,
+                include_working_tree: None,
+            },
+        )
+        .await;
+        assert!(opened.success, "{opened:?}");
+        let snapshot_id = opened.data.as_ref().expect("open data")["snapshotId"]
+            .as_str()
+            .expect("snapshot id")
+            .to_owned();
+
+        let open_page = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewFileDiff {
+                id: None,
+                snapshot_id: snapshot_id.clone(),
+                path: "untracked.txt".into(),
+                cursor: 0,
+                max_lines: Some(25),
+            },
+        )
+        .await;
+        assert!(open_page.success, "{open_page:?}");
+        let open_text = file_diff_page_text(open_page.data.as_ref().expect("open page"));
+        assert!(open_text.contains("u1"), "{open_text:?}");
+        assert!(!open_text.contains("u2"), "{open_text:?}");
+
+        std::fs::write(cwd.path().join("tracked.txt"), "v2\n").expect("mutate tracked");
+        assert!(git(&["checkout", "-q", "-b", "feature"]).status.success());
+        std::fs::write(cwd.path().join("untracked.txt"), "u2\n").expect("rewrite untracked");
+        let refreshed = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewRefresh { id: None },
+        )
+        .await;
+        assert!(refreshed.success, "{refreshed:?}");
+        let refreshed_id = refreshed.data.as_ref().expect("refresh data")["snapshotId"]
+            .as_str()
+            .expect("snapshot id")
+            .to_owned();
+        assert_ne!(
+            refreshed_id, snapshot_id,
+            "mutation + untracked rewrite must flip the snapshot identity"
+        );
+
+        let refreshed_page = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewFileDiff {
+                id: None,
+                snapshot_id: refreshed_id.clone(),
+                path: "untracked.txt".into(),
+                cursor: 0,
+                max_lines: Some(25),
+            },
+        )
+        .await;
+        assert!(refreshed_page.success, "{refreshed_page:?}");
+        let page = refreshed_page.data.as_ref().expect("refreshed page");
+        assert_eq!(page["snapshotId"], refreshed_id);
+        let text = file_diff_page_text(page);
+        assert!(
+            text.contains("u2"),
+            "post-refresh paging must serve the refreshed untracked pin: {text:?}"
+        );
+        assert!(
+            !text.contains("u1"),
+            "the open-time pin must not survive the refresh: {text:?}"
+        );
+
+        let tracked_page = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewFileDiff {
+                id: None,
+                snapshot_id: refreshed_id.clone(),
+                path: "tracked.txt".into(),
+                cursor: 0,
+                max_lines: Some(25),
+            },
+        )
+        .await;
+        assert!(tracked_page.success, "{tracked_page:?}");
+        let tracked_text =
+            file_diff_page_text(tracked_page.data.as_ref().expect("tracked page"));
+        assert!(
+            tracked_text.contains("v2"),
+            "post-refresh paging must serve the refreshed tracked state: {tracked_text:?}"
+        );
+
+        let closed = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewClose { id: None, review_id: None },
+        )
+        .await;
+        assert!(closed.success);
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn code_review_file_diff_cache_evicts_lru_and_reloads_evicted_file() {
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"]).status.success();
+        git(&["config", "user.name", "Test"]).status.success();
+        for index in 0..40 {
+            std::fs::write(cwd.path().join(format!("f{index:02}.txt")), "base\n")
+                .expect("write base");
+        }
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "init"]).status.success());
+        for index in 0..40 {
+            std::fs::write(
+                cwd.path().join(format!("f{index:02}.txt")),
+                format!("base\nchanged-{index}\n"),
+            )
+            .expect("write changed");
+        }
+        assert!(git(&["add", "."]).status.success());
+
+        let app = build_code_review_app(cwd.path()).await;
+        let code_review = CodeReviewRpcState::default();
+        let opened = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen {
+                id: None,
+                commit: None,
+                from: None,
+                to: None,
+                include_working_tree: None,
+            },
+        )
+        .await;
+        assert!(opened.success, "{opened:?}");
+        let snapshot_id = opened.data.as_ref().expect("open data")["snapshotId"]
+            .as_str()
+            .expect("snapshot id")
+            .to_owned();
+        let files = opened.data.as_ref().expect("open data")["files"]
+            .as_array()
+            .expect("files")
+            .clone();
+        assert!(
+            files.len() > FILE_DIFF_CACHE_MAX_ENTRIES,
+            "fixture must visit more files than the entry cap"
+        );
+
+        for file in &files {
+            let path = file["path"].as_str().expect("path").to_owned();
+            let response = handle_code_review_command(
+                &app,
+                &code_review,
+                RpcCommand::CodeReviewFileDiff {
+                    id: None,
+                    snapshot_id: snapshot_id.clone(),
+                    path,
+                    cursor: 0,
+                    max_lines: Some(25),
+                },
+            )
+            .await;
+            assert!(response.success, "{response:?}");
+        }
+
+        let cached = code_review_file_diff_cache_paths(&code_review).await;
+        assert!(
+            cached.len() <= FILE_DIFF_CACHE_MAX_ENTRIES,
+            "cache must be bounded by the entry cap: {} entries",
+            cached.len()
+        );
+        let first_path = files[0]["path"].as_str().expect("path").to_owned();
+        let last_path = files[files.len() - 1]["path"].as_str().expect("path").to_owned();
+        assert!(
+            !cached.iter().any(|path| *path == first_path),
+            "first visited (LRU) path must be evicted: {cached:?}"
+        );
+        assert!(
+            cached.iter().any(|path| *path == last_path),
+            "most recently used path must survive: {cached:?}"
+        );
+
+        let reloaded = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewFileDiff {
+                id: None,
+                snapshot_id: snapshot_id.clone(),
+                path: first_path.clone(),
+                cursor: 0,
+                max_lines: Some(25),
+            },
+        )
+        .await;
+        assert!(reloaded.success, "{reloaded:?}");
+        let page = reloaded.data.expect("page data");
+        let hunk = &page["hunks"].as_array().expect("hunks")[0];
+        let identity = (
+            hunk["oldStart"].as_u64().expect("oldStart") as u32,
+            hunk["oldCount"].as_u64().expect("oldCount") as u32,
+            hunk["newStart"].as_u64().expect("newStart") as u32,
+            hunk["newCount"].as_u64().expect("newCount") as u32,
+            hunk["contentHash"].as_str().expect("hash").to_owned(),
+        );
+
+        let commented = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewComment {
+                id: Some("comment-after-eviction".into()),
+                snapshot_id,
+                path: first_path,
+                old_start: identity.0,
+                old_count: identity.1,
+                new_start: identity.2,
+                new_count: identity.3,
+                content_hash: identity.4,
+                comment: "after eviction reload".into(),
+                images: Vec::new(),
+            },
+        )
+        .await;
+        assert!(commented.success, "{commented:?}");
+        let thread = commented.data.as_ref().expect("comment data")["threads"]
+            .as_array()
+            .expect("threads")
+            .first()
+            .expect("thread")
+            .clone();
+        assert_eq!(thread["comments"].as_array().expect("comments").len(), 1);
+
+        let closed = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewClose { id: None, review_id: None },
+        )
+        .await;
+        assert!(closed.success);
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn code_review_comment_resolves_cached_then_evicted_via_authority() {
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"]).status.success();
+        git(&["config", "user.name", "Test"]).status.success();
+        for index in 0..40 {
+            std::fs::write(cwd.path().join(format!("f{index:02}.txt")), "base\n")
+                .expect("write base");
+        }
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "init"]).status.success());
+        for index in 0..40 {
+            std::fs::write(
+                cwd.path().join(format!("f{index:02}.txt")),
+                format!("base\nchanged-{index}\n"),
+            )
+            .expect("write changed");
+        }
+        assert!(git(&["add", "."]).status.success());
+
+        let app = build_code_review_app(cwd.path()).await;
+        let code_review = CodeReviewRpcState::default();
+        let opened = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen {
+                id: None,
+                commit: None,
+                from: None,
+                to: None,
+                include_working_tree: None,
+            },
+        )
+        .await;
+        assert!(opened.success, "{opened:?}");
+        let snapshot_id = opened.data.as_ref().expect("open data")["snapshotId"]
+            .as_str()
+            .expect("snapshot id")
+            .to_owned();
+        let files = opened.data.as_ref().expect("open data")["files"]
+            .as_array()
+            .expect("files")
+            .clone();
+        let first_path = files[0]["path"].as_str().expect("path").to_owned();
+
+        let first_page = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewFileDiff {
+                id: None,
+                snapshot_id: snapshot_id.clone(),
+                path: first_path.clone(),
+                cursor: 0,
+                max_lines: Some(25),
+            },
+        )
+        .await;
+        assert!(first_page.success, "{first_page:?}");
+        let page = first_page.data.expect("page data");
+        let hunk = &page["hunks"].as_array().expect("hunks")[0];
+        assert_eq!(hunk["complete"], true, "cached load serves complete hunks");
+        let identity = (
+            hunk["oldStart"].as_u64().expect("oldStart") as u32,
+            hunk["oldCount"].as_u64().expect("oldCount") as u32,
+            hunk["newStart"].as_u64().expect("newStart") as u32,
+            hunk["newCount"].as_u64().expect("newCount") as u32,
+            hunk["contentHash"].as_str().expect("hash").to_owned(),
+        );
+
+        for file in &files {
+            let path = file["path"].as_str().expect("path").to_owned();
+            let response = handle_code_review_command(
+                &app,
+                &code_review,
+                RpcCommand::CodeReviewFileDiff {
+                    id: None,
+                    snapshot_id: snapshot_id.clone(),
+                    path,
+                    cursor: 0,
+                    max_lines: Some(25),
+                },
+            )
+            .await;
+            assert!(response.success, "{response:?}");
+        }
+
+        let cached = code_review_file_diff_cache_paths(&code_review).await;
+        assert!(
+            !cached.iter().any(|path| *path == first_path),
+            "the loaded entry must be evicted before the comment: {cached:?}"
+        );
+        {
+            let state = code_review.state.lock().await;
+            let session = state.session.as_ref().expect("open session");
+            let records = session
+                .comment_authority
+                .lookup(&first_path)
+                .expect("authority retained the cached-then-evicted identities");
+            assert!(
+                records.iter().any(|record| record.content_hash == identity.4),
+                "authority must cover the identity captured while cached"
+            );
+        }
+
+        let commented = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewComment {
+                id: Some("comment-cached-then-evicted".into()),
+                snapshot_id,
+                path: first_path,
+                old_start: identity.0,
+                old_count: identity.1,
+                new_start: identity.2,
+                new_count: identity.3,
+                content_hash: identity.4,
+                comment: "resolved via retained authority".into(),
+                images: Vec::new(),
+            },
+        )
+        .await;
+        assert!(
+            commented.success,
+            "comment must resolve via retained authority without a prior refetch: {commented:?}"
+        );
+        let thread = commented.data.as_ref().expect("comment data")["threads"]
+            .as_array()
+            .expect("threads")
+            .first()
+            .expect("thread")
+            .clone();
+        assert_eq!(thread["comments"].as_array().expect("comments").len(), 1);
+
+        let closed = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewClose { id: None, review_id: None },
+        )
+        .await;
+        assert!(closed.success);
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn file_explorer_rpc_lists_reads_pages_and_reports_worktree_changes() {
+        let cwd = tempfile::tempdir().expect("file explorer cwd");
+        std::fs::create_dir(cwd.path().join("dir")).expect("directory");
+        std::fs::create_dir(cwd.path().join(".git-hidden-fixture")).expect("dot directory");
+        std::fs::write(cwd.path().join("dir/nested.txt"), "nested\n").expect("nested file");
+        std::fs::write(cwd.path().join("z.txt"), "one\ntwo\nthree\n").expect("text file");
+        std::fs::write(cwd.path().join("binary.bin"), b"text\0binary").expect("binary file");
+        std::fs::create_dir_all(cwd.path().join("removed/deep")).expect("deleted directory");
+        std::fs::write(cwd.path().join("removed/deep/gone.txt"), "gone\n")
+            .expect("deleted fixture");
+        for index in 0..505 {
+            std::fs::write(cwd.path().join(format!("cap-{index:03}.txt")), "x")
+                .expect("cap fixture");
+        }
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "baseline"]).status.success());
+        std::fs::remove_dir_all(cwd.path().join("removed")).expect("delete tracked tree");
+        std::fs::write(cwd.path().join("z.txt"), "one\nTWO\nthree\n").expect("modify text");
+        std::fs::write(cwd.path().join("new.txt"), "new\nbody\n").expect("untracked file");
+
+        let app = build_code_review_app(cwd.path()).await;
+        let list = handle_file_explorer_command(
+            &app,
+            RpcCommand::FileExplorerList {
+                id: Some("list".into()),
+                path: None,
+            },
+        )
+        .await;
+        assert!(list.success, "{list:?}");
+        let list_data = list.data.expect("list data");
+        let entries = list_data["entries"].as_array().expect("entries");
+        assert_eq!(entries[0]["kind"], "dir", "dirs sort before files: {entries:?}");
+        assert!(!entries.iter().any(|entry| entry["name"] == ".git"));
+        assert_eq!(entries.len(), 511);
+        assert_eq!(list_data["truncated"], false);
+
+        let first = handle_file_explorer_command(
+            &app,
+            RpcCommand::FileExplorerRead {
+                id: None,
+                path: "z.txt".into(),
+                cursor: 0,
+                max_lines: Some(2),
+            },
+        )
+        .await;
+        assert!(first.success, "{first:?}");
+        let first_data = first.data.expect("first page");
+        assert_eq!(first_data["lines"], json!(["one", "TWO"]));
+        assert_eq!(first_data["nextCursor"], 2);
+        assert_eq!(first_data["truncated"], true);
+        let final_page = handle_file_explorer_command(
+            &app,
+            RpcCommand::FileExplorerRead {
+                id: None,
+                path: "z.txt".into(),
+                cursor: 2,
+                max_lines: Some(2),
+            },
+        )
+        .await;
+        let final_data = final_page.data.expect("final page");
+        assert_eq!(final_data["lines"], json!(["three"]));
+        assert!(final_data.get("nextCursor").is_none());
+        assert_eq!(final_data["truncated"], false);
+
+        let changes = handle_file_explorer_command(
+            &app,
+            RpcCommand::FileExplorerChanges { id: None },
+        )
+        .await;
+        assert!(changes.success, "{changes:?}");
+        let changes_data = changes.data.expect("changes");
+        assert_eq!(changes_data["isRepo"], true);
+        assert!(changes_data["files"].as_array().expect("files").iter().any(|file| {
+            file["path"] == "z.txt" && file["status"] == "modified"
+        }));
+        assert!(changes_data["files"].as_array().expect("files").iter().any(|file| {
+            file["path"] == "new.txt" && file["status"] == "added"
+        }));
+        assert!(changes_data["files"].as_array().expect("files").iter().any(|file| {
+            file["path"] == "removed/deep/gone.txt" && file["status"] == "deleted"
+        }));
+
+        for path in ["z.txt", "new.txt", "removed/deep/gone.txt"] {
+            let diff = handle_file_explorer_command(
+                &app,
+                RpcCommand::FileExplorerDiff {
+                    id: None,
+                    path: path.into(),
+                    cursor: 0,
+                    max_lines: None,
+                },
+            )
+            .await;
+            assert!(diff.success, "{path}: {diff:?}");
+            let lines = diff.data.expect("diff")["lines"]
+                .as_array()
+                .expect("diff lines")
+                .clone();
+            assert!(lines.iter().any(|line| line.as_str().is_some_and(|line| line.starts_with("@@"))), "{path}: {lines:?}");
+            if path == "new.txt" {
+                assert!(lines.iter().any(|line| line == "+new"), "{lines:?}");
+            }
+            if path == "removed/deep/gone.txt" {
+                assert!(lines.iter().any(|line| line == "-gone"), "{lines:?}");
+            }
+        }
+
+        let binary = handle_file_explorer_command(
+            &app,
+            RpcCommand::FileExplorerRead {
+                id: None,
+                path: "binary.bin".into(),
+                cursor: 0,
+                max_lines: None,
+            },
+        )
+        .await;
+        assert_eq!(binary.error.as_deref(), Some("not a text file"));
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn file_explorer_rpc_rejects_unsafe_paths_and_non_files_without_leaking_paths() {
+        let cwd = tempfile::tempdir().expect("file explorer cwd");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("secret.txt"), "secret\n").expect("outside file");
+        std::fs::create_dir(cwd.path().join("dir")).expect("directory");
+        std::fs::write(cwd.path().join("file.txt"), "safe\n").expect("safe file");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), cwd.path().join("escape"))
+            .expect("symlink escape");
+        let app = build_code_review_app(cwd.path()).await;
+
+        for path in [
+            "../secret.txt".to_owned(),
+            outside.path().join("secret.txt").to_string_lossy().into_owned(),
+            "dir".to_owned(),
+            #[cfg(unix)]
+            "escape/secret.txt".to_owned(),
+        ] {
+            let response = handle_file_explorer_command(
+                &app,
+                RpcCommand::FileExplorerRead {
+                    id: None,
+                    path: path.clone(),
+                    cursor: 0,
+                    max_lines: None,
+                },
+            )
+            .await;
+            assert!(!response.success, "{response:?}");
+            let error = response.error.expect("bounded error");
+            if path == "dir" {
+                assert_eq!(error, "not a file");
+            }
+            assert!(matches!(
+                error.as_str(),
+                "path is outside the workspace"
+                    | "not a file"
+                    | "file is unavailable"
+                    | "file is a symlink"
+            ), "{error}");
+            assert!(!error.contains(cwd.path().to_string_lossy().as_ref()), "{error}");
+            assert!(!error.contains(outside.path().to_string_lossy().as_ref()), "{error}");
+        }
+
+        for path in [
+            "../outside".to_owned(),
+            outside.path().to_string_lossy().into_owned(),
+            "file.txt".to_owned(),
+            #[cfg(unix)]
+            "escape".to_owned(),
+        ] {
+            let response = handle_file_explorer_command(
+                &app,
+                RpcCommand::FileExplorerList {
+                    id: None,
+                    path: Some(path),
+                },
+            )
+            .await;
+            assert!(!response.success, "{response:?}");
+            let error = response.error.expect("list error");
+            assert!(matches!(
+                error.as_str(),
+                "path is outside the workspace" | "not a directory" | "directory is unavailable"
+            ), "{error}");
+            assert!(!error.contains(cwd.path().to_string_lossy().as_ref()), "{error}");
+            assert!(!error.contains(outside.path().to_string_lossy().as_ref()), "{error}");
+        }
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn file_explorer_changes_non_repo_returns_false_and_empty_files() {
+        let cwd = tempfile::tempdir().expect("non-repo cwd");
+        std::fs::write(cwd.path().join("plain.txt"), "plain\n").expect("plain file");
+        let app = build_code_review_app(cwd.path()).await;
+        let response = handle_file_explorer_command(
+            &app,
+            RpcCommand::FileExplorerChanges { id: None },
+        )
+        .await;
+        assert!(response.success, "{response:?}");
+        let data = response.data.expect("changes response");
+        assert_eq!(data, json!({"files": [], "isRepo": false, "truncated": false}));
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn file_explorer_rpc_attaches_typed_error_codes_independently_of_prose() {
+        let cwd = tempfile::tempdir().expect("file explorer cwd");
+        std::fs::write(
+            cwd.path().join("long.txt"),
+            format!("{}", "z".repeat(crate::file_explorer::MAX_PAGE_BYTES + 1)),
+        )
+        .expect("oversized line");
+        std::fs::write(cwd.path().join("binary.bin"), b"text\0binary").expect("binary file");
+        std::fs::create_dir_all(cwd.path().join("removed/deep")).expect("deleted directory");
+        std::fs::write(cwd.path().join("removed/deep/gone.txt"), "gone\n")
+            .expect("deleted fixture");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "baseline"]).status.success());
+        std::fs::remove_dir_all(cwd.path().join("removed")).expect("delete tracked tree");
+
+        let app = build_code_review_app(cwd.path()).await;
+
+        let too_large = handle_file_explorer_command(
+            &app,
+            RpcCommand::FileExplorerRead {
+                id: None,
+                path: "long.txt".into(),
+                cursor: 0,
+                max_lines: None,
+            },
+        )
+        .await;
+        assert!(!too_large.success, "{too_large:?}");
+        assert_eq!(
+            too_large.error.as_deref(),
+            Some("line exceeds response limit")
+        );
+        assert_eq!(too_large.data, Some(json!({"code": "file_line_too_large"})));
+
+        let missing = handle_file_explorer_command(
+            &app,
+            RpcCommand::FileExplorerRead {
+                id: None,
+                path: "removed/deep/gone.txt".into(),
+                cursor: 0,
+                max_lines: None,
+            },
+        )
+        .await;
+        assert!(!missing.success, "{missing:?}");
+        assert_eq!(missing.error.as_deref(), Some("file is unavailable"));
+        assert_eq!(missing.data, Some(json!({"code": "file_unavailable"})));
+
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().expect("outside");
+            std::fs::write(outside.path().join("secret.txt"), "secret").expect("secret");
+            std::os::unix::fs::symlink(
+                outside.path().join("secret.txt"),
+                cwd.path().join("escape.txt"),
+            )
+            .expect("symlink");
+            let symlink = handle_file_explorer_command(
+                &app,
+                RpcCommand::FileExplorerRead {
+                    id: None,
+                    path: "escape.txt".into(),
+                    cursor: 0,
+                    max_lines: None,
+                },
+            )
+            .await;
+            assert!(!symlink.success, "{symlink:?}");
+            assert_eq!(symlink.error.as_deref(), Some("file is a symlink"));
+            assert_eq!(symlink.data, Some(json!({"code": "file_symlink"})));
+        }
+
+        let binary = handle_file_explorer_command(
+            &app,
+            RpcCommand::FileExplorerRead {
+                id: None,
+                path: "binary.bin".into(),
+                cursor: 0,
+                max_lines: None,
+            },
+        )
+        .await;
+        assert!(!binary.success, "{binary:?}");
+        assert_eq!(binary.error.as_deref(), Some("not a text file"));
+        assert!(binary.data.is_none(), "{binary:?}");
+
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn file_explorer_read_resolves_unique_basename_from_transcript_prose() {
+        // A basename-only citation (`init.rs:495` in the audit findings)
+        // misses at the workspace root yet names a real file deeper in the
+        // tree: the unique-basename fallback reads it and echoes the real
+        // workspace-relative path. Two REAL homonyms in eligible subtrees
+        // keep the stable missing-file error (the request never guesses),
+        // a file only under the skipped `target/` subtree stays missing,
+        // and a deeper missing path never triggers the basename walk.
+        let cwd = tempfile::tempdir().expect("file explorer cwd");
+        std::fs::create_dir_all(cwd.path().join("psy_node_common/src/realm/processor/db"))
+            .expect("nested dirs");
+        std::fs::write(cwd.path().join("psy_node_common/src/realm/processor/db/init.rs"), "unique body\n")
+            .expect("unique file");
+        std::fs::write(cwd.path().join("gone.rs"), "eligible competing file\n").expect("root gone.rs");
+        std::fs::create_dir_all(cwd.path().join("crates/alpha/src")).expect("alpha dirs");
+        std::fs::create_dir_all(cwd.path().join("crates/beta/src")).expect("beta dirs");
+        std::fs::write(cwd.path().join("crates/alpha/src/homonym.rs"), "alpha body\n")
+            .expect("alpha homonym");
+        std::fs::write(cwd.path().join("crates/beta/src/homonym.rs"), "beta body\n")
+            .expect("beta homonym");
+        std::fs::create_dir_all(cwd.path().join("target/debug")).expect("target dir");
+        std::fs::write(cwd.path().join("target/debug/target_only.rs"), "build artifact\n")
+            .expect("target file");
+        let app = build_code_review_app(cwd.path()).await;
+        let read = |path: &'static str, max_lines: Option<usize>| {
+            let app = app.clone();
+            async move {
+                handle_file_explorer_command(
+                    &app,
+                    RpcCommand::FileExplorerRead {
+                        id: None,
+                        path: path.into(),
+                        cursor: 0,
+                        max_lines,
+                    },
+                )
+                .await
+            }
+        };
+
+        let unique = read("init.rs", Some(5)).await;
+        assert!(unique.success, "{unique:?}");
+        let data = unique.data.expect("unique read data");
+        assert_eq!(data["path"], "psy_node_common/src/realm/processor/db/init.rs");
+        assert_eq!(data["lines"], json!(["unique body"]));
+
+        let homonym = read("homonym.rs", Some(5)).await;
+        assert!(!homonym.success, "{homonym:?}");
+        assert_eq!(homonym.error.as_deref(), Some("file is unavailable"));
+        assert_eq!(homonym.data, Some(json!({"code": "file_unavailable"})));
+
+        let target_only = read("target_only.rs", Some(5)).await;
+        assert!(!target_only.success, "{target_only:?}");
+        assert_eq!(target_only.error.as_deref(), Some("file is unavailable"));
+
+        let deeper_missing = read("realm/edge/gone.rs", Some(5)).await;
+        assert!(!deeper_missing.success, "{deeper_missing:?}");
+        assert_eq!(deeper_missing.error.as_deref(), Some("file is unavailable"));
+
+        app.cleanup().await;
     }
 
     #[tokio::test]
     async fn side_chat_rpc_round_trip_creates_prompts_switches_and_closes_tabs() {
-        let app = build_side_chat_app("faux-rpc-side").await;
+        let (_cwd, _agent, app) =
+            build_side_chat_app("faux-rpc-side", reply_stream("side reply")).await;
         let side_chat = SideChatRpcState::default();
-        let dispatch =
-            |command: RpcCommand| handle_side_chat_command(&app, &side_chat, command);
-
+        let dispatch = |command: RpcCommand| handle_side_chat_command(&app, &side_chat, command);
         let listed = dispatch(RpcCommand::SideChatList {
             id: Some("list-1".into()),
         })
@@ -7109,6 +14251,7 @@ mod tests {
         let prompted = dispatch(RpcCommand::SideChatPrompt {
             id: Some("prompt-1".into()),
             message: "side hello".into(),
+            images: vec![],
         })
         .await;
         assert!(prompted.success, "{prompted:?}");
@@ -7116,8 +14259,6 @@ mod tests {
         assert_eq!(data["accepted"], json!(true), "{data}");
         assert_eq!(data["busy"], json!(false));
 
-        // Poll until the assistant reply lands (the prompt task runs in the
-        // background; snapshots drain controller events before serializing).
         let mut saw_reply = false;
         for _ in 0..100 {
             let listed = dispatch(RpcCommand::SideChatList { id: None }).await;
@@ -7144,9 +14285,11 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        assert!(saw_reply, "side-chat assistant reply must appear in the snapshot");
+        assert!(
+            saw_reply,
+            "side-chat assistant reply must appear in the snapshot"
+        );
 
-        // The side transcript must not have leaked into the main session.
         assert!(
             app.messages()
                 .iter()
@@ -7184,18 +14327,42 @@ mod tests {
 
     #[tokio::test]
     async fn side_chat_rpc_rejects_busy_prompt_and_unknown_switch() {
-        let app = build_side_chat_app("faux-rpc-side-busy").await;
+        let release = Arc::new(tokio::sync::Notify::new());
+        let gated_stream: pi_agent::StreamFn = {
+            let release = release.clone();
+            Arc::new(move |model, _context, _options| {
+                let release = release.clone();
+                Box::pin(async move {
+                    let stream = pi_ai::new_assistant_message_event_stream();
+                    let producer = stream.clone();
+                    tokio::spawn(async move {
+                        release.notified().await;
+                        let mut message = pi_ai::AssistantMessage::pending(&model);
+                        message.content.push(ContentBlock::text("side reply"));
+                        message.stop_reason = pi_ai::StopReason::Stop;
+                        producer.end(Some(message)).await;
+                    });
+                    stream
+                })
+            })
+        };
+        let (_cwd, _agent, app) = build_side_chat_app("faux-rpc-side-busy", gated_stream).await;
         let side_chat = SideChatRpcState::default();
-        let dispatch =
-            |command: RpcCommand| handle_side_chat_command(&app, &side_chat, command);
+        let dispatch = |command: RpcCommand| handle_side_chat_command(&app, &side_chat, command);
 
         let switched = dispatch(RpcCommand::SideChatSwitch {
-            id: None,
+            id: Some("missing-switch".into()),
             name: "nope".into(),
         })
         .await;
-        assert!(!switched.success);
-        assert!(switched.error.as_deref().is_some_and(|e| e.contains("nope")));
+        assert!(!switched.success, "{switched:?}");
+        assert_eq!(switched.command, "side_chat_switch");
+        assert_eq!(switched.id.as_deref(), Some("missing-switch"));
+        assert_eq!(
+            switched.error.as_deref(),
+            Some(r#"no side tab named "nope""#),
+            "{switched:?}"
+        );
 
         let invalid = dispatch(RpcCommand::SideChatNew {
             id: None,
@@ -7203,18 +14370,74 @@ mod tests {
         })
         .await;
         assert!(!invalid.success, "{invalid:?}");
-        assert!(invalid
-            .error
-            .as_deref()
-            .is_some_and(|e| e.contains("reserved")));
+        assert!(
+            invalid
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("reserved"))
+        );
 
+        let first = dispatch(RpcCommand::SideChatPrompt {
+            id: Some("prompt-first".into()),
+            message: "first prompt".into(),
+            images: vec![],
+        })
+        .await;
+        assert!(first.success, "{first:?}");
+        let first_data = first.data.expect("first prompt snapshot");
+        assert_eq!(first_data["accepted"], json!(true), "{first_data}");
+        assert_eq!(first_data["busy"], json!(false), "{first_data}");
+
+        let busy = dispatch(RpcCommand::SideChatPrompt {
+            id: Some("prompt-busy".into()),
+            message: "must not be submitted".into(),
+            images: vec![],
+        })
+        .await;
+        assert!(busy.success, "{busy:?}");
+        let busy_data = busy.data.expect("busy prompt snapshot");
+        assert_eq!(busy_data["accepted"], json!(false), "{busy_data}");
+        assert_eq!(busy_data["busy"], json!(true), "{busy_data}");
+        let default = busy_data["tabs"]
+            .as_array()
+            .expect("tabs")
+            .iter()
+            .find(|tab| tab["name"] == "default")
+            .expect("default tab");
+        assert!(
+            default["entries"]
+                .as_array()
+                .expect("entries")
+                .iter()
+                .all(|entry| entry["text"] != "must not be submitted"),
+            "busy prompt must not enter the side transcript: {default}"
+        );
+
+        let aborted = dispatch(RpcCommand::SideChatAbort {
+            id: Some("prompt-abort".into()),
+        })
+        .await;
+        assert!(aborted.success, "{aborted:?}");
+
+        let second = dispatch(RpcCommand::SideChatPrompt {
+            id: Some("prompt-second".into()),
+            message: "second prompt".into(),
+            images: vec![],
+        })
+        .await;
+        assert!(second.success, "{second:?}");
+        let second_data = second.data.expect("second prompt snapshot");
+        assert_eq!(second_data["accepted"], json!(true), "{second_data}");
+        assert_eq!(second_data["busy"], json!(false), "{second_data}");
+
+        release.notify_one();
         side_chat.shutdown().await;
         app.cleanup().await;
     }
 
     #[tokio::test]
     async fn skill_rpc_returns_frontmatter_summary_and_rejects_unknown() {
-        let (_cwd, app) = build_command_catalog_app().await;
+        let (_cwd, _agent_dir, app) = build_command_catalog_app().await;
         let ok = handle_command(
             &app,
             &settings_state(),
@@ -7231,9 +14454,11 @@ mod tests {
         assert_eq!(data["name"], "catalog-skill");
         let summary = data["summary"].as_str().expect("summary text");
         assert!(summary.contains("name: catalog-skill"), "{summary}");
-        assert!(summary.contains("description: Skill only command"), "{summary}");
+        assert!(
+            summary.contains("description: Skill only command"),
+            "{summary}"
+        );
 
-        // Empty / whitespace name is rejected with a typed error.
         let empty = handle_command(
             &app,
             &settings_state(),
@@ -7253,7 +14478,6 @@ mod tests {
             "{empty:?}"
         );
 
-        // Unknown skill is rejected (never sent to the model).
         let unknown = handle_command(
             &app,
             &settings_state(),
@@ -7276,8 +14500,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_rpc_invokes_trusted_extension_command_and_rejects_unknown() {
+        let (_cwd, _agent_dir, app) = build_command_catalog_app().await;
+        let ok = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::Run {
+                id: Some("run-ok".into()),
+                name: "extension-only".into(),
+                args: String::new(),
+            },
+        )
+        .await;
+        assert!(ok.success, "{ok:?}");
+        assert_eq!(ok.command, "run");
+        let data = ok.data.expect("run data");
+        assert_eq!(data["name"], "extension-only");
+        assert_eq!(data["value"], "pong");
+
+        let empty = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::Run {
+                id: Some("run-empty".into()),
+                name: "   ".into(),
+                args: String::new(),
+            },
+        )
+        .await;
+        assert!(!empty.success, "{empty:?}");
+        assert!(
+            empty
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("required")),
+            "{empty:?}"
+        );
+
+        let unknown = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::Run {
+                id: Some("run-unknown".into()),
+                name: "nope".into(),
+                args: String::new(),
+            },
+        )
+        .await;
+        assert!(!unknown.success, "{unknown:?}");
+        assert!(
+            unknown
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("unknown or untrusted")),
+            "{unknown:?}"
+        );
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn get_commands_projects_skill_argument_metadata() {
-        let (_cwd, app) = build_command_catalog_app().await;
+        let (_cwd, _agent_dir, app) = build_command_catalog_app().await;
         let response = handle_command(
             &app,
             &settings_state(),
@@ -7299,12 +14585,11 @@ mod tests {
         assert_eq!(skill["source"], "builtin");
         assert_eq!(skill["argumentHint"], "<name>");
         assert_eq!(skill["requiresArguments"], true);
-        // code-review stays primary with an optional argument hint.
         let code_review = commands
             .iter()
             .find(|command| command["name"] == "code-review")
             .expect("code-review is a visible primary command");
-        assert_eq!(code_review["argumentHint"], "[<from> <to>]");
+        assert_eq!(code_review["argumentHint"], "[<base> | <from> <to>]");
         assert_eq!(code_review["requiresArguments"], false);
         app.cleanup().await;
     }
@@ -7312,7 +14597,6 @@ mod tests {
     #[tokio::test]
     async fn code_review_open_on_non_git_cwd_surfaces_error_without_root() {
         let cwd = tempfile::tempdir().expect("non-git cwd");
-        // Intentionally NOT a git repository.
         let app = build_code_review_app(cwd.path()).await;
         let code_review = CodeReviewRpcState::default();
         let response = handle_code_review_command(
@@ -7320,20 +14604,26 @@ mod tests {
             &code_review,
             RpcCommand::CodeReviewOpen {
                 id: Some("open-non-git".into()),
+                commit: None,
                 from: None,
                 to: None,
+                include_working_tree: None,
             },
         )
         .await;
         assert!(response.success, "{response:?}");
         assert_eq!(response.command, "code_review_open");
         let data = response.data.expect("open data");
-        // The absolute repository root must never be exposed on the wire.
         let encoded = serde_json::to_string(&data).unwrap();
-        assert!(!encoded.contains("\"root\""), "root must not be exposed: {encoded}");
+        assert!(
+            !encoded.contains("\"root\""),
+            "root must not be exposed: {encoded}"
+        );
         assert!(data["files"].as_array().expect("files").is_empty());
         assert!(
-            data["error"].as_str().is_some_and(|error| !error.is_empty()),
+            data["error"]
+                .as_str()
+                .is_some_and(|error| !error.is_empty()),
             "non-git open must surface an error payload: {data}"
         );
         assert_eq!(data["comparisonLabel"], "HEAD → working tree");
@@ -7341,7 +14631,6 @@ mod tests {
         assert_eq!(data["activeCount"], 0);
         assert_eq!(data["threads"].as_array().expect("threads").len(), 0);
 
-        // A bare snapshot re-projects the same error state.
         let snap = handle_code_review_command(
             &app,
             &code_review,
@@ -7353,19 +14642,15 @@ mod tests {
         assert!(snap.success, "{snap:?}");
         assert!(snap.data.expect("snap data")["error"].as_str().is_some());
 
-        // Close tears down the review controller.
         let closed = handle_code_review_command(
             &app,
             &code_review,
-            RpcCommand::CodeReviewClose {
-                id: Some("close-non-git".into()),
-            },
+            RpcCommand::CodeReviewClose { id: Some("close-non-git".into()), review_id: None },
         )
         .await;
         assert!(closed.success, "{closed:?}");
         assert_eq!(closed.data.expect("close data")["closed"], true);
 
-        // After close, snapshot errors (no open review).
         let after = handle_code_review_command(
             &app,
             &code_review,
@@ -7375,7 +14660,15 @@ mod tests {
         )
         .await;
         assert!(!after.success, "{after:?}");
-        assert!(after.error.as_deref().is_some_and(|e| e.contains("no open code review")));
+        assert_eq!(
+            after.data.as_ref().and_then(|data| data.get("code")).and_then(|code| code.as_str()),
+            Some("code_review_not_open"),
+            "a snapshot of a closed review is the typed no-open rejection: {after:?}"
+        );
+        assert_eq!(
+            after.error.as_deref(),
+            Some("no open code review; call code_review_open first"),
+        );
         app.cleanup().await;
     }
 
@@ -7393,12 +14686,14 @@ mod tests {
             git(&["init", "-q"]).status.success(),
             "git init must succeed"
         );
-        git(&["config", "user.email", "test@example.com"]).status.success();
+        git(&["config", "user.email", "test@example.com"])
+            .status
+            .success();
         git(&["config", "user.name", "Test"]).status.success();
         std::fs::write(cwd.path().join("README.md"), "initial\n").expect("write");
+
         assert!(git(&["add", "."]).status.success());
         assert!(git(&["commit", "-q", "-m", "init"]).status.success());
-        // Working-tree changes: modify README.md and add new.txt.
         std::fs::write(cwd.path().join("README.md"), "initial\nchanged\n").expect("write");
         std::fs::write(cwd.path().join("new.txt"), "new file\n").expect("write");
         assert!(git(&["add", "."]).status.success());
@@ -7410,25 +14705,38 @@ mod tests {
             &code_review,
             RpcCommand::CodeReviewOpen {
                 id: Some("open-git".into()),
+                commit: None,
                 from: None,
                 to: None,
+                include_working_tree: None,
             },
         )
         .await;
         assert!(response.success, "{response:?}");
         let data = response.data.expect("open data");
-        assert!(data["error"].is_null(), "no error expected on a real repo: {data}");
+        assert!(
+            data["error"].is_null(),
+            "no error expected on a real repo: {data}"
+        );
         let encoded = serde_json::to_string(&data).unwrap();
-        assert!(!encoded.contains("\"root\""), "root must not be exposed: {encoded}");
+        assert!(
+            !encoded.contains("\"root\""),
+            "root must not be exposed: {encoded}"
+        );
         let files = data["files"].as_array().expect("files");
         let paths: Vec<&str> = files
             .iter()
             .map(|file| file["path"].as_str().expect("path"))
             .collect();
-        assert!(paths.contains(&"README.md"), "modified file must appear: {paths:?}");
-        assert!(paths.contains(&"new.txt"), "added file must appear: {paths:?}");
+        assert!(
+            paths.contains(&"README.md"),
+            "modified file must appear: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"new.txt"),
+            "added file must appear: {paths:?}"
+        );
 
-        // Hunks carry identity + typed lines.
         let readme = files
             .iter()
             .find(|file| file["path"] == "README.md")
@@ -7437,7 +14745,9 @@ mod tests {
         assert!(!hunks.is_empty(), "modified file must have a hunk");
         let hunk = &hunks[0];
         assert!(
-            hunk["contentHash"].as_str().is_some_and(|hash| !hash.is_empty()),
+            hunk["contentHash"]
+                .as_str()
+                .is_some_and(|hash| !hash.is_empty()),
             "hunk must carry a content hash"
         );
         assert!(hunk["oldStart"].as_u64().is_some());
@@ -7458,36 +14768,1667 @@ mod tests {
         );
         assert_eq!(data["isStreaming"], false);
 
-        // Open rejects from+to mismatch (one without the other).
         let half = handle_code_review_command(
             &app,
             &code_review,
             RpcCommand::CodeReviewOpen {
                 id: Some("open-half".into()),
+                commit: None,
                 from: Some("HEAD".into()),
                 to: None,
+                include_working_tree: None,
             },
         )
         .await;
         assert!(!half.success, "{half:?}");
         assert!(
-            half.error
-                .as_deref()
-                .is_some_and(|e| e.contains("from") && e.contains("to")),
+            half.error.as_deref().is_some_and(|e| e.contains("from")
+                && e.contains("to")
+                && e.contains("includeWorkingTree")),
             "{half:?}"
         );
 
-        // Close cleans up the review controller.
+        let base_to_tree = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen {
+                id: Some("open-base".into()),
+                commit: None,
+                from: Some("HEAD".into()),
+                to: None,
+                include_working_tree: Some(true),
+            },
+        )
+        .await;
+        assert!(base_to_tree.success, "{base_to_tree:?}");
+        let base_data = base_to_tree.data.expect("base-to-tree data");
+        assert_eq!(base_data["comparisonLabel"], "HEAD → working tree");
+        assert!(base_data["error"].is_null(), "{base_data}");
+        assert!(
+            base_data["files"]
+                .as_array()
+                .expect("files")
+                .iter()
+                .any(|file| file["path"] == "README.md"),
+            "HEAD with includeWorkingTree must keep working-tree files: {base_data}"
+        );
+
         let closed = handle_code_review_command(
             &app,
             &code_review,
-            RpcCommand::CodeReviewClose {
-                id: Some("close-git".into()),
-            },
+            RpcCommand::CodeReviewClose { id: Some("close-git".into()), review_id: None },
         )
         .await;
         assert!(closed.success, "{closed:?}");
         assert_eq!(closed.data.expect("close data")["closed"], true);
+        app.cleanup().await;
+    }
+
+    #[test]
+    fn code_review_open_commit_and_commits_wire_decode() {
+        let parse_command = |value: Value| match parse_input(
+            &serde_json::to_vec(&value).expect("serialize command fixture"),
+        )
+        .expect("parse command fixture")
+        {
+            RpcInput::Command { command, .. } => command,
+            RpcInput::ExtensionUiResponse(_) => panic!("expected RPC command"),
+        };
+        match parse_command(json!({"type":"code_review_open","commit":"abc123"})) {
+            RpcCommand::CodeReviewOpen {
+                commit,
+                from,
+                to,
+                include_working_tree,
+                ..
+            } => {
+                assert_eq!(commit.as_deref(), Some("abc123"));
+                assert!(from.is_none() && to.is_none());
+                assert_eq!(include_working_tree, None);
+            }
+            other => panic!("expected code_review_open: {other:?}"),
+        }
+        // An explicit `includeWorkingTree: false` must stay distinguishable
+        // from an absent operand: it counts as supplied for exclusivity.
+        match parse_command(json!({"type":"code_review_open","includeWorkingTree":false})) {
+            RpcCommand::CodeReviewOpen {
+                include_working_tree,
+                ..
+            } => {
+                assert_eq!(include_working_tree, Some(false));
+            }
+            other => panic!("expected code_review_open: {other:?}"),
+        }
+        match parse_command(json!({"type":"code_review_commits"})) {
+            RpcCommand::CodeReviewCommits { limit, .. } => assert_eq!(limit, None),
+            other => panic!("expected code_review_commits: {other:?}"),
+        }
+        match parse_command(json!({"type":"code_review_commits","limit":5})) {
+            RpcCommand::CodeReviewCommits { limit, .. } => assert_eq!(limit, Some(5)),
+            other => panic!("expected code_review_commits: {other:?}"),
+        }
+        // Null is fail-closed on the scope-selecting operands: an explicit
+        // `null` is a parse-time rejection, never "absent".
+        for fixture in [
+            r#"{"type":"code_review_open","commit":null}"#,
+            r#"{"type":"code_review_open","includeWorkingTree":null}"#,
+        ] {
+            let rejected = parse_input(fixture.as_bytes())
+                .expect_err("an explicit null operand must be rejected");
+            assert!(
+                rejected
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("invalid type")),
+                "explicit null must fail closed: {rejected:?}"
+            );
+        }
+        // `from`/`to` keep the legacy null-means-absent baseline: mixing a
+        // commit with `"from": null` is still a pure commit scope.
+        match parse_command(json!({"type":"code_review_open","commit":"abc123","from":null})) {
+            RpcCommand::CodeReviewOpen { commit, from, .. } => {
+                assert_eq!(commit.as_deref(), Some("abc123"));
+                assert!(from.is_none());
+            }
+            other => panic!("expected code_review_open: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn code_review_open_commit_scope_rejects_conflated_operands() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let app = build_code_review_app(cwd.path()).await;
+        let code_review = CodeReviewRpcState::default();
+        for (commit, from, to, include_working_tree) in [
+            (Some("HEAD".to_owned()), Some("HEAD".to_owned()), None, None),
+            (Some("HEAD".to_owned()), None, Some("main".to_owned()), None),
+            (Some("HEAD".to_owned()), None, None, Some(true)),
+            (Some("HEAD".to_owned()), None, None, Some(false)),
+        ] {
+            let response = handle_code_review_command(
+                &app,
+                &code_review,
+                RpcCommand::CodeReviewOpen {
+                    id: Some("open-conflated".into()),
+                    commit,
+                    from,
+                    to,
+                    include_working_tree,
+                },
+            )
+            .await;
+            assert!(!response.success, "{response:?}");
+            assert!(
+                response
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("commit") && error.contains("excludes")),
+                "conflated operands must be rejected: {response:?}"
+            );
+        }
+        let empty = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen {
+                id: Some("open-empty".into()),
+                commit: Some("   ".to_owned()),
+                from: None,
+                to: None,
+                include_working_tree: None,
+            },
+        )
+        .await;
+        assert!(!empty.success, "{empty:?}");
+        assert!(
+            empty
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("non-empty")),
+            "an empty commit must be rejected: {empty:?}"
+        );
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn code_review_open_commit_pins_root_commit_on_real_git_repo() {
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"]).status.success();
+        git(&["config", "user.name", "Test"]).status.success();
+        std::fs::write(cwd.path().join("README.md"), "root\n").expect("write");
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "root commit"]).status.success());
+        let full_hash = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+            .expect("rev-parse utf8")
+            .trim()
+            .to_owned();
+
+        let app = build_code_review_app(cwd.path()).await;
+        let code_review = CodeReviewRpcState::default();
+        let response = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen {
+                id: Some("open-root".into()),
+                commit: Some("HEAD".into()),
+                from: None,
+                to: None,
+                include_working_tree: None,
+            },
+        )
+        .await;
+        assert!(response.success, "{response:?}");
+        let data = response.data.expect("open data");
+        assert!(
+            data["error"].is_null(),
+            "a root commit must open without a scope error: {data}"
+        );
+        // The label names the empty-tree comparison and pins the RESOLVED
+        // object id, not the requested "HEAD" ref.
+        let label = data["comparisonLabel"].as_str().expect("comparison label");
+        let pinned = label
+            .strip_prefix("empty tree → ")
+            .expect("root commit label names the empty tree");
+        assert!(
+            full_hash.starts_with(pinned),
+            "label must pin the resolved hash: {label} vs {full_hash}"
+        );
+        let files = data["files"].as_array().expect("files");
+        assert!(
+            files.iter().any(|file| file["path"] == "README.md"),
+            "the root commit diff must list its committed file: {files:?}"
+        );
+
+        // Pinning: a follow-up snapshot reuses the resolved scope.
+        let snap = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewSnapshot {
+                id: Some("snap-root".into()),
+            },
+        )
+        .await;
+        assert!(snap.success, "{snap:?}");
+        assert_eq!(
+            snap.data.expect("snapshot data")["comparisonLabel"],
+            data["comparisonLabel"]
+        );
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn code_review_commits_lists_recent_commits_on_real_git_repo() {
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"]).status.success();
+        git(&["config", "user.name", "Test"]).status.success();
+        std::fs::write(cwd.path().join("README.md"), "base\n").expect("write");
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "root commit"]).status.success());
+        std::fs::write(cwd.path().join("README.md"), "base\nchanged\n").expect("write");
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "second commit"]).status.success());
+        let head_hash = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+            .expect("rev-parse utf8")
+            .trim()
+            .to_owned();
+        let root_hash = String::from_utf8(git(&["rev-parse", "HEAD~1"]).stdout)
+            .expect("rev-parse utf8")
+            .trim()
+            .to_owned();
+
+        let app = build_code_review_app(cwd.path()).await;
+        let code_review = CodeReviewRpcState::default();
+        let response = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewCommits {
+                id: Some("commits-1".into()),
+                limit: Some(1),
+            },
+        )
+        .await;
+        assert!(response.success, "{response:?}");
+        let data = response.data.expect("commits data");
+        let rows = data["commits"].as_array().expect("commits array");
+        assert_eq!(rows.len(), 1, "limit 1 returns one row: {data}");
+        assert_eq!(
+            data["truncated"],
+            true,
+            "an extra row existed past the limit"
+        );
+        assert_eq!(rows[0]["commit"], head_hash.as_str());
+        assert_eq!(rows[0]["parentCommit"], root_hash.as_str());
+        assert_eq!(rows[0]["parentCount"], 1);
+        assert_eq!(rows[0]["subject"], "second commit");
+        assert_eq!(rows[0]["author"], "Test");
+        let author_date = rows[0]["authorDate"].as_str().expect("authorDate");
+        assert!(
+            author_date.contains('T'),
+            "authorDate must be a strict ISO 8601 string: {author_date}"
+        );
+
+        let full = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewCommits {
+                id: Some("commits-all".into()),
+                limit: None,
+            },
+        )
+        .await;
+        assert!(full.success, "{full:?}");
+        let full_data = full.data.expect("full list data");
+        let full_rows = full_data["commits"].as_array().expect("commits array");
+        assert_eq!(
+            full_rows.len(),
+            2,
+            "the default limit lists both commits: {full_data}"
+        );
+        assert_eq!(full_data["truncated"], false);
+        assert_eq!(full_rows[1]["commit"], root_hash.as_str());
+        assert!(
+            full_rows[1]["parentCommit"].is_null(),
+            "a root commit has no first parent: {full_rows:?}"
+        );
+        assert_eq!(full_rows[1]["parentCount"], 0);
+        assert_eq!(full_rows[1]["subject"], "root commit");
+        app.cleanup().await;
+    }
+
+    /// Per-hunk provider stream that blocks each reply on the semaphore so an
+    /// auto review batch stays provably running between dispatches.
+    fn gated_rpc_review_stream(gate: Arc<tokio::sync::Semaphore>) -> pi_agent::StreamFn {
+        Arc::new(move |model, context, _options| {
+            let gate = gate.clone();
+            let prompt = review_request_text(&context);
+            let triage = prompt.strip_prefix("Classify every hunk").map(|text| {
+                text.lines()
+                    .filter_map(|line| line.strip_prefix("Hunk: "))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            });
+            Box::pin(async move {
+                let stream = pi_ai::new_assistant_message_event_stream();
+                let producer = stream.clone();
+                tokio::spawn(async move {
+                    let reply = if let Some(core) = triage {
+                        let tokens: Vec<&str> = if core.is_empty() {
+                            Vec::new()
+                        } else {
+                            core.split(',').collect()
+                        };
+                        serde_json::json!({"core": tokens, "skipped": 0}).to_string()
+                    } else {
+                        gate.acquire().await.expect("release permit").forget();
+                        findings_reply_for_request(&prompt, &[])
+                    };
+                    let mut message = pi_ai::AssistantMessage::pending(&model);
+                    message.content.push(pi_ai::ContentBlock::text(reply));
+                    message.stop_reason = pi_ai::StopReason::Stop;
+                    producer.end(Some(message)).await;
+                });
+                stream
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn code_review_auto_review_submits_and_second_batch_rejects() {
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"]).status.success();
+        git(&["config", "user.name", "Test"]).status.success();
+        std::fs::write(cwd.path().join("README.md"), "initial\n").expect("write");
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "init"]).status.success());
+        std::fs::write(cwd.path().join("README.md"), "initial\nchanged\n").expect("write");
+        assert!(git(&["add", "."]).status.success());
+
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let app = build_code_review_app_with_stream(cwd.path(), gated_rpc_review_stream(gate.clone())).await;
+        let code_review = CodeReviewRpcState::default();
+        let opened = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen {
+                id: Some("open-auto".into()),
+                commit: None,
+                from: None,
+                to: None,
+                include_working_tree: None,
+            },
+        )
+        .await;
+        assert!(opened.success, "{opened:?}");
+        {
+            let mut state = code_review.state.lock().await;
+            let session = state.session.as_mut().expect("open review");
+            let mut model = session.controller.fork_model().clone();
+            model.api = pi_ai::API_OPENAI_COMPLETIONS.to_owned();
+            session.controller.set_model(model);
+            session.controller.start_auto_review(&session.snapshot, None, None).await.expect("triage accepted");
+            let projection = code_review_projection(&session.snapshot, &session.controller);
+            assert_eq!(projection["autoReviewState"], "triaging");
+            assert_eq!(projection["reviewLanguageDefault"], "zh");
+            assert!(projection["threads"].as_array().expect("threads").is_empty());
+            session.controller.abort().await;
+        }
+
+        let auto = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewAutoReview {
+                id: Some("auto-run".into()),
+                model_id: None,
+                language: None,
+            },
+        )
+        .await;
+        assert!(auto.success, "{auto:?}");
+        let data = auto.data.expect("auto data");
+        assert_eq!(data["ok"], true);
+        assert_eq!(data["state"], "triaging");
+        assert!(data["batchId"].as_u64().is_some(), "{data}");
+
+        let second = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewAutoReview {
+                id: Some("auto-second".into()),
+                model_id: None,
+                language: None,
+            },
+        )
+        .await;
+        assert!(!second.success, "{second:?}");
+        assert_eq!(
+            second.data.as_ref().and_then(|data| data["code"].as_str()),
+            Some("code_review_auto_running"),
+            "{second:?}"
+        );
+
+        let unknown = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewAutoReview {
+                id: Some("auto-unknown".into()),
+                model_id: Some("no-such-provider/definitely-not-a-model".into()),
+                language: None,
+            },
+        )
+        .await;
+        assert!(!unknown.success, "{unknown:?}");
+        assert_eq!(
+            unknown.data.as_ref().and_then(|data| data["code"].as_str()),
+            Some("code_review_unknown_model"),
+            "{unknown:?}"
+        );
+
+        let snapshot = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewSnapshot {
+                id: Some("snap-auto".into()),
+            },
+        )
+        .await;
+        let mut data = snapshot.data.expect("snapshot data");
+        for _ in 0..100 {
+            if data["autoReviewState"] == "running" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let snapshot = handle_code_review_command(
+                &app,
+                &code_review,
+                RpcCommand::CodeReviewSnapshot {
+                    id: Some("snap-auto".into()),
+                },
+            )
+            .await;
+            data = snapshot.data.expect("snapshot data");
+        }
+        assert_eq!(data["autoReviewState"], "running", "{data}");
+        let submitted = data["autoReviewCounts"]["submitted"].as_u64().expect("submitted");
+        assert!(submitted >= 1, "the changed hunk is submitted: {data}");
+        assert_eq!(data["autoReviewCounts"]["failed"], 0);
+        let threads = data["threads"].as_array().expect("threads");
+        assert!(
+            threads
+                .iter()
+                .any(|thread| thread["comments"]
+                    .as_array()
+                    .expect("comments")
+                    .iter()
+                    .any(|comment| comment["auto"] == true)),
+            "auto cards must be marked on the wire: {data}"
+        );
+        assert!(
+            threads
+                .iter()
+                .all(|thread| thread.get("autoReview").is_none()),
+            "threads carry no finding verdict: {data}"
+        );
+
+        gate.add_permits(submitted.try_into().expect("submitted count"));
+        let snapshot = loop {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let snapshot = handle_code_review_command(
+                &app,
+                &code_review,
+                RpcCommand::CodeReviewSnapshot {
+                    id: Some("snap-auto".into()),
+                },
+            )
+            .await;
+            let data = snapshot.data.expect("snapshot data");
+            if data["autoReviewState"] == "done" {
+                break data;
+            }
+        };
+        assert_eq!(snapshot["autoReviewCounts"]["completed"], submitted, "{snapshot}");
+        assert_eq!(snapshot["autoReviewCounts"]["failed"], 0);
+
+        let closed = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewClose { id: Some("close-auto".into()), review_id: None },
+        )
+        .await;
+        assert!(closed.success, "{closed:?}");
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn code_review_auto_review_rejects_oversized_triage_without_started_status() {
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"]).status.success();
+        git(&["config", "user.name", "Test"]).status.success();
+        std::fs::write(cwd.path().join("README.md"), "initial\n").expect("write");
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "init"]).status.success());
+        std::fs::write(cwd.path().join("README.md"), "initial\nchanged\n").expect("write");
+        assert!(git(&["add", "."]).status.success());
+
+        let app = build_code_review_app_with_stream(cwd.path(), highlight_rpc_review_stream(Vec::new())).await;
+        let code_review = CodeReviewRpcState::default();
+        let opened = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen {
+                id: Some("open-oversize".into()),
+                from: None,
+                commit: None,
+                to: None,
+                include_working_tree: None,
+            },
+        )
+        .await;
+        assert!(opened.success, "{opened:?}");
+        {
+            let mut state = code_review.state.lock().await;
+            let session = state.session.as_mut().expect("open review");
+            let mut model = session.controller.fork_model().clone();
+            model.api = pi_ai::API_OPENAI_COMPLETIONS.to_owned();
+            session.controller.set_model(model);
+        }
+        let model_before = {
+            let state = code_review.state.lock().await;
+            let session = state.session.as_ref().expect("open review");
+            fork_model_display(session.controller.fork_model())
+        };
+        {
+            let mut state = code_review.state.lock().await;
+            let session = state.session.as_mut().expect("open review");
+            let mut snapshot = session.snapshot.clone();
+            if let Some(file) = snapshot.files.first_mut() {
+                if let Some(hunk) = file.hunks.first_mut() {
+                    hunk.lines.push(crate::code_review::DiffLine {
+                        kind: crate::code_review::DiffLineKind::Addition,
+                        old_no: None,
+                        new_no: Some(99),
+                        text: "x".repeat(crate::code_review::MAX_DIFF_BYTES),
+                    });
+                    hunk.new_count += 1;
+                }
+            }
+            session.snapshot = snapshot;
+        }
+        let rejected = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewAutoReview {
+                id: Some("auto-oversize".into()),
+                model_id: None,
+                language: None,
+            },
+        )
+        .await;
+        assert!(
+            !rejected.success,
+            "oversized triage must be rejected, never report started: {rejected:?}"
+        );
+        assert_eq!(
+            rejected.data.as_ref().and_then(|data| data["code"].as_str()),
+            Some("code_review_auto_failed"),
+            "{rejected:?}"
+        );
+        let error = rejected.error.as_deref().expect("typed error message");
+        assert!(error.contains("exceeds"), "{error}");
+        {
+            let mut state = code_review.state.lock().await;
+            let session = state.session.as_mut().expect("open review");
+            let projection = code_review_projection(&session.snapshot, &session.controller);
+            assert_eq!(projection["autoReviewState"], "idle", "{projection}");
+            assert!(projection["threads"].as_array().expect("threads").is_empty());
+            assert_eq!(
+                fork_model_display(session.controller.fork_model()),
+                model_before,
+                "a rejected triage must not mutate the selected model"
+            );
+        }
+        app.cleanup().await;
+    }
+
+    /// Stream whose per-hunk prompt future blocks synchronously inside its
+    /// first poll for `hold`, so an abort's task-handle join is provably held
+    /// while other RPC commands must still acquire the state mutex.
+    fn blocking_abort_rpc_stream(hold: std::time::Duration) -> pi_agent::StreamFn {
+        Arc::new(move |model, context, _options| {
+            let prompt = review_request_text(&context);
+            let triage = prompt.strip_prefix("Classify every hunk").map(|text| {
+                text.lines()
+                    .filter_map(|line| line.strip_prefix("Hunk: "))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            });
+            Box::pin(async move {
+                if triage.is_none() {
+                    std::thread::sleep(hold);
+                }
+                let stream = pi_ai::new_assistant_message_event_stream();
+                let producer = stream.clone();
+                tokio::spawn(async move {
+                    let reply = if let Some(core) = triage {
+                        let tokens: Vec<&str> = if core.is_empty() {
+                            Vec::new()
+                        } else {
+                            core.split(',').collect()
+                        };
+                        serde_json::json!({"core": tokens, "skipped": 0}).to_string()
+                    } else {
+                        findings_reply_for_request(&prompt, &[])
+                    };
+                    let mut message = pi_ai::AssistantMessage::pending(&model);
+                    message.content.push(pi_ai::ContentBlock::text(reply));
+                    message.stop_reason = pi_ai::StopReason::Stop;
+                    producer.end(Some(message)).await;
+                });
+                stream
+            })
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn code_review_stop_releases_state_mutex_while_aborting_agents() {
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"]).status.success();
+        git(&["config", "user.name", "Test"]).status.success();
+        std::fs::write(cwd.path().join("README.md"), "initial\n").expect("write");
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "init"]).status.success());
+        std::fs::write(cwd.path().join("README.md"), "initial\nchanged\n").expect("write");
+        assert!(git(&["add", "."]).status.success());
+
+        let app = build_code_review_app_with_stream(cwd.path(), blocking_abort_rpc_stream(std::time::Duration::from_secs(3))).await;
+        let code_review = CodeReviewRpcState::default();
+        let opened = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen {
+                id: Some("open-held".into()),
+                from: None,
+                commit: None,
+                to: None,
+                include_working_tree: None,
+            },
+        )
+        .await;
+        assert!(opened.success, "{opened:?}");
+        {
+            let mut state = code_review.state.lock().await;
+            let session = state.session.as_mut().expect("open review");
+            let mut model = session.controller.fork_model().clone();
+            model.api = pi_ai::API_OPENAI_COMPLETIONS.to_owned();
+            session.controller.set_model(model);
+        }
+        let auto = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewAutoReview {
+                id: Some("auto-held".into()),
+                model_id: None,
+                language: None,
+            },
+        )
+        .await;
+        assert!(auto.success, "{auto:?}");
+        let auto_data = auto.data.expect("auto data");
+        assert_eq!(auto_data["state"], "triaging", "{auto_data}");
+        let mut data = auto_data;
+        for _ in 0..100 {
+            let snapshot = handle_code_review_command(
+                &app,
+                &code_review,
+                RpcCommand::CodeReviewSnapshot {
+                    id: Some("poll-running".into()),
+                },
+            )
+            .await;
+            data = snapshot.data.expect("snapshot data");
+            if data["autoReviewState"] == "running" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(data["autoReviewState"], "running", "{data}");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let stop_code_review = code_review.clone();
+        let stop_app = app.clone();
+        let stop_task = tokio::spawn(async move {
+            handle_code_review_command(
+                &stop_app,
+                &stop_code_review,
+                RpcCommand::CodeReviewStop {
+                    id: Some("stop-held".into()),
+                    operation: ReviewStopOperation::AutoReview,
+                },
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let mut prepare_seen = false;
+        for _ in 0..20 {
+            let poll = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                handle_code_review_command(
+                    &app,
+                    &code_review,
+                    RpcCommand::CodeReviewSnapshot {
+                        id: Some("poll-prepare".into()),
+                    },
+                ),
+            )
+            .await;
+            if let Ok(response) = poll {
+                let poll_data = response.data.expect("snapshot data");
+                if poll_data["autoReviewState"] == "failed" {
+                    prepare_seen = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            prepare_seen,
+            "stop prepare must mutate state and release the mutex while the abort is held"
+        );
+        assert!(
+            !stop_task.is_finished(),
+            "the stop must still be inside its held abort"
+        );
+        let probe = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle_code_review_command(
+                &app,
+                &code_review,
+                RpcCommand::CodeReviewSnapshot {
+                    id: Some("probe-during-abort".into()),
+                },
+            ),
+        )
+        .await;
+        let Ok(probe_response) = probe else {
+            panic!("a snapshot command must acquire the state mutex during the held abort");
+        };
+        assert!(probe_response.success, "{probe_response:?}");
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(15), stop_task)
+            .await
+            .expect("stop settles after the blocking stream poll returns")
+            .expect("stop task joins");
+        assert!(stopped.success, "{stopped:?}");
+        let final_projection = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewSnapshot {
+                id: Some("final-held".into()),
+            },
+        )
+        .await;
+        let final_data = final_projection.data.expect("final snapshot");
+        assert_eq!(final_data["autoReviewState"], "failed", "{final_data}");
+        app.cleanup().await;
+    }
+
+    /// Provider stream that answers the single Highlight prompt with findings
+    /// JSON whose identities are copied from that request. Every other prompt
+    /// gets a plain non-JSON reply.
+    fn highlight_rpc_review_stream(findings: Vec<serde_json::Value>) -> pi_agent::StreamFn {
+        Arc::new(move |model, context, _options| {
+            let findings = findings.clone();
+            let prompt = review_request_text(&context);
+            Box::pin(async move {
+                let stream = pi_ai::new_assistant_message_event_stream();
+                let producer = stream.clone();
+                tokio::spawn(async move {
+                    let reply = if prompt.contains("Requested hunks:") {
+                        findings_reply_for_request(&prompt, &findings)
+                    } else {
+                        "non-highlight reply".to_owned()
+                    };
+                    let mut message = pi_ai::AssistantMessage::pending(&model);
+                    message.content.push(pi_ai::ContentBlock::text(reply));
+                    message.stop_reason = pi_ai::StopReason::Stop;
+                    producer.end(Some(message)).await;
+                });
+                stream
+            })
+        })
+    }
+
+    fn review_request_text(context: &pi_ai::Context) -> String {
+        context
+            .messages
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                pi_ai::Message::User(user) => user.content.iter().find_map(|block| match block {
+                    pi_ai::ContentBlock::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// One findings document naming every identity captured from the request.
+    /// `finding_for` is keyed by request path; paths without an entry are clean.
+    fn findings_reply_for_request(prompt: &str, finding_for: &[serde_json::Value]) -> String {
+        let hunks = prompt
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("Hunk identity: ")?;
+                let mut fields = std::collections::HashMap::new();
+                for field in rest.split_whitespace() {
+                    let (key, value) = field.split_once('=')?;
+                    fields.insert(key, value);
+                }
+                let path = fields.get("path")?.to_owned();
+                let mut finding = finding_for
+                    .iter()
+                    .find(|finding| finding["path"].as_str() == Some(path))
+                    .cloned();
+                if let Some(finding) = finding.as_mut().and_then(serde_json::Value::as_object_mut) {
+                    finding.remove("path");
+                }
+                let findings = finding.into_iter().collect::<Vec<_>>();
+                Some(json!({
+                    "identity": {
+                        "snapshotId": fields.get("snapshotId")?.to_owned(),
+                        "path": path,
+                        "oldStart": fields.get("oldStart")?.parse::<u32>().ok()?,
+                        "oldCount": fields.get("oldCount")?.parse::<u32>().ok()?,
+                        "newStart": fields.get("newStart")?.parse::<u32>().ok()?,
+                        "newCount": fields.get("newCount")?.parse::<u32>().ok()?,
+                        "contentHash": fields.get("contentHash")?.to_owned(),
+                    },
+                    "findings": findings,
+                }))
+            })
+            .collect::<Vec<_>>();
+        json!({"hunks": hunks}).to_string()
+    }
+
+    #[tokio::test]
+    async fn code_review_highlight_returns_summary_and_projection_fields() {
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"]).status.success();
+        git(&["config", "user.name", "Test"]).status.success();
+        std::fs::write(cwd.path().join("README.md"), "initial\n").expect("write");
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "init"]).status.success());
+        std::fs::write(cwd.path().join("README.md"), "initial\nchanged\n").expect("write");
+        assert!(git(&["add", "."]).status.success());
+
+        let app = build_code_review_app_with_stream(
+            cwd.path(),
+            highlight_rpc_review_stream(vec![json!({
+                "path": "README.md",
+                "category": "naming",
+                "side": "new",
+                "startLine": 2,
+                "endLine": 2,
+                "summary": "changed name",
+                "evidence": "changed",
+            })]),
+        )
+        .await;
+        let code_review = CodeReviewRpcState::default();
+
+        let missing = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewHighlight { id: None },
+        )
+        .await;
+        assert!(!missing.success, "{missing:?}");
+
+        let opened = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen {
+                id: Some("open-hl".into()),
+                from: None,
+                commit: None,
+                to: None,
+                include_working_tree: None,
+            },
+        )
+        .await;
+        assert!(opened.success, "{opened:?}");
+
+        let first = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewHighlight { id: Some("hl-1".into()) },
+        )
+        .await;
+        assert!(first.success, "{first:?}");
+        let data = first.data.expect("highlight data");
+        assert_eq!(data["ok"], true);
+        assert_eq!(data["state"], "running");
+
+        let mut data = serde_json::Value::Null;
+        for _ in 0..100 {
+            let snapshot = handle_code_review_command(
+                &app,
+                &code_review,
+                RpcCommand::CodeReviewSnapshot {
+                    id: Some("snap-hl".into()),
+                },
+            )
+            .await;
+            data = snapshot.data.expect("snapshot data");
+            if data["highlightState"] == "done" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(data["highlightState"], "done", "{data}");
+        let findings = data["reviewFindings"].as_array().expect("reviewFindings");
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0]["identity"]["path"], "README.md");
+        assert_eq!(findings[0]["identity"]["snapshotId"], data["snapshotId"]);
+        assert_eq!(findings[0]["findings"][0]["category"], "naming");
+        assert_eq!(findings[0]["findings"][0]["side"], "new");
+        assert_eq!(findings[0]["findings"][0]["startLine"], 2);
+        assert!(data.get("highlightHunks").is_none());
+        assert!(data.get("autoReview").is_none());
+        assert!(data["highlightError"].is_null());
+
+        // A settled highlight may be rerun: one call at a time, sequentially.
+        let rerun = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewHighlight { id: Some("hl-2".into()) },
+        )
+        .await;
+        assert!(rerun.success, "{rerun:?}");
+
+        let closed = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewClose { id: Some("close-hl".into()), review_id: None },
+        )
+        .await;
+        assert!(closed.success, "{closed:?}");
+        app.cleanup().await;
+    }
+
+    /// Provider stream whose Highlight reply blocks on `gate` (so a call can
+    /// be held provably Running); every other prompt replies immediately.
+    fn gated_highlight_rpc_stream(gate: Arc<tokio::sync::Semaphore>) -> pi_agent::StreamFn {
+        Arc::new(move |model, context, _options| {
+            let gate = gate.clone();
+            Box::pin(async move {
+                let is_highlight = context.messages.iter().any(|message| match message {
+                    pi_ai::Message::User(user) => user.content.iter().any(|block| matches!(
+                        block,
+                        pi_ai::ContentBlock::Text { text, .. } if text.contains("Requested hunks:")
+                    )),
+                    _ => false,
+                });
+                let stream = pi_ai::new_assistant_message_event_stream();
+                let producer = stream.clone();
+                tokio::spawn(async move {
+                    let reply = if is_highlight {
+                        gate.acquire().await.expect("release permit").forget();
+                        "definitely not json".to_owned()
+                    } else {
+                        "non-highlight reply".to_owned()
+                    };
+                    let mut message = pi_ai::AssistantMessage::pending(&model);
+                    message.content.push(pi_ai::ContentBlock::text(reply));
+                    message.stop_reason = pi_ai::StopReason::Stop;
+                    producer.end(Some(message)).await;
+                });
+                stream
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn code_review_highlight_rejects_concurrent_call_and_invalid_reply() {
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"]).status.success();
+        git(&["config", "user.name", "Test"]).status.success();
+        std::fs::write(cwd.path().join("README.md"), "initial\n").expect("write");
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "init"]).status.success());
+        std::fs::write(cwd.path().join("README.md"), "initial\nchanged\n").expect("write");
+        assert!(git(&["add", "."]).status.success());
+
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let app = build_code_review_app_with_stream(cwd.path(), gated_highlight_rpc_stream(gate.clone()))
+            .await;
+        let code_review = CodeReviewRpcState::default();
+        let opened = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen {
+                id: Some("open-hl-bad".into()),
+                from: None,
+                commit: None,
+                to: None,
+                include_working_tree: None,
+            },
+        )
+        .await;
+        assert!(opened.success, "{opened:?}");
+
+        {
+            let mut state = code_review.state.lock().await;
+            let session = state.session.as_mut().expect("open review");
+            assert_eq!(
+                session.controller.start_highlight(&session.snapshot),
+                crate::code_review_panel::HighlightStart::Started
+            );
+            assert_eq!(
+                session.controller.highlight_state(),
+                crate::code_review_panel::HighlightState::Running
+            );
+        }
+        let busy = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewHighlight { id: Some("hl-busy".into()) },
+        )
+        .await;
+        assert!(!busy.success, "{busy:?}");
+        assert_eq!(
+            busy.data.as_ref().and_then(|data| data["code"].as_str()),
+            Some("code_review_highlight_running"),
+            "{busy:?}"
+        );
+
+        // Release the held call; its plain reply fails the typed parse.
+        gate.add_permits(1);
+        loop {
+            let settled = {
+                let mut state = code_review.state.lock().await;
+                let session = state.session.as_mut().expect("open review");
+                session.controller.poll_events();
+                session.controller.highlight_state()
+            };
+            if settled == crate::code_review_panel::HighlightState::Failed {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let invalid = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewHighlight { id: Some("hl-invalid".into()) },
+        )
+        .await;
+        assert!(invalid.success, "{invalid:?}");
+        {
+            let state = code_review.state.lock().await;
+            assert_eq!(
+                state.session.as_ref().expect("open review").controller.highlight_state(),
+                crate::code_review_panel::HighlightState::Running,
+                "retried highlight must enter Running before its gated reply"
+            );
+        }
+        // The gate only exists to hold the first call provably Running for
+        // the concurrency check; release the second held call so its plain
+        // reply reaches the typed parse and fails closed.
+        gate.add_permits(1);
+        let mut failed = false;
+        for _ in 0..100 {
+            let settled = {
+                let mut state = code_review.state.lock().await;
+                let session = state.session.as_mut().expect("open review");
+                session.controller.poll_events();
+                session.controller.highlight_state()
+            };
+            if settled == crate::code_review_panel::HighlightState::Failed {
+                failed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(failed, "invalid highlight must fail closed");
+        {
+            let state = code_review.state.lock().await;
+            let session = state.session.as_ref().expect("open review");
+            assert!(session.controller.review_findings().is_empty());
+        }
+        app.cleanup().await;
+    }
+    #[tokio::test]
+    async fn code_review_tldr_projects_generation_and_stop_keeps_last_good() {
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"]).status.success();
+        git(&["config", "user.name", "Test"]).status.success();
+        std::fs::write(cwd.path().join("README.md"), "initial\n").expect("write");
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "init"]).status.success());
+        std::fs::write(cwd.path().join("README.md"), "initial\nchanged\n").expect("write");
+
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let app = build_code_review_app_with_stream(
+            cwd.path(),
+            gated_tldr_rpc_stream(gate.clone(), "# Overview\n\nREADME changed.\n"),
+        )
+        .await;
+        let code_review = CodeReviewRpcState::default();
+        let missing = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewTldr { id: None, language: None },
+        )
+        .await;
+        assert!(!missing.success, "{missing:?}");
+        assert_eq!(
+            missing.data.as_ref().and_then(|data| data["code"].as_str()),
+            Some("code_review_not_open"),
+            "{missing:?}"
+        );
+
+        let opened = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen {
+                id: Some("open-tldr".into()),
+                commit: None,
+                from: None,
+                to: None,
+                include_working_tree: None,
+            },
+        )
+        .await;
+        assert!(opened.success, "{opened:?}");
+        let snapshot_id = opened.data.expect("open data")["snapshotId"]
+            .as_str()
+            .expect("snapshot id")
+            .to_owned();
+        let idle = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewSnapshot { id: Some("tldr-idle".into()) },
+        )
+        .await;
+        let idle = idle.data.expect("idle snapshot");
+        assert_eq!(idle["tldrState"], "idle");
+        assert_eq!(idle["tldrGeneration"], 0);
+        assert!(idle["tldrSnapshotId"].is_null());
+        assert!(idle["tldrError"].is_null());
+        assert_eq!(idle["tldrMarkdown"], "");
+
+        let started = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewTldr {
+                id: Some("tldr-1".into()),
+                language: Some("en".into()),
+            },
+        )
+        .await;
+        assert!(started.success, "{started:?}");
+        let started = started.data.expect("tldr ack");
+        assert_eq!(started["ok"], true);
+        assert_eq!(started["state"], "running");
+        let generation = started["tldrGeneration"].as_u64().expect("generation");
+        assert_eq!(generation, 1);
+
+        let busy = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewTldr { id: Some("tldr-busy".into()), language: None },
+        )
+        .await;
+        assert!(!busy.success, "{busy:?}");
+        assert_eq!(
+            busy.data.as_ref().and_then(|data| data["code"].as_str()),
+            Some("code_review_tldr_running"),
+            "{busy:?}"
+        );
+
+        gate.add_permits(1);
+        let mut done = serde_json::Value::Null;
+        for _ in 0..100 {
+            let snapshot = handle_code_review_command(
+                &app,
+                &code_review,
+                RpcCommand::CodeReviewSnapshot { id: Some("tldr-done".into()) },
+            )
+            .await;
+            done = snapshot.data.expect("done snapshot");
+            if done["tldrState"] == "done" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(done["tldrState"], "done", "{done}");
+        assert_eq!(done["tldrGeneration"], generation);
+        assert_eq!(done["tldrSnapshotId"], snapshot_id);
+        assert!(done["tldrError"].is_null());
+        assert_eq!(
+            done["tldrMarkdown"].as_str().unwrap_or("").trim(),
+            "# Overview\n\nREADME changed.\n".trim(),
+        );
+
+        let stopped_start = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewTldr { id: Some("tldr-2".into()), language: None },
+        )
+        .await;
+        assert!(stopped_start.success, "{stopped_start:?}");
+        let stopped_generation = stopped_start.data.expect("second ack")["tldrGeneration"]
+            .as_u64()
+            .expect("second generation");
+        assert!(stopped_generation > generation);
+        let stopped = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewStop {
+                id: Some("stop-tldr".into()),
+                operation: ReviewStopOperation::Tldr,
+            },
+        )
+        .await;
+        assert!(stopped.success, "{stopped:?}");
+        assert_eq!(stopped.data.expect("stop ack")["operation"], "tldr");
+        let after = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewSnapshot { id: Some("tldr-stopped".into()) },
+        )
+        .await;
+        let after = after.data.expect("stopped snapshot");
+        assert_eq!(after["tldrState"], "done", "{after}");
+        assert!(after["tldrGeneration"].as_u64().expect("generation") > stopped_generation);
+        assert_eq!(
+            after["tldrMarkdown"].as_str().unwrap_or("").trim(),
+            "# Overview\n\nREADME changed.\n".trim(),
+        );
+        assert!(after["tldrError"].is_null());
+        app.cleanup().await;
+    }
+
+    fn gated_tldr_rpc_stream(
+        gate: Arc<tokio::sync::Semaphore>,
+        markdown: &'static str,
+    ) -> pi_agent::StreamFn {
+        Arc::new(move |model, context, _options| {
+            let gate = gate.clone();
+            let prompt = review_request_text(&context);
+            Box::pin(async move {
+                let stream = pi_ai::new_assistant_message_event_stream();
+                let producer = stream.clone();
+                tokio::spawn(async move {
+                    let reply = if prompt.contains("comparisonLabel:") {
+                        gate.acquire().await.expect("release permit").forget();
+                        markdown.to_owned()
+                    } else {
+                        "non-tldr reply".to_owned()
+                    };
+                    let mut message = pi_ai::AssistantMessage::pending(&model);
+                    message.content.push(pi_ai::ContentBlock::text(reply));
+                    message.stop_reason = pi_ai::StopReason::Stop;
+                    producer.end(Some(message)).await;
+                });
+                stream
+            })
+        })
+    }
+    #[tokio::test]
+    async fn code_review_refresh_capture_keeps_snapshot_and_abort_responsive() {
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(cwd.path().join("review.txt"), "base\n").expect("write baseline");
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "baseline"]).status.success());
+        std::fs::write(cwd.path().join("review.txt"), "base\nchanged\n").expect("write change");
+
+        let app = build_code_review_app(cwd.path()).await;
+        let code_review = CodeReviewRpcState::default();
+        let opened = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen {
+                id: None,
+                commit: None,
+                from: None,
+                to: None,
+                include_working_tree: None,
+            },
+        )
+        .await;
+        assert!(opened.success, "{opened:?}");
+        let opened_data = opened.data.expect("open data");
+        let snapshot_id = opened_data["snapshotId"]
+            .as_str()
+            .expect("snapshot id")
+            .to_owned();
+        let hunk = &opened_data["files"][0]["hunks"][0];
+        let abort = RpcCommand::CodeReviewAbort {
+            id: Some("abort-during-refresh".into()),
+            snapshot_id: snapshot_id.clone(),
+            path: opened_data["files"][0]["path"]
+                .as_str()
+                .expect("path")
+                .to_owned(),
+            old_start: hunk["oldStart"].as_u64().expect("old start") as u32,
+            old_count: hunk["oldCount"].as_u64().expect("old count") as u32,
+            new_start: hunk["newStart"].as_u64().expect("new start") as u32,
+            new_count: hunk["newCount"].as_u64().expect("new count") as u32,
+            content_hash: hunk["contentHash"]
+                .as_str()
+                .expect("content hash")
+                .to_owned(),
+        };
+        let gate = Arc::new(ReviewCaptureGate {
+            captured: tokio::sync::Notify::new(),
+            released: std::sync::Mutex::new(false),
+            release: std::sync::Condvar::new(),
+        });
+        *code_review.review_capture_gate.lock().await = Some(gate.clone());
+        let refresh_state = code_review.clone();
+        let refresh = tokio::spawn({
+            let app = app.clone();
+            async move {
+                handle_code_review_command(
+                    &app,
+                    &refresh_state,
+                    RpcCommand::CodeReviewRefresh {
+                        id: Some("held-refresh".into()),
+                    },
+                )
+                .await
+            }
+        });
+        gate.captured.notified().await;
+
+        let snapshot = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            handle_code_review_command(
+                &app,
+                &code_review,
+                RpcCommand::CodeReviewSnapshot {
+                    id: Some("snapshot-during-refresh".into()),
+                },
+            ),
+        )
+        .await
+        .expect("snapshot pinned behind Git capture");
+        assert!(snapshot.success, "{snapshot:?}");
+        assert_eq!(
+            snapshot.data.expect("snapshot data")["snapshotId"],
+            snapshot_id
+        );
+        let aborted = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            handle_code_review_command(&app, &code_review, abort),
+        )
+        .await
+        .expect("abort pinned behind Git capture");
+        assert!(aborted.success, "{aborted:?}");
+
+        gate.release();
+        let refreshed = refresh.await.expect("refresh task");
+        assert!(refreshed.success, "{refreshed:?}");
+        *code_review.review_capture_gate.lock().await = None;
+        assert!(code_review.close(None).await.is_ok());
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn code_review_delayed_refresh_cannot_resurrect_closed_state() {
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(cwd.path().join("review.txt"), "base\n").expect("write baseline");
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "baseline"]).status.success());
+        std::fs::write(cwd.path().join("review.txt"), "changed\n").expect("write change");
+
+        let app = build_code_review_app(cwd.path()).await;
+        let code_review = CodeReviewRpcState::default();
+        assert!(code_review.open(&app, None, None, None, None).await.is_ok());
+        let gate = Arc::new(ReviewCaptureGate {
+            captured: tokio::sync::Notify::new(),
+            released: std::sync::Mutex::new(false),
+            release: std::sync::Condvar::new(),
+        });
+        *code_review.review_capture_gate.lock().await = Some(gate.clone());
+        let refresh_state = code_review.clone();
+        let refresh = tokio::spawn({
+            let app = app.clone();
+            async move { refresh_state.refresh(&app).await }
+        });
+        gate.captured.notified().await;
+        let closed =
+            tokio::time::timeout(std::time::Duration::from_millis(250), code_review.close(None))
+                .await
+                .expect("close pinned behind Git capture");
+        assert!(closed.is_ok(), "{closed:?}");
+        gate.release();
+        let stale = refresh
+            .await
+            .expect("refresh task")
+            .expect_err("stale refresh resurrected state");
+        assert!(stale.to_string().contains("superseded"), "{stale:#}");
+        assert!(
+            code_review.snapshot().await.is_err(),
+            "closed state was resurrected"
+        );
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn code_review_delayed_open_cannot_overwrite_newer_open() {
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(cwd.path().join("review.txt"), "base\n").expect("write baseline");
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "baseline"]).status.success());
+        std::fs::write(cwd.path().join("review.txt"), "first\n").expect("write first change");
+
+        let app = build_code_review_app(cwd.path()).await;
+        let code_review = CodeReviewRpcState::default();
+        let initial = code_review
+            .open(&app, None, None, None, None)
+            .await
+            .expect("initial open");
+        let initial_id = initial["snapshotId"]
+            .as_str()
+            .expect("initial snapshot id")
+            .to_owned();
+        let gate = Arc::new(ReviewCaptureGate {
+            captured: tokio::sync::Notify::new(),
+            released: std::sync::Mutex::new(false),
+            release: std::sync::Condvar::new(),
+        });
+        *code_review.review_capture_gate.lock().await = Some(gate.clone());
+        let stale_state = code_review.clone();
+        let stale_open = tokio::spawn({
+            let app = app.clone();
+            async move { stale_state.open(&app, None, None, None, None).await }
+        });
+        gate.captured.notified().await;
+        *code_review.review_capture_gate.lock().await = None;
+        let during_open = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            code_review.snapshot(),
+        )
+        .await
+        .expect("snapshot pinned behind replacement open capture")
+        .expect("previous review remains authoritative");
+        assert_eq!(during_open["snapshotId"], initial_id);
+        std::fs::write(cwd.path().join("review.txt"), "second\n").expect("write second change");
+        let newer = code_review
+            .open(&app, None, None, None, None)
+            .await
+            .expect("newer open");
+        let newer_id = newer["snapshotId"]
+            .as_str()
+            .expect("newer snapshot id")
+            .to_owned();
+        gate.release();
+        let stale = stale_open
+            .await
+            .expect("stale open task")
+            .expect_err("stale open overwrote newer state");
+        assert!(stale.to_string().contains("superseded"), "{stale:#}");
+        assert_eq!(
+            code_review.snapshot().await.expect("live snapshot")["snapshotId"],
+            newer_id,
+        );
+        assert!(code_review.close(None).await.is_ok());
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn code_review_stale_close_cannot_kill_newer_controller() {
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(cwd.path().join("review.txt"), "base\n").expect("write baseline");
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "baseline"]).status.success());
+        std::fs::write(cwd.path().join("review.txt"), "changed\n").expect("write change");
+
+        let app = build_code_review_app(cwd.path()).await;
+        let code_review = CodeReviewRpcState::default();
+        code_review
+            .open(&app, None, None, None, None)
+            .await
+            .expect("open");
+        let review_id = code_review
+            .snapshot()
+            .await
+            .expect("snapshot")["reviewId"]
+            .as_str()
+            .expect("review id")
+            .to_owned();
+        let stale = code_review
+            .close(Some("retired-review-identity"))
+            .await
+            .expect("stale close ok");
+        assert_eq!(stale["closed"], false, "{stale}");
+        assert_eq!(stale["staleReview"], true, "{stale}");
+        assert_eq!(
+            code_review.snapshot().await.expect("controller survived")["reviewId"],
+            review_id,
+        );
+        let closed = code_review.close(Some(&review_id)).await.expect("real close");
+        assert_eq!(closed["closed"], true, "{closed:?}");
+        assert!(
+            code_review.snapshot().await.is_err(),
+            "the matching close still closes the controller"
+        );
+        // A repeat stamped close after the review is gone is the typed no-open
+        // rejection, never a silent success or an authority bump.
+        let repeat = code_review
+            .close(Some(&review_id))
+            .await
+            .expect_err("repeat close must reject");
+        assert_eq!(
+            repeat.downcast_ref::<CodeReviewRpcError>(),
+            Some(&CodeReviewRpcError::ReviewNotOpen),
+            "{repeat:#}"
+        );
         app.cleanup().await;
     }
 
@@ -7502,7 +16443,9 @@ mod tests {
                 .expect("git invocation")
         };
         assert!(git(&["init", "-q"]).status.success());
-        git(&["config", "user.email", "test@example.com"]).status.success();
+        git(&["config", "user.email", "test@example.com"])
+            .status
+            .success();
         git(&["config", "user.name", "Test"]).status.success();
         std::fs::write(cwd.path().join("big.txt"), "base\n").expect("write");
         assert!(git(&["add", "."]).status.success());
@@ -7516,7 +16459,13 @@ mod tests {
         let opened = handle_code_review_command(
             &app,
             &code_review,
-            RpcCommand::CodeReviewOpen { id: None, from: None, to: None },
+            RpcCommand::CodeReviewOpen {
+                id: None,
+                commit: None,
+                from: None,
+                to: None,
+                include_working_tree: None,
+            },
         )
         .await;
         assert!(opened.success, "{opened:?}");
@@ -7525,7 +16474,6 @@ mod tests {
             .expect("snapshot id")
             .to_owned();
 
-        // Unknown path is rejected (containment) before git ever runs.
         let unknown = handle_code_review_command(
             &app,
             &code_review,
@@ -7539,9 +16487,13 @@ mod tests {
         )
         .await;
         assert!(!unknown.success, "{unknown:?}");
-        assert!(unknown.error.as_deref().is_some_and(|e| e.contains("unknown file")));
+        assert!(
+            unknown
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("unknown file"))
+        );
 
-        // A traversal path is rejected as unknown (normalize collapses "..").
         let traversal = handle_code_review_command(
             &app,
             &code_review,
@@ -7556,7 +16508,6 @@ mod tests {
         .await;
         assert!(!traversal.success, "{traversal:?}");
 
-        // First page loads the big file's full diff and returns a bounded page.
         let first = handle_code_review_command(
             &app,
             &code_review,
@@ -7574,7 +16525,10 @@ mod tests {
         assert_eq!(page["path"], "big.txt");
         assert_eq!(page["cursor"], 0);
         let hunks = page["hunks"].as_array().expect("hunks");
-        assert!(!hunks.is_empty(), "page must carry hunk descriptors: {page}");
+        assert!(
+            !hunks.is_empty(),
+            "page must carry hunk descriptors: {page}"
+        );
         let page_lines: usize = hunks
             .iter()
             .map(|hunk| hunk["lines"].as_array().expect("hunk lines").len())
@@ -7590,13 +16544,13 @@ mod tests {
         let next = page["nextCursor"].as_u64().expect("next cursor");
         assert_eq!(next, 50);
         let total = page["totalLines"].as_u64().expect("total lines");
-        assert!(total > 4000, "the big file should exceed the render cap: {total}");
+        assert!(
+            total > 4000,
+            "the big file should exceed the render cap: {total}"
+        );
         let hunk_count = page["hunkCount"].as_u64().expect("hunk count");
         assert!(hunk_count >= 1);
 
-        // The page's hunk descriptor is the exact identity a comment targets:
-        // a comment carrying ranges + contentHash from the loaded page resolves
-        // against the cached per-file hunks and queues on the review thread.
         let hunk = &hunks[0];
         let identity = (
             hunk["oldStart"].as_u64().expect("oldStart") as u32,
@@ -7618,14 +16572,12 @@ mod tests {
                 new_count: identity.3,
                 content_hash: identity.4.clone(),
                 comment: "loaded hunk comment".into(),
+                images: Vec::new(),
             },
         )
         .await;
         assert!(commented.success, "{commented:?}");
-        let thread = commented
-            .data
-            .as_ref()
-            .expect("comment data")["threads"]
+        let thread = commented.data.as_ref().expect("comment data")["threads"]
             .as_array()
             .expect("threads")
             .first()
@@ -7642,7 +16594,6 @@ mod tests {
             "the accepted comment must be queued on the thread"
         );
         assert_eq!(thread["comments"][0]["text"], "loaded hunk comment");
-        // A second comment on the same loaded hunk queues behind the first.
         let second = handle_code_review_command(
             &app,
             &code_review,
@@ -7656,14 +16607,12 @@ mod tests {
                 new_count: identity.3,
                 content_hash: identity.4.clone(),
                 comment: "queued follow-up".into(),
+                images: Vec::new(),
             },
         )
         .await;
         assert!(second.success, "{second:?}");
-        let thread = second
-            .data
-            .as_ref()
-            .expect("comment data")["threads"]
+        let thread = second.data.as_ref().expect("comment data")["threads"]
             .as_array()
             .expect("threads")
             .first()
@@ -7674,8 +16623,6 @@ mod tests {
             2,
             "the second comment must queue on the same loaded hunk thread"
         );
-        // Wrong range and wrong hash for the same path are rejected (the
-        // authoritative cache never falls back to the snapshot hunks).
         let wrong_hash = handle_code_review_command(
             &app,
             &code_review,
@@ -7689,11 +16636,17 @@ mod tests {
                 new_count: identity.3,
                 content_hash: "deadbeef".into(),
                 comment: "stale".into(),
+                images: Vec::new(),
             },
         )
         .await;
         assert!(!wrong_hash.success, "{wrong_hash:?}");
-        assert!(wrong_hash.error.as_deref().is_some_and(|e| e.contains("stale hunk")));
+        assert!(
+            wrong_hash
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("stale hunk"))
+        );
         let wrong_range = handle_code_review_command(
             &app,
             &code_review,
@@ -7707,12 +16660,17 @@ mod tests {
                 new_count: 1,
                 content_hash: identity.4.clone(),
                 comment: "stale".into(),
+                images: Vec::new(),
             },
         )
         .await;
         assert!(!wrong_range.success, "{wrong_range:?}");
-        assert!(wrong_range.error.as_deref().is_some_and(|e| e.contains("unknown hunk")));
-        // Abort with the exact loaded identity resolves against the cache.
+        assert!(
+            wrong_range
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("unknown hunk"))
+        );
         let aborted = handle_code_review_command(
             &app,
             &code_review,
@@ -7730,7 +16688,6 @@ mod tests {
         .await;
         assert!(aborted.success, "{aborted:?}");
 
-        // A stale snapshot id is rejected.
         let stale = handle_code_review_command(
             &app,
             &code_review,
@@ -7744,9 +16701,13 @@ mod tests {
         )
         .await;
         assert!(!stale.success, "{stale:?}");
-        assert!(stale.error.as_deref().is_some_and(|e| e.contains("stale snapshot")));
+        assert!(
+            stale
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("stale snapshot"))
+        );
 
-        // A cursor past the end is rejected by the slicer.
         let over_cursor = handle_code_review_command(
             &app,
             &code_review,
@@ -7760,16 +16721,17 @@ mod tests {
         )
         .await;
         assert!(!over_cursor.success, "{over_cursor:?}");
-        assert!(over_cursor.error.as_deref().is_some_and(|e| e.contains("out of range")));
+        assert!(
+            over_cursor
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("out of range"))
+        );
 
-        // Mutate the working tree before refresh so the snapshot identity
-        // (a digest of the diff bytes) actually changes; an unchanged refresh
-        // is idempotent and reuses the same snapshot id by design.
         let changed2 = "changed-line\n".repeat(6000);
         std::fs::write(cwd.path().join("big.txt"), &changed2).expect("write big2");
         assert!(git(&["add", "big.txt"]).status.success());
 
-        // Refresh invalidates the cache: the old snapshot id is now stale.
         let refreshed = handle_code_review_command(
             &app,
             &code_review,
@@ -7794,7 +16756,6 @@ mod tests {
         )
         .await;
         assert!(!stale_after_refresh.success, "{stale_after_refresh:?}");
-        // The new snapshot id still serves pages.
         let ok_after = handle_code_review_command(
             &app,
             &code_review,
@@ -7812,7 +16773,1100 @@ mod tests {
         let closed = handle_code_review_command(
             &app,
             &code_review,
-            RpcCommand::CodeReviewClose { id: None },
+            RpcCommand::CodeReviewClose { id: None, review_id: None },
+        )
+        .await;
+        assert!(closed.success);
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn code_review_file_context_expands_above_hunk_and_rejects_stale_snapshot() {
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"])
+            .status
+            .success();
+        git(&["config", "user.name", "Test"]).status.success();
+        let mut body = String::new();
+        for n in 1..=50 {
+            body.push_str(&format!("line-{n}\n"));
+        }
+        std::fs::write(cwd.path().join("wide.rs"), &body).expect("write");
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "init"]).status.success());
+        let edited = body.replace("line-40\n", "line-40-edit\n");
+        std::fs::write(cwd.path().join("wide.rs"), &edited).expect("edit");
+
+        let app = build_code_review_app(cwd.path()).await;
+        let code_review = CodeReviewRpcState::default();
+        let opened = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen {
+                id: None,
+                commit: None,
+                from: None,
+                to: None,
+                include_working_tree: None,
+            },
+        )
+        .await;
+        assert!(opened.success, "{opened:?}");
+        let snapshot_id = opened.data.as_ref().expect("open data")["snapshotId"]
+            .as_str()
+            .expect("snapshot id")
+            .to_owned();
+        let files = opened.data.as_ref().expect("open data")["files"]
+            .as_array()
+            .expect("files");
+        let file = files
+            .iter()
+            .find(|file| file["path"] == "wide.rs")
+            .expect("wide.rs");
+        let hunks = file["hunks"].as_array().expect("hunks");
+        assert!(!hunks.is_empty(), "{file}");
+        let new_start = hunks[0]["newStart"].as_u64().expect("newStart");
+        assert!(new_start > 1, "hunk must sit below file start: {file}");
+        let hash_before = hunks[0]["contentHash"].as_str().expect("hash").to_owned();
+
+        std::fs::write(cwd.path().join("wide.rs"), "LIVE-WORKTREE-SHOULD-NOT-APPEAR\n")
+            .expect("overwrite live worktree");
+
+        let stale = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewFileContext {
+                id: None,
+                snapshot_id: "wrong-snapshot-id".to_owned(),
+                path: "wide.rs".into(),
+                old_start: 1,
+                new_start: 1,
+                count: Some(20),
+            },
+        )
+        .await;
+        assert!(!stale.success, "{stale:?}");
+        assert!(
+            stale
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("stale snapshot")),
+            "{stale:?}"
+        );
+
+        let expanded = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewFileContext {
+                id: None,
+                snapshot_id: snapshot_id.clone(),
+                path: "wide.rs".into(),
+                old_start: 20,
+                new_start: 20,
+                count: Some(20),
+            },
+        )
+        .await;
+        assert!(expanded.success, "{expanded:?}");
+        let page = expanded.data.expect("context data");
+        assert_eq!(page["snapshotId"], snapshot_id);
+        assert_eq!(page["path"], "wide.rs");
+        let lines = page["lines"].as_array().expect("lines");
+        assert_eq!(lines.len(), 20, "{page}");
+        assert_eq!(lines[0]["kind"], "context");
+        assert_eq!(lines[0]["newNo"], 20);
+        assert_eq!(lines[0]["text"], "line-20");
+        assert!(
+            !lines.iter().any(|line| line["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("LIVE-WORKTREE"))),
+            "{page}"
+        );
+        let after = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewSnapshot { id: None },
+        )
+        .await;
+        assert!(after.success, "{after:?}");
+        let after_hunks = after.data.as_ref().expect("snapshot")["files"]
+            .as_array()
+            .expect("files")
+            .iter()
+            .find(|file| file["path"] == "wide.rs")
+            .expect("wide.rs")["hunks"]
+            .as_array()
+            .expect("hunks");
+        assert_eq!(
+            after_hunks[0]["contentHash"].as_str().expect("hash"),
+            hash_before
+        );
+
+        let meta = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewFileContext {
+                id: None,
+                snapshot_id: snapshot_id.clone(),
+                path: "wide.rs".into(),
+                old_start: 0,
+                new_start: 0,
+                count: Some(0),
+            },
+        )
+        .await;
+        assert!(meta.success, "{meta:?}");
+        let meta_page = meta.data.expect("count-0 data");
+        assert_eq!(meta_page["oldLineCount"], 50);
+        assert_eq!(meta_page["newLineCount"], 50);
+        assert_eq!(
+            meta_page["lines"].as_array().expect("lines").len(),
+            0,
+            "{meta_page}"
+        );
+
+        let closed = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewClose { id: None, review_id: None },
+        )
+        .await;
+        assert!(closed.success);
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn code_review_served_uncached_diff_keeps_comment_and_abort_authority() {
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"])
+            .status
+            .success();
+        git(&["config", "user.name", "Test"]).status.success();
+        std::fs::write(cwd.path().join("big.txt"), "base\n").expect("write");
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "init"]).status.success());
+        let changed = "changed-line\n".repeat(5000);
+        std::fs::write(cwd.path().join("big.txt"), &changed).expect("write");
+        assert!(git(&["add", "."]).status.success());
+
+        let app = build_code_review_app(cwd.path()).await;
+        let code_review = CodeReviewRpcState::default();
+        let opened = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen {
+                id: None,
+                commit: None,
+                from: None,
+                to: None,
+                include_working_tree: None,
+            },
+        )
+        .await;
+        assert!(opened.success, "{opened:?}");
+        let snapshot_id = opened.data.as_ref().expect("open data")["snapshotId"]
+            .as_str()
+            .expect("snapshot id")
+            .to_owned();
+
+        {
+            let mut state = code_review.state.lock().await;
+            let session = state.session.as_mut().expect("open review");
+            session.file_diff_cache = FileDiffCache::new(FILE_DIFF_CACHE_MAX_ENTRIES, 1);
+        }
+
+        let first = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewFileDiff {
+                id: None,
+                snapshot_id: snapshot_id.clone(),
+                path: "big.txt".into(),
+                cursor: 0,
+                max_lines: Some(50),
+            },
+        )
+        .await;
+        assert!(first.success, "{first:?}");
+        let page = first.data.expect("page data");
+        let hunks = page["hunks"].as_array().expect("hunks").clone();
+        assert!(!hunks.is_empty(), "page carries hunk descriptors: {page}");
+        assert!(
+            hunks.iter().all(|hunk| hunk["complete"] == true),
+            "retained authority lets the page expose comment-ready identities: {page}"
+        );
+        let hunk = &hunks[0];
+        let identity = (
+            hunk["oldStart"].as_u64().expect("oldStart") as u32,
+            hunk["oldCount"].as_u64().expect("oldCount") as u32,
+            hunk["newStart"].as_u64().expect("newStart") as u32,
+            hunk["newCount"].as_u64().expect("newCount") as u32,
+            hunk["contentHash"].as_str().expect("hash").to_owned(),
+        );
+
+        {
+            let state = code_review.state.lock().await;
+            let session = state.session.as_ref().expect("open review");
+            assert!(
+                session.file_diff_cache.peek("big.txt").is_none(),
+                "the body cache rejected the diff"
+            );
+            let records = session
+                .comment_authority
+                .lookup("big.txt")
+                .expect("authority retained the served identities");
+            assert_eq!(records.len() as u64, page["hunkCount"].as_u64().expect("hunk count"));
+            assert_eq!(session.comment_authority.total, records.len());
+            assert!(!session.comment_authority.overflowed("big.txt"));
+            assert_eq!(
+                records[0].content_hash, identity.4,
+                "record digest matches the page projection"
+            );
+        }
+
+        let commented = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewComment {
+                id: Some("comment-uncached".into()),
+                snapshot_id: snapshot_id.clone(),
+                path: "big.txt".into(),
+                old_start: identity.0,
+                old_count: identity.1,
+                new_start: identity.2,
+                new_count: identity.3,
+                content_hash: identity.4.clone(),
+                comment: "served-uncached comment".into(),
+                images: Vec::new(),
+            },
+        )
+        .await;
+        assert!(commented.success, "{commented:?}");
+        let thread = commented.data.as_ref().expect("comment data")["threads"]
+            .as_array()
+            .expect("threads")
+            .first()
+            .expect("thread")
+            .clone();
+        assert_eq!(thread["identity"]["path"], "big.txt");
+        assert_eq!(
+            thread["identity"]["contentHash"].as_str().expect("thread hash"),
+            identity.4.as_str(),
+            "the thread carries the served page's exact identity"
+        );
+
+        let aborted = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewAbort {
+                id: None,
+                snapshot_id: snapshot_id.clone(),
+                path: "big.txt".into(),
+                old_start: identity.0,
+                old_count: identity.1,
+                new_start: identity.2,
+                new_count: identity.3,
+                content_hash: identity.4.clone(),
+            },
+        )
+        .await;
+        assert!(aborted.success, "{aborted:?}");
+
+        // Snapshot identity is content-derived: refresh only yields a new id
+        // once the captured comparison actually changed.
+        std::fs::write(cwd.path().join("big.txt"), format!("{changed}more\n"))
+            .expect("mutate before refresh");
+        assert!(git(&["add", "big.txt"]).status.success());
+
+        let refreshed = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewRefresh { id: None },
+        )
+        .await;
+        assert!(refreshed.success, "{refreshed:?}");
+        {
+            let state = code_review.state.lock().await;
+            let session = state.session.as_ref().expect("open review");
+            assert_ne!(session.snapshot.snapshot_id, snapshot_id);
+            assert!(
+                session.comment_authority.records.is_empty()
+                    && session.comment_authority.total == 0
+                    && session.comment_authority.overflow.is_empty(),
+                "refresh clears the comment authority with the session"
+            );
+        }
+
+        let closed = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewClose { id: None, review_id: None },
+        )
+        .await;
+        assert!(closed.success, "{closed:?}");
+        {
+            let state = code_review.state.lock().await;
+            assert!(state.session.is_none(), "close drops the session");
+        }
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn code_review_authority_overflow_pages_fail_closed_and_reject_comments() {
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"])
+            .status
+            .success();
+        git(&["config", "user.name", "Test"]).status.success();
+        std::fs::write(cwd.path().join("big.txt"), "base\n").expect("write");
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "init"]).status.success());
+        let changed = "changed-line\n".repeat(5000);
+        std::fs::write(cwd.path().join("big.txt"), &changed).expect("write");
+        assert!(git(&["add", "."]).status.success());
+
+        let app = build_code_review_app(cwd.path()).await;
+        let code_review = CodeReviewRpcState::default();
+        let opened = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen {
+                id: None,
+                from: None,
+                commit: None,
+                to: None,
+                include_working_tree: None,
+            },
+        )
+        .await;
+        assert!(opened.success, "{opened:?}");
+        let snapshot_id = opened.data.as_ref().expect("open data")["snapshotId"]
+            .as_str()
+            .expect("snapshot id")
+            .to_owned();
+
+        {
+            use crate::code_review::{DiffLine, FileStatus};
+            let hunk = |text: &str| DiffHunk {
+                header: "@@ -1,1 +1,1 @@".into(),
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 1,
+                lines: vec![DiffLine {
+                    kind: DiffLineKind::Addition,
+                    old_no: None,
+                    new_no: Some(1),
+                    text: text.to_owned(),
+                }],
+            };
+            let filler = |texts: &[&str]| FileDiff {
+                path: "filler".into(),
+                previous_path: None,
+                status: FileStatus::Modified,
+                binary: false,
+                hunks: texts.iter().map(|text| hunk(text)).collect(),
+                byte_capped: false,
+                error: None,
+            };
+            let mut state = code_review.state.lock().await;
+            let session = state.session.as_mut().expect("open review");
+            session.file_diff_cache = FileDiffCache::new(FILE_DIFF_CACHE_MAX_ENTRIES, 1);
+            let mut batch = 0usize;
+            while session.comment_authority.total + 256 <= MAX_COMMENT_AUTHORITY_HUNKS {
+                let texts: Vec<String> = (0..256)
+                    .map(|i| format!("hunk {}", batch * 256 + i))
+                    .collect();
+                let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+                assert!(session
+                    .comment_authority
+                    .record(&format!("filler{batch}.txt"), &filler(&texts)));
+                batch += 1;
+            }
+            assert_eq!(session.comment_authority.total, MAX_COMMENT_AUTHORITY_HUNKS);
+        }
+
+        let first = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewFileDiff {
+                id: None,
+                snapshot_id: snapshot_id.clone(),
+                path: "big.txt".into(),
+                cursor: 0,
+                max_lines: Some(50),
+            },
+        )
+        .await;
+        assert!(first.success, "{first:?}");
+        let page = first.data.expect("page data");
+        let hunks = page["hunks"].as_array().expect("hunks").clone();
+        assert!(!hunks.is_empty());
+        assert!(
+            hunks.iter().all(|hunk| hunk["complete"] == false),
+            "an authority-overflowed path serves complete=false on every hunk: {page}"
+        );
+        let hunk = &hunks[0];
+
+        let rejected = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewComment {
+                id: Some("overflow-comment".into()),
+                snapshot_id: snapshot_id.clone(),
+                path: "big.txt".into(),
+                old_start: hunk["oldStart"].as_u64().expect("oldStart") as u32,
+                old_count: hunk["oldCount"].as_u64().expect("oldCount") as u32,
+                new_start: hunk["newStart"].as_u64().expect("newStart") as u32,
+                new_count: hunk["newCount"].as_u64().expect("newCount") as u32,
+                content_hash: hunk["contentHash"].as_str().expect("hash").to_owned(),
+                comment: "must be rejected".into(),
+                images: Vec::new(),
+            },
+        )
+        .await;
+        assert!(!rejected.success, "{rejected:?}");
+        assert!(
+            rejected
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("comment authority bound")),
+            "rejection names the retained authority bound: {rejected:?}"
+        );
+
+        let abort_rejected = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewAbort {
+                id: None,
+                snapshot_id,
+                path: "big.txt".into(),
+                old_start: hunk["oldStart"].as_u64().expect("oldStart") as u32,
+                old_count: hunk["oldCount"].as_u64().expect("oldCount") as u32,
+                new_start: hunk["newStart"].as_u64().expect("newStart") as u32,
+                new_count: hunk["newCount"].as_u64().expect("newCount") as u32,
+                content_hash: hunk["contentHash"].as_str().expect("hash").to_owned(),
+            },
+        )
+        .await;
+        assert!(!abort_rejected.success, "{abort_rejected:?}");
+        assert!(
+            abort_rejected
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("comment authority bound")),
+            "{abort_rejected:?}"
+        );
+
+        let closed = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewClose { id: None, review_id: None },
+        )
+        .await;
+        assert!(closed.success, "{closed:?}");
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn code_review_authority_overflow_denies_cached_diff_pages_and_comments() {
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"]).status.success();
+        git(&["config", "user.name", "Test"]).status.success();
+        std::fs::write(cwd.path().join("big.txt"), "base\n").expect("write");
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "init"]).status.success());
+        let changed = "changed-line\n".repeat(5000);
+        std::fs::write(cwd.path().join("big.txt"), &changed).expect("write");
+        assert!(git(&["add", "."]).status.success());
+
+        let app = build_code_review_app(cwd.path()).await;
+        let code_review = CodeReviewRpcState::default();
+        let opened = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen {
+                id: None,
+                from: None,
+                commit: None,
+                to: None,
+                include_working_tree: None,
+            },
+        )
+        .await;
+        assert!(opened.success, "{opened:?}");
+        let snapshot_id = opened.data.as_ref().expect("open data")["snapshotId"]
+            .as_str()
+            .expect("snapshot id")
+            .to_owned();
+
+        {
+            use crate::code_review::{DiffLine, FileStatus};
+            let hunk = |text: &str| DiffHunk {
+                header: "@@ -1,1 +1,1 @@".into(),
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 1,
+                lines: vec![DiffLine {
+                    kind: DiffLineKind::Addition,
+                    old_no: None,
+                    new_no: Some(1),
+                    text: text.to_owned(),
+                }],
+            };
+            let filler = |texts: &[&str]| FileDiff {
+                path: "filler".into(),
+                previous_path: None,
+                status: FileStatus::Modified,
+                binary: false,
+                hunks: texts.iter().map(|text| hunk(text)).collect(),
+                byte_capped: false,
+                error: None,
+            };
+            let mut state = code_review.state.lock().await;
+            let session = state.session.as_mut().expect("open review");
+            let mut batch = 0usize;
+            while session.comment_authority.total + 256 <= MAX_COMMENT_AUTHORITY_HUNKS {
+                let texts: Vec<String> = (0..256)
+                    .map(|i| format!("hunk {}", batch * 256 + i))
+                    .collect();
+                let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+                assert!(session
+                    .comment_authority
+                    .record(&format!("filler{batch}.txt"), &filler(&texts)));
+                batch += 1;
+            }
+            assert_eq!(session.comment_authority.total, MAX_COMMENT_AUTHORITY_HUNKS);
+        }
+
+        let page = |cursor: usize| {
+            let app = &app;
+            let code_review = &code_review;
+            let snapshot_id = &snapshot_id;
+            async move {
+                handle_code_review_command(
+                    app,
+                    code_review,
+                    RpcCommand::CodeReviewFileDiff {
+                        id: None,
+                        snapshot_id: snapshot_id.clone(),
+                        path: "big.txt".into(),
+                        cursor,
+                        max_lines: Some(50),
+                    },
+                )
+                .await
+            }
+        };
+        let first = page(0).await;
+        assert!(first.success, "{first:?}");
+        let first_page = first.data.expect("page data");
+        let hunks = first_page["hunks"].as_array().expect("hunks").clone();
+        assert!(!hunks.is_empty());
+        assert!(
+            hunks.iter().all(|hunk| hunk["complete"] == false),
+            "the overflowed path serves complete=false on the first (loading) pass: {first_page}"
+        );
+
+        let second = page(0).await;
+        assert!(second.success, "{second:?}");
+        let second_page = second.data.expect("page data");
+        let cached_hunks = second_page["hunks"].as_array().expect("hunks").clone();
+        assert_eq!(second_page["cursor"], 0);
+        assert!(
+            cached_hunks.iter().all(|hunk| hunk["complete"] == false),
+            "a cache hit must NOT restore complete=true for an authority-denied path: {second_page}"
+        );
+        {
+            let state = code_review.state.lock().await;
+            let session = state.session.as_ref().expect("open review");
+            assert!(
+                session.file_diff_cache.peek("big.txt").is_some(),
+                "the diff body stayed cached across the two requests"
+            );
+            assert!(session.comment_authority.overflowed("big.txt"));
+        }
+
+        let hunk = &cached_hunks[0];
+        let rejected = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewComment {
+                id: Some("overflow-cached-comment".into()),
+                snapshot_id,
+                path: "big.txt".into(),
+                old_start: hunk["oldStart"].as_u64().expect("oldStart") as u32,
+                old_count: hunk["oldCount"].as_u64().expect("oldCount") as u32,
+                new_start: hunk["newStart"].as_u64().expect("newStart") as u32,
+                new_count: hunk["newCount"].as_u64().expect("newCount") as u32,
+                content_hash: hunk["contentHash"].as_str().expect("hash").to_owned(),
+                comment: "must fail closed even cached".into(),
+                images: Vec::new(),
+            },
+        )
+        .await;
+        assert!(
+            !rejected.success,
+            "the resolver must fail closed for an overflowed path even on a cache hit: {rejected:?}"
+        );
+        assert!(
+            rejected
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("comment authority bound")),
+            "rejection names the retained authority bound: {rejected:?}"
+        );
+
+        let closed = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewClose { id: None, review_id: None },
+        )
+        .await;
+        assert!(closed.success, "{closed:?}");
+        app.cleanup().await;
+    }
+
+    #[test]
+    fn file_diff_page_projection_serializes_within_wire_cap() {
+        // Quote-heavy lines expand under JSON escaping. Keep line count under
+        // MAX_FILE_PAGE_LINES so paging is forced by the byte cap, not the
+        // line cap. Control bytes cannot be used: sanitize_display maps them
+        // to spaces and collapses the escaped cost.
+        let hostile_line = "\"".repeat(2500);
+        let lines: usize = 300;
+        let mut patch = format!(
+            "diff --git a/hostile.rs b/hostile.rs\n--- a/hostile.rs\n+++ b/hostile.rs\n@@ -0,0 +1,{lines} @@\n"
+        );
+        for i in 0..lines {
+            patch.push_str(&format!("+{i}{hostile_line}\n"));
+        }
+        let files = crate::code_review::parse_unified_diff(&patch);
+        assert_eq!(files.len(), 1);
+        let diff = crate::code_review::FileDiff {
+            path: "hostile.rs".into(),
+            previous_path: None,
+            status: crate::code_review::FileStatus::Modified,
+            binary: false,
+            hunks: files[0].hunks.clone(),
+            byte_capped: false,
+            error: None,
+        };
+        let mut cursor = 0usize;
+        let mut pages = 0usize;
+        while let Ok(page) = diff.slice_page("snap-1", cursor, MAX_FILE_PAGE_LINES) {
+            let wire = serde_json::to_string(&file_diff_projection(&page))
+                .expect("projection serializes");
+            assert!(
+                wire.len() <= crate::code_review::MAX_FILE_PAGE_BYTES,
+                "page {} serialized to {} bytes: {wire}",
+                page.cursor,
+                wire.len()
+            );
+            pages += 1;
+            match page.next_cursor {
+                Some(next) => cursor = next,
+                None => break,
+            }
+            assert!(pages <= 100, "paging did not terminate");
+        }
+        assert!(pages > 1, "hostile lines must be byte-bound: {pages} pages");
+
+        let oversized_line: String = "\\\"".repeat(crate::code_review::MAX_DIFF_LINE_TEXT_BYTES / 2);
+        let mut patch = format!(
+            "diff --git a/huge.rs b/huge.rs\n--- a/huge.rs\n+++ b/huge.rs\n@@ -0,0 +1,2 @@\n"
+        );
+        for i in 0..2 {
+            patch.push_str(&format!("+{i}{oversized_line}\n"));
+        }
+        let files = crate::code_review::parse_unified_diff(&patch);
+        let diff = crate::code_review::FileDiff {
+            path: "huge.rs".into(),
+            previous_path: None,
+            status: crate::code_review::FileStatus::Modified,
+            binary: false,
+            hunks: files[0].hunks.clone(),
+            byte_capped: false,
+            error: None,
+        };
+        let page = diff.slice_page("snap-1", 0, MAX_FILE_PAGE_LINES).expect("page");
+        assert_eq!(page.hunks[0].lines.len(), 1, "one-line progress exception");
+        let wire = serde_json::to_string(&file_diff_projection(&page)).expect("projection serializes");
+        assert!(
+            wire.len() <= crate::code_review::MAX_FILE_PAGE_BYTES,
+            "one-line exception page serialized to {} bytes",
+            wire.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn code_review_file_diff_rejects_load_completed_during_refresh() {
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"])
+            .status
+            .success();
+        git(&["config", "user.name", "Test"]).status.success();
+        std::fs::write(cwd.path().join("race.txt"), "base\n").expect("write baseline");
+        assert!(git(&["add", "race.txt"]).status.success());
+        assert!(git(&["commit", "-q", "-m", "baseline"]).status.success());
+        std::fs::write(cwd.path().join("race.txt"), "base\nopened\n").expect("write opened");
+
+        let app = build_code_review_app(cwd.path()).await;
+        let code_review = CodeReviewRpcState::default();
+        let opened = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen {
+                id: None,
+                from: None,
+                commit: None,
+                to: None,
+                include_working_tree: None,
+            },
+        )
+        .await;
+        assert!(opened.success, "{opened:?}");
+        let old_snapshot_id = opened.data.as_ref().expect("open data")["snapshotId"]
+            .as_str()
+            .expect("snapshot id")
+            .to_owned();
+
+        let gate = Arc::new(FileDiffLoadGate {
+            loaded: tokio::sync::Barrier::new(2),
+            release: tokio::sync::Barrier::new(2),
+        });
+        *code_review.file_diff_load_gate.lock().await = Some(gate.clone());
+        let load_state = code_review.clone();
+        let load_app = &app;
+        let load_id = old_snapshot_id.clone();
+        let load = async move {
+            handle_code_review_command(
+                load_app,
+                &load_state,
+                RpcCommand::CodeReviewFileDiff {
+                    id: None,
+                    snapshot_id: load_id,
+                    path: "race.txt".into(),
+                    cursor: 0,
+                    max_lines: Some(50),
+                },
+            )
+            .await
+        };
+        let race = async {
+            gate.loaded.wait().await;
+            std::fs::write(cwd.path().join("race.txt"), "base\nrefreshed\n")
+                .expect("write refreshed");
+            let refreshed = handle_code_review_command(
+                &app,
+                &code_review,
+                RpcCommand::CodeReviewRefresh { id: None },
+            )
+            .await;
+            assert!(refreshed.success, "{refreshed:?}");
+            gate.release.wait().await;
+            refreshed
+        };
+        let (loaded, refreshed) = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            async { tokio::join!(load, race) },
+        )
+        .await
+        .expect("load held a state lock across the gate barriers and deadlocked the racing refresh");
+        assert!(!loaded.success, "in-flight old page was served: {loaded:?}");
+        assert!(
+            loaded
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("stale snapshot"))
+        );
+        assert_ne!(
+            refreshed.data.as_ref().expect("refresh data")["snapshotId"],
+            old_snapshot_id
+        );
+
+        assert!(
+            code_review_file_diff_cache_paths(&code_review)
+                .await
+                .is_empty(),
+            "a load that completed under a superseded snapshot must not be cached"
+        );
+
+        *code_review.file_diff_load_gate.lock().await = None;
+        let closed = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewClose { id: None, review_id: None },
+        )
+        .await;
+        assert!(closed.success);
+        app.cleanup().await;
+    }
+
+
+    #[tokio::test]
+    async fn code_review_file_diff_coalesces_duplicate_concurrent_loads() {
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"])
+            .status
+            .success();
+        git(&["config", "user.name", "Test"]).status.success();
+        std::fs::write(cwd.path().join("race.txt"), "base\n").expect("write baseline");
+        assert!(git(&["add", "race.txt"]).status.success());
+        assert!(git(&["commit", "-q", "-m", "baseline"]).status.success());
+        std::fs::write(cwd.path().join("race.txt"), "base\nopened\n").expect("write opened");
+
+        let app = build_code_review_app(cwd.path()).await;
+        let code_review = CodeReviewRpcState::default();
+        let opened = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen {
+                id: None,
+                from: None,
+                commit: None,
+                to: None,
+                include_working_tree: None,
+            },
+        )
+        .await;
+        assert!(opened.success, "{opened:?}");
+        let snapshot_id = opened.data.as_ref().expect("open data")["snapshotId"]
+            .as_str()
+            .expect("snapshot id")
+            .to_owned();
+
+        let gate = Arc::new(FileDiffLoadGate {
+            loaded: tokio::sync::Barrier::new(2),
+            release: tokio::sync::Barrier::new(2),
+        });
+        *code_review.file_diff_load_gate.lock().await = Some(gate.clone());
+        let make_request = || {
+            let code_review = code_review.clone();
+            let snapshot_id = snapshot_id.clone();
+            let app = &app;
+            async move {
+                handle_code_review_command(
+                    app,
+                    &code_review,
+                    RpcCommand::CodeReviewFileDiff {
+                        id: None,
+                        snapshot_id,
+                        path: "race.txt".into(),
+                        cursor: 0,
+                        max_lines: Some(50),
+                    },
+                )
+                .await
+            }
+        };
+        let race = {
+            let gate = gate.clone();
+            async move {
+                gate.loaded.wait().await;
+                gate.release.wait().await;
+            }
+        };
+        let joined = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            async { tokio::join!(make_request(), make_request(), race) },
+        )
+        .await
+        .expect("single-flight violated: a duplicate request ran its own physical load and deadlocked on the load gate");
+        let (first, second, ()) = joined;
+        assert!(first.success, "{first:?}");
+        assert!(second.success, "{second:?}");
+        assert_eq!(
+            first.data, second.data,
+            "both concurrent requests must slice the SAME loaded FileDiff"
+        );
+        assert_eq!(
+            code_review
+                .file_diff_load_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly ONE physical git load must serve both concurrent requests"
+        );
+
+        *code_review.file_diff_load_gate.lock().await = None;
+        let closed = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewClose { id: None, review_id: None },
+        )
+        .await;
+        assert!(closed.success);
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn code_review_file_diff_shares_uncacheable_outcome_among_waiters() {
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"])
+            .status
+            .success();
+        git(&["config", "user.name", "Test"]).status.success();
+        std::fs::write(cwd.path().join("race.txt"), "base\n").expect("write baseline");
+        assert!(git(&["add", "race.txt"]).status.success());
+        assert!(git(&["commit", "-q", "-m", "baseline"]).status.success());
+        // A single oversize untracked file provides the deterministic
+        // uncacheable outcome: larger than the per-file diff cap, it is
+        // catalogued as an on-demand placeholder whose body is never pinned,
+        // so its per-file load fails identically for every caller and must
+        // never enter the file-diff cache.
+        let oversize = cwd.path().join("oversize.txt");
+        std::fs::File::create(&oversize)
+            .expect("create oversize file")
+            .set_len(crate::code_review::MAX_FILE_DIFF_BYTES as u64 + 1)
+            .expect("grow oversize file");
+
+        let app = build_code_review_app(cwd.path()).await;
+        let code_review = CodeReviewRpcState::default();
+        let opened = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen {
+                id: None,
+                from: None,
+                commit: None,
+                to: None,
+                include_working_tree: None,
+            },
+        )
+        .await;
+        assert!(opened.success, "{opened:?}");
+        let snapshot_id = opened.data.as_ref().expect("open data")["snapshotId"]
+            .as_str()
+            .expect("snapshot id")
+            .to_owned();
+
+        let gate = Arc::new(FileDiffLoadGate {
+            loaded: tokio::sync::Barrier::new(2),
+            release: tokio::sync::Barrier::new(2),
+        });
+        *code_review.file_diff_load_gate.lock().await = Some(gate.clone());
+        let make_request = || {
+            let code_review = code_review.clone();
+            let snapshot_id = snapshot_id.clone();
+            let app = &app;
+            async move {
+                handle_code_review_command(
+                    app,
+                    &code_review,
+                    RpcCommand::CodeReviewFileDiff {
+                        id: None,
+                        snapshot_id,
+                        path: "oversize.txt".into(),
+                        cursor: 0,
+                        max_lines: Some(50),
+                    },
+                )
+                .await
+            }
+        };
+        let race = {
+            let gate = gate.clone();
+            async move {
+                gate.loaded.wait().await;
+                gate.release.wait().await;
+            }
+        };
+        let joined = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            async { tokio::join!(make_request(), make_request(), race) },
+        )
+        .await
+        .expect("single-flight violated: a duplicate request ran its own physical load and deadlocked on the load gate");
+        let (first, second, ()) = joined;
+        assert!(!first.success, "{first:?}");
+        assert!(
+            first
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("untracked file body was not captured")),
+            "the shared outcome must be the deterministic unpinned-body failure: {first:?}"
+        );
+        assert!(!second.success, "{second:?}");
+        assert_eq!(
+            first.error, second.error,
+            "both concurrent requests must consume the SAME shared terminal outcome"
+        );
+        assert_eq!(
+            code_review
+                .file_diff_load_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly ONE physical file-diff load must serve both concurrent requests even when the outcome is not cacheable"
+        );
+        assert!(
+            code_review_file_diff_cache_paths(&code_review)
+                .await
+                .is_empty(),
+            "an error outcome must not enter the file-diff cache",
+        );
+
+        *code_review.file_diff_load_gate.lock().await = None;
+        let closed = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewClose { id: None, review_id: None },
         )
         .await;
         assert!(closed.success);
@@ -7834,26 +17888,35 @@ mod tests {
                 .expect("git invocation")
         };
         assert!(git(&["init", "-q"]).status.success());
-        git(&["config", "user.email", "test@example.com"]).status.success();
+        git(&["config", "user.email", "test@example.com"])
+            .status
+            .success();
         git(&["config", "user.name", "Test"]).status.success();
         std::fs::write(cwd.path().join("big-a.txt"), "base\n").expect("write big-a");
         std::fs::write(cwd.path().join("big-b.txt"), "base\n").expect("write big-b");
-        std::fs::write(cwd.path().join("rename-old.txt"), "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\n")
-            .expect("write rename source");
+        std::fs::write(
+            cwd.path().join("rename-old.txt"),
+            "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\n",
+        )
+        .expect("write rename source");
         std::fs::write(cwd.path().join("zz-later.txt"), "base\n").expect("write later");
         assert!(git(&["add", "-A"]).status.success());
         assert!(git(&["commit", "-q", "-m", "baseline"]).status.success());
         let changed = "changed-line\n".repeat(200_000);
         std::fs::write(cwd.path().join("big-a.txt"), &changed).expect("write big-a changed");
         std::fs::write(cwd.path().join("big-b.txt"), &changed).expect("write big-b changed");
-        std::fs::rename(cwd.path().join("rename-old.txt"), cwd.path().join("rename-new.txt"))
-            .expect("rename");
+        std::fs::rename(
+            cwd.path().join("rename-old.txt"),
+            cwd.path().join("rename-new.txt"),
+        )
+        .expect("rename");
         std::fs::write(
             cwd.path().join("rename-new.txt"),
             "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\nrenamed\n",
         )
         .expect("write rename destination");
-        std::fs::write(cwd.path().join("zz-later.txt"), "base\nchanged\n").expect("write later changed");
+        std::fs::write(cwd.path().join("zz-later.txt"), "base\nchanged\n")
+            .expect("write later changed");
         assert!(git(&["add", "-A"]).status.success());
 
         let app = build_code_review_app(cwd.path()).await;
@@ -7861,12 +17924,27 @@ mod tests {
         let opened = handle_code_review_command(
             &app,
             &code_review,
-            RpcCommand::CodeReviewOpen { id: None, from: None, to: None },
+            RpcCommand::CodeReviewOpen {
+                id: None,
+                from: None,
+                commit: None,
+                to: None,
+                include_working_tree: None,
+            },
         )
         .await;
         assert!(opened.success, "{opened:?}");
         let data = opened.data.expect("open data");
-        assert_eq!(data["truncated"], true, "snapshot must be globally truncated: {data}");
+        assert_eq!(
+            data["truncated"], true,
+            "snapshot must be globally truncated: {data}"
+        );
+        assert_eq!(data["totalsComplete"], true, "{data}");
+        assert_eq!(data["totalInsertions"], 400_002, "{data}");
+        // git ground truth: each big file replaces its single baseline line
+        // (-1 each), while the rename and the zz-later append add lines
+        // without deleting any — two deletions in total.
+        assert_eq!(data["totalDeletions"], 2, "{data}");
         let files = data["files"].as_array().expect("files");
         let paths: Vec<&str> = files
             .iter()
@@ -7880,16 +17958,25 @@ mod tests {
         }
         let snapshot_id = data["snapshotId"].as_str().expect("snapshot id").to_owned();
 
-        // A placeholder (empty hunks + truncated) must be present and must
-        // serve its first page through code_review_file_diff.
+        // The path-sorted late file is a guaranteed placeholder. Mutate it
+        // after open but before its first FileDiff: the old snapshot must page
+        // the prepared index, never the newer worktree bytes.
         let placeholder = files
             .iter()
-            .find(|file| {
-                file["truncated"] == true && file["hunks"].as_array().expect("hunks").is_empty()
-            })
-            .expect("truncated snapshot must expose a placeholder");
-        let placeholder_path = placeholder["path"].as_str().expect("placeholder path").to_owned();
-        assert_eq!(placeholder["message"], "diff omitted: combined diff truncated; loaded on demand");
+            .find(|file| file["path"] == "zz-later.txt")
+            .expect("late placeholder");
+        assert_eq!(placeholder["bodyState"], "onDemand");
+        assert!(placeholder["hunks"].as_array().expect("hunks").is_empty());
+        let placeholder_path = placeholder["path"]
+            .as_str()
+            .expect("placeholder path")
+            .to_owned();
+        assert_eq!(
+            placeholder["message"],
+            "diff omitted: combined diff truncated; loaded on demand"
+        );
+        std::fs::write(cwd.path().join("zz-later.txt"), "base\nnewer-after-open\n")
+            .expect("mutate after open");
         let placeholder_diff = handle_code_review_command(
             &app,
             &code_review,
@@ -7911,7 +17998,64 @@ mod tests {
             .iter()
             .map(|hunk| hunk["lines"].as_array().expect("hunk lines").len())
             .sum();
-        assert_eq!(placeholder_lines, 50);
+        assert!(placeholder_lines > 0);
+        let old_page_text = placeholder_hunks
+            .iter()
+            .flat_map(|hunk| hunk["lines"].as_array().expect("hunk lines"))
+            .filter_map(|line| line["text"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            old_page_text.contains(&"changed"),
+            "old page lost open-time content: {old_page_text:?}"
+        );
+        assert!(
+            !old_page_text.contains(&"newer-after-open"),
+            "old page read post-open worktree content: {old_page_text:?}"
+        );
+
+        // Even a real identity derived from the newer worktree cannot be
+        // authorized under the old snapshot id: the cached old FileDiff is
+        // authoritative for comment resolution.
+        let (newer_snapshot, newer_paging) =
+            load_review_snapshot_capture(cwd.path(), ReviewScope::WorkingTree);
+        let newer_file = newer_snapshot
+            .files
+            .iter()
+            .find(|file| file.path == "zz-later.txt")
+            .expect("newer file");
+        let newer_diff = FileDiff::load_snapshot_file(
+            cwd.path(),
+            &ReviewScope::WorkingTree,
+            &newer_paging,
+            newer_file,
+        );
+        let newer_hunk = newer_diff.hunks.first().expect("newer hunk");
+        let newer_identity = HunkIdentity::new(&snapshot_id, "zz-later.txt", newer_hunk);
+        let forged_newer_comment = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewComment {
+                id: None,
+                snapshot_id: snapshot_id.clone(),
+                path: "zz-later.txt".into(),
+                old_start: newer_identity.old_start,
+                old_count: newer_identity.old_count,
+                new_start: newer_identity.new_start,
+                new_count: newer_identity.new_count,
+                content_hash: newer_identity.content_hash,
+                comment: "must not authorize newer bytes".into(),
+                images: Vec::new(),
+            },
+        )
+        .await;
+        assert!(!forged_newer_comment.success, "{forged_newer_comment:?}");
+        assert!(
+            forged_newer_comment
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("stale hunk")),
+            "{forged_newer_comment:?}"
+        );
 
         // Every catalogued path in the truncated snapshot serves a bounded
         // first page — containment must accept placeholders like any file.
@@ -7943,10 +18087,49 @@ mod tests {
             );
         }
 
+        let refreshed = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewRefresh { id: None },
+        )
+        .await;
+        assert!(refreshed.success, "{refreshed:?}");
+        let refreshed_id = refreshed.data.as_ref().expect("refresh data")["snapshotId"]
+            .as_str()
+            .expect("refreshed id")
+            .to_owned();
+        assert_ne!(refreshed_id, snapshot_id);
+        let refreshed_page = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewFileDiff {
+                id: None,
+                snapshot_id: refreshed_id,
+                path: "zz-later.txt".into(),
+                cursor: 0,
+                max_lines: Some(50),
+            },
+        )
+        .await;
+        assert!(refreshed_page.success, "{refreshed_page:?}");
+        let refreshed_page = refreshed_page.data.expect("refreshed page");
+        let refreshed_text = refreshed_page["hunks"]
+            .as_array()
+            .expect("hunks")
+            .iter()
+            .flat_map(|hunk| hunk["lines"].as_array().expect("hunk lines"))
+            .filter_map(|line| line["text"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            refreshed_text.contains(&"newer-after-open"),
+            "{refreshed_text:?}"
+        );
+        assert!(!refreshed_text.contains(&"changed"), "{refreshed_text:?}");
+
         let closed = handle_code_review_command(
             &app,
             &code_review,
-            RpcCommand::CodeReviewClose { id: None },
+            RpcCommand::CodeReviewClose { id: None, review_id: None },
         )
         .await;
         assert!(closed.success);
@@ -7985,6 +18168,9 @@ mod tests {
             snapshot_id: "snap-1".into(),
             files: vec![file],
             truncated: false,
+            total_insertions: 0,
+            total_deletions: 0,
+            summary_complete: true,
             error: None,
         };
         let identity = snapshot.hunk_identity(&snapshot.files[0], &snapshot.files[0].hunks[0]);
@@ -7993,6 +18179,7 @@ mod tests {
         let resolved = resolve_comment_target(
             &snapshot,
             None,
+            None as Option<&CommentAuthority>,
             &identity.snapshot_id,
             "src/lib.rs",
             1,
@@ -8003,17 +18190,20 @@ mod tests {
         )
         .expect("matching identity resolves");
         match resolved {
-            ResolvedHunk::Snapshot { file, hunk } => {
+            ResolvedHunk::Snapshot { file, hunk_index } => {
                 assert_eq!(file.path, "src/lib.rs");
-                assert_eq!(hunk.old_start, 1);
+                assert_eq!(file.hunks[hunk_index].old_start, 1);
             }
-            ResolvedHunk::Loaded { .. } => panic!("no cache: must resolve against the snapshot"),
+            ResolvedHunk::Loaded { .. } | ResolvedHunk::Authority { .. } => {
+                panic!("no cache: must resolve against the snapshot")
+            }
         }
 
         // Stale snapshot id is rejected.
         let err = resolve_comment_target(
             &snapshot,
             None,
+            None as Option<&CommentAuthority>,
             "other-snapshot",
             "src/lib.rs",
             1,
@@ -8029,6 +18219,7 @@ mod tests {
         let err = resolve_comment_target(
             &snapshot,
             None,
+            None as Option<&CommentAuthority>,
             &identity.snapshot_id,
             "missing.rs",
             1,
@@ -8044,6 +18235,7 @@ mod tests {
         let err = resolve_comment_target(
             &snapshot,
             None,
+            None as Option<&CommentAuthority>,
             &identity.snapshot_id,
             "src/lib.rs",
             5,
@@ -8059,6 +18251,7 @@ mod tests {
         let err = resolve_comment_target(
             &snapshot,
             None,
+            None as Option<&CommentAuthority>,
             &identity.snapshot_id,
             "src/lib.rs",
             1,
@@ -8095,6 +18288,9 @@ mod tests {
             snapshot_id: "snap-1".into(),
             files: vec![snapshot_file],
             truncated: true,
+            total_insertions: 0,
+            total_deletions: 0,
+            summary_complete: true,
             error: None,
         };
         let loaded_hunk = DiffHunk {
@@ -8124,11 +18320,11 @@ mod tests {
             status: FileStatus::Modified,
             binary: false,
             hunks: vec![loaded_hunk.clone()],
-            truncated: false,
+            byte_capped: false,
             error: None,
         };
-        let mut cache = HashMap::new();
-        cache.insert("placeholder.txt".into(), Arc::new(loaded));
+        let mut cache = FileDiffCache::default();
+        cache.put("placeholder.txt".into(), Arc::new(loaded));
 
         // The loaded hunk identity resolves to the cached hunk, not the
         // snapshot's (empty) placeholder set.
@@ -8136,6 +18332,7 @@ mod tests {
         let resolved = resolve_comment_target(
             &snapshot,
             Some(&cache),
+            None as Option<&CommentAuthority>,
             &identity.snapshot_id,
             "placeholder.txt",
             identity.old_start,
@@ -8146,17 +18343,24 @@ mod tests {
         )
         .expect("cached loaded hunk resolves");
         match resolved {
-            ResolvedHunk::Loaded { file, diff, hunk_index } => {
+            ResolvedHunk::Loaded {
+                file,
+                diff,
+                hunk_index,
+            } => {
                 assert_eq!(file.path, "placeholder.txt");
                 assert_eq!(diff.hunks[hunk_index], loaded_hunk);
             }
-            ResolvedHunk::Snapshot { .. } => panic!("cached path must resolve via the cache"),
+            ResolvedHunk::Snapshot { .. } | ResolvedHunk::Authority { .. } => {
+                panic!("cached path must resolve via the cache")
+            }
         }
 
         // Wrong hash for the cached hunk is rejected (never falls back).
         let err = resolve_comment_target(
             &snapshot,
             Some(&cache),
+            None as Option<&CommentAuthority>,
             &identity.snapshot_id,
             "placeholder.txt",
             identity.old_start,
@@ -8172,6 +18376,7 @@ mod tests {
         let err = resolve_comment_target(
             &snapshot,
             Some(&cache),
+            None as Option<&CommentAuthority>,
             &identity.snapshot_id,
             "placeholder.txt",
             42,
@@ -8207,23 +18412,22 @@ mod tests {
             ],
         };
         assert!(!partial_hunk.is_complete());
-        let mut capped_cache = HashMap::new();
-        capped_cache.insert(
-            "placeholder.txt".into(),
-            Arc::new(FileDiff {
-                path: "placeholder.txt".into(),
-                previous_path: None,
-                status: FileStatus::Modified,
-                binary: false,
-                hunks: vec![partial_hunk.clone()],
-                truncated: true,
-                error: None,
-            }),
-        );
+        let mut capped_cache = FileDiffCache::default();
+        let capped_diff = Arc::new(FileDiff {
+            path: "placeholder.txt".into(),
+            previous_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            hunks: vec![partial_hunk.clone()],
+            byte_capped: true,
+            error: None,
+        });
+        capped_cache.put("placeholder.txt".into(), capped_diff);
         let partial_identity = HunkIdentity::new("snap-1", "placeholder.txt", &partial_hunk);
         let err = resolve_comment_target(
             &snapshot,
             Some(&capped_cache),
+            None as Option<&CommentAuthority>,
             &partial_identity.snapshot_id,
             "placeholder.txt",
             partial_identity.old_start,
@@ -8235,6 +18439,52 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("incomplete hunk"), "{err}");
 
+        let counts_ok_hunk = DiffHunk {
+            header: "@@ -1,1 +1,1 @@".into(),
+            old_start: 1,
+            old_count: 1,
+            new_start: 1,
+            new_count: 1,
+            lines: vec![DiffLine {
+                kind: DiffLineKind::Context,
+                old_no: Some(1),
+                new_no: Some(1),
+                text: "no-eol tail".into(),
+            }],
+        };
+        assert!(counts_ok_hunk.is_complete());
+        let mut meta_cut_cache = FileDiffCache::default();
+        meta_cut_cache.put(
+            "placeholder.txt".into(),
+            Arc::new(FileDiff {
+                path: "placeholder.txt".into(),
+                previous_path: None,
+                status: FileStatus::Modified,
+                binary: false,
+                hunks: vec![counts_ok_hunk.clone()],
+                byte_capped: true,
+                error: None,
+            }),
+        );
+        let meta_cut_identity = HunkIdentity::new("snap-1", "placeholder.txt", &counts_ok_hunk);
+        let err = resolve_comment_target(
+            &snapshot,
+            Some(&meta_cut_cache),
+            None as Option<&CommentAuthority>,
+            &meta_cut_identity.snapshot_id,
+            "placeholder.txt",
+            meta_cut_identity.old_start,
+            meta_cut_identity.old_count,
+            meta_cut_identity.new_start,
+            meta_cut_identity.new_count,
+            &meta_cut_identity.content_hash,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("incomplete hunk"),
+            "a counts-satisfied byte-capped final hunk must still be rejected: {err}"
+        );
+
         // A snapshot with a COMPLETE hunk still resolves against the snapshot
         // when no cache exists (the pre-load window for non-truncated files).
         let mut complete_snapshot = snapshot.clone();
@@ -8243,6 +18493,7 @@ mod tests {
         let resolved = resolve_comment_target(
             &complete_snapshot,
             None,
+            None as Option<&CommentAuthority>,
             &identity.snapshot_id,
             "placeholder.txt",
             identity.old_start,
@@ -8262,6 +18513,7 @@ mod tests {
         let err = resolve_comment_target(
             &partial_snapshot,
             None,
+            None as Option<&CommentAuthority>,
             &partial_identity.snapshot_id,
             "placeholder.txt",
             partial_identity.old_start,
@@ -8272,6 +18524,220 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("incomplete hunk"), "{err}");
+    }
+
+    #[test]
+    fn resolve_comment_target_resolves_served_uncached_authority() {
+        use crate::code_review::{DiffLine, FileStatus, ReviewScope};
+        let snapshot_file = DiffFile {
+            path: "placeholder.txt".into(),
+            previous_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            insertions: 0,
+            deletions: 0,
+            hunks: Vec::new(),
+            truncated: true,
+            message: Some("diff omitted: combined diff truncated; loaded on demand".into()),
+        };
+        let snapshot = ReviewSnapshot {
+            root: PathBuf::from("/tmp/fake-root"),
+            scope: ReviewScope::WorkingTree,
+            snapshot_id: "snap-1".into(),
+            files: vec![snapshot_file],
+            truncated: true,
+            total_insertions: 0,
+            total_deletions: 0,
+            summary_complete: true,
+            error: None,
+        };
+        let loaded_hunk = DiffHunk {
+            header: "@@ -1,2 +1,2 @@".into(),
+            old_start: 1,
+            old_count: 1,
+            new_start: 1,
+            new_count: 1,
+            lines: vec![
+                DiffLine {
+                    kind: DiffLineKind::Deletion,
+                    old_no: Some(1),
+                    new_no: None,
+                    text: "later base".into(),
+                },
+                DiffLine {
+                    kind: DiffLineKind::Addition,
+                    old_no: None,
+                    new_no: Some(1),
+                    text: "later changed".into(),
+                },
+            ],
+        };
+        let loaded = FileDiff {
+            path: "placeholder.txt".into(),
+            previous_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            hunks: vec![loaded_hunk.clone()],
+            byte_capped: false,
+            error: None,
+        };
+        let mut authority = CommentAuthority::default();
+        assert!(authority.record("placeholder.txt", &loaded));
+        assert!(authority.lookup("placeholder.txt").is_some());
+        let identity = HunkIdentity::new("snap-1", "placeholder.txt", &loaded_hunk);
+
+        let resolved = resolve_comment_target(
+            &snapshot,
+            None,
+            Some(&authority),
+            &identity.snapshot_id,
+            "placeholder.txt",
+            identity.old_start,
+            identity.old_count,
+            identity.new_start,
+            identity.new_count,
+            &identity.content_hash,
+        )
+        .expect("served-uncached identity resolves");
+        match resolved {
+            ResolvedHunk::Authority { file, record } => {
+                assert_eq!(file.path, "placeholder.txt");
+                assert!(record.comment_ready);
+                assert_eq!(record.old_start, identity.old_start);
+                assert_eq!(record.content_hash, identity.content_hash);
+            }
+            ResolvedHunk::Snapshot { .. } | ResolvedHunk::Loaded { .. } => {
+                panic!("uncached path must resolve via the authority map")
+            }
+        }
+
+        let err = resolve_comment_target(
+            &snapshot,
+            None,
+            Some(&authority),
+            &identity.snapshot_id,
+            "placeholder.txt",
+            identity.old_start,
+            identity.old_count,
+            identity.new_start,
+            identity.new_count,
+            "deadbeef",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("stale hunk"), "{err}");
+
+        let err = resolve_comment_target(
+            &snapshot,
+            None,
+            Some(&authority),
+            &identity.snapshot_id,
+            "placeholder.txt",
+            999,
+            identity.old_count,
+            999,
+            identity.new_count,
+            &identity.content_hash,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown hunk"), "{err}");
+
+        let mut partial_hunk = loaded_hunk.clone();
+        partial_hunk.lines.pop();
+        partial_hunk.new_count = 2;
+        partial_hunk.header = "@@ -1,2 +1,2 @@".into();
+        let partial = FileDiff {
+            path: "placeholder.txt".into(),
+            previous_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            hunks: vec![partial_hunk.clone()],
+            byte_capped: true,
+            error: None,
+        };
+        let mut capped_authority = CommentAuthority::default();
+        assert!(capped_authority.record("placeholder.txt", &partial));
+        let partial_identity = HunkIdentity::new("snap-1", "placeholder.txt", &partial_hunk);
+        let err = resolve_comment_target(
+            &snapshot,
+            None,
+            Some(&capped_authority),
+            &partial_identity.snapshot_id,
+            "placeholder.txt",
+            partial_identity.old_start,
+            partial_identity.old_count,
+            partial_identity.new_start,
+            partial_identity.new_count,
+            &partial_identity.content_hash,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("incomplete hunk"), "{err}");
+
+        let mut overflow = CommentAuthority::default();
+        overflow.overflow.insert("placeholder.txt".to_owned());
+        let err = resolve_comment_target(
+            &snapshot,
+            None,
+            Some(&overflow),
+            &identity.snapshot_id,
+            "placeholder.txt",
+            identity.old_start,
+            identity.old_count,
+            identity.new_start,
+            identity.new_count,
+            &identity.content_hash,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("comment authority bound"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn comment_authority_record_replaces_and_bounds_retention() {
+        use crate::code_review::{DiffLine, FileStatus};
+        let hunk = |text: &str| DiffHunk {
+            header: "@@ -1,1 +1,1 @@".into(),
+            old_start: 1,
+            old_count: 1,
+            new_start: 1,
+            new_count: 1,
+            lines: vec![DiffLine {
+                kind: DiffLineKind::Addition,
+                old_no: None,
+                new_no: Some(1),
+                text: text.to_owned(),
+            }],
+        };
+        let diff = |texts: &[&str]| FileDiff {
+            path: "a.txt".into(),
+            previous_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            hunks: texts.iter().map(|text| hunk(text)).collect(),
+            byte_capped: false,
+            error: None,
+        };
+        let mut authority = CommentAuthority::default();
+
+        assert!(authority.record("a.txt", &diff(&["one", "two"])));
+        assert_eq!(authority.total, 2);
+        assert!(authority.record("a.txt", &diff(&["one"])));
+        assert_eq!(authority.total, 1, "reload replaces, never double-charges");
+        let mut authority = CommentAuthority::default();
+        let texts: Vec<String> = (0..MAX_COMMENT_AUTHORITY_HUNKS + 1)
+            .map(|i| format!("hunk {i}"))
+            .collect();
+        let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+        assert!(!authority.record("big.txt", &diff(&texts)));
+        assert_eq!(
+            authority.total, 0,
+            "a dropped path's budget is never stranded: total counts only retained records"
+        );
+        assert!(authority.overflowed("big.txt"));
+        assert!(authority.lookup("big.txt").is_none());
+        assert!(authority.record("small.txt", &diff(&["one"])));
+        assert_eq!(authority.total, 1);
     }
 
     #[test]
@@ -8347,16 +18813,22 @@ mod tests {
             RpcCommand::CodeReviewOpen {
                 id: Some("open-proj".into()),
                 from: None,
+                commit: None,
                 to: None,
+                include_working_tree: None,
             },
         )
         .await;
         assert!(opened.success, "{opened:?}");
         let data = opened.data.expect("open data");
         // Aggregate streaming + bounded active count; activeHunk is gone.
+        assert_eq!(data["internalBusy"], false);
         assert_eq!(data["isStreaming"], false);
         assert_eq!(data["activeCount"], 0);
-        assert!(data.get("activeHunk").is_none(), "activeHunk must be removed: {data}");
+        assert!(
+            data.get("activeHunk").is_none(),
+            "activeHunk must be removed: {data}"
+        );
         assert!(data["threads"].as_array().expect("threads").is_empty());
 
         // Snapshot re-projects the same shape.
@@ -8370,6 +18842,7 @@ mod tests {
         .await;
         assert!(snap.success, "{snap:?}");
         let snap_data = snap.data.expect("snap");
+        assert_eq!(snap_data["internalBusy"], false);
         assert_eq!(snap_data["activeCount"], 0);
         assert!(snap_data.get("activeHunk").is_none());
 
@@ -8401,28 +18874,22 @@ mod tests {
         let closed = handle_code_review_command(
             &app,
             &code_review,
-            RpcCommand::CodeReviewClose {
-                id: Some("close-proj".into()),
-            },
+            RpcCommand::CodeReviewClose { id: Some("close-proj".into()), review_id: None },
         )
         .await;
         assert!(closed.success, "{closed:?}");
         app.cleanup().await;
     }
 
-
     /// Session with dense history so snap compact has something to archive
     /// (mirrors the pi-coding snap_compact_tests fixture: 12 large turns,
     /// keep 2, never calls the provider).
     async fn build_snapcompact_app(model_id: &str) -> Application {
-        let mut model = Model::default();
+        let mut model = faux_model();
         model.id = model_id.into();
         model.name = model_id.into();
-        model.api = format!("{model_id}-api");
-        model.provider = "faux".into();
-        model.base_url = "http://localhost:0".into();
         let cwd = tempfile::tempdir().expect("tempdir");
-        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+        let session = disabled_session(pi_coding::SessionOptions {
             model,
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
@@ -8440,6 +18907,7 @@ mod tests {
             after_tool_call: None,
             stream_fn: Some(reply_stream("unused snap reply")),
             auth_resolver: None,
+            auth_manager: None,
         })
         .expect("session");
         let padding = "x".repeat(200);
@@ -8459,7 +18927,7 @@ mod tests {
             .load_history(history)
             .await
             .expect("load dense history");
-        Application::new(session).await
+        isolated_application(session).await
     }
 
     #[tokio::test]
@@ -8516,34 +18984,13 @@ mod tests {
                 .expect("record message");
         }
         recorder.persist_now().expect("persist");
-        app.session().set_session_dir(session_dir.path().to_path_buf());
+        app.session()
+            .set_session_dir(session_dir.path().to_path_buf());
         app.session().record(recorder).expect("attach recorder");
 
         let settings = settings_state();
         let workflows = workflows_state();
         let handle = |command: RpcCommand| handle_command(&app, &settings, &workflows, command);
-
-        // Bare rewind must refuse and point at get_entries.
-        let bare = handle(RpcCommand::Rewind {
-            id: Some("rewind-bare".into()),
-            index: None,
-            checkpoint: None,
-        })
-        .await;
-        assert!(!bare.success, "{bare:?}");
-        assert!(bare
-            .error
-            .as_deref()
-            .is_some_and(|e| e.contains("get_entries") && e.contains("index")));
-
-        // Both targets must be rejected.
-        let both = handle(RpcCommand::Rewind {
-            id: Some("rewind-both".into()),
-            index: Some(2),
-            checkpoint: Some("c".into()),
-        })
-        .await;
-        assert!(!both.success);
 
         // The web flow: list entries via get_entries, then rewind to a target.
         let entries = handle(RpcCommand::GetEntries {
@@ -8584,7 +19031,10 @@ mod tests {
         })
         .await;
         assert!(checkpointed.success, "{checkpointed:?}");
-        assert_eq!(checkpointed.data.expect("rewind")["checkpoint"], "milestone");
+        assert_eq!(
+            checkpointed.data.expect("rewind")["checkpoint"],
+            "milestone"
+        );
 
         // Out-of-range index must fail cleanly.
         let out_of_range = handle(RpcCommand::Rewind {
@@ -8629,8 +19079,12 @@ mod tests {
         let app = build_todo_app("faux-rpc-queue", "faux-rpc-queue-api").await;
         app.set_steering_mode(QueueMode::All).await;
         app.set_follow_up_mode(QueueMode::All).await;
-        app.steer("first steer".to_owned(), Vec::new()).await.expect("queue steer");
-        app.follow_up("second follow".to_owned(), Vec::new()).await.expect("queue follow-up");
+        app.steer("first steer".to_owned(), Vec::new())
+            .await
+            .expect("queue steer");
+        app.follow_up("second follow".to_owned(), Vec::new())
+            .await
+            .expect("queue follow-up");
 
         let listed = handle_command(
             &app,
@@ -8653,6 +19107,8 @@ mod tests {
             &workflows_state(),
             RpcCommand::QueueCancel {
                 id: Some("queue-2".into()),
+                scope: QueueCancelScope::All,
+                index: None,
             },
         )
         .await;
@@ -8678,13 +19134,145 @@ mod tests {
         app.cleanup().await;
     }
 
+    #[tokio::test]
+    async fn queue_rpc_send_now_combines_steering_and_cancel_one_leaves_follow_up() {
+        let app = build_todo_app("faux-rpc-queue-send", "faux-rpc-queue-send-api").await;
+        app.set_steering_mode(QueueMode::All).await;
+        app.set_follow_up_mode(QueueMode::All).await;
+        app.steer("first".to_owned(), Vec::new())
+            .await
+            .expect("steer first");
+        app.steer("second".to_owned(), Vec::new())
+            .await
+            .expect("steer second");
+        app.follow_up("later".to_owned(), Vec::new())
+            .await
+            .expect("follow-up");
+
+        let removed = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::QueueCancel {
+                id: Some("drop-0".into()),
+                scope: QueueCancelScope::Steering,
+                index: Some(0),
+            },
+        )
+        .await;
+        assert!(removed.success, "{removed:?}");
+        assert_eq!(removed.data.expect("removed")["cancelled"], 1);
+        let (steering, follow_up) = app.queued_messages().await;
+        assert_eq!(pi_agent::queued_user_previews(&steering), ["second"]);
+        assert_eq!(pi_agent::queued_user_previews(&follow_up), ["later"]);
+
+        let cancelled = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::QueueCancel {
+                id: Some("steer-only".into()),
+                scope: QueueCancelScope::Steering,
+                index: None,
+            },
+        )
+        .await;
+        assert!(cancelled.success, "{cancelled:?}");
+        assert_eq!(cancelled.data.expect("cancelled")["cancelled"], 1);
+        let (steering, follow_up) = app.queued_messages().await;
+        assert!(steering.is_empty(), "steering-only cancel");
+        assert_eq!(pi_agent::queued_user_previews(&follow_up), ["later"]);
+        app.drain_queued_messages().await;
+
+        app.steer("alpha".to_owned(), Vec::new())
+            .await
+            .expect("steer alpha");
+        app.steer("beta".to_owned(), Vec::new())
+            .await
+            .expect("steer beta");
+        let sent = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::QueueSendNow {
+                id: Some("send-now".into()),
+            },
+        )
+        .await;
+        assert!(sent.success, "{sent:?}");
+        let data = sent.data.expect("send now");
+        assert_eq!(data["sent"], 2);
+        assert_eq!(data["combined"], true);
+        let (steering, follow_up) = app.queued_messages().await;
+        assert!(steering.is_empty(), "send now drains steering");
+        assert!(follow_up.is_empty(), "no follow-up on this send");
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn queue_cancel_missing_index_is_idempotent_success() {
+        let app = build_todo_app(
+            "faux-rpc-queue-missing",
+            "faux-rpc-queue-missing-api",
+        )
+        .await;
+        let missing = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::QueueCancel {
+                id: Some("missing-0".into()),
+                scope: QueueCancelScope::Steering,
+                index: Some(0),
+            },
+        )
+        .await;
+        assert!(missing.success, "{missing:?}");
+        let missing_data = missing.data.expect("missing");
+        assert_eq!(missing_data["cancelled"], 0);
+        assert_eq!(missing_data["index"], 0);
+        app.steer("only".to_owned(), Vec::new())
+            .await
+            .expect("steer");
+        let first = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::QueueCancel {
+                id: Some("drop-only".into()),
+                scope: QueueCancelScope::Steering,
+                index: Some(0),
+            },
+        )
+        .await;
+        assert!(first.success, "{first:?}");
+        assert_eq!(first.data.expect("first")["cancelled"], 1);
+        let again = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::QueueCancel {
+                id: Some("drop-again".into()),
+                scope: QueueCancelScope::Steering,
+                index: Some(0),
+            },
+        )
+        .await;
+        assert!(again.success, "{again:?}");
+        assert_eq!(again.data.expect("again")["cancelled"], 0);
+        let (steering, follow_up) = app.queued_messages().await;
+        assert!(steering.is_empty() && follow_up.is_empty());
+        app.cleanup().await;
+    }
+
+
     // ------------------------------------------------------------------
     // D93: Subagents panel RPC — job_list / task_spawn / job_cancel /
     // hub_send / job_output.
     // ------------------------------------------------------------------
 
     /// Session wired to an instantly-settling faux stream (one empty turn).
-    fn subagents_session() -> pi_coding::Session {
+    fn subagents_session(cwd: &Path) -> pi_coding::Session {
         use pi_ai::{AssistantMessage, AssistantMessageEvent, StopReason};
         let stream_fn: pi_agent::StreamFn = Arc::new(|model, _context, _options| {
             async move {
@@ -8705,9 +19293,9 @@ mod tests {
             }
             .boxed()
         });
-        pi_coding::Session::new(pi_coding::SessionOptions {
-            model: Model::default(),
-            cwd: std::env::current_dir().expect("cwd"),
+        disabled_session(pi_coding::SessionOptions {
+            model: faux_model(),
+            cwd: cwd.to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
             api_key: "subagents".to_owned(),
@@ -8718,6 +19306,7 @@ mod tests {
             after_tool_call: None,
             stream_fn: Some(stream_fn),
             auth_resolver: None,
+            auth_manager: None,
         })
         .expect("subagents session")
     }
@@ -8733,23 +19322,35 @@ mod tests {
     async fn subagents_app_with_child_delay(
         child_delay: std::time::Duration,
     ) -> (tempfile::TempDir, Application) {
-        use pi_coding::{AgentCatalog, AgentDefinition, AgentDefinitionSource, OrchestrationConfig};
+        use pi_coding::{
+            AgentCatalog, AgentDefinition, AgentDefinitionSource, OrchestrationConfig,
+        };
         let root = tempfile::tempdir().expect("tempdir");
-        let agent = |name: &str, description: &str| AgentDefinition { name: name.to_owned(),
-        description: description.to_owned(),
-        system_prompt: "prompt".to_owned(),
-        tools: Some(Vec::new()),
-        autoload_skills: Vec::new(),
-        model: None,
-        thinking_level: Some(ThinkingLevel::Off),
-        max_turns: None,
-        max_tool_calls: None,
-        timeout_secs: None,
-        disallowed_tools: Vec::new(),
-        capability_ceiling: None,
-        source: AgentDefinitionSource::Bundled,
-        path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None };
+        let child_cwd = root.path().to_path_buf();
+        let agent = |name: &str, description: &str| AgentDefinition {
+            name: name.to_owned(),
+            description: description.to_owned(),
+            system_prompt: "prompt".to_owned(),
+            tools: Some(Vec::new()),
+            autoload_skills: Vec::new(),
+            model: None,
+            thinking_level: Some(ThinkingLevel::Off),
+            max_turns: None,
+            max_tool_calls: None,
+            timeout_secs: None,
+            disallowed_tools: Vec::new(),
+            capability_ceiling: None,
+            source: AgentDefinitionSource::Bundled,
+            path: None,
+            trusted: true,
+            kind: pi_coding::AgentDefinitionKind::Agent,
+            personality: None,
+            soft_budget: None,
+            knowledge_roots: Vec::new(),
+            user_proxy: false,
+        };
         let factory: pi_coding::ChildSessionFactory = Arc::new(move |request| {
+            let child_cwd = child_cwd.clone();
             let stream_fn: pi_agent::StreamFn = Arc::new(move |model, _context, _options| {
                 use pi_ai::{AssistantMessage, AssistantMessageEvent, StopReason};
                 async move {
@@ -8772,9 +19373,9 @@ mod tests {
                 .boxed()
             });
             Box::pin(async move {
-                pi_coding::Session::new(pi_coding::SessionOptions {
+                disabled_session(pi_coding::SessionOptions {
                     model: request.model,
-                    cwd: std::env::current_dir().expect("cwd"),
+                    cwd: child_cwd,
                     system_prompt: request.system_prompt,
                     thinking_level: request.thinking_level.unwrap_or(ThinkingLevel::Off),
                     api_key: "subagents-child".to_owned(),
@@ -8785,6 +19386,7 @@ mod tests {
                     after_tool_call: None,
                     stream_fn: Some(stream_fn),
                     auth_resolver: None,
+                    auth_manager: None,
                 })
             })
         });
@@ -8799,15 +19401,24 @@ mod tests {
         config.parent_model = Model::default();
         let runtime =
             pi_coding::OrchestrationRuntime::new(config, factory).expect("orchestration runtime");
-        let application =
-            Application::new_with_orchestration(subagents_session(), runtime).await;
+        let workspace = root.path().join("workspace");
+        let agent_dir = root.path().join("agent");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        let session = subagents_session(&workspace);
+        session
+            .attach_resources(isolated_resources(&workspace, &agent_dir))
+            .await
+            .expect("attach resources");
+        let session_dir = root.path().join("sessions");
+        std::fs::create_dir_all(&session_dir).expect("session dir");
+        session.set_session_dir(session_dir);
+        session.start_new_recording().expect("start recording");
+        let application = Application::new_with_orchestration(session, runtime).await;
         (root, application)
     }
 
-    async fn subagents_handle(
-        app: &Application,
-        command: RpcCommand,
-    ) -> RpcResponse {
+    async fn subagents_handle(app: &Application, command: RpcCommand) -> RpcResponse {
         handle_command(app, &settings_state(), &workflows_state(), command).await
     }
 
@@ -8832,6 +19443,10 @@ mod tests {
         assert!(listed.success, "{listed:?}");
         let list_data = listed.data.expect("job list");
         assert_eq!(list_data["enabled"], true);
+        assert_eq!(
+            list_data["groupId"],
+            json!(app.orchestration_runtime().expect("runtime").group_id())
+        );
         assert_eq!(list_data["jobs"], json!([]));
         let catalog = list_data["catalog"]
             .as_array()
@@ -8854,9 +19469,7 @@ mod tests {
         )
         .await;
         assert!(spawned.success, "{spawned:?}");
-        let spawns = spawned
-            .data
-            .expect("spawns")["spawns"]
+        let spawns = spawned.data.expect("spawns")["spawns"]
             .as_array()
             .expect("spawns array")
             .clone();
@@ -9201,12 +19814,16 @@ mod tests {
 
     /// Seeds `personas/<name>/persona.md` (plus memory/sessions when
     /// `seed_state`) under the agent dir, returning the persona root.
-    fn seed_persona(agent_dir: &std::path::Path, name: &str, seed_state: bool) -> std::path::PathBuf {
+    fn seed_persona(
+        agent_dir: &std::path::Path,
+        name: &str,
+        seed_state: bool,
+    ) -> std::path::PathBuf {
         let root = agent_dir.join("personas").join(name);
         std::fs::create_dir_all(&root).expect("persona root");
         std::fs::write(
             root.join("persona.md"),
-            format!("---\nname: {name}\ndescription: durable {name}\n---\n{name} prompt"),
+            format!("---\nname: {name}\ndescription: durable {name}\ntools: [read, grep]\n---\n{name} prompt"),
         )
         .expect("persona.md");
         if seed_state {
@@ -9227,9 +19844,16 @@ mod tests {
     /// Application with a resource-discovered persona, a recording session,
     /// and an orchestration runtime cataloged from the resource snapshot.
     /// Returns (temp root, app, provider registration, persona root).
-    async fn persona_rpc_app(seed_state: bool) -> (tempfile::TempDir, Application, pi_ai::providers::FauxProviderRegistration, std::path::PathBuf) {
-        use pi_ai::providers::{FauxProviderOptions, FauxResponse, register_faux_provider};
+    async fn persona_rpc_app(
+        seed_state: bool,
+    ) -> (
+        tempfile::TempDir,
+        Application,
+        pi_ai::providers::FauxProviderRegistration,
+        std::path::PathBuf,
+    ) {
         use pi_ai::StopReason;
+        use pi_ai::providers::{FauxProviderOptions, FauxResponse, register_faux_provider};
         use pi_coding::{
             AgentCatalog, OrchestrationConfig, OrchestrationRuntime, ResourceManager,
             ResourceManagerOptions, Session, SessionOptions,
@@ -9240,7 +19864,7 @@ mod tests {
         let persona_root = seed_persona(&agent_dir, "mentor", seed_state);
         let cwd = root.path().join("project");
         std::fs::create_dir_all(&cwd).expect("cwd");
-        std::fs::create_dir_all(cwd.join(".pi").join("artifacts")).expect("artifacts");
+        std::fs::create_dir_all(cwd.join(".rpi").join("artifacts")).expect("artifacts");
 
         let suffix = uuid::Uuid::now_v7().simple().to_string();
         let api = format!("persona-rpc-api-{suffix}");
@@ -9264,6 +19888,11 @@ mod tests {
             error_message: None,
         }]);
 
+        std::fs::write(
+            root.path().join("agent").join("settings.json"),
+            r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+        )
+        .expect("isolated sandbox settings");
         let mut options = ResourceManagerOptions::new(&cwd);
         options.agent_dir = agent_dir;
         options.disable_extensions = true;
@@ -9272,7 +19901,7 @@ mod tests {
         options.disable_themes = true;
         options.disable_context_files = true;
         let resources = ResourceManager::new(options).expect("resources");
-        let session = Session::new(SessionOptions {
+        let session = disabled_session(SessionOptions {
             model: model.clone(),
             cwd: cwd.clone(),
             system_prompt: String::new(),
@@ -9285,24 +19914,23 @@ mod tests {
             after_tool_call: None,
             stream_fn: None,
             auth_resolver: None,
+            auth_manager: None,
         })
         .expect("session");
         let session_root = root.path().join("session-root");
-        std::fs::create_dir_all(&session_root).expect("session root");
         session.set_session_dir(session_root);
         session.start_new_recording().expect("start recording");
         session
-            .attach_resources(resources)
+            .attach_resources(resources.clone())
             .await
             .expect("attach resources");
-        let application = Application::new(session).await;
 
-        // Orchestration catalog mirrors the resource snapshot (the real flow
-        // builds it from snapshot.agents at startup and rebuilds on reload).
-        let snapshot = application
-            .resource_snapshot()
-            .expect("resource snapshot after attach");
+        // Orchestration catalog mirrors the resource snapshot and is staged
+        // in the same published generation as the recorded parent session.
+        let snapshot = resources.snapshot();
+        let child_cwd = cwd.clone();
         let factory: pi_coding::ChildSessionFactory = Arc::new(move |request| {
+            let child_cwd = child_cwd.clone();
             let stream_fn: pi_agent::StreamFn = Arc::new(move |model, _context, _options| {
                 use pi_ai::{AssistantMessage, AssistantMessageEvent, StopReason};
                 async move {
@@ -9324,9 +19952,9 @@ mod tests {
                 .boxed()
             });
             Box::pin(async move {
-                pi_coding::Session::new(pi_coding::SessionOptions {
+                disabled_session(pi_coding::SessionOptions {
                     model: request.model,
-                    cwd: std::env::current_dir().expect("cwd"),
+                    cwd: child_cwd,
                     system_prompt: request.system_prompt,
                     thinking_level: request.thinking_level.unwrap_or(ThinkingLevel::Off),
                     api_key: "persona-rpc-child".to_owned(),
@@ -9337,19 +19965,21 @@ mod tests {
                     after_tool_call: None,
                     stream_fn: Some(stream_fn),
                     auth_resolver: None,
+                    auth_manager: None,
                 })
             })
         });
         let mut config = OrchestrationConfig::new(
             AgentCatalog::from_agents(snapshot.agents.clone()),
-            cwd.join(".pi").join("artifacts"),
+            cwd.join(".rpi").join("artifacts"),
         );
         config.parent_model = model;
         let runtime = OrchestrationRuntime::new(config, factory).expect("orchestration runtime");
-        application
-            .attach_orchestration(runtime)
-            .await
-            .expect("attach orchestration");
+        let application = Application::from_runtime_candidate(
+            pi_coding::ApplicationRuntimeCandidate::new(session).with_orchestration(runtime),
+        )
+        .await
+        .expect("publish persona application");
         (root, application, registration, persona_root)
     }
 
@@ -9369,7 +19999,11 @@ mod tests {
         assert_eq!(row["source"], json!("user"));
         assert_eq!(row["trusted"], json!(true));
         assert_eq!(row["preferred"], json!(false));
-        assert!(row["contractSummary"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(
+            row["contractSummary"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty())
+        );
         assert_eq!(row["memoryEntries"], json!(1));
         assert_eq!(row["sessionCount"], json!(1));
         assert_eq!(row["stateError"], json!(null));
@@ -9381,7 +20015,12 @@ mod tests {
             "persona_list leaked the persona root path: {serialized}"
         );
         assert!(
-            !serialized.contains(std::env::current_dir().expect("cwd").to_string_lossy().as_ref()),
+            !serialized.contains(
+                std::env::current_dir()
+                    .expect("cwd")
+                    .to_string_lossy()
+                    .as_ref()
+            ),
             "persona_list leaked an absolute path: {serialized}"
         );
         app.cleanup().await;
@@ -9440,7 +20079,8 @@ mod tests {
             RpcCommand::PersonaCreate {
                 id: None,
                 name: "guide".to_owned(),
-                content: "---\nname: guide\ndescription: guided assistant\n---\nguide prompt\n".to_owned(),
+                content: "---\nname: guide\ndescription: guided assistant\n---\nguide prompt\n"
+                    .to_owned(),
             },
         )
         .await;
@@ -9503,7 +20143,8 @@ mod tests {
             RpcCommand::PersonaEdit {
                 id: None,
                 name: "guide".to_owned(),
-                content: "---\nname: guide\ndescription: refined guide\n---\nrefined prompt".to_owned(),
+                content: "---\nname: guide\ndescription: refined guide\n---\nrefined prompt"
+                    .to_owned(),
             },
         )
         .await;
@@ -9555,7 +20196,10 @@ mod tests {
                 "{response:?}"
             );
         }
-        assert!(persona_md.exists(), "unconfirmed op must not touch the disk");
+        assert!(
+            persona_md.exists(),
+            "unconfirmed op must not touch the disk"
+        );
 
         // Unknown personas fail closed even with confirmation.
         let unknown = subagents_handle(
@@ -9587,7 +20231,10 @@ mod tests {
         assert!(sessions.exists(), "remove must keep sessions archives");
         let listed = subagents_handle(&app, RpcCommand::PersonaList { id: None }).await;
         assert_eq!(
-            listed.data.expect("list")["personas"].as_array().expect("rows").len(),
+            listed.data.expect("list")["personas"]
+                .as_array()
+                .expect("rows")
+                .len(),
             0,
             "removed persona must leave the catalog"
         );
@@ -9634,7 +20281,10 @@ mod tests {
         assert!(!persona_root.exists(), "purge must delete the persona root");
         let listed_after = subagents_handle(&app, RpcCommand::PersonaList { id: None }).await;
         assert_eq!(
-            listed_after.data.expect("list")["personas"].as_array().expect("rows").len(),
+            listed_after.data.expect("list")["personas"]
+                .as_array()
+                .expect("rows")
+                .len(),
             0
         );
         app.cleanup().await;
@@ -9722,144 +20372,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persona_rpc_natural_language_prompt_routes_to_persona() {
-        // The natural-language form `让 mentor 审查这次修改` with NO explicit
-        // agent routes through the existing orchestration selector to the
-        // PERSONA agent (durably-bound runtime; no frontend heuristic).
-        let (_root, app, _registration, _persona_root) = persona_rpc_app(false).await;
-        let runtime = app.orchestration_runtime().expect("runtime");
-        let spawned = runtime
-            .spawn_from_natural_language("Main", 0, "让 mentor 审查这次修改")
-            .expect("spawn from natural language")
-            .expect("delegation must produce spawns");
-        assert_eq!(spawned.len(), 1, "{spawned:?}");
-        assert_eq!(spawned[0].agent, "mentor", "{spawned:?}");
-        assert_eq!(spawned[0].agent_id, "mentor", "{spawned:?}");
-        let listed = subagents_handle(&app, RpcCommand::JobList { id: None }).await;
-        let jobs = listed.data.expect("job list")["jobs"]
-            .as_array()
-            .expect("jobs array")
-            .clone();
-        assert_eq!(jobs.len(), 1, "{jobs:?}");
-        assert_eq!(jobs[0]["agent"], json!("mentor"), "{jobs:?}");
-        app.cleanup().await;
-    }
-
-    #[tokio::test]
-    async fn plural_natural_language_prompt_fans_out_to_every_named_agent_in_job_list() {
-        // RpcCommand::Prompt funnels into the same prompt_inner spawn path as
-        // the TUI composer and the Web /rpc dispatch: a plural CJK delegation
-        // must spawn BOTH named agents, and job_list must prove it.
-        use pi_coding::{AgentCatalog, AgentDefinition, AgentDefinitionSource, OrchestrationConfig};
-        let root = tempfile::tempdir().expect("tempdir");
-        let agent = |name: &str, description: &str| AgentDefinition {
-            name: name.to_owned(),
-            description: description.to_owned(),
-            system_prompt: "prompt".to_owned(),
-            tools: Some(Vec::new()),
-            autoload_skills: Vec::new(),
-            model: None,
-            thinking_level: Some(ThinkingLevel::Off),
-            max_turns: None,
-            max_tool_calls: None,
-            timeout_secs: None,
-            disallowed_tools: Vec::new(),
-            capability_ceiling: None,
-            source: AgentDefinitionSource::Bundled,
-            path: None,
-            trusted: true,
-            kind: pi_coding::AgentDefinitionKind::Agent,
-            personality: None,
-            soft_budget: None,
-        };
-        let factory: pi_coding::ChildSessionFactory = Arc::new(move |request| {
-            let stream_fn: pi_agent::StreamFn = Arc::new(move |model, _context, _options| {
-                use pi_ai::{AssistantMessage, AssistantMessageEvent, StopReason};
-                async move {
-                    let events = pi_ai::new_assistant_message_event_stream();
-                    let writer = events.clone();
-                    tokio::spawn(async move {
-                        let mut message = AssistantMessage::pending(&model);
-                        message.stop_reason = StopReason::Stop;
-                        writer
-                            .push(AssistantMessageEvent::Done {
-                                reason: StopReason::Stop,
-                                message: message.clone(),
-                            })
-                            .await;
-                        writer.end(Some(message)).await;
-                    });
-                    events
-                }
-                .boxed()
-            });
-            Box::pin(async move {
-                pi_coding::Session::new(pi_coding::SessionOptions {
-                    model: request.model,
-                    cwd: std::env::current_dir().expect("cwd"),
-                    system_prompt: request.system_prompt,
-                    thinking_level: request.thinking_level.unwrap_or(ThinkingLevel::Off),
-                    api_key: "subagents-child".to_owned(),
-                    compaction: None,
-                    stream_options: Default::default(),
-                    tools: Some(request.orchestration_tools),
-                    before_tool_call: None,
-                    after_tool_call: None,
-                    stream_fn: Some(stream_fn),
-                    auth_resolver: None,
-                })
-            })
-        });
-        let mut config = OrchestrationConfig::new(
-            AgentCatalog::from_agents(vec![
-                agent("glm", "General language model agent"),
-                agent("grok", "Research assistant agent"),
-            ]),
-            root.path(),
-        );
-        config.default_agent = "glm".to_owned();
-        config.parent_model = Model::default();
-        let runtime =
-            pi_coding::OrchestrationRuntime::new(config, factory).expect("orchestration runtime");
-        let application = Application::new_with_orchestration(subagents_session(), runtime).await;
-
-        let prompted = subagents_handle(
-            &application,
-            RpcCommand::Prompt {
-                id: None,
-                message: "你让glm和grok一起调研这个仓库".to_owned(),
-                images: Vec::new(),
-                streaming_behavior: None,
-            },
-        )
-        .await;
-        assert!(prompted.success, "{prompted:?}");
-
-        let listed = subagents_handle(&application, RpcCommand::JobList { id: None }).await;
-        assert!(listed.success, "{listed:?}");
-        let jobs = listed.data.expect("job list")["jobs"]
-            .as_array()
-            .expect("jobs array")
-            .clone();
-        let mut names = jobs
-            .iter()
-            .filter_map(|job| job.get("agent").and_then(Value::as_str))
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        names.sort();
-        assert_eq!(names, vec!["glm".to_owned(), "grok".to_owned()], "{jobs:?}");
-        for job in &jobs {
-            assert!(
-                job.get("agentId")
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| !id.is_empty()),
-                "each spawn must carry a stable agent id: {job:?}"
-            );
-        }
-        application.cleanup().await;
-    }
-
-    #[tokio::test]
     async fn persona_rpc_failure_errors_never_embed_absolute_paths() {
         let (root, app, _registration, persona_root) = persona_rpc_app(false).await;
 
@@ -9883,7 +20395,12 @@ mod tests {
             "persona_get failure must not leak the temp root: {serialized}"
         );
         assert!(
-            !serialized.contains(std::env::current_dir().expect("cwd").to_string_lossy().as_ref()),
+            !serialized.contains(
+                std::env::current_dir()
+                    .expect("cwd")
+                    .to_string_lossy()
+                    .as_ref()
+            ),
             "persona_get failure must not leak an absolute path: {serialized}"
         );
         assert!(
@@ -9951,7 +20468,10 @@ mod tests {
             },
         )
         .await;
-        assert!(!response.success, "reload failure must not fake success: {response:?}");
+        assert!(
+            !response.success,
+            "reload failure must not fake success: {response:?}"
+        );
         let error = response.error.as_deref().expect("error");
         assert!(
             error.contains("reload or restart required") && error.contains("scribe"),
@@ -9970,14 +20490,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persona_rpc_fails_closed_without_resource_manager() {
-        // A session without a ResourceManager has no persona catalog: list
-        // reports disabled, and read/mutate commands fail instead of
-        // fabricating rows.
+    async fn persona_rpc_published_empty_catalog_fails_closed_for_unknown_personas() {
+        // A published session with no persona definitions reports an empty
+        // catalog, and read commands fail instead of fabricating rows.
         let app = build_todo_app("faux-rpc-persona-none", "faux-rpc-persona-none-api").await;
         let listed = subagents_handle(&app, RpcCommand::PersonaList { id: None }).await;
         assert!(listed.success, "{listed:?}");
-        assert_eq!(listed.data.expect("list")["enabled"], json!(false));
+        let data = listed.data.expect("list");
+        assert_eq!(data["enabled"], json!(true));
+        assert_eq!(data["personas"], json!([]));
         let got = subagents_handle(
             &app,
             RpcCommand::PersonaGet {
@@ -10055,8 +20576,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     const REALTIME_TEST_KEY: &str = "test-bearer-not-a-real-secret";
-    const REALTIME_TEST_SDP_OFFER: &str =
-        "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n";
+    const REALTIME_TEST_SDP_OFFER: &str = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n";
 
     fn realtime_test_settings(base_url: &str) -> pi_coding::LiveRuntimeSettings {
         pi_coding::LiveRuntimeSettings {
@@ -10067,11 +20587,8 @@ mod tests {
             stt_model: String::new(),
             realtime_base_url: base_url.to_owned(),
             realtime_api_key: REALTIME_TEST_KEY.to_owned(),
-            // A custom alias (not the upstream's gpt-realtime-1.5) keeps the
-            // fixture distinct from any hardcoded upstream value. The create-call
-            // session omits `model` entirely (Codex rejects it with 400); the
-            // web `session.update` data-channel shape forwards the configured
-            // label verbatim instead.
+            // The create-call session intentionally omits this configured
+            // model; the web data channel forwards it in `session.update`.
             realtime_model: "gpt-5.6-sol".to_owned(),
             voice: "sol".to_owned(),
             language: None,
@@ -10094,8 +20611,7 @@ mod tests {
     fn validate_realtime_proxy_rejects_userinfo_without_echoing_secrets() {
         // A base URL carrying userinfo must fail closed with fixed text —
         // neither the username nor the password may surface in the error.
-        let settings =
-            realtime_test_settings("http://alice:SUPER-SECRET-PASSWORD@127.0.0.1:1/v1");
+        let settings = realtime_test_settings("http://alice:SUPER-SECRET-PASSWORD@127.0.0.1:1/v1");
         let error = validate_realtime_proxy(&settings)
             .expect_err("userinfo base URL must fail closed")
             .to_string();
@@ -10180,9 +20696,10 @@ mod tests {
         let port = listener.local_addr().expect("local addr").port();
         let settings = realtime_test_settings(&format!("http://127.0.0.1:{port}"));
 
-        let call = tokio::spawn(async move {
-            realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await
-        });
+        let call =
+            tokio::spawn(
+                async move { realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await },
+            );
 
         let (mut sock, _addr) = listener.accept().await.expect("accept");
         let _req = read_http_request(&mut sock).await;
@@ -10192,8 +20709,7 @@ mod tests {
         // the shared redaction must scrub all of them from the error.
         let body = format!(
             "Authorization: Bearer {0}\nAPI_KEY: {0}\nToken : {0}\ntoken={0}\napiKey={1}\n{1}",
-            "SUPER-SECRET-UPSTREAM-TOKEN",
-            REALTIME_TEST_KEY
+            "SUPER-SECRET-UPSTREAM-TOKEN", REALTIME_TEST_KEY
         );
         write_http_response(
             &mut sock,
@@ -10223,9 +20739,10 @@ mod tests {
         let port = listener.local_addr().expect("local addr").port();
         let settings = realtime_test_settings(&format!("http://127.0.0.1:{port}"));
 
-        let call = tokio::spawn(async move {
-            realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await
-        });
+        let call =
+            tokio::spawn(
+                async move { realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await },
+            );
 
         let (mut sock, _addr) = listener.accept().await.expect("accept");
         let _req = read_http_request(&mut sock).await;
@@ -10235,7 +20752,9 @@ mod tests {
             "HTTP/1.1 200 OK\r\nLocation: /v1/realtime/calls/rtc_big\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             REALTIME_BODY_LIMIT + 1
         );
-        sock.write_all(header.as_bytes()).await.expect("write oversized headers");
+        sock.write_all(header.as_bytes())
+            .await
+            .expect("write oversized headers");
         drop(sock);
 
         let err = call
@@ -10348,14 +20867,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn realtime_create_call_posts_session_payload_and_returns_sdp_call_id() {
+    async fn realtime_create_call_posts_session_and_returns_sdp_call_id() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("local addr").port();
         let settings = realtime_test_settings(&format!("http://127.0.0.1:{port}"));
 
-        let call = tokio::spawn(async move {
-            realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await
-        });
+        let call =
+            tokio::spawn(
+                async move { realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await },
+            );
 
         let (mut sock, _addr) = listener.accept().await.expect("accept");
         let req = read_http_request(&mut sock).await;
@@ -10370,16 +20890,13 @@ mod tests {
         // AVAS rejects the create-call request when this exact alpha contract
         // header is absent or carries a different value.
         assert_eq!(req.header("openai-alpha"), Some("quicksilver=v2"));
-        // The create-call contract is a JSON POST: `Content-Type:
-        // application/json` and a body that is EXACTLY `{sdp, session}` — no
-        // extra fields, no multipart. The session object is the Quicksilver
-        // create-call shape: `{type, audio}` with `voice` nested under
-        // `audio.output` — `model` is deliberately absent because Codex
-        // realtime rejects `session.model` with 400 (the configured model
-        // rides the data-channel `session.update` instead, where it is
-        // accepted).
+        // The create-call contract is a JSON POST with exactly `sdp` and the
+        // required frameless v3 `session` object. The proxy owns model injection.
         let content_type = req.header("content-type").expect("content-type");
-        assert_eq!(content_type, "application/json", "content-type: {content_type:?}");
+        assert_eq!(
+            content_type, "application/json",
+            "content-type: {content_type:?}"
+        );
         let request_body = json_request_body(&req.body);
         let mut body_keys = request_body
             .as_object()
@@ -10389,41 +20906,27 @@ mod tests {
             .collect::<Vec<_>>();
         body_keys.sort();
         assert_eq!(
-            body_keys, ["sdp", "session"],
-            "create-call body must be exactly {{sdp, session}}: {request_body}"
+            body_keys,
+            ["sdp", "session"],
+            "create-call body must contain sdp and session: {request_body}"
         );
         assert_eq!(request_body["sdp"], REALTIME_TEST_SDP_OFFER);
-        let session = &request_body["session"];
-        assert!(session.is_object(), "session must be an object: {session}");
-        // Exact create-call session shape: `{audio, type}` and nothing else.
-        let mut session_keys = session
-            .as_object()
-            .expect("session must be an object")
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-        session_keys.sort();
-        assert_eq!(
-            session_keys, ["audio", "type"],
-            "create-call session must be exactly {{audio, type}}: {session}"
-        );
-        assert_eq!(session["type"], "quicksilver");
-        // The forbidden `model` field must never reach the create-call POST —
-        // Codex rejects it with 400.
-        assert!(
-            session.get("model").is_none(),
-            "create-call session must not carry `model`: {session}"
-        );
-        assert_eq!(session["audio"]["input"]["format"]["type"], "audio/pcm");
-        assert_eq!(session["audio"]["input"]["format"]["rate"], 24000);
-        assert_eq!(session["audio"]["output"]["voice"], "sol");
+        assert_eq!(request_body["session"]["instructions"], "");
+        assert!(request_body["session"].get("model").is_none());
+        assert!(request_body["session"].get("type").is_none());
+        assert!(request_body["session"]["audio"].get("input").is_none());
+        assert_eq!(request_body["session"]["audio"]["output"]["voice"], "sol");
+        assert_eq!(request_body["session"]["delegation"]["type"], "client");
 
         let sdp_answer = "v=0\r\no=- 2 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n";
         write_http_response(
             &mut sock,
             "HTTP/1.1 201 Created",
             &[
-                ("Location".to_owned(), "/v1/realtime/calls/rtc_alpha-001".to_owned()),
+                (
+                    "Location".to_owned(),
+                    "/v1/realtime/calls/rtc_alpha-001".to_owned(),
+                ),
                 ("Content-Type".to_owned(), "application/sdp".to_owned()),
             ],
             sdp_answer.as_bytes(),
@@ -10435,25 +20938,25 @@ mod tests {
         assert_eq!(result["callId"], "rtc_alpha-001");
     }
 
-    /// Loopback CLIProxyAPI stand-in implementing the reported Codex
-    /// quicksilver create-call contract: a `session` that carries `model` is
-    /// rejected with 400 `Field session.model is not allowed for this Codex
-    /// realtime session`; one without `model` is accepted with 201 +
-    /// `Location` + a bare SDP body. Returns the parsed request and the status
-    /// line sent back.
+    /// Loopback stand-in for the current create-call contract: a complete
+    /// object-valued `session` without the rejected `audio.input` field
+    /// succeeds; missing or malformed session data fails with 400. Returns
+    /// the parsed request and response status line.
     async fn serve_realtime_create_call(listener: &TcpListener) -> (MockRequest, String) {
         let (mut sock, _addr) = listener.accept().await.expect("accept");
         let req = read_http_request(&mut sock).await;
         let request_body = json_request_body(&req.body);
         let session = &request_body["session"];
+        let session_is_valid = session["instructions"] == ""
+            && session.get("model").is_none()
+            && session.get("type").is_none()
+            && session["audio"].get("input").is_none()
+            && session["audio"]["output"]["voice"]
+                .as_str()
+                .is_some_and(|voice| !voice.trim().is_empty())
+            && session["delegation"]["type"] == "client";
         let (status_line, headers, body): (&str, Vec<(String, String)>, Vec<u8>) =
-            if session.get("model").is_some() {
-                (
-                    "HTTP/1.1 400 Bad Request",
-                    vec![("Content-Type".to_owned(), "text/plain".to_owned())],
-                    b"Field session.model is not allowed for this Codex realtime session".to_vec(),
-                )
-            } else {
+            if session_is_valid {
                 (
                     "HTTP/1.1 201 Created",
                     vec![
@@ -10464,6 +20967,12 @@ mod tests {
                         ("Content-Type".to_owned(), "application/sdp".to_owned()),
                     ],
                     b"v=0\r\no=- 2 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n".to_vec(),
+                )
+            } else {
+                (
+                    "HTTP/1.1 400 Bad Request",
+                    vec![("Content-Type".to_owned(), "text/plain".to_owned())],
+                    b"create-call requires an object-valued session".to_vec(),
                 )
             };
         write_http_response(&mut sock, status_line, &headers, &body).await;
@@ -10487,52 +20996,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn realtime_create_call_omits_model_forbidden_by_codex_create_call() {
-        // Codex realtime (CLIProxyAPI quicksilver) rejects create-call
-        // requests whose `session` carries `model` with 400 "Field
-        // session.model is not allowed for this Codex realtime session". The
-        // loopback mock reproduces exactly that discriminator: a session WITH
-        // `model` → 400, one WITHOUT → 201. The fixed client must land on the
-        // 2xx path, proving the create-call session omits `model` — the
-        // configured model rides the data-channel `session.update` instead.
+    async fn realtime_create_call_requires_complete_session_object() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("local addr").port();
         let settings = realtime_test_settings(&format!("http://127.0.0.1:{port}"));
 
-        // Leg 1: the real client. If `realtime_session_payload` ever sends
-        // `model` again, the mock 400s the request and this leg fails.
-        let call = tokio::spawn(async move {
-            realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await
-        });
+        // Leg 1: the real client must satisfy the current session contract.
+        let call =
+            tokio::spawn(
+                async move { realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await },
+            );
         let (req, status_line) = serve_realtime_create_call(&listener).await;
         let request_body = json_request_body(&req.body);
-        let session = &request_body["session"];
-        assert!(
-            session.get("model").is_none(),
-            "create-call session must not carry `model` (Codex rejects it): {session}"
-        );
+        assert_eq!(request_body["session"]["instructions"], "");
+        assert!(request_body["session"].get("model").is_none());
+        assert!(request_body["session"].get("type").is_none());
+        assert!(request_body["session"]["audio"].get("input").is_none());
+        assert_eq!(request_body["session"]["audio"]["output"]["voice"], "sol");
+        assert_eq!(request_body["sdp"], REALTIME_TEST_SDP_OFFER);
         assert!(status_line.starts_with("HTTP/1.1 201"), "{status_line}");
-        let result = call
+        let response = call
             .await
             .expect("task join")
-            .expect("model-free create call must succeed");
-        assert_eq!(result["callId"], "rtc_alpha-001");
+            .expect("session-bearing create call must succeed");
+        assert_eq!(response["callId"], "rtc_alpha-001");
 
-        // Leg 2: mock fidelity — the pre-fix shape (session WITH `model`) must
-        // be rejected with the reported 400, proving the discriminator above
-        // is the real upstream contract and leg 1's pass is not a tautology
-        // (a mock that always 2xx'd would let a regressed client slip through).
-        let old_shape = json!({
-            "sdp": REALTIME_TEST_SDP_OFFER,
-            "session": {
-                "type": "quicksilver",
-                "model": "gpt-5.6-sol",
-                "audio": {
-                    "input": { "format": { "type": "audio/pcm", "rate": 24000 } },
-                    "output": { "voice": "sol" },
-                },
-            },
-        });
+        // Leg 2: mock fidelity — the legacy request without session must fail.
+        let old_shape = json!({ "sdp": REALTIME_TEST_SDP_OFFER });
         let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .expect("connect");
@@ -10544,7 +21034,7 @@ mod tests {
         client
             .write_all(raw.as_bytes())
             .await
-            .expect("write pre-fix shape request");
+            .expect("write legacy request without session");
         let (_req, status_line) = serve_realtime_create_call(&listener).await;
         let rejected = read_http_status_line(&mut client).await;
         assert_eq!(status_line, "HTTP/1.1 400 Bad Request", "{status_line}");
@@ -10558,9 +21048,10 @@ mod tests {
         let settings = realtime_test_settings(&format!("http://127.0.0.1:{port}"));
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
 
-        let call = tokio::spawn(async move {
-            realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await
-        });
+        let call =
+            tokio::spawn(
+                async move { realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await },
+            );
 
         let (mut sock, _addr) = listener.accept().await.expect("accept");
         let _req = read_http_request(&mut sock).await;
@@ -10587,9 +21078,10 @@ mod tests {
         let port = listener.local_addr().expect("local addr").port();
         let settings = realtime_test_settings(&format!("http://127.0.0.1:{port}"));
 
-        let call = tokio::spawn(async move {
-            realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await
-        });
+        let call =
+            tokio::spawn(
+                async move { realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await },
+            );
 
         let (mut sock, _addr) = listener.accept().await.expect("accept");
         let _req = read_http_request(&mut sock).await;
@@ -10618,9 +21110,10 @@ mod tests {
         let port = listener.local_addr().expect("local addr").port();
         let settings = realtime_test_settings(&format!("http://127.0.0.1:{port}"));
 
-        let call = tokio::spawn(async move {
-            realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await
-        });
+        let call =
+            tokio::spawn(
+                async move { realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await },
+            );
 
         let (mut sock, _addr) = listener.accept().await.expect("accept");
         let _req = read_http_request(&mut sock).await;
@@ -10628,7 +21121,10 @@ mod tests {
             &mut sock,
             "HTTP/1.1 201 Created",
             &[
-                ("Location".to_owned(), "/v1/realtime/calls/not-a-valid-id".to_owned()),
+                (
+                    "Location".to_owned(),
+                    "/v1/realtime/calls/not-a-valid-id".to_owned(),
+                ),
                 ("Content-Type".to_owned(), "application/sdp".to_owned()),
             ],
             b"v=0\r\no=- 4 4 IN IP4 127.0.0.1\r\n",
@@ -10652,9 +21148,10 @@ mod tests {
         let port = listener.local_addr().expect("local addr").port();
         let settings = realtime_test_settings(&format!("http://127.0.0.1:{port}"));
 
-        let call = tokio::spawn(async move {
-            realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await
-        });
+        let call =
+            tokio::spawn(
+                async move { realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await },
+            );
 
         let (mut sock, _addr) = listener.accept().await.expect("accept");
         let _req = read_http_request(&mut sock).await;
@@ -10711,9 +21208,10 @@ mod tests {
         let port = listener.local_addr().expect("local addr").port();
         let settings = realtime_test_settings(&format!("http://127.0.0.1:{port}"));
 
-        let call = tokio::spawn(async move {
-            realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await
-        });
+        let call =
+            tokio::spawn(
+                async move { realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await },
+            );
 
         let (mut sock, _addr) = listener.accept().await.expect("accept");
         let _req = read_http_request(&mut sock).await;
@@ -10722,7 +21220,10 @@ mod tests {
             &mut sock,
             "HTTP/1.1 201 Created",
             &[
-                ("Location".to_owned(), "/v1/realtime/calls/rtc_ok".to_owned()),
+                (
+                    "Location".to_owned(),
+                    "/v1/realtime/calls/rtc_ok".to_owned(),
+                ),
                 ("Content-Type".to_owned(), "application/sdp".to_owned()),
             ],
             b"   \r\n  \t ",
@@ -10742,9 +21243,10 @@ mod tests {
         let port = listener.local_addr().expect("local addr").port();
         let settings = realtime_test_settings(&format!("http://127.0.0.1:{port}"));
 
-        let call = tokio::spawn(async move {
-            realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await
-        });
+        let call =
+            tokio::spawn(
+                async move { realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await },
+            );
 
         let (mut sock, _addr) = listener.accept().await.expect("accept");
         let _req = read_http_request(&mut sock).await;
@@ -10786,17 +21288,15 @@ mod tests {
         // A gather-complete offer: host candidate + end-of-candidates marker.
         // This is what pc.localDescription.sdp looks like after ICE gathering
         // resolves on a loopback/LAN (host candidates only).
-        let gathered_offer =
-            "v=0\r\no=- 42 2 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+        let gathered_offer = "v=0\r\no=- 42 2 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
              a=mid:0\r\na=rtpmap:111 opus/48000/2\r\n\
              a=candidate:1 1 udp 2122252543 127.0.0.1 50000 typ host generation 0 ufrag abcd\r\n\
              a=candidate:1 2 udp 2122252543 127.0.0.1 50000 typ host generation 0 ufrag abcd\r\n\
              a=end-of-candidates\r\n";
 
         let offer_for_task = gathered_offer.to_owned();
-        let call = tokio::spawn(async move {
-            realtime_create_call(&settings, &offer_for_task).await
-        });
+        let call =
+            tokio::spawn(async move { realtime_create_call(&settings, &offer_for_task).await });
 
         let (mut sock, _addr) = listener.accept().await.expect("accept");
         let req = read_http_request(&mut sock).await;
@@ -10804,37 +21304,63 @@ mod tests {
         assert_eq!(req.path, "/v1/realtime/calls");
         assert_eq!(req.header("openai-alpha"), Some("quicksilver=v2"));
         let content_type = req.header("content-type").expect("content-type");
-        assert_eq!(content_type, "application/json", "content-type: {content_type:?}");
+        assert_eq!(
+            content_type, "application/json",
+            "content-type: {content_type:?}"
+        );
         let request_body = json_request_body(&req.body);
         // The SDP is forwarded VERBATIM, including every a=candidate line and
         // the end-of-candidates marker — no rewriting, no candidate stripping.
         // The browser's gathered offer is what the upstream sees.
         let sdp = request_body["sdp"].as_str().expect("sdp string");
-        assert_eq!(sdp, gathered_offer, "gathered offer must be forwarded byte-for-byte");
-        assert!(sdp.contains("a=candidate:"), "offer must carry ICE candidates: {sdp}");
-        assert!(sdp.contains("a=end-of-candidates"), "offer must mark gather complete: {sdp}");
-        // The session object is unchanged by the ICE fix.
-        let session = &request_body["session"];
-        assert_eq!(session["type"], "quicksilver");
-        assert_eq!(session["audio"]["input"]["format"]["rate"], 24000);
+        assert_eq!(
+            sdp, gathered_offer,
+            "gathered offer must be forwarded byte-for-byte"
+        );
+        assert!(
+            sdp.contains("a=candidate:"),
+            "offer must carry ICE candidates: {sdp}"
+        );
+        assert!(
+            sdp.contains("a=end-of-candidates"),
+            "offer must mark gather complete: {sdp}"
+        );
+        // Frameless session metadata accompanies the gathered offer without a model.
+        assert_eq!(request_body["session"]["instructions"], "");
+        assert!(request_body["session"].get("model").is_none());
+        assert!(request_body["session"].get("type").is_none());
+        assert!(request_body["session"]["audio"].get("input").is_none());
+        assert_eq!(request_body["session"]["audio"]["output"]["voice"], "sol");
+        assert_eq!(request_body["session"]["delegation"]["type"], "client");
 
         // Reply with a bare SDP answer + Location; the proxy returns both.
-        let sdp_answer = "v=0\r\no=- 7 7 IN IP4 127.0.0.1\r\ns=-\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n";
+        let sdp_answer =
+            "v=0\r\no=- 7 7 IN IP4 127.0.0.1\r\ns=-\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n";
         write_http_response(
             &mut sock,
             "HTTP/1.1 201 Created",
             &[
-                ("Location".to_owned(), "/v1/realtime/calls/rtc_gather_001".to_owned()),
+                (
+                    "Location".to_owned(),
+                    "/v1/realtime/calls/rtc_gather_001".to_owned(),
+                ),
                 ("Content-Type".to_owned(), "application/sdp".to_owned()),
             ],
             sdp_answer.as_bytes(),
         )
         .await;
-        let result = call.await.expect("task join").expect("realtime_create_call ok");
+        let result = call
+            .await
+            .expect("task join")
+            .expect("realtime_create_call ok");
         assert_eq!(result["sdp"], sdp_answer);
         assert_eq!(result["callId"], "rtc_gather_001");
         // Auth never leaks into the persisted call id or SDP.
-        assert!(!result.to_string().contains(REALTIME_TEST_KEY), "{}", result);
+        assert!(
+            !result.to_string().contains(REALTIME_TEST_KEY),
+            "{}",
+            result
+        );
     }
 
     // ---- STT voice proxy (stt_transcribe): bounded WAV-only contract ----
@@ -10881,9 +21407,10 @@ mod tests {
         let wav = stt_test_wav();
 
         // "Audio/WAV": the MIME allowlist is case-insensitive.
-        let call = tokio::spawn(async move {
-            stt_transcribe(&settings, &stt_b64(&wav), "Audio/WAV").await
-        });
+        let call =
+            tokio::spawn(
+                async move { stt_transcribe(&settings, &stt_b64(&wav), "Audio/WAV").await },
+            );
 
         let (mut sock, _addr) = listener.accept().await.expect("accept");
         let req = read_http_request(&mut sock).await;
@@ -10901,7 +21428,10 @@ mod tests {
             "content-type: {content_type:?}"
         );
         let body = String::from_utf8_lossy(&req.body);
-        assert!(body.contains("RIFF"), "wav bytes embedded in the multipart body");
+        assert!(
+            body.contains("RIFF"),
+            "wav bytes embedded in the multipart body"
+        );
         assert!(body.contains("audio/wav"), "{body}");
         assert!(body.contains("name=\"file\""), "{body}");
         assert!(body.contains("name=\"model\""), "{body}");
@@ -11043,5 +21573,236 @@ mod tests {
             .to_string();
         assert!(err.contains("allowInsecure"), "{err}");
         assert!(!err.contains(STT_TEST_KEY), "{err}");
+    }
+
+    /// Stack overflow regression: execute the actual `GetTree` handler against
+    /// a 20,001-entry recorded session and serialize the returned response on
+    /// a 2 MiB stack (the Tokio worker default). The command path must bypass
+    /// `serde_json::to_value`, preserve the nested contract, and emit every
+    /// entry in parent-child order without recursion-limit errors or abort.
+    #[test]
+    fn get_tree_rpc_serializes_deep_chain_without_stack_overflow() {
+        const ENTRY_COUNT: usize = 20_001;
+        const WORKER_STACK: usize = 2 * 1024 * 1024;
+        let join_result = std::thread::Builder::new()
+            .stack_size(WORKER_STACK)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime");
+                runtime.block_on(async move {
+                    let root = tempfile::tempdir().expect("deep session root");
+                    let cwd = root.path().join("workspace");
+                    let session_dir = root.path().join("sessions");
+                    std::fs::create_dir_all(&cwd).expect("workspace");
+                    std::fs::create_dir_all(&session_dir).expect("session dir");
+                    let recorder = pi_coding::start_session_in(
+                        &cwd,
+                        None,
+                        None,
+                        Some(&session_dir),
+                        Some("deep-get-tree"),
+                        None,
+                    )
+                    .expect("start session");
+                    let mut entry_ids = Vec::with_capacity(ENTRY_COUNT);
+                    for _ in 0..ENTRY_COUNT {
+                        entry_ids.push(
+                            recorder
+                                .record_message(&Message::user_text("msg", 0))
+                                .expect("record chain entry"),
+                        );
+                    }
+                    recorder.persist_now().expect("persist chain");
+                    let path = recorder.path();
+                    recorder.close().expect("close writer");
+                    let recorder = pi_coding::resume_session(&path).expect("resume deep session");
+                    let session = disabled_session(pi_coding::SessionOptions {
+                        model: faux_model(),
+                        cwd: cwd.clone(),
+                        system_prompt: String::new(),
+                        thinking_level: ThinkingLevel::Off,
+                        api_key: "test".to_owned(),
+                        compaction: None,
+                        stream_options: Default::default(),
+                        tools: Some(Vec::new()),
+                        before_tool_call: None,
+                        after_tool_call: None,
+                        stream_fn: None,
+                        auth_resolver: None,
+                        auth_manager: None,
+                    })
+                    .expect("deep session");
+                    session.set_session_dir(session_dir);
+                    session.record(recorder).expect("attach recorder");
+                    let app = isolated_application(session).await;
+                    let response = handle_command(
+                        &app,
+                        &settings_state(),
+                        &workflows_state(),
+                        RpcCommand::GetTree {
+                            id: Some("tree-deep".into()),
+                        },
+                    )
+                    .await;
+                    assert!(response.success, "{response:?}");
+                    assert!(response.data.is_none(), "deep tree must bypass Value");
+                    assert!(response.raw_data.is_some(), "deep tree must use raw data");
+                    let mut buffer = Vec::new();
+                    crate::modes::json::write_json_line(&mut buffer, &response)
+                        .expect("write actual GetTree JSONL response");
+                    let encoded = String::from_utf8(buffer).expect("UTF-8 JSONL response");
+                    (encoded, entry_ids)
+                })
+            })
+            .expect("worker-stack thread")
+            .join();
+        assert!(
+            join_result.is_ok(),
+            "GetTree must not overflow {} stack",
+            WORKER_STACK
+        );
+        let (encoded, entry_ids) = join_result.unwrap();
+        assert!(encoded.contains(r#""type":"response""#));
+        assert!(encoded.contains(r#""command":"get_tree""#));
+        assert!(encoded.contains(r#""id":"tree-deep""#));
+        assert!(encoded.ends_with('\n'), "RPC response must use LF framing");
+        assert_eq!(encoded.matches(r#""entry":{"#).count(), ENTRY_COUNT);
+        assert_eq!(encoded.matches(r#""children":[{"#).count(), ENTRY_COUNT - 1);
+        assert_eq!(encoded.matches(r#""children":[]"#).count(), 1);
+        let mut cursor = 0;
+        for (index, id) in entry_ids.iter().enumerate() {
+            let parent = index.checked_sub(1).map_or_else(
+                || "null".to_owned(),
+                |parent| serde_json::to_string(&entry_ids[parent]).expect("parent id"),
+            );
+            let expected = format!(
+                r#""entry":{{"type":"message","id":{},"parentId":{parent},"timestamp":"#,
+                serde_json::to_string(id).expect("entry id"),
+            );
+            let offset = encoded[cursor..]
+                .find(&expected)
+                .unwrap_or_else(|| panic!("missing ordered entry {index}"));
+            cursor += offset + expected.len();
+        }
+        let leaf = serde_json::to_string(entry_ids.last().expect("leaf id")).expect("leaf id");
+        assert!(encoded.contains(&format!(r#""leafId":{leaf}"#)));
+        assert!(encoded.contains(&format!(r#""activeLeafId":{leaf}"#)));
+    }
+
+    #[test]
+    fn session_list_row_wire_carries_agent_and_bootstrap_flags() {
+        let row = crate::resume_catalog::ResumeSelectorRow {
+            source: pi_coding::SessionSourceKind::Codex,
+            source_badge: "codex",
+            session_id: "wire-agent".to_owned(),
+            cwd: PathBuf::from("/home/u/.slock/agents/agent-7"),
+            modified_epoch: 1.0,
+            display_time: "2026-01-01 00:00".to_owned(),
+            summary: "<user_info>bootstrap</user_info>".to_owned(),
+            path: PathBuf::from("/sessions/rollout-agent.jsonl"),
+            size: 1,
+            message_count: Some(1),
+            name: None,
+            status: pi_coding::CatalogRowStatus::Foreign,
+            search_text: String::new(),
+            message_blob: String::new(),
+            has_parent_session: false,
+            session_kind: pi_coding::SessionKind::WorkflowSupervisor,
+            agent_session: true,
+            bootstrap_only: true,
+        };
+        let wire = serde_json::to_value(RpcSessionListRow::from_resume_row(row, false))
+            .expect("serialize session_list row");
+        assert_eq!(wire["agentSession"], true, "{wire}");
+        assert_eq!(wire["bootstrapOnly"], true, "{wire}");
+        assert_eq!(wire["sessionKind"], "workflowSupervisor", "{wire}");
+
+        let plain = crate::resume_catalog::ResumeSelectorRow {
+            source: pi_coding::SessionSourceKind::NativePi,
+            source_badge: "rpi",
+            session_id: "wire-user".to_owned(),
+            cwd: PathBuf::from("/home/u/Projects/app"),
+            modified_epoch: 2.0,
+            display_time: "2026-01-02 00:00".to_owned(),
+            summary: "fix the login bug".to_owned(),
+            path: PathBuf::from("/sessions/user.jsonl"),
+            size: 2,
+            message_count: Some(2),
+            name: None,
+            status: pi_coding::CatalogRowStatus::Native,
+            search_text: String::new(),
+            message_blob: String::new(),
+            has_parent_session: false,
+            session_kind: pi_coding::SessionKind::User,
+            agent_session: false,
+            bootstrap_only: false,
+        };
+        let wire = serde_json::to_value(RpcSessionListRow::from_resume_row(plain, false))
+            .expect("serialize user row");
+        assert_eq!(wire["agentSession"], false, "{wire}");
+        assert_eq!(wire["bootstrapOnly"], false, "{wire}");
+        assert_eq!(wire["sessionKind"], "user", "{wire}");
+    }
+    #[test]
+    fn session_list_grok_row_wire_source_is_canonical_grok() {
+        let row = crate::resume_catalog::ResumeSelectorRow {
+            source: pi_coding::SessionSourceKind::Grok,
+            source_badge: "grok/hyper",
+            session_id: "grok-switch".to_owned(),
+            cwd: PathBuf::from("/ws/pi-rs"),
+            modified_epoch: 3.0,
+            display_time: "2026-01-03 00:00".to_owned(),
+            summary: "grok session".to_owned(),
+            path: PathBuf::from("/sessions/grok.jsonl"),
+            size: 3,
+            message_count: Some(3),
+            name: None,
+            status: pi_coding::CatalogRowStatus::Foreign,
+            search_text: String::new(),
+            message_blob: String::new(),
+            has_parent_session: false,
+            session_kind: pi_coding::SessionKind::User,
+            agent_session: false,
+            bootstrap_only: false,
+        };
+        let wire = serde_json::to_value(RpcSessionListRow::from_resume_row(row, false))
+            .expect("serialize grok row");
+        // The Web switch authority accepts only the byte-exact canonical token
+        // `grok`; the picker label `grok/hyper` would make every Grok row click
+        // inert (no switch_session frame ever sent).
+        assert_eq!(wire["source"], "grok", "{wire}");
+        assert_ne!(wire["source"], "grok/hyper", "{wire}");
+    }
+    #[test]
+    fn session_list_already_imported_row_carries_authoritative_native_id() {
+        let row = crate::resume_catalog::ResumeSelectorRow {
+            source: pi_coding::SessionSourceKind::Grok,
+            source_badge: "grok/hyper",
+            session_id: "grok-source".to_owned(),
+            cwd: PathBuf::from("<workspace>/project"),
+            modified_epoch: 4.0,
+            display_time: "2026-01-04 00:00".to_owned(),
+            summary: "grok session".to_owned(),
+            path: PathBuf::from("<workspace>/grok/summary.json"),
+            size: 4,
+            message_count: Some(1),
+            name: None,
+            status: pi_coding::CatalogRowStatus::AlreadyImported {
+                native_id: "native-header-id".to_owned(),
+                native_path: PathBuf::from("<workspace>/sessions/import_storage-id.jsonl"),
+            },
+            search_text: String::new(),
+            message_blob: String::new(),
+            has_parent_session: false,
+            session_kind: pi_coding::SessionKind::User,
+            agent_session: false,
+            bootstrap_only: false,
+        };
+        let wire = serde_json::to_value(RpcSessionListRow::from_resume_row(row, false))
+            .expect("serialize imported row");
+        assert_eq!(wire["nativeSessionId"], "native-header-id");
+        assert_eq!(wire["nativePath"], "<workspace>/sessions/import_storage-id.jsonl");
     }
 }

@@ -12,7 +12,9 @@ use pi_coding::{
 use serde_json::{Value, json};
 
 fn at(second: i64) -> chrono::DateTime<Utc> {
-    Utc.timestamp_opt(second, 0).single().expect("valid timestamp")
+    Utc.timestamp_opt(second, 0)
+        .single()
+        .expect("valid timestamp")
 }
 
 fn clock_at(second: i64) -> pi_coding::GoalClockFn {
@@ -168,7 +170,13 @@ fn drop_is_terminal_and_illegal_transitions_do_not_mutate() {
         .expect("charge late usage after drop");
     assert_eq!(charged.lifecycle, GoalLifecycle::Dropped);
     assert_eq!(charged.pause_reason, None);
-    assert_eq!(charged.usage, GoalUsage { tokens_used: 1, active_time_seconds: 1 });
+    assert_eq!(
+        charged.usage,
+        GoalUsage {
+            tokens_used: 1,
+            active_time_seconds: 1
+        }
+    );
     assert_eq!(runtime.get().revision, terminal.revision + 1);
 }
 
@@ -190,7 +198,13 @@ fn completed_goal_rejects_drop_pause_and_resume_but_accepts_late_usage() {
         .expect("charge late usage after completion");
     assert_eq!(charged.lifecycle, GoalLifecycle::Completed);
     assert_eq!(charged.pause_reason, None);
-    assert_eq!(charged.usage, GoalUsage { tokens_used: 1, active_time_seconds: 1 });
+    assert_eq!(
+        charged.usage,
+        GoalUsage {
+            tokens_used: 1,
+            active_time_seconds: 1
+        }
+    );
     let replayed = GoalRuntime::from_events(&events.lock().expect("event lock")).expect("replay");
     assert_eq!(replayed.get(), runtime.get());
 }
@@ -288,7 +302,10 @@ fn replay_restores_exact_state_and_rejects_corrupt_history() {
     let events = events.lock().expect("event lock").clone();
     let replayed = GoalRuntime::from_events(&events).expect("replay");
     assert_eq!(replayed.get(), expected);
-    assert_eq!(replayed.continuation_decision(), runtime.continuation_decision());
+    assert_eq!(
+        replayed.continuation_decision(),
+        runtime.continuation_decision()
+    );
 
     let mut corrupt = events;
     corrupt[1].revision = 9;
@@ -321,7 +338,10 @@ fn session_custom_events_replay_across_resume() {
     let reloaded = load_session_tree(&path).expect("load tree");
     let events = goal_events_from_session_tree(&reloaded).expect("decode goal events");
     assert_eq!(events.len(), 4);
-    assert_eq!(events.last().expect("last event").kind, GoalEventKind::Resumed);
+    assert_eq!(
+        events.last().expect("last event").kind,
+        GoalEventKind::Resumed
+    );
     assert_eq!(
         GoalRuntime::from_events(&events)
             .expect("replay resumed events")
@@ -351,7 +371,11 @@ fn goal_events_survive_session_compaction_boundaries() {
     persist_session(&recorder);
 
     let tree = load_session_tree(&path).expect("load compacted tree");
-    assert!(tree.entries.iter().any(|entry| entry.entry_type == "compaction"));
+    assert!(
+        tree.entries
+            .iter()
+            .any(|entry| entry.entry_type == "compaction")
+    );
     let goal_entries = tree
         .entries
         .iter()
@@ -412,7 +436,8 @@ fn serialized_goal_state_has_a_narrow_secret_free_schema() {
         vec!["current", "lifecycleRevision", "revision"]
     );
     assert_eq!(
-        object["lifecycleRevision"], json!(1),
+        object["lifecycleRevision"],
+        json!(1),
         "the created goal's lifecycle epoch must be the create revision"
     );
     let goal = object["current"].as_object().expect("goal object");
@@ -430,7 +455,11 @@ fn serialized_goal_state_has_a_narrow_secret_free_schema() {
     );
     let serialized = serde_json::to_string(&value).expect("serialize JSON");
     for forbidden in ["apiKey", "authorization", "credential", "secret", "bearer"] {
-        assert!(!serialized.to_ascii_lowercase().contains(&forbidden.to_ascii_lowercase()));
+        assert!(
+            !serialized
+                .to_ascii_lowercase()
+                .contains(&forbidden.to_ascii_lowercase())
+        );
     }
 }
 
@@ -445,8 +474,7 @@ fn session_entry_wire_shape_is_typed_and_versioned() {
         goal,
     };
     assert_eq!(
-        serde_json::to_value(GoalSessionEntry { version: 1, event }).expect("serialize entry")
-            ["version"],
+        serde_json::to_value(GoalSessionEntry { version: 1, event }).expect("serialize entry")["version"],
         json!(1)
     );
 }
@@ -460,7 +488,9 @@ fn concurrent_mutations_are_linearized_without_lost_usage() {
         captured.lock().expect("event lock").push(event.clone());
         Ok(())
     }));
-    runtime.create("linearize accounting", None).expect("create");
+    runtime
+        .create("linearize accounting", None)
+        .expect("create");
     let barrier = Arc::new(Barrier::new(WORKERS));
     let mut workers = Vec::new();
     for _ in 0..WORKERS {
@@ -537,7 +567,9 @@ fn concurrent_create_allows_exactly_one_goal() {
 #[test]
 fn reservation_commit_ordering_blocks_older_inversion() {
     let runtime = GoalRuntime::memory();
-    runtime.create("ordered reservation", Some(100)).expect("create");
+    runtime
+        .create("ordered reservation", Some(100))
+        .expect("create");
     runtime.pause().expect("pause");
 
     let older_committed = Arc::new(Barrier::new(2));
@@ -622,7 +654,10 @@ fn reservation_commit_ordering_blocks_older_inversion() {
     );
     let state = runtime.get();
     assert_eq!(state.revision, 5);
-    assert_eq!(state.current.expect("goal").lifecycle, GoalLifecycle::Active);
+    assert_eq!(
+        state.current.expect("goal").lifecycle,
+        GoalLifecycle::Active
+    );
     assert_eq!(
         state.lifecycle_revision, 5,
         "pause+resume advance the lifecycle epoch, invalidating the rev-3 reservation"
@@ -656,7 +691,9 @@ fn malformed_and_future_session_goal_entries_fail_closed() {
 #[test]
 fn replay_rejects_forged_snapshot_fields_and_illegal_transitions() {
     let runtime = GoalRuntime::with_clock_and_persistence(clock_at(100), Arc::new(|_| Ok(())));
-    let created = runtime.create("authentic objective", Some(20)).expect("create");
+    let created = runtime
+        .create("authentic objective", Some(20))
+        .expect("create");
     let base = GoalEvent {
         revision: 1,
         timestamp: created.updated_at,
@@ -1085,7 +1122,11 @@ fn dual_runtime_shared_recorder_rejects_stale_revision_append() {
         matches!(stale_err, GoalError::Persistence(_)),
         "stale append must surface persistence CAS failure, got {stale_err:?}"
     );
-    assert_eq!(stale.get().revision, 1, "failed stale write must not advance local revision");
+    assert_eq!(
+        stale.get().revision,
+        1,
+        "failed stale write must not advance local revision"
+    );
 
     persist_session(&recorder);
     let events = goal_events_from_session_tree(&load_session_tree(&path).expect("load tree"))
@@ -1119,9 +1160,14 @@ fn stale_runtime_after_branch_cannot_corrupt_active_history() {
 
     recorder.branch(&create_entry_id).expect("branch to create");
 
-    let live_before = goal_events_from_session_tree(&recorder.tree().expect("live tree after branch"))
-        .expect("active branch decodes");
-    assert_eq!(live_before.len(), 1, "live tree must be create-only after branch");
+    let live_before =
+        goal_events_from_session_tree(&recorder.tree().expect("live tree after branch"))
+            .expect("active branch decodes");
+    assert_eq!(
+        live_before.len(),
+        1,
+        "live tree must be create-only after branch"
+    );
     assert_eq!(live_before[0].kind, GoalEventKind::Created);
 
     let stale_err = runtime
@@ -1131,10 +1177,15 @@ fn stale_runtime_after_branch_cannot_corrupt_active_history() {
         matches!(stale_err, GoalError::Persistence(_)),
         "stale branch append must surface persistence CAS failure, got {stale_err:?}"
     );
-    assert_eq!(runtime.get().revision, 2, "rejected drop must not mutate runtime");
+    assert_eq!(
+        runtime.get().revision,
+        2,
+        "rejected drop must not mutate runtime"
+    );
 
-    let live_after = goal_events_from_session_tree(&recorder.tree().expect("live tree after reject"))
-        .expect("active branch still decodes");
+    let live_after =
+        goal_events_from_session_tree(&recorder.tree().expect("live tree after reject"))
+            .expect("active branch still decodes");
     assert_eq!(live_after.len(), 1);
     assert_eq!(live_after[0].kind, GoalEventKind::Created);
     GoalRuntime::from_events(&live_after).expect("create-only branch replays");
@@ -1208,7 +1259,10 @@ fn oversized_objective_does_not_create_unreplayable_session() {
     if path.exists() {
         if let Ok(tree) = load_session_tree(&path) {
             let events = goal_events_from_session_tree(&tree).expect("no corrupt goal entries");
-            assert!(events.is_empty(), "rejected create must leave no goal events");
+            assert!(
+                events.is_empty(),
+                "rejected create must leave no goal events"
+            );
         }
     }
 }
@@ -1245,10 +1299,7 @@ fn early_persist_now_preserves_pending_goal_events_across_restore() {
     );
     let restored = GoalRuntime::from_session_recorder(recorder.clone()).expect("restore facade");
     assert_eq!(restored.get().revision, 2);
-    assert_eq!(
-        restored.get().current.expect("goal").usage.tokens_used,
-        5
-    );
+    assert_eq!(restored.get().current.expect("goal").usage.tokens_used, 5);
 
     // First assistant append must keep the full goal journal, not only the
     // latest pending record.
@@ -1262,7 +1313,11 @@ fn early_persist_now_preserves_pending_goal_events_across_restore() {
 
     let durable = goal_events_from_session_tree(&load_session_tree(&path).expect("load durable"))
         .expect("durable goal events");
-    assert_eq!(durable.len(), 2, "assistant flush must retain create+usage; got {durable:?}");
+    assert_eq!(
+        durable.len(),
+        2,
+        "assistant flush must retain create+usage; got {durable:?}"
+    );
     let final_runtime = GoalRuntime::from_events(&durable).expect("replay durable");
     assert_eq!(final_runtime.get().revision, 2);
     assert_eq!(
@@ -1278,7 +1333,9 @@ fn goal_create_and_update_before_first_assistant_survive_close_and_reopen() {
     let path = recorder.path();
     let runtime = GoalRuntime::from_session_recorder(recorder.clone()).expect("runtime");
 
-    runtime.create("durable before assistant", Some(20)).expect("create");
+    runtime
+        .create("durable before assistant", Some(20))
+        .expect("create");
     runtime
         .update_usage(GoalUsageDelta::new(4, 2))
         .expect("update");
@@ -1300,7 +1357,9 @@ fn stale_topology_token_cannot_redirect_validated_goal_append() {
     let token = recorder.append_token();
 
     recorder.reset_leaf();
-    recorder.branch(&create_entry).expect("return to original leaf");
+    recorder
+        .branch(&create_entry)
+        .expect("return to original leaf");
     let before = recorder.tree().expect("tree before stale append");
     let error = recorder
         .record_custom_entry_durable_checked(
@@ -1339,7 +1398,9 @@ fn checked_serialization_failure_leaves_goal_runtime_tree_and_file_unchanged() {
     let recorder = recorder_in(&directory);
     let path = recorder.path();
     let runtime = GoalRuntime::from_session_recorder(recorder.clone()).expect("runtime");
-    runtime.create("stable serialization", None).expect("create");
+    runtime
+        .create("stable serialization", None)
+        .expect("create");
     let before_state = runtime.get();
     let before_tree = recorder.tree().expect("tree before failure");
     let before_file = std::fs::read(&path).expect("file before failure");
@@ -1361,7 +1422,10 @@ fn checked_serialization_failure_leaves_goal_runtime_tree_and_file_unchanged() {
         serde_json::to_value(after_tree.entries).expect("serialize after entries"),
         serde_json::to_value(before_tree.entries).expect("serialize before entries")
     );
-    assert_eq!(std::fs::read(&path).expect("file after failure"), before_file);
+    assert_eq!(
+        std::fs::read(&path).expect("file after failure"),
+        before_file
+    );
 }
 
 #[test]
@@ -1386,10 +1450,11 @@ fn durable_goal_write_failure_leaves_runtime_tree_and_file_unchanged() {
         serde_json::to_value(after_tree.entries).expect("serialize after entries"),
         serde_json::to_value(before_tree.entries).expect("serialize before entries")
     );
-    assert_eq!(std::fs::read(&path).expect("file after write failure"), before_file);
+    assert_eq!(
+        std::fs::read(&path).expect("file after write failure"),
+        before_file
+    );
 }
-
-
 
 fn dummy_model() -> pi_ai::Model {
     pi_ai::Model {
@@ -1412,7 +1477,9 @@ fn pause_on_resume_safety_pauses_only_active_goals_and_replays() {
         captured.lock().expect("event lock").push(event.clone());
         Ok(())
     }));
-    let created = runtime.create("resume deliberately", Some(100)).expect("create");
+    let created = runtime
+        .create("resume deliberately", Some(100))
+        .expect("create");
     runtime
         .update_usage(GoalUsageDelta::new(7, 3))
         .expect("charge usage");
@@ -1432,15 +1499,23 @@ fn pause_on_resume_safety_pauses_only_active_goals_and_replays() {
     let replayed = GoalRuntime::from_events(&events.lock().expect("events")).expect("replay");
     assert_eq!(replayed.get(), runtime.get());
     assert_eq!(
-        runtime.resume().expect("explicitly resume safety pause").lifecycle,
+        runtime
+            .resume()
+            .expect("explicitly resume safety pause")
+            .lifecycle,
         GoalLifecycle::Active
     );
 
     let terminal = GoalRuntime::memory();
-    terminal.create("already finished", None).expect("create terminal");
+    terminal
+        .create("already finished", None)
+        .expect("create terminal");
     terminal.complete().expect("complete");
     let before = terminal.get();
-    assert_eq!(terminal.pause_on_resume().expect("leave terminal"), before.current.clone().expect("goal"));
+    assert_eq!(
+        terminal.pause_on_resume().expect("leave terminal"),
+        before.current.clone().expect("goal")
+    );
     assert_eq!(terminal.get(), before);
 }
 
@@ -1487,13 +1562,20 @@ fn fork_clone_preserves_paused_and_terminal_state() {
     let paused_source = GoalRuntime::memory();
     paused_source.create("paused source", None).expect("create");
     let paused = paused_source.pause().expect("pause source");
-    let paused_clone = GoalRuntime::memory().fork_clone(&paused).expect("clone paused");
+    let paused_clone = GoalRuntime::memory()
+        .fork_clone(&paused)
+        .expect("clone paused");
     assert_eq!(paused_clone.lifecycle, GoalLifecycle::Paused);
     assert_eq!(paused_clone.pause_reason, Some(GoalPauseReason::Manual));
-    assert_eq!(paused_clone.origin_goal_id.as_deref(), Some(paused.id.as_str()));
+    assert_eq!(
+        paused_clone.origin_goal_id.as_deref(),
+        Some(paused.id.as_str())
+    );
 
     let completed_source = GoalRuntime::memory();
-    completed_source.create("completed source", None).expect("create");
+    completed_source
+        .create("completed source", None)
+        .expect("create");
     let completed = completed_source.complete().expect("complete source");
     let completed_clone = GoalRuntime::memory()
         .fork_clone(&completed)
@@ -1502,9 +1584,13 @@ fn fork_clone_preserves_paused_and_terminal_state() {
     assert_eq!(completed_clone.pause_reason, None);
 
     let dropped_source = GoalRuntime::memory();
-    dropped_source.create("dropped source", None).expect("create");
+    dropped_source
+        .create("dropped source", None)
+        .expect("create");
     let dropped = dropped_source.drop().expect("drop source");
-    let dropped_clone = GoalRuntime::memory().fork_clone(&dropped).expect("clone dropped");
+    let dropped_clone = GoalRuntime::memory()
+        .fork_clone(&dropped)
+        .expect("clone dropped");
     assert_eq!(dropped_clone.lifecycle, GoalLifecycle::Dropped);
     assert_eq!(dropped_clone.pause_reason, None);
 }
@@ -1512,20 +1598,27 @@ fn fork_clone_preserves_paused_and_terminal_state() {
 #[test]
 fn fork_clone_is_durable_and_forged_lineage_fails_closed() {
     let source_runtime = GoalRuntime::memory();
-    source_runtime.create("durable fork", Some(80)).expect("create source");
+    source_runtime
+        .create("durable fork", Some(80))
+        .expect("create source");
     let source = source_runtime.pause().expect("pause source");
 
     let directory = tempfile::tempdir().expect("tempdir");
     let recorder = recorder_in(&directory);
     let path = recorder.path();
     let fork_runtime = GoalRuntime::from_session_recorder(recorder.clone()).expect("fork runtime");
-    let cloned = fork_runtime.fork_clone(&source).expect("persist fork clone");
+    let cloned = fork_runtime
+        .fork_clone(&source)
+        .expect("persist fork clone");
     recorder.close().expect("close fork recorder");
 
     let resumed = resume_session(&path).expect("resume fork session");
     let restored = GoalRuntime::from_session_recorder(resumed.clone()).expect("restore fork goal");
     assert_eq!(restored.get(), fork_runtime.get());
-    assert_eq!(restored.get().current.expect("goal").origin_goal_id, Some(source.id.clone()));
+    assert_eq!(
+        restored.get().current.expect("goal").origin_goal_id,
+        Some(source.id.clone())
+    );
     resumed.close().expect("close resumed");
 
     let mut event = GoalEvent {
@@ -1563,7 +1656,8 @@ fn fork_clone_transitions_a_copied_source_journal_to_new_lineage() {
     let directory = tempfile::tempdir().expect("tempdir");
     let recorder = recorder_in(&directory);
     let path = recorder.path();
-    let source_runtime = GoalRuntime::from_session_recorder(recorder.clone()).expect("source runtime");
+    let source_runtime =
+        GoalRuntime::from_session_recorder(recorder.clone()).expect("source runtime");
     source_runtime
         .create("copied journal fork", Some(120))
         .expect("create source");
@@ -1587,7 +1681,8 @@ fn fork_clone_transitions_a_copied_source_journal_to_new_lineage() {
 
     recorder.close().expect("close copied fork session");
     let resumed = resume_session(&path).expect("resume copied fork session");
-    let restored = GoalRuntime::from_session_recorder(resumed.clone()).expect("restore cloned goal");
+    let restored =
+        GoalRuntime::from_session_recorder(resumed.clone()).expect("restore cloned goal");
     assert_eq!(restored.get(), copied.get());
     assert_eq!(restored.get().revision, 3);
     resumed.close().expect("close restored fork session");
@@ -1601,25 +1696,46 @@ fn pins_lifecycle_pin_list_unpin_and_replay() {
         captured.lock().expect("event lock").push(event.clone());
         Ok(())
     }));
-    runtime.create("pin the workflow", Some(100)).expect("create");
+    runtime
+        .create("pin the workflow", Some(100))
+        .expect("create");
     assert!(runtime.pins().is_empty());
-    assert_eq!(runtime.get().current.expect("goal").pins, Vec::<String>::new());
+    assert_eq!(
+        runtime.get().current.expect("goal").pins,
+        Vec::<String>::new()
+    );
 
-    let pinned = runtime.pin("keep the release checklist in scope").expect("pin");
-    assert_eq!(pinned.pins, vec!["keep the release checklist in scope".to_owned()]);
-    assert_eq!(runtime.pins(), vec!["keep the release checklist in scope".to_owned()]);
+    let pinned = runtime
+        .pin("keep the release checklist in scope")
+        .expect("pin");
+    assert_eq!(
+        pinned.pins,
+        vec!["keep the release checklist in scope".to_owned()]
+    );
+    assert_eq!(
+        runtime.pins(),
+        vec!["keep the release checklist in scope".to_owned()]
+    );
     assert_eq!(runtime.get().revision, 2);
     assert!(matches!(
         &events.lock().expect("events")[1].kind,
         GoalEventKind::PinsUpdated { pins } if pins == &vec!["keep the release checklist in scope".to_owned()]
     ));
 
-    runtime.pin("reference the omp skill-card style").expect("second pin");
+    runtime
+        .pin("reference the omp skill-card style")
+        .expect("second pin");
     assert_eq!(runtime.pins().len(), 2);
 
     let unpinned = runtime.unpin(0).expect("unpin first");
-    assert_eq!(unpinned.pins, vec!["reference the omp skill-card style".to_owned()]);
-    assert_eq!(runtime.pins(), vec!["reference the omp skill-card style".to_owned()]);
+    assert_eq!(
+        unpinned.pins,
+        vec!["reference the omp skill-card style".to_owned()]
+    );
+    assert_eq!(
+        runtime.pins(),
+        vec!["reference the omp skill-card style".to_owned()]
+    );
     assert_eq!(runtime.get().revision, 4);
     assert!(matches!(
         &events.lock().expect("events")[3].kind,
@@ -1648,7 +1764,9 @@ fn pins_validate_empty_length_limit_and_index_bounds() {
         })
     );
     for index in 0..MAX_GOAL_PINS {
-        runtime.pin(format!("pin {index}")).expect("pin within limit");
+        runtime
+            .pin(format!("pin {index}"))
+            .expect("pin within limit");
     }
     assert_eq!(runtime.pins().len(), MAX_GOAL_PINS);
     assert_eq!(
@@ -1696,7 +1814,11 @@ fn pins_are_terminal_gated_and_forged_pin_events_fail_closed() {
             lifecycle: GoalLifecycle::Completed,
         })
     ));
-    assert_eq!(terminal.get().revision, 2, "rejected pin must not advance the journal");
+    assert_eq!(
+        terminal.get().revision,
+        2,
+        "rejected pin must not advance the journal"
+    );
 
     let runtime = GoalRuntime::with_clock_and_persistence(clock_at(100), Arc::new(|_| Ok(())));
     let created = runtime.create("forge pins", None).expect("create");
@@ -1778,11 +1900,16 @@ fn pins_survive_session_resume_and_fork_clone_copies_them() {
     let resumed = resume_session(&path).expect("resume session");
     let restored = GoalRuntime::from_session_recorder(resumed.clone()).expect("restore goal");
     assert_eq!(restored.get(), expected);
-    assert_eq!(restored.pins(), vec!["role model example".to_owned(), "second example".to_owned()]);
+    assert_eq!(
+        restored.pins(),
+        vec!["role model example".to_owned(), "second example".to_owned()]
+    );
 
     // Fork clones carry the pinned role-model context into the new lineage.
     let source = restored.get().current.expect("restored goal");
-    let cloned = GoalRuntime::memory().fork_clone(&source).expect("fork clone");
+    let cloned = GoalRuntime::memory()
+        .fork_clone(&source)
+        .expect("fork clone");
     assert_eq!(cloned.pins, source.pins);
     resumed.close().expect("close resumed session");
 }
@@ -1805,8 +1932,7 @@ fn pins_serialize_under_camel_case_and_skip_when_empty() {
     runtime.pin("role model example").expect("pin");
     let with_pins = serde_json::to_value(runtime.get()).expect("serialize with pins");
     assert_eq!(with_pins["current"]["pins"], json!(["role model example"]));
-    let round_tripped: GoalState =
-        serde_json::from_value(with_pins).expect("with-pins round trip");
+    let round_tripped: GoalState = serde_json::from_value(with_pins).expect("with-pins round trip");
     assert_eq!(round_tripped, runtime.get());
     assert_eq!(
         round_tripped.current.expect("goal").pins,
@@ -1858,7 +1984,11 @@ fn pin_and_unpin_enforce_all_boundaries_and_reject_illegal_transitions() {
         Some("freed slot"),
         "unpinned slot must be refilled by the new pin"
     );
-    assert!(!pins.iter().any(|pin| pin.len() == MAX_GOAL_PIN_CHARS && pin.chars().all(|c| c == 'x')));
+    assert!(
+        !pins
+            .iter()
+            .any(|pin| pin.len() == MAX_GOAL_PIN_CHARS && pin.chars().all(|c| c == 'x'))
+    );
 
     // Pinning a completed goal is an illegal transition.
     let done = GoalRuntime::memory();
@@ -1894,12 +2024,19 @@ fn pins_updated_events_replay_through_the_journal() {
         .iter()
         .filter(|event| matches!(event.kind, GoalEventKind::PinsUpdated { .. }))
         .collect();
-    assert_eq!(pins_updates.len(), 3, "every pin/unpin must journal a PinsUpdated");
+    assert_eq!(
+        pins_updates.len(),
+        3,
+        "every pin/unpin must journal a PinsUpdated"
+    );
     for event in &pins_updates {
         let GoalEventKind::PinsUpdated { pins } = &event.kind else {
             unreachable!("filtered");
         };
-        assert_eq!(pins, &event.goal.pins, "journal pins must match the resulting goal");
+        assert_eq!(
+            pins, &event.goal.pins,
+            "journal pins must match the resulting goal"
+        );
     }
 
     // Replay restores the exact pinned state (the resume path relies on it).

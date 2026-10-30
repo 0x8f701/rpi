@@ -12,7 +12,13 @@ use std::sync::Arc;
 use base64::Engine as _;
 use pi_agent::{AbortController, AgentTool, AgentToolResult, ToolCallContext, ToolUpdateFn};
 use pi_ai::ContentBlock;
-use pi_coding::{ProcessManager, ProcessManagerConfig, ProcessOwnerId, ProcessState, process_tool};
+use pi_ai::providers::{FauxProviderOptions, register_faux_provider};
+use pi_ai::Model;
+use pi_coding::{
+    Application, ProcessManager, ProcessManagerConfig, ProcessOwnerId, ProcessState,
+    ResourceDiscovery, ResourceManager, ResourceManagerOptions, Session, SessionOptions,
+    ToolSelection, process_tool,
+};
 use serde_json::{Value, json};
 
 fn noop_update() -> ToolUpdateFn {
@@ -29,6 +35,7 @@ fn make_ctx(arguments: Value) -> ToolCallContext {
         on_update: noop_update(),
         abort,
         model: None,
+        approval_token: None,
     }
 }
 
@@ -41,6 +48,7 @@ fn make_aborted_ctx(arguments: Value) -> ToolCallContext {
         on_update: noop_update(),
         abort,
         model: None,
+        approval_token: None,
     }
 }
 
@@ -86,22 +94,111 @@ fn process_id(details: &Value) -> String {
         .to_owned()
 }
 
-fn fixture_manager() -> ProcessManager {
-    ProcessManager::with_config(ProcessManagerConfig {
-        idle_timeout: None,
-        ..ProcessManagerConfig::default()
-    })
+struct BoundProcessTool {
+    manager: ProcessManager,
+    owner: ProcessOwnerId,
+    cwd: tempfile::TempDir,
+    _application: Application,
+    _agent: tempfile::TempDir,
+    _registration: pi_ai::providers::FauxProviderRegistration,
+}
+async fn bound_process_tool(config: Option<ProcessManagerConfig>) -> BoundProcessTool {
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let suffix = uuid::Uuid::now_v7().to_string();
+    let api = format!("process-tool-api-{suffix}");
+    let provider = format!("process-tool-provider-{suffix}");
+    let model = Model {
+        id: "process-tool-model".to_owned(),
+        name: "Process Tool Model".to_owned(),
+        api: api.clone(),
+        provider: provider.clone(),
+        ..Model::default()
+    };
+    let registration = register_faux_provider(FauxProviderOptions {
+        api,
+        provider,
+        models: vec![model.clone()],
+        chunk_size: 1,
+    });
+    let agent = tempfile::tempdir().expect("agent dir");
+    let session_dir = agent.path().join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    std::fs::write(
+        agent.path().join("settings.json"),
+        r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+    )
+    .expect("danger settings");
+    let mut resource_options = ResourceManagerOptions::new(cwd.path());
+    resource_options.agent_dir = agent.path().to_path_buf();
+    resource_options.disable_extensions = true;
+    resource_options.disable_skills = true;
+    resource_options.disable_prompt_templates = true;
+    resource_options.disable_themes = true;
+    resource_options.disable_context_files = true;
+    let resources = ResourceManager::new(resource_options).expect("resources");
+    let session = Session::new_with_additional_tools_filtered_and_discovery(
+        SessionOptions {
+            model,
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: pi_agent::ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: None,
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+            auth_manager: None,
+        },
+        Vec::new(),
+        ToolSelection::default(),
+        ResourceDiscovery::Disabled,
+    )
+    .expect("session");
+    session.set_session_dir(session_dir);
+    session.start_new_recording().expect("session recording");
+    session
+        .attach_resources(resources)
+        .await
+        .expect("attach resources");
+    let application = Application::new(session).await;
+    let manager = application.process_manager();
+    if let Some(config) = config {
+        manager.replace_config(config).expect("replace process config");
+    }
+    let owner = application.session().process_owner_id();
+    BoundProcessTool {
+        manager,
+        owner,
+        cwd,
+        _application: application,
+        _agent: agent,
+        _registration: registration,
+    }
 }
 
-fn owner_tool(cwd: &Path, manager: ProcessManager, owner: &str) -> AgentTool {
-    process_tool(cwd, manager, ProcessOwnerId::new(owner))
+async fn fixture_bound() -> BoundProcessTool {
+    bound_process_tool(Some(ProcessManagerConfig {
+        idle_timeout: None,
+        ..ProcessManagerConfig::default()
+    }))
+    .await
+}
+
+fn owner_tool(cwd: &Path, manager: ProcessManager, owner: &ProcessOwnerId) -> AgentTool {
+    process_tool(cwd, manager, owner.clone())
+}
+
+fn tool_for(bound: &BoundProcessTool) -> AgentTool {
+    owner_tool(bound.cwd.path(), bound.manager.clone(), &bound.owner)
 }
 
 #[tokio::test]
 async fn process_tool_start_ps_describe_logs_send_stop_wait_lifecycle() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    let manager = fixture_manager();
-    let tool = owner_tool(directory.path(), manager.clone(), "lifecycle-owner");
+    let bound = fixture_bound().await;
+    let tool = tool_for(&bound);
 
     // start — argv only, no shell interpolation; pipe mode for deterministic IO.
     let started = call(
@@ -152,11 +249,17 @@ async fn process_tool_start_ps_describe_logs_send_stop_wait_lifecycle() {
         )
         .await;
         assert_eq!(logs.details["requestedCursor"], cursor);
-        assert!(logs.details["cursor"].as_u64().unwrap() >= logs.details["startCursor"].as_u64().unwrap());
+        assert!(
+            logs.details["cursor"].as_u64().unwrap()
+                >= logs.details["startCursor"].as_u64().unwrap()
+        );
         assert_eq!(logs.details["lost"], false);
         cursor = logs.details["cursor"].as_u64().expect("cursor");
         let bytes = decode_log_bytes(&logs.details);
-        if bytes.windows(b"ready\n".len()).any(|window| window == b"ready\n") {
+        if bytes
+            .windows(b"ready\n".len())
+            .any(|window| window == b"ready\n")
+        {
             saw_ready = true;
             break;
         }
@@ -216,8 +319,14 @@ async fn process_tool_start_ps_describe_logs_send_stop_wait_lifecycle() {
     assert_eq!(final_logs.details["lost"], false);
     assert_eq!(final_logs.details["eof"], true);
     let output = String::from_utf8(decode_log_bytes(&final_logs.details)).expect("utf8 logs");
-    assert!(output.contains("ready\n"), "output missing ready: {output:?}");
-    assert!(output.contains("got:payload\n"), "output missing echo: {output:?}");
+    assert!(
+        output.contains("ready\n"),
+        "output missing ready: {output:?}"
+    );
+    assert!(
+        output.contains("got:payload\n"),
+        "output missing echo: {output:?}"
+    );
     assert_eq!(
         final_logs.details["cursor"].as_u64().unwrap(),
         waited.details["outputCursor"].as_u64().unwrap()
@@ -239,14 +348,13 @@ async fn process_tool_start_ps_describe_logs_send_stop_wait_lifecycle() {
 
 #[tokio::test]
 async fn process_tool_logs_honor_bounded_cursor_and_max_bytes() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    // Tiny ring so early bytes are dropped — tool must surface lost/lostBytes.
-    let manager = ProcessManager::with_config(ProcessManagerConfig {
+    let bound = bound_process_tool(Some(ProcessManagerConfig {
         max_output_bytes: 5,
         idle_timeout: None,
         ..ProcessManagerConfig::default()
-    });
-    let tool = owner_tool(directory.path(), manager, "cursor-owner");
+    }))
+    .await;
+    let tool = tool_for(&bound);
 
     let started = call(
         &tool,
@@ -260,11 +368,7 @@ async fn process_tool_logs_honor_bounded_cursor_and_max_bytes() {
     .await;
     let id = process_id(&started.details);
 
-    let waited = call(
-        &tool,
-        json!({ "op": "wait", "id": id, "timeoutMs": 3000 }),
-    )
-    .await;
+    let waited = call(&tool, json!({ "op": "wait", "id": id, "timeoutMs": 3000 })).await;
     assert_eq!(waited.details["exitCode"], 0);
     // With a 5-byte ring over 9 bytes of output, start cursor advances past the head.
     assert_eq!(waited.details["outputStartCursor"], 4);
@@ -329,9 +433,8 @@ async fn process_tool_logs_honor_bounded_cursor_and_max_bytes() {
 
 #[tokio::test]
 async fn process_tool_pty_resize_send_keys_and_signal() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    let manager = fixture_manager();
-    let tool = owner_tool(directory.path(), manager, "pty-owner");
+    let bound = fixture_bound().await;
+    let tool = tool_for(&bound);
 
     let started = call(
         &tool,
@@ -391,12 +494,17 @@ async fn process_tool_pty_resize_send_keys_and_signal() {
         .await;
         cursor = logs.details["cursor"].as_u64().expect("cursor");
         output.extend(decode_log_bytes(&logs.details));
-        if output.windows(b"<hello>".len()).any(|window| window == b"<hello>") {
+        if output
+            .windows(b"<hello>".len())
+            .any(|window| window == b"<hello>")
+        {
             break;
         }
     }
     assert!(
-        output.windows(b"<hello>".len()).any(|window| window == b"<hello>"),
+        output
+            .windows(b"<hello>".len())
+            .any(|window| window == b"<hello>"),
         "PTY never echoed input: {:?}",
         String::from_utf8_lossy(&output)
     );
@@ -425,11 +533,7 @@ async fn process_tool_pty_resize_send_keys_and_signal() {
         Ok(result) => result,
         Err(_) => {
             // Escalate via stop (SIGTERM then SIGKILL under the manager).
-            call(
-                &tool,
-                json!({ "op": "stop", "id": id, "timeoutMs": 2000 }),
-            )
-            .await
+            call(&tool, json!({ "op": "stop", "id": id, "timeoutMs": 2000 })).await
         }
     };
     assert_eq!(terminal.details["id"], id);
@@ -439,9 +543,8 @@ async fn process_tool_pty_resize_send_keys_and_signal() {
 
 #[tokio::test]
 async fn process_tool_rejects_invalid_base64_missing_size_and_unknown_op() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    let manager = fixture_manager();
-    let tool = owner_tool(directory.path(), manager, "validation-owner");
+    let bound = fixture_bound().await;
+    let tool = tool_for(&bound);
 
     let started = call(
         &tool,
@@ -522,19 +625,15 @@ async fn process_tool_rejects_invalid_base64_missing_size_and_unknown_op() {
         "unexpected missing argv error: {missing_argv}"
     );
 
-    let _ = call(
-        &tool,
-        json!({ "op": "stop", "id": id, "timeoutMs": 1000 }),
-    )
-    .await;
+    let _ = call(&tool, json!({ "op": "stop", "id": id, "timeoutMs": 1000 })).await;
 }
 
 #[tokio::test]
 async fn process_tool_pre_abort_does_not_spawn() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    let manager = fixture_manager();
-    let owner = ProcessOwnerId::new("abort-owner");
-    let tool = process_tool(directory.path(), manager.clone(), owner.clone());
+    let bound = fixture_bound().await;
+    let manager = bound.manager.clone();
+    let owner = bound.owner.clone();
+    let tool = tool_for(&bound);
 
     let error = (tool.execute)(make_aborted_ctx(json!({
         "op": "start",
@@ -552,10 +651,10 @@ async fn process_tool_pre_abort_does_not_spawn() {
 
 #[tokio::test]
 async fn process_tool_aborted_wait_bails_without_killing_supervised_process() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    let manager = fixture_manager();
-    let owner = ProcessOwnerId::new("abort-wait-owner");
-    let tool = process_tool(directory.path(), manager.clone(), owner.clone());
+    let bound = fixture_bound().await;
+    let manager = bound.manager.clone();
+    let owner = bound.owner.clone();
+    let tool = tool_for(&bound);
 
     let started = call(
         &tool,
@@ -601,10 +700,13 @@ async fn process_tool_aborted_wait_bails_without_killing_supervised_process() {
 
 #[tokio::test]
 async fn process_tool_owner_isolation_via_public_construction() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    let manager = fixture_manager();
-    let owner_a = owner_tool(directory.path(), manager.clone(), "owner-a");
-    let owner_b = owner_tool(directory.path(), manager.clone(), "owner-b");
+    let bound = fixture_bound().await;
+    let owner_a = tool_for(&bound);
+    let owner_b = owner_tool(
+        bound.cwd.path(),
+        bound.manager.clone(),
+        &ProcessOwnerId::new("owner-b"),
+    );
 
     let started = call(
         &owner_a,
@@ -637,12 +739,18 @@ async fn process_tool_owner_isolation_via_public_construction() {
         .await;
         cursor = logs.details["cursor"].as_u64().expect("cursor");
         let bytes = decode_log_bytes(&logs.details);
-        if bytes.windows(b"secret-a\n".len()).any(|window| window == b"secret-a\n") {
+        if bytes
+            .windows(b"secret-a\n".len())
+            .any(|window| window == b"secret-a\n")
+        {
             saw_secret = true;
             break;
         }
     }
-    assert!(saw_secret, "owner A never observed own process output before isolation checks");
+    assert!(
+        saw_secret,
+        "owner A never observed own process output before isolation checks"
+    );
 
     // Owner B's ps must not list A's process.
     let ps_b = call(&owner_b, json!({ "op": "ps" })).await;
@@ -654,10 +762,7 @@ async fn process_tool_owner_isolation_via_public_construction() {
 
     // Cross-owner describe/logs/send/stop must fail.
     let describe_err = call_err(&owner_b, json!({ "op": "describe", "id": id })).await;
-    assert!(
-        !describe_err.is_empty(),
-        "cross-owner describe must error"
-    );
+    assert!(!describe_err.is_empty(), "cross-owner describe must error");
 
     let logs_err = call_err(
         &owner_b,
@@ -724,20 +829,13 @@ async fn process_tool_owner_isolation_via_public_construction() {
     assert_eq!(listed_a[0]["id"], id);
 
     let ps_b_after = call(&owner_b, json!({ "op": "ps" })).await;
-    assert!(
-        ps_b_after
-            .details
-            .as_array()
-            .expect("ps array")
-            .is_empty()
-    );
+    assert!(ps_b_after.details.as_array().expect("ps array").is_empty());
 }
 
 #[tokio::test]
 async fn process_tool_send_data_base64_and_close_stdin() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    let manager = fixture_manager();
-    let tool = owner_tool(directory.path(), manager, "b64-owner");
+    let bound = fixture_bound().await;
+    let tool = tool_for(&bound);
 
     let payload = b"binary\x00payload";
     let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
@@ -766,11 +864,7 @@ async fn process_tool_send_data_base64_and_close_stdin() {
     .await;
     assert_eq!(sent.details["ok"], true);
 
-    let waited = call(
-        &tool,
-        json!({ "op": "wait", "id": id, "timeoutMs": 3000 }),
-    )
-    .await;
+    let waited = call(&tool, json!({ "op": "wait", "id": id, "timeoutMs": 3000 })).await;
     assert_eq!(waited.details["exitCode"], 0);
 
     let logs = call(
@@ -795,8 +889,8 @@ async fn process_tool_send_data_base64_and_close_stdin() {
 
 #[tokio::test]
 async fn process_tool_name_and_schema_surface() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    let tool = owner_tool(directory.path(), fixture_manager(), "schema-owner");
+    let bound = fixture_bound().await;
+    let tool = tool_for(&bound);
     assert_eq!(tool.name, "process");
     assert!(
         tool.description.to_lowercase().contains("process"),
@@ -816,4 +910,3 @@ async fn process_tool_name_and_schema_surface() {
         );
     }
 }
-

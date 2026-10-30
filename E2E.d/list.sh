@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+printf '%s\n' '[FEATURES.md inventory (one command)]'
+"$SCRIPT_DIR/features.sh" list
 printf '%s\n' '[CI deterministic]'
 "$SCRIPT_DIR/ci/campaign.sh" list
 "$SCRIPT_DIR/ci.sh" list

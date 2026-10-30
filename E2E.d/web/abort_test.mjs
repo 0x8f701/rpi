@@ -26,6 +26,64 @@ const abortedTail = process.env.RPI_ABORTED_TAIL || '-done';
 const fastReply = process.env.RPI_FAST_REPLY || 'steering-followup-reply';
 const chromePath = process.env.RPI_CHROME || '';
 const evidence = process.env.RPI_EVIDENCE || '.';
+const pageErrors = [];
+const consoleErrors = [];
+
+function parseFrame(payload) {
+  try {
+    return JSON.parse(payload);
+  } catch {
+    return null;
+  }
+}
+
+async function installSocketHarness(page) {
+  await page.addInitScript(() => {
+    const NativeWebSocket = window.WebSocket;
+    const frames = { sent: [], received: [] };
+    class TracedWebSocket extends NativeWebSocket {
+      constructor(...args) {
+        super(...args);
+        this.addEventListener('message', (event) => {
+          if (typeof event.data === 'string') frames.received.push(event.data);
+        });
+      }
+      send(data) {
+        if (typeof data === 'string') frames.sent.push(data);
+        return super.send(data);
+      }
+    }
+    for (const key of ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED']) {
+      Object.defineProperty(TracedWebSocket, key, { value: NativeWebSocket[key] });
+    }
+    window.WebSocket = TracedWebSocket;
+    window.__rpiAbortFrames = frames;
+  });
+}
+
+async function waitForFrame(page, kind, expected, label, timeoutMs = 25000) {
+  await waitFor(
+    page,
+    ({ kind: frameKind, expectedFields }) => window.__rpiAbortFrames[frameKind]
+      .map((raw) => { try { return JSON.parse(raw); } catch { return null; } })
+      .some((frame) => frame && Object.entries(expectedFields).every(([key, value]) => frame[key] === value)),
+    label,
+    timeoutMs,
+    { kind, expectedFields: expected },
+  );
+  const raw = await page.evaluate(
+    ({ kind: frameKind, expectedFields }) => window.__rpiAbortFrames[frameKind].find((candidate) => {
+      try {
+        const frame = JSON.parse(candidate);
+        return Object.entries(expectedFields).every(([key, value]) => frame[key] === value);
+      } catch {
+        return false;
+      }
+    }),
+    { kind, expectedFields: expected },
+  );
+  return parseFrame(raw);
+}
 
 function fail(message) {
   // Exit 2 (not 1): 1 means "playwright setup failure (node/chromium/npm)",
@@ -49,45 +107,67 @@ async function main() {
   const browser = await chromium.launch(launchOptions);
   try {
     const page = await browser.newPage();
+    await installSocketHarness(page);
     if (token) {
       await page.addInitScript((t) => { window.localStorage.setItem('rpi-web-token', t); }, token);
     }
-    page.on('pageerror', (err) => {
-      console.error(`web-abort: page error: ${err.message}`);
+    page.on('pageerror', (err) => pageErrors.push(err.message));
+    page.on('console', (message) => {
+      if (message.type() === 'error') consoleErrors.push(message.text());
     });
-
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await waitFor(page, () => document.title === 'rpi web', 'page title missing');
-    await waitFor(page, () => document.querySelector('#conn-state') !== null, 'conn-state missing');
-
     await waitFor(
       page,
-      () => document.getElementById('conn-state').dataset.state === 'on',
+      () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true,
       'WS did not reach "connected"'
     );
 
     // Request 1 in the steering mock is the ~3.6s slow stream.
     await page.fill('#prompt-input', 'write a very long answer');
     await page.press('#prompt-input', 'Enter');
+    const promptFrame = await waitForFrame(page, 'sent', { type: 'prompt' }, 'typed prompt frame missing');
+    if (!promptFrame.id || !promptFrame.sessionId) fail(`typed prompt identity missing: ${JSON.stringify(promptFrame)}`);
+    const promptResponse = await waitForFrame(page, 'received', { type: 'response', id: promptFrame.id }, 'typed prompt response missing');
+    if (promptResponse.success !== true || promptResponse.command !== 'prompt' || promptResponse.sessionId !== promptFrame.sessionId) {
+      fail(`typed prompt response authority mismatch: ${JSON.stringify(promptResponse)}`);
+    }
+    const turnId = promptResponse.data?.turnId;
+    if (typeof turnId !== 'string' || !turnId) fail(`typed prompt response omitted turnId: ${JSON.stringify(promptResponse)}`);
+    await waitForFrame(page, 'received', { type: 'turn_started', sessionId: promptFrame.sessionId, turnId }, 'authoritative turn_started missing');
     await waitFor(
       page,
       (prefix) => document.body.textContent.includes(prefix),
       'slow stream never started (first delta missing)',
       30000,
-      slowPrefix
+      slowPrefix,
     );
 
     // EARLY abort: the unified composer action changes to Stop as soon as the
     // first delta is visible. The next chunks arrive 0.6s apart.
     await waitFor(page, () => document.getElementById('send-btn')?.getAttribute('aria-label') === 'Stop generating', 'unified action never switched to Stop');
+    await page.screenshot({ path: `${evidence}/abort-active.png`, fullPage: true });
     await page.click('#send-btn');
+    const abortFrame = await waitForFrame(page, 'sent', { type: 'abort', sessionId: promptFrame.sessionId }, 'typed abort frame missing');
+    if (!abortFrame.id) fail(`typed abort request id missing: ${JSON.stringify(abortFrame)}`);
+    const abortResponse = await waitForFrame(page, 'received', { type: 'response', id: abortFrame.id }, 'typed abort response missing');
+    if (abortResponse.success !== true || abortResponse.command !== 'abort' || abortResponse.sessionId !== promptFrame.sessionId) {
+      fail(`typed abort response authority mismatch: ${JSON.stringify(abortResponse)}`);
+    }
+    const terminalFrame = await waitForFrame(
+      page,
+      'received',
+      { type: 'turn_terminal', sessionId: promptFrame.sessionId, turnId, status: 'aborted' },
+      'authoritative aborted turn_terminal missing',
+    );
+    if (terminalFrame.message !== null && typeof terminalFrame.message !== 'string') {
+      fail(`turn_terminal message shape invalid: ${JSON.stringify(terminalFrame)}`);
+    }
     await waitFor(
       page,
-      () => document.getElementById('stream-badge').hidden === true,
-      'streaming badge did not clear after abort'
+      () => document.getElementById('send-btn')?.getAttribute('aria-label') === 'Send message',
+      'composer did not return to Send after abort',
     );
-
-    // B1: the streamed text survived the abort; the final chunks did not.
     const preserved = await page.evaluate(() => {
       const nodes = document.querySelectorAll('.msg--assistant .assistant-text');
       return nodes.length ? nodes[nodes.length - 1].textContent : '';
@@ -130,7 +210,11 @@ async function main() {
       fastReply
     );
 
-    console.log('web-abort: PASSED (early-abort preserves text + neutral toast + recovery)');
+    if (pageErrors.length || consoleErrors.length) {
+      fail(`browser errors: ${JSON.stringify({ pageErrors, consoleErrors })}`);
+    }
+    await page.screenshot({ path: `${evidence}/abort-recovered.png`, fullPage: true });
+    console.log(`web-abort: PASSED (prompt=${promptFrame.id} turn=${turnId} abort=${abortFrame.id}; early-abort preserves text + neutral toast + recovery)`);
   } finally {
     await browser.close().catch(() => {});
   }

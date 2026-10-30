@@ -5,7 +5,7 @@ TUI themes and keybindings are implemented in this release.
 ## Custom theme
 
 Create `$PI_CODING_AGENT_DIR/themes/solarized.json` or
-`$CWD/.pi/themes/solarized.json`:
+`$CWD/.rpi/themes/solarized.json`:
 
 ```json
 {
@@ -33,7 +33,7 @@ in `settings.json`.
 
 ## Custom keybindings
 
-Create `$PI_CODING_AGENT_DIR/keybindings.json` or `$CWD/.pi/keybindings.json`:
+Create `$PI_CODING_AGENT_DIR/keybindings.json` or `$CWD/.rpi/keybindings.json`:
 
 ```json
 {

@@ -26,10 +26,14 @@ pub(crate) struct JobRetention {
 impl JobRetention {
     pub(crate) fn validate(self) -> Result<Self> {
         if self.max_settled == 0 {
-            return Err(anyhow!("orchestration retained job limit must be greater than zero"));
+            return Err(anyhow!(
+                "orchestration retained job limit must be greater than zero"
+            ));
         }
         if self.ttl.is_zero() {
-            return Err(anyhow!("orchestration retained job TTL must be greater than zero"));
+            return Err(anyhow!(
+                "orchestration retained job TTL must be greater than zero"
+            ));
         }
         Ok(self)
     }
@@ -39,7 +43,6 @@ pub(crate) struct PruneCandidate {
     pub(crate) job_id: String,
     pub(crate) agent_id: String,
 }
-
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -120,14 +123,18 @@ pub(crate) struct PreparedJobCancellation {
     cancelled: Vec<String>,
     tokens: Vec<CancellationToken>,
     snapshots: Vec<JobSnapshot>,
+    error: String,
 }
 
 impl PreparedJobCancellation {
     pub(crate) fn take_snapshots(&mut self) -> Vec<JobSnapshot> {
         std::mem::take(&mut self.snapshots)
     }
-}
 
+    pub(crate) fn cancelled_ids(&self) -> &[String] {
+        &self.cancelled
+    }
+}
 
 pub(crate) struct JobManager {
     records: Mutex<HashMap<String, JobRecord>>,
@@ -186,11 +193,11 @@ impl JobManager {
         self.changed.notify_waiters();
     }
 
-
     pub(crate) fn contains_identifier(&self, id: &str) -> bool {
-        self.records.lock().values().any(|record| {
-            record.snapshot.id == id || record.snapshot.agent_id == id
-        })
+        self.records
+            .lock()
+            .values()
+            .any(|record| record.snapshot.id == id || record.snapshot.agent_id == id)
     }
 
     /// Resolve a job id or agent id accepted by job APIs to the canonical agent id.
@@ -219,16 +226,35 @@ impl JobManager {
         }
     }
 
-
-    pub(crate) fn insert(&self, snapshot: JobSnapshot, cancel: CancellationToken) -> Result<JobSnapshot> {
+    pub(crate) fn insert(
+        &self,
+        snapshot: JobSnapshot,
+        cancel: CancellationToken,
+    ) -> Result<JobSnapshot> {
         let mut records = self.records.lock();
         if records.contains_key(&snapshot.id) {
-            return Err(anyhow!("orchestration job id {:?} already exists", snapshot.id));
+            return Err(anyhow!(
+                "orchestration job id {:?} already exists",
+                snapshot.id
+            ));
         }
-        records.insert(snapshot.id.clone(), JobRecord { snapshot: snapshot.clone(), cancel });
+        records.insert(
+            snapshot.id.clone(),
+            JobRecord {
+                snapshot: snapshot.clone(),
+                cancel,
+            },
+        );
         drop(records);
         self.changed.notify_waiters();
         Ok(snapshot)
+    }
+
+    pub(crate) fn cancellation_token(&self, id: &str) -> Option<CancellationToken> {
+        self.records
+            .lock()
+            .get(id)
+            .map(|record| record.cancel.clone())
     }
 
     pub(crate) fn mark_running(&self, id: &str, timestamp: u64) -> Option<JobSnapshot> {
@@ -253,6 +279,9 @@ impl JobManager {
     ) -> Option<JobSnapshot> {
         let mut records = self.records.lock();
         let record = records.get_mut(id)?;
+        if record.snapshot.status.is_settled() {
+            return None;
+        }
         record.snapshot.status = if result.status == super::AgentStatus::Aborted {
             JobStatus::Cancelled
         } else if result.error.is_some() {
@@ -285,7 +314,12 @@ impl JobManager {
 
     pub(crate) fn prune_candidates(&self) -> Vec<PruneCandidate> {
         let now = (self.clock)();
-        let ttl_ms = self.retention.ttl.as_millis().try_into().unwrap_or(u64::MAX);
+        let ttl_ms = self
+            .retention
+            .ttl
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
         let records = self.records.lock();
         let mut settled = records
             .iter()
@@ -293,15 +327,20 @@ impl JobManager {
                 record.snapshot.status.is_settled().then_some((
                     id.clone(),
                     record.snapshot.agent_id.clone(),
-                    record.snapshot.finished_at.unwrap_or(record.snapshot.created_at),
+                    record
+                        .snapshot
+                        .finished_at
+                        .unwrap_or(record.snapshot.created_at),
                 ))
             })
             .collect::<Vec<_>>();
-        settled.sort_by(|(left_id, _, left_finished), (right_id, _, right_finished)| {
-            left_finished
-                .cmp(right_finished)
-                .then_with(|| left_id.cmp(right_id))
-        });
+        settled.sort_by(
+            |(left_id, _, left_finished), (right_id, _, right_finished)| {
+                left_finished
+                    .cmp(right_finished)
+                    .then_with(|| left_id.cmp(right_id))
+            },
+        );
         let over_limit = settled.len().saturating_sub(self.retention.max_settled);
         settled
             .into_iter()
@@ -374,7 +413,12 @@ impl JobManager {
         snapshots
     }
 
-    pub(crate) fn prepare_cancellation(&self, ids: &[String]) -> PreparedJobCancellation {
+    pub(crate) fn prepare_cancellation(
+        &self,
+        ids: &[String],
+        error: impl Into<String>,
+    ) -> PreparedJobCancellation {
+        let error = error.into();
         let records = self.records.lock();
         let mut cancelled = Vec::new();
         let mut tokens = Vec::new();
@@ -391,13 +435,16 @@ impl JobManager {
             }
         }
         cancelled.sort();
+        let timestamp = (self.clock)();
         let mut snapshots = records
             .values()
             .map(|record| {
                 let mut snapshot = record.snapshot.clone();
                 if seen.contains(&snapshot.id) {
                     snapshot.status = JobStatus::Cancelled;
-                    snapshot.finished_at = Some((self.clock)());
+                    snapshot.finished_at = Some(timestamp);
+                    snapshot.soft_budget_exhausted = false;
+                    snapshot.result = Some(cancelled_result(&snapshot, &error));
                 }
                 snapshot
             })
@@ -411,17 +458,16 @@ impl JobManager {
             cancelled,
             tokens,
             snapshots,
+            error,
         }
     }
 
-    pub(crate) fn commit_cancellation(
-        &self,
-        prepared: PreparedJobCancellation,
-    ) -> Vec<String> {
+    pub(crate) fn commit_cancellation(&self, prepared: PreparedJobCancellation) -> Vec<String> {
         let PreparedJobCancellation {
             cancelled,
             tokens,
             snapshots,
+            error,
         } = prepared;
         debug_assert!(snapshots.is_empty());
         let cancelled_ids = cancelled.iter().map(String::as_str).collect::<HashSet<_>>();
@@ -433,6 +479,8 @@ impl JobManager {
             {
                 record.snapshot.status = JobStatus::Cancelled;
                 record.snapshot.finished_at = Some(timestamp);
+                record.snapshot.soft_budget_exhausted = false;
+                record.snapshot.result = Some(cancelled_result(&record.snapshot, &error));
             }
         }
         for token in tokens {
@@ -462,6 +510,11 @@ impl JobManager {
         cancelled
     }
 
+    /// A wait resolves only when EVERY requested job is terminal. A parent
+    /// waiting on several children must never observe a partially settled
+    /// batch — otherwise the parent turn could conclude (the outer Task
+    /// projecting Done) while a delegated child job is still Running/Queued.
+    /// Single-id waits keep their exact prior behavior.
     pub(crate) async fn wait(
         &self,
         ids: &[String],
@@ -474,7 +527,12 @@ impl JobManager {
             loop {
                 let changed = self.changed.notified();
                 let snapshots = self.snapshots(Some(ids));
-                if snapshots.iter().any(|snapshot| snapshot.status.is_settled()) {
+                if ids.iter().all(|id| {
+                    snapshots.iter().any(|snapshot| {
+                        (snapshot.id == *id || snapshot.agent_id == *id)
+                            && snapshot.status.is_settled()
+                    })
+                }) {
                     return snapshots;
                 }
                 changed.await;
@@ -547,13 +605,30 @@ impl JobManager {
         }
         let records = self.records.lock();
         if let Some(id) = ids.iter().find(|id| {
-            !records.values().any(|record| {
-                record.snapshot.id == **id || record.snapshot.agent_id == **id
-            })
+            !records
+                .values()
+                .any(|record| record.snapshot.id == **id || record.snapshot.agent_id == **id)
         }) {
             return Err(anyhow!("unknown orchestration job or agent id {id:?}"));
         }
         Ok(())
+    }
+}
+
+fn cancelled_result(snapshot: &JobSnapshot, error: &str) -> TaskResult {
+    TaskResult {
+        index: 0,
+        id: snapshot.agent_id.clone(),
+        agent: snapshot.agent.clone(),
+        status: super::AgentStatus::Aborted,
+        output: String::new(),
+        usage: pi_ai::Usage::default(),
+        soft_budget_exhausted: false,
+        error: Some(error.to_owned()),
+        structured_output: None,
+        artifact_ref: format!("agent://{}", snapshot.agent_id),
+        history_ref: format!("history://{}", snapshot.agent_id),
+        artifact_uri: format!("artifact://{}", snapshot.agent_id),
     }
 }
 
@@ -587,10 +662,7 @@ mod tests {
             .expect("insert");
 
         assert_eq!(jobs.resolve_agent_id("job-a").expect("job uuid"), "Worker");
-        assert_eq!(
-            jobs.resolve_agent_id("Worker").expect("agent id"),
-            "Worker"
-        );
+        assert_eq!(jobs.resolve_agent_id("Worker").expect("agent id"), "Worker");
     }
 
     #[test]
@@ -650,13 +722,30 @@ mod tests {
         let finished = jobs
             .finish("job-budget", task_result(true), 2)
             .expect("finish with soft budget");
-        assert!(finished.soft_budget_exhausted, "snapshot must carry the marker");
-        assert_eq!(finished.status, JobStatus::Completed, "soft budget must not fail the job");
+        assert!(
+            finished.soft_budget_exhausted,
+            "snapshot must carry the marker"
+        );
+        assert_eq!(
+            finished.status,
+            JobStatus::Completed,
+            "soft budget must not fail the job"
+        );
         assert_eq!(finished.finished_at, Some(2));
-        assert!(finished.result.is_some_and(|result| result.soft_budget_exhausted));
+        assert!(
+            finished
+                .result
+                .is_some_and(|result| result.soft_budget_exhausted)
+        );
 
+        assert!(
+            jobs.finish("job-budget", task_result(false), 3).is_none(),
+            "a settled job must not be overwritten by a later result",
+        );
+        jobs.insert(snapshot("job-plain", "Worker"), CancellationToken::new())
+            .expect("insert plain job");
         let plain = jobs
-            .finish("job-budget", task_result(false), 3)
+            .finish("job-plain", task_result(false), 3)
             .expect("finish without soft budget");
         assert!(!plain.soft_budget_exhausted);
         assert_eq!(plain.status, JobStatus::Completed);

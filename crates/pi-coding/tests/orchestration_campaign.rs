@@ -17,8 +17,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use pi_agent::{AbortController, AgentTool, ThinkingLevel, ToolCallContext};
-use pi_ai::{ContentBlock, Context, Message, Model, StopReason, ToolCall};
+use pi_agent::{AbortController, AgentTool, AgentToolResult, ThinkingLevel, ToolCallContext};
+use pi_ai::{ContentBlock, Context, Message, Model, Schema, StopReason, ToolCall};
 use pi_coding::{
     AgentCatalog, AgentDefinition, AgentDefinitionSource, AgentRuntimeSettings, AgentStatus,
     ChildSessionFactory, JobSnapshot, JobStatus, OrchestrationConfig, OrchestrationRuntime,
@@ -50,23 +50,31 @@ fn agent(
     tools: &[&str],
     autoload_skills: &[&str],
 ) -> AgentDefinition {
-    AgentDefinition { name: name.to_owned(),
-    description: description.to_owned(),
-    system_prompt: prompt.to_owned(),
-    tools: Some(tools.iter().map(|tool| (*tool).to_owned()).collect()),
-    autoload_skills: autoload_skills
-        .iter()
-        .map(|skill| (*skill).to_owned())
-        .collect(),
-    model: None,
-    thinking_level: Some(ThinkingLevel::Off),
-    max_turns: None,
-    max_tool_calls: None,
-    timeout_secs: None,
-    disallowed_tools: Vec::new(),
-    capability_ceiling: None,
-    source: AgentDefinitionSource::User,
-    path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None }
+    AgentDefinition {
+        name: name.to_owned(),
+        description: description.to_owned(),
+        system_prompt: prompt.to_owned(),
+        tools: Some(tools.iter().map(|tool| (*tool).to_owned()).collect()),
+        autoload_skills: autoload_skills
+            .iter()
+            .map(|skill| (*skill).to_owned())
+            .collect(),
+        model: None,
+        thinking_level: Some(ThinkingLevel::Off),
+        max_turns: None,
+        max_tool_calls: None,
+        timeout_secs: None,
+        disallowed_tools: Vec::new(),
+        capability_ceiling: None,
+        source: AgentDefinitionSource::User,
+        path: None,
+        trusted: true,
+        kind: pi_coding::AgentDefinitionKind::Agent,
+        personality: None,
+        soft_budget: None,
+        knowledge_roots: Vec::new(),
+        user_proxy: false,
+    }
 }
 
 fn skill(root: &Path, name: &str, description: &str, body: &str) -> OrchestrationSkill {
@@ -88,6 +96,8 @@ fn skill(root: &Path, name: &str, description: &str, body: &str) -> Orchestratio
         hidden: false,
         disable_model_invocation: false,
         source: SkillSource::User,
+        managed_project_boundary: None,
+        managed_root: Some(root.join("skills")),
         trusted: true,
     }
 }
@@ -117,6 +127,7 @@ fn context(id: &str, arguments: Value) -> ToolCallContext {
         on_update: Arc::new(|_| {}),
         abort,
         model: None,
+        approval_token: None,
     }
 }
 
@@ -155,6 +166,51 @@ fn guidance_hits(context: &Context) -> usize {
         .into_iter()
         .filter(|text| text.contains(GUIDANCE_TOKEN))
         .count()
+}
+fn campaign_write_tool(workspace: PathBuf) -> AgentTool {
+    AgentTool::new(
+        "write",
+        "Write campaign fixture content inside its workspace.",
+        Schema::object_ordered(vec![
+            ("path".to_owned(), Schema::string(), true),
+            ("content".to_owned(), Schema::string(), true),
+        ]),
+        move |context| {
+            let workspace = workspace.clone();
+            async move {
+                let relative = context
+                    .arguments
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("write path is required"))?;
+                let relative = Path::new(relative);
+                if relative.is_absolute()
+                    || relative
+                        .components()
+                        .any(|component| matches!(component, std::path::Component::ParentDir))
+                {
+                    return Err(anyhow::anyhow!(
+                        "campaign write path must stay inside the workspace"
+                    ));
+                }
+                let content = context
+                    .arguments
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("write content is required"))?;
+                let path = workspace.join(relative);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&path, content)?;
+                Ok(AgentToolResult::text(format!(
+                    "Wrote {} bytes",
+                    content.len()
+                )))
+            }
+        },
+    )
+    .with_capability(pi_agent::ToolCapability::Write)
 }
 
 struct CampaignFactory {
@@ -204,15 +260,16 @@ impl CampaignFactory {
                     Some(names) => names
                         .iter()
                         .filter(|name| {
-                            !matches!(
-                                name.as_str(),
-                                "todo" | "process" | "task" | "hub" | "goal"
-                            )
+                            !matches!(name.as_str(), "todo" | "process" | "task" | "hub" | "goal")
                         })
                         .map(|name| {
-                            pi_coding::create_tool(name, &cwd).unwrap_or_else(|error| {
-                                panic!("create tool {name} for {child_id}: {error}")
-                            })
+                            if name == "write" {
+                                campaign_write_tool(workspace.clone())
+                            } else {
+                                pi_coding::create_tool(name, &cwd).unwrap_or_else(|error| {
+                                    panic!("create tool {name} for {child_id}: {error}")
+                                })
+                            }
                         })
                         .collect::<Vec<_>>(),
                     None => pi_coding::create_coding_tools(&cwd),
@@ -339,18 +396,14 @@ impl CampaignFactory {
                     after_tool_call: None,
                     stream_fn: Some(stream_fn),
                     auth_resolver: None,
+                    auth_manager: None,
                 })
             })
         })
     }
 }
 
-async fn wait_for_count(
-    count: &AtomicUsize,
-    notify: &Notify,
-    expected: usize,
-    description: &str,
-) {
+async fn wait_for_count(count: &AtomicUsize, notify: &Notify, expected: usize, description: &str) {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let notified = notify.notified();
@@ -664,7 +717,10 @@ async fn orchestration_campaign_selector_steer_cancel_and_isolation() {
 
     assert_eq!(spawns[0].agent_id, "Scribe");
     assert_eq!(spawns[1].agent_id, "Scribe_2");
-    assert_eq!(spawns[0].agent, "reviewer", "NL security text selects reviewer");
+    assert_eq!(
+        spawns[0].agent, "reviewer",
+        "NL security text selects reviewer"
+    );
     assert_eq!(spawns[1].agent, "writer");
     assert!(spawns.iter().all(|spawn| spawn.status == JobStatus::Queued));
     assert!(spawns.iter().all(|spawn| !spawn.job_id.is_empty()));
@@ -685,7 +741,13 @@ async fn orchestration_campaign_selector_steer_cancel_and_isolation() {
     )
     .await;
     wait_for_count(&hang_running, &hang_started, 1, "hanging sibling running").await;
-    wait_for_job_status(&runtime, &steered_job, JobStatus::Running, "steered running").await;
+    wait_for_job_status(
+        &runtime,
+        &steered_job,
+        JobStatus::Running,
+        "steered running",
+    )
+    .await;
     wait_for_job_status(&runtime, &hang_job, JobStatus::Running, "hang running").await;
 
     let jobs_snapshot = (hub.execute)(context("jobs-running", json!({ "op": "jobs" })))
@@ -744,9 +806,7 @@ async fn orchestration_campaign_selector_steer_cancel_and_isolation() {
     ))
     .await
     .expect("hub send by job uuid");
-    let receipts = send.details["receipts"]
-        .as_array()
-        .expect("receipts array");
+    let receipts = send.details["receipts"].as_array().expect("receipts array");
     assert_eq!(receipts.len(), 1);
     assert_eq!(receipts[0]["to"], steered_agent);
     assert_eq!(receipts[0]["requested"], steered_job);
@@ -760,19 +820,30 @@ async fn orchestration_campaign_selector_steer_cancel_and_isolation() {
     // draining the canonical mailbox; poll until it does, matching the post-ack
     // inbox-empty check in `running_child_observes_mid_run_steering_exactly_once`.
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !runtime.inbox(&steered_agent, true).is_empty() {
+        while !runtime
+            .inbox(&steered_agent, true)
+            .expect("inbox")
+            .is_empty()
+        {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("steered delivery must drain the canonical mailbox after ack");
     assert!(
-        runtime.inbox(&steered_agent, true).is_empty(),
+        runtime
+            .inbox(&steered_agent, true)
+            .expect("inbox")
+            .is_empty(),
         "active steered delivery must not leave a canonical mailbox duplicate"
     );
+    let job_inbox_error = runtime
+        .inbox(&steered_job, true)
+        .expect_err("job uuid is not an agent mailbox");
     assert!(
-        runtime.inbox(&steered_job, true).is_empty(),
-        "job uuid must not be a separate mailbox"
+        job_inbox_error
+            .to_string()
+            .contains("unknown orchestration agent")
     );
 
     release_steered_first.cancel();
@@ -803,7 +874,10 @@ async fn orchestration_campaign_selector_steer_cancel_and_isolation() {
     assert!(steered_result.error.is_none(), "{:?}", steered_result.error);
     assert_eq!(
         steered_result.output,
-        format!("guidance applied exactly once\n\n{}", pi_coding::MISSING_YIELD_WARNING)
+        format!(
+            "guidance applied exactly once\n\n{}",
+            pi_coding::MISSING_YIELD_WARNING
+        )
     );
     assert_eq!(
         guidance_write_calls.load(Ordering::SeqCst),
@@ -824,7 +898,11 @@ async fn orchestration_campaign_selector_steer_cancel_and_isolation() {
     let artifact_bytes = std::fs::read(&result_artifact).expect("read result artifact");
     assert_eq!(
         artifact_bytes,
-        format!("guidance applied exactly once\n\n{}", pi_coding::MISSING_YIELD_WARNING).as_bytes(),
+        format!(
+            "guidance applied exactly once\n\n{}",
+            pi_coding::MISSING_YIELD_WARNING
+        )
+        .as_bytes(),
         "settled artifact body must match final output"
     );
 
@@ -909,8 +987,19 @@ async fn orchestration_campaign_selector_steer_cancel_and_isolation() {
     assert_eq!(by_id(&steered_job).status, JobStatus::Completed);
     assert_eq!(by_id(&hang_job).status, JobStatus::Cancelled);
 
-    assert!(runtime.inbox(&steered_agent, true).is_empty());
-    assert!(runtime.inbox(&steered_job, true).is_empty());
+    assert!(
+        runtime
+            .inbox(&steered_agent, true)
+            .expect("inbox")
+            .is_empty()
+    );
+    assert!(
+        runtime
+            .inbox(&steered_job, true)
+            .expect_err("retained job uuid is not an agent mailbox")
+            .to_string()
+            .contains("unknown orchestration agent")
+    );
 
     assert_eq!(
         std::fs::read(&marker_path).expect("final marker"),

@@ -3,7 +3,7 @@ members = ["crates/pi-ai", "crates/pi-agent", "crates/pi-coding", "crates/pi-cli
 resolver = "2"
 
 [workspace.package]
-version = "0.2.11"
+version = "1.0.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.88"
@@ -24,6 +24,7 @@ similar = "3.1"
 # Linux Codex sandbox library primitives: bubblewrap policy planning and
 # seccomp/no-new-privileges enforcement. Apache-2.0/BSD-3-Clause; no helper C.
 libc = "0.2"
+mdns-sd = "0.11"
 seccompiler = "0.5"
 globset = "0.4"
 # Plugin marketplace tarball installs (`rpi plugin install <source>.tgz`).
@@ -34,7 +35,10 @@ pi-ai = { path = "crates/pi-ai" }
 pi-agent = { path = "crates/pi-agent" }
 pi-coding = { path = "crates/pi-coding" }
 pi-sandbox = { path = "crates/pi-sandbox" }
+arc-swap = "1"
 nix = { version = "0.29", default-features = false, features = ["signal", "process", "term", "resource", "poll"] }
+rustix = { version = "0.38.44", features = ["fs"] }
+syn = { version = "2", features = ["full", "visit"] }
 # Self-signed certificate generation for --listen HTTPS when no real
 # certificate pair is configured. Default features use the ring backend
 # (already in the tree via rustls).
@@ -53,7 +57,7 @@ rustls-pemfile = "2"
 semver = "1.0"
 sha2 = "0.10"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["raw_value"] }
 # TOML settings files (`settings.toml`) for Grok-config parity: parse (and,
 # when the settings file is TOML, serialize) via the toml data model.
 toml = "0.9"
@@ -82,6 +86,12 @@ ast-grep-language = { version = "0.45", default-features = false, features = [
 ] }
 uuid = { version = "1.16", features = ["serde", "v4", "v7"] }
 walkdir = "2.5"
+# Cross-platform settings-file watch (inotify / kqueue / ReadDirectoryChanges).
+notify = "8.0"
+# Cross-agent session parse/convert (Pi/OMP/Codex/Claude/Grok/Hyper/Droid/Rpi).
+# Replaces rpi's lossy first-text import. Not on crates.io; pin the published tag.
+# We consume domain/formats/emit only; the al CLI is unused (cli feature off).
+agent-loader = { git = "https://github.com/0x8f701/agent-loader", tag = "v0.7.0", default-features = false }
 # In-process QuickJS extension runtime (rquickjs, MIT). QuickJS-NG C sources are
 # vendored inside rquickjs-sys and compiled via `cc` at build time. The `futures`
 # feature provides AsyncRuntime/AsyncContext; `loader` provides set_loader for
@@ -108,6 +118,9 @@ cpal = { version = "0.15", default-features = false }
 # bash tool executes commands in-process via brush_core::Shell instead of a
 # /bin/bash subprocess (sandboxed invocations keep the subprocess path).
 brush-core = "0.5"
+# Terminal pairing QR at --listen startup (unicode blocks). MIT/ISC, pure Rust,
+# zero transitive deps beyond optional features — no new download surface.
+qrcode = { version = "0.14", default-features = false }
 
 [profile.release-dist]
 inherits = "release"

@@ -51,22 +51,22 @@ const evidence = process.env.RPI_EVIDENCE || '.';
 // as the sessions/scroll/projects lanes, so the assertions enter the existing
 // coverage counting/reporting. The matrix fails when any named contract did
 // not execute and when any executed ID is not declared in the matrix.
+// The documented contract this lane must execute EXACTLY once — IN THE
+// ACTUAL ASSERTION-SITE (runtime) ORDER (the matrix requires the published
+// executed array to equal the documented array in order): the composer
+// picker phase, the /ps block interleaved with the loop/goal composer
+// checks, the loop lifecycle, the goal lifecycle, and the closing
+// hygiene/routing probes — exactly as the record() sites execute.
 const DOCUMENTED_IDS = [
   'lg.picker-lists-loop-goal',
+  'lg.ps-picker-listed',
   'lg.loop-draft-no-submit',
   'lg.goal-draft-no-submit',
-  'lg.goal-panel-open',
-  'lg.ps-picker-listed',
   'lg.ps-draft-no-submit',
   'lg.ps-empty-list',
-  'lg.ps-args-local-reject',
-  'lg.ps-session-routed',
+  'lg.goal-panel-open',
   'lg.loop-create',
   'lg.loop-streaming-guard',
-  'lg.loop-list',
-  'lg.loop-update',
-  'lg.loop-delete',
-  'lg.loop-cancel-error',
   'lg.goal-create-activate',
   'lg.goal-show',
   'lg.goal-pin',
@@ -75,15 +75,21 @@ const DOCUMENTED_IDS = [
   'lg.goal-resume-activate',
   'lg.goal-complete',
   'lg.goal-drop-error',
-  'lg.usage-error-no-rpc',
+  'lg.loop-list',
+  'lg.loop-update',
+  'lg.loop-delete',
+  'lg.loop-cancel-error',
+  'lg.ps-args-local-reject',
   'lg.draft-preserved-on-error',
   'lg.alias-no-prompt',
+  'lg.usage-error-no-rpc',
   'lg.no-user-bubbles',
   'lg.session-routed',
+  'lg.ps-session-routed',
 ];
-const executed = new Set();
+const executed = new Map(); // id -> exact execution count (per-ID ledger, no Set erasure)
 function record(id) {
-  executed.add(id);
+  executed.set(id, (executed.get(id) || 0) + 1);
 }
 
 function fail(message) {
@@ -123,11 +129,31 @@ async function waitForSummary(page, startIndex, matches, label, timeoutMs = 2500
     toasts: Array.from(document.querySelectorAll('#toasts .toast')).map((el) => el.textContent || ''),
     users: Array.from(document.querySelectorAll('.msg--user')).map((el) => (el.textContent || '').slice(0, 120)),
     assistants: Array.from(document.querySelectorAll('.msg--assistant')).map((el) => (el.textContent || '').slice(0, 120)),
+    composer: document.getElementById('prompt-input')?.value || '',
+    sendAria: document.getElementById('send-btn')?.getAttribute('aria-label') || '',
   }));
   const frameTypes = sentFrames
     .map((payload) => { try { const frame = JSON.parse(payload); return typeof frame.type === 'string' ? frame.type : '?'; } catch { return null; } })
     .filter(Boolean);
-  fail(`${label}: no new summary bubble matching ${matches} (summaries=${JSON.stringify(dump.summaries)} toasts=${JSON.stringify(dump.toasts)} users=${JSON.stringify(dump.users)} assistants=${JSON.stringify(dump.assistants)} frames=${JSON.stringify(frameTypes)})`);
+  fail(`${label}: no new summary bubble matching ${matches} (summaries=${JSON.stringify(dump.summaries)} toasts=${JSON.stringify(dump.toasts)} users=${JSON.stringify(dump.users)} assistants=${JSON.stringify(dump.assistants)} composer=${JSON.stringify(dump.composer)} sendAria=${JSON.stringify(dump.sendAria)} frames=${JSON.stringify(frameTypes)})`);
+}
+
+async function waitForIdle(page, label, timeoutMs = 25000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const idle = await page.evaluate(
+      () => document.getElementById('send-btn')?.getAttribute('aria-label') === 'Send message',
+    );
+    if (idle) return;
+    await sleep(100);
+  }
+  const dump = await page.evaluate(() => ({
+    sendAria: document.getElementById('send-btn')?.getAttribute('aria-label') || '',
+    composer: document.getElementById('prompt-input')?.value || '',
+    strip: document.getElementById('activity-strip')?.textContent || '',
+  }));
+  const inbound = inboundTypes.slice(-80);
+  fail(`${label} (timeout ${timeoutMs}ms) sendAria=${JSON.stringify(dump.sendAria)} composer=${JSON.stringify(dump.composer)} strip=${JSON.stringify(dump.strip)} inbound=${JSON.stringify(inbound)}`);
 }
 
 /** Poll the transcript for ANY assistant/user text containing `substr`
@@ -244,6 +270,7 @@ function commandFrameCount() {
 }
 
 let sentFrames = [];
+let inboundTypes = [];
 
 async function main() {
   if (!url) fail('RPI_URL is required');
@@ -265,14 +292,23 @@ async function main() {
         if (!payload) return;
         sentFrames.push(payload);
       });
+      ws.on('framereceived', (frame) => {
+        const payload = typeof frame.payload === 'string' ? frame.payload : '';
+        if (!payload) return;
+        try {
+          const parsed = JSON.parse(payload);
+          if (parsed && typeof parsed.type === 'string') inboundTypes.push(parsed.type);
+        } catch {
+          inboundTypes.push('?');
+        }
+      });
     });
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await waitFor(page, () => document.title === 'rpi web', 'page title missing');
-    await waitFor(page, () => document.getElementById('conn-state') !== null, 'conn-state missing');
     await waitFor(
       page,
-      () => document.getElementById('conn-state').dataset.state === 'on',
+      () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true,
       'WS did not reach "connected"'
     );
 
@@ -497,10 +533,11 @@ async function main() {
     // Both goal-work turns must finish: the create's work replies instantly
     // ("steering-followup-reply") and the resume's work streams slowly
     // (a second "chunk-four-done"). With a 1h cadence no further loop fires
-    // occur, so the session is idle and update is allowed again.
+    // occur. Transcript tails can land before turn_terminal; wait for the
+    // Send control so /loop update is not locally rejected with no RPC.
     await waitForTranscriptCount(page, 'chunk-four-done', 2, 'goal work stream completed');
     await waitForTranscriptText(page, 'steering-followup-reply', 'goal work turn completed');
-    await sleep(700);
+    await waitForIdle(page, 'session not idle after goal work (send-btn still Stop)');
     const listed = await runCommand(page, '/loop list', `${loopId}  every 1 hour`, 'loop list bubble');
     if (!listed.includes('e2e loop probe')) fail(`loop list bubble missing prompt (text=${JSON.stringify(listed)})`);
     record('lg.loop-list');
@@ -638,10 +675,27 @@ async function main() {
     if (missingContracts.length > 0) {
       fail(`documented contracts never executed: ${missingContracts.join(', ')}`);
     }
+    const overExecuted = [...executed.keys()].filter((id) => !DOCUMENTED_IDS.includes(id));
+    if (overExecuted.length > 0) {
+      fail(`executed-but-undocumented contract ids: ${overExecuted.join(', ')}`);
+    }
+    const repeatedIds = [...executed].filter(([, count]) => count !== 1).map(([id]) => id);
+    if (repeatedIds.length > 0) {
+      fail(`exact-once violation (duplicate execution): ${repeatedIds.join(', ')}`);
+    }
     fs.mkdirSync(evidence, { recursive: true });
     fs.writeFileSync(
       path.join(evidence, 'coverage-assertions.json'),
-      JSON.stringify({ executed: [...executed] }, null, 2),
+      JSON.stringify({
+        documented: [...DOCUMENTED_IDS],
+        // The REAL ledger: executed is the Map's insertion order (actual
+        // execution order — never a reconstruction of DOCUMENTED_IDS);
+        // counts the real per-ID ledger. The gate above proved documented ==
+        // executed as exact-once sets; the matrix's ordered gate additionally
+        // proves the runtime order matches the documented order.
+        executed: [...executed.keys()],
+        counts: Object.fromEntries(executed),
+      }, null, 2),
     );
     console.log(`web-loop-goal: PASSED (${executed.size}/${DOCUMENTED_IDS.length} assertions) — evidence at ${path.join(evidence, 'coverage-assertions.json')}`);
   } finally {

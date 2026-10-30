@@ -4,7 +4,7 @@
 //! Also hosts the line-ending helpers (`normalize_to_lf`, `detect_line_ending`,
 //! `restore_line_endings`) used by the edit tool.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use unicode_normalization::UnicodeNormalization;
 
 /// A single `oldText` → `newText` replacement.
@@ -21,7 +21,11 @@ pub(crate) struct EditEntry {
 fn is_js_whitespace(r: char) -> bool {
     matches!(
         r,
-        '\t' | '\n' | '\u{000B}' | '\u{000C}' | '\r' | ' '
+        '\t' | '\n'
+            | '\u{000B}'
+            | '\u{000C}'
+            | '\r'
+            | ' '
             | '\u{00A0}'
             | '\u{FEFF}'
             | '\u{2028}'
@@ -207,7 +211,8 @@ fn get_replacement_line_range(lines: &[LineSpan], m: &MatchedEdit) -> Result<(us
             break;
         }
     }
-    let start_line = start_line.ok_or_else(|| anyhow!("Replacement range is outside the base content."))?;
+    let start_line =
+        start_line.ok_or_else(|| anyhow!("Replacement range is outside the base content."))?;
     let mut end_line = start_line;
     while end_line < lines.len() && lines[end_line].end < rep_end {
         end_line += 1;
@@ -369,7 +374,11 @@ pub(crate) fn apply_edits_to_normalized_content(
 
     let base = normalized_content.to_string();
     let result = if any_fuzzy {
-        apply_replacements_preserving_unchanged_lines(normalized_content, &replacement_base, &matched)?
+        apply_replacements_preserving_unchanged_lines(
+            normalized_content,
+            &replacement_base,
+            &matched,
+        )?
     } else {
         apply_replacements(&replacement_base, &matched, 0)
     };
@@ -464,12 +473,9 @@ mod tests {
     #[test]
     fn apply_multiple_disjoint_edits() {
         let content = "a\nb\nc\nd\n";
-        let (base, result) = apply_edits_to_normalized_content(
-            content,
-            &[edit("a", "A"), edit("c", "C")],
-            "f.rs",
-        )
-        .unwrap();
+        let (base, result) =
+            apply_edits_to_normalized_content(content, &[edit("a", "A"), edit("c", "C")], "f.rs")
+                .unwrap();
         assert_eq!(base, content);
         assert_eq!(result, "A\nb\nC\nd\n");
     }
@@ -518,10 +524,9 @@ mod tests {
     #[test]
     fn no_change_rejected() {
         let content = "same\n";
-        let err =
-            apply_edits_to_normalized_content(content, &[edit("same", "same")], "f.rs")
-                .unwrap_err()
-                .to_string();
+        let err = apply_edits_to_normalized_content(content, &[edit("same", "same")], "f.rs")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("No changes"));
     }
 

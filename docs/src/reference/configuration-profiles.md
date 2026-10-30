@@ -1,147 +1,35 @@
 # Configuration profiles, TOML settings, and scoped auth
 
-This page covers the configuration surfaces beyond plain `settings.json`:
-config profiles, TOML settings files, environment expansion inside settings,
-scoped credentials, and opt-in stateful Responses chaining.
+Profiles separate configuration bases. Credential scopes select credentials within a base. Global/project settings scopes select the settings layer to inspect or edit. These three mechanisms are not interchangeable.
 
-## Config profiles (`--profile`)
+## Profile selection
 
-`--profile` is a **global** flag that relocates the user base directory —
-agent dir, sessions, settings, auth, memory, skills — to
-`<base>/profiles/<name>`. `default` keeps the default base; `PI_PROFILE` is
-honored when the flag is absent (`crates/pi-cli/src/args.rs:87-92`).
+`--profile NAME` takes precedence over `PI_PROFILE` and is fixed before command dispatch. `default` uses the ordinary base. Other names relocate agent-directory-derived settings, authentication, sessions, memory, and skills to `<base>/profiles/<name>`.
+
+The base resolves in this order: `PI_CODING_AGENT_DIR`, `RPI_HOME`, then the user's `.rpi` directory. Empty overrides do not select an empty path. Profile names are 1–64 ASCII letters, digits, hyphens, or underscores after trimming.
 
 ```sh
-rpi --profile work sessions
-rpi sessions --profile work        # global flag: accepted after subcommands
-PI_PROFILE=work rpi                # environment equivalent
+rpi --profile work setup
+rpi --profile work models
+rpi --profile default sessions
 ```
 
-- Name rules: 1–64 ASCII letters, digits, `-`, or `_` (`default` is valid and
-  selects the default profile); whitespace is trimmed first. Anything else
-  (slashes, dots, spaces, non-ASCII) fails with an actionable error
-  (`validate_profile_name` in `args.rs:231-249`).
-- Each profile has its own `settings.json`, `auth.json`, `models.json`,
-  `trust.json`, `skills/`, `sessions/`, and resource trees — profile
-  isolation is by directory, so credentials, trust decisions, and memory
-  never leak between profiles.
+Project-local `.rpi` resources remain project resources subject to project trust. A profile is configuration separation, not an operating-system sandbox.
 
-## TOML settings
+## Settings format
 
-Each scope's settings file is chosen **deterministically by name**, never by
-content sniffing: a `settings.toml` sitting next to the canonical
-`settings.json` wins when present; otherwise the canonical JSON file is used.
-A `.toml` extension selects TOML parsing/serialization; any other extension
-(or none) selects JSON (`crates/pi-coding/src/settings.rs:2277-2299`).
+Within each scope, `settings.toml` wins over `settings.json`. Parsing and serialization follow the selected filename, not content sniffing. Unknown fields survive typed round-tripping. Settings operations write the file the loader reads.
 
-- TOML files round-trip through the typed `Settings` struct; unknown fields
-  are retained in the `extra` maps, so mixed-format documents survive a
-  settings write.
-- Settings writes target whichever file the loader would read (JSON→JSON,
-  TOML→TOML).
-- TOML has no null: JSON nulls inside retained `extra` maps are dropped on
-  serialization; datetimes become their string form.
+Runtime environment expansion applies recursively to string values, preserving literal references in persisted layers. Missing names remain literal and generate diagnostics. Credential authority identifiers are not expanded.
 
-```toml
-# settings.toml next to settings.json wins
-defaultProvider = "openai"
-defaultModel = "openai/gpt-5"
-approvalMode = "write"
+Use `rpi config list --json` to inspect actual supported keys, types, source, and behavior instead of copying an obsolete full settings example.
 
-[orchestration]
-tasks = true
-maxConcurrency = 8
-isolation = "worktree"
+## Credential scope
 
-[memory]
-backend = "local"
+`rpi login PROVIDER --scope work` stores a scoped credential. `PI_AUTH_SCOPE` overrides the `authScope` setting. The selected scope wins when present; an unscoped credential is used otherwise if available. A scope selection failure reports available labels, not credentials.
 
-[mcp_servers.my-tools]
-transport = "stdio"
-command = "npx"
-```
+Changing a profile changes the credential file being read. Changing credential scope does not move sessions or resources. See [authentication](../user-guide/authentication.md).
 
-## Environment expansion in settings
+## Safety
 
-`$NAME` and `${NAME}` references in **every string value** of the settings
-document are replaced with the matching process-environment value,
-recursively through nested objects and arrays (including retained unknown
-fields). Keys and non-string values are never expanded
-(`expand_env_in_value_with` in `settings.rs:2375-2439`).
-
-Important properties:
-
-- Expansion applies **only when projecting the effective runtime view**
-  (`SettingsManager::settings`, consumed by sessions). The persisted layers
-  keep the raw references, so writing settings never persists expanded
-  secrets (e.g. `mcpServers[].env` tokens).
-- Unset names are left verbatim (fail-open) and reported once per name
-  through the settings diagnostic channel; there is no default-value syntax.
-- Expansion is recursive over the runtime view only; the persistence view
-  keeps literals.
-
-```json
-{
-  "mcpServers": [
-    { "name": "local", "command": "$MCP_CMD", "args": ["-y", "${MCP_PKG}"] }
-  ],
-  "sandbox": { "allowedPaths": ["$PROJECT_ROOT", "${CACHE_DIR}/pi"] }
-}
-```
-
-## Scoped credentials (`--scope`)
-
-`rpi login` and `rpi logout` accept a scope label:
-
-```sh
-rpi login anthropic --scope work
-rpi login anthropic --scope personal
-rpi logout xai --scope personal
-```
-
-The **active scope** is `PI_AUTH_SCOPE` (environment) or
-`settings.authScope` (`settings.rs:911-915`). A scoped credential is selected
-over the unscoped default when the active scope matches its label, which
-lets one machine hold multiple credentials per provider (work vs. personal)
-and pick between them per project or per shell.
-
-## Opt-in stateful Responses chaining
-
-`responsesStatefulChain` (`settings.rs`; default `false`) opts into
-stateful turn chaining for OpenAI Responses API models
-(`crates/pi-ai/src/providers/responses.rs:30-43`): the provider keeps the
-previous response id per session and sends it as `previous_response_id` on
-the next turn, sending only the new input items instead of the full
-conversation history.
-
-- While enabled, every response is stored server-side (`store: true`) —
-  both the seed response and each chained response — because the provider
-  must resolve `previous_response_id` from stored responses. Stateless mode
-  (`store: false`) never chains.
-- The chain is per session in process memory (a session resumed from disk
-  starts fresh — the stored id would not match a foreign transcript). It
-  breaks (falls back to full history) after consecutive failures or when the
-  session transcript is replaced wholesale (compaction resets it,
-  `reset_responses_chain`).
-- Ignored by every other provider.
-
-## Invariants
-
-- Profile names are validated before any use; `default` and empty select the
-  default base, and profile isolation is by directory (no cross-profile
-  credential/trust leakage).
-- Settings file format is name-determined, never sniffed; a `.toml`
-  extension always parses as TOML.
-- Environment expansion never mutates the persisted document — expanded
-  secrets cannot be written back.
-- Scoped credentials only ever *add* a labeled choice; the unscoped default
-  remains for providers/sessions without a matching scope.
-
-## Related documentation
-
-- [`settings-trust.md`](settings-trust.md) — `settings.json` fields and
-  trust
-- [`authentication.md`](../user-guide/authentication.md) — credential
-  precedence
-- [`environment-variables.md`](environment-variables.md) — `PI_PROFILE`,
-  `PI_AUTH_SCOPE`, and all env vars
+Inspect the active paths with `rpi setup` before editing or deleting configuration. Do not copy credential files into a repository or assume a new profile grants project trust. Settings edits use the shared validation and atomic apply path described in [settings and trust](settings-trust.md).

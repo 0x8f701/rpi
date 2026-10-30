@@ -30,17 +30,18 @@
 
 use std::io::Cursor;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde_json::Value;
 
 use pi_agent::{AbortSignal, AgentTool, AgentToolResult, ToolCallContext, ToolCapability};
 
+use crate::WorkspaceRoots;
 use crate::tools::imageresize::exif_orientation_from_bytes;
 use crate::tools::paths::resolve_scoped_path;
+use crate::tools::{GenerationCaptureFn, captured_policy_fs};
 use crate::truncate::format_size;
-use crate::WorkspaceRoots;
 
-use ::image as image;
+use ::image;
 use image::{GenericImageView, ImageFormat};
 
 /// `inspect_image` refuses files larger than this. Enforced from metadata
@@ -88,13 +89,14 @@ pub(crate) fn inspect_image_tool(cwd: &str) -> AgentTool {
         )],
         vec!["path"],
     );
-    let description = "Inspect an image file without rendering it: format, dimensions, color type, \
+    let description =
+        "Inspect an image file without rendering it: format, dimensions, color type, \
         file size, EXIF orientation (JPEG/WebP), mean/stddev brightness, and a coarse \
         dominant-color histogram. Deterministic, bounded (<=4 KiB) text output (no vision model \
         call; statistics for very large images use a deterministic downsampled view). Supports \
         PNG, JPEG, GIF, BMP, and WebP up to 32 MiB and 16 megapixels. No OCR, no ML. For image \
         generation, use the generate_image tool."
-        .to_string();
+            .to_string();
     AgentTool::new("inspect_image", description, params, move |ctx| {
         let workspace = workspace.clone();
         async move { run_inspect_image(&workspace, ctx.arguments, ctx.abort).await }
@@ -106,10 +108,33 @@ pub(crate) fn inspect_image_tool(cwd: &str) -> AgentTool {
     ])
 }
 
-/// Action-less single-purpose execution: reads `args.path`, validates it, and
-/// renders the bounded report (or an actionable error).
-async fn run_inspect_image(
+pub(crate) fn inspect_image_tool_with_generation(
+    workspace: WorkspaceRoots,
+    capture: GenerationCaptureFn,
+) -> AgentTool {
+    let params = super::s_object(
+        vec![("path", super::s_string("Policy-authorized image path"))],
+        vec!["path"],
+    );
+    AgentTool::new(
+        "inspect_image",
+        "Inspect an image through retained policy filesystem authority.",
+        params,
+        move |ctx| {
+            let workspace = workspace.clone();
+            let capture = capture.clone();
+            async move {
+                let generation = capture()?;
+                run_inspect_image_captured(&workspace, &generation, ctx.arguments, ctx.abort).await
+            }
+        },
+    )
+    .with_capability(ToolCapability::Read)
+}
+
+async fn run_inspect_image_captured(
     workspace: &WorkspaceRoots,
+    generation: &std::sync::Arc<crate::application::generation::ApplicationGeneration>,
     args: Value,
     abort: AbortSignal,
 ) -> Result<AgentToolResult> {
@@ -118,115 +143,83 @@ async fn run_inspect_image(
     if path.is_empty() {
         return Err(anyhow!("File path must not be empty."));
     }
-    // Workspace containment via the same helper the other scoped tools use:
-    // relative paths resolve from the primary working directory, and symlinks
-    // cannot escape the boundary.
-    let abs = resolve_scoped_path(&path, workspace)?;
-    super::check_aborted(&abort)?;
-
-    // Size bound is enforced from metadata BEFORE any read: an oversized file
-    // (including a sparse one) is rejected without touching its contents.
-    let info = std::fs::metadata(&abs)
-        .map_err(|e| anyhow!("Could not stat image {}: {}", abs, e))?;
-    super::check_aborted(&abort)?;
-    if info.is_dir() {
-        return Err(anyhow!("EISDIR: illegal operation on a directory, inspect_image"));
-    }
-    let len = info.len();
-    if len > MAX_INSPECT_BYTES {
+    let absolute = std::path::PathBuf::from(resolve_scoped_path(&path, workspace)?);
+    let fs = captured_policy_fs(generation)?;
+    let opened = fs.open_file(&absolute)?;
+    let metadata = opened.metadata()?;
+    if metadata.len > MAX_INSPECT_BYTES {
         return Err(anyhow!(
-            "File {} is {} ({} bytes), exceeding the inspect_image limit of 32 MiB. \
-             Downscale or split the image before inspecting it.",
-            abs,
-            format_size(len as usize),
-            len
+            "File {} is {} ({} bytes), exceeding the inspect_image limit of 32 MiB.",
+            absolute.display(),
+            format_size(metadata.len as usize),
+            metadata.len
         ));
     }
+    let data = opened.read_bounded(MAX_INSPECT_BYTES)?;
+    inspect_image_bytes(&absolute.to_string_lossy(), &data, &abort)
+}
 
-    let data = std::fs::read(&abs).map_err(|e| anyhow!("Could not read image {}: {}", abs, e))?;
-    super::check_aborted(&abort)?;
-
-    // Format is guessed from the magic bytes; decode errors distinguish
-    // unsupported formats from corrupt/truncated files.
-    let mut reader = image::ImageReader::new(Cursor::new(&data));
+fn inspect_image_bytes(display: &str, data: &[u8], abort: &AbortSignal) -> Result<AgentToolResult> {
+    super::check_aborted(abort)?;
+    let mut reader = image::ImageReader::new(Cursor::new(data));
     reader = reader
         .with_guessed_format()
-        .map_err(|e| anyhow!("Could not determine the image format of {}: {}", abs, e))?;
+        .map_err(|error| anyhow!("Could not determine the image format of {display}: {error}"))?;
     let format = reader
         .format()
-        .ok_or_else(|| unsupported_format_error(&abs))?;
-    // Decoded-memory pre-check (mirrors image_pipeline.rs image_dimensions):
-    // reject decompression bombs from the header before allocating anything.
-    let (w, h) = image::ImageReader::with_format(Cursor::new(&data), format)
+        .ok_or_else(|| unsupported_format_error(display))?;
+    let (w, h) = image::ImageReader::with_format(Cursor::new(data), format)
         .into_dimensions()
-        .map_err(|e| {
-            anyhow!(
-                "Could not decode image {}: {} (the file may be corrupt or truncated)",
-                abs,
-                e
-            )
-        })?;
+        .map_err(|error| anyhow!("Could not decode image {display}: {error}"))?;
     if u64::from(w) * u64::from(h) > MAX_IMAGE_PIXELS {
         return Err(anyhow!(
-            "Image {} dimensions {}x{} exceed the {} MiB decoded-memory safety limit; \
-             downscale the image before inspecting it.",
-            abs,
-            w,
-            h,
-            MAX_DECODE_ALLOC_BYTES / 1024 / 1024
+            "Image {display} dimensions {w}x{h} exceed the decoded-memory safety limit"
         ));
     }
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(MAX_DECODE_ALLOC_BYTES);
     reader.limits(limits);
-    let img = reader.decode().map_err(|e| match e {
-        image::ImageError::Unsupported(_) => unsupported_format_error(&abs),
-        image::ImageError::Limits(_) => anyhow!(
-            "Image {} exceeds the {} MiB decoded-memory safety limit; downscale the image \
-             before inspecting it.",
-            abs,
-            MAX_DECODE_ALLOC_BYTES / 1024 / 1024
-        ),
-        other => anyhow!(
-            "Could not decode image {}: {} (the file may be corrupt or truncated)",
-            abs,
-            other
-        ),
-    })?;
-    super::check_aborted(&abort)?;
-
-    let stats = image_stats(&img);
-    // EXIF orientation is cheaply available for JPEG/WebP only (read from the
-    // raw bytes by the shared helper); other formats carry no EXIF.
+    let decoded = reader
+        .decode()
+        .map_err(|error| anyhow!("Could not decode image {display}: {error}"))?;
+    super::check_aborted(abort)?;
+    let stats = image_stats(&decoded);
     let orientation = matches!(format, ImageFormat::Jpeg | ImageFormat::WebP)
-        .then(|| exif_orientation_from_bytes(&data));
-
+        .then(|| exif_orientation_from_bytes(data));
     let mut out = String::new();
     out.push_str(&format!("Format: {}\n", format_name(format)));
-    out.push_str(&format!(
-        "Dimensions: {}x{} ({})\n",
-        w,
-        h,
-        aspect_label(w, h)
-    ));
-    out.push_str(&format!("Color type: {:?}\n", img.color()));
+    out.push_str(&format!("Dimensions: {w}x{h} ({})\n", aspect_label(w, h)));
+    out.push_str(&format!("Color type: {:?}\n", decoded.color()));
     out.push_str(&format!(
         "File size: {} ({} bytes)\n",
-        format_size(len as usize),
-        len
+        format_size(data.len()),
+        data.len()
     ));
-    if let Some(o) = orientation {
-        out.push_str(&format!("EXIF orientation: {} ({})\n", o, orientation_name(o)));
+    if let Some(orientation) = orientation {
+        out.push_str(&format!(
+            "EXIF orientation: {orientation} ({})\n",
+            orientation_name(orientation)
+        ));
     }
     out.push_str(&format!(
         "Brightness (8-bit luma): mean {:.1}, stddev {:.1} (of 255)\n",
         stats.mean, stats.stddev
     ));
     out.push_str("Dominant colors (coarse 8-bin RGB histogram):\n");
-    for (name, pct) in stats.dominant_colors {
-        out.push_str(&format!("  {name}: {pct:.1}%\n"));
+    for (name, percentage) in stats.dominant_colors {
+        out.push_str(&format!("  {name}: {percentage:.1}%\n"));
     }
     Ok(super::text_result(out))
+}
+
+/// Action-less single-purpose execution: reads `args.path`, validates it, and
+/// renders the bounded report (or an actionable error).
+async fn run_inspect_image(
+    _workspace: &WorkspaceRoots,
+    _args: Value,
+    _abort: AbortSignal,
+) -> Result<AgentToolResult> {
+    Err(anyhow!("inspect_image requires an application generation"))
 }
 
 fn unsupported_format_error(path: &str) -> anyhow::Error {
@@ -357,13 +350,105 @@ mod tests {
     use pi_ai::ContentBlock;
     use serde_json::json;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
     fn tmpdir() -> PathBuf {
         let d = std::env::temp_dir().join(format!("pi-image-inspect-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&d).unwrap();
         d
+    }
+    struct CapturedToolFixture {
+        _agent: tempfile::TempDir,
+        _sessions: tempfile::TempDir,
+        _resources: crate::ResourceManager,
+        _session: crate::Session,
+        _application: crate::Application,
+        _faux: pi_ai::providers::FauxProviderRegistration,
+        tool: AgentTool,
+    }
+
+    async fn captured_tool(cwd: &Path) -> CapturedToolFixture {
+        let workspace = crate::WorkspaceRoots::new(cwd, Vec::<PathBuf>::new()).expect("workspace");
+        let agent = tempfile::tempdir().expect("agent dir");
+        let sessions = tempfile::tempdir().expect("sessions root");
+        let session_dir = sessions.path().join("active");
+        fs::create_dir(&session_dir).expect("session dir");
+        fs::write(
+            agent.path().join("settings.json"),
+            r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+        )
+        .expect("sandbox settings");
+        let mut resource_options = crate::ResourceManagerOptions::new(cwd);
+        resource_options.agent_dir = agent.path().to_path_buf();
+        resource_options.project_trust_override = Some(true);
+        resource_options.disable_extensions = true;
+        resource_options.disable_skills = true;
+        resource_options.disable_prompt_templates = true;
+        resource_options.disable_themes = true;
+        resource_options.disable_context_files = true;
+        let resources = crate::ResourceManager::new(resource_options).expect("resources");
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let api = format!("image-inspect-{suffix}");
+        let provider = format!("image-inspect-{suffix}");
+        let model = pi_ai::Model {
+            id: format!("image-inspect-{suffix}"),
+            api: api.clone(),
+            provider: provider.clone(),
+            ..pi_ai::Model::default()
+        };
+        let faux =
+            pi_ai::providers::register_faux_provider(pi_ai::providers::FauxProviderOptions {
+                api,
+                provider,
+                models: vec![model.clone()],
+                chunk_size: 1,
+            });
+        let session =
+            crate::Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
+                crate::SessionOptions {
+                    model,
+                    cwd: cwd.to_path_buf(),
+                    system_prompt: String::new(),
+                    thinking_level: pi_agent::ThinkingLevel::Off,
+                    api_key: String::new(),
+                    compaction: None,
+                    stream_options: Default::default(),
+                    tools: Some(Vec::new()),
+                    before_tool_call: None,
+                    after_tool_call: None,
+                    stream_fn: None,
+                    auth_resolver: None,
+                    auth_manager: None,
+                },
+                Vec::new(),
+                crate::ToolSelection::default(),
+                crate::ResourceDiscovery::Disabled,
+                workspace.clone(),
+                None,
+            )
+            .expect("session");
+        session.set_session_dir(session_dir);
+        session
+            .attach_resources(resources.clone())
+            .await
+            .expect("attach resources");
+        let application = crate::Application::from_runtime_candidate(
+            crate::ApplicationRuntimeCandidate::new(session.clone()),
+        )
+        .await
+        .expect("publish image inspection application");
+        let tool =
+            inspect_image_tool_with_generation(workspace, application.generation_capture_fn());
+        CapturedToolFixture {
+            _agent: agent,
+            _sessions: sessions,
+            _resources: resources,
+            _session: session,
+            _application: application,
+            _faux: faux,
+            tool,
+        }
     }
 
     fn make_ctx(args: Value) -> ToolCallContext {
@@ -375,6 +460,7 @@ mod tests {
             on_update: Arc::new(|_r: AgentToolResult| {}),
             abort,
             model: None,
+            approval_token: None,
         }
     }
 
@@ -427,9 +513,9 @@ mod tests {
     async fn png_report_is_deterministic_and_correct() {
         let d = tmpdir();
         fs::write(d.join("four.png"), fixture_png_bytes()).unwrap();
-        let tool = inspect_image_tool(&d.to_string_lossy());
+        let fixture = captured_tool(&d).await;
 
-        let res = (tool.execute)(make_ctx(json!({ "path": "four.png" })))
+        let res = (fixture.tool.execute)(make_ctx(json!({ "path": "four.png" })))
             .await
             .unwrap();
         let text = text_of(&res);
@@ -451,10 +537,14 @@ mod tests {
         // PNG carries no EXIF → no orientation line.
         assert!(!text.contains("EXIF orientation"), "{text}");
         // Report is bounded to a few KiB.
-        assert!(text.len() <= 4 * 1024, "report too large: {} bytes", text.len());
+        assert!(
+            text.len() <= 4 * 1024,
+            "report too large: {} bytes",
+            text.len()
+        );
 
         // Deterministic: a second run yields byte-identical output.
-        let again = (tool.execute)(make_ctx(json!({ "path": "four.png" })))
+        let again = (fixture.tool.execute)(make_ctx(json!({ "path": "four.png" })))
             .await
             .unwrap();
         assert_eq!(text_of(&again), text);
@@ -468,9 +558,9 @@ mod tests {
         img.write_to(&mut std::io::Cursor::new(&mut bytes), ImageFormat::Jpeg)
             .unwrap();
         fs::write(d.join("photo.jpg"), bytes).unwrap();
-        let tool = inspect_image_tool(&d.to_string_lossy());
+        let fixture = captured_tool(&d).await;
 
-        let res = (tool.execute)(make_ctx(json!({ "path": "photo.jpg" })))
+        let res = (fixture.tool.execute)(make_ctx(json!({ "path": "photo.jpg" })))
             .await
             .unwrap();
         let text = text_of(&res);
@@ -482,13 +572,16 @@ mod tests {
     #[tokio::test]
     async fn missing_file_reports_actionable_error() {
         let d = tmpdir();
-        let tool = inspect_image_tool(&d.to_string_lossy());
-        let err = (tool.execute)(make_ctx(json!({ "path": "nope.png" })))
+        let fixture = captured_tool(&d).await;
+        let err = (fixture.tool.execute)(make_ctx(json!({ "path": "nope.png" })))
             .await
             .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("No such file or directory"), "{msg}");
-        assert!(msg.contains("nope.png"), "{msg}");
+        assert!(
+            msg.contains("filesystem operation OpenEntry failed"),
+            "{msg}"
+        );
+        assert!(msg.contains("NotFound"), "{msg}");
     }
 
     #[tokio::test]
@@ -500,12 +593,15 @@ mod tests {
         let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         f.set_len(MAX_INSPECT_BYTES + 1).unwrap();
         drop(f);
-        let tool = inspect_image_tool(&d.to_string_lossy());
-        let err = (tool.execute)(make_ctx(json!({ "path": "huge.png" })))
+        let fixture = captured_tool(&d).await;
+        let err = (fixture.tool.execute)(make_ctx(json!({ "path": "huge.png" })))
             .await
             .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("exceeding the inspect_image limit of 32 MiB"), "{msg}");
+        assert!(
+            msg.contains("exceeding the inspect_image limit of 32 MiB"),
+            "{msg}"
+        );
         assert!(msg.contains("33554433 bytes"), "{msg}");
     }
 
@@ -516,24 +612,26 @@ mod tests {
         // decoding must fail.
         fs::write(
             d.join("broken.png"),
-            [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+            [
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            ],
         )
         .unwrap();
-        let tool = inspect_image_tool(&d.to_string_lossy());
-        let err = (tool.execute)(make_ctx(json!({ "path": "broken.png" })))
+        let fixture = captured_tool(&d).await;
+        let err = (fixture.tool.execute)(make_ctx(json!({ "path": "broken.png" })))
             .await
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("Could not decode image"), "{msg}");
-        assert!(msg.contains("corrupt or truncated"), "{msg}");
+        assert!(msg.contains("unexpected end of file"), "{msg}");
     }
 
     #[tokio::test]
     async fn unsupported_format_reports_actionable_error() {
         let d = tmpdir();
         fs::write(d.join("data.bin"), b"not an image at all").unwrap();
-        let tool = inspect_image_tool(&d.to_string_lossy());
-        let err = (tool.execute)(make_ctx(json!({ "path": "data.bin" })))
+        let fixture = captured_tool(&d).await;
+        let err = (fixture.tool.execute)(make_ctx(json!({ "path": "data.bin" })))
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -548,8 +646,8 @@ mod tests {
         // no pixel data) but decoding it would allocate ~805 MB. The
         // decoded-memory pre-check must reject it from the header alone.
         fs::write(d.join("bomb.bmp"), huge_dimension_bmp_bytes()).unwrap();
-        let tool = inspect_image_tool(&d.to_string_lossy());
-        let err = (tool.execute)(make_ctx(json!({ "path": "bomb.bmp" })))
+        let fixture = captured_tool(&d).await;
+        let err = (fixture.tool.execute)(make_ctx(json!({ "path": "bomb.bmp" })))
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -562,19 +660,24 @@ mod tests {
         let outside = tmpdir();
         fs::write(outside.join("secret.png"), fixture_png_bytes()).unwrap();
         let cwd = tmpdir();
-        let tool = inspect_image_tool(&cwd.to_string_lossy());
+        let fixture = captured_tool(&cwd).await;
         let abs = outside.join("secret.png");
-        let err = (tool.execute)(make_ctx(json!({ "path": abs })))
+        let err = (fixture.tool.execute)(make_ctx(json!({ "path": abs })))
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("escapes working directory"), "{err}");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("path_outside_workspace:")
+                && msg.contains("outside authorized workspace roots"),
+            "{msg}"
+        );
     }
 
     #[tokio::test]
     async fn empty_path_is_rejected() {
         let d = tmpdir();
-        let tool = inspect_image_tool(&d.to_string_lossy());
-        let err = (tool.execute)(make_ctx(json!({ "path": "" })))
+        let fixture = captured_tool(&d).await;
+        let err = (fixture.tool.execute)(make_ctx(json!({ "path": "" })))
             .await
             .unwrap_err();
         assert_eq!(err.to_string(), "File path must not be empty.");

@@ -10,6 +10,17 @@ fn rpi_bin() -> String {
 
 fn write_config(agent_dir: &Path, settings: &str, providers: &str) {
     fs::create_dir_all(agent_dir).expect("create agent dir");
+    let settings = match serde_json::from_str::<serde_json::Value>(settings) {
+        Ok(mut value) => {
+            if let Some(object) = value.as_object_mut() {
+                object
+                    .entry("sandbox")
+                    .or_insert_with(|| serde_json::json!({"mode": "danger-full-access"}));
+            }
+            value.to_string()
+        }
+        Err(_) => settings.to_owned(),
+    };
     fs::write(agent_dir.join("settings.json"), settings).expect("write settings");
     fs::write(
         agent_dir.join("models.json"),
@@ -21,16 +32,19 @@ fn write_config(agent_dir: &Path, settings: &str, providers: &str) {
 fn provider(id: &str, model: &str, key: Option<&str>) -> String {
     let key = key.map_or(String::new(), |key| format!(r#", "apiKey":"{key}""#));
     format!(
-        r#""{id}":{{"baseUrl":"http://localhost:0","api":"openai-completions"{key},"models":[{{"id":"{model}","reasoning":true}}]}}"#
+        r#""{id}":{{"baseUrl":"http://127.0.0.1:1","api":"openai-completions"{key},"models":[{{"id":"{model}","reasoning":true}}]}}"#
     )
 }
 
 fn run(agent_dir: &Path, args: &[&str]) -> (bool, String, String) {
+    let session_dir = agent_dir.join("sessions");
+    fs::create_dir_all(&session_dir).expect("session dir");
     let output = Command::new(rpi_bin())
         .args(args)
         .env("PI_CODING_AGENT_DIR", agent_dir)
         .env("HOME", agent_dir)
         .env("USERPROFILE", agent_dir)
+        .env("PI_CODING_AGENT_SESSION_DIR", &session_dir)
         .env_remove("PI_PROFILE")
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("OPENAI_API_KEY")
@@ -93,6 +107,9 @@ fn run_with_env(
     args: &[&str],
     session_dir_env: Option<&Path>,
 ) -> (bool, String, String) {
+    if let Some(session_dir) = session_dir_env {
+        fs::create_dir_all(session_dir).expect("session dir");
+    }
     let mut command = Command::new(rpi_bin());
     command
         .args(args)
@@ -126,6 +143,8 @@ fn run_with_env_stdin(
     stdin: &str,
 ) -> (bool, String, String) {
     use std::io::Write as _;
+    let session_dir = agent_dir.join("sessions");
+    fs::create_dir_all(&session_dir).expect("session dir");
 
     let mut child = Command::new(rpi_bin())
         .args(args)
@@ -134,7 +153,7 @@ fn run_with_env_stdin(
         .env("PI_CODING_AGENT_DIR", agent_dir)
         .env("HOME", agent_dir)
         .env("USERPROFILE", agent_dir)
-        .env_remove("PI_CODING_AGENT_SESSION_DIR")
+        .env("PI_CODING_AGENT_SESSION_DIR", &session_dir)
         .env_remove("PI_PROFILE")
         .env("PI_FAUX_RESPONSE", "session-dir-test-response")
         .stdin(Stdio::piped())
@@ -244,7 +263,7 @@ fn resumed_model_wins_when_cli_model_is_absent() {
 }
 
 #[test]
-fn unauthenticated_settings_model_falls_back_to_authenticated_model() {
+fn unauthenticated_settings_model_does_not_fall_back_to_another_provider() {
     let dir = TempDir::new().unwrap();
     let providers = format!(
         "{},{}",
@@ -257,10 +276,14 @@ fn unauthenticated_settings_model_falls_back_to_authenticated_model() {
         &providers,
     );
     let (ok, out, err) = run(dir.path(), &[]);
-    assert!(ok, "fallback startup failed: {err}");
+    assert!(!ok, "unauthenticated configured default must fail closed: {out}");
     assert!(
-        out.contains("a-backup/ready"),
-        "authenticated fallback not selected: {out}"
+        err.contains("not available for the resolved credential"),
+        "missing credential refusal: {err}"
+    );
+    assert!(
+        !out.contains("a-backup/ready"),
+        "prompt route changed providers: {out}"
     );
 }
 
@@ -353,6 +376,18 @@ fn malformed_settings_error_is_contextual_and_sanitized() {
     assert!(!err.contains(secret), "credential leaked in error: {err}");
 }
 
+#[test]
+fn startup_rejects_removed_sandbox_keys_without_translation() {
+    let agent = TempDir::new().expect("agent");
+    write_config(
+        agent.path(),
+        r#"{"sandbox":{"enabled":true}}"#,
+        &provider("cliproxy", "grok-4.5", Some("fixture-key")),
+    );
+    let (ok, _, err) = run(agent.path(), &[]);
+    assert!(!ok, "removed sandbox key must fail startup");
+    assert!(err.contains("unknown field `enabled`"), "{err}");
+}
 
 #[test]
 fn settings_session_dir_controls_creation_listing_and_continue() {
@@ -368,35 +403,60 @@ fn settings_session_dir_controls_creation_listing_and_continue() {
         ),
         "",
     );
-    fs::create_dir_all(cwd.path().join(".pi")).expect("project settings directory");
+    fs::create_dir_all(cwd.path().join(".rpi")).expect("project settings directory");
     fs::write(
-        cwd.path().join(".pi/settings.json"),
-        format!(r#"{{"sessionDir":{}}}"#, serde_json::to_string(&sessions).expect("project session dir json")),
+        cwd.path().join(".rpi/settings.json"),
+        format!(
+            r#"{{"sessionDir":{}}}"#,
+            serde_json::to_string(&sessions).expect("project session dir json")
+        ),
     )
     .expect("project settings");
 
     let (created, _, create_err) = run_with_env(
         agent.path(),
         cwd.path(),
-        &["--approve", "--offline", "--model", "faux/faux-1", "--session-id", "settings-created", "created"],
+        &[
+            "--approve",
+            "--offline",
+            "--model",
+            "faux/faux-1",
+            "--session-id",
+            "settings-created",
+            "created",
+        ],
         None,
     );
     assert!(created, "settings creation failed: {create_err}");
     assert!(sessions.join("settings-created.jsonl").is_file());
     assert!(!global_sessions.join("settings-created.jsonl").exists());
 
-    let (listed, list_out, list_err) = run_with_env(agent.path(), cwd.path(), &["--approve", "sessions"], None);
+    let (listed, list_out, list_err) =
+        run_with_env(agent.path(), cwd.path(), &["--approve", "sessions"], None);
     assert!(listed, "settings list failed: {list_err}");
-    assert!(list_out.contains("settings-created"), "settings list missed session: {list_out}");
+    assert!(
+        list_out.contains("settings-created"),
+        "settings list missed session: {list_out}"
+    );
 
     let (continued, _, continue_err) = run_with_env(
         agent.path(),
         cwd.path(),
-        &["--approve", "--offline", "--model", "faux/faux-1", "--continue", "continued"],
+        &[
+            "--approve",
+            "--offline",
+            "--model",
+            "faux/faux-1",
+            "--continue",
+            "continued",
+        ],
         None,
     );
     assert!(continued, "settings continue failed: {continue_err}");
-    assert!(continue_err.contains("settings-created.jsonl"), "continued wrong session: {continue_err}");
+    assert!(
+        continue_err.contains("settings-created.jsonl"),
+        "continued wrong session: {continue_err}"
+    );
 }
 
 #[test]
@@ -407,22 +467,36 @@ fn environment_session_dir_controls_creation_and_listing() {
     let env_sessions = agent.path().join("env-sessions");
     write_config(
         agent.path(),
-        &format!(r#"{{"sessionDir":{}}}"#, serde_json::to_string(&settings_sessions).expect("settings path")),
+        &format!(
+            r#"{{"sessionDir":{}}}"#,
+            serde_json::to_string(&settings_sessions).expect("settings path")
+        ),
         "",
     );
     let (created, _, err) = run_with_env(
         agent.path(),
         cwd.path(),
-        &["--offline", "--model", "faux/faux-1", "--session-id", "env-created", "created"],
+        &[
+            "--offline",
+            "--model",
+            "faux/faux-1",
+            "--session-id",
+            "env-created",
+            "created",
+        ],
         Some(&env_sessions),
     );
     assert!(created, "environment creation failed: {err}");
     assert!(env_sessions.join("env-created.jsonl").is_file());
     assert!(!settings_sessions.join("env-created.jsonl").exists());
 
-    let (listed, out, list_err) = run_with_env(agent.path(), cwd.path(), &["sessions"], Some(&env_sessions));
+    let (listed, out, list_err) =
+        run_with_env(agent.path(), cwd.path(), &["sessions"], Some(&env_sessions));
     assert!(listed, "environment list failed: {list_err}");
-    assert!(out.contains("env-created"), "environment list missed session: {out}");
+    assert!(
+        out.contains("env-created"),
+        "environment list missed session: {out}"
+    );
 }
 
 #[test]
@@ -434,14 +508,26 @@ fn cli_session_dir_wins_and_empty_environment_is_ignored() {
     let cli_sessions = agent.path().join("cli-sessions");
     write_config(
         agent.path(),
-        &format!(r#"{{"sessionDir":{}}}"#, serde_json::to_string(&settings_sessions).expect("settings path")),
+        &format!(
+            r#"{{"sessionDir":{}}}"#,
+            serde_json::to_string(&settings_sessions).expect("settings path")
+        ),
         "",
     );
     let cli_arg = cli_sessions.to_str().expect("CLI session dir");
     let (created, _, err) = run_with_env(
         agent.path(),
         cwd.path(),
-        &["--offline", "--model", "faux/faux-1", "--session-dir", cli_arg, "--session-id", "cli-created", "created"],
+        &[
+            "--offline",
+            "--model",
+            "faux/faux-1",
+            "--session-dir",
+            cli_arg,
+            "--session-id",
+            "cli-created",
+            "created",
+        ],
         Some(&env_sessions),
     );
     assert!(created, "CLI creation failed: {err}");
@@ -449,7 +535,14 @@ fn cli_session_dir_wins_and_empty_environment_is_ignored() {
     assert!(!env_sessions.join("cli-created.jsonl").exists());
 
     let output = Command::new(rpi_bin())
-        .args(["--offline", "--model", "faux/faux-1", "--session-id", "empty-env", "empty"])
+        .args([
+            "--offline",
+            "--model",
+            "faux/faux-1",
+            "--session-id",
+            "empty-env",
+            "empty",
+        ])
         .arg("--cwd")
         .arg(cwd.path())
         .env("PI_CODING_AGENT_DIR", agent.path())
@@ -459,7 +552,11 @@ fn cli_session_dir_wins_and_empty_environment_is_ignored() {
         .stdin(Stdio::null())
         .output()
         .expect("empty environment run");
-    assert!(output.status.success(), "empty environment creation failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "empty environment creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(settings_sessions.join("empty-env.jsonl").is_file());
 }
 
@@ -476,20 +573,40 @@ fn explicit_path_resume_still_opens_that_path() {
     let (resumed, _, resume_err) = run_with_env(
         agent.path(),
         cwd.path(),
-        &["--offline", "--model", "faux/faux-1", "--resume", source_arg, "resumed"],
+        &[
+            "--offline",
+            "--model",
+            "faux/faux-1",
+            "--resume",
+            source_arg,
+            "resumed",
+        ],
         Some(&selected),
     );
     assert!(resumed, "explicit resume failed: {resume_err}");
-    assert!(resume_err.contains(source_arg), "explicit path was not opened: {resume_err}");
+    assert!(
+        resume_err.contains(source_arg),
+        "explicit path was not opened: {resume_err}"
+    );
 
     let (opened, _, session_err) = run_with_env(
         agent.path(),
         cwd.path(),
-        &["--offline", "--model", "faux/faux-1", "--session", source_arg, "opened"],
+        &[
+            "--offline",
+            "--model",
+            "faux/faux-1",
+            "--session",
+            source_arg,
+            "opened",
+        ],
         Some(&selected),
     );
     assert!(opened, "explicit --session failed: {session_err}");
-    assert!(session_err.contains(source_arg), "explicit --session path was not opened: {session_err}");
+    assert!(
+        session_err.contains(source_arg),
+        "explicit --session path was not opened: {session_err}"
+    );
 
     let fork_dir = agent.path().join("fork-output");
     let fork_dir_arg = fork_dir.to_str().expect("fork output path");
@@ -512,7 +629,11 @@ fn explicit_path_resume_still_opens_that_path() {
     assert!(
         fs::read_dir(&fork_dir)
             .expect("fork output directory")
-            .any(|entry| entry.expect("fork entry").path().extension().is_some_and(|ext| ext == "jsonl")),
+            .any(|entry| entry
+                .expect("fork entry")
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "jsonl")),
         "fork did not record beneath the selected directory"
     );
 }
@@ -529,12 +650,23 @@ fn session_dir_settings_diagnostics_do_not_pollute_json_stdout() {
     let (ok, out, err) = run_with_env(
         agent.path(),
         cwd.path(),
-        &["--offline", "--mode", "json", "--model", "faux/faux-1", "json"],
+        &[
+            "--offline",
+            "--mode",
+            "json",
+            "--model",
+            "faux/faux-1",
+            "json",
+        ],
         None,
     );
     assert!(ok, "JSON startup failed: {err}");
-    assert!(!err.contains("deprecated subagents.agentOverrides"), "agentOverrides migration is silent: {err}");
-    let raw = fs::read_to_string(agent.path().join("settings.json")).expect("read settings after startup");
+    assert!(
+        !err.contains("deprecated subagents.agentOverrides"),
+        "agentOverrides migration is silent: {err}"
+    );
+    let raw = fs::read_to_string(agent.path().join("settings.json"))
+        .expect("read settings after startup");
     assert!(
         raw.contains("agentOverrides"),
         "silent in-memory migration must not rewrite settings until an explicit save: {raw}"
@@ -569,17 +701,35 @@ fn cli_session_dir_controls_startup_and_interactive_resume_catalogs() {
         ],
         None,
     );
-    assert!(startup_ok, "startup --resume ignored --session-dir: {startup_err}");
-    assert!(startup_err.contains("custom-resume.jsonl"), "startup resumed wrong path: {startup_err}");
+    assert!(
+        startup_ok,
+        "startup --resume ignored --session-dir: {startup_err}"
+    );
+    assert!(
+        startup_err.contains("custom-resume.jsonl"),
+        "startup resumed wrong path: {startup_err}"
+    );
 
     let (interactive_ok, interactive_out, interactive_err) = run_with_env_stdin(
         agent.path(),
         cwd.path(),
-        &["--offline", "--model", "faux/faux-1", "--session-dir", sessions_arg],
+        &[
+            "--offline",
+            "--model",
+            "faux/faux-1",
+            "--session-dir",
+            sessions_arg,
+        ],
         "/resume custom-resume\n/quit\n",
     );
-    assert!(interactive_ok, "interactive /resume failed: {interactive_err}");
-    assert!(interactive_out.contains("custom-resume.jsonl"), "interactive /resume ignored stored root: {interactive_out}");
+    assert!(
+        interactive_ok,
+        "interactive /resume failed: {interactive_err}"
+    );
+    assert!(
+        interactive_out.contains("custom-resume.jsonl"),
+        "interactive /resume ignored stored root: {interactive_out}"
+    );
 }
 
 #[test]
@@ -590,7 +740,10 @@ fn import_session_without_output_uses_effective_session_root() {
     let source_dir = TempDir::new().expect("source");
     write_config(
         agent.path(),
-        &format!(r#"{{"sessionDir":{}}}"#, serde_json::to_string(&sessions).expect("session root")),
+        &format!(
+            r#"{{"sessionDir":{}}}"#,
+            serde_json::to_string(&sessions).expect("session root")
+        ),
         "",
     );
     let source = plant_native_session(source_dir.path(), cwd.path(), "import-source");
@@ -602,5 +755,8 @@ fn import_session_without_output_uses_effective_session_root() {
         None,
     );
     assert!(ok, "import-session failed: {err}");
-    assert!(out.contains(&sessions.display().to_string()), "import ignored effective root: {out}");
+    assert!(
+        out.contains(&sessions.display().to_string()),
+        "import ignored effective root: {out}"
+    );
 }

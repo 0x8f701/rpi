@@ -31,9 +31,22 @@ const approvalMarker = process.env.RPI_APPROVAL_MARKER || 'REQUEST_APPROVAL';
 const approvalExtId = process.env.RPI_APPROVAL_EXT_ID || 'web-xss-approval';
 const approvalSecret = process.env.RPI_APPROVAL_SECRET || (_P + 'approval-secret-abcdef0123456789');
 
-const executed = new Set();
+const executed = new Map(); // id -> exact execution count (per-ID ledger, no Set erasure)
+// The documented contract this driver must execute EXACTLY once — IN THE
+// ACTUAL ASSERTION-SITE (runtime) ORDER (the matrix requires the published
+// executed array to equal the documented array in order).
+const DOCUMENTED_IDS = [
+  'xss.inert-text',
+  'xss.no-global',
+  'xss.no-live-elements',
+  'xss.secret-redacted',
+  'xss.approval-card',
+  'xss.approval-no-exec',
+  'xss.approval-secret-redacted',
+  'xss.approval-no-toast-leak',
+];
 function record(id) {
-  executed.add(id);
+  executed.set(id, (executed.get(id) || 0) + 1);
   console.log(`[web-cov:assert] ${id}`);
 }
 
@@ -66,10 +79,9 @@ async function main() {
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await waitFor(page, () => document.title === 'rpi web', 'page title missing');
-    await waitFor(page, () => document.querySelector('#conn-state') !== null, 'conn-state missing');
     await waitFor(
       page,
-      () => document.getElementById('conn-state').dataset.state === 'on',
+      () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true,
       'WS did not reach "connected"'
     );
 
@@ -77,27 +89,27 @@ async function main() {
     await page.fill('#prompt-input', 'render whatever you found');
     await page.press('#prompt-input', 'Enter');
     // Wait for the hostile payload to actually render: the bare
-    // `stream-badge.hidden === true` check is already true right after connect
-    // (the session is idle before the turn starts), so it would return
-    // immediately and race the reply — wait for the assistant message to
-    // render AND the turn to complete instead (mirrors the steering driver,
-    // which waits for reply content, not the idle badge).
+    // `send-btn === Send message` idle check is already true right after
+    // connect (the session is idle before the turn starts), so it would
+    // return immediately and race the reply — wait for the assistant message
+    // to render AND the turn to complete instead (mirrors the steering
+    // driver, which waits for reply content, not the idle gate).
     await waitFor(
       page,
       (ctx) => {
         const msg = document.querySelector('.msg--assistant .assistant-text');
         // Wait for the hostile payload to render as ESCAPED TEXT (the literal
-        // is visible in textContent) and the turn to complete. The bare
-        // `stream-badge.hidden === true` check is already true before the turn
-        // starts (idle right after connect), and the async markdown escape can
-        // lag the stream-badge clear on the heavy coverage bundle — so wait for
-        // the actual escaped output, not just the idle badge. The literals are
-        // passed via the arg (page context has no Node-scope closures).
+        // is visible in textContent) and the turn to complete. The bare idle
+        // action check is already true before the turn starts (idle right
+        // after connect), and the async markdown escape can lag the turn
+        // settle on the heavy coverage bundle — so wait for the actual
+        // escaped output AND the unified action back to Send. The literals
+        // are passed via the arg (page context has no Node-scope closures).
         return (
           msg !== null &&
           msg.textContent.includes(ctx.imgLit) &&
           msg.textContent.includes(ctx.scriptLit) &&
-          document.getElementById('stream-badge').hidden === true
+          document.getElementById('send-btn')?.getAttribute('aria-label') === 'Send message'
         );
       },
       'hostile payload reply never rendered/completed',
@@ -200,7 +212,31 @@ async function main() {
     record('xss.approval-no-toast-leak');
 
     fs.mkdirSync(evidence, { recursive: true });
-    fs.writeFileSync(path.join(evidence, 'coverage-assertions.json'), JSON.stringify({ executed: [...executed] }, null, 2));
+    // Exact per-ID ledger gate BEFORE any write: every documented id must
+    // have executed EXACTLY once and nothing undocumented may execute; the
+    // published executed array is the documented order (ordered equality).
+    const missing = DOCUMENTED_IDS.filter((id) => !executed.has(id));
+    if (missing.length > 0) {
+      fail(`xss coverage evidence incomplete: ${missing.join(', ')} never executed (coverage matrix contract)`);
+    }
+    const overExecuted = [...executed.keys()].filter((id) => !DOCUMENTED_IDS.includes(id));
+    if (overExecuted.length > 0) {
+      fail(`xss coverage evidence drift: executed-but-undocumented ids: ${overExecuted.join(', ')}`);
+    }
+    const repeatedIds = [...executed].filter(([, count]) => count !== 1).map(([id]) => id);
+    if (repeatedIds.length > 0) {
+      fail(`xss coverage evidence exact-once violation: ${repeatedIds.join(', ')}`);
+    }
+    // Publish the REAL ledger: executed is the Map's insertion order (actual
+    // execution order — never a reconstruction of DOCUMENTED_IDS) and counts
+    // the real per-ID ledger. The gate above proved documented == executed
+    // as exact-once sets; the matrix's ordered gate additionally proves the
+    // runtime order matches the documented order.
+    fs.writeFileSync(path.join(evidence, 'coverage-assertions.json'), JSON.stringify({
+      documented: [...DOCUMENTED_IDS],
+      executed: [...executed.keys()],
+      counts: Object.fromEntries(executed),
+    }, null, 2));
     console.log(`web-xss-cov: PASSED (${executed.size} assertions) — evidence at ${path.join(evidence, 'coverage-assertions.json')}`);
   } finally {
     await browser.close().catch(() => {});

@@ -27,8 +27,8 @@ fn run(agent_dir: &Path, cwd: &Path, args: &[&str]) -> (bool, String, String) {
         .env("PI_CODING_AGENT_DIR", agent_dir)
         .env("HOME", agent_dir)
         .env("USERPROFILE", agent_dir)
-        .env("PI_SKIP_VERSION_CHECK", "1")
-        .env_remove("PI_OFFLINE")
+        .env("RPI_SKIP_VERSION_CHECK", "1")
+        .env_remove("RPI_OFFLINE")
         .env_remove("PI_PROFILE")
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("OPENAI_API_KEY")
@@ -89,7 +89,15 @@ fn mcp_import_claude_config_then_list_round_trip() {
     let (ok, stdout, stderr) = run(
         agent.path(),
         cwd.path(),
-        &["mcp", "import", "--source", "claude", "--file", config.to_str().unwrap(), "--force"],
+        &[
+            "mcp",
+            "import",
+            "--source",
+            "claude",
+            "--file",
+            config.to_str().unwrap(),
+            "--force",
+        ],
     );
     assert!(ok, "mcp import must succeed: {stderr}");
     assert!(
@@ -137,7 +145,14 @@ fn mcp_import_claude_config_then_list_round_trip() {
     let (ok, stdout, stderr) = run(
         agent.path(),
         cwd.path(),
-        &["mcp", "import", "--source", "claude", "--file", "/nonexistent/mcp.json"],
+        &[
+            "mcp",
+            "import",
+            "--source",
+            "claude",
+            "--file",
+            "/nonexistent/mcp.json",
+        ],
     );
     assert!(!ok, "missing config must fail");
     assert!(
@@ -175,7 +190,16 @@ fn mcp_import_local_is_fail_closed_without_resolved_trust() {
     let (ok, stdout, stderr) = run(
         agent.path(),
         cwd.path(),
-        &["mcp", "import", "--source", "cursor", "--file", config.to_str().unwrap(), "--local", "--force"],
+        &[
+            "mcp",
+            "import",
+            "--source",
+            "cursor",
+            "--file",
+            config.to_str().unwrap(),
+            "--local",
+            "--force",
+        ],
     );
     assert!(!ok, "local import must fail closed without project trust");
     assert!(

@@ -338,7 +338,9 @@ fn append_rewrite_diagnostic(
     message: &mut AssistantMessage,
     rewrite: Option<PiMessagesRewriteImpact>,
 ) {
-    let Some(rewrite) = rewrite else { return; };
+    let Some(rewrite) = rewrite else {
+        return;
+    };
     let details = serde_json::to_string(&rewrite).unwrap_or_else(|_| "{}".into());
     message.diagnostics.push(Diagnostic {
         message: format!("pi_messages_rewrite: {details}"),
@@ -424,7 +426,11 @@ fn collect_sensitive_header_values(headers: &HashMap<String, String>, secrets: &
             let value = value.trim();
             if !value.is_empty() {
                 secrets.push(value.to_owned());
-                if let Some(token) = value.strip_prefix("Bearer ").map(str::trim).filter(|token| !token.is_empty()) {
+                if let Some(token) = value
+                    .strip_prefix("Bearer ")
+                    .map(str::trim)
+                    .filter(|token| !token.is_empty())
+                {
                     secrets.push(token.to_owned());
                 }
             }
@@ -493,19 +499,21 @@ pub fn stream_pi_messages(
             }
         };
         let headers = match request_headers(&model, &options.stream, key) {
-            Ok(headers) => match common::apply_provider_headers(headers, &model, &options.stream).await {
-                Ok(headers) => headers,
-                Err(error) => {
-                    common::fail(
-                        &sink,
-                        AssistantMessage::pending(&model),
-                        error.to_string(),
-                        false,
-                    )
-                    .await;
-                    return;
+            Ok(headers) => {
+                match common::apply_provider_headers(headers, &model, &options.stream).await {
+                    Ok(headers) => headers,
+                    Err(error) => {
+                        common::fail(
+                            &sink,
+                            AssistantMessage::pending(&model),
+                            error.to_string(),
+                            false,
+                        )
+                        .await;
+                        return;
+                    }
                 }
-            },
+            }
             Err(error) => {
                 common::fail(
                     &sink,
@@ -517,8 +525,18 @@ pub fn stream_pi_messages(
                 return;
             }
         };
-        let client = match common::client(&options.stream) {
-            Ok(v) => v,
+        if let Err(e) = common::client(&options.stream) {
+            common::fail(
+                &sink,
+                AssistantMessage::pending(&model),
+                e.to_string(),
+                false,
+            )
+            .await;
+            return;
+        }
+        let payload = match serde_json::to_vec(&body) {
+            Ok(payload) => payload,
             Err(e) => {
                 common::fail(
                     &sink,
@@ -531,7 +549,13 @@ pub fn stream_pi_messages(
             }
         };
         let response = match common::send_with_retry(&options.stream, || {
-            client.post(&url).headers(headers.clone()).json(&body)
+            common::build_request(
+                &options.stream,
+                HttpMethod::Post,
+                &url,
+                &headers,
+                payload.clone(),
+            )
         })
         .await
         {
@@ -547,7 +571,14 @@ pub fn stream_pi_messages(
                 return;
             }
         };
-        if let Err(e) = common::notify_response(&options.stream, &response, &model).await {
+        if let Err(e) = common::notify_response(
+            &options.stream,
+            response.status(),
+            response.headers().clone(),
+            &model,
+        )
+        .await
+        {
             common::fail(
                 &sink,
                 AssistantMessage::pending(&model),
@@ -661,6 +692,12 @@ pub fn register_pi_messages() {
                 async move { stream_simple_pi_messages(m, c, o) }.boxed()
             }),
             generate_image: None,
+            resolve_http_authorities: Arc::new(|model, options| {
+                let base = resolve_base_url(model.base_url.trim(), &options.env)?;
+                let (authority, _) =
+                    resolve_http_endpoint(&format!("{}/messages", base.trim_end_matches('/')))?;
+                Ok(std::collections::BTreeSet::from([authority]))
+            }),
         },
         None,
     )

@@ -610,7 +610,7 @@ def main() -> None:
             f"LANG={os.environ.get('LANG', 'C.UTF-8')}",
             f"LC_ALL={os.environ.get('LC_ALL', 'C.UTF-8')}",
             f"PI_CODING_AGENT_DIR={agent_dir}",
-            "PI_SKIP_VERSION_CHECK=1",
+            "RPI_SKIP_VERSION_CHECK=1",
             "TERM=xterm-256color",
             rpi,
             "--model",

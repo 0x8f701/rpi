@@ -53,6 +53,21 @@ export function saveSessionPreference(storage: StorageLike | null, authority: st
 export interface SessionPreferenceRow {
   sessionId: string;
   path: string;
+  status?: string;
+  nativeSessionId?: string;
+}
+
+/** Runtime identity for RPC (get_messages / subscribe / switch). An
+ *  already-imported row's catalog `sessionId` is the foreign source/display
+ *  name; the native file id is `nativeSessionId`. Unimported foreign rows
+ *  keep their catalog id for the switch_session tuple. */
+export function catalogRuntimeSessionId(
+  row: Pick<SessionPreferenceRow, 'sessionId'> & { status?: string; nativeSessionId?: string },
+): string {
+  if (row.status === 'already_imported') {
+    return typeof row.nativeSessionId === 'string' ? row.nativeSessionId : '';
+  }
+  return row.sessionId;
 }
 
 /** Pure catalog selector: the SAVED session's row when it exists in the
@@ -60,7 +75,8 @@ export interface SessionPreferenceRow {
  *  Rows with empty sessionId/path are skipped (never a restore target), so
  *  junk wire rows can never be switched to. The saved match wins over
  *  position — restoring the user's choice even when it is not the newest
- *  catalog row. */
+ *  catalog row. A saved native UUID also matches `nativeSessionId` on an
+ *  already-imported foreign row. */
 export function selectSessionFromCatalog(
   rows: readonly SessionPreferenceRow[] | null | undefined,
   savedId: string,
@@ -79,6 +95,7 @@ export function selectSessionFromCatalog(
     }
     if (first === null) first = row;
     if (saved !== '' && row.sessionId === saved) return row;
+    if (saved !== '' && catalogRuntimeSessionId(row) === saved) return row;
   }
   return first;
 }

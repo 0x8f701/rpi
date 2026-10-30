@@ -80,6 +80,22 @@ def has_tool_result(body: dict[str, Any], call_id: str) -> bool:
         for message in body.get("messages", [])
     )
 
+def tool_result_text(body: dict[str, Any], call_id: str) -> str | None:
+    for message in body.get("messages", []):
+        if message.get("role") != "tool" or message.get("tool_call_id") != call_id:
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(
+                str(block.get("text", ""))
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+        return ""
+    return None
+
 
 class HubTuiHandler(BaseHTTPRequestHandler):
     lock = threading.Lock()
@@ -90,8 +106,6 @@ class HubTuiHandler(BaseHTTPRequestHandler):
     completed = threading.Event()
     alpha_wait_issued = threading.Event()
     beta_wait_issued = threading.Event()
-    main_send_completed = threading.Event()
-    alpha_send_completed = threading.Event()
 
     def do_POST(self) -> None:
         try:
@@ -131,20 +145,36 @@ class HubTuiHandler(BaseHTTPRequestHandler):
                     raise AssertionError("children did not issue their hub waits before Main send")
                 response = tool_response(route, "main-send-alpha", "hub", {"op": "send", "to": "Alpha", "message": MAIN_TO_ALPHA})
             elif route == "main" and state == 2:
-                if not has_tool_result(body, "main-send-alpha"):
-                    raise AssertionError("Main did not receive its hub send result")
+                send_result = tool_result_text(body, "main-send-alpha")
+                if send_result != "- Alpha: processed":
+                    raise AssertionError(f"Main did not receive its exact hub send result: {send_result!r}")
                 response = tool_response(route, "main-wait-beta", "hub", {"op": "wait", "from": "Beta", "timeoutMs": 10000})
             elif route == "main" and state == 3:
-                if not has_tool_result(body, "main-wait-beta") or BETA_TO_MAIN not in serialized:
-                    raise AssertionError("Main hub wait did not receive Beta's exact body")
+                wait_result = tool_result_text(body, "main-wait-beta")
+                if wait_result is None or not wait_result.endswith(f"Beta: {BETA_TO_MAIN}"):
+                    raise AssertionError(f"Main hub wait did not receive Beta's exact body: {wait_result!r}")
+                response = tool_response(route, "main-jobs", "hub", {"op": "jobs"})
+            elif route == "main" and state == 4:
+                if not has_tool_result(body, "main-jobs"):
+                    raise AssertionError("Main did not receive its hub jobs result")
+                response = tool_response(route, "main-list", "hub", {"op": "list"})
+            elif route == "main" and state == 5:
+                if not has_tool_result(body, "main-list"):
+                    raise AssertionError("Main did not receive its hub list result")
+                response = tool_response(route, "main-timeout", "hub", {"op": "wait", "from": "Beta", "timeoutMs": 10})
+            elif route == "main" and state == 6:
+                timeout_result = tool_result_text(body, "main-timeout")
+                if timeout_result != "No message before timeout.":
+                    raise AssertionError(f"Main hub wait did not produce the exact neutral timeout: {timeout_result!r}")
                 response = text_response(route, "hub tool campaign complete")
                 type(self).completed.set()
             elif route == "alpha" and state == 0:
                 type(self).alpha_wait_issued.set()
                 response = tool_response(route, "alpha-wait-main", "hub", {"op": "wait", "from": "Main", "timeoutMs": 10000})
             elif route == "alpha" and state == 1:
-                if not has_tool_result(body, "alpha-wait-main") or MAIN_TO_ALPHA not in serialized:
-                    raise AssertionError("Alpha hub wait did not receive Main's exact body")
+                wait_result = tool_result_text(body, "alpha-wait-main")
+                if wait_result is None or not wait_result.endswith(f"Main: {MAIN_TO_ALPHA}"):
+                    raise AssertionError(f"Alpha hub wait did not receive Main's exact body: {wait_result!r}")
                 if not type(self).beta_wait_issued.wait(5):
                     raise AssertionError("Beta did not issue its hub wait before Alpha send")
                 response = tool_response(route, "alpha-send-beta", "hub", {"op": "send", "to": "Beta", "message": ALPHA_TO_BETA})
@@ -156,8 +186,9 @@ class HubTuiHandler(BaseHTTPRequestHandler):
                 type(self).beta_wait_issued.set()
                 response = tool_response(route, "beta-wait-alpha", "hub", {"op": "wait", "from": "Alpha", "timeoutMs": 10000})
             elif route == "beta" and state == 1:
-                if not has_tool_result(body, "beta-wait-alpha") or ALPHA_TO_BETA not in serialized:
-                    raise AssertionError("Beta hub wait did not receive Alpha's exact body")
+                wait_result = tool_result_text(body, "beta-wait-alpha")
+                if wait_result is None or not wait_result.endswith(f"Alpha: {ALPHA_TO_BETA}"):
+                    raise AssertionError(f"Beta hub wait did not receive Alpha's exact body: {wait_result!r}")
                 response = tool_response(route, "beta-send-main", "hub", {"op": "send", "to": "Main", "message": BETA_TO_MAIN})
             elif route == "beta" and state == 2:
                 if not has_tool_result(body, "beta-send-main"):
@@ -187,6 +218,25 @@ def run_tmux(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]
 def capture(session: str) -> str:
     return run_tmux("capture-pane", "-p", "-S", "-2000", "-t", f"{session}:0").stdout
 
+def wait_for_session_exit(session: str, timeout: float) -> int:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status = run_tmux(
+            "display-message",
+            "-p",
+            "-t",
+            f"{session}:0",
+            "#{pane_dead} #{pane_dead_status}",
+            check=False,
+        )
+        if status.returncode != 0:
+            raise AssertionError("Hub TUI session vanished before its exit status was captured")
+        dead, _, exit_status = status.stdout.strip().partition(" ")
+        if dead == "1":
+            return int(exit_status)
+        time.sleep(0.1)
+    raise AssertionError("Application cleanup did not terminate the Hub TUI process")
+
 
 def wait_for(session: str, needles: list[str], timeout: float) -> str:
     deadline = time.monotonic() + timeout
@@ -199,6 +249,29 @@ def wait_for(session: str, needles: list[str], timeout: float) -> str:
             raise HubTuiHandler.request_error
         time.sleep(0.1)
     raise AssertionError(f"TUI did not display {needles!r}; final pane:\n{latest}")
+
+def assert_transcript(pane: str) -> None:
+    lines = pane.splitlines()
+    for expected in ["✓ Hub jobs · complete", "✓ Hub agents · complete", "• Hub wait · timed out · no message arrived", "✉ IRC ⟵ Beta received", BETA_TO_MAIN]:
+        if not any(expected in line for line in lines):
+            raise AssertionError(f"transcript omitted {expected!r}:\n{pane}")
+
+    for title in ["✓ Hub jobs · complete", "✓ Hub agents · complete", "• Hub wait · timed out · no message arrived"]:
+        matches = [line for line in lines if title in line]
+        if any(marker in line for line in matches for marker in "╭╰│"):
+            raise AssertionError(f"metadata-only Hub operation retained an empty frame for {title!r}: {matches!r}")
+
+    title_index = next(index for index, line in enumerate(lines) if "✉ IRC ⟵ Beta received" in line)
+    if "╭──" not in lines[title_index] or title_index + 2 >= len(lines):
+        raise AssertionError(f"typed IRC title lost its frame:\n{pane}")
+    if BETA_TO_MAIN not in lines[title_index + 1] or "│" not in lines[title_index + 1]:
+        raise AssertionError(f"typed IRC body lost its framed row:\n{pane}")
+    if "╰" not in lines[title_index + 2]:
+        raise AssertionError(f"typed IRC card lost its bottom frame:\n{pane}")
+    if "<orchestration-message" in pane:
+        raise AssertionError("raw orchestration XML leaked into public TUI")
+    if "orchestration shut down" in pane.lower():
+        raise AssertionError(f"orchestration stopped before child jobs completed:\n{pane}")
 
 
 def write_agent(path: Path, name: str, sentinel: str) -> None:
@@ -258,27 +331,51 @@ def main() -> None:
         f"LANG={os.environ.get('LANG', 'C.UTF-8')}",
         f"LC_ALL={os.environ.get('LC_ALL', 'C.UTF-8')}",
         f"PI_CODING_AGENT_DIR={agent_dir}",
-        "PI_SKIP_VERSION_CHECK=1",
+        "RPI_SKIP_VERSION_CHECK=1",
         "TERM=xterm-256color",
     ]
     try:
         run_tmux(
             "new-session", "-d", "-s", session, "-x", "120", "-y", "40", "-c", str(workspace),
-            "env", *environment, rpi, "--model", "hub-tui-e2e/mock", "--api-key", "localhost-hub-e2e-not-a-secret",
+            "remain-on-exit", "on", ";",
+            "respawn-pane", "-k", "env", *environment, rpi, "--model", "hub-tui-e2e/mock", "--api-key", "localhost-hub-e2e-not-a-secret",
         )
         time.sleep(1.5)
         run_tmux("send-keys", "-t", f"{session}:0", "-l", "Run the authoritative child-owned hub campaign.")
         run_tmux("send-keys", "-t", f"{session}:0", "Enter")
-        pane = wait_for(session, ["hub tool campaign complete", "IRC ⟵ Beta", BETA_TO_MAIN], 35)
-        pane = wait_for(session, ["Alpha (Alpha) · completed", "Beta (Beta) · completed"], 10)
+        transcript = wait_for(
+            session,
+            [
+                "hub tool campaign complete",
+                "IRC ⟵ Beta",
+                BETA_TO_MAIN,
+                "✓ Hub jobs · complete",
+                "✓ Hub agents · complete",
+                "Hub wait · timed out · no message arrived",
+            ],
+            35,
+        )
+        assert_transcript(transcript)
+        (evidence / "transcript.txt").write_text(transcript, encoding="utf-8")
+        run_tmux("send-keys", "-t", f"{session}:0", "-l", "/jobs")
+        run_tmux("send-keys", "-t", f"{session}:0", "Enter")
+        jobs_overlay = wait_for(session, ["2 completed", "completed Alpha", "completed Beta"], 10)
         if HubTuiHandler.request_error is not None:
             raise HubTuiHandler.request_error
-        expected_states = {"main": 4, "alpha": 3, "beta": 3}
+        expected_states = {"main": 7, "alpha": 3, "beta": 3}
         if HubTuiHandler.states != expected_states or not HubTuiHandler.completed.is_set():
             raise AssertionError(f"incomplete provider route states: {HubTuiHandler.states!r}")
-        if "<orchestration-message" in pane:
-            raise AssertionError("raw orchestration XML leaked into public TUI")
-        (evidence / "tui.txt").write_text(pane, encoding="utf-8")
+        if "<orchestration-message" in jobs_overlay:
+            raise AssertionError("raw orchestration XML leaked into jobs overlay")
+        if "orchestration shut down" in jobs_overlay.lower():
+            raise AssertionError(f"orchestration stopped before completed jobs were observable:\n{jobs_overlay}")
+        (evidence / "jobs-overlay.txt").write_text(jobs_overlay, encoding="utf-8")
+        run_tmux("send-keys", "-t", f"{session}:0", "Escape")
+        run_tmux("send-keys", "-t", f"{session}:0", "-l", "/quit")
+        run_tmux("send-keys", "-t", f"{session}:0", "Enter")
+        exit_status = wait_for_session_exit(session, 10)
+        if exit_status != 0:
+            raise AssertionError(f"Application cleanup exited with status {exit_status}")
         (evidence / "provider-transitions.json").write_text(
             json.dumps({"states": HubTuiHandler.states, "transitions": HubTuiHandler.transitions}, indent=2),
             encoding="utf-8",
@@ -293,9 +390,17 @@ def main() -> None:
                         "alpha-child-owned-hub-wait-send",
                         "beta-child-owned-hub-wait-send",
                         "visible-beta-to-main-irc",
+                        "typed-irc-frame-shape",
+                        "compact-hub-jobs-operation",
+                        "compact-hub-agents-operation",
+                        "application-cleanup-exit",
+                        "neutral-hub-wait-timeout",
+                        "separate-transcript-jobs-evidence",
                         "alpha-beta-completed-jobs",
+                        "no-premature-orchestration-shutdown",
                     ],
-                }
+                },
+                indent=2,
             ),
             encoding="utf-8",
         )

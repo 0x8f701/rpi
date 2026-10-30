@@ -14,6 +14,12 @@ path = "src/lib.rs"
 name = "rpi"
 path = "src/main.rs"
 
+
+[[test]]
+name = "windows_confined_unsupported"
+path = "tests/windows_confined_unsupported.rs"
+harness = false
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
@@ -28,10 +34,11 @@ globset.workspace = true
 http.workspace = true
 image.workspace = true
 ignore.workspace = true
-nix.workspace = true
+nix = { workspace = true, features = ["fs"] }
 pi-ai.workspace = true
 pi-agent.workspace = true
 pi-coding.workspace = true
+pi-sandbox.workspace = true
 parking_lot.workspace = true
 ratatui.workspace = true
 rcgen.workspace = true
@@ -44,13 +51,19 @@ sha2.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 tokio-tungstenite.workspace = true
+mdns-sd.workspace = true
 tokio-util.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
+portable-pty.workspace = true
+qrcode.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Protocol-owner tests inject synthetic ApplicationEvent values into the
+# existing broadcast channel; production does not enable this feature.
+pi-coding = { workspace = true, features = ["test-support"] }
 # Local-tarball plugin install e2e (`rpi plugin install <local>.tgz`).
 tar.workspace = true
 flate2.workspace = true

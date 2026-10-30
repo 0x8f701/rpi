@@ -1,265 +1,106 @@
 # Web client (`/web`)
 
-`rpi --listen` serves a web chat client at `GET /web` on the control-plane
-listener. The frontend is a React + TypeScript app (`crates/pi-cli/web/`,
-built with Vite); `vite-plugin-singlefile` inlines it into one self-contained
-`dist/index.html` that `build.rs` embeds into the binary as an asset table
-(`path -> MIME/bytes`). At runtime there is no framework, build step, or
-external asset — the listener serves the embedded page, and the page drives
-the existing [WebSocket control plane](rpc-json.md) in a browser.
+The Web client controls sessions through the same application command layer as the terminal interface. Open `/web` from an interactive session, or start a standalone listener:
 
-Frontend development uses the Vite dev server:
-
-```console
-$ rpi --listen 127.0.0.1:8765 --listen-token-file <workspace>/rpi-token
-$ cd crates/pi-cli/web
-$ npm install
-$ RPI_LISTEN=http://127.0.0.1:8765 npm run dev   # http://localhost:5173
+```sh
+rpi --listen 127.0.0.1:8543
 ```
 
-The dev server proxies `/ws` and `/rpc` to the listener. `npm run build`
-regenerates `dist/index.html` (generated build output, not tracked by git);
-rebuilding the Rust binary embeds the new bundle. CI generates the bundle
-from a clean checkout before any cargo command. `RPI_WEB_DEV_DIR=<dir>` makes
-the listener serve a built page from disk instead, for iterating without
-recompiling Rust.
+The standalone listener runs independently of standard input and does not start the terminal interface. It serves HTTPS by default, using an automatically generated certificate when no certificate pair is supplied. Use `--listen-cert` with `--listen-key` for your own certificate. `--listen-plaintext` explicitly selects HTTP.
 
-## Starting the listener
+## Connection and pairing
 
-`rpi --listen <SOCKET_ADDR>` is a headless Web-only backend. It never
-initializes terminal raw mode, cursor probing, a TUI, or a line REPL. Standard
-input may be closed; the service stays alive until Ctrl-C or SIGTERM, then
-flushes the active session and shuts down its listener and runtime manager
-cleanly. Web prompts use the normal session recorder, so restarting with
-`--continue`, `--resume`, `--session`, or `--session-id` restores the recorded
-conversation.
+Use the address printed by the listener. The Web startup banner supplies a token-bearing pairing URL when authentication is configured; treat that URL as a credential and do not share it publicly.
 
-Authentication rules:
+When the listener requires a token and none is stored, the client enters `token_required` rather than opening an endless unauthenticated reconnect loop. The pairing card identifies the listener and accepts its access token. A nonempty submission saves the token for that listener and reconnects. Settings also provides connection configuration.
 
-- Loopback (127.0.0.0/8 or ::1) may be tokenless or tokenized.
-- A non-loopback **HTTPS** bind requires `--listen-token-file`; tokenless
-  remote TLS is rejected pre-bind.
-- `--listen-allow-insecure-remote` is the explicit tokenless-remote opt-in:
-  it permits tokenless browsers on a non-loopback bind. Combined with
-  `--listen-plaintext` it is both unauthenticated and unencrypted; without
-  `--listen-plaintext` it is encrypted but unauthenticated.
+For remote access, use TLS and `--listen-token-file`. A non-loopback listener requires a token unless `--listen-allow-insecure-remote` explicitly opts out. A configured token remains mandatory even with that opt-in. Wildcard binds require `--listen-advertised-origin` so generated links have a usable origin.
 
-By default `--listen` uses HTTPS with an auto-generated self-signed
-certificate; use `--listen-plaintext` to opt out, or `--listen-cert` /
-`--listen-key` for real certificates.
+## Sessions and conversation
 
-**One-command local startup** (loopback, no token, HTTPS):
+The session list separates saved session selection from the displayed runtime. Prompts, streamed replies, tool output, approvals, and session state belong to the selected session. Switching the displayed session is not a command to stop another session.
 
-```console
-$ rpi --listen 127.0.0.1:8765
-Control plane listening on https://127.0.0.1:8765 (loopback only)
-```
+The client includes session, model, settings, Todo, subagent, activity, workflow, file, automation, and process surfaces. Availability depends on the active session and configured capabilities. Use **Stop** to interrupt generation; the underlying protocol identifier remains `abort`.
 
-Open <https://127.0.0.1:8765/web> in a browser; accept the self-signed
-certificate warning for local testing. The page auto-connects with no token.
+**Steering queue status: in progress.** The Web queue component provides queued-prompt previews. The Rust queue and scoped cancellation contract are still being integrated; do not rely on `QueueCancel` scopes `all`, `steering`, or `index` as a stable end-to-end interface yet.
 
-**Local plaintext** — opt out of TLS on loopback:
+## Loop
 
-```console
-$ rpi --listen 127.0.0.1:8765 --listen-plaintext
-```
+The Loop panel is the Web counterpart of `/loop`. It creates, lists, and deletes recurring prompts through `loop_create`, `loop_list`, and `loop_delete`.
 
-Open <http://127.0.0.1:8765/web>; the page auto-connects with no token.
+- Interval presets: **30s, 1m, 5m, 15m, 1h, 4h**.
+- The initial interval selection is **5m**.
+- Creating a loop sends the trimmed prompt with `fireImmediately: true` and `durable: false`.
+- Each row shows its interval and a prompt preview. Cancel removes that loop and refreshes the list.
 
-**Remote / LAN HTTPS** — non-loopback; a token file is mandatory:
+Recurring prompts are separate from supervised operating-system processes.
 
-```console
-$ rpi --listen 0.0.0.0:8765 --listen-token-file <workspace>/rpi-token
-```
+## Processes
 
-Open `https://<host>:8765/web`. The browser must present the token.
+The Processes panel provides `/ps`-style supervised command management:
 
-**Remote plaintext, tokenless** — explicit insecure opt-in (not recommended):
+1. Enter a command and an optional label.
+2. **Run** submits `process_spawn` with `argv: ["bash", "-c", command]` and the session working directory. An unknown working directory fails immediately rather than running elsewhere.
+3. **Output** opens a per-process output viewer using `process_logs`. The client requests a 16 KiB tail, decodes base64 output as UTF-8, and prefixes reported output loss with `(lost N bytes)` when `lost` and positive `lostBytes` are returned.
+4. **Stop** sends `process_stop`. Supervision uses termination followed by a grace period and forced kill when necessary.
 
-```console
-$ rpi --listen 0.0.0.0:8765 --listen-plaintext --listen-allow-insecure-remote
-```
+While the panel is mounted, process state and the open output view refresh every three seconds, except while a panel action is busy. Closing the panel stops polling; it does not itself stop a process.
 
-Open `http://<host>:8765/web`. No `--listen-advertised-origin` is needed for
-ordinary `/web`, `/ws`, or `/rpc`: the browser request is accepted when its
-`Origin` authority equals the HTTP `Host` — an ordinary same-origin check that
-rejects unrelated cross-origin pages, not authentication and not
-DNS-rebinding protection. This is plaintext HTTP and WebSocket with **no
-authentication and no encryption**: anyone reachable on the network can
-drive the agent and observe traffic. Use loopback, real certificates, or a
-TLS-terminating proxy in front of the listener, unless that exposure is
-explicitly acceptable.
+## File explorer
 
-The token authenticates clients but provides no encryption: passive LAN
-observers can still capture the bearer token and control traffic.
+The Files surface offers a workspace tree, changed-file view, and file contents. Previewable files start in **Preview**; **Source | Preview** switches between rendered content and the line-numbered source surface. A directory that cannot be listed — deleted, permission-denied, or a symlink — is hidden from the tree rather than shown as an error; changed files beneath it that exist only in the changed-file catalog still appear under the parent directory.
 
-Collaboration join links remain separate from the Web UI banner: wildcard
-binds (0.0.0.0 or `::`) require `--listen-advertised-origin <URL>` (a strict
-http/https origin without credentials, path, query, or fragment) before
-`/collab` — or `collab_start` without an explicit `baseUrl` — can print
-reachable links; loopback binds advertise their local address automatically.
-Startup still prints a Web UI hint on wildcard binds: explicit
-`--listen-advertised-origin` wins; otherwise rpi best-effort discovers a
-route-selected LAN address (`Web UI: <scheme>://<lan-ip>:<port>/web`) or falls
-back to text telling you to use this machine's LAN IP and port. Ordinary
-`/web` access does not depend on that banner.
+| Extension | Preview |
+| --- | --- |
+| `.md`, `.markdown` | Shared safe Markdown renderer |
+| `.html`, `.htm` | Sandboxed iframe with `sandbox=""`; scripts are not allowed |
+| `.svg` | Image element rather than inline executable markup |
+| Other files | Source surface |
 
-The page itself is always served without authentication: it carries no data,
-and every command and event flows through the `/rpc` and `/ws` routes, which
-are token-gated only when a token file is configured.
+Directory listings and changed-file catalogs are capped at **5,000** entries. The client also caps rendered changed-file rows at **5,000**, and reports truncation. These are safety bounds, not a promise that a large workspace is fully represented in one response. The project's frontend policy requires generous limits sized for heavy normal workflows.
 
-## Authentication: the `rpi-auth.<token>` subprotocol
+The static Files header keeps refresh, fullscreen/restore, and close separate from aligned per-column toolbars: Search and tree visibility belong to the tree column; **Source | Preview | Ask | Map** belongs to the file-content column. The collapsed tree retains a reachable toggle. Selected-line actions and Blame results float over the surface without inserting rows or shifting the file content. File and folder types use SVG icons, including Solidity. Search and the open file conversation survive tree visibility changes. Fullscreen hides the global header until Files is restored or closed.
 
-Browsers cannot set the `Authorization` header on `WebSocket` connections.
-The listener therefore accepts the token as a WebSocket subprotocol request:
+**Ask** adds a per-file conversation to the open file tab. Questions stream into the dock with a ■ Stop control, and a selection on the numbered source lines attaches that inclusive line range as context. The range stays attached after the painted page window compacts or pages away; the backend reads those exact lines (at most **2,000**), and the snapshot reports what was attached (`requestedRange` / `includedRange` / `truncated`). A wider selection is rejected. Switching session owner or file, or leaving file view, drops the selection. Conversations run on a read-only fork, so their tool calls stay in the dock and never enter the main transcript. Each tab owns one conversation (up to 8 open tabs); hiding the panel keeps drafts, selections, and snapshots, while closing the tab ends that conversation and a reopened tab starts a new one.
 
-```
-Sec-WebSocket-Protocol: rpi-auth.<token>
-```
+### Ask or blame selected source lines
 
-- The offered list is scanned for the first `rpi-auth.<token>` entry whose
-  token matches the configured token file, compared in constant time (the
-  same comparison used for `Authorization: Bearer <token>`).
-- On success the exact offered protocol is reflected in the upgrade response
-  (RFC 6455 requires the server to select and echo one subprotocol), so the
-  browser accepts the handshake.
-- The `Authorization` header path is unchanged. A token file makes the token
-  mandatory on every bind; without one the listener is tokenless — browsers
-  are accepted on loopback, and on a non-loopback bind with
-  `--listen-allow-insecure-remote` (with `--listen-plaintext` for a plaintext
-  transport) when the request's `Origin` authority equals the HTTP `Host` (an
-  ordinary same-origin check that rejects unrelated cross-origin pages, not
-  authentication and not DNS-rebinding protection). Wrong, empty, or
-  whitespace-containing candidates are rejected. A configured token
-  authenticates clients but provides no encryption against passive network
-  observers.
+Select numbered lines on the **Source** surface, then choose **Ask** or **Blame**. Both actions use the same inclusive, 1-based range, with a maximum of **2,000 lines**. These selection actions are not available on diff or rendered Preview content. Selected **Ask** opens the existing file conversation and focuses its composer without replacing your draft or conversation history.
 
-The token never appears in a URL or cookie; it is held only in the WebSocket
-handshake header and persisted by the page in `localStorage` under a
-per-listener-authority key (so a token saved for host A is not sent to host
-B).
+**Blame** shows attribution for each selected line: commit, author, and date (the response carries Unix-seconds time). Uncommitted changes have a null commit and display **Uncommitted**, rather than a zero commit hash. The request is scoped to the selected file and exact line range; the backend validates source access and uses bounded, read-only Git commands with explicit arguments, not a shell (`crates/pi-cli/src/file_explorer.rs:915`).
 
-## v1 features
+The conversation shows only the question you typed, not the injected source context; the model still receives that context (`crates/pi-cli/src/file_conversation.rs:411`). Ask's isolated side-chat session preserves the parent session's already-authorized workspace roots, so authorized additional folders remain readable. Tool instructions reflect the tools actually installed in the child session, not shell examples inherited from the parent. This does not grant `BashExec` or expand Ask beyond its read-only tools (`crates/pi-cli/src/side_chat.rs:349`, `:1633`).
 
-- **Connection state + auto-reconnect** — the status pill shows
-  `connecting / connected / reconnecting / offline`; unexpected disconnects
-  retry with exponential backoff (1s → 15s cap). A manual **Connect** button
-  reconnects after changing the token.
-- **Prompt box** — while idle, Enter and the primary **Send** button send
-  `prompt`; while a run is active, both switch to **Steer** and send `steer`,
-  avoiding a rejected second prompt. Shift+Enter inserts a newline; Esc (or
-  the active-only **Abort** button) stops the run. Redundant dedicated Steer
-  and Follow up buttons are intentionally absent, leaving the textarea usable
-  on phone-width screens.
-- **Command picker** — the button left of the prompt opens the backend
-  `get_commands` catalog. The Web surface exposes `/compact`, `/skill`, and
-  `/code-review`; selecting an entry drafts the command and keeps focus in the
-  composer so the user can add arguments before confirming with Enter.
-- **Attachments** — attach images and code/text via the paperclip multi-file
-  picker, drag/drop onto the composer, or pasting clipboard files (for example
-  a screenshot). Ordinary text paste is unchanged. Supported images
-  (PNG/JPEG/GIF/WebP) are sent as image content blocks; recognized UTF-8
-  code/text files (common source and config extensions such as `.rs` and
-  `.ts`) are prepended as a sanitized filename plus a safely fenced code
-  block in the prompt message. Multiple files are accepted in intake order.
-  Unsupported binaries, non-image formats the prompt wire cannot carry, files
-  that fail UTF-8 validation, and oversized or over-budget batches are
-  rejected with a visible summary. Intake is bounded by per-file size, file
-  count, and a combined wire budget under the control-plane frame limit.
-- **Code highlighting** — fenced blocks use highlight.js. Fence info strings
-  with metadata or aliases (for example `rust,ignore` or `rs`) normalize to
-  the base language so Rust and other registered languages highlight the full
-  source instead of only a partial auto-detected span.
+### Dependency Map
 
-- **Code review** — `/code-review` opens a bounded HEAD-to-working-tree diff;
-  `/code-review <from> <to>` compares two commits, branches, or tags. The panel
-  supports file and hunk navigation, refresh, and per-hunk comments answered by
-  a detached read-only review agent.
-- **Streaming transcript** — assistant turns render live from the event
-  stream: text deltas, collapsible `thinking` blocks, compact tool-call cards,
-  bash/tool-result blocks, and final markdown. Task delegations render a
-  structured card (Goal / Constraints / Contract from shared context, plus each
-  child name/agent/target with live status, activity, and result) instead of
-  raw tool-args JSON; Edit cards show path, operation, and a
-  semantically styled `details.diff`. Raw args/details stay collapsed.
-  Internal `display: false` system scaffolding is hidden like the TUI; bash
-  output keeps the last 10 lines and other tool output keeps the last 6 with
-  an omitted-line count.
-- **Model / thinking switch** — model and thinking-level dropdowns populated
-  from `get_available_models` / `get_available_thinking_levels`, applying
-  `set_model` and `set_thinking_level`; the session name comes from
-  `get_state`.
-- **Status line** — a pulsing "streaming" badge while a run is in flight and
-  error toasts for failed commands, failed runs, and connection problems.
-- **Multi-session authoritative restore** — switching sessions consumes the
-  target runtime's backend snapshot; closed sessions resume from disk, and a
-  listener restart rebinds before controls become active. The saved-session
-  sidebar requests `session_list` with `scope: "all_projects"`: the default
-  native tree lists sessions across projects in the active profile, while an
-  explicit `--session-dir` or `sessionDir` setting lists only that exact root.
-  Web prompts use the normal session recorder and remain available after restart.
-- **Panels** — dedicated views for todo, goal, workflow, session tree,
-  settings, subagent jobs, side chat, and code review, each driven by the same
-  JSONL RPC control plane.
-- **Personas** — the Personas panel manages the same persistent persona
-  definitions as the TUI `/persona` surface. A persona is a durable agent
-  definition at `~/.pi/agent/personas/<name>/persona.md` (user scope) or
-  `<project>/.pi/personas/<name>/persona.md` (project scope, trusted
-  projects), with its memory (`memory/entries.jsonl`) and session archives
-  (`sessions/`) kept under the same root. The panel lists each persona with
-  its contract summary and memory/session counts, shows the raw definition,
-  and supports create/edit (validated against the same schema and storage as
-  `/persona new` / `/persona edit`, with a live catalog reload on save).
-  Destructive actions are explicitly confirmed and clearly distinguished:
-  **Remove** deletes only `persona.md` and keeps the memory/sessions under
-  the persona root, while **Purge** deletes the whole root including state.
-  **Select** makes the persona the preferred agent for unnamed task spawns
-  (`/persona <name> --select`); **Run** spawns a task with the persona as the
-  agent via the existing `task_spawn` RPC. Natural-language delegation
-  (`让 <persona> …`) is resolved by the main agent through the existing
-  orchestration agent catalog/task tool — the page never heuristically routes
-  prompts.
-- **Collaboration guest route** — `/collab/ws/<roomId>` serves the same
-  embedded client for encrypted live-collaboration guests, reading the
-  capability key from the URL fragment locally before opening the encrypted
-  WebSocket.
+**Map** shows the selected file's bounded one-hop incoming and outgoing dependencies, with navigable file nodes and source-documentation evidence. It extracts TypeScript/JavaScript, Rust, and Solidity relationships, but does not claim complete resolution. Relative TypeScript/JavaScript imports and exact Solidity source-unit paths are resolved conservatively. Rust module ancestry, attributes, and crate bindings remain explicitly **unresolved**, not inferred from filenames.
 
-## Security
+Read the coverage notice: truncated scans, unsupported or unreadable files, incomplete parses, and omitted dynamic imports can leave relationships unknown. Ignored files and symlinks are outside the visible-entry scan; an empty incoming list does not prove that a file has no dependents (`crates/pi-cli/src/dependency_map.rs:1`, `crates/pi-cli/web/src/panels/FileDependencyMap.tsx:96`).
 
-- Every model-derived string passes through a JavaScript port of the export
-  pipeline's `redact_secrets` (credential shapes such as `sk-…`, `ghp_…`,
-  `Bearer …`, `token=…`, PEM private keys) before touching the DOM, and every
-  string crossing into `innerHTML` is additionally HTML-escaped
-  (`& < > " '`). Streaming deltas use `textContent`; model text is never
-  injected as raw HTML.
-- Links are restricted to `http`/`https`/`mailto` and same-origin relative
-  paths; images only render from base64 `data:` URIs with whitelisted MIME
-  types.
-- The token is never placed in a URL, and there is no cookie, so nothing to
-  CSRF. Commands require the token only when one is configured; the page itself
-  is static.
+## Commit review
 
-## v1 limitations
+`/commit` reviews a commit without touching the worktree: bare `/commit` opens a recent-commit chooser (newest first, first-parent history, at most 100 rows), and choosing a row or entering `/commit <ref>` reviews that commit pinned to its resolved hash — a root commit diffs from the empty tree, a merge from its first parent. Nothing stages, checks out, or commits.
 
-- Remote approvals and overlay confirmations are intentionally unavailable
-  (`extension_ui_response` is hard-rejected on the wire by design); the page
-  shows tool results but cannot answer interactive extension prompts.
-- TLS is self-signed by default; provide real certificates with `--listen-cert` / `--listen-key` for production. Plaintext remote access is an explicit opt-in (`--listen-plaintext --listen-allow-insecure-remote`), and passive network observers can capture any bearer token and control traffic.
+### Focused Auto Review and Highlight
 
-## Testing
+**Auto Review** screens for demonstrated critical bugs, overdesign that violates the owning project's principles, and naming violations supported by its rules. It does not request generic warnings, style preferences, speculative risks, or change summaries. Naming-only and rename-only changes remain eligible for review, along with policy-relevant comment, test, and abstraction changes (`crates/pi-cli/src/code_review_panel.rs:502`, `:978`).
 
-- Frontend type-check + build: `cd crates/pi-cli/web && npm run build`
-  (type-check, focused transcript assertions, Vite bundle, and deterministic
-  trim); the generated `dist/index.html` (not tracked by git) is what the
-  binary embeds.
-- Rust: `cargo test -p pi-cli --lib` (subprotocol unit tests) and
-  `cargo test -p pi-cli --test listen_control_plane` (GET /web route, positive
-  and negative subprotocol auth, existing routes unchanged).
-- Browser E2E (playwright-only hard gate): `bash E2E.d/web/run.sh` spawns the
-  real binary with the loopback mock provider and runs 12 lanes: core, goal,
-  xss, abort, reconnect, switch, mobile, auth, auth_tokenless, extras,
-  sessions, and session_restore. The final lane proves loaded switching,
-  close/resume from disk, and listener-restart history restoration. Most lanes
-  use a token file; auth_tokenless starts without one. Playwright uses a system
-  Chrome/Chromium binary or its bundled Chromium; an unavailable browser or
-  failed assertion fails the lane with no skip or fallback.
+Auto Review and Highlight share one structured `reviewFindings` collection. Each hunk result has an exact `identity` and a `findings` list. Each finding records **Critical**, **Overdesign**, or **Naming**, an **old/new** side, inclusive 1-based `startLine`/`endLine`, a `summary`, and supporting `evidence`. Multiple findings in one hunk remain distinct. **Clean** is derived from an explicitly reviewed empty list, not a finding category or separate verdict. Structured model output uses `{"hunks":[{"identity":...,"findings":[...]}]}`; ranges must match actual numbered rows on the stated side, not merely fall within the hunk header. Legacy severity categories are not accepted.
+
+Finding marks identify the relevant source lines. **Previous/Next finding** moves within and across files in file/hunk/physical-row order without wrapping. With no selection, Next chooses the first finding and Previous the last. Selecting one opens its file, reveals the paged hunk and exact line range, and synchronizes the detail. Replacing findings invalidates old selected references. Automatic finding details do not replace your manual hunk conversation or draft.
+
+After the existing **151ms** busy gate, the Web panel shows **Screening…** while Auto Review selects hunks, **Review N/M** for completed/submitted deep reviews, and **Identifying…** while Highlight runs. Unknown review counts appear as **Review --/--**, not invented progress (`crates/pi-cli/web/src/codeReview.ts:3258`).
+
+One-shot screening and Highlight keep the project's system policy but omit unrelated main-conversation history. Manual hunk conversations and deep-review histories are unchanged (`crates/pi-cli/src/code_review_panel.rs:704`, `:1132`). This is a context and progress-display change, not a measured speed claim: no post-change timing comparison is available.
+
+### TL;DR summary
+
+**TL;DR** generates a summary owned by the current review snapshot. The pane opens expanded; **Collapse details** and **Expand details** render the same document through the existing safe Markdown body, including supported Mermaid rendering. **Stop** cancels the summary operation, not the review or a manual hunk reply; **Close** only hides the summary pane.
+
+The latest integrated runtime, device, and deployment acceptance for these changes remains pending. These descriptions document implementation, not a claim that the latest build has been deployed or runtime-verified.
+
+## Rendering and security
+
+Markdown escapes input before applying supported formatting: raw HTML is never rendered as document markup. Mermaid uses strict security and sanitized SVG. HTML file preview is a deliberately separate sandboxed surface, not an exception to the Markdown rule.
+
+Web access grants control over an agent running with the host's configured authority. Pair only with listeners you trust, protect token files and pairing links, and review tool approvals. See [Security](../reference/security.md) and [RPC protocol](rpc-json.md).

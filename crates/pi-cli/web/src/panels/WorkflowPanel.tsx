@@ -9,132 +9,37 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { safeText } from '../redact';
-import type { EventFrame } from '../types';
+import {
+  WorkflowPanelAuthority,
+  projectWorkflowListSnapshot,
+  workflowActorNavigationKey,
+  workflowActionError,
+  workflowCommand,
+  workflowIdentity,
+  type WorkflowDetailRequest,
+  type WorkflowActorSnapshot,
+  type WorkflowEventPayload,
+  type WorkflowIdentity,
+  type WorkflowPanelSnapshot,
+  type WorkflowStatus,
+  type WorkflowWireSnapshot,
+} from './workflowPanelState';
 
-/* ------------------------------------------------------------------ *
- * Wire types (camelCase — see crates/pi-cli/src/workflow_rpc.rs and
- * crates/pi-cli/src/workflow_panel.rs)
- * ------------------------------------------------------------------ */
+export type {
+  WorkflowActiveTaskSnapshot,
+  WorkflowActivitySnapshot,
+  WorkflowActorSnapshot,
+  WorkflowAgentActivitySnapshot,
+  WorkflowIntegrationSnapshot,
+  WorkflowIrcSnapshot,
+  WorkflowJobSnapshot,
+  WorkflowPanelSnapshot,
+  WorkflowStatus,
+  WorkflowWireSnapshot,
+  WorkflowWorktreeSnapshot,
+  WorkflowEventPayload,
+} from './workflowPanelState';
 
-export type WorkflowStatus =
-  | 'queued'
-  | 'planning'
-  | 'running'
-  | 'paused'
-  | 'integrating'
-  | 'completed'
-  | 'failed'
-  | 'cancelled'
-  | 'conflicted';
-
-export interface WorkflowWireSnapshot {
-  workflowId: string;
-  name: string;
-  objective: string;
-  status: WorkflowStatus;
-  generation: number;
-  worktree?: string | null;
-  branch?: string | null;
-  supervisorAgentId?: string | null;
-  supervisorJobId?: string | null;
-  failure?: string | null;
-  integration?: string | null;
-}
-
-export interface WorkflowAgentActivitySnapshot {
-  atMs: number;
-  kind: 'task' | 'irc';
-  text: string;
-}
-
-export interface WorkflowActorSnapshot {
-  name: string;
-  status: string;
-  task?: string | null;
-  taskId?: string | null;
-  activity?: WorkflowAgentActivitySnapshot[];
-}
-
-export interface WorkflowActiveTaskSnapshot {
-  taskId?: string | null;
-  summary: string;
-}
-
-export interface WorkflowIrcSnapshot {
-  sender: string;
-  text: string;
-  atMs?: number;
-}
-
-export interface WorkflowActivitySnapshot {
-  atMs: number;
-  kind: 'thinking' | 'text' | 'tool' | 'irc';
-  text: string;
-}
-
-export interface WorkflowWorktreeSnapshot {
-  label: string;
-  branch: string;
-}
-
-export interface WorkflowIntegrationSnapshot {
-  step: 'pending' | 'integrating' | 'applied' | 'conflicted';
-  summary: string;
-  filesChanged?: number;
-  insertions?: number;
-  deletions?: number;
-  conflicts?: string[];
-}
-
-export interface WorkflowPanelSnapshot {
-  id: string;
-  generation: number;
-  name: string;
-  objective: string;
-  status: WorkflowStatus;
-  supervisor?: WorkflowActorSnapshot | null;
-  subagents: WorkflowActorSnapshot[];
-  activeTasks: WorkflowActiveTaskSnapshot[];
-  worktree?: WorkflowWorktreeSnapshot | null;
-  integration?: WorkflowIntegrationSnapshot | null;
-  planningActivity?: WorkflowActivitySnapshot[];
-  planningStartedAtMs?: number | null;
-  recentIrc?: WorkflowIrcSnapshot[];
-}
-
-interface WorkflowEventPayload extends EventFrame {
-  workflowId?: string;
-  generation?: number;
-  status?: WorkflowStatus;
-  snapshot?: WorkflowWireSnapshot;
-}
-
-/* ------------------------------------------------------------------ *
- * Workflow event fan-out: App dispatches workflow_* WS events here so the
- * mounted panel can refresh without prop-drilling. Module-level registry,
- * matching the liveNodes/streamBuf hot-path pattern in App.tsx.
- * ------------------------------------------------------------------ */
-
-type WorkflowEventListener = (frame: WorkflowEventPayload) => void;
-
-const workflowEventListeners = new Set<WorkflowEventListener>();
-
-export function dispatchWorkflowEvents(frame: WorkflowEventPayload): void {
-  for (const listener of workflowEventListeners) {
-    try {
-      listener(frame);
-    } catch {
-      /* a listener must never break the event dispatch */
-    }
-  }
-}
-
-function subscribeWorkflowEvents(listener: WorkflowEventListener): () => void {
-  workflowEventListeners.add(listener);
-  return () => {
-    workflowEventListeners.delete(listener);
-  };
-}
 
 /* ------------------------------------------------------------------ *
  * Status helpers
@@ -199,31 +104,79 @@ function clock(ms: number): string {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
+/** Detail-pane failure row: the LIVE panel snapshot's failure is authoritative
+ * while a runtime is resident (the supervisor's message may not have landed on
+ * the durable record yet); the durable list snapshot is the fallback. Mirrors
+ * WorkflowRuntimeDetail::from_live in detail.rs. */
+export function WorkflowDetailFailure({
+  selected,
+  detail,
+}: {
+  selected: WorkflowWireSnapshot;
+  detail: WorkflowPanelSnapshot | null;
+}) {
+  const failure = detail?.failure ?? selected.failure;
+  if (!failure) return null;
+  return (
+    <div className="workflow-detail__failure" title={safeText(failure)}>
+      failure: {safeText(failure)}
+    </div>
+  );
+}
+
 /* ------------------------------------------------------------------ *
  * Panel
  * ------------------------------------------------------------------ */
 
+export interface IrcReceipt {
+  to: string;
+  outcome: 'queued' | 'woken' | 'revived' | 'processed' | 'failed' | string;
+  requested?: string;
+  messageId?: string;
+  error?: string;
+}
+
 export interface WorkflowPanelProps {
+  sessionId: string;
   sendCommand: (command: Record<string, unknown>, bubbleId?: string) => Promise<unknown>;
+  subscribeEvents: (handler: (frame: WorkflowEventPayload) => void) => () => void;
   onClose: () => void;
 }
 
 const DETAIL_POLL_MS = 1500;
 const ACTIVITY_FEED_LIMIT = 6;
 
-export function WorkflowPanel({ sendCommand, onClose }: WorkflowPanelProps) {
+export function WorkflowPanel({ sessionId, sendCommand, subscribeEvents, onClose }: WorkflowPanelProps) {
   const [workflows, setWorkflows] = useState<WorkflowWireSnapshot[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [detail, setDetail] = useState<WorkflowPanelSnapshot | null>(null);
+  const [detailSnapshot, setDetail] = useState<WorkflowPanelSnapshot | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
   const [listError, setListError] = useState<string | null>(null);
   const [busy, setBusy] = useState<Set<string>>(new Set());
   const [createName, setCreateName] = useState('');
   const [createObjective, setCreateObjective] = useState('');
   const [creating, setCreating] = useState(false);
+  const creatingRef = useRef(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const [expandedAgents, setExpandedAgents] = useState<Set<string>>(new Set());
   const [refreshing, setRefreshing] = useState(false);
+  // IRC send composer: recipient + body + last receipts. Receipt outcomes are
+  // shown verbatim (queued/woken/revived/processed/failed) — "processed" is
+  // the backend's delivery classification and is never reworded as success.
+  const [ircRecipient, setIrcRecipient] = useState('');
+  const [ircBody, setIrcBody] = useState('');
+  const [ircSending, setIrcSending] = useState(false);
+  const ircSendingRef = useRef(false);
+  const [ircReceipts, setIrcReceipts] = useState<IrcReceipt[] | null>(null);
+  const [ircError, setIrcError] = useState<string | null>(null);
+  const createRequestRef = useRef(0);
+  const ircRequestRef = useRef(0);
+  const authorityRef = useRef(new WorkflowPanelAuthority(sessionId));
+  // Synchronous mirror of `workflows` so event/list settlement can compute the
+  // next list OUTSIDE a state updater — removed-workflow handling carries side
+  // effects (tombstone, selection clear, list refresh) that must never run
+  // inside an updater.
+  const workflowsRef = useRef<WorkflowWireSnapshot[]>([]);
 
   const selectedRef = useRef<string | null>(null);
   selectedRef.current = selectedId;
@@ -234,127 +187,209 @@ export function WorkflowPanel({ sendCommand, onClose }: WorkflowPanelProps) {
       mountedRef.current = false;
     };
   }, []);
-  // Reject stale workflow_detail responses: only the newest request wins.
-  const detailSeqRef = useRef(0);
+  const selectedIdentityRef = useRef<WorkflowIdentity | null>(null);
 
   /* ---------------- list ---------------- */
 
   const refreshList = useCallback(
-    (preserveSelection = true) => {
+    (preserveSelection = true): Promise<void> => {
+      const request = authorityRef.current.beginList();
       setRefreshing(true);
-      sendCommand({ type: 'workflow_list' })
+      // The returned promise settles when THIS list response settles (either
+      // outcome). Lifecycle actions chain on it so their authority gate can
+      // outlive the action RPC and hold until the list is authoritative.
+      return sendCommand(workflowCommand(sessionId, { type: 'workflow_list' }))
         .then((data) => {
-          const list = (data as { workflows?: WorkflowWireSnapshot[] }).workflows || [];
-          setWorkflows(() => {
-            const next = list.filter((w) => w && w.workflowId && w.status);
-            if (preserveSelection && selectedRef.current) {
-              const stillThere = next.some((w) => w.workflowId === selectedRef.current);
-              if (stillThere) return next;
-              setSelectedId(next[0]?.workflowId ?? null);
-              return next;
-            }
-            if (!selectedRef.current) setSelectedId(next[0]?.workflowId ?? null);
-            return next;
-          });
+          if (!mountedRef.current || !authorityRef.current.isCurrentList(request)) return;
+          const next = authorityRef.current.acceptList(request, workflowsRef.current, data);
+          if (!next) return;
+          workflowsRef.current = next;
+          setWorkflows(next);
+          if (preserveSelection && selectedRef.current) {
+            const stillThere = next.some((workflow) => workflow.workflowId === selectedRef.current);
+            if (!stillThere) setSelectedId(next[0]?.workflowId ?? null);
+          } else if (!selectedRef.current) {
+            setSelectedId(next[0]?.workflowId ?? null);
+          }
           setListError(null);
         })
         .catch((err: Error) => {
-          setListError(err.message);
+          if (mountedRef.current && authorityRef.current.isCurrentList(request)) setListError(err.message);
         })
-        .finally(() => setRefreshing(false));
+        .finally(() => {
+          if (mountedRef.current && authorityRef.current.isCurrentList(request)) setRefreshing(false);
+        });
     },
-    [sendCommand]
+    [sendCommand, sessionId]
   );
 
   /* ---------------- detail ---------------- */
 
-  const refreshDetail = useCallback(
-    (workflowId: string) => {
+  const refreshDetail: (identity: WorkflowIdentity) => void = useCallback(
+    (identity: WorkflowIdentity) => {
+      // Physical single-flight admission: an identical
+      // sessionId+workflowId+generation request already on the wire
+      // coalesces (returns null); a different identity records the one
+      // latest desired identity and waits for the physical settle — the
+      // concurrency limit can never be reached by polling.
+      const request = authorityRef.current.beginDetail(identity);
+      if (!request) return;
       setDetailError(null);
-      const seq = ++detailSeqRef.current;
-      sendCommand({ type: 'workflow_detail', workflowId })
-        .then((data) => {
-          if (seq !== detailSeqRef.current || !mountedRef.current) return;
-          const panel = data as WorkflowPanelSnapshot;
-          if (panel && panel.id) setDetail(panel);
-        })
-        .catch((err: Error) => {
-          if (seq !== detailSeqRef.current || !mountedRef.current) return;
-          setDetailError(err.message);
-        });
+      const send = (current: WorkflowDetailRequest): void => {
+        sendCommand(workflowCommand(sessionId, { type: 'workflow_detail', workflowId: current.identity.workflowId }))
+          .then((data) => {
+            if (!mountedRef.current) return;
+            const panel = authorityRef.current.acceptDetail(current, selectedIdentityRef.current, data);
+            if (panel) setDetail(panel);
+          })
+          .catch((err: Error) => {
+            if (!mountedRef.current) return;
+            // Superseded/cancelled requests AND removed-workflow failures are
+            // discarded silently: a "workflow was not found" arriving after an
+            // authoritative remove is a stale response, never an error.
+            if (!authorityRef.current.isCurrentDetail(current) || authorityRef.current.isRemoved(current.identity.workflowId)) return;
+            setDetailError(workflowActionError(err));
+          })
+          .finally(() => {
+            if (!mountedRef.current) return;
+            // Physical settle: release the on-wire slot, then launch AT MOST
+            // ONE latest desired identity — only if it is still exactly the
+            // selected identity and still exists in the accepted list. The
+            // recursion re-admits through every gate (removed/action-busy).
+            const desired = authorityRef.current.settleDetail(current);
+            if (!desired) return;
+            const selected = selectedIdentityRef.current;
+            if (
+              !selected ||
+              selected.sessionId !== desired.sessionId ||
+              selected.workflowId !== desired.workflowId ||
+              selected.generation !== desired.generation
+            ) return;
+            if (!workflowsRef.current.some((workflow) => workflow.workflowId === desired.workflowId)) return;
+            refreshDetail(desired);
+          });
+      };
+      send(request);
     },
-    [sendCommand]
+    [sendCommand, sessionId]
   );
 
   const selectWorkflow = useCallback((workflowId: string) => {
+    authorityRef.current.cancelDetail();
+    ircRequestRef.current += 1;
+    ircSendingRef.current = false;
+    setDetail(null);
+    setDetailError(null);
+    setExpandedAgents(new Set());
+    setIrcSending(false);
+    setIrcReceipts(null);
+    setIrcError(null);
     setSelectedId(workflowId);
   }, []);
+
+  /* ---------------- irc send ---------------- */
+
+  const sendIrc = useCallback(
+    (workflowId: string, generation: number) => {
+      const body = ircBody.trim();
+      const recipient = ircRecipient.trim();
+      if (!body || !recipient || ircSendingRef.current) return;
+      ircSendingRef.current = true;
+      setIrcSending(true);
+      setIrcError(null);
+      const requestId = ++ircRequestRef.current;
+      const identity = workflowIdentity(sessionId, { workflowId, generation });
+      const isCurrent = () => {
+        const selected = selectedIdentityRef.current;
+        return mountedRef.current &&
+          requestId === ircRequestRef.current &&
+          selected?.sessionId === identity.sessionId &&
+          selected.workflowId === identity.workflowId &&
+          selected.generation === identity.generation;
+      };
+      sendCommand(workflowCommand(sessionId, {
+        type: 'workflow_hub_send', workflowId, generation, recipient, body,
+      }))
+        .then((data) => {
+          if (!isCurrent()) return;
+          const payload = data as { receipts?: IrcReceipt[] };
+          setIrcReceipts(payload.receipts ?? []);
+          setIrcBody((current) => current.trim() === body ? '' : current);
+        })
+        .catch((err: Error) => {
+          if (isCurrent()) setIrcError(err.message);
+        })
+        .finally(() => {
+          if (isCurrent()) {
+            ircSendingRef.current = false;
+            setIrcSending(false);
+          }
+        });
+    },
+    [ircBody, ircRecipient, sendCommand, sessionId]
+  );
 
   /* ---------------- live events ---------------- */
 
   useEffect(() => {
-    return subscribeWorkflowEvents((frame) => {
-      const workflowId = frame.workflowId || '';
-      if (!workflowId) return;
-      setWorkflows((prev) => {
-        if (frame.type === 'workflow_removed') {
-          const next = prev.filter((w) => w.workflowId !== workflowId);
-          if (selectedRef.current === workflowId) {
-            setSelectedId(next[0]?.workflowId ?? null);
-          }
-          return next;
+    return subscribeEvents((frame) => {
+      const application = authorityRef.current.applyEvent(frame, workflowsRef.current);
+      if (!application) return;
+      workflowsRef.current = application.workflows;
+      setWorkflows(application.workflows);
+      if (selectedRef.current === application.workflowId) {
+        setDetail(null);
+        authorityRef.current.cancelDetail();
+        if (application.removed) {
+          // Authoritative removal event: applyEvent already tombstoned the
+          // identity. Clear selection + detail and refresh the LIST only —
+          // the removed id is never detailed again.
+          setSelectedId(application.workflows[0]?.workflowId ?? null);
+          ircRequestRef.current += 1;
+          ircSendingRef.current = false;
+          setIrcSending(false);
+          refreshList(true);
         }
-        if (frame.type === 'workflow_status_changed' && frame.status) {
-          const found = prev.some((w) => w.workflowId === workflowId);
-          if (!found) return prev;
-          return prev.map((w) =>
-            w.workflowId === workflowId
-              ? {
-                  ...w,
-                  status: frame.status as WorkflowStatus,
-                  name: typeof frame.name === 'string' ? (frame.name as string) : w.name,
-                }
-              : w
-          );
-        }
-        if (frame.type === 'workflow_updated' && frame.snapshot) {
-          const snap = frame.snapshot;
-          const exists = prev.some((w) => w.workflowId === workflowId);
-          const updated = exists
-            ? prev.map((w) => (w.workflowId === workflowId ? snap : w))
-            : [snap, ...prev];
-          return updated;
-        }
-        return prev;
-      });
-      // A workflow that changed status or updated matters for the open
-      // detail too: refresh it whenever the selected workflow is involved.
-      if (selectedRef.current === workflowId) {
-        refreshDetail(workflowId);
       }
     });
-  }, [refreshDetail]);
+  }, [refreshList, subscribeEvents]);
 
   /* ---------------- initial fetch + live poll ---------------- */
 
   useEffect(() => {
-    refreshList(false);
+    // refreshList returns its settlement promise (for action gating); the
+    // mount effect must not return it (React forbids non-cleanup returns).
+    void refreshList(false);
   }, [refreshList]);
 
-  // Any selection change (click, create, event-driven reselect) fetches the
-  // authoritative detail projection.
   useEffect(() => {
-    if (!selectedId) return;
-    refreshDetail(selectedId);
-  }, [selectedId, refreshDetail]);
+    const selected = workflows.find((workflow) => workflow.workflowId === selectedId) ?? null;
+    const identity = selected ? workflowIdentity(sessionId, selected) : null;
+    selectedIdentityRef.current = identity;
+    if (!identity) {
+      authorityRef.current.cancelDetail();
+      setDetail(null);
+      return;
+    }
+    // A removed identity is never detailed; while a lifecycle action is
+    // admitted for this workflow, NO effect (initial/list/event) may restart
+    // its detail stream — the settlement path owns exactly one refresh.
+    if (authorityRef.current.isRemoved(identity.workflowId) || authorityRef.current.isActionBusy(identity.workflowId)) return;
+    refreshDetail(identity);
+  }, [selectedId, workflows, refreshDetail, sessionId]);
 
   useEffect(() => {
-    if (!selectedId) return;
-    const selected = workflows.find((w) => w.workflowId === selectedId);
+    const selected = workflows.find((workflow) => workflow.workflowId === selectedId);
     const live = selected && !isTerminal(selected.status);
     if (!live) return;
     const timer = window.setInterval(() => {
-      refreshDetail(selectedRef.current || '');
+      const identity = selectedIdentityRef.current;
+      if (!identity) return;
+      // Same authority gates as the selection effect: removed identities and
+      // in-flight actions suppress the poll; single-flight coalesces ticks
+      // that race an open request.
+      if (authorityRef.current.isRemoved(identity.workflowId) || authorityRef.current.isActionBusy(identity.workflowId)) return;
+      refreshDetail(identity);
     }, DETAIL_POLL_MS);
     return () => window.clearInterval(timer);
   }, [selectedId, workflows, refreshDetail]);
@@ -362,66 +397,126 @@ export function WorkflowPanel({ sendCommand, onClose }: WorkflowPanelProps) {
   /* ---------------- actions ---------------- */
 
   const runAction = useCallback(
-    (command: string, workflowId: string) => {
-      setBusy((prev) => new Set(prev).add(workflowId));
-      sendCommand({ type: command, workflowId })
+    (command: string, identity: WorkflowIdentity) => {
+      // Admission: synchronously invalidate the detail authority for this
+      // workflow (any in-flight detail becomes stale), clear the stale detail
+      // error, and mark the row busy. Until settlement, no poll/effect may
+      // restart detail — zero further detail RPCs for this workflow.
+      authorityRef.current.beginAction(identity.workflowId);
+      setBusy((previous) => new Set(previous).add(identity.workflowId));
+      setDetailError(null);
+      sendCommand(workflowCommand(sessionId, { type: command, workflowId: identity.workflowId }))
         .then(() => {
-          refreshList(true);
-          refreshDetail(workflowId);
+          if (command === 'workflow_remove') {
+            // Remove is a terminal tombstone: the identity can never be
+            // detailed again. Clear the selection's detail and refresh the
+            // LIST only — never detail the removed id.
+            authorityRef.current.tombstoneWorkflow(identity.workflowId);
+            if (selectedRef.current === identity.workflowId) {
+              setDetail(null);
+              authorityRef.current.cancelDetail();
+            }
+            // Chain on the list settlement so the gate below outlives the
+            // action RPC: no poll may detail between the action response and
+            // the authoritative list.
+            return refreshList(true);
+          }
+          // Cancel/pause/resume/integrate: refresh the list ONCE. When the
+          // list authority accepts it and the workflow still exists and is
+          // selected, the selection effect issues exactly one detail refresh
+          // (single-flight coalesces anything racing it).
+          return refreshList(true);
         })
         .catch((err: Error & { rpc?: boolean }) => {
-          if (err.rpc) {
-            // The App already toasts RPC failures; surface the state too.
-            setDetailError(err.message);
+          // EVERY current action rejection — transport, timeout, or business
+          // — surfaces exactly once as a bounded panel error row (the global
+          // RPC layer stays silent for workflow_*). Suppression is
+          // identity-based only: a tombstoned workflow (authoritative remove)
+          // or a different current selection never renders an error. Never an
+          // error-message regex.
+          const selected = selectedIdentityRef.current;
+          if (
+            mountedRef.current &&
+            selected !== null &&
+            selected.sessionId === identity.sessionId &&
+            selected.workflowId === identity.workflowId &&
+            selected.generation === identity.generation &&
+            !authorityRef.current.isRemoved(identity.workflowId)
+          ) {
+            setDetailError(workflowActionError(err));
           }
-          refreshList(true);
+          return refreshList(true);
         })
         .finally(() => {
-          setBusy((prev) => {
-            const next = new Set(prev);
-            next.delete(workflowId);
+          // The gate releases only after the settlement list response settled
+          // (success or failure): between the action response and the
+          // authoritative list, no poll/effect may detail this workflow.
+          authorityRef.current.endAction(identity.workflowId);
+          setBusy((previous) => {
+            const next = new Set(previous);
+            next.delete(identity.workflowId);
             return next;
           });
         });
     },
-    [refreshDetail, refreshList, sendCommand]
+    [refreshList, sendCommand, sessionId]
   );
 
   const createWorkflow = useCallback(() => {
     const name = createName.trim();
     const objective = createObjective.trim();
-    if (!name || !objective || creating) return;
+    if (!name || !objective || creatingRef.current) return;
+    creatingRef.current = true;
     setCreating(true);
     setCreateError(null);
-    sendCommand({ type: 'workflow_create', name, objective })
+    const requestId = ++createRequestRef.current;
+    const selectionAtStart = selectedRef.current;
+    sendCommand(workflowCommand(sessionId, { type: 'workflow_create', name, objective }))
       .then((data) => {
-        const snap = data as WorkflowWireSnapshot;
-        setCreateName('');
-        setCreateObjective('');
-        if (snap && snap.workflowId) {
-          refreshList(false);
-          selectWorkflow(snap.workflowId);
-        } else {
-          refreshList(false);
-        }
+        if (!mountedRef.current || requestId !== createRequestRef.current) return;
+        const snapshot = projectWorkflowListSnapshot(data);
+        setCreateName((current) => current.trim() === name ? '' : current);
+        setCreateObjective((current) => current.trim() === objective ? '' : current);
+        refreshList(false);
+        if (snapshot && selectedRef.current === selectionAtStart) selectWorkflow(snapshot.workflowId);
       })
       .catch((err: Error & { rpc?: boolean }) => {
-        if (err.rpc) setCreateError(err.message);
+        // The create composer owns its error surface: EVERY current rejection
+        // — transport, timeout, or business — renders once, bounded. A stale
+        // request (superseded or unmounted) renders nothing.
+        if (mountedRef.current && requestId === createRequestRef.current) {
+          setCreateError(workflowActionError(err));
+        }
       })
-      .finally(() => setCreating(false));
-  }, [createName, createObjective, creating, refreshList, selectWorkflow, sendCommand]);
+      .finally(() => {
+        if (mountedRef.current && requestId === createRequestRef.current) {
+          creatingRef.current = false;
+          setCreating(false);
+        }
+      });
+  }, [createName, createObjective, refreshList, selectWorkflow, sendCommand, sessionId]);
 
   /* ---------------- derived ---------------- */
 
   const selected = workflows.find((w) => w.workflowId === selectedId) || null;
+  const selectedIdentity = selected ? workflowIdentity(sessionId, selected) : null;
+  const detail = detailSnapshot &&
+    selectedIdentity &&
+    detailSnapshot.id === selectedIdentity.workflowId &&
+    detailSnapshot.generation >= selectedIdentity.generation
+    ? detailSnapshot
+    : null;
   const selectedBusy = selected ? busy.has(selected.workflowId) : false;
   const isSelectedLive = selected ? !isTerminal(selected.status) : false;
 
   const toggleAgent = useCallback((name: string) => {
-    setExpandedAgents((prev) => {
-      const next = new Set(prev);
-      if (next.has(name)) next.delete(name);
-      else next.add(name);
+    const identity = selectedIdentityRef.current;
+    if (!identity) return;
+    const key = workflowActorNavigationKey(identity, name);
+    setExpandedAgents((previous) => {
+      const next = new Set(previous);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
       return next;
     });
   }, []);
@@ -528,6 +623,11 @@ export function WorkflowPanel({ sendCommand, onClose }: WorkflowPanelProps) {
                       </span>
                     )}
                   </div>
+                  {w.failure && (
+                    <div className="workflow-row__failure" title={safeText(w.failure)}>
+                      failure: {safeText(w.failure)}
+                    </div>
+                  )}
                   <div className="workflow-row__objective" title={safeText(w.objective)}>
                     {safeText(w.objective)}
                   </div>
@@ -560,11 +660,7 @@ export function WorkflowPanel({ sendCommand, onClose }: WorkflowPanelProps) {
                 {selected.branch && <span title="branch">{safeText(selected.branch)}</span>}
                 {selected.worktree && <span title="worktree (redacted label)">{safeText(selected.worktree)}</span>}
               </div>
-              {selected.failure && (
-                <div className="workflow-detail__failure" title={safeText(selected.failure)}>
-                  failure: {safeText(selected.failure)}
-                </div>
-              )}
+              <WorkflowDetailFailure selected={selected} detail={detail} />
               {selected.integration && (
                 <div className="workflow-detail__integration" title={safeText(selected.integration)}>
                   integration: {safeText(selected.integration)}
@@ -575,45 +671,45 @@ export function WorkflowPanel({ sendCommand, onClose }: WorkflowPanelProps) {
                 <button
                   id="workflow-pause-btn"
                   type="button"
-                  disabled={selectedBusy || !canPause(selected.status)}
+                  disabled={selectedBusy || !canPause(selected.status) || !selectedIdentity}
                   title="Pause this workflow (workflow_pause)"
-                  onClick={() => runAction('workflow_pause', selected.workflowId)}
+                  onClick={() => selectedIdentity && runAction('workflow_pause', selectedIdentity)}
                 >
                   Pause
                 </button>
                 <button
                   id="workflow-resume-btn"
                   type="button"
-                  disabled={selectedBusy || !canResume(selected.status)}
+                  disabled={selectedBusy || !canResume(selected.status) || !selectedIdentity}
                   title="Resume this workflow (workflow_resume)"
-                  onClick={() => runAction('workflow_resume', selected.workflowId)}
+                  onClick={() => selectedIdentity && runAction('workflow_resume', selectedIdentity)}
                 >
                   Resume
                 </button>
                 <button
                   id="workflow-cancel-btn"
                   type="button"
-                  disabled={selectedBusy || !canCancel(selected.status)}
+                  disabled={selectedBusy || !canCancel(selected.status) || !selectedIdentity}
                   title="Cancel this workflow (workflow_cancel)"
-                  onClick={() => runAction('workflow_cancel', selected.workflowId)}
+                  onClick={() => selectedIdentity && runAction('workflow_cancel', selectedIdentity)}
                 >
                   Cancel
                 </button>
                 <button
                   id="workflow-integrate-btn"
                   type="button"
-                  disabled={selectedBusy || !canIntegrate(selected.status)}
+                  disabled={selectedBusy || !canIntegrate(selected.status) || !selectedIdentity}
                   title="Integrate the worktree back to the source branch (workflow_integrate)"
-                  onClick={() => runAction('workflow_integrate', selected.workflowId)}
+                  onClick={() => selectedIdentity && runAction('workflow_integrate', selectedIdentity)}
                 >
                   Integrate
                 </button>
                 <button
                   id="workflow-remove-btn"
                   type="button"
-                  disabled={selectedBusy}
+                  disabled={selectedBusy || !selectedIdentity}
                   title="Remove this workflow (workflow_remove; cancels first when not terminal)"
-                  onClick={() => runAction('workflow_remove', selected.workflowId)}
+                  onClick={() => selectedIdentity && runAction('workflow_remove', selectedIdentity)}
                 >
                   Remove
                 </button>
@@ -624,10 +720,10 @@ export function WorkflowPanel({ sendCommand, onClose }: WorkflowPanelProps) {
               {/* supervisor + planning activity feed */}
               <section className="workflow-section" aria-label="Supervisor">
                 <h4 className="workflow-section__title">Supervisor</h4>
-                {detail?.supervisor ? (
+                {detail?.supervisor && selectedIdentity ? (
                   <ActorRow
                     actor={detail.supervisor}
-                    expanded={expandedAgents.has(detail.supervisor.name)}
+                    expanded={expandedAgents.has(workflowActorNavigationKey(selectedIdentity, detail.supervisor.name))}
                     onToggle={toggleAgent}
                   />
                 ) : (
@@ -700,7 +796,7 @@ export function WorkflowPanel({ sendCommand, onClose }: WorkflowPanelProps) {
                       <li key={agent.name} className="workflow-worker" data-worker={agent.name}>
                         <ActorRow
                           actor={agent}
-                          expanded={expandedAgents.has(agent.name)}
+                          expanded={Boolean(selectedIdentity && expandedAgents.has(workflowActorNavigationKey(selectedIdentity, agent.name)))}
                           onToggle={toggleAgent}
                         />
                       </li>
@@ -710,19 +806,99 @@ export function WorkflowPanel({ sendCommand, onClose }: WorkflowPanelProps) {
               </section>
 
               {/* recent IRC */}
-              {detail && detail.recentIrc && detail.recentIrc.length > 0 && (
+              {detail && (
                 <section className="workflow-section" aria-label="Recent IRC">
                   <h4 className="workflow-section__title">Recent IRC</h4>
-                  <ul className="workflow-irc">
-                    {detail.recentIrc.slice(-6).map((msg, index) => (
-                      <li key={`${msg.sender}-${index}`} className="workflow-irc__item">
-                        <span className="workflow-irc__sender">{safeText(msg.sender)}</span>
-                        <span className="workflow-irc__text" title={safeText(msg.text)}>
-                          {safeText(msg.text)}
-                        </span>
-                      </li>
-                    ))}
-                  </ul>
+                  {detail.recentIrc && detail.recentIrc.length > 0 && (
+                    <ul className="workflow-irc">
+                      {detail.recentIrc.slice(-6).map((msg, index) => (
+                        <li key={`${msg.sender}-${index}`} className="workflow-irc__item">
+                          <span className="workflow-irc__sender">{safeText(msg.sender)}</span>
+                          <span className="workflow-irc__time">
+                            {new Date(msg.atMs || Date.now()).toLocaleTimeString()}
+                          </span>
+                          <span className="workflow-irc__text" title={safeText(msg.text)}>
+                            {safeText(msg.text)}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  {/* hub send composer: recipient from the workflow's agents */}
+                  <form
+                    className="workflow-irc__composer"
+                    aria-label="Send workflow message"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      if (detail.id && detail.generation > 0) {
+                        sendIrc(detail.id, detail.generation);
+                      }
+                    }}
+                  >
+                    <select
+                      className="workflow-irc__recipient"
+                      aria-label="Recipient"
+                      value={ircRecipient}
+                      onChange={(event) => setIrcRecipient(event.target.value)}
+                      disabled={ircSending}
+                    >
+                      <option value="">recipient…</option>
+                      {[detail.supervisor, ...detail.subagents]
+                        .filter((agent): agent is NonNullable<typeof agent> => Boolean(agent))
+                        .map((agent) => (
+                          <option key={agent.name} value={agent.name}>
+                            {safeText(agent.name)}
+                            {agent.role ? ` (${safeText(agent.role)})` : ''}
+                          </option>
+                        ))}
+                    </select>
+                    <input
+                      className="workflow-irc__body"
+                      aria-label="Message body"
+                      value={ircBody}
+                      placeholder="message to send…"
+                      onChange={(event) => setIrcBody(event.target.value)}
+                      disabled={ircSending}
+                    />
+                    <button
+                      type="submit"
+                      className="workflow-irc__send"
+                      disabled={ircSending || !ircBody.trim() || !ircRecipient.trim()}
+                    >
+                      {ircSending ? 'sending…' : 'send'}
+                    </button>
+                  </form>
+                  {ircError && (
+                    <p className="workflow-irc__error" role="alert">{safeText(ircError)}</p>
+                  )}
+                  {ircReceipts && (
+                    <ul className="workflow-irc__receipts" aria-label="Delivery receipts">
+                      {ircReceipts.map((receipt, index) => {
+                        const presentation = receiptPresentation(receipt);
+                        return (
+                          <li
+                            key={`${receipt.to}-${index}`}
+                            className={`workflow-irc__receipt workflow-irc__receipt--${presentation.tone}`}
+                          >
+                            <span className="workflow-irc__receipt-to">{safeText(presentation.target)}</span>
+                            <span className={`workflow-irc__receipt-outcome workflow-irc__receipt-outcome--${presentation.tone}`}>
+                              {presentation.outcome}
+                            </span>
+                            {presentation.messageId && (
+                              <span className="workflow-irc__receipt-message" title={safeText(presentation.messageId)}>
+                                message {safeText(presentation.messageId)}
+                              </span>
+                            )}
+                            {presentation.error && (
+                              <span className="workflow-irc__receipt-error" title={safeText(presentation.error)}>
+                                {safeText(presentation.error)}
+                              </span>
+                            )}
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  )}
                 </section>
               )}
 
@@ -749,6 +925,45 @@ export function WorkflowPanel({ sendCommand, onClose }: WorkflowPanelProps) {
       </div>
     </aside>
   );
+}
+
+/* ------------------------------------------------------------------ *
+ * Receipt presentation: outcome verbatim from the backend contract. The
+ * pending set (queued/woken/revived) reads as "in flight", processed is the
+ * backend's own delivery classification (never reworded), failed carries the
+ * error text.
+ * ------------------------------------------------------------------ */
+
+export type ReceiptTone = 'pending' | 'processed' | 'failed';
+
+export function receiptTone(outcome: string): ReceiptTone {
+  switch (outcome) {
+    case 'queued':
+    case 'woken':
+    case 'revived':
+      return 'pending';
+    case 'processed':
+      return 'processed';
+    default:
+      return 'failed';
+  }
+}
+export interface ReceiptPresentation {
+  target: string;
+  tone: ReceiptTone;
+  outcome: string;
+  error: string;
+  messageId: string;
+}
+
+export function receiptPresentation(receipt: IrcReceipt): ReceiptPresentation {
+  return {
+    target: receipt.requested || receipt.to,
+    tone: receiptTone(receipt.outcome),
+    outcome: receipt.outcome,
+    error: receipt.error || '',
+    messageId: receipt.messageId || '',
+  };
 }
 
 /* ------------------------------------------------------------------ *

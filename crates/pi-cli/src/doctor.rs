@@ -5,8 +5,9 @@
 //! for shape and counts only, and their contents are never echoed — auth
 //! presence is reported as provider names and the file path.
 
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
@@ -21,6 +22,9 @@ const MAX_CONFIG_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// How many objective characters the dashboard prints before truncating.
 const MAX_OBJECTIVE_CHARS: usize = 80;
+const GIT_VERSION_TIMEOUT: Duration = Duration::from_secs(2);
+const GIT_VERSION_POLL: Duration = Duration::from_millis(10);
+const MAX_GIT_VERSION_BYTES: usize = 4 * 1024;
 
 /// Example `models.json` contents shown by `rpi setup` on a terminal.
 const MODELS_EXAMPLE: &str = r#"{
@@ -200,10 +204,7 @@ fn collect_doctor_checks(cli: &crate::Cli) -> Vec<Check> {
 fn agent_dir_check(agent_dir: Option<&Path>) -> Check {
     match agent_dir {
         Some(dir) => Check::pass("agent dir", dir.display().to_string()),
-        None => Check::fail(
-            "agent dir",
-            "cannot resolve (set HOME or PI_CODING_AGENT_DIR)",
-        ),
+        None => Check::fail("agent dir", "cannot resolve (set HOME or RPI_HOME)"),
     }
 }
 
@@ -215,14 +216,14 @@ fn models_json_check(path: Option<&Path>) -> Check {
         Some(path) => match dry_parse_models_json(path) {
             Ok((providers, models)) => Check::pass(
                 "models.json",
-                format!("{} ({providers} providers, {models} models)", path.display()),
+                format!(
+                    "{} ({providers} providers, {models} models)",
+                    path.display()
+                ),
             ),
             Err(error) => Check::fail("models.json", format!("{}: {error:#}", path.display())),
         },
-        None => Check::fail(
-            "models.json",
-            "cannot resolve (set HOME or PI_CODING_AGENT_DIR)",
-        ),
+        None => Check::fail("models.json", "cannot resolve (set HOME or RPI_HOME)"),
     }
 }
 
@@ -350,7 +351,7 @@ fn setup_into(json: bool, agent_dir: Option<&Path>, writer: &mut impl Write) -> 
             }
         }
         None => {
-            let message = "cannot resolve the agent directory (set HOME or PI_CODING_AGENT_DIR)";
+            let message = "cannot resolve the rpi directory (set HOME or RPI_HOME)";
             if json {
                 writeln!(
                     writer,
@@ -383,13 +384,24 @@ fn write_setup_guidance<W: Write>(writer: &mut W, dir: &Path, models: &Path, aut
     writeln!(writer, "auth.json example:").expect("writing setup guidance");
     writeln!(writer, "{AUTH_EXAMPLE}").expect("writing setup guidance");
     writeln!(writer).expect("writing setup guidance");
-    writeln!(writer, "Environment variables (e.g. MY_PROVIDER_API_KEY) and `rpi login`")
-        .expect("writing setup guidance");
-    writeln!(writer, "are also supported for credentials. rpi never prints secrets.")
-        .expect("writing setup guidance");
+    writeln!(
+        writer,
+        "Environment variables (e.g. MY_PROVIDER_API_KEY) and `rpi login`"
+    )
+    .expect("writing setup guidance");
+    writeln!(
+        writer,
+        "are also supported for credentials. rpi never prints secrets."
+    )
+    .expect("writing setup guidance");
 }
 
-fn write_setup_json<W: Write>(writer: &mut W, dir: &Path, models: &Path, auth: &Path) -> Result<()> {
+fn write_setup_json<W: Write>(
+    writer: &mut W,
+    dir: &Path,
+    models: &Path,
+    auth: &Path,
+) -> Result<()> {
     let report = serde_json::json!({
         "command": "setup",
         "agentDir": dir,
@@ -418,24 +430,21 @@ pub fn dashboard_command(cli: &crate::Cli, json: bool) -> Result<()> {
 fn dashboard_into(cli: &crate::Cli, json: bool, writer: &mut impl Write) -> Result<()> {
     let cwd = resolve_cwd(cli)?;
     let settings_dir = load_settings_session_dir(&cwd, cli).ok().flatten();
-    let session_dir =
-        match crate::session_run::effective_session_dir(
-            &cwd,
-            cli.session_dir.as_deref(),
-            settings_dir.as_deref(),
-        ) {
-            Ok(dir) => dir,
-            Err(_) => fallback_session_dir(cli, &cwd),
-        };
+    let session_dir = match crate::session_run::effective_session_dir(
+        &cwd,
+        cli.session_dir.as_deref(),
+        settings_dir.as_deref(),
+    ) {
+        Ok(dir) => dir,
+        Err(_) => fallback_session_dir(cli, &cwd),
+    };
 
     let sessions = scan_session_files(&session_dir);
     let latest = sessions
         .iter()
         .max_by_key(|(_, modified)| *modified)
         .map(|(path, _)| path.clone());
-    let latest_info = latest
-        .as_deref()
-        .and_then(|path| session_info(path).ok());
+    let latest_info = latest.as_deref().and_then(|path| session_info(path).ok());
     let goal = latest
         .as_deref()
         .and_then(|path| read_goal_summary(path).ok())
@@ -480,8 +489,8 @@ fn read_goal_summary(path: &Path) -> Result<Option<GoalSummary>> {
     let tree = pi_coding::load_session_tree(path)
         .with_context(|| format!("reading session {}", path.display()))?;
     let events = pi_coding::goal_events_from_session_tree(&tree)?;
-    let runtime = pi_coding::GoalRuntime::from_events(&events)
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let runtime =
+        pi_coding::GoalRuntime::from_events(&events).map_err(|error| anyhow::anyhow!("{error}"))?;
     let Some(goal) = runtime.get().current else {
         return Ok(None);
     };
@@ -573,9 +582,9 @@ fn write_dashboard_text<W: Write>(
     }
     match goal {
         Some(goal) => {
-            let budget = goal.token_budget.map_or_else(String::new, |budget| {
-                format!(", budget {budget}")
-            });
+            let budget = goal
+                .token_budget
+                .map_or_else(String::new, |budget| format!(", budget {budget}"));
             writeln!(
                 writer,
                 "goal:              {} — \"{}\" ({} tokens used{budget})",
@@ -585,8 +594,13 @@ fn write_dashboard_text<W: Write>(
         }
         None => writeln!(writer, "goal:              none").expect("writing dashboard"),
     }
-    writeln!(writer, "tools ({}):        {}", tools.len(), tools.join(" "))
-        .expect("writing dashboard");
+    writeln!(
+        writer,
+        "tools ({}):        {}",
+        tools.len(),
+        tools.join(" ")
+    )
+    .expect("writing dashboard");
 }
 
 fn write_dashboard_json<W: Write>(
@@ -666,20 +680,83 @@ fn probe_writable(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Probe `git` availability, returning its version line.
+/// Probe the fixed `git --version` operator boundary with a bounded wait and
+/// bounded output. A separate reader prevents a hostile or broken executable
+/// from filling the pipe and stalling the timeout loop.
 fn git_version() -> Result<String> {
-    let output = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    command
         .arg("--version")
-        .output()
-        .context("spawning git")?;
-    if !output.status.success() {
-        bail!("git --version exited with {}", output.status);
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
     }
-    let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let mut child = command.spawn().context("spawning git")?;
+    let stdout = child.stdout.take().context("git stdout was unavailable")?;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout
+            .take(
+                u64::try_from(MAX_GIT_VERSION_BYTES)
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(1),
+            )
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        let _ = sender.send(result);
+    });
+
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() >= GIT_VERSION_TIMEOUT => {
+                terminate_git_probe(&mut child);
+                bail!("git --version timed out");
+            }
+            Ok(None) => std::thread::sleep(GIT_VERSION_POLL),
+            Err(error) => {
+                terminate_git_probe(&mut child);
+                return Err(error).context("waiting for git");
+            }
+        }
+    };
+    let bytes = match receiver.recv_timeout(Duration::from_secs(1)) {
+        Ok(result) => result.context("reading git version")?,
+        Err(_) => {
+            terminate_git_probe(&mut child);
+            bail!("git --version output remained open after exit");
+        }
+    };
+    if bytes.len() > MAX_GIT_VERSION_BYTES {
+        terminate_git_probe(&mut child);
+        bail!("git --version output exceeded the size limit");
+    }
+    if !status.success() {
+        bail!("git --version exited with {status}");
+    }
+    let version = String::from_utf8_lossy(&bytes).trim().to_owned();
     if version.is_empty() {
         bail!("git --version produced no output");
     }
     Ok(version)
+}
+
+fn terminate_git_probe(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Ok(pid) = i32::try_from(child.id()) {
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Read-only `models.json` parse: size-bound read, comment stripping, and JSON
@@ -710,11 +787,7 @@ fn dry_parse_models_json(path: &Path) -> Result<(usize, usize)> {
         .and_then(serde_json::Value::as_object)
         .map_or(0, |map| {
             map.values()
-                .filter_map(|provider| {
-                    provider
-                        .get("models")
-                        .and_then(serde_json::Value::as_array)
-                })
+                .filter_map(|provider| provider.get("models").and_then(serde_json::Value::as_array))
                 .map(Vec::len)
                 .sum()
         });
@@ -815,7 +888,10 @@ mod tests {
         let session_root = tempfile::tempdir().expect("session dir");
         let cli = parse_subcommand(
             "doctor",
-            &["--session-dir", session_root.path().to_str().expect("utf-8")],
+            &[
+                "--session-dir",
+                session_root.path().to_str().expect("utf-8"),
+            ],
             false,
         );
         let output = render(&cli, false).expect("doctor");
@@ -831,7 +907,10 @@ mod tests {
             "git",
             "providers",
         ] {
-            assert!(text.contains(section), "missing section {section:?} in:\n{text}");
+            assert!(
+                text.contains(section),
+                "missing section {section:?} in:\n{text}"
+            );
         }
         assert!(text.contains("PASS"), "expected PASS lines in:\n{text}");
         assert!(
@@ -845,11 +924,15 @@ mod tests {
         let session_root = tempfile::tempdir().expect("session dir");
         let cli = parse_subcommand(
             "doctor",
-            &["--session-dir", session_root.path().to_str().expect("utf-8")],
+            &[
+                "--session-dir",
+                session_root.path().to_str().expect("utf-8"),
+            ],
             true,
         );
         let output = render(&cli, true).expect("doctor json");
-        let report: serde_json::Value = serde_json::from_slice(&output).expect("doctor json parses");
+        let report: serde_json::Value =
+            serde_json::from_slice(&output).expect("doctor json parses");
         assert_eq!(report["command"], "doctor");
         assert!(report["version"].is_string());
         let checks = report["checks"].as_array().expect("checks array");
@@ -906,8 +989,14 @@ mod tests {
         let mut buf = Vec::new();
         write_doctor_text(&mut buf, std::slice::from_ref(&check));
         let text = String::from_utf8(buf).expect("utf-8");
-        assert!(text.contains("FAIL"), "expected FAIL for malformed models.json:\n{text}");
-        assert!(text.contains("models.json"), "expected models.json check:\n{text}");
+        assert!(
+            text.contains("FAIL"),
+            "expected FAIL for malformed models.json:\n{text}"
+        );
+        assert!(
+            text.contains("models.json"),
+            "expected models.json check:\n{text}"
+        );
         assert!(
             !text.contains("must-not-leak-model-content"),
             "models.json content leaked:\n{text}"
@@ -921,9 +1010,19 @@ mod tests {
         setup_into(false, Some(agent.path()), &mut buf).expect("setup");
         let text = String::from_utf8(buf).expect("utf-8");
         let lines = text.lines().collect::<Vec<_>>();
-        assert_eq!(lines.len(), 2, "expected exactly two path lines, got:\n{text}");
-        assert_eq!(lines[0], agent.path().join("models.json").display().to_string());
-        assert_eq!(lines[1], agent.path().join("auth.json").display().to_string());
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected exactly two path lines, got:\n{text}"
+        );
+        assert_eq!(
+            lines[0],
+            agent.path().join("models.json").display().to_string()
+        );
+        assert_eq!(
+            lines[1],
+            agent.path().join("auth.json").display().to_string()
+        );
     }
 
     #[test]
@@ -942,8 +1041,16 @@ mod tests {
             serde_json::Value::String(agent.path().join("auth.json").display().to_string())
         );
         let examples = &report["examples"];
-        assert!(examples["modelsJson"].as_str().is_some_and(|s| s.contains("providers")));
-        assert!(examples["authJson"].as_str().is_some_and(|s| s.contains("api_key")));
+        assert!(
+            examples["modelsJson"]
+                .as_str()
+                .is_some_and(|s| s.contains("providers"))
+        );
+        assert!(
+            examples["authJson"]
+                .as_str()
+                .is_some_and(|s| s.contains("api_key"))
+        );
     }
 
     #[test]
@@ -1016,8 +1123,7 @@ mod tests {
             serde_json::from_slice(&render(&cli_json, true).expect("dashboard json"))
                 .expect("dashboard parses");
         assert_eq!(
-            report["goal"]["objective"],
-            "deploy with [REDACTED]",
+            report["goal"]["objective"], "deploy with [REDACTED]",
             "dashboard JSON must redact the goal objective"
         );
     }
@@ -1062,7 +1168,10 @@ mod tests {
         let output = render(&cli, false).expect("dashboard");
         let text = String::from_utf8(output).expect("utf-8");
         assert!(text.contains("sessions:          2"), "count in:\n{text}");
-        assert!(text.contains("newer"), "latest session should be newer:\n{text}");
+        assert!(
+            text.contains("newer"),
+            "latest session should be newer:\n{text}"
+        );
         assert!(
             text.contains("goal:              active — \"Ship the release\" (1200 tokens used)"),
             "goal line in:\n{text}"
@@ -1107,7 +1216,11 @@ mod tests {
         assert_eq!(models, 3);
         let check = models_json_check(Some(&path));
         assert_eq!(check.status, Status::Pass);
-        assert!(check.detail.contains("2 providers, 3 models"), "detail: {}", check.detail);
+        assert!(
+            check.detail.contains("2 providers, 3 models"),
+            "detail: {}",
+            check.detail
+        );
     }
 
     #[test]

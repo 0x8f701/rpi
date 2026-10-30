@@ -1,15 +1,17 @@
 #![cfg(unix)]
 
+use nix::pty::{Winsize, openpty};
+use nix::sys::termios::{SetArg, Termios, cfmakeraw, tcgetattr, tcsetattr};
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use nix::pty::{Winsize, openpty};
-use nix::sys::termios::{SetArg, Termios, cfmakeraw, tcgetattr, tcsetattr};
 use tempfile::TempDir;
 
-fn rpi_bin() -> String { env!("CARGO_BIN_EXE_rpi").to_owned() }
+fn rpi_bin() -> String {
+    env!("CARGO_BIN_EXE_rpi").to_owned()
+}
 
 fn type_chars(writer: &mut std::fs::File, text: &str) {
     for byte in text.bytes() {
@@ -38,13 +40,40 @@ export default function (pi) {
   }});
 }
 "#).unwrap();
-    let pty = openpty(Some(&Winsize { ws_row: 24, ws_col: 100, ws_xpixel: 0, ws_ypixel: 0 }), None::<&Termios>).unwrap();
+    let pty = openpty(
+        Some(&Winsize {
+            ws_row: 24,
+            ws_col: 100,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        }),
+        None::<&Termios>,
+    )
+    .unwrap();
     let mut slave_termios = tcgetattr(&pty.slave).unwrap();
     cfmakeraw(&mut slave_termios);
     tcsetattr(&pty.slave, SetArg::TCSANOW, &slave_termios).unwrap();
     let slave_in = pty.slave.try_clone().unwrap();
     let slave_out = pty.slave.try_clone().unwrap();
-    let mut child = Command::new(rpi_bin()).env_clear().env("HOME", home.path()).env("PATH", std::env::var("PATH").unwrap_or_default()).env("TERM", "xterm-256color").env("PI_OFFLINE", "1").env("PI_SKIP_VERSION_CHECK", "1").args(["--model", "faux/faux-1", "--extension", extension.to_str().unwrap()]).current_dir(cwd.path()).stdin(Stdio::from(slave_in)).stdout(Stdio::from(slave_out)).stderr(Stdio::from(pty.slave)).spawn().unwrap();
+    let mut child = Command::new(rpi_bin())
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("TERM", "xterm-256color")
+        .env("RPI_OFFLINE", "1")
+        .env("RPI_SKIP_VERSION_CHECK", "1")
+        .args([
+            "--model",
+            "faux/faux-1",
+            "--extension",
+            extension.to_str().unwrap(),
+        ])
+        .current_dir(cwd.path())
+        .stdin(Stdio::from(slave_in))
+        .stdout(Stdio::from(slave_out))
+        .stderr(Stdio::from(pty.slave))
+        .spawn()
+        .unwrap();
     let mut writer = std::fs::File::from(pty.master.try_clone().unwrap());
     let mut master = std::fs::File::from(pty.master);
     let output = Arc::new(Mutex::new(String::new()));
@@ -56,7 +85,10 @@ export default function (pi) {
                 Ok(0) => break,
                 Ok(count) => {
                     let chunk = &bytes[..count];
-                    captured.lock().unwrap().push_str(&String::from_utf8_lossy(chunk));
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push_str(&String::from_utf8_lossy(chunk));
                     if chunk.windows(4).any(|window| window == b"\x1b[6n") {
                         let _ = master.write_all(b"\x1b[1;1R");
                         let _ = master.flush();
@@ -66,7 +98,16 @@ export default function (pi) {
             }
         }
     });
-    let wait_for = |needle: &str, timeout: Duration| { let deadline = Instant::now() + timeout; while Instant::now() < deadline { if output.lock().unwrap().contains(needle) { return true; } thread::sleep(Duration::from_millis(25)); } false };
+    let wait_for = |needle: &str, timeout: Duration| {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if output.lock().unwrap().contains(needle) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        false
+    };
     assert!(
         wait_for("rpi", Duration::from_secs(30))
             || wait_for("π", Duration::from_secs(5))
@@ -76,14 +117,35 @@ export default function (pi) {
     );
     writer.write_all(b"/run dialog-smoke\r").unwrap();
     writer.flush().unwrap();
-    assert!(wait_for("Choose target", Duration::from_secs(15)), "select missing: {}", output.lock().unwrap());
-    writer.write_all(b"\x1b[B\r").unwrap(); writer.flush().unwrap();
-    assert!(wait_for("Enter suffix", Duration::from_secs(15)), "input missing: {}", output.lock().unwrap());
+    assert!(
+        wait_for("Choose target", Duration::from_secs(15)),
+        "select missing: {}",
+        output.lock().unwrap()
+    );
+    writer.write_all(b"\x1b[B\r").unwrap();
+    writer.flush().unwrap();
+    assert!(
+        wait_for("Enter suffix", Duration::from_secs(15)),
+        "input missing: {}",
+        output.lock().unwrap()
+    );
     type_chars(&mut writer, "typed");
-    writer.write_all(b"\r").unwrap(); writer.flush().unwrap();
-    assert!(wait_for("result:beta-value:typed", Duration::from_secs(15)), "result missing: {}", output.lock().unwrap());
-    writer.write_all(&[0x04]).unwrap(); writer.flush().unwrap();
+    writer.write_all(b"\r").unwrap();
+    writer.flush().unwrap();
+    assert!(
+        wait_for("result:beta-value:typed", Duration::from_secs(15)),
+        "result missing: {}",
+        output.lock().unwrap()
+    );
+    writer.write_all(&[0x04]).unwrap();
+    writer.flush().unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
-    while Instant::now() < deadline { if child.try_wait().unwrap().is_some() { return; } thread::sleep(Duration::from_millis(25)); }
-    let _ = child.kill(); panic!("TUI did not exit");
+    while Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let _ = child.kill();
+    panic!("TUI did not exit");
 }

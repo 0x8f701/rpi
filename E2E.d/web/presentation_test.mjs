@@ -30,9 +30,98 @@ const token = process.env.RPI_TOKEN || '';
 const chromePath = process.env.RPI_CHROME || '';
 const evidence = process.env.RPI_EVIDENCE || '.';
 
-const executed = new Set();
+const executed = new Map(); // id -> exact execution count (per-ID ledger, no Set erasure)
+// The documented contract this lane must execute EXACTLY once — IN THE
+// ACTUAL ASSERTION-SITE (runtime) ORDER (the matrix requires the published
+// executed array to equal the documented array in order).
+const DOCUMENTED_IDS = [
+  'pres.composer-equal-height',
+  'pres.command-title',
+  'pres.command-no-bash-title',
+  'pres.command-no-default-args',
+  'pres.command-success-green',
+  'pres.command-two-line-clamp',
+  'pres.command-failure-red',
+  'pres.write-summary',
+  'pres.read-summary',
+  'pres.image-render',
+  'pres.grep-oversized-single-call',
+  'pres.grep-doom-loop-identity',
+  'pres.process-long',
+  'pres.process-short',
+  'pres.process-summary',
+  'pres.process-equal-width',
+  'pres.process-error-op',
+  'pres.hub-wait-running',
+  'pres.activity-tool-visible',
+  'pres.hub-wait-timeout',
+  'pres.hub-wait-typed-running',
+  'pres.hub-wait-typed-irc',
+  'pres.hub-send-card',
+  'pres.no-raw-json',
+  'pres.no-done-text',
+  'pres.tool-cards-equal-width',
+  'pres.activity-reduced-motion-static',
+  'pres.activity-thinking-visible',
+  'pres.thinking-streaming-visible',
+  'pres.thinking-header-icon',
+  'pres.thinking-no-bare-marker',
+  'pres.thinking-multiline-body',
+  'pres.thinking-final-fold',
+  'pres.tb.thinking-prose',
+  'pres.activity-thinking-tool-precedence',
+  'pres.tb.card-live-no-raw',
+  'pres.tb.card-done-no-raw',
+  'pres.thinking-narrow-no-overflow',
+  'pres.activity-mobile-no-overflow',
+  'pres.video-controls',
+  'pres.media-hostile-rejected',
+  'pres.bash-execution-durable',
+  'pres.host-switch-hidden-default',
+  'pres.session-providers-only',
+  'pres.session-no-tmp-uuid',
+  'pres.session-search-filter',
+  'pres.session-search-clear',
+  'pres.host-switch-hidden-mobile',
+  'pres.composer-equal-height-mobile',
+];
+const pageErrors = [];
+const consoleErrors = [];
+const turnByPage = new WeakMap();
+const turnFramesByPage = new WeakMap();
+function observeBrowserErrors(page) {
+  const turnFrames = { startWaiters: [], terminals: new Map(), terminalWaiters: new Map() };
+  turnFramesByPage.set(page, turnFrames);
+  page.on('pageerror', (err) => pageErrors.push(err.message));
+  page.on('console', (msg) => {
+    if (msg.type() === 'error') consoleErrors.push(msg.text());
+  });
+  page.on('websocket', (socket) => {
+    socket.on('framereceived', (frame) => {
+      let event;
+      try {
+        event = JSON.parse(String(frame.payload));
+      } catch {
+        return;
+      }
+      const sessionId = typeof event.sessionId === 'string' ? event.sessionId : '';
+      const turnId = typeof event.turnId === 'string' ? event.turnId : '';
+      if (event.type === 'turn_started' && sessionId !== '' && turnId !== '') {
+        const index = turnFrames.startWaiters.findIndex((waiter) => waiter.sessionId === '' || waiter.sessionId === sessionId);
+        if (index >= 0) turnFrames.startWaiters.splice(index, 1)[0].resolve({ sessionId, turnId });
+      }
+      if (event.type === 'turn_terminal' && sessionId !== '' && turnId !== '') {
+        const key = `${sessionId}:${turnId}`;
+        turnFrames.terminals.set(key, event.status);
+        const waiters = turnFrames.terminalWaiters.get(key) || [];
+        turnFrames.terminalWaiters.delete(key);
+        for (const resolve of waiters) resolve(event.status);
+      }
+    });
+  });
+}
 function record(id) {
-  executed.add(id);
+  executed.set(id, (executed.get(id) || 0) + 1);
   console.log(`[web-pres:assert] ${id}`);
 }
 function fail(message) {
@@ -53,6 +142,23 @@ async function assertId(page, id, fn, label, timeoutMs = 30000, arg) {
   await waitFor(page, fn, `${id}: ${label}`, timeoutMs, arg);
   record(id);
 }
+async function assertActivityId(page, id, state, label, timeoutMs = 30000) {
+  const turn = turnByPage.get(page);
+  if (!turn) fail(`${id}: no authoritative turn identity`);
+  await assertId(
+    page,
+    id,
+    ({ state: expectedState, sessionId, turnId }) => {
+      const strip = document.getElementById('activity-strip');
+      return strip?.dataset.state === expectedState
+        && strip.dataset.sessionId === sessionId
+        && strip.dataset.turnId === turnId;
+    },
+    label,
+    timeoutMs,
+    { state, sessionId: turn.sessionId, turnId: turn.turnId },
+  );
+}
 
 async function connectPage(page) {
   if (token) {
@@ -60,19 +166,62 @@ async function connectPage(page) {
   }
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
   await waitFor(page, () => document.title === 'rpi web', 'page title missing');
-  await waitFor(page, () => document.querySelector('#conn-state') !== null, 'conn-state missing');
-  await waitFor(page, () => document.getElementById('conn-state').dataset.state === 'on', 'WS did not reach "connected"');
+  await waitFor(page, () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true, 'WS did not reach "connected"');
 }
 
-/** Send a prompt. */
+/** Send a prompt and capture its authoritative new turn identity. */
 async function sendPrompt(page, text) {
+  const sessionId = await page.evaluate(() => document.querySelector('.session-sidebar__row--active .session-sidebar__switch')?.dataset.sessionId || '');
+  const turnFrames = turnFramesByPage.get(page);
+  if (!turnFrames) fail('turn frame observer was not installed');
+  const turnIdPromise = new Promise((resolve, reject) => {
+    const waiter = { sessionId, resolve };
+    turnFrames.startWaiters.push(waiter);
+    setTimeout(() => {
+      const index = turnFrames.startWaiters.indexOf(waiter);
+      if (index >= 0) turnFrames.startWaiters.splice(index, 1);
+      reject(new Error(`turn did not start for ${text}`));
+    }, 20000);
+  });
   await page.fill('#prompt-input', text);
   await page.press('#prompt-input', 'Enter');
+  try {
+    const turn = await turnIdPromise;
+    turnByPage.set(page, turn);
+    return turn.turnId;
+  } catch (error) {
+    fail(error.message);
+  }
 }
 
-/** Wait for the turn to settle (stream badge cleared). */
+/** Wait for the captured authoritative terminal frame, then its strip unmount. */
+async function waitForTerminal(page, expectedStatus = 'succeeded', timeoutMs = 40000) {
+  const turn = turnByPage.get(page);
+  if (!turn) fail('waitForTerminal requires a captured turn id');
+  const turnFrames = turnFramesByPage.get(page);
+  if (!turnFrames) fail('turn frame observer was not installed');
+  const key = `${turn.sessionId}:${turn.turnId}`;
+  let terminalStatus = turnFrames.terminals.get(key);
+  if (terminalStatus === undefined) {
+    terminalStatus = await new Promise((resolve, reject) => {
+      const waiters = turnFrames.terminalWaiters.get(key) || [];
+      waiters.push(resolve);
+      turnFrames.terminalWaiters.set(key, waiters);
+      setTimeout(() => reject(new Error(`turn ${turn.turnId} did not settle`)), timeoutMs);
+    }).catch((error) => fail(error.message));
+  }
+  if (terminalStatus !== expectedStatus) fail(`turn ${turn.turnId} ended with ${terminalStatus || 'unknown'} status`);
+  await waitFor(
+    page,
+    () => document.getElementById('activity-strip') === null,
+    `turn ${turn.turnId} strip did not unmount`,
+    timeoutMs,
+  );
+  turnByPage.delete(page);
+}
+
 async function waitForSettled(page, timeoutMs = 40000) {
-  await waitFor(page, () => document.getElementById('stream-badge').hidden === true, 'turn did not settle (stream badge still on)', timeoutMs);
+  await waitForTerminal(page, 'succeeded', timeoutMs);
 }
 
 /** Raw RPC client over the SAME listener (second WS session). */
@@ -134,7 +283,7 @@ async function main() {
   try {
     // ============ connect + composer equal height (desktop) ============
     const page = await browser.newPage();
-    page.on('pageerror', (err) => console.error(`web-pres: page error: ${err.message}`));
+    observeBrowserErrors(page);
     await connectPage(page);
 
     await assertId(
@@ -291,6 +440,56 @@ async function main() {
       'read image card did not render a decoded inline image',
     );
     await waitForSettled(page);
+    // ============ oversized grep: one call survives a >64 MiB file ============
+    await sendPrompt(page, 'presentation oversized grep');
+    await assertId(
+      page,
+      'pres.grep-oversized-single-call',
+      () => {
+        const cards = [...document.querySelectorAll('.tool-card[data-tool-name="grep"]')];
+        if (cards.length !== 1) return false;
+        const card = cards[0];
+        if (card.getAttribute('data-tool-status') !== 'done') return false;
+        const text = card.textContent || '';
+        return text.includes('early.txt:1: needle early')
+          && text.includes('later.txt:1: needle later')
+          && /huge\.txt:\d+: needle huge/.test(text)
+          && !text.includes('repeated failure');
+      },
+      'oversized grep did not settle in one successful call with all matches',
+      45000,
+    );
+    await page.screenshot({ path: path.join(evidence, 'grep-oversized-single-call.png'), fullPage: true });
+    await waitForSettled(page);
+    // ============ doom loop: 3 backend calls == 3 unique DOM identities ==========
+    const grepCardBaseline = await page.evaluate(() => document.querySelectorAll('.tool-card[data-tool-name="grep"]').length);
+    await sendPrompt(page, 'presentation grep doom loop');
+    await assertId(
+      page,
+      'pres.grep-doom-loop-identity',
+      (baseline) => {
+        const expected = [
+          'call-presentation-grep-doom-1',
+          'call-presentation-grep-doom-2',
+          'call-presentation-grep-doom-3',
+        ];
+        const allCards = [...document.querySelectorAll('.tool-card[data-tool-name="grep"]')];
+        const cards = allCards.slice(baseline);
+        const ids = cards.map((card) => card.getAttribute('data-tool-call-id') || '');
+        if (cards.length !== 3 || new Set(ids).size !== 3) return false;
+        if (expected.some((id, index) => ids[index] !== id)) return false;
+        const doomCards = cards.filter((card) => (card.textContent || '').includes('repeated failure'));
+        return doomCards.length === 1
+          && doomCards[0] === cards[2]
+          && cards[2].getAttribute('data-tool-status') === 'error'
+          && (cards[2].textContent || '').includes('repeated failure (3× identical /grep errors)');
+      },
+      'doom-loop backend IDs did not reconcile to exactly three unique DOM cards',
+      45000,
+      grepCardBaseline,
+    );
+    await page.screenshot({ path: path.join(evidence, 'grep-doom-loop-identities.png'), fullPage: true });
+    await waitForTerminal(page, 'failed');
 
     // ============ Process cards long + short (human summary, equal width) ============
     await sendPrompt(page, 'presentation process long');
@@ -386,7 +585,13 @@ async function main() {
       'hub wait running card did not render the humanized waiting view',
       15000,
     );
-    // RPC client (second WS session) for the typed delivery below; reused by
+    await assertActivityId(
+      page,
+      'pres.activity-tool-visible',
+      'tool',
+      'activity strip never projected the running Hub tool',
+      15000,
+    );
     // the durable bashExecution section further down.
     rpc = rpcClient(wsUrlFrom(url));
     await rpc.ready;
@@ -497,7 +702,7 @@ async function main() {
           for (const card of document.querySelectorAll(sel)) {
             if (card.querySelector('.tool-card__args') !== null) return false;
             // Default (non-expanded) view must not dump raw JSON key:value noise.
-            const txt = card.textContent || '';
+            const txt = [...card.querySelectorAll('.tool-card__head, .tool-card__command-line, .tool-card__summary-line, .tool-card__summary-path, .tool-card__summary-text')].map((node) => node.textContent || '').join('\n');
             if (txt.includes('"path":') || txt.includes('"command":') || txt.includes('"op":') || txt.includes('"argv":')) return false;
           }
         }
@@ -528,14 +733,46 @@ async function main() {
       },
       'tool cards in the transcript differ in width by >1px',
     );
+    const reduced = await browser.newPage({
+      viewport: { width: 1280, height: 800 },
+      reducedMotion: 'reduce',
+    });
+    observeBrowserErrors(reduced);
+    await connectPage(reduced);
+    await sendPrompt(reduced, 'presentation thinking turn');
+    await assertActivityId(
+      reduced,
+      'pres.activity-reduced-motion-static',
+      'thinking',
+      'activity strip did not bind reduced-motion Thinking to the prompted turn',
+      20000,
+    );
+    await waitFor(
+      reduced,
+      () => {
+        const dot = document.querySelector('#activity-strip .activity-strip__dot');
+        return dot !== null && getComputedStyle(dot).animationName === 'none';
+      },
+      'activity strip dot still animated under reduced motion',
+      20000,
+    );
+    await reduced.screenshot({ path: path.join(evidence, 'activity-strip-thinking-reduced-motion.png'), fullPage: true });
+    await waitForSettled(reduced);
+    await reduced.close();
 
-    // ============ Thinking — streaming visible, final hidden ============
+    // ============ Thinking — streaming visible, final fold remains ============
     // Enable reasoning so the mock's reasoning_content deltas are requested.
     if (await page.evaluate(() => document.getElementById('thinking-select') !== null)) {
       await page.selectOption('#thinking-select', 'high');
     }
     await sendPrompt(page, 'presentation thinking turn');
-    // During the stream the <details class="thinking"> must be visible with
+    await assertActivityId(
+      page,
+      'pres.activity-thinking-visible',
+      'thinking',
+      'activity strip never projected Thinking',
+      20000,
+    );
     // a non-empty body — and OPEN by default (default-visible contract), so
     // the body actually renders on screen until the user collapses it.
     await assertId(
@@ -599,23 +836,30 @@ async function main() {
         if (!body) return false;
         const text = body.textContent || '';
         if (text.includes('\\n')) return false;
-        return text.split('\n').length >= 3;
+        const paragraphs = body.querySelectorAll('p.md-p').length;
+        return paragraphs >= 3 || text.split('\n').length >= 3;
       },
       'thinking body did not render real multiple lines from literal \\n',
       15000,
     );
     await waitForSettled(page);
-    // After completion the final assistant turn must contain NO thinking block.
     await assertId(
       page,
-      'pres.thinking-final-hidden',
+      'pres.thinking-final-fold',
       () => {
         const nodes = [...document.querySelectorAll('.msg--assistant')];
         if (nodes.length === 0) return false;
         const last = nodes[nodes.length - 1];
-        return last.querySelector('.thinking') === null;
+        const t = last.querySelector('.thinking');
+        if (!t || t.hidden !== false) return false;
+        const body = t.querySelector('.thinking__body');
+        if (!body) return false;
+        const text = body.textContent || '';
+        if (text.includes('\\n')) return false;
+        const paragraphs = body.querySelectorAll('p.md-p').length;
+        return paragraphs >= 3 || text.split('\n').length >= 3;
       },
-      'completed assistant turn still contains a thinking block',
+      'completed assistant turn lost the thinking fold or collapsed literal \\n to one line',
     );
 
     // ============ Thinking + streamed tool call — no raw JSON ever ============
@@ -655,7 +899,8 @@ async function main() {
       page,
       'pres.tb.thinking-prose',
       () => {
-        const t = document.querySelector('.thinking');
+        const last = [...document.querySelectorAll('.msg--assistant')].at(-1);
+        const t = last?.querySelector('.thinking');
         if (!t || t.hidden !== false) return false;
         const body = t.querySelector('.thinking__body');
         if (!body) return false;
@@ -665,15 +910,21 @@ async function main() {
       'thinking block did not show the reasoning prose during the think+bash stream',
       20000,
     );
-    // While the Command card is live and the turn still streams: no
+    await assertActivityId(
+      page,
+      'pres.activity-thinking-tool-precedence',
+      'tool',
+      'activity strip did not promote the running tool above thinking',
+      20000,
+    );
     // `.assistant-toolcall` element, no raw JSON/args anywhere in the
     // transcript, and the structured card carries the Command title.
     await assertId(
       page,
       'pres.tb.card-live-no-raw',
       () => {
-        const badge = document.getElementById('stream-badge');
-        if (!badge || badge.hidden !== false) return false;
+        const strip = document.getElementById('activity-strip');
+        if (!strip || strip.dataset.state !== 'tool') return false;
         if (document.querySelector('#transcript .assistant-toolcall') !== null) return false;
         const txt = (document.getElementById('transcript')?.textContent || '');
         if (txt.includes('{"command"') || txt.includes('"command":')) return false;
@@ -713,6 +964,7 @@ async function main() {
     // ============ Thinking — 390px viewport: long/CJK lines wrap, no overflow ============
     {
       const narrow = await browser.newPage({ viewport: { width: 390, height: 844 } });
+      observeBrowserErrors(narrow);
       await connectPage(narrow);
       await sendPrompt(narrow, 'presentation thinking turn');
       // The long unbroken run in the reasoning body must WRAP (overflow-wrap:
@@ -722,7 +974,8 @@ async function main() {
         narrow,
         'pres.thinking-narrow-no-overflow',
         () => {
-          const t = document.querySelector('.thinking');
+          const last = [...document.querySelectorAll('.msg--assistant')].at(-1);
+          const t = last?.querySelector('.thinking');
           if (!t || t.hidden !== false) return false;
           const body = t.querySelector('.thinking__body');
           if (!body || (body.textContent || '').length === 0) return false;
@@ -737,10 +990,66 @@ async function main() {
         'thinking body overflows a 390px viewport (long line did not wrap)',
         20000,
       );
+      const narrowTurn = turnByPage.get(narrow);
+      if (!narrowTurn) fail('pres.activity-mobile-no-overflow: no authoritative turn identity');
+      await assertId(
+        narrow,
+        'pres.activity-mobile-no-overflow',
+        ({ sessionId, turnId }) => {
+          const strip = document.getElementById('activity-strip');
+          if (!strip || strip.dataset.state !== 'thinking') return false;
+          const rect = strip.getBoundingClientRect();
+          return strip.dataset.sessionId === sessionId
+            && strip.dataset.turnId === turnId
+            && strip.scrollWidth <= strip.clientWidth + 1
+            && rect.left >= -1
+            && rect.right <= window.innerWidth + 1;
+        },
+        'activity strip overflowed the 390px viewport',
+        20000,
+        narrowTurn,
+      );
+      await narrow.screenshot({ path: path.join(evidence, 'activity-strip-thinking-mobile.png'), fullPage: true });
       await waitForSettled(narrow);
       await narrow.close();
     }
 
+
+    // ============ media video (controls + preload + no autoplay) ============
+    await sendPrompt(page, 'presentation media video');
+    await assertId(
+      page,
+      'pres.video-controls',
+      () => {
+        const cards = [...document.querySelectorAll('.tool-card--read')];
+        const card = cards[cards.length - 1];
+        if (!card) return false;
+        const video = card.querySelector('video.tool-media__video');
+        return !!video
+          && video.controls
+          && (video.getAttribute('preload') || '') === 'metadata'
+          && !video.autoplay
+          && video.paused;
+      },
+      'media video did not render with controls + preload=metadata + no autoplay',
+    );
+    await waitForSettled(page);
+
+    // ============ hostile media rejected (no image / no video) ============
+    await sendPrompt(page, 'presentation media hostile');
+    await waitForSettled(page);
+    await assertId(
+      page,
+      'pres.media-hostile-rejected',
+      () => {
+        const cards = [...document.querySelectorAll('.tool-card--read')];
+        const card = cards[cards.length - 1];
+        return !!card
+          && card.querySelector('.tool-media__image') === null
+          && card.querySelector('.tool-media__video') === null;
+      },
+      'hostile media was rendered instead of rejected',
+    );
     // ============ durable bashExecution (RPC → live .msg--bash) ============
     // The durable `execute_bash` RPC publishes a BashExecutionEnd session
     // event the web client renders live as a .msg--bash card (success →
@@ -767,6 +1076,17 @@ async function main() {
     // ============ session sidebar — providers + no tmp/UUID + search ============
     await waitFor(page, () => document.getElementById('session-sidebar') !== null, 'session sidebar did not render');
     await waitFor(page, () => document.querySelectorAll('.session-sidebar__row').length >= 1, 'session sidebar never listed rows');
+    await page.click('#settings-toggle-btn');
+    await assertId(
+      page,
+      'pres.host-switch-hidden-default',
+      () => document.querySelector('.settings-connection input[type="password"]')?.getClientRects().length > 0
+        && document.getElementById('settings-token-save-btn')?.getClientRects().length > 0
+        && document.getElementById('host-input') === null,
+      'Connection token controls were unreachable or removed host input reappeared on desktop',
+    );
+    await page.screenshot({ path: path.join(evidence, 'header-host-hidden-desktop.png'), fullPage: true });
+    await page.click('#settings-close-btn');
     await assertId(
       page,
       'pres.session-providers-only',
@@ -816,48 +1136,26 @@ async function main() {
       rowsBefore,
     );
 
-    // ============ media video (controls + preload + no autoplay) ============
-    await sendPrompt(page, 'presentation media video');
-    await assertId(
-      page,
-      'pres.video-controls',
-      () => {
-        const cards = [...document.querySelectorAll('.tool-card--read')];
-        const card = cards[cards.length - 1];
-        if (!card) return false;
-        const v = card.querySelector('video.tool-media__video');
-        if (!v) return false;
-        if (!v.controls) return false;
-        if ((v.getAttribute('preload') || '') !== 'metadata') return false;
-        // No autoplay: the element must be paused with no autoplay attr.
-        if (v.autoplay) return false;
-        return v.paused;
-      },
-      'media video did not render with controls + preload=metadata + no autoplay',
-    );
-    await waitForSettled(page);
-
-    // ============ hostile media rejected (no image / no video) ============
-    await sendPrompt(page, 'presentation media hostile');
-    await waitForSettled(page);
-    await assertId(
-      page,
-      'pres.media-hostile-rejected',
-      () => {
-        const cards = [...document.querySelectorAll('.tool-card--read')];
-        const card = cards[cards.length - 1];
-        if (!card) return false;
-        return card.querySelector('.tool-media__image') === null && card.querySelector('.tool-media__video') === null;
-      },
-      'hostile media was rendered instead of rejected',
-    );
 
     // ============ composer controls (mobile viewport) ============
     // At phone width the textarea occupies its own row, so the three controls
     // are not on the same baseline; assert the two action buttons share one
     // height and the textarea keeps a usable width (per the mobile contract).
     const mobile = await browser.newPage({ viewport: { width: 375, height: 667 } });
+    observeBrowserErrors(mobile);
     await connectPage(mobile);
+    await mobile.click('#sidebar-toggle-btn');
+    await mobile.click('#settings-toggle-btn');
+    await assertId(
+      mobile,
+      'pres.host-switch-hidden-mobile',
+      () => document.querySelector('.settings-connection input[type="password"]')?.getClientRects().length > 0
+        && document.getElementById('settings-token-save-btn')?.getClientRects().length > 0
+        && document.getElementById('host-input') === null,
+      'Connection token controls were unreachable or removed host input reappeared on mobile',
+    );
+    await mobile.screenshot({ path: path.join(evidence, 'header-host-hidden-mobile.png'), fullPage: true });
+    await mobile.click('#settings-close-btn');
     await assertId(
       mobile,
       'pres.composer-equal-height-mobile',
@@ -874,10 +1172,40 @@ async function main() {
       'mobile composer buttons differ in height by >1px or textarea width <240px',
     );
 
+    if (pageErrors.length > 0 || consoleErrors.length > 0) {
+      fail(`browser errors observed: ${JSON.stringify({ pageErrors, consoleErrors })}`);
+    }
+    // Exact per-ID ledger gate BEFORE any write: every documented id must
+    // have executed EXACTLY once and nothing undocumented may execute; the
+    // published executed array is the documented order (ordered equality —
+    // never a sorted comparison).
+    const missing = DOCUMENTED_IDS.filter((id) => !executed.has(id));
+    if (missing.length > 0) {
+      fail(`presentation evidence incomplete: ${missing.join(', ')} never executed (coverage matrix contract)`);
+    }
+    const overExecuted = [...executed.keys()].filter((id) => !DOCUMENTED_IDS.includes(id));
+    if (overExecuted.length > 0) {
+      fail(`presentation evidence drift: executed-but-undocumented ids: ${overExecuted.join(', ')}`);
+    }
+    const repeatedIds = [...executed].filter(([, count]) => count !== 1).map(([id]) => id);
+    if (repeatedIds.length > 0) {
+      fail(`presentation evidence exact-once violation: ${repeatedIds.join(', ')}`);
+    }
     await fs.promises.mkdir(evidence, { recursive: true });
     fs.writeFileSync(
       path.join(evidence, 'coverage-assertions.json'),
-      JSON.stringify({ executed: [...executed].sort() }, null, 2),
+      // The REAL ledger: executed is the Map's insertion order (actual
+      // execution order — never a reconstruction of DOCUMENTED_IDS); counts
+      // the real per-ID ledger. The gates above proved documented == executed
+      // as exact-once sets; the matrix's ordered gate additionally proves
+      // the runtime order matches the documented order.
+      JSON.stringify({
+        documented: [...DOCUMENTED_IDS],
+        executed: [...executed.keys()],
+        counts: Object.fromEntries(executed),
+        pageErrors,
+        consoleErrors,
+      }, null, 2),
     );
     console.log(`web-pres: PASS — ${executed.size} assertions`);
   } finally {

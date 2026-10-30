@@ -298,7 +298,10 @@ pub fn redact_worktree_path(path: &str) -> Option<String> {
         for component in as_path.components() {
             match component {
                 Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
-                Component::CurDir | Component::ParentDir | Component::Prefix(_) | Component::RootDir => {}
+                Component::CurDir
+                | Component::ParentDir
+                | Component::Prefix(_)
+                | Component::RootDir => {}
             }
         }
         return if parts.is_empty() {
@@ -339,7 +342,9 @@ pub async fn dispatch_workflow_command(
     command: WorkflowRpcCommand,
 ) -> Result<Value> {
     match command {
-        WorkflowRpcCommand::WorkflowCreate { name, objective, .. } => {
+        WorkflowRpcCommand::WorkflowCreate {
+            name, objective, ..
+        } => {
             if name.trim().is_empty() {
                 bail!("workflow name must not be empty");
             }
@@ -360,7 +365,11 @@ pub async fn dispatch_workflow_command(
         WorkflowRpcCommand::WorkflowGet {
             workflow_id, name, ..
         } => {
-            if workflow_id.as_deref().map(str::trim).unwrap_or("").is_empty()
+            if workflow_id
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
                 && name.as_deref().map(str::trim).unwrap_or("").is_empty()
             {
                 bail!("workflow_get requires workflowId or name");
@@ -371,7 +380,11 @@ pub async fn dispatch_workflow_command(
         WorkflowRpcCommand::WorkflowDetail {
             workflow_id, name, ..
         } => {
-            if workflow_id.as_deref().map(str::trim).unwrap_or("").is_empty()
+            if workflow_id
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
                 && name.as_deref().map(str::trim).unwrap_or("").is_empty()
             {
                 bail!("workflow_detail requires workflowId or name");
@@ -435,11 +448,7 @@ impl ApplicationWorkflowHost {
         bail!("workflow selector requires workflowId or name")
     }
 
-    async fn lifecycle(
-        &self,
-        workflow_id: &str,
-        op: LifecycleOp,
-    ) -> Result<WorkflowSnapshot> {
+    async fn lifecycle(&self, workflow_id: &str, op: LifecycleOp) -> Result<WorkflowSnapshot> {
         let current = self.manager.get(&WorkflowId::new(workflow_id))?;
         let id = current.workflow_id.clone();
         let generation = current.generation;
@@ -486,9 +495,7 @@ impl WorkflowRpcHost for ApplicationWorkflowHost {
         let detail = self
             .application
             .workflow_detail(&snapshot.workflow_id, snapshot.generation)?;
-        Ok(crate::workflow_panel::WorkflowPanelSnapshot::from_runtime_detail(
-            &detail, &snapshot,
-        ))
+        Ok(crate::workflow_panel::WorkflowPanelSnapshot::from_runtime_detail(&detail, &snapshot))
     }
 
     async fn pause(&self, workflow_id: &str) -> Result<WorkflowSnapshot> {
@@ -629,6 +636,7 @@ mod memory_host {
                     phases: Vec::new(),
                     storage: pi_coding::TodoStorage::Memory,
                 },
+                durable_policy: crate::test_support::test_durable_policy_state(),
                 // Store absolute path in label field to exercise redaction.
                 worktree_label: Some(absolute.to_string_lossy().into_owned()),
                 branch: Some(format!("workflow/{label}")),
@@ -636,6 +644,8 @@ mod memory_host {
                 supervisor_job_id: None,
                 failure: None,
                 integration: pi_coding::WorkflowIntegration::None,
+                planning_prompts_consumed: 0,
+
             };
             workflows.push(snap.clone());
             Ok(snap)
@@ -673,7 +683,9 @@ mod memory_host {
             // Test double: no live runtime, so project the durable snapshot
             // (same fallback the Application uses for terminal workflows).
             let snapshot = self.get(workflow_id, name)?;
-            Ok(crate::workflow_panel::WorkflowPanelSnapshot::from(&snapshot))
+            Ok(crate::workflow_panel::WorkflowPanelSnapshot::from(
+                &snapshot,
+            ))
         }
 
         async fn pause(&self, workflow_id: &str) -> Result<WorkflowSnapshot> {

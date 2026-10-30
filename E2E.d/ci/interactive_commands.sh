@@ -134,7 +134,7 @@ launch_tui() {
         "env -i HOME='$root/home' USERPROFILE='$root/home' PATH='$binpath:/usr/bin:/bin' \
 LANG=${LANG:-C.UTF-8} LC_ALL=${LC_ALL:-C.UTF-8} \
 PI_CODING_AGENT_DIR='$root/home/.pi/agent' \
-PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 \
+RPI_OFFLINE=1 RPI_SKIP_VERSION_CHECK=1 \
 PI_FAUX_RESPONSE='${FAUX_REPLY:-$FAUX_REPLY_NORMAL}' \
 TERM=xterm-256color \
 ${FAUX_EXTRA:-} \
@@ -158,7 +158,7 @@ launch_repl() {
         "env -i HOME='$root/home' USERPROFILE='$root/home' PATH='$binpath:/usr/bin:/bin' \
 LANG=${LANG:-C.UTF-8} LC_ALL=${LC_ALL:-C.UTF-8} \
 PI_CODING_AGENT_DIR='$root/home/.pi/agent' \
-PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 \
+RPI_OFFLINE=1 RPI_SKIP_VERSION_CHECK=1 \
 PI_FAUX_RESPONSE='${FAUX_REPLY:-$FAUX_REPLY_NORMAL}' \
 TERM=xterm-256color \
 ${FAUX_EXTRA:-} \

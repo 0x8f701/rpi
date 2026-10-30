@@ -48,13 +48,29 @@ run_rpc_state() {
 import json, sys
 rows=[json.loads(line) for line in open(sys.argv[1], encoding='utf-8') if line.strip()]
 r={row.get('id'):row for row in rows if row.get('type')=='response'}
-assert any(m.get('provider')=='faux' and m.get('id')=='faux-1' for m in r['models']['data']['models'])
 assert r['goal-get']['data']['current']['objective']=='deterministic release readiness'
-assert r['todo-state']['data']['todoPhases'][0]['tasks'][1]['blockedBy'][0]['taskId']=='inventory'
+assert r['todo-state']['data']['todoPhases'][0]['tasks'][1]['waitingOn'][0]['taskId']=='inventory'
 assert len(r['loops']['data'])==1
 assert isinstance(r['commands']['data']['commands'], list)
+PRIMARY=[
+    "settings","model","branch","resume","fork","export","dump","handoff",
+    "agents","role","persona","compact","rewind","checkpoint","ps","loop",
+    "goal","workflow","code-review","btw","queue","live","skill",
+    "theme","thinking","todo","tree","trust","jobs",
+    "activity","irc",
+]
+assert len(PRIMARY)==31, PRIMARY
+catalog=r['commands']['data']['commands']
+by_name={}
+for c in catalog:
+    by_name.setdefault(c.get('name'),[]).append(c.get('source'))
+for name in PRIMARY:
+    sources=by_name.get(name,[])
+    assert sources==['builtin'], (name, sources)
+assert by_name.get("todo-child",[])==[], by_name.get("todo-child")
 assert r['bash']['data']['output']=='tools-campaign'
 assert len(r['process-list']['data']) >= 1
+assert all(m.get('provider') != 'faux' for m in r['models']['data']['models'])
 PY
 }
 
@@ -93,15 +109,21 @@ export default function (pi) {
 EOF
     register_tmux_session "$session"
     tmux new-session -d -s "$session" -x 120 -y 31 -c "$root/workspace" \
-        "env HOME='$root/home' USERPROFILE='$root/home' PI_CODING_AGENT_DIR='$root/home/.pi/agent' PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 TERM=xterm-256color '$RPI_BIN' --offline --model faux/faux-1 --extension '$extension'"
+        "env HOME='$root/home' USERPROFILE='$root/home' PI_CODING_AGENT_DIR='$root/home/.pi/agent' RPI_OFFLINE=1 RPI_SKIP_VERSION_CHECK=1 TERM=xterm-256color '$RPI_BIN' --offline --model faux/faux-1 --extension '$extension'"
     sleep 2
     tmux send-keys -t "$session":0 '/run alpha hello' C-m
-    sleep 1
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        tmux capture-pane -p -S -1000 -t "$session":0 > "$evidence/tui-run.txt"
+        grep -F 'alpha:hello' "$evidence/tui-run.txt" >/dev/null && break
+        sleep 0.1
+    done
+    grep -F 'alpha:hello' "$evidence/tui-run.txt" >/dev/null
     tmux send-keys -t "$session":0 '/chain alpha one | beta two' C-m
     sleep 2
     tmux capture-pane -p -e -S -1000 -t "$session":0 > "$evidence/tui.ansi"
     tmux capture-pane -p -S -1000 -t "$session":0 > "$evidence/tui.txt"
-    grep -F 'alpha:hello' "$evidence/tui.txt" >/dev/null
+    grep -F 'alpha:one' "$evidence/tui.txt" >/dev/null
     grep -F 'beta:two' "$evidence/tui.txt" >/dev/null
 }
 
@@ -112,7 +134,7 @@ run_tmux_matrix() {
         cols="${size%x*}"; rows="${size#*x}"; root="$(scenario_workspace "tmux-$size")"; evidence="$EVIDENCE_ROOT/tmux-$size"; session="$(unique_tmux_name "matrix-$size")"
         register_tmux_session "$session"
         tmux new-session -d -s "$session" -x "$cols" -y "$rows" -c "$root/workspace" \
-            "env HOME='$root/home' USERPROFILE='$root/home' PI_CODING_AGENT_DIR='$root/home/.pi/agent' PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 PI_FAUX_RESPONSE=matrix-$size TERM=xterm-256color '$RPI_BIN' --offline --model faux/faux-1"
+            "env HOME='$root/home' USERPROFILE='$root/home' PI_CODING_AGENT_DIR='$root/home/.pi/agent' RPI_OFFLINE=1 RPI_SKIP_VERSION_CHECK=1 PI_FAUX_RESPONSE=matrix-$size TERM=xterm-256color '$RPI_BIN' --offline --model faux/faux-1"
         sleep 2
         tmux send-keys -t "$session":0 'matrix input probe' C-m
         sleep 2
@@ -148,6 +170,9 @@ case "${1:-run}" in
         printf 'campaigns passed\nevidence=%s\n' "$EVIDENCE_ROOT"
         printf 'note: run the workflow release lane separately: bash E2E.d/ci/workflow.sh run\n'
         ;;
+    version) prepare_roots; require_rpi; run_version; printf 'version campaign passed\nevidence=%s\n' "$EVIDENCE_ROOT" ;;
+    faux-json) prepare_roots; require_rpi; require_cmd python3; run_faux_json; printf 'faux-json campaign passed\nevidence=%s\n' "$EVIDENCE_ROOT" ;;
+    rpc-state) prepare_roots; require_rpi; require_cmd python3; run_rpc_state; printf 'rpc-state campaign passed\nevidence=%s\n' "$EVIDENCE_ROOT" ;;
     openai-schema) prepare_roots; require_rpi; require_cmd python3; run_openai_schema; printf 'openai schema campaign passed\nevidence=%s\n' "$EVIDENCE_ROOT" ;;
     bash-tui) prepare_roots; require_rpi; run_bash_tui; printf 'bash TUI campaign passed\nevidence=%s\n' "$EVIDENCE_ROOT" ;;
     orchestration) "$SCRIPT_DIR/orchestration.sh" run ;;
@@ -162,11 +187,15 @@ case "${1:-run}" in
     user) "$SCRIPT_DIR/user_scenarios.sh" run ;;
     user-goal) "$SCRIPT_DIR/user_scenarios.sh" goal ;;
     user-rewind-compact) "$SCRIPT_DIR/user_scenarios.sh" rewind-compact ;;
+    user-code-review-expand) "$SCRIPT_DIR/user_scenarios.sh" code-review-expand ;;
+    user-code-review-submodule) "$SCRIPT_DIR/user_scenarios.sh" code-review-submodule ;;
+    user-code-review-operations) "$SCRIPT_DIR/user_scenarios.sh" code-review-operations ;;
     user-btw) "$SCRIPT_DIR/user_scenarios.sh" btw ;;
     user-steering-queue) "$SCRIPT_DIR/user_scenarios.sh" steering-queue ;;
     user-bash-card) "$SCRIPT_DIR/user_scenarios.sh" bash-card ;;
     user-fence) "$SCRIPT_DIR/user_scenarios.sh" fence ;;
     user-todo-dag) "$SCRIPT_DIR/user_scenarios.sh" todo-dag ;;
+    user-todo-nl-mutations) "$SCRIPT_DIR/user_scenarios.sh" todo-nl-mutations ;;
     user-workflow-run) "$SCRIPT_DIR/user_scenarios.sh" workflow-run ;;
-    *) fail "usage: $0 [run|list|--dry-run|openai-schema|bash-tui|orchestration|orchestration-rpc|orchestration-rust|orchestration-tmux|workflow|workflow-rpc|workflow-tmux|extension|tmux-matrix|user|user-goal|user-rewind-compact|user-btw|user-steering-queue|user-bash-card|user-fence|user-todo-dag|user-workflow-run]" ;;
+    *) fail "usage: $0 [run|list|--dry-run|version|faux-json|rpc-state|openai-schema|bash-tui|orchestration|orchestration-rpc|orchestration-rust|orchestration-tmux|workflow|workflow-rpc|workflow-tmux|extension|tmux-matrix|user|user-goal|user-rewind-compact|user-code-review-expand|user-code-review-submodule|user-code-review-operations|user-btw|user-steering-queue|user-bash-card|user-fence|user-todo-dag|user-todo-nl-mutations|user-workflow-run]" ;;
 esac

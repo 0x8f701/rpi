@@ -8,11 +8,11 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use pi_agent::ThinkingLevel;
+use pi_ai::Model;
 use pi_ai::providers::{
     FauxProviderOptions, FauxProviderRegistration, FauxResponse, register_faux_provider,
 };
-use pi_ai::Model;
-use pi_agent::ThinkingLevel;
 use pi_cli::extension_ui::ExtensionUiAdapter;
 use pi_cli::modes::listen::{ListenConfig, ListenHandle, MAX_CONNECTION_TASKS, start};
 use pi_coding::{Application, ProcessSpawnSpec, Session, SessionOptions};
@@ -27,6 +27,15 @@ pub const REMOTE_UI_DISABLED: &str = "remote interactive extension UI is disable
 
 pub fn unique(label: &str) -> String {
     format!("{label}-{}", uuid::Uuid::now_v7().simple())
+}
+
+/// Hermetic session-store fixture: create `<cwd>/sessions` and bind it as the
+/// session's directory before `Application` bootstrap, which fails closed when
+/// the sandbox authority cannot open the session store root.
+pub fn prepare_session_store(session: &pi_coding::Session, cwd: &std::path::Path) {
+    let session_dir = cwd.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session directory");
+    session.set_session_dir(session_dir);
 }
 
 pub fn spawn_sleep_spec(cwd: &std::path::Path, seconds: u64) -> ProcessSpawnSpec {
@@ -82,20 +91,43 @@ pub async fn faux_application(label: &str) -> FauxApp {
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: None,
+        auth_manager: None,
     })
     .expect("session");
-    let session_dir = cwd.path().join("sessions");
-    std::fs::create_dir_all(&session_dir).expect("session dir");
+    prepare_session_store(&session, cwd.path());
+    let agent_dir = cwd.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).expect("agent directory");
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+    )
+    .expect("sandbox settings");
+    let mut resource_options = pi_coding::ResourceManagerOptions::new(cwd.path());
+    resource_options.agent_dir = agent_dir;
+    resource_options.project_trust_override = Some(true);
+    resource_options.disable_extensions = true;
+    resource_options.disable_skills = true;
+    resource_options.disable_prompt_templates = true;
+    resource_options.disable_themes = true;
+    resource_options.disable_context_files = true;
+    session
+        .attach_resources(
+            pi_coding::ResourceManager::new(resource_options).expect("isolated resources"),
+        )
+        .await
+        .expect("attach isolated resources");
     let recorder = pi_coding::start_session_in(
         cwd.path(),
         session.model().as_ref(),
         Some("off"),
-        Some(&session_dir),
+        Some(&session.session_dir()),
         None,
         None,
     )
     .expect("start listener test recorder");
-    session.record(recorder).expect("attach listener test recorder");
+    session
+        .record(recorder)
+        .expect("attach listener test recorder");
     FauxApp {
         application: Application::new(session).await,
         _registration: registration,
@@ -114,6 +146,7 @@ pub async fn listen(application: Application) -> (ListenHandle, ExtensionUiAdapt
             token_file: None,
             allow_insecure_remote: false,
             advertised_origin: None,
+            runner_codename_override: None,
             plaintext: true,
             tls_cert: None,
             tls_key: None,
@@ -142,6 +175,7 @@ pub async fn listen_with_token(
             token_file: Some(token_path),
             allow_insecure_remote: false,
             advertised_origin: None,
+            runner_codename_override: None,
             plaintext: true,
             tls_cert: None,
             tls_key: None,
@@ -212,7 +246,11 @@ pub fn parse_body(response: &[u8]) -> Option<Vec<u8>> {
     Some(response[split + 4..].to_vec())
 }
 
-pub async fn http_get(addr: std::net::SocketAddr, path: &str, token: Option<&str>) -> (u16, Vec<u8>) {
+pub async fn http_get(
+    addr: std::net::SocketAddr,
+    path: &str,
+    token: Option<&str>,
+) -> (u16, Vec<u8>) {
     tokio::time::timeout(DEADLINE, async {
         let mut stream = TcpStream::connect(addr).await.expect("connect");
         let mut request = format!("GET {path} HTTP/1.1\r\nhost: {addr}\r\nconnection: close\r\n");

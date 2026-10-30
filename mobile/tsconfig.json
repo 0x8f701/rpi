@@ -1,0 +1,4 @@
+{
+  "extends": "@react-native/typescript-config/tsconfig.json",
+  "exclude": ["**/Pods/**", "__tests__", "jest.setup.js", "android"]
+}

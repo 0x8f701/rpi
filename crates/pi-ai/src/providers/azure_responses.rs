@@ -56,6 +56,12 @@ pub fn register_azure_openai_responses() {
                 async move { stream_simple_azure_openai_responses(model, context, options) }.boxed()
             }),
             generate_image: None,
+            resolve_http_authorities: Arc::new(|model, stream| {
+                let url =
+                    azure_responses_url(model, &AzureOpenAIResponsesOptions::from(stream.clone()))?;
+                let (authority, _) = resolve_http_endpoint(url.as_str())?;
+                Ok(std::collections::BTreeSet::from([authority]))
+            }),
         },
         None,
     );
@@ -147,31 +153,40 @@ pub fn stream_azure_openai_responses(
             }
         };
         let headers = match azure_request_headers(&model, &options.stream, auth) {
-            Ok(headers) => match common::apply_provider_headers(headers, &model, &options.stream).await {
-                Ok(headers) => headers,
-                Err(error) => {
-                    common::fail(&task_stream, output, error.to_string(), false).await;
-                    return;
+            Ok(headers) => {
+                match common::apply_provider_headers(headers, &model, &options.stream).await {
+                    Ok(headers) => headers,
+                    Err(error) => {
+                        common::fail(&task_stream, output, error.to_string(), false).await;
+                        return;
+                    }
                 }
-            },
+            }
             Err(error) => {
                 common::fail(&task_stream, output, error.to_string(), false).await;
                 return;
             }
         };
-        let client = match common::client(&options.stream) {
-            Ok(client) => client,
-            Err(error) => {
-                common::fail(&task_stream, output, error.to_string(), false).await;
-                return;
-            }
-        };
+        if let Err(error) = common::client(&options.stream) {
+            common::fail(&task_stream, output, error.to_string(), false).await;
+            return;
+        }
 
+        let payload = match serde_json::to_vec(&body) {
+            Ok(payload) => payload,
+            Err(error) => {
+                common::fail(&task_stream, output, error.to_string(), false).await;
+                return;
+            }
+        };
         let response = match common::send_with_retry(&options.stream, || {
-            client
-                .post(url.clone())
-                .headers(headers.clone())
-                .json(&body)
+            common::build_request(
+                &options.stream,
+                HttpMethod::Post,
+                url.as_str(),
+                &headers,
+                payload.clone(),
+            )
         })
         .await
         {
@@ -182,7 +197,14 @@ pub fn stream_azure_openai_responses(
                 return;
             }
         };
-        if let Err(error) = common::notify_response(&options.stream, &response, &model).await {
+        if let Err(error) = common::notify_response(
+            &options.stream,
+            response.status(),
+            response.headers().clone(),
+            &model,
+        )
+        .await
+        {
             common::fail(&task_stream, output, error.to_string(), false).await;
             return;
         }
@@ -850,7 +872,10 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_azure\",\"sta
     #[test]
     fn selected_auth_debug_is_redacted() {
         let secret = "debug-secret-must-not-leak";
-        let auth = AzureAuth { name: "api-key", value: secret.into() };
+        let auth = AzureAuth {
+            name: "api-key",
+            value: secret.into(),
+        };
         let debug = format!("{auth:?}");
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains(secret));
@@ -874,6 +899,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_azure\",\"sta
         let options = AzureOpenAIResponsesOptions {
             stream: StreamOptions {
                 api_key: Some("azure-api-key".into()),
+                http_executor: Some(crate::http::test_http_executor()),
                 on_payload: Some(Arc::new(move |payload, _| {
                     *payload_capture.lock().expect("payload hook lock") = Some(payload.clone());
                     Ok(payload)
@@ -992,7 +1018,9 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_azure\",\"sta
                 "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
-            socket.write_all(response.as_bytes()).expect("write error response");
+            socket
+                .write_all(response.as_bytes())
+                .expect("write error response");
             socket.flush().expect("flush error response");
         });
 
@@ -1004,6 +1032,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_azure\",\"sta
             AzureOpenAIResponsesOptions {
                 stream: StreamOptions {
                     api_key: Some(secret.into()),
+                    http_executor: Some(crate::http::test_http_executor()),
                     ..StreamOptions::default()
                 },
                 ..AzureOpenAIResponsesOptions::default()
@@ -1015,7 +1044,13 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_azure\",\"sta
             result.error_message.as_deref(),
             Some("Azure OpenAI Responses API error 401: credential rejected (invalid_api_key)")
         );
-        assert!(!result.error_message.as_deref().unwrap_or_default().contains(secret));
+        assert!(
+            !result
+                .error_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains(secret)
+        );
     }
 
     #[tokio::test]
@@ -1027,6 +1062,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_azure\",\"sta
             stream: StreamOptions {
                 api_key: Some("retry-key".into()),
                 max_retries: 1,
+                http_executor: Some(crate::http::test_http_executor()),
                 ..StreamOptions::default()
             },
             ..AzureOpenAIResponsesOptions::default()
@@ -1066,6 +1102,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_azure\",\"sta
             stream: StreamOptions {
                 api_key: Some("cancel-key".into()),
                 abort_signal: Some(token.clone()),
+                http_executor: Some(crate::http::test_http_executor()),
                 ..StreamOptions::default()
             },
             ..AzureOpenAIResponsesOptions::default()

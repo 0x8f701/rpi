@@ -23,7 +23,8 @@ fn bytes_start_with(buf: &[u8], prefix: &[u8]) -> bool {
 }
 
 fn starts_with_ascii(buf: &[u8], offset: usize, text: &str) -> bool {
-    buf.get(offset..).is_some_and(|s| s.starts_with(text.as_bytes()))
+    buf.get(offset..)
+        .is_some_and(|s| s.starts_with(text.as_bytes()))
 }
 
 fn read_uint16_le(buf: &[u8], offset: usize) -> usize {
@@ -42,7 +43,9 @@ fn read_uint32_be(buf: &[u8], offset: usize) -> usize {
 }
 
 fn is_png(buf: &[u8]) -> bool {
-    buf.len() >= 16 && read_uint32_be(buf, PNG_SIGNATURE.len()) == 13 && starts_with_ascii(buf, 12, "IHDR")
+    buf.len() >= 16
+        && read_uint32_be(buf, PNG_SIGNATURE.len()) == 13
+        && starts_with_ascii(buf, 12, "IHDR")
 }
 
 fn is_animated_png(buf: &[u8]) -> bool {
@@ -126,6 +129,10 @@ pub(crate) fn detect_supported_image_mime_type(buf: &[u8]) -> Option<String> {
         return Some("image/bmp".to_string());
     }
     None
+}
+pub(crate) fn is_pdf_bytes(buf: &[u8]) -> bool {
+    buf.get(..buf.len().min(PDF_SNIFF_BYTES))
+        .is_some_and(|prefix| prefix.starts_with(PDF_SIGNATURE))
 }
 
 /// Reads up to the sniff window from a file and identifies a supported image
@@ -218,7 +225,10 @@ mod tests {
 
     #[test]
     fn detect_png() {
-        assert_eq!(detect_supported_image_mime_type(&minimal_png()).as_deref(), Some("image/png"));
+        assert_eq!(
+            detect_supported_image_mime_type(&minimal_png()).as_deref(),
+            Some("image/png")
+        );
     }
 
     #[test]
@@ -228,16 +238,25 @@ mod tests {
             Some("image/jpeg")
         );
         // CMYK JPEG (ffd8fff7) is unsupported.
-        assert_eq!(detect_supported_image_mime_type(&[0xff, 0xd8, 0xff, 0xf7]), None);
+        assert_eq!(
+            detect_supported_image_mime_type(&[0xff, 0xd8, 0xff, 0xf7]),
+            None
+        );
     }
 
     #[test]
     fn detect_gif_webp() {
-        assert_eq!(detect_supported_image_mime_type(b"GIF89a").as_deref(), Some("image/gif"));
+        assert_eq!(
+            detect_supported_image_mime_type(b"GIF89a").as_deref(),
+            Some("image/gif")
+        );
         let mut webp = b"RIFF".to_vec();
         webp.extend_from_slice(&[0; 4]);
         webp.extend_from_slice(b"WEBP");
-        assert_eq!(detect_supported_image_mime_type(&webp).as_deref(), Some("image/webp"));
+        assert_eq!(
+            detect_supported_image_mime_type(&webp).as_deref(),
+            Some("image/webp")
+        );
     }
 
     #[test]
@@ -248,12 +267,19 @@ mod tests {
     #[test]
     fn read_to_cap_fills_across_short_reads() {
         let data = minimal_png();
-        let mut r = Chunked { data: &data, pos: 0, chunk: 1 };
+        let mut r = Chunked {
+            data: &data,
+            pos: 0,
+            chunk: 1,
+        };
         let mut buf = vec![0u8; IMAGE_TYPE_SNIFF_BYTES];
         let n = read_to_cap(&mut r, &mut buf).unwrap();
         assert_eq!(n, data.len());
         assert_eq!(&buf[..n], data.as_slice());
-        assert_eq!(detect_supported_image_mime_type(&buf[..n]).as_deref(), Some("image/png"));
+        assert_eq!(
+            detect_supported_image_mime_type(&buf[..n]).as_deref(),
+            Some("image/png")
+        );
     }
 
     #[test]
@@ -275,8 +301,14 @@ mod tests {
     #[test]
     fn short_reads_fill_full_sniff_window_when_larger() {
         // Cap-sized payload delivered one byte at a time must fully fill.
-        let data: Vec<u8> = (0..IMAGE_TYPE_SNIFF_BYTES).map(|i| (i % 251) as u8).collect();
-        let mut r = Chunked { data: &data, pos: 0, chunk: 3 };
+        let data: Vec<u8> = (0..IMAGE_TYPE_SNIFF_BYTES)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let mut r = Chunked {
+            data: &data,
+            pos: 0,
+            chunk: 3,
+        };
         let mut buf = vec![0u8; IMAGE_TYPE_SNIFF_BYTES];
         let n = read_to_cap(&mut r, &mut buf).unwrap();
         assert_eq!(n, IMAGE_TYPE_SNIFF_BYTES);

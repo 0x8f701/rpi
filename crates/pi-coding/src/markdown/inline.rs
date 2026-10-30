@@ -91,7 +91,9 @@ fn parse_segment(source: &str) -> StyledText {
         output.text.push(character);
         offset += character.len_utf8();
     }
-    output.styles.sort_by_key(|styled| (styled.range.start, styled.range.end));
+    output
+        .styles
+        .sort_by_key(|styled| (styled.range.start, styled.range.end));
     output
 }
 
@@ -273,7 +275,8 @@ pub(crate) fn append_styled(output: &mut StyledText, source: &StyledText, range:
         let end = styled.range.end.min(range.end);
         if start < end {
             output.styles.push(InlineStyleRange {
-                range: destination_start + start - range.start..destination_start + end - range.start,
+                range: destination_start + start - range.start
+                    ..destination_start + end - range.start,
                 style: styled.style,
             });
         }

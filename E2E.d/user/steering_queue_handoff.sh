@@ -24,6 +24,20 @@ wait_for() { # needle [timeout]
     fi
 }
 
+wait_for_count() { # needle minimum-count [timeout]
+    local needle="$1" minimum="$2" timeout="${3:-25}" deadline count
+    deadline=$((SECONDS + timeout))
+    while ((SECONDS < deadline)); do
+        tmux capture-pane -p -S -3000 -t "$session":0 >"$evidence/live.txt"
+        count="$(grep -F -c -- "$needle" "$evidence/live.txt" || true)"
+        if [ "$count" -ge "$minimum" ]; then
+            return
+        fi
+        sleep 0.2
+    done
+    fail "user.$SCENARIO: expected at least $minimum occurrences of ${needle@Q} (see $evidence/live.txt)"
+}
+
 send_cmd() { # literal command line
     tmux send-keys -t "$session":0 -l "$1"
     tmux send-keys -t "$session":0 Enter
@@ -70,14 +84,13 @@ assert_mock_request_lacks() { # n needle
     esac
 }
 
-assert_transcript_order() { # follow-up replies must follow their turns
+assert_transcript_order() { # round-1 auto-drain ordering; round 2 injects via /queue send
     if ! awk '
         /steer-1-ing stream chunk-four-done/ { s1 = NR }
-        /steer-3-ing stream chunk-four-done/ { s3 = NR }
-        /steering-followup-reply/ { if (!r1) r1 = NR; r2 = NR }
-        END { exit !(s1 && s3 && r1 && r2 && s1 < r1 && s3 < r2) }
+        /steering-followup-reply/ { if (!r1) r1 = NR }
+        END { exit !(s1 && r1 && s1 < r1) }
     ' "$evidence/tui.txt"; then
-        fail "user.$SCENARIO: follow-up replies must render after their turns complete (see $evidence/tui.txt)"
+        fail "user.$SCENARIO: round-1 follow-up reply must render after its turn completes (see $evidence/tui.txt)"
     fi
 }
 
@@ -108,6 +121,7 @@ main() {
     require_rpi
     require_cmd tmux
     require_cmd python3
+    require_cmd pgrep
 
     local root evidence session port bindir
     root="$(scenario_workspace "$SCENARIO")"
@@ -135,7 +149,7 @@ EOF
     tmux new-session -d -s "$session" -x 140 -y 42 -c "$root/workspace" \
         "env HOME='$root/home' USERPROFILE='$root/home' PATH='$bindir:/usr/bin:/bin' \
 PI_CODING_AGENT_DIR='$root/home/.pi/agent' \
-PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 \
+RPI_OFFLINE=1 RPI_SKIP_VERSION_CHECK=1 \
 TERM=xterm-256color \
 '$RPI_BIN' --offline --model user-steering/mock --api-key user-mock-key; printf '===TUI-DONE-steering-queue-handoff===\n'"
 
@@ -170,8 +184,33 @@ TERM=xterm-256color \
     # The queue drained with the turn; /queue reports empty.
     send_cmd '/queue'
     wait_for 'Queue is empty' 15
+    # Survival invariant: the supervised process spawned here must still be the
+    # SAME /ps row (same short id + pid, still running) after round 2's
+    # /queue send — Send now must never exit or drop it.
+    send_cmd "/process start sh -c 'printf send-now-process-ready; sleep 90'"
+    wait_for 'Running' 20
+    tmux capture-pane -p -S -120 -t "$session":0 >"$evidence/process-start.txt"
+    proc_id="$(grep -E 'Running.*cursor' "$evidence/process-start.txt" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | tail -n 1)"
+    if [ -z "$proc_id" ]; then
+        fail "user.$SCENARIO: /process start output missing the process id (see $evidence/process-start.txt)"
+    fi
+    proc_short="${proc_id%%-*}"
+    send_cmd '/ps'
+    wait_for 'attach PTY' 15
+    tmux capture-pane -p -t "$session":0 >"$evidence/ps-before-send-now.txt"
+    ps_row_before="$(awk -v id="$proc_short" 'index($0, id) && /running/ { print; exit }' "$evidence/ps-before-send-now.txt")"
+    if [ -z "$ps_row_before" ]; then
+        fail "user.$SCENARIO: /ps must list process $proc_short as running before Send now (see $evidence/ps-before-send-now.txt)"
+    fi
+    proc_pid="$(printf '%s\n' "$ps_row_before" | awk '{ for (i = 1; i < NF; i++) if ($i == "pid") { print $(i + 1); exit } }')"
+    if [ -z "$proc_pid" ]; then
+        fail "user.$SCENARIO: /ps row for $proc_short carries no pid (see $evidence/ps-before-send-now.txt)"
+    fi
+    tmux send-keys -t "$session":0 Escape
+    sleep 0.3
+    tmux clear-history -t "$session":0
 
-    # --- Round 2: repeat the queue window, then cancel (idempotent) ---
+    # --- Round 2: queue window, /queue send mid-stream, process survival, cancel (idempotent) ---
     # Clear pane history so the ⚙ wait can only be satisfied by a fresh
     # header frame (round 1's queued window must not linger in scrollback).
     sleep 0.8
@@ -183,17 +222,36 @@ TERM=xterm-256color \
     if ! tmux_wait_for "$session" 5 'Queued follow-up' >"$evidence/queued-status-2.txt"; then
         log "user.$SCENARIO: 'Queued follow-up' status already replaced; ⚙ count asserted"
     fi
-    # Drain: request 4 is the follow-up; request 3 (round 2's in-flight turn)
-    # must never have carried it (its digest is absent).
-    wait_for_log 'request#4 ' 25
+    # Send now injects the queued prompt mid-stream: request 4 carries it,
+    # request 3 (the aborted round-2 turn) must never have carried it.
+    send_cmd '/queue send'
+    wait_for_log 'request#4 ' 15
     assert_mock_request_lacks 3 "user_digest=$(digest_of 'steering-followup-two')"
     assert_mock_request_contains 4 "user_digest=$(digest_of 'steering-followup-two')"
+    wait_for_count 'steering-followup-reply' 2 25
+    tmux send-keys -t "$session":0 C-u
+    send_cmd '/ps'
+    wait_for 'attach PTY' 15
+    tmux capture-pane -p -t "$session":0 >"$evidence/ps-after-send-now.txt"
+    ps_row_after="$(awk -v id="$proc_short" 'index($0, id) && /running/ { print; exit }' "$evidence/ps-after-send-now.txt")"
+    if [ -z "$ps_row_after" ]; then
+        fail "user.$SCENARIO: process $proc_short must still be running after Send now (see $evidence/ps-after-send-now.txt)"
+    fi
+    after_pid="$(printf '%s\n' "$ps_row_after" | awk '{ for (i = 1; i < NF; i++) if ($i == "pid") { print $(i + 1); exit } }')"
+    if [ "$after_pid" != "$proc_pid" ]; then
+        fail "user.$SCENARIO: Send now changed the supervised process (pid $proc_pid -> ${after_pid:-none}; see $evidence/ps-after-send-now.txt)"
+    fi
+    tmux send-keys -t "$session":0 Escape
+    sleep 0.3
+    tmux send-keys -t "$session":0 C-u
     send_cmd '/queue cancel'
     wait_for 'Queue is empty' 15
+    tmux send-keys -t "$session":0 C-u
     send_cmd '/queue'
     wait_for 'Queue is empty' 15
 
     # --- /handoff: deterministic envelope in the transcript + clipboard ---
+    tmux send-keys -t "$session":0 C-u
     send_cmd '/handoff'
     wait_for 'Handoff' 20
     wait_for 'Next steps' 20
@@ -208,13 +266,20 @@ TERM=xterm-256color \
         log "user.$SCENARIO: quit marker not seen; scenario assertions already passed, tearing down"
     fi
     tmux kill-session -t "$session" 2>/dev/null || true
+    cleanup_rounds=0
+    until ! pgrep -f 'send-now-process-ready' >/dev/null 2>&1; do
+        cleanup_rounds=$((cleanup_rounds + 1))
+        if [ "$cleanup_rounds" -gt 40 ]; then
+            fail "user.$SCENARIO: supervised process survived app quit (pgrep -f send-now-process-ready)"
+        fi
+        sleep 0.2
+    done
 
     assert_file_contains "$evidence/tui.txt" \
         'steering-followup-reply' \
         'Next steps'
-    # Durable drain ordering: each follow-up reply must render after the turn
-    # it was queued behind completed (steer-1- / steer-3- streams), proving the
-    # prompt was queued rather than executed immediately.
+    # Durable round-1 drain ordering proves the first follow-up stayed queued
+    # until its turn completed; round 2 is pinned by the request digests above.
     assert_transcript_order
     printf 'user.%s passed\nevidence=%s\n' "$SCENARIO" "$evidence"
 }

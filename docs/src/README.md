@@ -1,51 +1,28 @@
-# rpi — reference manual
+# rpi
 
-`rpi` is a terminal coding agent for Pi v3 sessions: a single Rust binary that
-switches between print mode, a line REPL, a full-screen inline TUI, and headless
-JSON/RPC modes. It supports multiple model providers, local llama.cpp models,
-extensions, skills, prompt templates, packages, session export and sharing, a
-security model built around project trust and credential redaction, and a full
-orchestration stack: durable goals, Todo DAGs, subagent jobs with IRC
-coordination, isolated concurrent workflows, MCP/ACP protocol clients, voice
-input, memory backends, and host hooks.
+rpi is a Rust coding agent with an interactive terminal interface, noninteractive text/JSON output, a JSONL control protocol, a browser client, and Agent Client Protocol support for editors. It stores native conversations as Pi v3 JSONL.
 
-## Getting started
+Start with [installation](introduction/install.md) and [quick start](introduction/quickstart.md). The existing chapter order separates operator workflows from configuration, tool, protocol, and security references.
 
-- [Quick start](introduction/quickstart.md) — first-run workflow
-- [Installation](introduction/install.md) — supported platforms, installers, verification
+## Main capabilities
 
-## User guide
+- Model selection and provider authentication, with configuration profiles and credential scopes.
+- Workspace-scoped file tools, structural search/editing, supervised processes, and governed browser/service tools.
+- Goals, Todo dependency execution, child coding jobs, peer messages, and isolated workflows.
+- Recurring prompt loops through the terminal and Web Loop panel.
+- Session resume, foreign-session import, rewind/checkpoints, compaction, handoff, and local export.
+- Web Source/Preview file surfaces, process output viewing, token pairing, and safe rich-text rendering.
 
-- [TUI and keybindings](user-guide/tui.md)
-- [CLI modes and commands](user-guide/cli-modes.md)
-- [Goals](user-guide/goals.md)
-- [Todos and the Todo DAG](user-guide/todos.md)
-- [Orchestration: subagents, jobs, and IRC](user-guide/orchestration.md)
-- [Isolated concurrent workflows](user-guide/workflows.md)
-- [Session recovery: rewind, checkpoints, handoffs, and TTL](user-guide/session-recovery.md)
-- [Live voice: TUI `/live` STT and `/web` realtime](user-guide/live.md)
-- [Models and custom providers](user-guide/models.md)
-- [Authentication](user-guide/authentication.md)
-- [RPC JSONL protocol](user-guide/rpc-json.md)
-- [Web client (`/web`)](user-guide/web.md)
-- [E2E scenarios (user-perspective tmux tests)](user-guide/e2e-scenarios.md)
+The active tool set depends on settings, resources, trust, and approval. A capability listed here is not a promise that it is enabled in every session or supported by every platform.
 
-## Reference
+## Current contracts
 
-- [Settings, configuration, and trust](reference/settings-trust.md)
-- [Configuration profiles, TOML settings, and scoped auth](reference/configuration-profiles.md)
-- [Environment variables](reference/environment-variables.md)
-- [Sandbox and overlayfs isolation](reference/sandbox-isolation.md)
-- [Hooks and trust hooks](reference/hooks.md)
-- [Extensions and process protocol](reference/extensions.md)
-- [Skills](reference/skills.md)
-- [Packages](reference/packages.md)
-- [Memory](reference/memory.md)
-- [Extended tool catalog](reference/tools.md)
-- [Model Context Protocol (MCP) client](reference/mcp.md)
-- [Agent Client Protocol (ACP) mode](reference/acp.md)
-- [Prompt templates and system prompt assembly](reference/prompt-templates.md)
-- [Local / self-hosted models with llama.cpp](reference/local-llama.md)
-- [Security](reference/security.md)
-- [Export and share](reference/export-share.md)
-- [Update safety](reference/update.md)
+Search defaults are grep 1,000 matches, ls/find 5,000 entries/results, and glob 200. Web directory and changed-file catalogs are bounded at 5,000. Recurring-loop presets are 30s, 1m, 5m, 15m, 1h, and 4h.
+
+Imports use agent-loader v0.7.0 for Pi, OMP, Codex, Claude, Grok, and Droid sessions. See [session recovery](user-guide/session-recovery.md) for OMP rotation-chain semantics.
+
+**Steering queue status: in progress.** Web previews are implemented; Rust scoped cancellation integration remains in flight. This book does not present it as a stable end-to-end feature.
+
+## Security first
+
+Project trust, tool approval, process confinement, and safe Markdown rendering protect different boundaries. Read [Security](reference/security.md) before enabling remote listeners, admitting external extensions, or executing unfamiliar project code. Never publish provider credentials or token-bearing pairing URLs.

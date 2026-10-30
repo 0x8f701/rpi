@@ -4,7 +4,11 @@
 // command builder). Bundled by `npm run build` (esbuild) and executed before
 // the production bundle, so a persona wire-shape or spawn-target regression
 // fails the build.
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
+  DEFAULT_PERSONA_CODING_TOOLS,
   PERSONA_EDIT_MAX_UNITS,
   PURGE_NOTE,
   REMOVE_NOTE,
@@ -116,9 +120,13 @@ check(
   JSON.stringify(runCommand),
 );
 
-// ---- create seed template declares the name ----
+// ---- create seed template declares the name and bounded tools ----
 const seed = buildPersonaCreateContent('guide');
 check('seed declares the persona name', declaredFrontmatterName(seed) === 'guide');
+check(
+  'seed declares the bounded default tools',
+  seed.includes(`tools: [${DEFAULT_PERSONA_CODING_TOOLS.join(', ')}]`),
+);
 
 // ---- remove vs purge vocabulary stays distinct + correct ----
 check('remove note mentions keeping memory/sessions', REMOVE_NOTE.includes('stay under the persona root'));
@@ -129,6 +137,56 @@ check('remove and purge notes differ', REMOVE_NOTE !== PURGE_NOTE);
 check('small content editable', isEditableContent('x'.repeat(1000)));
 check('at-bound content editable', isEditableContent('x'.repeat(PERSONA_EDIT_MAX_UNITS)));
 check('over-bound content not editable', !isEditableContent('x'.repeat(PERSONA_EDIT_MAX_UNITS + 1)));
+
+// ---- PersonasPanel exclusive lock (busyRef, not React busy) ----
+const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'panels', 'PersonasPanel.tsx'), 'utf8');
+const saveAt = src.indexOf('const saveEditor = () => {');
+const save = saveAt >= 0 ? src.slice(saveAt, saveAt + 1400) : '';
+const runAt = src.indexOf('const runPersona = (name: string) => {');
+const run = runAt >= 0 ? src.slice(runAt, runAt + 1400) : '';
+const confirmAt = src.indexOf('const confirmDestructive = (kind: \'remove\' | \'purge\') => {');
+const confirm = confirmAt >= 0 ? src.slice(confirmAt, confirmAt + 900) : '';
+const selectAt = src.indexOf('const selectPersona = (name: string) => {');
+const select = selectAt >= 0 ? src.slice(selectAt, selectAt + 500) : '';
+const clearAt = src.indexOf('const clearPreference = () => {');
+const clear = clearAt >= 0 ? src.slice(clearAt, clearAt + 500) : '';
+
+check(
+  'saveEditor claims busyRef after local validation, before persona_create',
+  save.includes("setEditorError('persona definition content is required')")
+    && save.indexOf('if (!claimBusy()) return') > save.indexOf("setEditorError('persona definition content is required')")
+    && save.indexOf('if (!claimBusy()) return') < save.indexOf("type: 'persona_create'")
+    && src.includes('const busyRef = useRef(false)'),
+);
+check(
+  'runPersona claims busyRef after empty-task return, before task_spawn',
+  run.includes("const task = (runDrafts[name] || '').trim()")
+    && run.indexOf('if (!task) return') < run.indexOf('if (!claimBusy()) return')
+    && run.indexOf('if (!claimBusy()) return') < run.indexOf('buildPersonaRunCommand(name, task)'),
+);
+check(
+  'runPersona clears draft only on trim-match after first job',
+  run.includes('if (!first)')
+    && run.includes("throw new Error('task_spawn returned no jobs')")
+    && run.includes('if (current.trim() !== task) return prev')
+    && !run.includes("setRunDrafts((prev) => ({ ...prev, [name]: '' }))"),
+);
+check(
+  'confirmDestructive claims busyRef before persona_remove',
+  confirm.includes('if (!claimBusy()) return')
+    && confirm.indexOf('if (!claimBusy()) return') < confirm.indexOf("type: 'persona_remove'")
+    && confirm.includes('.finally(() => releaseBusy())'),
+);
+check(
+  'selectPersona and clearPreference claim/release so they cannot overlap a run/save',
+  select.includes('if (!claimBusy()) return')
+    && select.indexOf('if (!claimBusy()) return') < select.indexOf("type: 'persona_select'")
+    && select.includes('.finally(() => releaseBusy())')
+    && clear.includes('if (!claimBusy()) return')
+    && clear.indexOf('if (!claimBusy()) return') < clear.indexOf("type: 'persona_clear'")
+    && clear.includes('.finally(() => releaseBusy())'),
+);
+
 
 if (failures.length > 0) {
   console.error(`personas: ${failures.length}/${ran} checks FAILED:\n- ${failures.join('\n- ')}`);

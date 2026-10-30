@@ -1,8 +1,7 @@
 //! Persistent llama.cpp router configuration, catalog refresh, and GGUF installs.
 
 use std::{
-    fs::{File, OpenOptions},
-    io::{Read as _, Write as _},
+    io::{Read as _, Seek as _, SeekFrom, Write as _},
     path::{Component, Path, PathBuf},
     sync::{LazyLock, Mutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -11,15 +10,19 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
 use pi_ai::{
-    HuggingFaceClient, HuggingFaceGgufFile, HuggingFaceModelDetails, LlamaRouterClient,
-    LlamaRouterModel, LlamaRouterSettings, Model, LLAMA_PROVIDER_ID, replace_registered_models,
+    HttpMethod, HuggingFaceClient, HuggingFaceGgufFile, HuggingFaceModelDetails, LLAMA_PROVIDER_ID,
+    LlamaRouterClient, LlamaRouterModel, LlamaRouterSettings, Model, SharedHttpExecutor,
+    StreamOptions, replace_registered_models, request_from_url,
 };
+use pi_sandbox::AbsolutePath;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
-use crate::resources::agent_dir;
+use crate::fs::{
+    CapabilityAccess, CapabilityFs, CapabilityRootLease, CapabilityRootPurpose, FileMode, FsError,
+    Replacement, RootCreation,
+};
 
 const LLAMA_DIR: &str = "llama";
 const SETTINGS_FILE: &str = "router.json";
@@ -86,21 +89,38 @@ pub enum CatalogSource {
     Cache,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LlamaManager {
     root: PathBuf,
+    store: CapabilityRootLease,
 }
 
-impl Default for LlamaManager {
-    fn default() -> Self {
-        Self::new(llama_data_dir())
+impl std::fmt::Debug for LlamaManager {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LlamaManager")
+            .field("root", &self.root)
+            .finish()
     }
 }
 
 impl LlamaManager {
-    #[must_use]
-    pub fn new(root: PathBuf) -> Self {
-        Self { root }
+    pub fn new(root: PathBuf) -> Result<Self> {
+        let capabilities = CapabilityFs::new().context("creating llama filesystem capabilities")?;
+        let absolute = AbsolutePath::parse(root.clone()).map_err(|_| FsError::InvalidPath)?;
+        let store = capabilities
+            .open_root(
+                CapabilityRootPurpose::AgentStore,
+                absolute,
+                CapabilityAccess::PrivateReadWrite,
+                RootCreation::CreateDirectory,
+            )
+            .context("opening private llama data store")?;
+        Ok(Self { root, store })
+    }
+
+    pub fn global() -> Result<Self> {
+        Self::new(llama_data_dir())
     }
 
     #[must_use]
@@ -129,22 +149,20 @@ impl LlamaManager {
     }
 
     pub fn settings(&self) -> Result<Option<LlamaRouterSettings>> {
-        read_optional_json(&self.settings_path(), "llama.cpp router settings")
+        read_optional_json(
+            &self.store,
+            Path::new(SETTINGS_FILE),
+            "llama.cpp router settings",
+        )
     }
     /// Effective settings prefer persisted configuration, then the standard
     /// `LLAMA_BASE_URL` / optional `LLAMA_API_KEY` environment adapter.
     pub fn effective_settings(&self) -> Result<Option<LlamaRouterSettings>> {
-        if let Some(settings) = self.settings()? {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let path = self.settings_path();
-                let metadata = std::fs::metadata(&path)
-                    .with_context(|| format!("reading llama.cpp settings permissions {}", path.display()))?;
-                if metadata.permissions().mode() & 0o077 != 0 {
-                    bail!("llama.cpp settings file {} must not be accessible by group or other users", path.display());
-                }
-            }
+        if let Some(settings) = read_optional_private_json(
+            &self.store,
+            Path::new(SETTINGS_FILE),
+            "llama.cpp router settings",
+        )? {
             return Ok(Some(settings));
         }
         let Some(base_url) = std::env::var("LLAMA_BASE_URL")
@@ -159,22 +177,26 @@ impl LlamaManager {
         )?))
     }
 
-    pub fn configured_client(&self) -> Result<LlamaRouterClient> {
+    pub fn configured_client(&self, executor: SharedHttpExecutor) -> Result<LlamaRouterClient> {
         let settings = self.effective_settings()?.ok_or_else(|| {
             anyhow!(
                 "llama.cpp router is not configured; run `rpi llama configure {}` or set LLAMA_BASE_URL",
                 pi_ai::DEFAULT_LLAMA_SERVER_URL
             )
         })?;
-        LlamaRouterClient::new(settings)
+        LlamaRouterClient::new(settings, executor)
     }
 
     /// Validate connectivity and the live `/v1/models` response before making
     /// the new configuration visible. Both settings and the observed catalog
     /// are then committed atomically per file.
-    pub async fn configure(&self, settings: LlamaRouterSettings) -> Result<Vec<Model>> {
+    pub async fn configure(
+        &self,
+        settings: LlamaRouterSettings,
+        executor: SharedHttpExecutor,
+    ) -> Result<Vec<Model>> {
         let settings = LlamaRouterSettings::validated(&settings.base_url, settings.api_key)?;
-        let client = LlamaRouterClient::new(settings.clone())?;
+        let client = LlamaRouterClient::new(settings.clone(), executor)?;
         let models = client
             .discover_models()
             .await
@@ -183,31 +205,49 @@ impl LlamaManager {
             checked_at: unix_millis(),
             models: models.clone(),
         };
-        write_json_atomic(&self.catalog_path(), &snapshot)
-            .context("persisting validated llama.cpp catalog")?;
-        write_json_atomic_secret(&self.settings_path(), &settings)
-            .context("persisting validated llama.cpp settings")?;
+        write_json_atomic(
+            &self.store,
+            Path::new(CATALOG_FILE),
+            &snapshot,
+            FileMode::Private,
+        )
+        .context("persisting validated llama.cpp catalog")?;
+        write_json_atomic(
+            &self.store,
+            Path::new(SETTINGS_FILE),
+            &settings,
+            FileMode::Private,
+        )
+        .context("persisting validated llama.cpp settings")?;
         apply_catalog(models.clone());
         Ok(models)
     }
 
     pub fn cached_catalog(&self) -> Result<Option<LlamaCatalogSnapshot>> {
-        read_optional_json(&self.catalog_path(), "llama.cpp model catalog")
+        read_optional_json(
+            &self.store,
+            Path::new(CATALOG_FILE),
+            "llama.cpp model catalog",
+        )
     }
-
     /// Refresh from the live router. If the router is unavailable, apply and
     /// return the last successfully observed snapshot rather than synthesizing
     /// a model. A missing cache preserves the live error.
-    pub async fn refresh_catalog(&self) -> Result<CatalogRefresh> {
-        let client = self.configured_client()?;
+    pub async fn refresh_catalog(&self, executor: SharedHttpExecutor) -> Result<CatalogRefresh> {
+        let client = self.configured_client(executor)?;
         match client.discover_models().await {
             Ok(models) => {
                 let snapshot = LlamaCatalogSnapshot {
                     checked_at: unix_millis(),
                     models: models.clone(),
                 };
-                write_json_atomic(&self.catalog_path(), &snapshot)
-                    .context("persisting refreshed llama.cpp model catalog")?;
+                write_json_atomic(
+                    &self.store,
+                    Path::new(CATALOG_FILE),
+                    &snapshot,
+                    FileMode::Private,
+                )
+                .context("persisting refreshed llama.cpp model catalog")?;
                 apply_catalog(models.clone());
                 Ok(CatalogRefresh {
                     models,
@@ -239,16 +279,24 @@ impl LlamaManager {
         Ok(models)
     }
 
-    pub async fn router_models(&self, reload: bool) -> Result<Vec<LlamaRouterModel>> {
-        self.configured_client()?
+    pub async fn router_models(
+        &self,
+        reload: bool,
+        executor: SharedHttpExecutor,
+    ) -> Result<Vec<LlamaRouterModel>> {
+        self.configured_client(executor)?
             .list_router_models(reload)
             .await
             .context("reading llama.cpp router management catalog")
     }
 
-    pub async fn load_model(&self, model: &str) -> Result<Vec<Model>> {
+    pub async fn load_model(
+        &self,
+        model: &str,
+        executor: SharedHttpExecutor,
+    ) -> Result<Vec<Model>> {
         validate_model_argument(model)?;
-        let client = self.configured_client()?;
+        let client = self.configured_client(executor)?;
         client
             .load(model)
             .await
@@ -261,15 +309,24 @@ impl LlamaManager {
             checked_at: unix_millis(),
             models: models.clone(),
         };
-        write_json_atomic(&self.catalog_path(), &snapshot)
-            .context("persisting llama.cpp catalog after load")?;
+        write_json_atomic(
+            &self.store,
+            Path::new(CATALOG_FILE),
+            &snapshot,
+            FileMode::Private,
+        )
+        .context("persisting llama.cpp catalog after load")?;
         apply_catalog(models.clone());
         Ok(models)
     }
 
-    pub async fn unload_model(&self, model: &str) -> Result<Vec<Model>> {
+    pub async fn unload_model(
+        &self,
+        model: &str,
+        executor: SharedHttpExecutor,
+    ) -> Result<Vec<Model>> {
         validate_model_argument(model)?;
-        let client = self.configured_client()?;
+        let client = self.configured_client(executor)?;
         client
             .unload(model)
             .await
@@ -282,15 +339,24 @@ impl LlamaManager {
             checked_at: unix_millis(),
             models: models.clone(),
         };
-        write_json_atomic(&self.catalog_path(), &snapshot)
-            .context("persisting llama.cpp catalog after unload")?;
+        write_json_atomic(
+            &self.store,
+            Path::new(CATALOG_FILE),
+            &snapshot,
+            FileMode::Private,
+        )
+        .context("persisting llama.cpp catalog after unload")?;
         apply_catalog(models.clone());
         Ok(models)
     }
 
     pub fn installed(&self) -> Result<InstalledGgufCatalog> {
-        Ok(read_optional_json(&self.installed_path(), "installed GGUF catalog")?
-            .unwrap_or_default())
+        Ok(read_optional_json(
+            &self.store,
+            Path::new(INSTALLED_FILE),
+            "installed GGUF catalog",
+        )?
+        .unwrap_or_default())
     }
 
     pub async fn install_from_hugging_face<F>(
@@ -298,6 +364,7 @@ impl LlamaManager {
         client: &HuggingFaceClient,
         details: &HuggingFaceModelDetails,
         quantization: Option<&str>,
+        executor: SharedHttpExecutor,
         cancel: &CancellationToken,
         mut progress: F,
     ) -> Result<InstalledGgufModel>
@@ -316,10 +383,12 @@ impl LlamaManager {
                         details.id
                     )
                 })?,
-            None => details
-                .quantizations
-                .first()
-                .ok_or_else(|| anyhow!("Hugging Face model {:?} has no downloadable GGUF files", details.id))?,
+            None => details.quantizations.first().ok_or_else(|| {
+                anyhow!(
+                    "Hugging Face model {:?} has no downloadable GGUF files",
+                    details.id
+                )
+            })?,
         };
         if selected.files.is_empty() {
             bail!(
@@ -328,44 +397,42 @@ impl LlamaManager {
                 selected.name
             );
         }
-        let destination = self.model_install_dir(&details.id, &selected.name)?;
-        tokio::fs::create_dir_all(&destination)
-            .await
-            .with_context(|| format!("creating GGUF install directory {}", destination.display()))?;
+        let destination_relative = self.model_install_relative(&details.id, &selected.name)?;
+        self.store
+            .create_dir_all(&destination_relative, FileMode::Private)
+            .context("creating GGUF install directory")?;
         let mut installed_files = Vec::with_capacity(selected.files.len());
         for file in &selected.files {
             if cancel.is_cancelled() {
                 bail!("GGUF download cancelled");
             }
-            let relative = safe_relative_path(&file.name)?;
-            let target = destination.join(&relative);
-            ensure_within(&destination, &target)?;
-            if let Some(parent) = target.parent() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .with_context(|| format!("creating GGUF directory {}", parent.display()))?;
+            let file_relative = safe_relative_path(&file.name)?;
+            let target_relative = destination_relative.join(&file_relative);
+            if let Some(parent) = target_relative.parent() {
+                self.store
+                    .create_dir_all(parent, FileMode::Private)
+                    .context("creating GGUF directory")?;
             }
             let source = client.resolve_url(&details.id, &file.name)?;
             download_one(
+                &self.store,
                 client,
                 file,
                 source.as_str(),
-                &target,
+                &target_relative,
+                executor.clone(),
                 cancel,
                 &mut progress,
             )
             .await?;
-            let metadata = tokio::fs::metadata(&target)
-                .await
-                .with_context(|| format!("reading downloaded GGUF metadata {}", target.display()))?;
-            let relative_path = target
-                .strip_prefix(&self.root)
-                .map_err(|_| anyhow!("download escaped llama data directory"))?
-                .to_path_buf();
+            let metadata = self
+                .store
+                .metadata(&target_relative)
+                .context("reading downloaded GGUF metadata")?;
             installed_files.push(InstalledGgufFile {
                 source: source.to_string(),
-                relative_path,
-                size: metadata.len(),
+                relative_path: target_relative,
+                size: metadata.len,
                 sha256: file.sha256.clone(),
             });
         }
@@ -386,20 +453,24 @@ impl LlamaManager {
                 .cmp(&right.repository)
                 .then_with(|| left.quantization.cmp(&right.quantization))
         });
-        write_json_atomic(&self.installed_path(), &catalog)
-            .context("persisting installed GGUF catalog")?;
+        write_json_atomic(
+            &self.store,
+            Path::new(INSTALLED_FILE),
+            &catalog,
+            FileMode::Private,
+        )
+        .context("persisting installed GGUF catalog")?;
         Ok(installed)
     }
 
-    fn model_install_dir(&self, repository: &str, quantization: &str) -> Result<PathBuf> {
+    fn model_install_relative(&self, repository: &str, quantization: &str) -> Result<PathBuf> {
         validate_repository(repository)?;
         validate_component(quantization, "quantization")?;
-        let mut target = self.models_dir();
+        let mut target = PathBuf::from(MODELS_DIR);
         for component in repository.split('/') {
             target.push(component);
         }
         target.push(quantization);
-        ensure_within(&self.models_dir(), &target)?;
         Ok(target)
     }
 }
@@ -412,7 +483,7 @@ pub trait ProviderAuthAdapter {
     fn resolve_api_key(&self) -> Result<Option<String>>;
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct LlamaAuthAdapter {
     manager: LlamaManager,
 }
@@ -421,6 +492,10 @@ impl LlamaAuthAdapter {
     #[must_use]
     pub fn new(manager: LlamaManager) -> Self {
         Self { manager }
+    }
+
+    pub fn global() -> Result<Self> {
+        Ok(Self::new(LlamaManager::global()?))
     }
 }
 
@@ -443,11 +518,7 @@ impl ProviderAuthAdapter for LlamaAuthAdapter {
 
 #[must_use]
 pub fn llama_data_dir() -> PathBuf {
-    std::env::var_os("PI_CODING_AGENT_DIR")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(agent_dir()))
-        .join(LLAMA_DIR)
+    crate::resources::agent_dir_path().join(LLAMA_DIR)
 }
 
 fn apply_catalog(models: Vec<Model>) {
@@ -462,23 +533,25 @@ fn apply_catalog(models: Vec<Model>) {
 }
 
 async fn download_one<F>(
+    store: &CapabilityRootLease,
     client: &HuggingFaceClient,
     metadata: &HuggingFaceGgufFile,
     source: &str,
     target: &Path,
+    executor: SharedHttpExecutor,
     cancel: &CancellationToken,
     progress: &mut F,
 ) -> Result<()>
 where
     F: FnMut(GgufDownloadProgress) + Send,
 {
-    if let Ok(existing) = tokio::fs::metadata(target).await {
-        if metadata.size.is_none_or(|size| size == existing.len())
-            && checksum_matches(target, metadata.sha256.as_deref()).await?
+    if let Ok(existing) = store.metadata(target) {
+        if metadata.size.is_none_or(|size| size == existing.len)
+            && checksum_matches(store, target, metadata.sha256.as_deref())?
         {
             progress(GgufDownloadProgress {
                 file: metadata.name.clone(),
-                downloaded: existing.len(),
+                downloaded: existing.len,
                 total: metadata.size,
                 resumed: true,
             });
@@ -486,36 +559,59 @@ where
         }
     }
     let part = part_path(target)?;
-    let mut offset = tokio::fs::metadata(&part).await.map_or(0, |entry| entry.len());
+    let mut offset = match store.metadata(&part) {
+        Ok(entry) => entry.len,
+        Err(error) if fs_error_kind(&error) == Some(std::io::ErrorKind::NotFound) => 0,
+        Err(error) => return Err(error).context("reading partial GGUF metadata"),
+    };
     if metadata.size.is_some_and(|size| offset > size) {
-        tokio::fs::remove_file(&part)
-            .await
-            .with_context(|| format!("discarding oversized partial GGUF {}", part.display()))?;
+        store
+            .remove_file(&part)
+            .context("discarding oversized partial GGUF")?;
         offset = 0;
     }
-    let http = reqwest::Client::builder()
-        .build()
-        .context("building GGUF download client")?;
-    let mut request = http
-        .get(source)
-        .header(reqwest::header::ACCEPT_ENCODING, "identity");
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::ACCEPT_ENCODING,
+        http::HeaderValue::from_static("identity"),
+    );
     if let Some(token) = client.token() {
-        request = request.bearer_auth(token);
+        let mut value = http::HeaderValue::from_str(&format!("Bearer {token}"))
+            .context("invalid Hugging Face token")?;
+        value.set_sensitive(true);
+        headers.insert(http::header::AUTHORIZATION, value);
     }
     if offset > 0 {
-        request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
+        headers.insert(
+            http::header::RANGE,
+            http::HeaderValue::from_str(&format!("bytes={offset}-"))
+                .context("invalid GGUF resume range")?,
+        );
     }
-    let response = tokio::select! {
-        () = cancel.cancelled() => bail!("GGUF download cancelled"),
-        response = request.send() => response.with_context(|| format!("downloading GGUF from {source}"))?,
+    let options = StreamOptions {
+        timeout_ms: Some(120_000),
+        abort_signal: Some(cancel.clone()),
+        ..StreamOptions::default()
     };
+    let request = request_from_url(
+        HttpMethod::Get,
+        source,
+        &headers,
+        Vec::new(),
+        &options,
+        pi_ai::MAX_HTTP_RESPONSE_BODY_BYTES,
+    )?;
+    let response = executor
+        .execute(request)
+        .await
+        .with_context(|| format!("downloading GGUF from {source}"))?;
     let status = response.status();
-    let append = offset > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
+    let append = offset > 0 && status == http::StatusCode::PARTIAL_CONTENT;
     if append {
         let expected_prefix = format!("bytes {offset}-");
         let content_range = response
             .headers()
-            .get(reqwest::header::CONTENT_RANGE)
+            .get(http::header::CONTENT_RANGE)
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default();
         if !content_range.starts_with(&expected_prefix) {
@@ -525,8 +621,16 @@ where
             );
         }
     }
+    let content_length = response
+        .headers()
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let bytes = pi_ai::collect_response_body(response)
+            .await
+            .unwrap_or_default();
+        let body = String::from_utf8_lossy(&bytes);
         bail!(
             "downloading GGUF {}: HTTP {status}: {}",
             metadata.name,
@@ -536,26 +640,32 @@ where
     if offset > 0 && !append {
         offset = 0;
     }
-    let total = metadata.size.or_else(|| {
-        response
-            .content_length()
-            .and_then(|length| length.checked_add(offset))
-    });
-    let mut options = tokio::fs::OpenOptions::new();
-    options.create(true).write(true);
-    if append {
-        options.append(true);
+    let total = metadata
+        .size
+        .or_else(|| content_length.and_then(|length| length.checked_add(offset)));
+    let mut file = if append {
+        store
+            .open_read_write_file(&part)
+            .context("opening partial GGUF")?
+            .try_clone_std()
+            .context("cloning partial GGUF handle")?
     } else {
-        options.truncate(true);
-    }
-    let mut file = options
-        .open(&part)
-        .await
-        .with_context(|| format!("opening partial GGUF {}", part.display()))?;
+        match store.remove_file(&part) {
+            Ok(()) => {}
+            Err(error) if fs_error_kind(&error) == Some(std::io::ErrorKind::NotFound) => {}
+            Err(error) => return Err(error).context("replacing partial GGUF"),
+        }
+        store
+            .create_new(&part, FileMode::Private)
+            .context("creating partial GGUF")?
+            .finish()
+            .context("syncing empty partial GGUF")?
+            .try_clone_std()
+            .context("cloning partial GGUF handle")?
+    };
     if append {
-        file.seek(std::io::SeekFrom::End(0))
-            .await
-            .with_context(|| format!("seeking partial GGUF {}", part.display()))?;
+        file.seek(SeekFrom::End(0))
+            .context("seeking partial GGUF")?;
     }
     let mut downloaded = offset;
     progress(GgufDownloadProgress {
@@ -564,12 +674,12 @@ where
         total,
         resumed: offset > 0,
     });
-    let mut stream = response.bytes_stream();
+    let mut stream = response.into_body();
     loop {
         let next = tokio::select! {
             () = cancel.cancelled() => {
-                file.flush().await.ok();
-                file.sync_all().await.ok();
+                file.flush().ok();
+                file.sync_all().ok();
                 bail!("GGUF download cancelled");
             }
             next = stream.next() => next,
@@ -578,9 +688,7 @@ where
             break;
         };
         let chunk = chunk.with_context(|| format!("streaming GGUF {}", metadata.name))?;
-        file.write_all(&chunk)
-            .await
-            .with_context(|| format!("writing partial GGUF {}", part.display()))?;
+        file.write_all(&chunk).context("writing partial GGUF")?;
         downloaded = downloaded
             .checked_add(u64::try_from(chunk.len()).context("GGUF chunk length overflow")?)
             .ok_or_else(|| anyhow!("GGUF download byte count overflow"))?;
@@ -591,12 +699,8 @@ where
             resumed: offset > 0,
         });
     }
-    file.flush()
-        .await
-        .with_context(|| format!("flushing partial GGUF {}", part.display()))?;
-    file.sync_all()
-        .await
-        .with_context(|| format!("syncing partial GGUF {}", part.display()))?;
+    file.flush().context("flushing partial GGUF")?;
+    file.sync_all().context("syncing partial GGUF")?;
     drop(file);
     if let Some(expected) = metadata.size
         && downloaded != expected
@@ -606,34 +710,36 @@ where
             metadata.name
         );
     }
-    if !checksum_matches(&part, metadata.sha256.as_deref()).await? {
+    if !checksum_matches(store, &part, metadata.sha256.as_deref())? {
         bail!(
-            "downloaded GGUF {} failed SHA-256 verification; partial file retained at {}",
-            metadata.name,
-            part.display()
+            "downloaded GGUF {} failed SHA-256 verification; partial file retained",
+            metadata.name
         );
     }
-    tokio::fs::rename(&part, target)
-        .await
-        .with_context(|| format!("atomically installing GGUF {}", target.display()))?;
-    sync_parent(target).context("syncing installed GGUF directory")?;
+    store
+        .rename(&part, target)
+        .context("atomically installing GGUF")?;
     Ok(())
 }
 
-async fn checksum_matches(path: &Path, expected: Option<&str>) -> Result<bool> {
+fn checksum_matches(
+    store: &CapabilityRootLease,
+    path: &Path,
+    expected: Option<&str>,
+) -> Result<bool> {
     let Some(expected) = expected else {
         return Ok(true);
     };
-    let mut file = tokio::fs::File::open(path)
-        .await
-        .with_context(|| format!("opening GGUF for checksum {}", path.display()))?;
+    let file = store.open_file(path).context("opening GGUF for checksum")?;
+    let mut file = file
+        .try_clone_std()
+        .context("cloning GGUF checksum handle")?;
     let mut digest = Sha256::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
         let read = file
             .read(&mut buffer)
-            .await
-            .with_context(|| format!("reading GGUF for checksum {}", path.display()))?;
+            .context("reading GGUF for checksum")?;
         if read == 0 {
             break;
         }
@@ -697,116 +803,101 @@ fn safe_relative_path(value: &str) -> Result<PathBuf> {
     Ok(safe)
 }
 
-fn ensure_within(root: &Path, target: &Path) -> Result<()> {
-    if !target.starts_with(root) {
+fn read_optional_json<T: DeserializeOwned>(
+    store: &CapabilityRootLease,
+    relative: &Path,
+    label: &str,
+) -> Result<Option<T>> {
+    read_optional_json_with_privacy(store, relative, label, false)
+}
+
+fn read_optional_private_json<T: DeserializeOwned>(
+    store: &CapabilityRootLease,
+    relative: &Path,
+    label: &str,
+) -> Result<Option<T>> {
+    read_optional_json_with_privacy(store, relative, label, true)
+}
+
+fn read_optional_json_with_privacy<T: DeserializeOwned>(
+    store: &CapabilityRootLease,
+    relative: &Path,
+    label: &str,
+    owner_only: bool,
+) -> Result<Option<T>> {
+    let file = match store.open_file(relative) {
+        Ok(file) => file,
+        Err(error) if fs_error_kind(&error) == Some(std::io::ErrorKind::NotFound) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error).with_context(|| format!("reading {label}")),
+    };
+    if owner_only {
+        validate_owner_only(&file, label)?;
+    }
+    let bytes = match file.read_bounded(MAX_STORED_JSON_BYTES) {
+        Ok(bytes) => bytes,
+        Err(FsError::ReadLimitExceeded { .. }) => bail!(
+            "{label} at {} is too large: exceeds the {MAX_STORED_JSON_BYTES}-byte limit",
+            file.display_path().display()
+        ),
+        Err(error) => return Err(error).with_context(|| format!("reading {label}")),
+    };
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing {label} from {}", file.display_path().display()))
+        .map(Some)
+}
+
+#[cfg(unix)]
+fn validate_owner_only(file: &crate::fs::CapabilityFile, label: &str) -> Result<()> {
+    let path = file.display_path();
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("reading {label} permissions at {}", path.display()))?;
+    if metadata.mode & 0o077 != 0 {
         bail!(
-            "path {} escapes llama data directory {}",
-            target.display(),
-            root.display()
+            "llama.cpp settings file {} must not be accessible by group or other users",
+            path.display()
         );
     }
     Ok(())
 }
 
-fn read_optional_json<T: DeserializeOwned>(path: &Path, label: &str) -> Result<Option<T>> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| format!("opening {label} at {}", path.display()));
-        }
+#[cfg(not(unix))]
+fn validate_owner_only(_file: &crate::fs::CapabilityFile, _label: &str) -> Result<()> {
+    Ok(())
+}
+
+fn write_json_atomic<T: Serialize>(
+    store: &CapabilityRootLease,
+    relative: &Path,
+    value: &T,
+    mode: FileMode,
+) -> Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(value).context("serializing llama state")?;
+    bytes.push(b'\n');
+    let expected = match store.metadata(relative) {
+        Ok(metadata) => Some(metadata.identity),
+        Err(error) if fs_error_kind(&error) == Some(std::io::ErrorKind::NotFound) => None,
+        Err(error) => return Err(error).context("reading stored llama identity"),
     };
-    let declared_size = file
-        .metadata()
-        .with_context(|| format!("reading {label} metadata at {}", path.display()))?
-        .len();
-    if declared_size > MAX_STORED_JSON_BYTES {
-        bail!(
-            "{label} at {} is too large: {declared_size} bytes exceeds the {MAX_STORED_JSON_BYTES}-byte limit",
-            path.display()
-        );
+    store
+        .replace_file(Replacement {
+            relative: relative.to_path_buf(),
+            expected,
+            bytes,
+            mode,
+        })
+        .context("atomically replacing llama state")?;
+    Ok(())
+}
+
+fn fs_error_kind(error: &FsError) -> Option<std::io::ErrorKind> {
+    match error {
+        FsError::System { kind, .. } => Some(*kind),
+        _ => None,
     }
-    let capacity = usize::try_from(declared_size)
-        .context("stored llama JSON size does not fit in memory address space")?;
-    let mut bytes = Vec::with_capacity(capacity);
-    file.take(MAX_STORED_JSON_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("reading bounded {label} from {}", path.display()))?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_STORED_JSON_BYTES {
-        bail!(
-            "{label} at {} grew beyond the {MAX_STORED_JSON_BYTES}-byte limit while being read",
-            path.display()
-        );
-    }
-    serde_json::from_slice(&bytes)
-        .with_context(|| format!("parsing {label} from {}", path.display()))
-        .map(Some)
 }
-
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    write_json_atomic_with_mode(path, value, false)
-}
-
-fn write_json_atomic_secret<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    write_json_atomic_with_mode(path, value, true)
-}
-
-fn write_json_atomic_with_mode<T: Serialize>(path: &Path, value: &T, secret: bool) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("stored path has no parent: {}", path.display()))?;
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("creating llama data directory {}", parent.display()))?;
-    let bytes = serde_json::to_vec_pretty(value).context("serializing llama state")?;
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| anyhow!("stored llama path is not UTF-8: {}", path.display()))?;
-    let temp = parent.join(format!(".{name}.tmp-{}-{}", std::process::id(), unix_millis()));
-    let mut options = OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(if secret { 0o600 } else { 0o644 });
-    }
-    let mut file = options
-        .open(&temp)
-        .with_context(|| format!("creating temporary llama state {}", temp.display()))?;
-    let result = (|| -> Result<()> {
-        file.write_all(&bytes)
-            .with_context(|| format!("writing temporary llama state {}", temp.display()))?;
-        file.write_all(b"\n")
-            .with_context(|| format!("terminating temporary llama state {}", temp.display()))?;
-        file.sync_all()
-            .with_context(|| format!("syncing temporary llama state {}", temp.display()))?;
-        std::fs::rename(&temp, path).with_context(|| {
-            format!(
-                "atomically replacing llama state {} with {}",
-                path.display(),
-                temp.display()
-            )
-        })?;
-        sync_parent(path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temp);
-    }
-    result
-}
-
-fn sync_parent(path: &Path) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
-    let directory = std::fs::File::open(parent)
-        .with_context(|| format!("opening directory for sync {}", parent.display()))?;
-    directory
-        .sync_all()
-        .with_context(|| format!("syncing directory {}", parent.display()))
-}
-
 fn unix_millis() -> u64 {
     u64::try_from(
         SystemTime::now()
@@ -819,37 +910,194 @@ fn unix_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+
     use super::*;
+    use futures_util::FutureExt;
     use tempfile::TempDir;
+
+    struct RecordingExecutor {
+        requests: Mutex<Vec<pi_ai::HttpRequestParts>>,
+        responses: Mutex<VecDeque<(http::StatusCode, http::HeaderMap, Vec<u8>)>>,
+    }
+
+    impl RecordingExecutor {
+        fn new(responses: Vec<(http::StatusCode, http::HeaderMap, Vec<u8>)>) -> Arc<Self> {
+            Arc::new(Self {
+                requests: Mutex::new(Vec::new()),
+                responses: Mutex::new(responses.into()),
+            })
+        }
+    }
+
+    impl pi_ai::HttpExecutor for RecordingExecutor {
+        fn execute<'a>(
+            &'a self,
+            request: pi_ai::HttpRequest,
+        ) -> futures_util::future::BoxFuture<'a, Result<pi_ai::HttpResponse>> {
+            async move {
+                self.requests
+                    .lock()
+                    .expect("request lock")
+                    .push(request.into_parts());
+                let (status, headers, body) = self
+                    .responses
+                    .lock()
+                    .expect("response lock")
+                    .pop_front()
+                    .expect("queued response");
+                Ok(pi_ai::HttpResponse::new(
+                    status,
+                    headers,
+                    Box::pin(futures_util::stream::iter([Ok(body)])),
+                ))
+            }
+            .boxed()
+        }
+    }
 
     #[test]
     fn persisted_json_accepts_exact_size_limit() {
         let directory = TempDir::new().expect("temporary directory");
-        let path = directory.path().join("catalog.json");
+        let manager = LlamaManager::new(directory.path().to_path_buf()).expect("llama manager");
         let payload_len = usize::try_from(MAX_STORED_JSON_BYTES).expect("limit fits usize") - 2;
         let payload = format!("\"{}\"", "a".repeat(payload_len));
         assert_eq!(u64::try_from(payload.len()).unwrap(), MAX_STORED_JSON_BYTES);
-        std::fs::write(&path, payload).expect("write exact-boundary JSON");
+        manager
+            .store
+            .replace_file(Replacement {
+                relative: PathBuf::from(CATALOG_FILE),
+                expected: None,
+                bytes: payload.into_bytes(),
+                mode: FileMode::Private,
+            })
+            .expect("write exact-boundary JSON");
 
-        let value = read_optional_json::<String>(&path, "llama.cpp model catalog")
-            .expect("read exact-boundary JSON")
-            .expect("stored value");
+        let value = read_optional_json::<String>(
+            &manager.store,
+            Path::new(CATALOG_FILE),
+            "llama.cpp model catalog",
+        )
+        .expect("read exact-boundary JSON")
+        .expect("stored value");
         assert_eq!(value.len(), payload_len);
     }
 
     #[test]
     fn persisted_json_rejects_one_byte_over_limit_with_context() {
         let directory = TempDir::new().expect("temporary directory");
-        let path = directory.path().join("installed.json");
-        let oversized = vec![b' '; usize::try_from(MAX_STORED_JSON_BYTES + 1).expect("limit fits usize")];
-        std::fs::write(&path, oversized).expect("write oversized JSON");
+        let manager = LlamaManager::new(directory.path().to_path_buf()).expect("llama manager");
+        let oversized =
+            vec![b' '; usize::try_from(MAX_STORED_JSON_BYTES + 1).expect("limit fits usize")];
+        manager
+            .store
+            .replace_file(Replacement {
+                relative: PathBuf::from(INSTALLED_FILE),
+                expected: None,
+                bytes: oversized,
+                mode: FileMode::Private,
+            })
+            .expect("write oversized JSON");
 
-        let error = read_optional_json::<serde_json::Value>(&path, "installed GGUF catalog")
-            .expect_err("oversized JSON must fail");
+        let error = read_optional_json::<serde_json::Value>(
+            &manager.store,
+            Path::new(INSTALLED_FILE),
+            "installed GGUF catalog",
+        )
+        .expect_err("oversized JSON must fail");
         let message = format!("{error:#}");
         assert!(message.contains("installed GGUF catalog"));
-        assert!(message.contains(path.to_string_lossy().as_ref()));
-        assert!(message.contains(&(MAX_STORED_JSON_BYTES + 1).to_string()));
         assert!(message.contains(&MAX_STORED_JSON_BYTES.to_string()));
+    }
+
+    #[tokio::test]
+    async fn gguf_resume_uses_injected_executor_and_preserves_integrity() {
+        let directory = TempDir::new().expect("temporary directory");
+        let manager = LlamaManager::new(directory.path().to_path_buf()).expect("llama manager");
+        manager
+            .store
+            .create_dir_all(Path::new("models"), FileMode::Private)
+            .expect("models directory");
+        manager
+            .store
+            .replace_file(Replacement {
+                relative: PathBuf::from("models/model.gguf.part"),
+                expected: None,
+                bytes: b"abc".to_vec(),
+                mode: FileMode::Private,
+            })
+            .expect("partial file");
+        let mut response_headers = http::HeaderMap::new();
+        response_headers.insert(
+            http::header::CONTENT_RANGE,
+            http::HeaderValue::from_static("bytes 3-5/6"),
+        );
+        response_headers.insert(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from_static("3"),
+        );
+        let executor = RecordingExecutor::new(vec![(
+            http::StatusCode::PARTIAL_CONTENT,
+            response_headers,
+            b"def".to_vec(),
+        )]);
+        let client = HuggingFaceClient::new(
+            Some("hf-secret".to_owned()),
+            Some("https://huggingface.example"),
+            executor.clone(),
+        )
+        .expect("client");
+        let metadata = HuggingFaceGgufFile {
+            name: "model.gguf".to_owned(),
+            size: Some(6),
+            sha256: Some(format!("{:x}", Sha256::digest(b"abcdef"))),
+            quantization: "Q4_K_M".to_owned(),
+        };
+        let mut progress = Vec::new();
+
+        download_one(
+            &manager.store,
+            &client,
+            &metadata,
+            "https://huggingface.example/owner/model/resolve/main/model.gguf",
+            Path::new("models/model.gguf"),
+            executor.clone(),
+            &CancellationToken::new(),
+            &mut |update| progress.push(update),
+        )
+        .await
+        .expect("download");
+
+        let installed = manager
+            .store
+            .read_bounded(Path::new("models/model.gguf"), 6)
+            .expect("installed file");
+        assert_eq!(installed, b"abcdef");
+        assert!(progress.iter().all(|update| update.resumed));
+        let request = executor.requests.lock().expect("request lock").remove(0);
+        assert_eq!(request.method, HttpMethod::Get);
+        assert_eq!(request.timeout_ms, 120_000);
+        assert_eq!(
+            request.max_response_bytes.get(),
+            pi_ai::MAX_HTTP_RESPONSE_BODY_BYTES
+        );
+        assert_eq!(
+            request
+                .headers
+                .iter()
+                .find(|(name, _)| name == http::header::RANGE)
+                .expect("range header")
+                .1
+                .to_str()
+                .expect("range"),
+            "bytes=3-"
+        );
+        let authorization = request
+            .headers
+            .iter()
+            .find(|(name, _)| name == http::header::AUTHORIZATION)
+            .expect("authorization header");
+        assert!(authorization.1.is_sensitive());
     }
 }

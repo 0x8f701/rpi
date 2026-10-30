@@ -1,6 +1,9 @@
+mod authorized;
 mod backend;
+mod capture;
 mod log;
 mod manager;
+mod probe;
 mod tool;
 
 use std::collections::BTreeMap;
@@ -11,8 +14,25 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub(crate) use authorized::{
+    AuthorizedSpawn, SpawnError, authorize_candidate_spawn, authorize_spawn,
+    authorize_spawn_with_auth,
+};
+#[cfg(unix)]
+pub(crate) use backend::{
+    BrowserDebuggingPipes, GovernedPipeProcess, browser_debugging_pipes,
+    launch_authorized_browser_pipe,
+};
+pub(crate) use backend::{GovernedChild, launch_authorized_pipe};
+#[cfg(test)]
+pub(crate) use capture::RepositoryTestExecutor;
+pub(crate) use capture::{
+    ForegroundShellOutput, ForegroundShellSpec, GovernedProcessSpec, run_authorized_pipe_bounded,
+};
+pub use capture::{GovernedProcessContext, GovernedProcessOutput, HermeticRepositoryExecutor};
 pub use log::{ProcessLogChunk, ProcessLogs};
 pub use manager::ProcessManager;
+pub(crate) use probe::{TrustedToolProbe, run_trusted_tool_probe};
 pub use tool::process_tool;
 
 pub const DEFAULT_PROCESS_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -83,7 +103,10 @@ pub enum ProcessState {
 impl ProcessState {
     #[must_use]
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Exited | Self::TimedOut | Self::Expired | Self::Failed)
+        matches!(
+            self,
+            Self::Exited | Self::TimedOut | Self::Expired | Self::Failed
+        )
     }
 }
 
@@ -210,7 +233,11 @@ pub struct ProcessInfo {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum ProcessEvent {
     ProcessStarted {
         process: ProcessInfo,

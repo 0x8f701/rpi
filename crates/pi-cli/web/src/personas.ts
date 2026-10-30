@@ -17,6 +17,8 @@
 // Task spawn for a persona is the EXISTING task_spawn RPC with `agent` set to
 // the persona's agent name (the same path the `task` tool and `/persona run`
 // use) — never a heuristic or a second persona store.
+// Persona selection supplies role metadata only. It never adds sandbox roots,
+// host HTTP destinations, credential grants, or any other authority.
 
 export interface PersonaRowWire {
   name: string;
@@ -183,11 +185,25 @@ export function persistenceLine(row: PersonaRowWire): string {
 }
 
 /** Seed template for a new persona (mirrors `persona_editor_seed`). */
+export const DEFAULT_PERSONA_CODING_TOOLS = [
+  'read',
+  'grep',
+  'find',
+  'ls',
+  'glob',
+  'bash',
+  'edit',
+  'write',
+  'web_search',
+  'browser',
+] as const;
+
 export function buildPersonaCreateContent(name: string): string {
   return (
-    `---\nname: ${name}\ndescription: ${name} persona\n---\n` +
+    `---\nname: ${name}\ndescription: ${name} persona\ntools: [${DEFAULT_PERSONA_CODING_TOOLS.join(', ')}]\n---\n` +
     `Describe ${name}'s behavior, personality, and contract here.\n` +
-    `Optional frontmatter: personality, softBudget, maxTurns, timeoutSecs, tools.\n`
+    `Optional frontmatter: personality, softBudget, maxTurns, timeoutSecs.\n` +
+    `Raise orchestration.maxToolsPerAgent before expanding tools past the cap.\n`
   );
 }
 

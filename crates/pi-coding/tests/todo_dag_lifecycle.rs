@@ -33,6 +33,7 @@ fn make_ctx(arguments: Value) -> ToolCallContext {
         on_update: noop_update(),
         abort,
         model: None,
+        approval_token: None,
     }
 }
 
@@ -100,6 +101,7 @@ fn session_options(cwd: &Path) -> SessionOptions {
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: None,
+        auth_manager: None,
     }
 }
 
@@ -135,7 +137,7 @@ fn attach_recorder(session: &Session, recorder: SessionRecorder) {
 }
 
 /// Full tool campaign: init/append, dependencies, readiness, complete, remove.
-/// Asserts model-visible ready/blockedBy and no silent dependency mutation.
+/// Asserts model-visible ready/waitingOn and no silent dependency mutation.
 #[tokio::test]
 async fn todo_tool_campaign_exercises_dag_lifecycle_and_model_visible_readiness() {
     let cwd = tempfile::tempdir().expect("cwd");
@@ -171,12 +173,11 @@ async fn todo_tool_campaign_exercises_dag_lifecycle_and_model_visible_readiness(
 
     // Roots are ready; dependents without edges are also ready until wired.
     assert_eq!(
-        init.details["phases"][0]["tasks"][0]["ready"],
-        true,
+        init.details["phases"][0]["tasks"][0]["ready"], true,
         "compile should start ready"
     );
     assert_eq!(
-        init.details["phases"][0]["tasks"][0]["blockedBy"],
+        init.details["phases"][0]["tasks"][0]["waitingOn"],
         json!([])
     );
 
@@ -240,11 +241,11 @@ async fn todo_tool_campaign_exercises_dag_lifecycle_and_model_visible_readiness(
     let lint = task_by_content(&after_deps, "lint");
 
     assert!(compile.ready, "root compile must be model-visible ready");
-    assert!(compile.blocked_by.is_empty());
+    assert!(compile.waiting_on.is_empty());
     assert!(!link.ready, "link must wait on compile");
     assert_eq!(link.depends_on, vec![compile_id.clone()]);
-    assert_eq!(link.blocked_by.len(), 1);
-    assert_eq!(link.blocked_by[0].task_id, compile_id);
+    assert_eq!(link.waiting_on.len(), 1);
+    assert_eq!(link.waiting_on[0].task_id, compile_id);
     assert!(!test.ready, "test must wait on link");
     assert_eq!(test.depends_on, vec![link_id.clone()]);
     assert!(!lint.ready, "lint must wait on compile and test");
@@ -255,12 +256,11 @@ async fn todo_tool_campaign_exercises_dag_lifecycle_and_model_visible_readiness(
     assert_no_todo_error(&view, "view");
     assert_eq!(view.details["op"], "view");
     assert_eq!(
-        view.details["phases"][0]["tasks"][1]["ready"],
-        false,
-        "model-visible view must keep link blocked"
+        view.details["phases"][0]["tasks"][1]["ready"], false,
+        "model-visible view must keep link waiting"
     );
     assert_eq!(
-        view.details["phases"][0]["tasks"][1]["blockedBy"][0]["taskId"],
+        view.details["phases"][0]["tasks"][1]["waitingOn"][0]["taskId"],
         compile_id
     );
     assert_eq!(
@@ -324,14 +324,14 @@ async fn todo_tool_campaign_exercises_dag_lifecycle_and_model_visible_readiness(
         TodoStatus::Completed
     );
     assert!(link.ready, "link must become ready after compile completes");
-    assert!(link.blocked_by.is_empty());
+    assert!(link.waiting_on.is_empty());
     assert_eq!(
         link.depends_on,
         vec![compile_id.clone()],
         "completion must not silently drop dependsOn edges"
     );
-    assert!(!test.ready, "test still blocked on incomplete link");
-    assert!(!lint.ready, "lint still blocked on incomplete test");
+    assert!(!test.ready, "test still waiting on incomplete link");
+    assert!(!lint.ready, "lint still waiting on incomplete test");
     assert_eq!(lint.depends_on, vec![compile_id.clone(), test_id.clone()]);
 
     // complete the rest of the chain.
@@ -344,7 +344,7 @@ async fn todo_tool_campaign_exercises_dag_lifecycle_and_model_visible_readiness(
         task_by_content(&after_test, "lint").ready,
         "lint must unlock once compile+test are terminal"
     );
-    assert!(task_by_content(&after_test, "lint").blocked_by.is_empty());
+    assert!(task_by_content(&after_test, "lint").waiting_on.is_empty());
 
     // remove_dependency is explicit — dropping only the requested edge.
     let remove_one = call_todo(
@@ -364,7 +364,7 @@ async fn todo_tool_campaign_exercises_dag_lifecycle_and_model_visible_readiness(
     );
 
     // remove — cascade delete of compile must require cascade.
-    let rm_blocked = call_todo(
+    let rm_rejected = call_todo(
         &todo,
         json!({
             "op": "rm",
@@ -373,12 +373,12 @@ async fn todo_tool_campaign_exercises_dag_lifecycle_and_model_visible_readiness(
         }),
     )
     .await;
-    assert_eq!(rm_blocked.details[TODO_ERROR_MARKER], true);
+    assert_eq!(rm_rejected.details[TODO_ERROR_MARKER], true);
     assert!(
-        text_of(&rm_blocked).contains("Cannot remove dependency target")
-            || text_of(&rm_blocked).contains("cascade=true"),
+        text_of(&rm_rejected).contains("Cannot remove dependency target")
+            || text_of(&rm_rejected).contains("cascade=true"),
         "rm without cascade must reject dependency targets: {}",
-        text_of(&rm_blocked)
+        text_of(&rm_rejected)
     );
     assert!(
         session
@@ -441,9 +441,7 @@ async fn todo_tool_persisted_snapshot_restores_readiness_without_silent_edge_rew
     let (_agent, recorder) = start_isolated_recording(cwd.path(), "todo-dag-restore");
     let path = recorder.path();
     attach_recorder(&session, recorder.clone());
-    let todo = session
-        .get_tool_definition("todo")
-        .expect("todo tool");
+    let todo = session.get_tool_definition("todo").expect("todo tool");
 
     let init = call_todo(
         &todo,
@@ -534,10 +532,14 @@ async fn todo_tool_persisted_snapshot_restores_readiness_without_silent_edge_rew
     );
     // Projection fields are part of the public snapshot contract.
     assert!(task_by_content(&snapshot, "implement").ready);
-    assert!(task_by_content(&snapshot, "implement").blocked_by.is_empty());
+    assert!(
+        task_by_content(&snapshot, "implement")
+            .waiting_on
+            .is_empty()
+    );
     assert!(!task_by_content(&snapshot, "review").ready);
     assert_eq!(
-        task_by_content(&snapshot, "review").blocked_by[0].task_id,
+        task_by_content(&snapshot, "review").waiting_on[0].task_id,
         implement_id
     );
 
@@ -562,18 +564,14 @@ async fn todo_tool_persisted_snapshot_restores_readiness_without_silent_edge_rew
     );
     assert!(
         !task_by_content(&restored_state, "review").ready,
-        "restored review must remain blocked"
+        "restored review must remain waiting on its dependency"
     );
 
     // Further tool ops on the restored session keep persistence coherent.
     let todo = restored
         .get_tool_definition("todo")
         .expect("todo after restore");
-    let done_implement = call_todo(
-        &todo,
-        json!({ "op": "done", "task": implement_id }),
-    )
-    .await;
+    let done_implement = call_todo(&todo, json!({ "op": "done", "task": implement_id })).await;
     assert_no_todo_error(&done_implement, "done implement after restore");
     let after = restored.todo_state();
     assert_eq!(
@@ -625,7 +623,7 @@ fn interrupted_unwritten_todo_operation_restores_last_durable_snapshot() {
                 status: TodoStatus::InProgress,
                 depends_on: Vec::new(),
                 ready: true,
-                blocked_by: Vec::new(),
+                waiting_on: Vec::new(),
                 agent: None,
             }],
         }],
@@ -646,7 +644,7 @@ fn interrupted_unwritten_todo_operation_restores_last_durable_snapshot() {
         status: TodoStatus::Pending,
         depends_on: Vec::new(),
         ready: false,
-        blocked_by: Vec::new(),
+        waiting_on: Vec::new(),
         agent: None,
     });
     assert_ne!(interrupted, durable);
@@ -686,7 +684,7 @@ fn attaching_recorded_todo_snapshot_restores_public_state_bytes() {
                     status: TodoStatus::Completed,
                     depends_on: Vec::new(),
                     ready: false,
-                    blocked_by: Vec::new(),
+                    waiting_on: Vec::new(),
                     agent: None,
                 },
                 TodoItem {
@@ -695,7 +693,7 @@ fn attaching_recorded_todo_snapshot_restores_public_state_bytes() {
                     status: TodoStatus::InProgress,
                     depends_on: vec!["task-root".to_owned()],
                     ready: true,
-                    blocked_by: Vec::new(),
+                    waiting_on: Vec::new(),
                     agent: None,
                 },
             ],

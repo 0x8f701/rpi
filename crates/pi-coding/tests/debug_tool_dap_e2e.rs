@@ -2,29 +2,39 @@
 //! adapter: the tool spawns `gdb -q -i dap` as a child, performs the
 //! initialize/launch handshake, sets a breakpoint, runs the debuggee to the
 //! stop, reads the stack, evaluates an expression in the stopped frame, and
-//! terminates the adapter — all through the public `create_tool("debug", …)`
-//! boundary (the only boundary reachable without a live model turn, since
-//! the faux REPL provider cannot script tool calls).
+//! terminates the adapter — all through the public tool boundary (the only
+//! boundary reachable without a live model turn, since the faux REPL provider
+//! cannot script tool calls).
+//!
+//! The `debug` tool is governed: it fail-closes without a captured application
+//! generation ("debug requires an application generation"). The tool is
+//! retrieved from a hermetic published `Application` generation
+//! (danger-full-access sandbox, no bubblewrap dependency) — the same boundary
+//! the agent runtime uses.
 //!
 //! The full client contract (framing, request/event routing, all action
 //! renderers, error paths) is already proven in-module against the fake DAP
-//! adapter; this file adds the real-adapter dimension. It is skip-guarded
-//! exactly like `sandbox_smoke.rs`: when `gdb` (>= 13, the first release
-//! with `-i dap`), `cc`, or a working DAP handshake is unavailable the test
-//! prints a notice and passes, so CI without a C toolchain stays green.
+//! adapter; this file adds the real-adapter dimension. It is skip-guarded when
+//! `gdb` (>= 13, the first release with `-i dap`), `cc`, or a working DAP
+//! handshake is unavailable, so CI without a C toolchain stays green.
 
 #![cfg(unix)]
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::thread;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-use pi_agent::{AbortController, AgentTool, AgentToolResult, ToolCallContext, ToolUpdateFn};
-use pi_ai::ContentBlock;
-use pi_coding::create_tool;
+use pi_agent::{
+    AbortController, AgentTool, AgentToolResult, ThinkingLevel, ToolCallContext, ToolUpdateFn,
+};
+use pi_ai::providers::{FauxProviderOptions, register_faux_provider};
+use pi_ai::{ContentBlock, Model, SimpleStreamOptions};
+use pi_coding::{
+    Application, ApplicationRuntimeCandidate, ResourceDiscovery, ResourceManager,
+    ResourceManagerOptions, Session, SessionOptions, ToolSelection,
+};
 use serde_json::{Value, json};
 
 /// `gdb -i dap` landed in gdb 13; older builds lack the DAP interpreter.
@@ -43,6 +53,7 @@ fn make_ctx(arguments: Value) -> ToolCallContext {
         on_update: noop_update(),
         abort,
         model: None,
+        approval_token: None,
     }
 }
 
@@ -65,6 +76,101 @@ async fn call_err(tool: &AgentTool, arguments: Value) -> String {
         .await
         .expect_err("expected debug tool error")
         .to_string()
+}
+
+fn session_options(cwd: &Path, model: Model) -> SessionOptions {
+    SessionOptions {
+        model,
+        cwd: cwd.to_path_buf(),
+        system_prompt: String::new(),
+        thinking_level: ThinkingLevel::Off,
+        api_key: "faux".to_owned(),
+        compaction: None,
+        stream_options: SimpleStreamOptions::default(),
+        tools: None,
+        before_tool_call: None,
+        after_tool_call: None,
+        stream_fn: None,
+        auth_resolver: None,
+        auth_manager: None,
+    }
+}
+
+/// Agent configuration and SessionStore directories kept OUTSIDE the writable
+/// `cwd` workspace and held alive for the application's lifetime, so the
+/// published generation's revision scratch directories (created by the normal
+/// Application bootstrap under the agent home) survive every tool call. A
+/// process-lifetime tempdir root hosts per-call subdirs.
+fn external_config_roots() -> (PathBuf, PathBuf) {
+    static ROOT: LazyLock<tempfile::TempDir> =
+        LazyLock::new(|| tempfile::tempdir().expect("debug dap e2e config root"));
+    let suffix = uuid::Uuid::now_v7().to_string();
+    let base = ROOT.path().join(suffix);
+    let agent_dir = base.join("agent");
+    let session_dir = base.join("sessions");
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    (agent_dir, session_dir)
+}
+
+/// Builds a hermetic published `Application` generation (danger-full-access
+/// sandbox, no extensions/skills/themes/context-files, faux provider) and
+/// returns it together with the `debug` tool retrieved from the application's
+/// tool catalog. The returned `Application` and the shared config `TempDir`
+/// must outlive every tool call.
+async fn debug_tool(cwd: &Path) -> (Application, AgentTool) {
+    let suffix = uuid::Uuid::now_v7().to_string();
+    let api = format!("debug-dap-e2e-api-{suffix}");
+    let provider = format!("debug-dap-e2e-provider-{suffix}");
+    let model = Model {
+        id: "debug-dap-e2e".to_owned(),
+        name: "Debug DAP E2E".to_owned(),
+        api: api.clone(),
+        provider: provider.clone(),
+        ..Model::default()
+    };
+    let _registration = register_faux_provider(FauxProviderOptions {
+        api,
+        provider,
+        models: vec![model.clone()],
+        chunk_size: 1,
+    });
+    let (agent_dir, session_dir) = external_config_roots();
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+    )
+    .expect("danger settings");
+    let mut resource_options = ResourceManagerOptions::new(cwd);
+    resource_options.agent_dir = agent_dir;
+    resource_options.disable_extensions = true;
+    resource_options.disable_skills = true;
+    resource_options.disable_prompt_templates = true;
+    resource_options.disable_themes = true;
+    resource_options.disable_context_files = true;
+    let resources = ResourceManager::new(resource_options).expect("resources");
+    let session = Session::new_with_additional_tools_filtered_and_discovery(
+        session_options(cwd, model.clone()),
+        Vec::new(),
+        ToolSelection::default(),
+        ResourceDiscovery::Disabled,
+    )
+    .expect("session");
+    session.set_session_dir(session_dir);
+    session
+        .attach_resources(resources)
+        .await
+        .expect("attach resources");
+    let application =
+        Application::from_runtime_candidate(ApplicationRuntimeCandidate::new(session))
+            .await
+            .expect("publish application generation");
+    let debug = application
+        .get_all_tools()
+        .into_iter()
+        .find(|tool| tool.name == "debug")
+        .expect("debug tool is in the published application catalog");
+    (application, debug)
 }
 
 // ---------------------------------------------------------------------------
@@ -100,7 +206,11 @@ fn gdb_dap_usable() -> bool {
         eprintln!("debug e2e: SKIP (gdb {major} is older than the {MIN_GDB_MAJOR} DAP release)");
         return false;
     }
-    if Command::new("cc").arg("--version").output().map_or(true, |out| !out.status.success()) {
+    if Command::new("cc")
+        .arg("--version")
+        .output()
+        .map_or(true, |out| !out.status.success())
+    {
         eprintln!("debug e2e: SKIP (cc is not installed)");
         return false;
     }
@@ -133,7 +243,11 @@ fn dap_initialize_probe() -> bool {
     let mut frame = Vec::with_capacity(body.len() + 64);
     frame.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
     frame.extend_from_slice(&body);
-    if stdin.write_all(&frame).and_then(|()| stdin.flush()).is_err() {
+    if stdin
+        .write_all(&frame)
+        .and_then(|()| stdin.flush())
+        .is_err()
+    {
         let _ = child.kill();
         let _ = child.wait();
         return false;
@@ -230,7 +344,7 @@ async fn debug_tool_drives_real_gdb_adapter_launch_handshake_and_terminate() {
         String::from_utf8_lossy(&compile.stderr)
     );
 
-    let tool = create_tool("debug", &cwd.path().to_string_lossy()).expect("debug tool builds");
+    let (_application, tool) = debug_tool(cwd.path()).await;
 
     let launched = call(
         &tool,
@@ -258,7 +372,10 @@ async fn debug_tool_drives_real_gdb_adapter_launch_handshake_and_terminate() {
     // The slot is freed: an action without a launch fails with the canonical
     // error instead of touching a stale session.
     let after = call_err(&tool, json!({ "action": "threads" })).await;
-    assert!(after.contains("no DAP adapter running"), "slot must be cleared: {after}");
+    assert!(
+        after.contains("no DAP adapter running"),
+        "slot must be cleared: {after}"
+    );
 }
 
 /// Contract: deterministic error paths that need no adapter — an unknown
@@ -267,7 +384,7 @@ async fn debug_tool_drives_real_gdb_adapter_launch_handshake_and_terminate() {
 #[tokio::test]
 async fn debug_tool_rejects_invalid_launch_actionably() {
     let cwd = tempfile::tempdir().expect("cwd");
-    let tool = create_tool("debug", &cwd.path().to_string_lossy()).expect("debug tool builds");
+    let (_application, tool) = debug_tool(cwd.path()).await;
 
     let unknown_adapter = call_err(
         &tool,
@@ -279,11 +396,7 @@ async fn debug_tool_rejects_invalid_launch_actionably() {
         "unknown adapter: {unknown_adapter}"
     );
 
-    let missing_program = call_err(
-        &tool,
-        json!({ "action": "launch", "adapter": "gdb" }),
-    )
-    .await;
+    let missing_program = call_err(&tool, json!({ "action": "launch", "adapter": "gdb" })).await;
     assert!(
         missing_program.contains("program"),
         "missing program: {missing_program}"

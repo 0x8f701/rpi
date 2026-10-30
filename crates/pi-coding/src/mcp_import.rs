@@ -13,16 +13,15 @@
 //!   import as the sse transport (this build's client transport is stdio;
 //!   sse entries parse and round-trip but report the limitation when used).
 //!
-//! Unknown entry fields are retained in `extra` so a config survives a
-//! settings write losslessly. [`merge_mcp_servers`] validates every entry
-//! (disabled entries are exempt from transport requirements — they never
+//! Imported entries are projected into the exact settings schema. Unknown
+//! fields are discarded; [`merge_mcp_servers`] validates every entry
+//! (disabled entries are exempt from transport requirements because they never
 //! spawn) and never overwrites an existing server unless `force` is set.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use crate::settings::{McpServerConfig, McpTransport, Settings};
 
@@ -113,8 +112,8 @@ pub fn cursor_mcp_config_path(cwd: &Path) -> PathBuf {
 /// into server entries. Entries named in the top-level `disabledMCPServers`
 /// list arrive with `disabled: true`.
 pub fn parse_claude_config(contents: &str) -> Result<Vec<McpServerConfig>> {
-    let document: Value = serde_json::from_str(contents)
-        .context("Claude Desktop config is not valid JSON")?;
+    let document: Value =
+        serde_json::from_str(contents).context("Claude Desktop config is not valid JSON")?;
     let servers = document
         .get("mcpServers")
         .and_then(Value::as_object)
@@ -178,43 +177,28 @@ fn entry_to_config(name: &str, entry: &Value) -> Result<McpServerConfig> {
         .get("command")
         .and_then(Value::as_str)
         .map(String::from);
-    let args = entry
-        .get("args")
-        .and_then(Value::as_array)
-        .map(|args| {
-            args.iter()
-                .filter_map(Value::as_str)
-                .map(String::from)
-                .collect()
-        });
+    let args = entry.get("args").and_then(Value::as_array).map(|args| {
+        args.iter()
+            .filter_map(Value::as_str)
+            .map(String::from)
+            .collect()
+    });
     let env = entry.get("env").and_then(Value::as_object).map(|env| {
-        env.iter()
-            .map(|(key, value)| {
-                (
-                    key.clone(),
-                    value
-                        .as_str()
-                        .map(String::from)
-                        .unwrap_or_else(|| value.to_string()),
-                )
-            })
-            .collect::<BTreeMap<String, String>>()
+        crate::McpEnvironmentWire::from_iter(env.iter().map(|(key, value)| {
+            (
+                key.clone(),
+                value
+                    .as_str()
+                    .map(String::from)
+                    .unwrap_or_else(|| value.to_string()),
+            )
+        }))
     });
     let url = entry.get("url").and_then(Value::as_str).map(String::from);
     let disabled = entry
         .get("disabled")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    // Retain everything unknown so the config round-trips losslessly.
-    let mut extra = Map::new();
-    for (key, value) in entry {
-        if !matches!(
-            key.as_str(),
-            "type" | "transport" | "command" | "args" | "env" | "url" | "disabled"
-        ) {
-            extra.insert(key.clone(), value.clone());
-        }
-    }
     Ok(McpServerConfig {
         name: name.to_owned(),
         disabled,
@@ -223,7 +207,7 @@ fn entry_to_config(name: &str, entry: &Value) -> Result<McpServerConfig> {
         args,
         url,
         env,
-        extra,
+        credential_grants: Vec::new(),
     })
 }
 
@@ -279,9 +263,7 @@ pub fn merge_mcp_servers(
     let mut outcome = McpImportOutcome::default();
     for server in entries {
         if let Err(error) = validate_imported(&server) {
-            outcome
-                .rejected
-                .push(format!("{}: {error:#}", server.name));
+            outcome.rejected.push(format!("{}: {error:#}", server.name));
             continue;
         }
         if server.disabled {
@@ -294,7 +276,9 @@ pub fn merge_mcp_servers(
         {
             Some(index) if force => {
                 settings.mcp_servers[index] = server;
-                outcome.replaced.push(settings.mcp_servers[index].name.clone());
+                outcome
+                    .replaced
+                    .push(settings.mcp_servers[index].name.clone());
             }
             Some(_) => outcome.skipped.push(server.name.clone()),
             None => {
@@ -352,7 +336,10 @@ mod tests {
             .expect("filesystem");
         assert_eq!(filesystem.transport, McpTransport::Stdio);
         assert_eq!(filesystem.command.as_deref(), Some("npx"));
-        assert!(!filesystem.disabled, "only disabledMCPServers names are disabled");
+        assert!(
+            !filesystem.disabled,
+            "only disabledMCPServers names are disabled"
+        );
 
         let github = servers
             .iter()
@@ -365,14 +352,17 @@ mod tests {
             "env references survive parsing for the settings write (expanded only at runtime)"
         );
 
-        // Unknown fields are retained so the config round-trips.
         let legacy = servers
             .iter()
             .find(|server| server.name == "legacy")
             .expect("legacy");
+        assert_eq!(legacy.command.as_deref(), Some("python"));
         assert_eq!(
-            legacy.extra.get("timeout").and_then(Value::as_i64),
-            Some(10)
+            legacy
+                .args
+                .as_ref()
+                .map(|args| args.iter().map(String::as_str).collect::<Vec<_>>()),
+            Some(vec!["-m", "legacy_server"])
         );
     }
 
@@ -394,7 +384,10 @@ mod tests {
             .find(|server| server.name == "remote")
             .expect("remote");
         assert_eq!(remote.transport, McpTransport::Sse);
-        assert_eq!(remote.url.as_deref(), Some("https://mcp.example.com/remote"));
+        assert_eq!(
+            remote.url.as_deref(),
+            Some("https://mcp.example.com/remote")
+        );
         assert!(remote.disabled, "per-entry disabled maps directly");
 
         // Cursor `type: http` imports as sse (transport limitation documented).
@@ -417,7 +410,7 @@ mod tests {
             args: None,
             url: None,
             env: None,
-            extra: Map::new(),
+            credential_grants: Vec::new(),
         }];
 
         let entries = parse_claude_config(CLAUDE_FIXTURE).expect("fixture");
@@ -472,7 +465,7 @@ mod tests {
             args: None,
             url: None,
             env: None,
-            extra: Map::new(),
+            credential_grants: Vec::new(),
         });
         // A disabled entry without a command is fine (it never spawns).
         entries.push(McpServerConfig {
@@ -483,7 +476,7 @@ mod tests {
             args: None,
             url: None,
             env: None,
-            extra: Map::new(),
+            credential_grants: Vec::new(),
         });
         let outcome = merge_mcp_servers(&mut settings, entries, false);
         assert!(
@@ -534,10 +527,13 @@ mod tests {
             .iter()
             .find(|server| server.name == "legacy")
             .expect("legacy");
+        assert_eq!(legacy.command.as_deref(), Some("python"));
         assert_eq!(
-            legacy.extra.get("timeout").and_then(Value::as_i64),
-            Some(10),
-            "extra fields survive the round-trip"
+            legacy
+                .args
+                .as_ref()
+                .map(|args| args.iter().map(String::as_str).collect::<Vec<_>>()),
+            Some(vec!["-m", "legacy_server"])
         );
         // The whole merged settings document validates (disabled entries are
         // exempt from transport requirements).
@@ -551,7 +547,10 @@ mod tests {
 
     #[test]
     fn malformed_configs_fail_with_context() {
-        assert!(parse_claude_config("not json").is_err(), "invalid JSON fails");
+        assert!(
+            parse_claude_config("not json").is_err(),
+            "invalid JSON fails"
+        );
         assert!(
             parse_claude_config(r#"{"mcpServers": []}"#).is_err(),
             "mcpServers must be an object"
@@ -616,17 +615,15 @@ mod tests {
     }
 
     #[test]
-    fn claude_entry_extra_keeps_arbitrary_fields() {
+    fn imported_unknown_mcp_fields_are_not_retained() {
         let entry = json!({
             "command": "npx",
             "alwaysAllow": ["read"],
             "headers": { "Authorization": "Bearer x" }
         });
         let config = entry_to_config("custom", &entry).expect("parse");
-        assert_eq!(
-            config.extra.get("alwaysAllow").and_then(Value::as_array).map(Vec::len),
-            Some(1)
-        );
-        assert!(config.extra.contains_key("headers"));
+        let encoded = serde_json::to_value(config).expect("serialize");
+        assert_eq!(encoded.get("alwaysAllow"), None);
+        assert_eq!(encoded.get("headers"), None);
     }
 }

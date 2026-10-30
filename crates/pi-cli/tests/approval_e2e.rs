@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
-
 use clap::Parser;
+use pi_agent::ThinkingLevel;
 use pi_agent::{
     ApprovalMode, BeforeToolCallContext, BeforeToolCallFn, BeforeToolCallResult, ToolCapability,
 };
@@ -18,7 +18,6 @@ use pi_ai::providers::{
     FauxProviderOptions, FauxProviderRegistration, FauxResponse, register_faux_provider,
 };
 use pi_ai::{ContentBlock, Model, StopReason, ToolCall};
-use pi_agent::ThinkingLevel;
 use pi_cli::Cli;
 use pi_cli::approval::{empty_permission_rules, host_approval_before_tool_call};
 use pi_cli::extension_ui::{
@@ -79,6 +78,7 @@ fn tool_call_context(tool_name: &str, capability: ToolCapability) -> BeforeToolC
             messages: Vec::new(),
             tools: vec![tool],
         },
+        approval_request: None,
     }
 }
 
@@ -126,6 +126,49 @@ fn resolved_mode(cli: &Cli, settings: &Settings) -> ApprovalMode {
     cli.approval_mode
         .map(Into::into)
         .unwrap_or_else(|| settings.approval_mode())
+}
+fn prepare_session_store(session: &Session, cwd: &std::path::Path) {
+    let session_dir = cwd.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session directory");
+    session.set_session_dir(session_dir);
+}
+fn approval_test_tool(
+    name: &str,
+    capability: ToolCapability,
+    text: &'static str,
+) -> pi_agent::AgentTool {
+    pi_agent::AgentTool::new(
+        name,
+        "approval test tool",
+        pi_ai::Schema::default(),
+        move |_| async move { Ok(pi_agent::AgentToolResult::text(text)) },
+    )
+    .with_capability(capability)
+}
+fn approval_write_tool(cwd: PathBuf) -> pi_agent::AgentTool {
+    pi_agent::AgentTool::new(
+        "write",
+        "approval test tool",
+        pi_ai::Schema::default(),
+        move |arguments| {
+            let cwd = cwd.clone();
+            async move {
+                let path = arguments
+                    .arguments
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("missing path"))?;
+                let content = arguments
+                    .arguments
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("missing content"))?;
+                std::fs::write(cwd.join(path), content)?;
+                Ok(pi_agent::AgentToolResult::text("written"))
+            }
+        },
+    )
+    .with_capability(ToolCapability::Write)
 }
 
 /// yolo never asks; write asks only for Exec; ask always asks.
@@ -227,7 +270,11 @@ async fn interactive_allow_deny_cancel_are_distinct() {
 #[tokio::test]
 async fn noninteractive_modes_fail_closed_without_adapter() {
     let _guard = CONFIRMATION_LOCK.lock().expect("confirmation lock");
-    for mode in [ExtensionMode::Print, ExtensionMode::Json, ExtensionMode::Rpc] {
+    for mode in [
+        ExtensionMode::Print,
+        ExtensionMode::Json,
+        ExtensionMode::Rpc,
+    ] {
         for (approval, capability) in [
             (ApprovalMode::Write, ToolCapability::Exec),
             (ApprovalMode::Ask, ToolCapability::Read),
@@ -274,6 +321,7 @@ async fn host_hook_orders_before_existing_and_denial_skips_it() {
                 block: false,
                 reason: None,
                 arguments: Some(json!({"rewritten": true})),
+                approval_token: None,
             })
         })
     });
@@ -388,9 +436,9 @@ async fn application_tool_turn_fail_closed_under_write_and_ask() {
         let cwd = TempDir::new().expect("cwd");
         std::fs::write(cwd.path().join("notes.txt"), "secret").expect("fixture");
         let tools = vec![
-            create_tool("read", cwd.path().to_str().expect("utf8")).expect("read tool"),
-            create_tool("bash", cwd.path().to_str().expect("utf8")).expect("bash tool"),
-            create_tool("write", cwd.path().to_str().expect("utf8")).expect("write tool"),
+            approval_test_tool("read", ToolCapability::Read, "secret"),
+            approval_test_tool("bash", ToolCapability::Exec, "blocked-should-not-run"),
+            approval_test_tool("write", ToolCapability::Write, "written"),
         ];
         let hook = host_approval_before_tool_call(
             mode,
@@ -413,8 +461,10 @@ async fn application_tool_turn_fail_closed_under_write_and_ask() {
             after_tool_call: None,
             stream_fn: None,
             auth_resolver: None,
+            auth_manager: None,
         })
         .expect("session");
+        prepare_session_store(&session, cwd.path());
         let application = Application::new(session).await;
         let mut events = application.subscribe();
         application
@@ -491,7 +541,11 @@ async fn application_interactive_allow_executes_read_tool() {
     let adapter = ExtensionUiAdapter::new();
     let events = adapter.subscribe();
     let responder = tokio::spawn(answer_confirmation(events, adapter.clone(), Some(true)));
-    let tools = vec![create_tool("read", cwd.path().to_str().expect("utf8")).expect("read")];
+    let tools = vec![approval_test_tool(
+        "read",
+        ToolCapability::Read,
+        "visible-content",
+    )];
     let hook = host_approval_before_tool_call(
         ApprovalMode::Ask,
         ExtensionMode::Tui,
@@ -513,8 +567,10 @@ async fn application_interactive_allow_executes_read_tool() {
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: None,
+        auth_manager: None,
     })
     .expect("session");
+    prepare_session_store(&session, cwd.path());
     let application = Application::new(session).await;
     let mut app_events = application.subscribe();
     application
@@ -623,7 +679,7 @@ async fn host_tool_confirmation_enum_maps_from_adapter_responses() {
     let events = adapter.subscribe();
     let responder = tokio::spawn(answer_confirmation(events, adapter.clone(), Some(true)));
     let decision = adapter
-        .confirm_host_tool(ExtensionMode::Tui, "bash", ToolCapability::Exec)
+        .confirm_host_tool(ExtensionMode::Tui, "bash", ToolCapability::Exec, None)
         .await
         .expect("confirm");
     responder.await.expect("responder");
@@ -695,8 +751,8 @@ async fn session_path_rules_deny_ask_and_allow_on_live_tool_turns() {
     std::fs::create_dir_all(cwd.path().join("public")).expect("public dir");
     std::fs::create_dir_all(cwd.path().join("elsewhere")).expect("elsewhere dir");
     let tools = vec![
-        create_tool("read", cwd.path().to_str().expect("utf8")).expect("read tool"),
-        create_tool("write", cwd.path().to_str().expect("utf8")).expect("write tool"),
+        approval_test_tool("read", ToolCapability::Read, "classified"),
+        approval_write_tool(cwd.path().to_path_buf()),
     ];
     let rules = vec![
         PermissionRule {
@@ -739,8 +795,10 @@ async fn session_path_rules_deny_ask_and_allow_on_live_tool_turns() {
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: None,
+        auth_manager: None,
     })
     .expect("session");
+    prepare_session_store(&session, cwd.path());
     let application = Application::new(session).await;
     let mut events = application.subscribe();
     application
@@ -802,7 +860,10 @@ async fn session_path_rules_deny_ask_and_allow_on_live_tool_turns() {
     let (ask_error, ask_body) = outcomes
         .get("elsewhere/out.txt")
         .expect("ask-rule write must end");
-    assert!(*ask_error, "ask rule must force confirmation (fails closed headless)");
+    assert!(
+        *ask_error,
+        "ask rule must force confirmation (fails closed headless)"
+    );
     assert!(
         ask_body.contains("no interactive confirmation adapter"),
         "ask body: {ask_body}"
@@ -811,9 +872,11 @@ async fn session_path_rules_deny_ask_and_allow_on_live_tool_turns() {
     let (allow_error, _) = outcomes
         .get("public/out.txt")
         .expect("allow-rule write must end");
-    assert!(!*allow_error, "allow rule must let the allowlisted write through");
-    let written =
-        std::fs::read_to_string(cwd.path().join("public/out.txt")).expect("written file");
+    assert!(
+        !*allow_error,
+        "allow rule must let the allowlisted write through"
+    );
+    let written = std::fs::read_to_string(cwd.path().join("public/out.txt")).expect("written file");
     assert_eq!(written, "allowed");
 
     application.cleanup().await;

@@ -74,12 +74,10 @@ async function main() {
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await waitFor(page, () => document.title === 'rpi web', 'page title missing');
-    await waitFor(page, () => document.querySelector('#conn-state') !== null, 'conn-state missing');
-
     // Connect via the rpi-auth.<token> subprotocol.
     await waitFor(
       page,
-      () => document.getElementById('conn-state').dataset.state === 'on',
+      () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true,
       'WS did not reach "connected"'
     );
 
@@ -88,8 +86,8 @@ async function main() {
     await page.press('#prompt-input', 'Enter');
     await waitFor(
       page,
-      () => document.getElementById('stream-badge').hidden === true,
-      'streaming badge did not clear after the reply completed'
+      () => document.getElementById('send-btn')?.getAttribute('aria-label') === 'Send message',
+      'composer never returned to the idle Send action after the reply completed'
     );
     await page.screenshot({ path: `${evidence}/xss.png`, fullPage: true });
 

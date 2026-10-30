@@ -90,9 +90,7 @@ pub(crate) fn normalize_origin(value: &str) -> Option<String> {
     if !tail.is_empty() || authority.is_empty() {
         return None;
     }
-    if authority.contains(['@', '?', '#'])
-        || authority.chars().any(char::is_whitespace)
-    {
+    if authority.contains(['@', '?', '#']) || authority.chars().any(char::is_whitespace) {
         return None;
     }
     Some(format!("{scheme}://{}", authority.to_lowercase()))
@@ -175,6 +173,15 @@ pub(crate) fn authorized(
     token: Option<&[u8]>,
     allow_tokenless_browser: bool,
 ) -> bool {
+    authorized_cross_origin(headers, token, allow_tokenless_browser, false)
+}
+
+pub(crate) fn authorized_cross_origin(
+    headers: &HeaderMap,
+    token: Option<&[u8]>,
+    allow_tokenless_browser: bool,
+    allow_cross_origin_tokenless: bool,
+) -> bool {
     let Some(token) = token else {
         let Some(origin) = headers.get(http::header::ORIGIN) else {
             return true;
@@ -182,8 +189,6 @@ pub(crate) fn authorized(
         if !allow_tokenless_browser {
             return false;
         }
-        // Same-origin: exactly one valid Origin and one Host whose
-        // authorities match.
         if headers.get_all(http::header::ORIGIN).iter().count() != 1
             || headers.get_all(http::header::HOST).iter().count() != 1
         {
@@ -199,10 +204,9 @@ pub(crate) fn authorized(
         else {
             return false;
         };
-        // A same-origin browser page carries the scheme the browser actually
-        // used: `http://` for a plaintext listener, `https://` for TLS.
-        // Either scheme whose authority matches the request's Host is
-        // accepted; any other scheme is rejected.
+        if allow_cross_origin_tokenless {
+            return true;
+        }
         let origin_http = format!("http://{host}");
         let origin_https = format!("https://{host}");
         return origin == origin_http || origin == origin_https;
@@ -311,16 +315,11 @@ pub(crate) fn load_auth_token(
 /// [`MAX_TOKEN_FILE_BYTES`], whose trimmed contents are a single nonempty
 /// whitespace-free token.
 pub(crate) fn read_token_file(path: &Path) -> Result<Vec<u8>> {
-    let metadata = std::fs::metadata(path)
-        .with_context(|| format!("reading token file metadata {}", path.display()))?;
-    if !metadata.file_type().is_file() {
-        bail!("token path must be a regular file");
-    }
-    if metadata.len() > MAX_TOKEN_FILE_BYTES {
+    let bytes = pi_coding::read_operator_auth_file(path, MAX_TOKEN_FILE_BYTES + 1)
+        .with_context(|| format!("reading token file {}", path.display()))?;
+    if bytes.len() as u64 > MAX_TOKEN_FILE_BYTES {
         bail!("token file exceeds {MAX_TOKEN_FILE_BYTES} bytes");
     }
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("reading token file {}", path.display()))?;
     let start = bytes
         .iter()
         .position(|byte| !byte.is_ascii_whitespace())
@@ -380,7 +379,10 @@ mod tests {
         let remote: [(IpAddr, &str); 6] = [
             ("0.0.0.0".parse().unwrap(), "IPv4 wildcard"),
             ("::".parse().unwrap(), "IPv6 wildcard"),
-            ("198.51.100.7".parse().unwrap(), "distinct non-loopback IPv4"),
+            (
+                "198.51.100.7".parse().unwrap(),
+                "distinct non-loopback IPv4",
+            ),
             ("192.0.2.1".parse().unwrap(), "documentation IPv4"),
             ("8.8.8.8".parse().unwrap(), "public IPv4"),
             ("2001:db8::1".parse().unwrap(), "documentation IPv6"),
@@ -392,8 +394,12 @@ mod tests {
             // refusal names the non-loopback address, hints at
             // --listen-token-file, and never echoes token contents.
             for path in [None, Some(token.as_path())] {
-                match load_auth_token(address, path, "--listen", ListenAddressPolicy::LoopbackOnly) {
-                    Ok(_) => panic!("{label}: LoopbackOnly must refuse non-loopback (token={})", path.is_some()),
+                match load_auth_token(address, path, "--listen", ListenAddressPolicy::LoopbackOnly)
+                {
+                    Ok(_) => panic!(
+                        "{label}: LoopbackOnly must refuse non-loopback (token={})",
+                        path.is_some()
+                    ),
                     Err(error) => {
                         let message = format!("{error:#}");
                         assert!(
@@ -416,8 +422,15 @@ mod tests {
             // bind is rejected pre-bind; a configured token is loaded and the
             // bind proceeds. The rejection names the address, hints at
             // --listen-token-file, and is secret-free.
-            match load_auth_token(address, None, "--listen", ListenAddressPolicy::AllowTlsRemote) {
-                Ok(_) => panic!("{label}: AllowTlsRemote must reject a tokenless non-loopback bind pre-bind"),
+            match load_auth_token(
+                address,
+                None,
+                "--listen",
+                ListenAddressPolicy::AllowTlsRemote,
+            ) {
+                Ok(_) => panic!(
+                    "{label}: AllowTlsRemote must reject a tokenless non-loopback bind pre-bind"
+                ),
                 Err(error) => {
                     let message = format!("{error:#}");
                     assert!(
@@ -435,7 +448,13 @@ mod tests {
                 }
             }
             assert_eq!(
-                load_auth_token(address, Some(&token), "--listen", ListenAddressPolicy::AllowTlsRemote).unwrap(),
+                load_auth_token(
+                    address,
+                    Some(&token),
+                    "--listen",
+                    ListenAddressPolicy::AllowTlsRemote
+                )
+                .unwrap(),
                 Some(b"fixture-value".to_vec()),
                 "{label}: AllowTlsRemote must load the token for a non-loopback bind"
             );
@@ -443,13 +462,24 @@ mod tests {
             // AllowInsecureRemote: the explicit insecure-remote opt-in permits
             // non-loopback binds tokenless (LAN access) or with a token.
             assert!(
-                load_auth_token(address, None, "--listen", ListenAddressPolicy::AllowInsecureRemote)
-                    .unwrap()
-                    .is_none(),
+                load_auth_token(
+                    address,
+                    None,
+                    "--listen",
+                    ListenAddressPolicy::AllowInsecureRemote
+                )
+                .unwrap()
+                .is_none(),
                 "{label}: AllowInsecureRemote must permit a tokenless non-loopback opt-in"
             );
             assert_eq!(
-                load_auth_token(address, Some(&token), "--listen", ListenAddressPolicy::AllowInsecureRemote).unwrap(),
+                load_auth_token(
+                    address,
+                    Some(&token),
+                    "--listen",
+                    ListenAddressPolicy::AllowInsecureRemote
+                )
+                .unwrap(),
                 Some(b"fixture-value".to_vec()),
                 "{label}: AllowInsecureRemote must load the token for a non-loopback bind"
             );
@@ -469,6 +499,26 @@ mod tests {
         let valid = dir.path().join("valid");
         std::fs::write(&valid, b"  secret-value\n").unwrap();
         assert_eq!(read_token_file(&valid).unwrap(), b"secret-value");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn token_file_parent_symlink_escape_is_rejected() {
+        // `read_token_file` delegates to the operator-auth bounded read,
+        // which is root-scoped: a token path whose PARENT is a symlink out
+        // of the operator root must fail closed rather than follow the
+        // escape. (A symlinked LEAF is intentionally served through the
+        // managed revalidated path; only the parent escape is forbidden.)
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let real = outside.path().join("real-token");
+        std::fs::write(&real, b"attacker-secret").unwrap();
+        let linked_dir = dir.path().join("escape");
+        std::os::unix::fs::symlink(outside.path(), &linked_dir).expect("parent symlink");
+        assert!(
+            read_token_file(&linked_dir.join("real-token")).is_err(),
+            "token file behind a symlinked parent directory must be rejected"
+        );
     }
 
     #[test]
@@ -563,18 +613,21 @@ mod tests {
         );
         assert!(!authorized(&headers, None, true));
         // Malformed, `null`, and duplicate Origins: rejected.
-        headers.insert(
-            http::header::ORIGIN,
-            http::HeaderValue::from_static("null"),
-        );
+        headers.insert(http::header::ORIGIN, http::HeaderValue::from_static("null"));
         assert!(!authorized(&headers, None, true));
         let mut headers = HeaderMap::new();
         headers.insert(
             http::header::HOST,
             http::HeaderValue::from_static("127.0.0.1:8765"),
         );
-        headers.append(http::header::ORIGIN, http::HeaderValue::from_static("http://127.0.0.1:8765"));
-        headers.append(http::header::ORIGIN, http::HeaderValue::from_static("http://127.0.0.1:8765"));
+        headers.append(
+            http::header::ORIGIN,
+            http::HeaderValue::from_static("http://127.0.0.1:8765"),
+        );
+        headers.append(
+            http::header::ORIGIN,
+            http::HeaderValue::from_static("http://127.0.0.1:8765"),
+        );
         assert!(
             !authorized(&headers, None, true),
             "duplicate Origin headers must be rejected"
@@ -589,6 +642,23 @@ mod tests {
             http::HeaderValue::from_static("http://127.0.0.1:8765/path"),
         );
         assert!(!authorized(&headers, None, true));
+    }
+
+    #[test]
+    fn authorized_cross_origin_tokenless_accepts_valid_foreign_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::HOST,
+            http::HeaderValue::from_static("192.0.2.10:8765"),
+        );
+        headers.insert(
+            http::header::ORIGIN,
+            http::HeaderValue::from_static("http://192.0.2.20:18765"),
+        );
+        assert!(authorized_cross_origin(&headers, None, true, true));
+        assert!(!authorized_cross_origin(&headers, None, true, false));
+        headers.insert(http::header::ORIGIN, http::HeaderValue::from_static("null"));
+        assert!(!authorized_cross_origin(&headers, None, true, true));
     }
 
     #[test]
@@ -607,7 +677,10 @@ mod tests {
         assert!(authorized(&headers, None, true));
         // Default-port forms match when both sides omit the port.
         let mut headers = HeaderMap::new();
-        headers.insert(http::header::HOST, http::HeaderValue::from_static("localhost"));
+        headers.insert(
+            http::header::HOST,
+            http::HeaderValue::from_static("localhost"),
+        );
         headers.insert(
             http::header::ORIGIN,
             http::HeaderValue::from_static("http://localhost"),
@@ -682,7 +755,8 @@ mod tests {
     }
 
     #[test]
-    fn authorized_tokenless_wildcard_listener_accepts_same_origin_browser_without_advertised_origin() {
+    fn authorized_tokenless_wildcard_listener_accepts_same_origin_browser_without_advertised_origin()
+     {
         // A wildcard bind has no advertised origin, but the request's own
         // Host is the comparison target: any address the browser actually
         // used is accepted, so no --listen-advertised-origin is needed for
@@ -721,8 +795,14 @@ mod tests {
         assert!(!authorized(&headers, None, true));
         // Duplicate Host headers are rejected like duplicate Origins.
         let mut headers = HeaderMap::new();
-        headers.append(http::header::HOST, http::HeaderValue::from_static("127.0.0.1:8765"));
-        headers.append(http::header::HOST, http::HeaderValue::from_static("127.0.0.1:8765"));
+        headers.append(
+            http::header::HOST,
+            http::HeaderValue::from_static("127.0.0.1:8765"),
+        );
+        headers.append(
+            http::header::HOST,
+            http::HeaderValue::from_static("127.0.0.1:8765"),
+        );
         headers.insert(
             http::header::ORIGIN,
             http::HeaderValue::from_static("http://127.0.0.1:8765"),
@@ -776,7 +856,11 @@ mod tests {
             ("http://[2001:DB8::1]:8765", "http://[2001:db8::1]:8765"),
             ("http://localhost", "http://localhost"),
         ] {
-            assert_eq!(normalize_origin(input).as_deref(), Some(expected), "{input:?}");
+            assert_eq!(
+                normalize_origin(input).as_deref(),
+                Some(expected),
+                "{input:?}"
+            );
         }
         for bad in [
             "null",
@@ -795,7 +879,10 @@ mod tests {
 
     fn protocol_headers(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        headers.insert(http::header::SEC_WEBSOCKET_PROTOCOL, http::HeaderValue::from_str(value).unwrap());
+        headers.insert(
+            http::header::SEC_WEBSOCKET_PROTOCOL,
+            http::HeaderValue::from_str(value).unwrap(),
+        );
         headers
     }
 

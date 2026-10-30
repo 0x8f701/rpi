@@ -9,19 +9,26 @@
 //! Fails with an actionable error when `gh` is not installed or not
 //! authenticated.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use tokio::process::Command;
 
+use crate::application::generation::ApplicationGeneration;
 use crate::export::{self, ExportOptions};
+use crate::process::{
+    GovernedProcessContext, GovernedProcessSpec, TrustedToolProbe, run_trusted_tool_probe,
+};
 
 /// Environment variable for the custom viewer URL template.
 pub const VIEWER_URL_ENV: &str = "PI_SHARE_VIEWER_URL";
 
 /// Default viewer URL (the gist itself is viewable on GitHub).
 pub const DEFAULT_VIEWER_URL: &str = "https://gist.github.com";
+const RPI_OFFLINE_ENV: &str = "RPI_OFFLINE";
 
 /// Result of a successful share operation.
 #[derive(Clone, Debug)]
@@ -34,8 +41,8 @@ pub struct ShareResult {
     pub html_path: PathBuf,
 }
 
-/// Truthy semantics for `PI_OFFLINE`, matching `pi_cli::session_run::offline`
-/// and `crate::tools::web_search`: any of `1`/`true`/`yes`
+/// Truthy semantics for `RPI_OFFLINE`, matching the CLI and
+/// `crate::tools::web_search`: any of `1`/`true`/`yes`
 /// (case-insensitive, trimmed) is "on".
 #[must_use]
 pub(crate) fn offline_from(value: Option<&str>) -> bool {
@@ -45,17 +52,17 @@ pub(crate) fn offline_from(value: Option<&str>) -> bool {
     )
 }
 
-/// Reads the live `PI_OFFLINE` process env var. Kept as a tiny seam so the
+/// Reads the live `RPI_OFFLINE` process env var. Kept as a tiny seam so the
 /// truthy parsing is unit-testable without mutating the process environment
 /// (`std::env::set_var` is `unsafe` in edition 2024 and forbidden here).
 fn offline() -> bool {
-    offline_from(std::env::var("PI_OFFLINE").ok().as_deref())
+    offline_from(std::env::var(RPI_OFFLINE_ENV).ok().as_deref())
 }
 
 /// Actionable failure message for the gist-share offline contract, shared by
 /// the pre-spawn gate and the spawn-time guard so both report the same text.
 pub(crate) const OFFLINE_MESSAGE: &str =
-    "share is unavailable while PI_OFFLINE is enabled; unset PI_OFFLINE to create a gist";
+    "share is unavailable while RPI_OFFLINE is enabled; unset RPI_OFFLINE to create a gist";
 
 /// Pure OR of the two offline sources, kept as a tiny seam so the contract is
 /// unit-testable without mutating the process environment.
@@ -64,7 +71,7 @@ fn share_offline_from_flags(process_offline: bool, session_offline: bool) -> boo
     process_offline || session_offline
 }
 
-/// Offline contract for gist sharing: `PI_OFFLINE` is truthy in the process
+/// Offline contract for gist sharing: `RPI_OFFLINE` is truthy in the process
 /// environment or the session-scoped offline flag is set
 /// ([`crate::Session::set_offline`]).
 #[must_use]
@@ -75,27 +82,60 @@ pub(crate) fn share_offline_for(session: &crate::Session) -> bool {
 /// Check that `gh` is installed and authenticated.
 ///
 /// Returns an actionable error explaining what to install or run if not.
-async fn check_gh_available() -> Result<()> {
+async fn check_gh_available(generation: Arc<ApplicationGeneration>) -> Result<PathBuf> {
     if offline() {
         bail!("{OFFLINE_MESSAGE}");
     }
-    let version = Command::new("gh")
-        .arg("--version")
-        .output()
-        .await
-        .context("gh CLI not found; install it from https://cli.github.com/")?;
-    if !version.status.success() {
-        bail!("gh CLI is installed but `gh --version` failed; reinstall from https://cli.github.com/");
+    let gh = run_trusted_tool_probe(&generation, TrustedToolProbe::GithubCli)
+        .map_err(|_| anyhow!("gh CLI not found; install it from https://cli.github.com/"))?;
+    let gh = gh.as_path().to_path_buf();
+    let version = run_gh(generation.clone(), &gh, vec!["--version".to_owned()]).await?;
+    if version.status != Some(0) {
+        bail!(
+            "gh CLI is installed but `gh --version` failed; reinstall from https://cli.github.com/"
+        );
     }
-    let auth = Command::new("gh")
-        .args(["auth", "status"])
-        .output()
-        .await
-        .context("failed to run `gh auth status`")?;
-    if !auth.status.success() {
+    let auth = run_gh(
+        generation,
+        &gh,
+        vec!["auth".to_owned(), "status".to_owned()],
+    )
+    .await?;
+    if auth.status != Some(0) {
         bail!("gh is not authenticated; run `gh auth login` to sign in");
     }
-    Ok(())
+    Ok(gh)
+}
+
+async fn run_gh(
+    generation: Arc<ApplicationGeneration>,
+    gh: &Path,
+    args: Vec<String>,
+) -> Result<crate::process::GovernedProcessOutput> {
+    let cwd = gh
+        .parent()
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| Path::new("/"));
+    GovernedProcessContext::new(generation, None)
+        .run(
+            pi_sandbox::SpawnFamily::ShareHelper,
+            GovernedProcessSpec {
+                program: gh.to_path_buf(),
+                args,
+                cwd: cwd.to_path_buf(),
+                environment: BTreeMap::new(),
+                timeout: Duration::from_secs(15),
+                stdout_bytes: 1024 * 1024,
+                stderr_bytes: 64 * 1024,
+                #[cfg(unix)]
+                mount_sources: Vec::new(),
+                #[cfg(unix)]
+                retained_executable: None,
+                #[cfg(unix)]
+                retained_working_directory: None,
+            },
+        )
+        .await
 }
 
 /// Derive the viewer URL from `PI_SHARE_VIEWER_URL` or the documented
@@ -173,14 +213,17 @@ fn gist_create_args(description: &str, path: &Path) -> Vec<String> {
 /// Spawns `gh gist create --desc <description> <path>` via argv — never
 /// through a shell. Visibility is left to gh's default (secret). The path
 /// must already exist.
-async fn create_gist(path: &Path, description: &str) -> Result<String> {
+async fn create_gist(
+    generation: Arc<ApplicationGeneration>,
+    gh: &Path,
+    path: &Path,
+    description: &str,
+) -> Result<String> {
     let args = gist_create_args(description, path);
-    let output = Command::new("gh")
-        .args(&args)
-        .output()
+    let output = run_gh(generation, gh, args)
         .await
         .context("failed to spawn `gh gist create`")?;
-    if !output.status.success() {
+    if output.status != Some(0) {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let hint = stderr.trim();
         bail!(
@@ -192,65 +235,24 @@ async fn create_gist(path: &Path, description: &str) -> Result<String> {
             }
         );
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_gist_url(&stdout)
-}
-
-/// Share a session file by exporting it to HTML and uploading to a secret
-/// gist. Returns the gist and viewer URLs.
-///
-/// No model, auth, or network access is needed for the export step; only the
-/// `gh` CLI call requires network/auth.
-pub async fn share_session_file(
-    session_path: &Path,
-    options: &ExportOptions,
-) -> Result<ShareResult> {
-    check_gh_available().await?;
-    let html = export::export_session_html(session_path, None, options)?;
-    let url = create_gist(&html, "rpi session export").await?;
-    let viewer = derive_viewer_url(&url);
-    Ok(ShareResult {
-        gist_url: url,
-        viewer_url: viewer,
-        html_path: html,
-    })
+    parse_gist_url(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Share a live [`crate::Session`] by exporting it and uploading to a
 /// secret gist.
-pub async fn share_session(
+pub(crate) async fn share_session(
+    generation: Arc<ApplicationGeneration>,
     session: &crate::Session,
     options: &ExportOptions,
 ) -> Result<ShareResult> {
-    check_gh_available().await?;
+    let gh = check_gh_available(generation.clone()).await?;
     let html = export::export_live_session(session, None, options)?;
-    let url = create_gist(&html, "rpi session export").await?;
+    let url = create_gist(generation, &gh, &html, "rpi session export").await?;
     let viewer = derive_viewer_url(&url);
     Ok(ShareResult {
         gist_url: url,
         viewer_url: viewer,
         html_path: html,
-    })
-}
-
-/// Share arbitrary HTML content by writing it to a temp file and uploading
-/// to a secret gist. The caller is responsible for cleaning up if needed;
-/// the temp file is in the system temp directory.
-pub async fn share_html_content(
-    html: &str,
-    description: &str,
-) -> Result<ShareResult> {
-    check_gh_available().await?;
-    let temp_dir = std::env::temp_dir();
-    let temp_path = temp_dir.join(format!("pi-export-{}.html", std::process::id()));
-    fs::write(&temp_path, html)
-        .with_context(|| format!("writing temporary HTML {}", temp_path.display()))?;
-    let url = create_gist(&temp_path, description).await?;
-    let viewer = derive_viewer_url(&url);
-    Ok(ShareResult {
-        gist_url: url,
-        viewer_url: viewer,
-        html_path: temp_path,
     })
 }
 
@@ -320,8 +322,8 @@ pub fn encrypt_session_share_to_file(
 /// are the PBKDF2 salt, the next 12 bytes the nonce, and the remainder the
 /// AES-256-GCM ciphertext+tag.
 pub fn decrypt_encrypted_session_file(passphrase: &str, path: &Path) -> Result<Vec<u8>> {
-    let data = fs::read(path)
-        .with_context(|| format!("reading encrypted share {}", path.display()))?;
+    let data =
+        fs::read(path).with_context(|| format!("reading encrypted share {}", path.display()))?;
     crate::encrypt::decrypt(passphrase, &data)
 }
 
@@ -329,31 +331,30 @@ pub fn decrypt_encrypted_session_file(passphrase: &str, path: &Path) -> Result<V
 /// `gh` CLI is available and authenticated, also upload the ciphertext to a
 /// secret gist. A missing/unauthenticated `gh` is non-fatal: the local file
 /// is the primary deliverable and `gist_url` stays `None`.
-pub async fn share_session_encrypted(
+pub(crate) async fn share_session_encrypted(
+    generation: Arc<ApplicationGeneration>,
     session: &crate::Session,
     passphrase: &str,
     output: Option<&Path>,
 ) -> Result<EncryptedShareResult> {
     let mut result = encrypt_session_share_to_file(session, passphrase, output)?;
-    match check_gh_available().await {
-        Ok(()) => match create_gist(
+    match check_gh_available(generation.clone()).await {
+        Ok(gh) => match create_gist(
+            generation,
+            &gh,
             &result.ciphertext_path,
             "rpi encrypted session export (AES-256-GCM)",
         )
         .await
         {
-            Ok(url) => {
-                result.gist_url = Some(derive_viewer_url(&url));
-            }
-            Err(error) => {
-                result.note.push_str(&format!(
-                    "\nGist upload skipped: {error:#}"
-                ));
-            }
+            Ok(url) => result.gist_url = Some(derive_viewer_url(&url)),
+            Err(error) => result
+                .note
+                .push_str(&format!("\nGist upload skipped: {error:#}")),
         },
-        Err(error) => {
-            result.note.push_str(&format!("\nGist upload skipped: {error:#}"));
-        }
+        Err(error) => result
+            .note
+            .push_str(&format!("\nGist upload skipped: {error:#}")),
     }
     Ok(result)
 }
@@ -375,25 +376,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn offline_from_matches_pi_offline_truthy_semantics() {
+    fn offline_from_matches_rpi_offline_truthy_semantics() {
         for value in ["1", "true", "TRUE", " yes ", "tRuE"] {
             assert!(offline_from(Some(value)), "{value:?} must count as offline");
         }
         for value in ["", "0", "false", "no", "off", "2", "disabled"] {
             assert!(!offline_from(Some(value)), "{value:?} must stay online");
         }
-        assert!(!offline_from(None), "missing PI_OFFLINE stays online");
+        assert!(!offline_from(None), "missing RPI_OFFLINE stays online");
     }
 
     #[test]
     fn share_offline_contract_is_process_env_or_session_flag() {
-        // Pure OR of the two offline sources (process env PI_OFFLINE and the
+        // Pure OR of the two offline sources (process env RPI_OFFLINE and the
         // session-scoped flag); the live wiring is covered end-to-end by the
         // pi-cli slash dispatch test (ShareFailed carrying the contract).
         assert!(!share_offline_from_flags(false, false));
         assert!(share_offline_from_flags(true, false));
         assert!(share_offline_from_flags(false, true));
         assert!(share_offline_from_flags(true, true));
+    }
+
+    #[test]
+    fn governed_share_family_is_exact() {
+        assert_eq!(
+            pi_sandbox::SpawnFamily::ShareHelper.as_str(),
+            "share-helper"
+        );
     }
 
     #[test]
@@ -437,7 +446,8 @@ mod tests {
 
     #[test]
     fn parse_gist_url_skips_progress_line() {
-        let url = parse_gist_url("- Creating gist...\nhttps://gist.github.com/cj/abc123\n").unwrap();
+        let url =
+            parse_gist_url("- Creating gist...\nhttps://gist.github.com/cj/abc123\n").unwrap();
         assert_eq!(url, "https://gist.github.com/cj/abc123");
     }
 
@@ -463,49 +473,65 @@ mod tests {
         assert!(!args.iter().any(|a| a == "--private" || a == "--public"));
     }
 
-    fn recorded_session(cwd: &Path, sessions: &Path, id: &str, text: &str) -> crate::Session {
+    fn recorded_session(
+        cwd: &Path,
+        sessions: &Path,
+        id: &str,
+        text: &str,
+    ) -> (crate::Session, pi_ai::providers::FauxProviderRegistration) {
         use pi_ai::Message;
-        let recorder = crate::start_session_in(
-            cwd,
-            None,
-            Some("off"),
-            Some(sessions),
-            Some(id),
-            None,
-        )
-        .expect("start recorder");
+        let recorder =
+            crate::start_session_in(cwd, None, Some("off"), Some(sessions), Some(id), None)
+                .expect("start recorder");
         recorder
             .record_message(&Message::user_text(text, 0))
             .expect("record message");
         recorder.persist_now().expect("persist session");
-        let session = crate::Session::new(crate::SessionOptions {
-            model: pi_ai::Model::default(),
-            cwd: cwd.to_path_buf(),
-            system_prompt: String::new(),
-            thinking_level: pi_agent::ThinkingLevel::Off,
-            api_key: String::new(),
-            compaction: None,
-            stream_options: Default::default(),
-            tools: Some(Vec::new()),
-            before_tool_call: None,
-            after_tool_call: None,
-            stream_fn: None,
-            auth_resolver: None,
-        })
-        .expect("session");
+        let prepared = crate::PreparedSessionResume::prepare_under_root(sessions, &recorder.path())
+            .expect("retain session authority");
+        drop(recorder);
+        let recorder = prepared.into_recorder().expect("resume retained recorder");
+        let faux = pi_ai::providers::register_faux_provider(Default::default());
+        let workspace = crate::WorkspaceRoots::new(cwd, Vec::<PathBuf>::new())
+            .expect("isolated share workspace");
+        let session =
+            crate::Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
+                crate::SessionOptions {
+                    model: faux.model(None).expect("share fixture model"),
+                    cwd: cwd.to_path_buf(),
+                    system_prompt: String::new(),
+                    thinking_level: pi_agent::ThinkingLevel::Off,
+                    api_key: String::new(),
+                    compaction: None,
+                    stream_options: Default::default(),
+                    tools: Some(Vec::new()),
+                    before_tool_call: None,
+                    after_tool_call: None,
+                    stream_fn: None,
+                    auth_resolver: None,
+                    auth_manager: None,
+                },
+                Vec::new(),
+                crate::ToolSelection::default(),
+                crate::ResourceDiscovery::Disabled,
+                workspace,
+                None,
+            )
+            .expect("session");
         session.set_session_dir(sessions.to_path_buf());
         session.record(recorder).expect("attach recorder");
-        session
+        (session, faux)
     }
 
     #[test]
     fn encrypted_share_round_trips_and_hides_plaintext() {
         let cwd = tempfile::tempdir().expect("cwd");
         let sessions = tempfile::tempdir().expect("sessions");
-        let session = recorded_session(cwd.path(), sessions.path(), "enc-rt", "top secret line");
+        let (session, _faux) =
+            recorded_session(cwd.path(), sessions.path(), "enc-rt", "top secret line");
 
-        let result = encrypt_session_share_to_file(&session, "hunter2", None)
-            .expect("encrypt share");
+        let result =
+            encrypt_session_share_to_file(&session, "hunter2", None).expect("encrypt share");
         let ciphertext_path = result.ciphertext_path.clone();
         assert_eq!(
             ciphertext_path.extension().and_then(|e| e.to_str()),
@@ -548,7 +574,8 @@ mod tests {
     fn encrypted_share_stages_no_plaintext_temp_file() {
         let cwd = tempfile::tempdir().expect("cwd");
         let sessions = tempfile::tempdir().expect("sessions");
-        let session = recorded_session(cwd.path(), sessions.path(), "enc-nostage", "sensitive");
+        let (session, _faux) =
+            recorded_session(cwd.path(), sessions.path(), "enc-nostage", "sensitive");
 
         // The plaintext JSONL must be serialized in memory: no `pi-share-*`
         // staging file may appear in the system temp dir during encryption.
@@ -579,14 +606,14 @@ mod tests {
     fn encrypted_share_writes_to_explicit_output_path() {
         let cwd = tempfile::tempdir().expect("cwd");
         let sessions = tempfile::tempdir().expect("sessions");
-        let session = recorded_session(cwd.path(), sessions.path(), "enc-out", "payload");
+        let (session, _faux) = recorded_session(cwd.path(), sessions.path(), "enc-out", "payload");
 
         let out = tempfile::tempdir()
             .expect("out dir")
             .path()
             .join("share.enc");
-        let result = encrypt_session_share_to_file(&session, "pass", Some(&out))
-            .expect("encrypt share");
+        let result =
+            encrypt_session_share_to_file(&session, "pass", Some(&out)).expect("encrypt share");
         assert_eq!(result.ciphertext_path, out);
         let plaintext = decrypt_encrypted_session_file("pass", &out).expect("decrypt");
         assert!(String::from_utf8_lossy(&plaintext).contains("payload"));

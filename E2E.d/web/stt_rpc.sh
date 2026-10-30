@@ -52,9 +52,11 @@ run_phase() {
     # with 500 for the S5 error phase.
     local stt_evidence="$evidence/stt-proxy-evidence.json"
     if [ "$mock_error" = "1" ]; then
-        MOCK_STT_EVIDENCE="$stt_evidence" MOCK_STT_ERROR=1 web_start_mock "$root" "$evidence"
+        MOCK_SCENARIO=sessions MOCK_STT_EVIDENCE="$stt_evidence" MOCK_STT_ERROR=1 web_start_mock "$root" "$evidence"
+    elif [ "$mock_error" = "owner-error" ]; then
+        MOCK_SCENARIO=sessions MOCK_STT_EVIDENCE="$stt_evidence" MOCK_STT_DELAY=1 MOCK_STT_ERROR=1 web_start_mock "$root" "$evidence"
     else
-        MOCK_STT_EVIDENCE="$stt_evidence" web_start_mock "$root" "$evidence"
+        MOCK_SCENARIO=sessions MOCK_STT_EVIDENCE="$stt_evidence" MOCK_STT_DELAY=1 web_start_mock "$root" "$evidence"
     fi
     local port
     port="$(cat "$root/mock-port.txt")"
@@ -64,7 +66,7 @@ run_phase() {
     # and the composer mic enters hold-to-talk mode. sttApiKey is a fixture
     # placeholder written directly to the fixture settings file (never
     # logged); the browser never receives it.
-    cat >"$root/home/.pi/agent/settings.json" <<EOF
+    cat >"$root/home/.rpi/settings.json" <<EOF
 {
   "live": {
     "enabled": true,
@@ -88,14 +90,15 @@ EOF
         "RPI_PHASE=$phase" \
         "RPI_STT_EVIDENCE=$stt_evidence" \
         "RPI_FIXTURE_KEY=$FIXTURE_KEY" \
-        "RPI_STT_BASE_URL=http://127.0.0.1:$port" || pw_status=$?
+        "RPI_STT_BASE_URL=http://127.0.0.1:$port" \
+        "RPI_STT_RELEASE_URL=http://127.0.0.1:$port/__release-stt" || pw_status=$?
     if [ "$pw_status" -eq 0 ]; then
         web_sanity_http "$url" >/dev/null
     fi
     web_kill_rpi
     web_kill_mock "$root"
     if [ "$pw_status" -eq 0 ]; then
-        printf 'playwright (%s): hold-to-talk STT RPC lifecycle PASSED\n' "$phase" | tee "$evidence/playwright-$phase-summary.txt"
+        printf 'playwright (%s): hold-to-talk STT RPC lifecycle and session-owner isolation PASSED\n' "$phase" | tee "$evidence/playwright-$phase-summary.txt"
     elif [ "$pw_status" -eq 1 ]; then
         fail "$SCENARIO ($phase): playwright SETUP FAILED (node/chromium/npm unavailable)"
     else
@@ -122,15 +125,22 @@ main() {
     local root evidence
     root="$(scenario_workspace "$SCENARIO")"
     evidence="$EVIDENCE_ROOT/$SCENARIO"
-    mkdir -p "$root/home/.pi/agent" "$root/workspace"
+    mkdir -p "$root/home/.rpi" "$root/workspace"
     run_phase "ok" "$root" "$evidence" "0"
 
     # Phase 2: error lifecycle (mock 500 -> bounded toast, no transcript).
     local root2 evidence2
     root2="$(scenario_workspace "$SCENARIO-error")"
     evidence2="$EVIDENCE_ROOT/$SCENARIO-error"
-    mkdir -p "$root2/home/.pi/agent" "$root2/workspace"
+    mkdir -p "$root2/home/.rpi" "$root2/workspace"
     run_phase "error" "$root2" "$evidence2" "1"
+
+    # Phase 3: delayed A failure after A→B switch stays owner-local.
+    local root3 evidence3
+    root3="$(scenario_workspace "$SCENARIO-owner-error")"
+    evidence3="$EVIDENCE_ROOT/$SCENARIO-owner-error"
+    mkdir -p "$root3/home/.rpi" "$root3/workspace"
+    run_phase "owner-error" "$root3" "$evidence3" "owner-error"
 
     web_finish_lane "$SCENARIO"
 }

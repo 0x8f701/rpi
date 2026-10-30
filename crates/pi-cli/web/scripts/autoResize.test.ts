@@ -72,9 +72,9 @@ const METRICS = { lineHeight: 18.85, paddingVertical: 12 };
 // lineCapFor(3, METRICS) = round(18.85*3 + 12) = 69
 const HOST_CAP = 69;
 
-/** Fake textarea: plain fields the controller writes/reads. */
+/** Fake textarea: plain fields the controller writes/reads (`value` mirrors the real textarea). */
 function el(scrollHeight) {
-  return { style: { height: '' }, scrollHeight };
+  return { style: { height: '' }, scrollHeight, value: scrollHeight > 0 ? 'typed' : '' };
 }
 
 function hostController() {
@@ -185,6 +185,25 @@ check('resizeHeight of empty content is 0', resizeHeight(0, HOST_CAP) === 0);
   controller.resize(short);
   frames.runFrame();
   check('guest still shrinks below its cap', short.style.height === '25px');
+}
+
+// ---- empty value: a wrapped placeholder must not size the composer ----
+{
+  const { controller, frames } = hostController();
+  const input = el(80); // scrollHeight of a wrapped placeholder
+  input.value = '';
+  controller.resize(input);
+  frames.runFrame();
+  check('empty value clears the inline height so CSS 44px wins', input.style.height === '');
+  input.value = 'hello world';
+  input.scrollHeight = 55;
+  controller.resize(input);
+  frames.runFrame();
+  check('typing a value grows again after the empty collapse', input.style.height === '55px');
+  input.value = '';
+  controller.flush(input);
+  check('clearing the value via flush collapses to the empty height', input.style.height === '');
+  check('no frame left pending after the value-clear flush', frames.frameCount() === 0);
 }
 
 // ---- flush on submit: immediate synchronous collapse ----

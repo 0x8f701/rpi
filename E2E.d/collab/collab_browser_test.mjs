@@ -121,10 +121,13 @@ async function main() {
     });
     await page.addInitScript(() => {
       let streamReported = false;
+      // The production streaming render path mounts `.assistant-text` with
+      // `data-stream-key` (App.tsx StreamingAssistant / CollabGuestView live
+      // items) and removes it on finalize — an exact live selector, present
+      // for BOTH control and view guests.
       const checkStream = () => {
         if (streamReported) return;
-        const badge = document.getElementById('stream-badge');
-        if (badge && !badge.hidden) {
+        if (document.querySelector('.assistant-text[data-stream-key]')) {
           streamReported = true;
           window.recordCollabStreamSeen();
         }
@@ -147,7 +150,7 @@ async function main() {
       checkStream();
       // Belt-and-suspenders: the live run can be brief, and a single
       // mutation-batch could in principle skip the visible window. Poll the
-      // badge for the first 12s so the streaming render path is reliably
+      // check for the first 12s so the streaming render path is reliably
       // observed even if the observer microtask races the settle render.
       const poll = setInterval(checkStream, 50);
       setTimeout(() => clearInterval(poll), 12000);
@@ -236,13 +239,13 @@ async function main() {
     }
     assert('BG-06', 'live stream renders every expected marker after control prompt', liveRendered,
       `expected=${eventTexts.length} messagesBefore=${msgCountBefore} messagesAfter=${await page.evaluate(() => document.querySelectorAll('#transcript .msg').length)}`);
-    // ── BG-06b: streaming badge becomes visible during the live run ────
-    // The host's live assistant turn flips `streaming` true, which toggles
-    // the #stream-badge `hidden` binding off — exercising the streaming
-    // render path (setStreaming(true) -> hidden={!streaming}). The init
-    // observer records the first visible transition; assert it fired.
-    assert('BG-06b', 'stream badge becomes visible during the live run (streaming render path)',
-      streamSeen, 'streamBadgeNeverVisible');
+    // ── BG-06b: the live streaming render path mounts ──────────────────
+    // The host's live assistant turn pushes an assistant item with status
+    // 'streaming', which renders the StreamingAssistant node (the
+    // `.assistant-text[data-stream-key]` mount). The init observer records
+    // the first appearance; assert it fired.
+    assert('BG-06b', 'streaming render path mounts during the live run (streaming assistant node)',
+      streamSeen, 'streamingMountNeverObserved');
 
     await page.screenshot({ path: path.join(evidence, 'collab-live.png'), fullPage: true });
 
@@ -264,24 +267,63 @@ async function main() {
         promptEnabled.actionExists && !promptEnabled.actionDisabled && promptEnabled.actionLabel === 'Send message',
         `input=${promptEnabled.inputExists} disabled=${promptEnabled.inputDisabled} action=${promptEnabled.actionExists} label=${promptEnabled.actionLabel}`);
 
-      // BG-07b: control can type and send a prompt
-      const testPrompt = 'browser-collab-e2e-prompt';
+      // BG-07b: a paste-synthesized Enter is canceled in the control guest
+      // composer; after the guard window, a normal Enter submits the draft.
+      const testPrompt = `browser-collab-e2e-prompt-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      // Use Playwright's fill path so the draft is established through the
+      // textarea's normal input event rather than by mutating a potentially
+      // stale DOM value behind the framework's event system.
       await page.fill('#prompt-input', testPrompt);
-      await page.click('#send-btn');
-      // The prompt should generate events; verify the input cleared or a response appeared.
+      const guard = await page.evaluate(() => {
+        const input = document.getElementById('prompt-input');
+        const paste = new ClipboardEvent('paste', {
+          clipboardData: new DataTransfer(),
+          bubbles: true,
+          cancelable: true,
+        });
+        input.dispatchEvent(paste);
+        const enter = new KeyboardEvent('keydown', {
+          key: 'Enter',
+          code: 'Enter',
+          bubbles: true,
+          cancelable: true,
+        });
+        input.dispatchEvent(enter);
+        return { enterPrevented: enter.defaultPrevented, pastePrevented: paste.defaultPrevented };
+      });
+      // Let any state update scheduled by the synthetic key event commit
+      // before proving that neither the draft nor transcript changed.
+      await page.waitForTimeout(0);
+      const guardedState = await page.evaluate((txt) => ({
+        value: document.getElementById('prompt-input')?.value || '',
+        matchingBubbles: Array.from(document.querySelectorAll('#transcript .msg--user'))
+          .filter((bubble) => (bubble.textContent || '').includes(txt)).length,
+      }), testPrompt);
+      assert('BG-07b', 'control guest: synthesized Enter during paste guard does not submit',
+        guard.enterPrevented && guardedState.value === testPrompt && guardedState.matchingBubbles === 0,
+        `enterPrevented=${guard.enterPrevented} value=${JSON.stringify(guardedState.value)} matchingBubbles=${guardedState.matchingBubbles}`);
+      await page.waitForTimeout(300);
+      await page.press('#prompt-input', 'Enter');
       try {
         await page.waitForFunction(
           (txt) => {
-            const transcript = document.querySelector('#transcript')?.textContent || '';
-            return transcript.includes(txt);
+            const input = document.getElementById('prompt-input');
+            const matches = Array.from(document.querySelectorAll('#transcript .msg--user'))
+              .filter((bubble) => (bubble.textContent || '').includes(txt));
+            return input?.value === '' && matches.length === 1;
           },
           testPrompt,
           { timeout: 20000 }
         );
-        assert('BG-07b', 'control guest: browser prompt appears in transcript', true);
+        assert('BG-07c', 'control guest: normal Enter after paste guard submits and clears the draft', true);
       } catch {
-        assert('BG-07b', 'control guest: browser prompt appears in transcript', false,
-          'prompt text not found in transcript after send');
+        const sendState = await page.evaluate((txt) => ({
+          value: document.getElementById('prompt-input')?.value || '',
+          matchingBubbles: Array.from(document.querySelectorAll('#transcript .msg--user'))
+            .filter((bubble) => (bubble.textContent || '').includes(txt)).length,
+        }), testPrompt);
+        assert('BG-07c', 'control guest: normal Enter after paste guard submits and clears the draft', false,
+          `value=${JSON.stringify(sendState.value)} matchingBubbles=${sendState.matchingBubbles}`);
       }
     } else {
       const viewState = await page.evaluate(() => {

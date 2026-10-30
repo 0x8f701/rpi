@@ -11,7 +11,11 @@ include!(concat!(env!("OUT_DIR"), "/web_assets.rs"));
 /// named assets use their relative path (e.g. `/assets/index-hash.js`).
 pub fn get(path: &str) -> Option<(&'static str, &'static [u8])> {
     let key = path.trim_start_matches('/');
-    let key = if key.is_empty() || key == "web" { "index.html" } else { key };
+    let key = if key.is_empty() || key == "web" {
+        "index.html"
+    } else {
+        key
+    };
     FILES
         .iter()
         .find(|(name, _, _)| *name == key)

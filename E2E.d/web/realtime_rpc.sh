@@ -13,9 +13,10 @@
 #         runtimeSettings.live = {enabled, mode: "realtime"}); clicking
 #         #mic-btn dispatches realtime_create_call on the WS
 #     R2  the Rust realtime proxy reaches the mock with the real JSON
-#         create-call request (OpenAI-Alpha: quicksilver=v2 + Bearer
-#         persisted in the mock evidence file) — the user click drives the
-#         REAL server path, not a client-only fake
+#         create-call request (`sdp` + complete `session`; OpenAI-Alpha:
+#         quicksilver=v2 + Bearer + sessionPresent/sessionValid=true persisted
+#         in the mock evidence file) — the user click drives the real server
+#         path, not a client-only fake
 #     R3  a successful call renders the live overlay (#realtime-transcript
 #         with the "realtime voice" label) and exposes the connection-state
 #         bucket (#realtime-conn-state)
@@ -54,14 +55,16 @@ run_phase() {
 
     # The mock must be up BEFORE the settings file is written: the live
     # realtimeBaseUrl points at the mock port. MOCK_REALTIME_EVIDENCE makes
-    # the mock persist the proxy's real request headers (OpenAI-Alpha +
-    # Bearer) for R2; MOCK_REALTIME_ERROR=1 makes the endpoint reject with
-    # 500 for the R4 error phase.
+    # the mock persist the proxy's request headers and exact session-presence
+    # and validity booleans for R2; MOCK_REALTIME_ERROR=1 makes the endpoint
+    # reject with 500 for the R4 error phase.
     local proxy_evidence="$evidence/realtime-proxy-evidence.json"
     if [ "$mock_error" = "1" ]; then
-        MOCK_REALTIME_EVIDENCE="$proxy_evidence" MOCK_REALTIME_ERROR=1 web_start_mock "$root" "$evidence"
+        MOCK_SCENARIO=sessions MOCK_REALTIME_EVIDENCE="$proxy_evidence" MOCK_REALTIME_ERROR=1 web_start_mock "$root" "$evidence"
+    elif [ "$mock_error" = "owner-delay" ]; then
+        MOCK_SCENARIO=sessions MOCK_REALTIME_EVIDENCE="$proxy_evidence" MOCK_REALTIME_DELAY=1 web_start_mock "$root" "$evidence"
     else
-        MOCK_REALTIME_EVIDENCE="$proxy_evidence" web_start_mock "$root" "$evidence"
+        MOCK_SCENARIO=sessions MOCK_REALTIME_EVIDENCE="$proxy_evidence" web_start_mock "$root" "$evidence"
     fi
     local port
     port="$(cat "$root/mock-port.txt")"
@@ -70,7 +73,7 @@ run_phase() {
     # advertises runtimeSettings.live = {enabled: true, mode: "realtime"} and
     # the composer mic enters realtime mode. realtimeApiKey is a fixture
     # secret written directly to the fixture settings file (never logged).
-    cat >"$root/home/.pi/agent/settings.json" <<EOF
+    cat >"$root/home/.rpi/settings.json" <<EOF
 {
   "live": {
     "enabled": true,
@@ -93,14 +96,15 @@ EOF
     web_run_playwright "$url" "$evidence" "$root/playwright-$phase" \
         "$SCRIPT_DIR/realtime_rpc_test.mjs" \
         "RPI_PHASE=$phase" \
-        "RPI_PROXY_EVIDENCE=$proxy_evidence" || pw_status=$?
+        "RPI_PROXY_EVIDENCE=$proxy_evidence" \
+        "RPI_REALTIME_RELEASE_URL=http://127.0.0.1:$port/__release-realtime" || pw_status=$?
     if [ "$pw_status" -eq 0 ]; then
         web_sanity_http "$url" >/dev/null
     fi
     web_kill_rpi
     web_kill_mock "$root"
     if [ "$pw_status" -eq 0 ]; then
-        printf 'playwright (%s): realtime start/error/stop RPC lifecycle PASSED\n' "$phase" | tee "$evidence/playwright-$phase-summary.txt"
+        printf 'playwright (%s): realtime RPC lifecycle and session-owner isolation PASSED\n' "$phase" | tee "$evidence/playwright-$phase-summary.txt"
     elif [ "$pw_status" -eq 1 ]; then
         fail "$SCENARIO ($phase): playwright SETUP FAILED (node/chromium/npm unavailable)"
     else
@@ -113,7 +117,7 @@ main() {
     case "${1:-run}" in
         list|--list|--dry-run)
             printf '%s\n' \
-                'web-realtime-rpc - user-visible realtime start/error/stop against the REAL Rust proxy: #mic-btn dispatches realtime_create_call + the mock records the quicksilver JSON request, live overlay renders ("realtime voice" + conn-state bucket), mock-500 surfaces the "realtime call failed" toast with the overlay down, second click dispatches realtime_stop + overlay gone (PLAYWRIGHT-ONLY, hard-fail)'
+                'web-realtime-rpc - user-visible realtime start/error/stop against the real Rust proxy: #mic-btn dispatches realtime_create_call + the mock validates SDP and the AVAS-compatible session shape without audio.input, live overlay renders, mock-500 surfaces the failure toast, second click dispatches realtime_stop (PLAYWRIGHT-ONLY, hard-fail)'
             return 0
             ;;
         run|all) ;;
@@ -127,7 +131,7 @@ main() {
     local root evidence
     root="$(scenario_workspace "$SCENARIO")"
     evidence="$EVIDENCE_ROOT/$SCENARIO"
-    mkdir -p "$root/home/.pi/agent" "$root/workspace"
+    mkdir -p "$root/home/.rpi" "$root/workspace"
     run_phase "ok" "$root" "$evidence" "0"
 
     # Phase 2: error lifecycle (mock 500 -> "realtime call failed" toast,
@@ -135,8 +139,14 @@ main() {
     local root2 evidence2
     root2="$(scenario_workspace "$SCENARIO-error")"
     evidence2="$EVIDENCE_ROOT/$SCENARIO-error"
-    mkdir -p "$root2/home/.pi/agent" "$root2/workspace"
+    mkdir -p "$root2/home/.rpi" "$root2/workspace"
     run_phase "error" "$root2" "$evidence2" "1"
+
+    local root3 evidence3
+    root3="$(scenario_workspace "$SCENARIO-owner-delay")"
+    evidence3="$EVIDENCE_ROOT/$SCENARIO-owner-delay"
+    mkdir -p "$root3/home/.rpi" "$root3/workspace"
+    run_phase "owner-delay" "$root3" "$evidence3" "owner-delay"
 
     web_finish_lane "$SCENARIO"
 }

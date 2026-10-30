@@ -11,9 +11,9 @@
 //      `__rpiReadyGateTest.releaseCurrentOpen()`; the App's onOpen fires, the
 //      gate resolves, and the sidebar finally loads the primary session row
 //      with NO `load failed: not connected` anywhere on the page.
-//   3. An active New-session click DURING the hold fails FAST (the sidebar
-//      shows a transient `not connected`, never a 15s hang, never
-//      `load failed: not connected`).
+//   3. An active New-session click DURING the hold fails FAST through Manage
+//      Session; the panel shows `new session failed: not connected`, never a
+//      15s hang and never `load failed: not connected`.
 //   4. Simulated reconnect: close the socket, the replacement's open is held
 //      again, the gate re-arms, and the sidebar reloads with the session row
 //      still present and still no `load failed: not connected`.
@@ -36,6 +36,10 @@
 //   RPI_OPEN_DELAY  optional settle ms applied ONLY after a release (default 0)
 
 import { chromium } from 'playwright';
+import {
+  assertSidebarNewActionAbsent,
+  clickNewSessionExpectingFailureViaManage,
+} from './lib/session-lifecycle.mjs';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
@@ -81,6 +85,7 @@ async function main() {
   if (!url) fail('RPI_URL is required');
   const launchOptions = chromePath ? { executablePath: chromePath } : {};
   const browser = await chromium.launch(launchOptions);
+  const browserErrors = [];
   try {
     const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
     if (token) {
@@ -180,6 +185,24 @@ async function main() {
          *  schedules the reconnect, whose replacement becomes the new current
          *  generation. */
         closeCurrent() { try { current && current.close(4000, 'ready-gate test outage'); } catch { /* */ } },
+        failCurrentOpen() {
+          const socket = current;
+          const state = socket && socket.__state;
+          if (!socket || !state || state.dead) return;
+          state.released = true;
+          const fail = () => {
+            if (state.dead || state.detached) return;
+            state.held = null;
+            state.ready = NativeWebSocket.CLOSED;
+            state.dead = true;
+            const close = socket.onclose;
+            if (typeof close === 'function') {
+              close.call(socket, { target: socket, code: 1006, reason: '', wasClean: false });
+            }
+          };
+          if (state.held !== null) fail();
+          else NativeWebSocket.prototype.addEventListener.call(socket, 'open', fail, { once: true });
+        },
         /** Release the CURRENT generation's held open: if the native open
          *  already arrived it dispatches now; otherwise it dispatches the
          *  moment the open arrives. Exactly one App onopen per generation. */
@@ -196,8 +219,9 @@ async function main() {
       };
     });
 
-    page.on('pageerror', (err) => {
-      console.error(`web-readygate: page error: ${err.message}`);
+    page.on('pageerror', (error) => browserErrors.push(`pageerror: ${error.message}`));
+    page.on('console', (message) => {
+      if (message.type() === 'error') browserErrors.push(`console: ${message.text()}`);
     });
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
@@ -214,23 +238,16 @@ async function main() {
     );
     await assertNoLoadFailed(page, 'during mount-before-OPEN window');
 
-    // Active New-session click DURING the hold must FAIL FAST: the sidebar
-    // shows a transient `not connected` (the active action bypasses the gate),
-    // never a 15s hang and never `load failed: not connected`. The held open
-    // guarantees the socket is still CONNECTING here — no timing race.
-    await page.click('#sidebar-new-session-btn');
-    await waitFor(
-      page,
-      () => {
-        const el = document.querySelector('.session-sidebar__error');
-        return el !== null && (el.textContent || '').length > 0;
-      },
-      'active New click did not fail fast during disconnect',
-      3000,
-    );
-    const activeErr = await page.evaluate(() => {
-      const el = document.querySelector('.session-sidebar__error');
-      return el ? el.textContent || '' : '';
+    // Active New-session click DURING the hold must FAIL FAST through the sole
+    // lifecycle route: Manage Session -> New session. The panel surfaces a
+    // transient `not connected`, never a 15s hang and never
+    // `load failed: not connected`. The held open guarantees the socket is
+    // still CONNECTING here — no timing race.
+    await assertSidebarNewActionAbsent(page, 'obsolete sidebar New action rendered during ready-gate hold');
+    const activeErr = await clickNewSessionExpectingFailureViaManage(page, waitFor, 'active New during disconnect', {
+      failureText: 'not connected',
+      timeoutMs: 3000,
+      closePanel: false,
     });
     if (activeErr.includes(SENTINEL)) {
       fail(`active New click surfaced "${SENTINEL}" instead of fail-fast not connected`);
@@ -244,12 +261,6 @@ async function main() {
     if (settleAfterRelease > 0) await page.waitForTimeout(settleAfterRelease);
     await waitFor(
       page,
-      () => document.getElementById('conn-state') && document.getElementById('conn-state').dataset.state === 'on',
-      'WS did not reach "connected" after releasing the held open',
-      30000,
-    );
-    await waitFor(
-      page,
       () => {
         const rows = [...document.querySelectorAll('.session-sidebar__switch')];
         return rows.length >= 1 && rows.every((r) => (r.dataset.sessionId || '') !== '');
@@ -259,10 +270,8 @@ async function main() {
     await assertNoLoadFailed(page, 'after released-open sidebar load');
     await page.screenshot({ path: `${evidence}/readygate-sidebar-loaded.png`, fullPage: true });
 
-    // Open the full Session panel (mount auto-load path) and assert it loads
-    // without `load failed: not connected` too.
-    await page.click('#sidebar-manage-btn');
-    await waitFor(page, () => document.querySelector('#session-panel') !== null, 'session panel did not open');
+    // The full Session panel is already open from the fail-fast lifecycle
+    // attempt. After release its gated mount load must populate normally.
     await waitFor(
       page,
       () => {
@@ -283,11 +292,8 @@ async function main() {
     await page.evaluate(() => window.__rpiReadyGateTest.closeCurrent());
     await waitFor(
       page,
-      () => {
-        const s = document.getElementById('conn-state');
-        return s && (s.dataset.state === 'off' || s.dataset.state === 'reconnecting' || s.dataset.state === 'connecting');
-      },
-      'socket never dropped after closeCurrent',
+      () => document.querySelectorAll('#toasts .toast[data-toast-kind="transport"]').length === 1,
+      'socket never dropped after closeCurrent (no transport outage toast)',
       5000,
     );
     // The replacement socket exists only after the reconnect backoff; the gen
@@ -306,12 +312,6 @@ async function main() {
     if (settleAfterRelease > 0) await page.waitForTimeout(settleAfterRelease);
     await waitFor(
       page,
-      () => document.getElementById('conn-state') && document.getElementById('conn-state').dataset.state === 'on',
-      'WS did not re-reach "connected" after releasing the replacement open',
-      30000,
-    );
-    await waitFor(
-      page,
       () => {
         const rows = [...document.querySelectorAll('.session-sidebar__switch')];
         return rows.length >= 1 && rows.every((r) => (r.dataset.sessionId || '') !== '');
@@ -321,7 +321,53 @@ async function main() {
     await assertNoLoadFailed(page, 'after reconnect sidebar reload');
     await page.screenshot({ path: `${evidence}/readygate-reconnect-loaded.png`, fullPage: true });
 
-    console.log('web-readygate: PASSED (mount-before-OPEN gate + active fail-fast + reconnect reload, no "load failed: not connected")');
+    // Repeated abnormal generations: three replacements fail with 1006 before
+    // the fourth is released. The page must keep retrying and converge without
+    // refresh; the retained session rows remain authoritative.
+    let failedGen = await page.evaluate(() => window.__rpiReadyGateTest.gen);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await page.evaluate(() => window.__rpiReadyGateTest.closeCurrent());
+      await waitFor(
+        page,
+        (previous) => window.__rpiReadyGateTest.gen > previous,
+        `repeated reconnect attempt ${attempt + 1} never constructed`,
+        20000,
+        failedGen,
+      );
+      if (attempt === 0) {
+        await waitFor(
+          page,
+          () => document.querySelectorAll('#toasts .toast[data-toast-kind="transport"]').length >= 1,
+          'no transport outage toast during repeated outage',
+          15000,
+        );
+        await page.screenshot({ path: `${evidence}/readygate-repeated-reconnecting.png`, fullPage: true });
+      }
+      failedGen = await page.evaluate(() => window.__rpiReadyGateTest.gen);
+      await page.evaluate(() => window.__rpiReadyGateTest.failCurrentOpen());
+      await waitFor(
+        page,
+        (previous) => window.__rpiReadyGateTest.gen > previous,
+        `repeated reconnect attempt ${attempt + 1} did not retry after 1006`,
+        30000,
+        failedGen,
+      );
+      failedGen = await page.evaluate(() => window.__rpiReadyGateTest.gen);
+    }
+    await page.evaluate(() => window.__rpiReadyGateTest.releaseCurrentOpen());
+    await waitFor(
+      page,
+      () => document.querySelectorAll('.session-sidebar__switch[data-session-id]:not([data-session-id=""])').length >= 1,
+      'session rows were not restored after repeated reconnects',
+      30000,
+    );
+    await assertNoLoadFailed(page, 'after repeated reconnect convergence');
+    await page.screenshot({ path: `${evidence}/readygate-repeated-reconnect-loaded.png`, fullPage: true });
+    if (browserErrors.length > 0) {
+      fail(`browser errors observed: ${browserErrors.join(' | ')}`);
+    }
+
+    console.log('web-readygate: PASSED (mount gate + active fail-fast + repeated 1006 reconnect convergence, retained session rows, zero browser errors)');
   } finally {
     await browser.close().catch(() => {});
   }

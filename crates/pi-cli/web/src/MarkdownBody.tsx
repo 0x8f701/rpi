@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef } from 'react';
 import type { Ref } from 'react';
 import { renderMarkdown, hydrateMermaid } from './markdown';
 
@@ -16,13 +16,15 @@ import { renderMarkdown, hydrateMermaid } from './markdown';
  *  commit and no delta, so `onLayoutChange` (the transcript pin controller's
  *  pinIfPinned) fires synchronously after each host mutation and on every
  *  image decode — the same contract as FinalAssistant / HubMarkdownFold. */
-export function MarkdownBody({
+function MarkdownBodyInner({
   text,
+  pathContext,
   className,
   onLayoutChange,
   bodyRef,
 }: {
   text: string;
+  pathContext?: string;
   className?: string;
   onLayoutChange?: () => void;
   /** Optional caller-owned ref: fold wrappers (IRC / hub) observe the root
@@ -39,35 +41,38 @@ export function MarkdownBody({
     },
     [bodyRef],
   );
-  const html = useMemo(() => renderMarkdown(text), [text]);
+  const html = useMemo(() => renderMarkdown(text, pathContext ?? text), [text, pathContext]);
   useEffect(() => {
     const node = innerRef.current;
     if (!node) return;
+    const hydration = new AbortController();
+    let cancelled = false;
+    const notify = () => {
+      if (cancelled || !node.isConnected) return;
+      onLayoutChange?.();
+    };
     // Mermaid fences render asynchronously: hydrate the hosts after
-    // dangerouslySetInnerHTML commits. `onLayoutChange` fires synchronously
-    // after each host mutation so the transcript pin re-glues before the
-    // next frame.
-    void hydrateMermaid(node, onLayoutChange);
-    // Markdown images (`![..](..)`) decode asynchronously and grow layout
-    // with no React commit and no delta. A scoped capture load handler
-    // re-pins synchronously with the decode; the pin controller preserves a
-    // deliberate user scroll-away (unpinned freeze). Data-URL decodes can
-    // race ahead of this layout effect, so a complete image pins once
-    // immediately instead of waiting for a load event that already fired.
+    // dangerouslySetInnerHTML commits. Abort prevents a superseded body from
+    // mutating or notifying even when the shared render promise completes.
+    void hydrateMermaid(node, notify, hydration.signal);
     const imgs = Array.from(node.querySelectorAll<HTMLImageElement>('img.md-image'));
     const listeners: Array<[HTMLImageElement, () => void]> = [];
     for (const img of imgs) {
       if (img.complete) {
-        onLayoutChange?.();
+        notify();
         continue;
       }
-      const onLoad = () => onLayoutChange?.();
+      const onLoad = () => notify();
       img.addEventListener('load', onLoad, { capture: true, once: true });
       listeners.push([img, onLoad]);
     }
     return () => {
+      hydration.abort();
+      cancelled = true;
       for (const [img, onLoad] of listeners) img.removeEventListener('load', onLoad, { capture: true });
     };
   }, [html, onLayoutChange]);
   return <div ref={setRootRef} className={className} dangerouslySetInnerHTML={{ __html: html }} />;
 }
+
+export const MarkdownBody = memo(MarkdownBodyInner);

@@ -1,16 +1,18 @@
 //! Versioned, bounded, per-workflow durable storage.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
-use uuid::Uuid;
+
+use crate::fs::{
+    CapabilityAccess, CapabilityEntry, CapabilityFile, CapabilityRootLease, CapabilityRootPurpose,
+    EntryKind, FileIdentity, FileMode, FsError, Replacement, RootCreation,
+};
 
 use super::WorkflowId;
 
-const STORE_VERSION: u32 = 1;
+const STORE_VERSION: u32 = 2;
 const RECORDS_DIRECTORY: &str = "records";
 const SELECTION_FILE: &str = "selection.json";
 const MAX_RECORD_BYTES: u64 = 1024 * 1024;
@@ -21,16 +23,10 @@ const MAX_SELECTION_BYTES: u64 = 16 * 1024;
 pub(super) enum StoreError {
     #[error("workflow id is not safe for durable storage")]
     InvalidWorkflowId,
-    #[error("workflow storage path contains a symbolic link")]
-    Symlink,
-    #[error("workflow storage path component is not a directory")]
-    NotDirectory,
-    #[error("{operation}: {source}")]
-    Io {
-        operation: &'static str,
-        #[source]
-        source: std::io::Error,
-    },
+    #[error("workflow storage lease has the wrong purpose or access")]
+    InvalidLease,
+    #[error("workflow storage capability failed: {0}")]
+    Capability(#[from] FsError),
     #[error("{operation}: {source}")]
     Json {
         operation: &'static str,
@@ -81,7 +77,6 @@ pub(super) struct SelectionLoad {
     pub(super) diagnostics: Vec<StoreDiagnostic>,
 }
 
-/// Adapter implemented by the canonical crate-private stored record.
 pub(super) trait StoreRecord {
     fn workflow_id(&self) -> &WorkflowId;
 }
@@ -102,8 +97,8 @@ struct SelectionEnvelope {
 
 #[derive(Clone)]
 pub(super) struct WorkflowStore {
-    root: PathBuf,
-    records: PathBuf,
+    root: CapabilityRootLease,
+    records: CapabilityRootLease,
 }
 
 impl std::fmt::Debug for WorkflowStore {
@@ -115,15 +110,17 @@ impl std::fmt::Debug for WorkflowStore {
 }
 
 impl WorkflowStore {
-    pub(super) fn open(root: impl Into<PathBuf>) -> Result<Self, StoreError> {
-        let root = root.into();
-        create_directory_chain(&root)?;
-        let records = root.join(RECORDS_DIRECTORY);
-        create_directory_chain(&records)?;
-        reject_symlink_components(&root)?;
-        reject_symlink_components(&records)?;
-        ensure_directory(&root)?;
-        ensure_directory(&records)?;
+    pub(super) fn open(root: CapabilityRootLease) -> Result<Self, StoreError> {
+        if root.purpose() != CapabilityRootPurpose::WorkflowStore
+            || root.access() != CapabilityAccess::PrivateReadWrite
+        {
+            return Err(StoreError::InvalidLease);
+        }
+        let records = root.lease_directory(
+            Path::new(RECORDS_DIRECTORY),
+            CapabilityAccess::PrivateReadWrite,
+            RootCreation::CreateDirectory,
+        )?;
         Ok(Self { root, records })
     }
 
@@ -131,20 +128,17 @@ impl WorkflowStore {
     where
         R: DeserializeOwned + StoreRecord,
     {
-        self.secure_records_directory()?;
-        let mut entries = fs::read_dir(&self.records)
-            .map_err(|source| io_error("reading workflow records directory", source))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|source| io_error("enumerating workflow records", source))?;
-        entries.sort_by_key(fs::DirEntry::file_name);
-
+        let mut entries = self.records.read_dir(Path::new(""))?;
         let mut records = Vec::new();
         let mut diagnostics = Vec::new();
         let mut aggregate_bytes = 0_u64;
-        for entry in entries {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                diagnostics.push(diagnostic(None, StoreDiagnosticKind::InvalidRecordName, "ignored a workflow record with a non-UTF-8 name"));
+        while let Some(entry) = entries.next()? {
+            let Some(name) = entry.name().to_str() else {
+                diagnostics.push(diagnostic(
+                    None,
+                    StoreDiagnosticKind::InvalidRecordName,
+                    "ignored a workflow record with a non-UTF-8 name",
+                ));
                 continue;
             };
             if is_temporary_name(name) || !name.ends_with(".json") {
@@ -152,46 +146,69 @@ impl WorkflowStore {
             }
             let record_id = workflow_id_from_file_name(name);
             let Some(file_id) = record_id.as_ref() else {
-                diagnostics.push(diagnostic(None, StoreDiagnosticKind::InvalidRecordName, "ignored a workflow record with an invalid file name"));
+                diagnostics.push(diagnostic(
+                    None,
+                    StoreDiagnosticKind::InvalidRecordName,
+                    "ignored a workflow record with an invalid file name",
+                ));
                 continue;
             };
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(error) => {
-                    diagnostics.push(diagnostic(record_id, StoreDiagnosticKind::CorruptRecord, format!("could not inspect workflow record: {error}")));
+            let file = match entry.into_entry() {
+                CapabilityEntry::File(file) => file,
+                CapabilityEntry::Directory(_) => {
+                    diagnostics.push(diagnostic(
+                        record_id,
+                        StoreDiagnosticKind::UnsafeRecord,
+                        "ignored a workflow record that is not a regular file",
+                    ));
                     continue;
                 }
             };
-            if file_type.is_symlink() || !file_type.is_file() {
-                diagnostics.push(diagnostic(record_id, StoreDiagnosticKind::UnsafeRecord, "ignored a workflow record that is not a regular file"));
-                continue;
-            }
-            let length = match entry.metadata() {
-                Ok(metadata) => metadata.len(),
+            let length = match file.metadata() {
+                Ok(metadata) => metadata.len,
                 Err(error) => {
-                    diagnostics.push(diagnostic(record_id, StoreDiagnosticKind::CorruptRecord, format!("could not read workflow record metadata: {error}")));
+                    diagnostics.push(diagnostic(
+                        record_id,
+                        StoreDiagnosticKind::CorruptRecord,
+                        format!("could not read workflow record metadata: {error}"),
+                    ));
                     continue;
                 }
             };
             if length > MAX_RECORD_BYTES {
-                diagnostics.push(diagnostic(record_id, StoreDiagnosticKind::RecordLimitExceeded, "ignored a workflow record larger than 1 MiB"));
+                diagnostics.push(diagnostic(
+                    record_id,
+                    StoreDiagnosticKind::RecordLimitExceeded,
+                    "ignored a workflow record larger than 1 MiB",
+                ));
                 continue;
             }
             let Some(next_aggregate) = aggregate_bytes.checked_add(length) else {
-                diagnostics.push(diagnostic(record_id, StoreDiagnosticKind::RecordLimitExceeded, "ignored a workflow record beyond the 8 MiB aggregate limit"));
+                diagnostics.push(diagnostic(
+                    record_id,
+                    StoreDiagnosticKind::RecordLimitExceeded,
+                    "ignored a workflow record beyond the 8 MiB aggregate limit",
+                ));
                 continue;
             };
             if next_aggregate > MAX_AGGREGATE_BYTES {
-                diagnostics.push(diagnostic(record_id, StoreDiagnosticKind::RecordLimitExceeded, "ignored a workflow record beyond the 8 MiB aggregate limit"));
+                diagnostics.push(diagnostic(
+                    record_id,
+                    StoreDiagnosticKind::RecordLimitExceeded,
+                    "ignored a workflow record beyond the 8 MiB aggregate limit",
+                ));
                 continue;
             }
             aggregate_bytes = next_aggregate;
-            match load_record::<R>(&entry.path(), file_id) {
+            match load_record::<R>(&file, file_id) {
                 Ok(record) => records.push(record),
                 Err((kind, message)) => diagnostics.push(diagnostic(record_id, kind, message)),
             }
         }
-        Ok(LoadAll { records, diagnostics })
+        Ok(LoadAll {
+            records,
+            diagnostics,
+        })
     }
 
     pub(super) fn write<R>(&self, record: &R) -> Result<(), StoreError>
@@ -200,226 +217,247 @@ impl WorkflowStore {
     {
         validate_workflow_id(record.workflow_id())?;
         let bytes = serialize_record(record)?;
-        self.secure_records_directory()?;
         self.ensure_aggregate_capacity(record.workflow_id(), bytes.len() as u64)?;
-        let target = self.record_path(record.workflow_id())?;
-        reject_symlink_components(&target)?;
-        atomic_write(&target, &self.records, &bytes, "writing workflow record")
+        let relative = record_relative(record.workflow_id())?;
+        let expected = existing_identity(&self.records, &relative)?;
+        self.records.replace_file(Replacement {
+            relative,
+            expected,
+            bytes,
+            mode: FileMode::Private,
+        })?;
+        Ok(())
     }
 
     pub(super) fn remove(&self, id: &WorkflowId) -> Result<(), StoreError> {
-        let path = self.record_path(id)?;
-        self.secure_records_directory()?;
-        reject_symlink_components(&path)?;
-        match fs::remove_file(&path) {
-            Ok(()) => sync_directory(&self.records),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-            Err(source) => Err(io_error("removing workflow record", source)),
+        let relative = record_relative(id)?;
+        match self.records.remove_file(&relative) {
+            Ok(()) => Ok(()),
+            Err(error) if is_missing(&error) => Ok(()),
+            Err(error) => Err(error.into()),
         }
     }
 
     pub(super) fn load_selection(&self) -> Result<SelectionLoad, StoreError> {
-        self.secure_root_directory()?;
-        let path = self.root.join(SELECTION_FILE);
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(SelectionLoad { selected: None, diagnostics: Vec::new() }),
-            Err(source) => return Err(io_error("inspecting workflow selection", source)),
+        let relative = Path::new(SELECTION_FILE);
+        let file = match self.root.open_file(relative) {
+            Ok(file) => file,
+            Err(error) if is_missing(&error) => {
+                return Ok(SelectionLoad {
+                    selected: None,
+                    diagnostics: Vec::new(),
+                });
+            }
+            Err(error) => return Err(error.into()),
         };
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Ok(selection_diagnostic(StoreDiagnosticKind::UnsafeSelection, "ignored workflow selection because it is not a regular file"));
+        let metadata = match file.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return Ok(selection_diagnostic(
+                    StoreDiagnosticKind::CorruptSelection,
+                    format!("ignored unreadable workflow selection: {error}"),
+                ));
+            }
+        };
+        if metadata.len > MAX_SELECTION_BYTES {
+            return Ok(selection_diagnostic(
+                StoreDiagnosticKind::CorruptSelection,
+                "ignored workflow selection because it exceeds its size limit",
+            ));
         }
-        if metadata.len() > MAX_SELECTION_BYTES {
-            return Ok(selection_diagnostic(StoreDiagnosticKind::CorruptSelection, "ignored workflow selection because it exceeds its size limit"));
-        }
-        let bytes = match read_bounded(&path, MAX_SELECTION_BYTES) {
+        let bytes = match file.read_bounded(MAX_SELECTION_BYTES) {
             Ok(bytes) => bytes,
-            Err(error) => return Ok(selection_diagnostic(StoreDiagnosticKind::CorruptSelection, format!("ignored unreadable workflow selection: {error}"))),
+            Err(error) => {
+                return Ok(selection_diagnostic(
+                    StoreDiagnosticKind::CorruptSelection,
+                    format!("ignored unreadable workflow selection: {error}"),
+                ));
+            }
         };
         let selection = match serde_json::from_slice::<SelectionEnvelope>(&bytes) {
             Ok(selection) => selection,
-            Err(error) => return Ok(selection_diagnostic(StoreDiagnosticKind::CorruptSelection, format!("ignored corrupt workflow selection: {error}"))),
+            Err(error) => {
+                return Ok(selection_diagnostic(
+                    StoreDiagnosticKind::CorruptSelection,
+                    format!("ignored corrupt workflow selection: {error}"),
+                ));
+            }
         };
         if selection.version != STORE_VERSION {
-            return Ok(selection_diagnostic(StoreDiagnosticKind::UnsupportedSelectionVersion, format!("ignored workflow selection version {} (supported version is {STORE_VERSION})", selection.version)));
+            return Ok(selection_diagnostic(
+                StoreDiagnosticKind::UnsupportedSelectionVersion,
+                format!(
+                    "ignored workflow selection version {} (supported version is {STORE_VERSION})",
+                    selection.version
+                ),
+            ));
         }
-        if let Some(id) = selection.selected_workflow_id.as_ref() && validate_workflow_id(id).is_err() {
-            return Ok(selection_diagnostic(StoreDiagnosticKind::CorruptSelection, "ignored workflow selection containing an invalid workflow id"));
+        if let Some(id) = selection.selected_workflow_id.as_ref()
+            && validate_workflow_id(id).is_err()
+        {
+            return Ok(selection_diagnostic(
+                StoreDiagnosticKind::CorruptSelection,
+                "ignored workflow selection containing an invalid workflow id",
+            ));
         }
-        Ok(SelectionLoad { selected: selection.selected_workflow_id, diagnostics: Vec::new() })
+        Ok(SelectionLoad {
+            selected: selection.selected_workflow_id,
+            diagnostics: Vec::new(),
+        })
     }
 
     pub(super) fn write_selection(&self, selected: Option<&WorkflowId>) -> Result<(), StoreError> {
-        if let Some(id) = selected { validate_workflow_id(id)?; }
-        let envelope = SelectionEnvelope { version: STORE_VERSION, selected_workflow_id: selected.cloned() };
-        let mut bytes = serde_json::to_vec_pretty(&envelope).map_err(|source| StoreError::Json { operation: "serializing workflow selection", source })?;
-        bytes.push(b'\n');
-        if bytes.len() as u64 > MAX_SELECTION_BYTES { return Err(StoreError::SelectionTooLarge); }
-        self.secure_root_directory()?;
-        let target = self.root.join(SELECTION_FILE);
-        reject_symlink_components(&target)?;
-        atomic_write(&target, &self.root, &bytes, "writing workflow selection")
-    }
-
-    fn record_path(&self, id: &WorkflowId) -> Result<PathBuf, StoreError> {
-        validate_workflow_id(id)?;
-        Ok(self.records.join(format!("{}.json", id.as_str())))
-    }
-
-    fn ensure_aggregate_capacity(&self, replacing: &WorkflowId, replacement_bytes: u64) -> Result<(), StoreError> {
-        let replacing_name = format!("{}.json", replacing.as_str());
-        let mut aggregate = replacement_bytes;
-        for entry in fs::read_dir(&self.records).map_err(|source| io_error("reading workflow records directory", source))? {
-            let entry = entry.map_err(|source| io_error("enumerating workflow records", source))?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue; };
-            if name == replacing_name || is_temporary_name(name) || !name.ends_with(".json") { continue; }
-            let file_type = entry.file_type().map_err(|source| io_error("inspecting workflow record", source))?;
-            if file_type.is_symlink() { return Err(StoreError::Symlink); }
-            if !file_type.is_file() { continue; }
-            aggregate = aggregate.checked_add(entry.metadata().map_err(|source| io_error("reading workflow record metadata", source))?.len()).ok_or(StoreError::AggregateTooLarge)?;
-            if aggregate > MAX_AGGREGATE_BYTES { return Err(StoreError::AggregateTooLarge); }
+        if let Some(id) = selected {
+            validate_workflow_id(id)?;
         }
+        let envelope = SelectionEnvelope {
+            version: STORE_VERSION,
+            selected_workflow_id: selected.cloned(),
+        };
+        let mut bytes =
+            serde_json::to_vec_pretty(&envelope).map_err(|source| StoreError::Json {
+                operation: "serializing workflow selection",
+                source,
+            })?;
+        bytes.push(b'\n');
+        if bytes.len() as u64 > MAX_SELECTION_BYTES {
+            return Err(StoreError::SelectionTooLarge);
+        }
+        let relative = PathBuf::from(SELECTION_FILE);
+        let expected = existing_identity(&self.root, &relative)?;
+        self.root.replace_file(Replacement {
+            relative,
+            expected,
+            bytes,
+            mode: FileMode::Private,
+        })?;
         Ok(())
     }
 
-    fn secure_root_directory(&self) -> Result<(), StoreError> {
-        reject_symlink_components(&self.root)?;
-        ensure_directory(&self.root)
-    }
-
-    fn secure_records_directory(&self) -> Result<(), StoreError> {
-        self.secure_root_directory()?;
-        reject_symlink_components(&self.records)?;
-        ensure_directory(&self.records)
+    fn ensure_aggregate_capacity(
+        &self,
+        replacing: &WorkflowId,
+        replacement_bytes: u64,
+    ) -> Result<(), StoreError> {
+        let replacing_name = format!("{}.json", replacing.as_str());
+        let mut aggregate = replacement_bytes;
+        let mut entries = self.records.read_dir(Path::new(""))?;
+        while let Some(entry) = entries.next()? {
+            let Some(name) = entry.name().to_str() else {
+                continue;
+            };
+            if name == replacing_name || is_temporary_name(name) || !name.ends_with(".json") {
+                continue;
+            }
+            if entry.entry().kind() != EntryKind::RegularFile {
+                continue;
+            }
+            let CapabilityEntry::File(file) = entry.into_entry() else {
+                continue;
+            };
+            aggregate = aggregate
+                .checked_add(file.metadata()?.len)
+                .ok_or(StoreError::AggregateTooLarge)?;
+            if aggregate > MAX_AGGREGATE_BYTES {
+                return Err(StoreError::AggregateTooLarge);
+            }
+        }
+        Ok(())
     }
 }
 
 fn serialize_record<R: Serialize + StoreRecord>(record: &R) -> Result<Vec<u8>, StoreError> {
-    let envelope = RecordEnvelope { version: STORE_VERSION, record };
-    let mut bytes = serde_json::to_vec_pretty(&envelope).map_err(|source| StoreError::Json { operation: "serializing workflow record", source })?;
+    let envelope = RecordEnvelope {
+        version: STORE_VERSION,
+        record,
+    };
+    let mut bytes = serde_json::to_vec_pretty(&envelope).map_err(|source| StoreError::Json {
+        operation: "serializing workflow record",
+        source,
+    })?;
     bytes.push(b'\n');
-    if bytes.len() as u64 > MAX_RECORD_BYTES { return Err(StoreError::RecordTooLarge); }
+    if bytes.len() as u64 > MAX_RECORD_BYTES {
+        return Err(StoreError::RecordTooLarge);
+    }
     Ok(bytes)
 }
 
-fn load_record<R: DeserializeOwned + StoreRecord>(path: &Path, file_id: &WorkflowId) -> Result<R, (StoreDiagnosticKind, String)> {
-    let bytes = read_bounded(path, MAX_RECORD_BYTES).map_err(|error| (StoreDiagnosticKind::CorruptRecord, format!("could not read workflow record: {error}")))?;
-    let envelope: RecordEnvelope<R> = serde_json::from_slice(&bytes).map_err(|error| (StoreDiagnosticKind::CorruptRecord, format!("could not decode workflow record: {error}")))?;
+fn load_record<R: DeserializeOwned + StoreRecord>(
+    file: &CapabilityFile,
+    file_id: &WorkflowId,
+) -> Result<R, (StoreDiagnosticKind, String)> {
+    let bytes = file.read_bounded(MAX_RECORD_BYTES).map_err(|error| {
+        (
+            StoreDiagnosticKind::CorruptRecord,
+            format!("could not read workflow record: {error}"),
+        )
+    })?;
+    let envelope: RecordEnvelope<R> = serde_json::from_slice(&bytes).map_err(|error| {
+        (
+            StoreDiagnosticKind::CorruptRecord,
+            format!("could not decode workflow record: {error}"),
+        )
+    })?;
     if envelope.version != STORE_VERSION {
-        return Err((StoreDiagnosticKind::UnsupportedRecordVersion, format!("ignored workflow record version {} (supported version is {STORE_VERSION})", envelope.version)));
+        return Err((
+            StoreDiagnosticKind::UnsupportedRecordVersion,
+            format!(
+                "ignored workflow record version {} (supported version is {STORE_VERSION})",
+                envelope.version
+            ),
+        ));
     }
     if envelope.record.workflow_id() != file_id {
-        return Err((StoreDiagnosticKind::RecordIdentityMismatch, "ignored workflow record whose identity does not match its file name".to_owned()));
+        return Err((
+            StoreDiagnosticKind::RecordIdentityMismatch,
+            "ignored workflow record whose identity does not match its file name".to_owned(),
+        ));
     }
     Ok(envelope.record)
 }
 
-fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, StoreError> {
-    let mut file = open_read_no_follow(path)?;
-    let metadata = file.metadata().map_err(|source| io_error("reading durable file metadata", source))?;
-    if !metadata.is_file() { return Err(StoreError::Symlink); }
-    if metadata.len() > limit { return Err(StoreError::RecordTooLarge); }
-    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-    file.take(limit + 1).read_to_end(&mut bytes).map_err(|source| io_error("reading durable file", source))?;
-    if bytes.len() as u64 > limit { return Err(StoreError::RecordTooLarge); }
-    Ok(bytes)
-}
-
-fn atomic_write(target: &Path, parent: &Path, bytes: &[u8], operation: &'static str) -> Result<(), StoreError> {
-    let temporary = parent.join(format!(".workflow-{}.tmp", Uuid::new_v4().simple()));
-    let result = (|| {
-        let mut file = private_create_new(&temporary).map_err(|source| io_error("creating private temporary file", source))?;
-        file.write_all(bytes).map_err(|source| io_error(operation, source))?;
-        file.sync_all().map_err(|source| io_error("syncing private temporary file", source))?;
-        drop(file);
-        reject_symlink_components(target)?;
-        fs::rename(&temporary, target).map_err(|source| io_error(operation, source))?;
-        sync_directory(parent)
-    })();
-    if result.is_err() { let _ = fs::remove_file(&temporary); }
-    result
-}
-
-fn private_create_new(path: &Path) -> std::io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
-    options.open(path)
-}
-
-fn open_read_no_follow(path: &Path) -> Result<File, StoreError> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.custom_flags(nix::libc::O_NOFOLLOW); }
-    options.open(path).map_err(|source| io_error("opening durable file", source))
-}
-
-fn sync_directory(path: &Path) -> Result<(), StoreError> {
-    File::open(path).and_then(|directory| directory.sync_all()).map_err(|source| io_error("syncing workflow storage directory", source))
-}
-
-fn create_directory_chain(path: &Path) -> Result<(), StoreError> {
-    let absolute = absolute_path(path)?;
-    let mut current = PathBuf::new();
-    for component in absolute.components() {
-        current.push(component.as_os_str());
-        loop {
-            match fs::symlink_metadata(&current) {
-                Ok(metadata) if metadata.file_type().is_symlink() => return Err(StoreError::Symlink),
-                Ok(metadata) if !metadata.is_dir() => return Err(StoreError::NotDirectory),
-                Ok(_) => break,
-                Err(error) if error.kind() == ErrorKind::NotFound => match create_private_directory(&current) {
-                    Ok(()) => break,
-                    Err(create_error) if create_error.kind() == ErrorKind::AlreadyExists => continue,
-                    Err(source) => return Err(io_error("creating workflow storage directory", source)),
-                },
-                Err(source) => return Err(io_error("inspecting workflow storage directory", source)),
-            }
-        }
+fn existing_identity(
+    lease: &CapabilityRootLease,
+    relative: &Path,
+) -> Result<Option<FileIdentity>, StoreError> {
+    match lease.metadata(relative) {
+        Ok(metadata) => Ok(Some(metadata.identity)),
+        Err(error) if is_missing(&error) => Ok(None),
+        Err(error) => Err(error.into()),
     }
-    Ok(())
 }
 
-fn create_private_directory(path: &Path) -> std::io::Result<()> {
-    let mut builder = fs::DirBuilder::new();
-    #[cfg(unix)] { use std::os::unix::fs::DirBuilderExt; builder.mode(0o700); }
-    builder.create(path)
-}
-
-fn reject_symlink_components(path: &Path) -> Result<(), StoreError> {
-    let absolute = absolute_path(path)?;
-    let mut current = PathBuf::new();
-    for component in absolute.components() {
-        current.push(component.as_os_str());
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => return Err(StoreError::Symlink),
-            Ok(_) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => break,
-            Err(source) => return Err(io_error("inspecting workflow storage path", source)),
+fn is_missing(error: &FsError) -> bool {
+    matches!(
+        error,
+        FsError::System {
+            kind: std::io::ErrorKind::NotFound,
+            ..
         }
-    }
-    Ok(())
+    )
 }
 
-fn ensure_directory(path: &Path) -> Result<(), StoreError> {
-    let metadata = fs::symlink_metadata(path).map_err(|source| io_error("inspecting workflow storage directory", source))?;
-    if metadata.file_type().is_symlink() { return Err(StoreError::Symlink); }
-    if !metadata.is_dir() { return Err(StoreError::NotDirectory); }
-    Ok(())
-}
-
-fn absolute_path(path: &Path) -> Result<PathBuf, StoreError> {
-    if path.is_absolute() { return Ok(path.to_path_buf()); }
-    std::env::current_dir().map(|directory| directory.join(path)).map_err(|source| io_error("resolving workflow storage path", source))
+fn record_relative(id: &WorkflowId) -> Result<PathBuf, StoreError> {
+    validate_workflow_id(id)?;
+    Ok(PathBuf::from(format!("{}.json", id.as_str())))
 }
 
 fn validate_workflow_id(id: &WorkflowId) -> Result<(), StoreError> {
     let value = id.as_str();
-    let valid = !value.is_empty() && value.len() <= 128 && value.as_bytes()[0].is_ascii_alphanumeric()
-        && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-        && !value.contains("..") && !value.ends_with('.') && !value.ends_with(".lock");
-    if valid { Ok(()) } else { Err(StoreError::InvalidWorkflowId) }
+    let valid = !value.is_empty()
+        && value.len() <= 128
+        && value.as_bytes()[0].is_ascii_alphanumeric()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        && !value.contains("..")
+        && !value.ends_with('.')
+        && !value.ends_with(".lock");
+    if valid {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidWorkflowId)
+    }
 }
 
 fn workflow_id_from_file_name(name: &str) -> Option<WorkflowId> {
@@ -428,23 +466,68 @@ fn workflow_id_from_file_name(name: &str) -> Option<WorkflowId> {
     Some(id)
 }
 
-fn is_temporary_name(name: &str) -> bool { name.starts_with(".workflow-") && name.ends_with(".tmp") }
-fn diagnostic(record_id: Option<WorkflowId>, kind: StoreDiagnosticKind, message: impl Into<String>) -> StoreDiagnostic { StoreDiagnostic { record_id, kind, message: message.into() } }
-fn selection_diagnostic(kind: StoreDiagnosticKind, message: impl Into<String>) -> SelectionLoad { SelectionLoad { selected: None, diagnostics: vec![diagnostic(None, kind, message)] } }
-fn io_error(operation: &'static str, source: std::io::Error) -> StoreError { StoreError::Io { operation, source } }
-
+fn is_temporary_name(name: &str) -> bool {
+    name.starts_with(".workflow-") && name.ends_with(".tmp")
+}
+fn diagnostic(
+    record_id: Option<WorkflowId>,
+    kind: StoreDiagnosticKind,
+    message: impl Into<String>,
+) -> StoreDiagnostic {
+    StoreDiagnostic {
+        record_id,
+        kind,
+        message: message.into(),
+    }
+}
+fn selection_diagnostic(kind: StoreDiagnosticKind, message: impl Into<String>) -> SelectionLoad {
+    SelectionLoad {
+        selected: None,
+        diagnostics: vec![diagnostic(None, kind, message)],
+    }
+}
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use pi_sandbox::AbsolutePath;
+
     use super::*;
+    use crate::fs::{CapabilityFs, RootCreation};
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
-    struct TestRecord { workflow_id: WorkflowId, payload: String, terminal: bool }
-    impl StoreRecord for TestRecord { fn workflow_id(&self) -> &WorkflowId { &self.workflow_id } }
-    fn record(id: &str, payload: impl Into<String>) -> TestRecord { TestRecord { workflow_id: WorkflowId::new(id), payload: payload.into(), terminal: false } }
+    struct TestRecord {
+        workflow_id: WorkflowId,
+        payload: String,
+        terminal: bool,
+    }
+    impl StoreRecord for TestRecord {
+        fn workflow_id(&self) -> &WorkflowId {
+            &self.workflow_id
+        }
+    }
+    fn record(id: &str, payload: impl Into<String>) -> TestRecord {
+        TestRecord {
+            workflow_id: WorkflowId::new(id),
+            payload: payload.into(),
+            terminal: false,
+        }
+    }
+    fn store_lease(fs: &Arc<CapabilityFs>, path: &Path) -> CapabilityRootLease {
+        fs.open_root(
+            CapabilityRootPurpose::WorkflowStore,
+            AbsolutePath::parse(path.to_path_buf()).expect("absolute workflow store"),
+            CapabilityAccess::PrivateReadWrite,
+            RootCreation::CreateDirectory,
+        )
+        .expect("workflow store lease")
+    }
     fn open_store() -> (tempfile::TempDir, WorkflowStore) {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let store = WorkflowStore::open(directory.path().join("workflow-state")).expect("open workflow store");
+        let fs = CapabilityFs::new().expect("capability fs");
+        let store = WorkflowStore::open(store_lease(&fs, &directory.path().join("workflow-state")))
+            .expect("open workflow store");
         (directory, store)
     }
 
@@ -455,92 +538,233 @@ mod tests {
         store.write(&expected).expect("write record");
         expected.payload = "replacement".to_owned();
         store.write(&expected).expect("replace record");
-        store.write_selection(Some(&expected.workflow_id)).expect("write selection");
+        store
+            .write_selection(Some(&expected.workflow_id))
+            .expect("write selection");
         let loaded = store.load_all::<TestRecord>().expect("load records");
         assert_eq!(loaded.records, vec![expected.clone()]);
         assert!(loaded.diagnostics.is_empty());
-        assert_eq!(store.load_selection().expect("load selection").selected, Some(expected.workflow_id));
-        assert_eq!(fs::read_dir(&store.records).expect("read records").count(), 1);
-        #[cfg(unix)] {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(fs::metadata(store.records.join("workflow-a.json")).expect("record metadata").permissions().mode() & 0o777, 0o600);
-        }
+        assert_eq!(
+            store.load_selection().expect("load selection").selected,
+            Some(expected.workflow_id)
+        );
+        let mut entries = store.records.read_dir(Path::new("")).expect("read records");
+        assert!(entries.next().expect("first entry").is_some());
+        assert!(entries.next().expect("end entries").is_none());
     }
 
     #[test]
     fn records_load_in_stable_filename_order() {
         let (_directory, store) = open_store();
-        for id in ["workflow-c", "workflow-a", "workflow-b"] { store.write(&record(id, id)).expect("write record"); }
+        for id in ["workflow-c", "workflow-a", "workflow-b"] {
+            store.write(&record(id, id)).expect("write record");
+        }
         let loaded = store.load_all::<TestRecord>().expect("load records");
-        assert_eq!(loaded.records.iter().map(|record| record.workflow_id.as_str()).collect::<Vec<_>>(), vec!["workflow-a", "workflow-b", "workflow-c"]);
+        assert_eq!(
+            loaded
+                .records
+                .iter()
+                .map(|record| record.workflow_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["workflow-a", "workflow-b", "workflow-c"]
+        );
     }
 
     #[test]
     fn corrupt_sibling_is_reported_without_hiding_valid_records() {
         let (_directory, store) = open_store();
-        store.write(&record("workflow-valid", "kept")).expect("write valid record");
-        fs::write(store.records.join("workflow-corrupt.json"), b"not json").expect("write corrupt sibling");
+        store
+            .write(&record("workflow-valid", "kept"))
+            .expect("write valid record");
+        store
+            .records
+            .replace_file(Replacement {
+                relative: PathBuf::from("workflow-corrupt.json"),
+                expected: None,
+                bytes: b"not json".to_vec(),
+                mode: FileMode::Private,
+            })
+            .expect("write corrupt sibling");
         let loaded = store.load_all::<TestRecord>().expect("load records");
         assert_eq!(loaded.records, vec![record("workflow-valid", "kept")]);
         assert_eq!(loaded.diagnostics.len(), 1);
-        assert_eq!(loaded.diagnostics[0].kind, StoreDiagnosticKind::CorruptRecord);
+        assert_eq!(
+            loaded.diagnostics[0].kind,
+            StoreDiagnosticKind::CorruptRecord
+        );
+    }
+
+    #[test]
+    fn previous_record_and_selection_versions_are_rejected() {
+        let (_directory, store) = open_store();
+        let expected = record("workflow-old", "retired schema");
+        let record_bytes = serde_json::to_vec_pretty(&RecordEnvelope {
+            version: STORE_VERSION - 1,
+            record: expected.clone(),
+        })
+        .expect("serialize previous record");
+        store
+            .records
+            .replace_file(Replacement {
+                relative: PathBuf::from("workflow-old.json"),
+                expected: None,
+                bytes: record_bytes,
+                mode: FileMode::Private,
+            })
+            .expect("write previous record");
+        let loaded = store.load_all::<TestRecord>().expect("load records");
+        assert!(loaded.records.is_empty());
+        assert_eq!(
+            loaded.diagnostics[0].kind,
+            StoreDiagnosticKind::UnsupportedRecordVersion
+        );
+
+        let selection_bytes = serde_json::to_vec_pretty(&SelectionEnvelope {
+            version: STORE_VERSION - 1,
+            selected_workflow_id: Some(expected.workflow_id),
+        })
+        .expect("serialize previous selection");
+        store
+            .root
+            .replace_file(Replacement {
+                relative: PathBuf::from(SELECTION_FILE),
+                expected: None,
+                bytes: selection_bytes,
+                mode: FileMode::Private,
+            })
+            .expect("write previous selection");
+        let selection = store.load_selection().expect("load selection");
+        assert_eq!(selection.selected, None);
+        assert_eq!(
+            selection.diagnostics[0].kind,
+            StoreDiagnosticKind::UnsupportedSelectionVersion
+        );
     }
 
     #[test]
     fn corrupt_selection_is_ignored_with_a_diagnostic() {
         let (_directory, store) = open_store();
-        fs::write(store.root.join(SELECTION_FILE), b"{").expect("write corrupt selection");
+        store
+            .root
+            .replace_file(Replacement {
+                relative: PathBuf::from(SELECTION_FILE),
+                expected: None,
+                bytes: b"{".to_vec(),
+                mode: FileMode::Private,
+            })
+            .expect("write corrupt selection");
         let loaded = store.load_selection().expect("load selection");
         assert_eq!(loaded.selected, None);
-        assert_eq!(loaded.diagnostics[0].kind, StoreDiagnosticKind::CorruptSelection);
+        assert_eq!(
+            loaded.diagnostics[0].kind,
+            StoreDiagnosticKind::CorruptSelection
+        );
     }
 
     #[cfg(unix)]
     #[test]
-    fn symbolic_links_fail_closed_without_exposing_paths() {
+    fn identity_swap_after_lease_fails_closed_without_exposing_paths() {
         use std::os::unix::fs::symlink;
+
         let directory = tempfile::tempdir().expect("temporary directory");
-        let real = directory.path().join("real");
-        fs::create_dir(&real).expect("create real directory");
-        let linked = directory.path().join("linked");
-        symlink(&real, &linked).expect("create directory symlink");
-        let error = WorkflowStore::open(&linked).expect_err("reject symlink root");
-        assert!(!format!("{error:?}").contains(&directory.path().display().to_string()));
-        assert!(matches!(error, StoreError::Symlink));
-        let (_directory, store) = open_store();
-        symlink(store.records.join("missing"), store.records.join("workflow-link.json")).expect("create record symlink");
-        assert_eq!(store.load_all::<TestRecord>().expect("load records").diagnostics[0].kind, StoreDiagnosticKind::UnsafeRecord);
-        assert!(matches!(store.write(&record("workflow-link", "blocked")), Err(StoreError::Symlink)));
+        let path = directory.path().join("workflow-state");
+        let fs = CapabilityFs::new().expect("capability fs");
+        let lease = store_lease(&fs, &path);
+        std::fs::rename(&path, directory.path().join("displaced")).expect("displace root");
+        symlink(directory.path().join("displaced"), &path).expect("replace with symlink");
+        let store = WorkflowStore::open(lease).expect("retained lease remains valid");
+        store
+            .write(&record("workflow-safe", "retained"))
+            .expect("write through retained lease");
+        assert!(matches!(
+            fs.open_root(
+                CapabilityRootPurpose::WorkflowStore,
+                AbsolutePath::parse(path).expect("absolute replacement"),
+                CapabilityAccess::PrivateReadWrite,
+                RootCreation::Existing,
+            ),
+            Err(FsError::UnsupportedEntryType | FsError::System { .. })
+        ));
+    }
+
+    #[test]
+    fn wrong_purpose_lease_is_rejected() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let fs = CapabilityFs::new().expect("capability fs");
+        let lease = fs
+            .open_root(
+                CapabilityRootPurpose::SessionStore,
+                AbsolutePath::parse(directory.path().to_path_buf())
+                    .expect("absolute session store"),
+                CapabilityAccess::PrivateReadWrite,
+                RootCreation::Existing,
+            )
+            .expect("session lease");
+        assert!(matches!(
+            WorkflowStore::open(lease),
+            Err(StoreError::InvalidLease)
+        ));
     }
 
     #[test]
     fn record_and_aggregate_size_limits_are_enforced() {
         let (_directory, store) = open_store();
-        assert!(matches!(store.write(&record("workflow-large", "x".repeat(MAX_RECORD_BYTES as usize))), Err(StoreError::RecordTooLarge)));
+        assert!(matches!(
+            store.write(&record(
+                "workflow-large",
+                "x".repeat(MAX_RECORD_BYTES as usize)
+            )),
+            Err(StoreError::RecordTooLarge)
+        ));
         let payload = "x".repeat(MAX_RECORD_BYTES as usize - 256);
-        for index in 0..8 { store.write(&record(&format!("workflow-{index}"), payload.clone())).expect("fill capacity"); }
-        assert!(matches!(store.write(&record("workflow-8", payload)), Err(StoreError::AggregateTooLarge)));
+        for index in 0..8 {
+            store
+                .write(&record(&format!("workflow-{index}"), payload.clone()))
+                .expect("fill capacity");
+        }
+        assert!(matches!(
+            store.write(&record("workflow-8", payload)),
+            Err(StoreError::AggregateTooLarge)
+        ));
     }
 
     #[test]
     fn removal_is_idempotent_and_selection_is_separate() {
         let (_directory, store) = open_store();
-        let mut terminal = record("workflow-terminal", "done"); terminal.terminal = true;
+        let mut terminal = record("workflow-terminal", "done");
+        terminal.terminal = true;
         store.write(&terminal).expect("write terminal record");
-        store.write_selection(Some(&terminal.workflow_id)).expect("select record");
+        store
+            .write_selection(Some(&terminal.workflow_id))
+            .expect("select record");
         store.remove(&terminal.workflow_id).expect("remove record");
         store.remove(&terminal.workflow_id).expect("repeat removal");
-        assert!(store.load_all::<TestRecord>().expect("load records").records.is_empty());
-        assert_eq!(store.load_selection().expect("load selection").selected, Some(terminal.workflow_id.clone()));
+        assert!(
+            store
+                .load_all::<TestRecord>()
+                .expect("load records")
+                .records
+                .is_empty()
+        );
+        assert_eq!(
+            store.load_selection().expect("load selection").selected,
+            Some(terminal.workflow_id.clone())
+        );
         store.write_selection(None).expect("clear selection");
-        assert_eq!(store.load_selection().expect("load selection").selected, None);
+        assert_eq!(
+            store.load_selection().expect("load selection").selected,
+            None
+        );
     }
 
     #[test]
     fn invalid_ids_cannot_escape_the_records_directory() {
         let (_directory, store) = open_store();
         for id in ["", "../escape", "a/b", ".hidden", "record.lock"] {
-            assert!(matches!(store.write(&record(id, "blocked")), Err(StoreError::InvalidWorkflowId)));
+            assert!(matches!(
+                store.write(&record(id, "blocked")),
+                Err(StoreError::InvalidWorkflowId)
+            ));
         }
     }
 }

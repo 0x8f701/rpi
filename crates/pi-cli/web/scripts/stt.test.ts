@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // Focused STT (hold-to-talk) pure regression for src/stt.ts — the bounded
-// WAV encode + 48k→16k resample and the decoded-size guard shared by
-// App.tsx's transcribeAudio flow. Run through `npm run build`, which bundles
-// this file with esbuild into a disposable Node module before executing the
-// assertions.
+// WAV encode + 48k→16k resample, the decoded-size guard, and the captured-
+// session owner check shared by App.tsx's transcribeAudio flow. Run through
+// `npm run build`, which bundles this file with esbuild into a disposable
+// Node module before executing the assertions.
 //
 // Exit codes: 0 = every assertion held; 1 = a regression.
 import {
@@ -14,7 +14,26 @@ import {
   encodeWavPcm16,
   resampleToSttRate,
   wavToBase64,
+  sttTranscribeCommand,
+  shouldCommitSttTranscript,
+  canStartSttRecording,
+  planSttCommit,
+  planSttStart,
+  planSttTranscribeResult,
+  selectSttRecorderMime,
+  sttTranscriptText,
+  STT_EMPTY_TRANSCRIPT_MESSAGE,
+  STT_HTTPS_MESSAGE,
+  STT_NO_SESSION_MESSAGE,
+  STT_UNCONFIGURED_MESSAGE,
+  STT_WAV_CONVERT_MESSAGE,
+  sttWavCapMessage,
 } from '../src/stt.ts';
+import {
+  captureSttRecordingDestination,
+  planSttTranscriptRoute,
+} from '../src/useSttRecorder.ts';
+import { compactSendAdmission } from '../src/compactProgress.ts';
 const failures = [];
 let ran = 0;
 function check(name, cond, detail) {
@@ -112,6 +131,162 @@ function check(name, cond, detail) {
   const thirtyOneSec48k = resampleToSttRate(new Float32Array(48000 * 31), 48000);
   const wav31 = encodeWavPcm16(thirtyOneSec48k, STT_SAMPLE_RATE);
   check('31 s WAV exceeds the cap -> null', wavToBase64(wav31) === null);
+}
+
+// ---- captured owner: A start -> switch B -> late STT result ----
+{
+  // Transcription begins on A; the owner is captured then. A later switch
+  // to B must not retarget the RPC or write the late transcript into B's
+  // composer. Prior code read sessionIdRef.current at result time, so the
+  // RPC and composer write both landed on B.
+  const owner = 'A';
+  let current = 'A';
+  current = 'B';
+  const cmd = sttTranscribeCommand(owner, 'ZGF0YQ==', STT_WAV_MIME);
+  check('late STT RPC type is stt_transcribe', cmd.type === 'stt_transcribe');
+  check('A start -> switch B: late STT RPC stays on A', cmd.sessionId === 'A');
+  check('A start -> switch B: late STT RPC is not B', cmd.sessionId !== current);
+  check('A start -> switch B: late STT does not write B composer', shouldCommitSttTranscript(owner, current) === false);
+  check('same-session STT still commits', shouldCommitSttTranscript(owner, 'A') === true);
+  check('empty owner never commits', shouldCommitSttTranscript('', 'A') === false);
+  check('null owner never commits', shouldCommitSttTranscript(null, 'A') === false);
+  check('null current never commits', shouldCommitSttTranscript('A', null) === false);
+  check('bound owner may start STT capture', canStartSttRecording('A') === true);
+  check('null owner rejects STT before getUserMedia', canStartSttRecording(null) === false);
+  check('empty owner rejects STT before routing fallback', canStartSttRecording('') === false);
+  check('fixed late STT command mime is the WAV allowlist', cmd.mimeType === STT_WAV_MIME);
+
+}
+
+// ---- post-transcription dispatch: owner state decides steer vs prompt ----
+// App.tsx reads the captured owner's live streaming mirror at result time through this seam.
+{
+  check('idle->running between press and result => steer', planSttCommit('A', 'A', true) === 'steer');
+  check('running->idle between press and result => prompt', planSttCommit('A', 'A', false) === 'prompt');
+  check('switched-away owner (running) never dispatches', planSttCommit('A', 'B', true) === null);
+  check('switched-away owner (idle) never dispatches', planSttCommit('A', 'B', false) === null);
+  check('empty owner never dispatches', planSttCommit('', 'A', true) === null);
+  check('null owner never dispatches', planSttCommit(null, 'A', false) === null);
+}
+
+// ---- compact-mode dispatch: gated prompt keeps the transcript draft ----
+// transcribeAudio appends the transcript BEFORE dispatching; submit consults
+// the compact send gate first (prompt only) and rejects without clearing.
+{
+  const sendWithGate = (value: string, kind: 'steer' | 'prompt', compacting: boolean): { value: string; sent: boolean } => {
+    if (kind === 'prompt' && compactSendAdmission(compacting).ok === false) return { value, sent: false };
+    return { value: '', sent: true };
+  };
+  const planIdle = planSttCommit('A', 'A', false);
+  const draft = 'transcript text';
+  const idleOutcome = sendWithGate(draft, planIdle, true);
+  check('idle owner plans the gated prompt kind', planIdle === 'prompt');
+  check('compact rejection keeps the transcript in the composer', idleOutcome.sent === false && idleOutcome.value === draft);
+  const idleNotCompacting = sendWithGate(draft, planIdle, false);
+  check('non-compacting prompt dispatch sends and clears the draft', idleNotCompacting.sent === true && idleNotCompacting.value === '');
+}
+
+{
+  check('unconfigured live blocks before getUserMedia', planSttStart({ owner: 'A', live: { sttConfigured: false }, hasGetUserMedia: true }).ok === false && (planSttStart({ owner: 'A', live: { sttConfigured: false }, hasGetUserMedia: true }) as { message: string }).message === STT_UNCONFIGURED_MESSAGE);
+  check('missing sttConfigured on a live block blocks', planSttStart({ owner: 'A', live: {}, hasGetUserMedia: true }).ok === false);
+  check('absent live block with no getUserMedia is the HTTPS error', planSttStart({ owner: 'A', live: null, hasGetUserMedia: false }).ok === false && (planSttStart({ owner: 'A', live: null, hasGetUserMedia: false }) as { message: string }).message === STT_HTTPS_MESSAGE);
+  check('null owner is rejected before capture', planSttStart({ owner: null, live: null, hasGetUserMedia: true }).ok === false && (planSttStart({ owner: null, live: null, hasGetUserMedia: true }) as { message: string }).message === STT_NO_SESSION_MESSAGE);
+  const allowed = planSttStart({ owner: 'A', live: { sttConfigured: true }, hasGetUserMedia: true });
+  check('configured live with owner starts', allowed.ok === true && allowed.ok && allowed.owner === 'A');
+  check('absent live block still allows a bound owner', planSttStart({ owner: 'A', live: null, hasGetUserMedia: true }).ok === true);
+  check('MIME picker takes the first supported candidate', selectSttRecorderMime((mime) => mime === 'audio/webm') === 'audio/webm');
+  check('MIME picker yields undefined when nothing is supported', selectSttRecorderMime(() => false) === undefined);
+  check('MIME picker yields undefined without an isTypeSupported hook', selectSttRecorderMime(undefined) === undefined);
+}
+
+{
+  const convertCurrent = planSttTranscribeResult({ owner: 'A', current: 'A', wavOk: false, audioBase64: null, text: '' });
+  check('WAV convert failure on the current owner errors', convertCurrent.kind === 'error' && convertCurrent.kind === 'error' && convertCurrent.message === STT_WAV_CONVERT_MESSAGE);
+  check('WAV convert failure after A→B is dropped', planSttTranscribeResult({ owner: 'A', current: 'B', wavOk: false, audioBase64: null, text: '' }).kind === 'drop');
+  const capCurrent = planSttTranscribeResult({ owner: 'A', current: 'A', wavOk: true, audioBase64: null, text: 'x' });
+  check('over-cap WAV on the current owner errors', capCurrent.kind === 'error' && capCurrent.kind === 'error' && capCurrent.message === sttWavCapMessage());
+  check('over-cap WAV after A→B is dropped', planSttTranscribeResult({ owner: 'A', current: 'B', wavOk: true, audioBase64: null, text: 'x' }).kind === 'drop');
+  check('empty transcript on the current owner errors', planSttTranscribeResult({ owner: 'A', current: 'A', wavOk: true, audioBase64: 'Zg==', text: '' }).kind === 'error' && (planSttTranscribeResult({ owner: 'A', current: 'A', wavOk: true, audioBase64: 'Zg==', text: '' }) as { message: string }).message === STT_EMPTY_TRANSCRIPT_MESSAGE);
+  check('empty transcript after A→B is dropped', planSttTranscribeResult({ owner: 'A', current: 'B', wavOk: true, audioBase64: 'Zg==', text: '' }).kind === 'drop');
+  const committed = planSttTranscribeResult({ owner: 'A', current: 'A', wavOk: true, audioBase64: 'Zg==', text: 'hello' });
+  check('current-owner transcript is delivered', committed.kind === 'transcript' && committed.kind === 'transcript' && committed.text === 'hello');
+  check('switched-away transcript is dropped', planSttTranscribeResult({ owner: 'A', current: 'B', wavOk: true, audioBase64: 'Zg==', text: 'hello' }).kind === 'drop');
+  check('RPC object with text is parsed', sttTranscriptText({ text: 'hello' }) === 'hello');
+  check('RPC object without text is empty', sttTranscriptText({ ok: true }) === '');
+  check('non-object RPC payload is empty', sttTranscriptText(null) === '' && sttTranscriptText('hello') === '');
+}
+
+{
+  const mainDest = captureSttRecordingDestination('A', 'MainComposer');
+  const sideDest = captureSttRecordingDestination('A', { kind: 'SideChatTab', tabId: 'alpha' });
+  check('main destination captures session + MainComposer', mainDest !== null && mainDest.kind === 'MainComposer' && mainDest.kind === 'MainComposer' && mainDest.sessionId === 'A');
+  check('side destination captures session + tab id', sideDest !== null && sideDest.kind === 'SideChatTab' && sideDest.kind === 'SideChatTab' && sideDest.tabId === 'alpha');
+  check('empty session never captures a destination', captureSttRecordingDestination('', 'MainComposer') === null);
+  check('empty side-chat tab never captures a destination', captureSttRecordingDestination('A', { kind: 'SideChatTab', tabId: '' }) === null);
+
+  const mainWhileSideOpen = planSttTranscriptRoute({
+    destination: mainDest,
+    owner: 'A',
+    currentSessionId: 'A',
+    sideChatPanelOpen: true,
+    sideChatTabs: ['alpha'],
+    text: 'hello',
+    streaming: false,
+  });
+  check(
+    'main-footer recording while Side chat is open stays on main',
+    mainWhileSideOpen.kind === 'mainSubmit' && mainWhileSideOpen.kind === 'mainSubmit' && mainWhileSideOpen.plan === 'prompt',
+  );
+  check(
+    'main-footer recording while Side chat is open does not insert into Side chat',
+    mainWhileSideOpen.kind !== 'sideChatInsert',
+  );
+
+  const sideThenPanelClosed = planSttTranscriptRoute({
+    destination: sideDest,
+    owner: 'A',
+    currentSessionId: 'A',
+    sideChatPanelOpen: false,
+    sideChatTabs: ['alpha'],
+    text: 'hello',
+    streaming: false,
+  });
+  check(
+    'side-chat recording then panel close never submits on main',
+    sideThenPanelClosed.kind === 'discardClosed',
+  );
+  check(
+    'side-chat recording then panel close is not a main submit',
+    sideThenPanelClosed.kind !== 'mainSubmit',
+  );
+
+  const sideThenTabSwitch = planSttTranscriptRoute({
+    destination: sideDest,
+    owner: 'A',
+    currentSessionId: 'A',
+    sideChatPanelOpen: true,
+    sideChatTabs: ['alpha', 'beta'],
+    text: 'hello',
+    streaming: false,
+  });
+  check(
+    'side-tab switch during transcription stays on the starting tab',
+    sideThenTabSwitch.kind === 'sideChatInsert' && sideThenTabSwitch.kind === 'sideChatInsert' && sideThenTabSwitch.tabId === 'alpha',
+  );
+
+  const sideThenTabClosed = planSttTranscriptRoute({
+    destination: sideDest,
+    owner: 'A',
+    currentSessionId: 'A',
+    sideChatPanelOpen: true,
+    sideChatTabs: ['beta'],
+    text: 'hello',
+    streaming: false,
+  });
+  check(
+    'closed side-chat tab discards without main submit',
+    sideThenTabClosed.kind === 'discardClosed',
+  );
 }
 
 if (failures.length > 0) {

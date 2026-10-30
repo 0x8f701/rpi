@@ -13,11 +13,7 @@ use super::{
     ProcessTerminalSize,
 };
 
-pub fn process_tool(
-    cwd: &Path,
-    manager: ProcessManager,
-    owner_id: ProcessOwnerId,
-) -> AgentTool {
+pub fn process_tool(cwd: &Path, manager: ProcessManager, owner_id: ProcessOwnerId) -> AgentTool {
     let cwd = cwd.to_path_buf();
     AgentTool::new(
         "process",
@@ -121,7 +117,9 @@ async fn execute_process_tool(
         "send" => {
             let id = process_id(&args)?;
             if let Some(text) = args.get("text").and_then(Value::as_str) {
-                manager.write(owner_id, &id, text.as_bytes().to_vec(), false).await?;
+                manager
+                    .write(owner_id, &id, text.as_bytes().to_vec(), false)
+                    .await?;
             }
             if let Some(encoded) = args.get("dataBase64").and_then(Value::as_str) {
                 let bytes = base64::engine::general_purpose::STANDARD
@@ -130,10 +128,7 @@ async fn execute_process_tool(
                 manager.write(owner_id, &id, bytes, false).await?;
             }
             if let Some(keys) = args.get("keys").and_then(Value::as_array) {
-                let keys = keys
-                    .iter()
-                    .map(parse_key)
-                    .collect::<Result<Vec<_>>>()?;
+                let keys = keys.iter().map(parse_key).collect::<Result<Vec<_>>>()?;
                 manager.send_keys(owner_id, &id, &keys).await?;
             }
             if let Some(signal) = args.get("signal") {
@@ -149,8 +144,8 @@ async fn execute_process_tool(
             json!({ "ok": true })
         }
         "resize" => {
-            let size = parse_size(args.get("size"))?
-                .ok_or_else(|| anyhow!("resize requires size"))?;
+            let size =
+                parse_size(args.get("size"))?.ok_or_else(|| anyhow!("resize requires size"))?;
             manager.resize(owner_id, &process_id(&args)?, size)?;
             json!({ "ok": true })
         }
@@ -190,7 +185,9 @@ async fn execute_process_tool(
     };
 
     Ok(AgentToolResult {
-        content: vec![pi_ai::ContentBlock::text(serde_json::to_string_pretty(&details)?)],
+        content: vec![pi_ai::ContentBlock::text(serde_json::to_string_pretty(
+            &details,
+        )?)],
         details,
         ..Default::default()
     })
@@ -269,30 +266,99 @@ fn process_schema() -> Schema {
         ..Schema::default()
     };
 
-    let mut op = string("Operation: start, ps, describe, logs, send, resize, signal, stop, or wait");
-    op.enum_values = ["start", "ps", "describe", "logs", "send", "resize", "signal", "stop", "wait"]
-        .into_iter()
-        .map(|value| Value::String(value.to_owned()))
-        .collect();
+    let mut op =
+        string("Operation: start, ps, describe, logs, send, resize, signal, stop, or wait");
+    op.enum_values = [
+        "start", "ps", "describe", "logs", "send", "resize", "signal", "stop", "wait",
+    ]
+    .into_iter()
+    .map(|value| Value::String(value.to_owned()))
+    .collect();
     let fields = vec![
         ("op".to_owned(), op, true),
-        ("id".to_owned(), string("Opaque process id returned by start"), false),
-        ("argv".to_owned(), array(string("One argv entry"), "Application and arguments; no shell interpolation"), false),
-        ("cwd".to_owned(), string("Absolute working directory"), false),
-        ("env".to_owned(), object("Environment overrides; null unsets a variable"), false),
-        ("pty".to_owned(), boolean("Attach a PTY; defaults true"), false),
-        ("size".to_owned(), object("PTY size with rows and cols"), false),
-        ("label".to_owned(), string("Human-readable process label"), false),
-        ("timeoutMs".to_owned(), integer("Operation or process timeout in milliseconds"), false),
-        ("outputBytes".to_owned(), integer("Bounded retained output bytes"), false),
+        (
+            "id".to_owned(),
+            string("Opaque process id returned by start"),
+            false,
+        ),
+        (
+            "argv".to_owned(),
+            array(
+                string("One argv entry"),
+                "Application and arguments; no shell interpolation",
+            ),
+            false,
+        ),
+        (
+            "cwd".to_owned(),
+            string("Absolute working directory"),
+            false,
+        ),
+        (
+            "env".to_owned(),
+            object("Environment overrides; null unsets a variable"),
+            false,
+        ),
+        (
+            "pty".to_owned(),
+            boolean("Attach a PTY; defaults true"),
+            false,
+        ),
+        (
+            "size".to_owned(),
+            object("PTY size with rows and cols"),
+            false,
+        ),
+        (
+            "label".to_owned(),
+            string("Human-readable process label"),
+            false,
+        ),
+        (
+            "timeoutMs".to_owned(),
+            integer("Operation or process timeout in milliseconds"),
+            false,
+        ),
+        (
+            "outputBytes".to_owned(),
+            integer("Bounded retained output bytes"),
+            false,
+        ),
         ("cursor".to_owned(), integer("Monotonic byte cursor"), false),
-        ("maxBytes".to_owned(), integer("Maximum bytes returned by logs"), false),
-        ("follow".to_owned(), boolean("Wait for output after cursor"), false),
+        (
+            "maxBytes".to_owned(),
+            integer("Maximum bytes returned by logs"),
+            false,
+        ),
+        (
+            "follow".to_owned(),
+            boolean("Wait for output after cursor"),
+            false,
+        ),
         ("text".to_owned(), string("UTF-8 stdin text"), false),
-        ("dataBase64".to_owned(), string("Raw stdin bytes as base64"), false),
-        ("keys".to_owned(), array(string("ENTER, TAB, ESCAPE, CTRL_C, CTRL_D, UP, DOWN, LEFT, RIGHT"), "PTY keys"), false),
-        ("signal".to_owned(), string("SIGINT, SIGTERM, SIGHUP, SIGQUIT, or SIGKILL"), false),
-        ("closeStdin".to_owned(), boolean("Close stdin after prior writes"), false),
+        (
+            "dataBase64".to_owned(),
+            string("Raw stdin bytes as base64"),
+            false,
+        ),
+        (
+            "keys".to_owned(),
+            array(
+                string("ENTER, TAB, ESCAPE, CTRL_C, CTRL_D, UP, DOWN, LEFT, RIGHT"),
+                "PTY keys",
+            ),
+            false,
+        ),
+        (
+            "signal".to_owned(),
+            string("SIGINT, SIGTERM, SIGHUP, SIGQUIT, or SIGKILL"),
+            false,
+        ),
+        (
+            "closeStdin".to_owned(),
+            boolean("Close stdin after prior writes"),
+            false,
+        ),
     ];
     let mut schema = Schema::object_ordered(fields);
     schema.additional_properties = Some(Value::Bool(false));

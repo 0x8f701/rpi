@@ -3,15 +3,18 @@
 //! Inference deliberately reuses the existing `openai-completions` provider:
 //! this module only discovers router models and drives router management APIs.
 
-use std::{collections::BTreeMap, path::PathBuf, sync::OnceLock, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, sync::OnceLock};
 
 use anyhow::{Context, Result, anyhow, bail};
 use regex::Regex;
-use reqwest::{Client, RequestBuilder, Url};
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{API_OPENAI_COMPLETIONS, Model, ModelCost};
+use crate::{
+    API_OPENAI_COMPLETIONS, HttpMethod, Model, ModelCost, SharedHttpExecutor, StreamOptions,
+    collect_response_body, request_from_url,
+};
 
 pub const LLAMA_PROVIDER_ID: &str = "llama.cpp";
 pub const DEFAULT_LLAMA_SERVER_URL: &str = "http://127.0.0.1:8080";
@@ -167,20 +170,25 @@ struct LlamaLiveModel {
     meta: Option<LlamaModelMeta>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LlamaRouterClient {
     settings: LlamaRouterSettings,
-    client: Client,
+    executor: SharedHttpExecutor,
+}
+
+impl std::fmt::Debug for LlamaRouterClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LlamaRouterClient")
+            .field("settings", &self.settings)
+            .finish_non_exhaustive()
+    }
 }
 
 impl LlamaRouterClient {
-    pub fn new(settings: LlamaRouterSettings) -> Result<Self> {
+    pub fn new(settings: LlamaRouterSettings, executor: SharedHttpExecutor) -> Result<Self> {
         let settings = LlamaRouterSettings::validated(&settings.base_url, settings.api_key)?;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .context("building llama.cpp HTTP client")?;
-        Ok(Self { settings, client })
+        Ok(Self { settings, executor })
     }
 
     #[must_use]
@@ -192,24 +200,66 @@ impl LlamaRouterClient {
         format!("{}{}", self.settings.base_url, path)
     }
 
-    fn request(&self, builder: RequestBuilder) -> RequestBuilder {
-        match self.settings.api_key.as_deref() {
-            Some(key) if !key.trim().is_empty() => builder.bearer_auth(key),
-            _ => builder,
+    fn headers(&self, has_json_body: bool) -> Result<http::HeaderMap> {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::ACCEPT,
+            http::HeaderValue::from_static("application/json"),
+        );
+        if has_json_body {
+            headers.insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("application/json"),
+            );
         }
+        if let Some(key) = self.settings.api_key.as_deref() {
+            let mut value = http::HeaderValue::from_str(&format!("Bearer {key}"))
+                .context("invalid llama.cpp API key")?;
+            value.set_sensitive(true);
+            headers.insert(http::header::AUTHORIZATION, value);
+        }
+        Ok(headers)
     }
 
-    async fn response_json(&self, request: RequestBuilder, operation: &str) -> Result<Value> {
+    async fn execute(
+        &self,
+        method: HttpMethod,
+        url: &str,
+        body: Vec<u8>,
+        operation: &str,
+    ) -> Result<(http::StatusCode, Vec<u8>)> {
+        let options = StreamOptions {
+            timeout_ms: Some(15_000),
+            ..StreamOptions::default()
+        };
+        let request = request_from_url(
+            method,
+            url,
+            &self.headers(!body.is_empty())?,
+            body,
+            &options,
+            8 * 1024 * 1024,
+        )?;
         let response = self
-            .request(request)
-            .send()
+            .executor
+            .execute(request)
             .await
             .with_context(|| format!("{operation} at {}", self.settings.base_url))?;
         let status = response.status();
-        let bytes = response
-            .bytes()
+        let bytes = collect_response_body(response)
             .await
             .with_context(|| format!("reading llama.cpp response while {operation}"))?;
+        Ok((status, bytes))
+    }
+
+    async fn response_json(
+        &self,
+        method: HttpMethod,
+        url: &str,
+        body: Vec<u8>,
+        operation: &str,
+    ) -> Result<Value> {
+        let (status, bytes) = self.execute(method, url, body, operation).await?;
         let payload = serde_json::from_slice::<Value>(&bytes).ok();
         if !status.is_success() {
             let message = payload
@@ -226,17 +276,19 @@ impl LlamaRouterClient {
         }
         payload.ok_or_else(|| anyhow!("{operation}: llama.cpp returned invalid JSON"))
     }
-    async fn response_empty_ok(&self, request: RequestBuilder, operation: &str) -> Result<()> {
-        let response = self
-            .request(request)
-            .send()
-            .await
-            .with_context(|| format!("{operation} at {}", self.settings.base_url))?;
-        let status = response.status();
+
+    async fn response_empty_ok(
+        &self,
+        method: HttpMethod,
+        url: &str,
+        body: Vec<u8>,
+        operation: &str,
+    ) -> Result<()> {
+        let (status, bytes) = self.execute(method, url, body, operation).await?;
         if status.is_success() {
             return Ok(());
         }
-        let payload = response.json::<Value>().await.ok();
+        let payload = serde_json::from_slice::<Value>(&bytes).ok();
         let message = payload
             .as_ref()
             .and_then(|value| value.get("error"))
@@ -256,7 +308,12 @@ impl LlamaRouterClient {
     pub async fn discover_models(&self) -> Result<Vec<Model>> {
         let operation = "discovering live llama.cpp models";
         let payload = self
-            .response_json(self.client.get(self.endpoint("/v1/models")), operation)
+            .response_json(
+                HttpMethod::Get,
+                &self.endpoint("/v1/models"),
+                Vec::new(),
+                operation,
+            )
             .await?;
         let response: OpenAiModelsResponse = serde_json::from_value(payload)
             .with_context(|| format!("{operation}: response must contain a data array"))?;
@@ -282,7 +339,12 @@ impl LlamaRouterClient {
         };
         let operation = "listing llama.cpp router models";
         let payload = self
-            .response_json(self.client.get(self.endpoint(suffix)), operation)
+            .response_json(
+                HttpMethod::Get,
+                &self.endpoint(suffix),
+                Vec::new(),
+                operation,
+            )
             .await?;
         let response: LlamaRouterModelsResponse = serde_json::from_value(payload)
             .with_context(|| format!("{operation}: server is not running in router mode"))?;
@@ -295,25 +357,23 @@ impl LlamaRouterClient {
     pub async fn load(&self, model: &str) -> Result<()> {
         let operation = format!("loading llama.cpp model {model:?}");
         self.response_empty_ok(
-            self.client
-                .post(self.endpoint("/models/load"))
-                .json(&serde_json::json!({ "model": model })),
+            HttpMethod::Post,
+            &self.endpoint("/models/load"),
+            serde_json::to_vec(&serde_json::json!({ "model": model }))?,
             &operation,
         )
-        .await?;
-        Ok(())
+        .await
     }
 
     pub async fn unload(&self, model: &str) -> Result<()> {
         let operation = format!("unloading llama.cpp model {model:?}");
         self.response_empty_ok(
-            self.client
-                .post(self.endpoint("/models/unload"))
-                .json(&serde_json::json!({ "model": model })),
+            HttpMethod::Post,
+            &self.endpoint("/models/unload"),
+            serde_json::to_vec(&serde_json::json!({ "model": model }))?,
             &operation,
         )
-        .await?;
-        Ok(())
+        .await
     }
 }
 
@@ -419,7 +479,7 @@ pub struct HuggingFaceModelDetails {
 pub struct HuggingFaceClient {
     token: Option<String>,
     base_url: String,
-    client: Client,
+    executor: SharedHttpExecutor,
 }
 
 impl std::fmt::Debug for HuggingFaceClient {
@@ -428,48 +488,77 @@ impl std::fmt::Debug for HuggingFaceClient {
             .debug_struct("HuggingFaceClient")
             .field("base_url", &self.base_url)
             .field("token_configured", &self.token.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 impl HuggingFaceClient {
-    pub fn new(token: Option<String>, base_url: Option<&str>) -> Result<Self> {
+    pub fn new(
+        token: Option<String>,
+        base_url: Option<&str>,
+        executor: SharedHttpExecutor,
+    ) -> Result<Self> {
         let raw_base = base_url.unwrap_or(DEFAULT_HUGGING_FACE_URL).trim();
         let parsed = Url::parse(raw_base).context("invalid Hugging Face base URL")?;
         if !matches!(parsed.scheme(), "http" | "https") {
             bail!("Hugging Face base URL must use http or https");
         }
-        let client = Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .context("building Hugging Face HTTP client")?;
+        if !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.fragment().is_some()
+        {
+            bail!("Hugging Face base URL must not contain credentials or a fragment");
+        }
         Ok(Self {
             token: token.filter(|token| !token.trim().is_empty()),
             base_url: raw_base.trim_end_matches('/').to_owned(),
-            client,
+            executor,
         })
     }
 
-    fn request(&self, builder: RequestBuilder) -> RequestBuilder {
-        match self.token.as_deref() {
-            Some(token) => builder.bearer_auth(token),
-            None => builder,
+    fn headers(&self) -> Result<http::HeaderMap> {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::ACCEPT,
+            http::HeaderValue::from_static("application/json"),
+        );
+        if let Some(token) = self.token.as_deref() {
+            let mut value = http::HeaderValue::from_str(&format!("Bearer {token}"))
+                .context("invalid Hugging Face token")?;
+            value.set_sensitive(true);
+            headers.insert(http::header::AUTHORIZATION, value);
         }
+        Ok(headers)
     }
 
-    async fn get_json(&self, request: RequestBuilder, operation: &str) -> Result<Value> {
+    async fn get_json(&self, url: &str, operation: &str) -> Result<Value> {
+        let options = StreamOptions {
+            timeout_ms: Some(15_000),
+            ..StreamOptions::default()
+        };
+        let request = request_from_url(
+            HttpMethod::Get,
+            url,
+            &self.headers()?,
+            Vec::new(),
+            &options,
+            8 * 1024 * 1024,
+        )?;
         let response = self
-            .request(request)
-            .send()
+            .executor
+            .execute(request)
             .await
             .with_context(|| format!("{operation} from Hugging Face"))?;
         let status = response.status();
         let retry_after = response
             .headers()
-            .get(reqwest::header::RETRY_AFTER)
+            .get(http::header::RETRY_AFTER)
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned);
-        let payload = response.json::<Value>().await.ok();
+        let bytes = collect_response_body(response)
+            .await
+            .with_context(|| format!("reading {operation} response from Hugging Face"))?;
+        let payload = serde_json::from_slice::<Value>(&bytes).ok();
         if !status.is_success() {
             if status.as_u16() == 429 {
                 bail!(
@@ -492,20 +581,14 @@ impl HuggingFaceClient {
     }
 
     pub async fn search(&self, query: &str) -> Result<Vec<HuggingFaceModel>> {
-        let payload = self
-            .get_json(
-                self.client
-                    .get(format!("{}/api/models", self.base_url))
-                    .query(&[
-                        ("search", query),
-                        ("filter", "gguf"),
-                        ("sort", "downloads"),
-                        ("direction", "-1"),
-                        ("limit", "20"),
-                    ]),
-                "searching GGUF models",
-            )
-            .await?;
+        let mut url = Url::parse(&format!("{}/api/models", self.base_url))?;
+        url.query_pairs_mut()
+            .append_pair("search", query)
+            .append_pair("filter", "gguf")
+            .append_pair("sort", "downloads")
+            .append_pair("direction", "-1")
+            .append_pair("limit", "20");
+        let payload = self.get_json(url.as_str(), "searching GGUF models").await?;
         let values = payload.as_array().ok_or_else(|| {
             anyhow!("searching GGUF models: Hugging Face returned invalid results")
         })?;
@@ -527,8 +610,7 @@ impl HuggingFaceClient {
         let encoded = encode_repository(repository)?;
         let payload = self
             .get_json(
-                self.client
-                    .get(format!("{}/api/models/{encoded}?blobs=true", self.base_url)),
+                &format!("{}/api/models/{encoded}?blobs=true", self.base_url),
                 &format!("loading GGUF metadata for {repository:?}"),
             )
             .await?;
@@ -725,4 +807,128 @@ fn percent_encode_segment(segment: &str) -> String {
         }
     }
     encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    use futures_util::FutureExt;
+
+    use super::*;
+
+    struct RecordingExecutor {
+        requests: Mutex<Vec<crate::HttpRequestParts>>,
+        responses: Mutex<VecDeque<(http::StatusCode, http::HeaderMap, Vec<u8>)>>,
+    }
+
+    impl RecordingExecutor {
+        fn new(responses: Vec<(http::StatusCode, http::HeaderMap, Vec<u8>)>) -> Arc<Self> {
+            Arc::new(Self {
+                requests: Mutex::new(Vec::new()),
+                responses: Mutex::new(responses.into()),
+            })
+        }
+
+        fn take_request(&self) -> crate::HttpRequestParts {
+            self.requests.lock().expect("request lock").remove(0)
+        }
+    }
+
+    impl crate::HttpExecutor for RecordingExecutor {
+        fn execute<'a>(
+            &'a self,
+            request: crate::HttpRequest,
+        ) -> futures_util::future::BoxFuture<'a, Result<crate::HttpResponse>> {
+            async move {
+                self.requests
+                    .lock()
+                    .expect("request lock")
+                    .push(request.into_parts());
+                let (status, headers, body) = self
+                    .responses
+                    .lock()
+                    .expect("response lock")
+                    .pop_front()
+                    .expect("queued response");
+                Ok(crate::HttpResponse::new(
+                    status,
+                    headers,
+                    Box::pin(futures_util::stream::iter([Ok(body)])),
+                ))
+            }
+            .boxed()
+        }
+    }
+
+    #[tokio::test]
+    async fn router_load_uses_injected_bounded_executor_request() {
+        let executor = RecordingExecutor::new(vec![(
+            http::StatusCode::NO_CONTENT,
+            http::HeaderMap::new(),
+            Vec::new(),
+        )]);
+        let client = LlamaRouterClient::new(
+            LlamaRouterSettings::validated(
+                "https://router.example/v1",
+                Some("router-secret".to_owned()),
+            )
+            .expect("settings"),
+            executor.clone(),
+        )
+        .expect("client");
+
+        client.load("model-a").await.expect("load request");
+
+        let request = executor.take_request();
+        assert_eq!(request.method, HttpMethod::Post);
+        assert_eq!(request.path_and_query, "/models/load");
+        assert_eq!(request.timeout_ms, 15_000);
+        assert_eq!(request.max_response_bytes.get(), 8 * 1024 * 1024);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&request.body).expect("JSON body"),
+            serde_json::json!({"model": "model-a"})
+        );
+        let authorization = request
+            .headers
+            .iter()
+            .find(|(name, _)| name == http::header::AUTHORIZATION)
+            .expect("authorization header");
+        assert!(authorization.1.is_sensitive());
+        assert_eq!(
+            authorization.1.to_str().expect("authorization"),
+            "Bearer router-secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn hugging_face_search_encodes_query_through_injected_executor() {
+        let executor = RecordingExecutor::new(vec![(
+            http::StatusCode::OK,
+            http::HeaderMap::new(),
+            br#"[{"id":"owner/model","downloads":7}]"#.to_vec(),
+        )]);
+        let client =
+            HuggingFaceClient::new(None, Some("https://huggingface.example"), executor.clone())
+                .expect("client");
+
+        let models = client.search("a model").await.expect("search");
+
+        assert_eq!(
+            models,
+            vec![HuggingFaceModel {
+                id: "owner/model".to_owned(),
+                downloads: 7
+            }]
+        );
+        let request = executor.take_request();
+        assert_eq!(request.method, HttpMethod::Get);
+        assert_eq!(
+            request.path_and_query,
+            "/api/models?search=a+model&filter=gguf&sort=downloads&direction=-1&limit=20"
+        );
+        assert_eq!(request.timeout_ms, 15_000);
+        assert_eq!(request.max_response_bytes.get(), 8 * 1024 * 1024);
+    }
 }

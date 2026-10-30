@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nix::pty::{openpty, Winsize};
+use nix::pty::{Winsize, openpty};
 use nix::sys::termios::Termios;
 use tempfile::TempDir;
 
@@ -73,8 +73,8 @@ impl OverlayProbe {
             .env("HOME", home.path())
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("TERM", "xterm-256color")
-            .env("PI_OFFLINE", "1")
-            .env("PI_SKIP_VERSION_CHECK", "1")
+            .env("RPI_OFFLINE", "1")
+            .env("RPI_SKIP_VERSION_CHECK", "1")
             .args([
                 "--model",
                 "faux/faux-1",
@@ -154,11 +154,7 @@ fn start_overlay_probe() -> (OverlayProbe, TempDir) {
         OVERLAY_EXTENSION_MANIFEST,
     )
     .expect("manifest");
-    std::fs::write(
-        extension.path().join("index.mjs"),
-        OVERLAY_EXTENSION_ENTRY,
-    )
-    .expect("entry");
+    std::fs::write(extension.path().join("index.mjs"), OVERLAY_EXTENSION_ENTRY).expect("entry");
     let mut probe = OverlayProbe::spawn(extension.path());
     assert!(
         probe.wait_for("pi (rs)", Duration::from_secs(30))

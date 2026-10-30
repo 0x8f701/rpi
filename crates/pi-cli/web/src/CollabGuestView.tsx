@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useScrollPin } from './scrollPin';
 import { createAutoResizeController, type AutoResizeController } from './autoResize';
+import { composerBeforeInputShouldSubmit, composerEnterShouldPreventDefault, composerEnterShouldSubmit, nativeEventShiftKey, nextPasteEnterGuard } from './composerPaste';
 import { safeText } from './redact';
 import {
   type Item,
@@ -24,9 +25,11 @@ import {
   boundOutput,
   customToItem,
   applyToolSnapshot,
+  toolCardCompletionStatus,
   applyToolResultToItems,
   toolMedia,
   finalizeStreamingAssistant,
+  transcriptPathContext,
   BASH_OUTPUT_LINE_LIMIT,
   TOOL_OUTPUT_LINE_LIMIT,
   userMessageProjection,
@@ -80,6 +83,9 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink | null }) {
   // the resize-observed content wrapper.
   const { transcriptRef, transcriptContentRef, onTranscriptScroll, pinIfPinned } = useScrollPin();
   const promptInputRef = useRef<HTMLTextAreaElement>(null);
+  const pasteEnterGuardUntilRef = useRef(0);
+  const composerComposingRef = useRef(false);
+  const composerEnterHandledRef = useRef(false);
   // Composer auto-resize controller (see ./autoResize): per-keystroke work is
   // coalesced to one layout pass per animation frame. Declared here so the
   // unmount cleanup below can cancel pending work.
@@ -143,12 +149,13 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink | null }) {
       exitCode?: number | null;
       cancelled?: boolean;
     };
-    const status: 'done' | 'error' | undefined = message.cancelled === true
-      || (typeof message.exitCode === 'number' && message.exitCode !== 0)
-      ? 'error'
-      : typeof message.exitCode === 'number'
-        ? 'done'
-        : undefined;
+    const status: 'done' | 'cancelled' | 'error' | undefined = message.cancelled === true
+      ? 'cancelled'
+      : typeof message.exitCode === 'number' && message.exitCode !== 0
+        ? 'error'
+        : typeof message.exitCode === 'number'
+          ? 'done'
+          : undefined;
     pushItem({
       kind: 'bash',
       id: nextId('b'),
@@ -163,6 +170,10 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink | null }) {
       content?: unknown;
       toolCallId?: string;
       details?: unknown;
+      command?: string;
+      output?: string;
+      exitCode?: number | null;
+      cancelled?: boolean;
     };
 
     switch (message.role) {
@@ -204,18 +215,19 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink | null }) {
         return;
       }
       case 'bashExecution': {
-        const m = message as { command?: string; output?: string; exitCode?: number | null; cancelled?: boolean };
-        const bashStatus: 'done' | 'error' | undefined =
-          m.cancelled === true || (typeof m.exitCode === 'number' && m.exitCode !== 0)
-            ? 'error'
-            : typeof m.exitCode === 'number'
-              ? 'done'
-              : undefined;
+        const bashStatus: 'done' | 'cancelled' | 'error' | undefined =
+          message.cancelled === true
+            ? 'cancelled'
+            : typeof message.exitCode === 'number' && message.exitCode !== 0
+              ? 'error'
+              : typeof message.exitCode === 'number'
+                ? 'done'
+                : undefined;
         pushItem({
           kind: 'bash',
           id: nextId('b'),
-          command: m.command || '',
-          output: boundOutput(m.output || '', BASH_OUTPUT_LINE_LIMIT).text,
+          command: message.command || '',
+          output: boundOutput(message.output || '', BASH_OUTPUT_LINE_LIMIT).text,
           ...(bashStatus ? { status: bashStatus } : {}),
         });
         return;
@@ -327,7 +339,14 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink | null }) {
     const text = contentText(content);
     const media = toolMedia(content, details);
     const isError = !!frame.isError;
-    updateItems((prev) => applyToolSnapshot(prev, toolCallId, text, isError ? 'error' : 'done', details, media));
+    updateItems((prev) => applyToolSnapshot(
+      prev,
+      toolCallId,
+      text,
+      toolCardCompletionStatus(isError, content, details),
+      details,
+      media,
+    ));
   }, [updateItems]);
 
   /** Projected extension UI requests. Interactive asks (confirm/
@@ -567,6 +586,7 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink | null }) {
   }
 
   const isControl = link.role === 'control';
+  const pathContext = transcriptPathContext(items);
   const statusLabel =
     status === 'connected' ? 'connected' :
     status === 'connecting' ? 'connecting…' :
@@ -584,9 +604,6 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink | null }) {
         </span>
         <span id="collab-role-badge" className="badge" data-role={link.role}>
           {isControl ? 'control' : 'view-only'}
-        </span>
-        <span id="stream-badge" className="badge" hidden={!streaming}>
-          streaming
         </span>
       </header>
 
@@ -621,7 +638,7 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink | null }) {
                     </div>
                   )}
                   {item.text !== '' && (
-                    <MarkdownBody className="msg--user__text" text={item.text} onLayoutChange={pinIfPinned} />
+                    <MarkdownBody className="msg--user__text" text={item.text} pathContext={pathContext} onLayoutChange={pinIfPinned} />
                   )}
                   {analysis && (
                     <details className="msg--user__analysis">
@@ -637,9 +654,9 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink | null }) {
             }
             case 'assistant':
               return item.status === 'streaming' ? (
-                <StreamingAssistant key={item.id} sid={sidRef.current ?? ''} id={item.id} />
+                <StreamingAssistant key={item.id} sid={sidRef.current ?? ''} id={item.id} pathContext={pathContext} />
               ) : (
-                <FinalAssistant key={item.id} blocks={item.blocks} onLayoutChange={pinIfPinned} />
+                <FinalAssistant key={item.id} blocks={item.blocks} errorMessage={item.errorMessage} onLayoutChange={pinIfPinned} pathContext={pathContext} />
               );
             case 'toolCard':
               return <ToolCard key={item.id} item={item} onLayoutChange={pinIfPinned} />;
@@ -657,7 +674,7 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink | null }) {
               return (
                 <div key={item.id} className="msg msg--custom" role="note">
                   <span className="msg--custom__label">{safeText(item.label)}</span>
-                  <MarkdownBody className="msg--custom__text" text={item.text} onLayoutChange={pinIfPinned} />
+                  <MarkdownBody className="msg--custom__text" text={item.text} pathContext={pathContext} onLayoutChange={pinIfPinned} />
                 </div>
               );
             case 'irc':
@@ -668,7 +685,7 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink | null }) {
               return (
                 <div key={item.id} className="msg msg--summary" role="note">
                   <span className="msg--summary__label">{safeText(item.label)}</span>
-                  <MarkdownBody className="msg--summary__text" text={item.text} onLayoutChange={pinIfPinned} />
+                  <MarkdownBody className="msg--summary__text" text={item.text} pathContext={pathContext} onLayoutChange={pinIfPinned} />
                 </div>
               );
             case 'approval':
@@ -699,15 +716,62 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink | null }) {
               id="prompt-input"
               ref={promptInputRef}
               rows={3}
-              placeholder="Message the host agent… (Enter to send, Shift+Enter for a newline, Esc to abort)"
+              enterKeyHint="send"
+              placeholder="Message the host agent… (Enter to send, Shift+Enter for a newline, Esc to stop)"
               disabled={status !== 'connected'}
+              onCompositionStart={() => {
+                composerComposingRef.current = true;
+              }}
+              onCompositionEnd={() => {
+                composerComposingRef.current = false;
+              }}
               onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault();
-                  submit();
-                } else if (e.key === 'Escape') {
-                  abort();
+                if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 'v' || e.key === 'V')) {
+                  pasteEnterGuardUntilRef.current = nextPasteEnterGuard(performance.now());
                 }
+                if (e.key === 'Escape') {
+                  abort();
+                  return;
+                }
+                const enterDecision = {
+                  key: e.key,
+                  shiftKey: e.shiftKey,
+                  isComposing: e.nativeEvent.isComposing,
+                  keyCode: e.nativeEvent.keyCode,
+                  which: e.nativeEvent.which,
+                  compositionActive: composerComposingRef.current,
+                  now: performance.now(),
+                  pasteGuardUntil: pasteEnterGuardUntilRef.current,
+                };
+                if (composerEnterShouldPreventDefault(enterDecision)) {
+                  e.preventDefault();
+                }
+                if (composerEnterShouldSubmit(enterDecision)) {
+                  composerEnterHandledRef.current = true;
+                  queueMicrotask(() => {
+                    composerEnterHandledRef.current = false;
+                  });
+                  submit();
+                }
+              }}
+              onBeforeInput={(e) => {
+                if (
+                  !composerBeforeInputShouldSubmit({
+                    inputType: e.nativeEvent.inputType,
+                    shiftKey: nativeEventShiftKey(e.nativeEvent),
+                    compositionActive: composerComposingRef.current,
+                    keydownHandled: composerEnterHandledRef.current,
+                    now: performance.now(),
+                    pasteGuardUntil: pasteEnterGuardUntilRef.current,
+                  })
+                ) {
+                  return;
+                }
+                e.preventDefault();
+                submit();
+              }}
+              onPaste={() => {
+                pasteEnterGuardUntilRef.current = nextPasteEnterGuard(performance.now());
               }}
               onInput={(e) => autoResize(e.currentTarget)}
             />

@@ -49,23 +49,15 @@ main() {
     require_rpi
     web_require_browser
 
-    local root evidence port url web_dist
+    local root evidence port url
+
     root="$(scenario_workspace "$SCENARIO")"
     evidence="$EVIDENCE_ROOT/$SCENARIO"
     printf '%s\n' "$TOKEN" >"$root/token"
 
-    # Serve the freshly built web dist from disk so the gate fix is exercised
-    # WITHOUT rebuilding the Rust binary (build.rs embeds dist at compile time;
-    # RPI_WEB_DEV_DIR overrides the embedded copy for frontend iteration).
-    # Standalone runs use the checked-in bundle. Coverage runs instead inherit
-    # the instrumented RPI_WEB_DEV_DIR exported by coverage.sh; overriding it
-    # here would serve the minified bundle (no inline source map) and make this
-    # lane's V8 payload unconvertible, failing the coverage hard gate.
-    if [ -z "${RPI_COVERAGE_DIR:-}" ]; then
-        web_dist="$REPO_ROOT/crates/pi-cli/web/dist"
-        [ -f "$web_dist/index.html" ] || fail "$SCENARIO: built web dist not found: $web_dist/index.html (run 'npm run build' in crates/pi-cli/web)"
-        export RPI_WEB_DEV_DIR="$web_dist"
-    fi
+    # RPI_WEB_DEV_DIR is prepared once by the suite (or verified for an
+    # explicit artifact), so this lane exercises current frontend bytes
+    # without rebuilding the Rust binary or replacing coverage instrumentation.
 
     # The `sessions` mock scenario exposes a primary session row at boot so the
     # sidebar visibly loads after the delayed open (mirrors sessions_test T0.3).

@@ -14,7 +14,7 @@
 // Exit codes: 0 = every assertion held; 1 = a regression.
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { parseAnsi, ansiToPlainText, ansiRgb, type AnsiRun } from '../src/ansi.ts';
+import { parseAnsi, ansiToPlainText, ansiRgb, redactedClipboardText, type AnsiRun } from '../src/ansi.ts';
 import { AnsiText } from '../src/AnsiText.tsx';
 import { redactSecrets, safeText } from '../src/redact.ts';
 
@@ -242,6 +242,33 @@ function styleOf(run: AnsiRun): string {
     'copy of a split credential is the redacted plain text',
     splitCopy === 'prefix [REDACTED] suffix',
     JSON.stringify(splitCopy),
+  );
+  check(
+    'redactedClipboardText strips SGR',
+    redactedClipboardText('\x1b[96mnew zk sign circuit\x1b[0m') === 'new zk sign circuit',
+  );
+  check(
+    'redactedClipboardText redacts sk- token',
+    redactedClipboardText('echo sk-ABCDEFGHIJKLMNOPQRST') === 'echo [REDACTED]',
+  );
+  check(
+    'redactedClipboardText redacts credential split across SGR',
+    redactedClipboardText(`prefix \x1b[96m${split}\x1b[0m suffix`) === 'prefix [REDACTED] suffix',
+  );
+  check(
+    'redactedClipboardText command token=secret becomes token=[REDACTED]',
+    redactedClipboardText('export token = supersecret') === 'export token=[REDACTED]',
+  );
+  check(
+    'redactedClipboardText matches the existing clipboard contract',
+    redactedClipboardText('\x1b[96mnew zk sign circuit\x1b[0m') === copy
+      && redactedClipboardText(`prefix \x1b[96m${split}\x1b[0m suffix`) === splitCopy,
+  );
+  const hostileCopy = redactedClipboardText('<img src=x onerror=alert(1)>\x1b[96mok\x1b[0m');
+  check(
+    'redactedClipboardText keeps hostile markup inert as plain text',
+    hostileCopy === '<img src=x onerror=alert(1)>ok' && !hostileCopy.includes('\u001b'),
+    JSON.stringify(hostileCopy),
   );
   check(
     // A space before the credential gives `\b` a real boundary (an SGR 'm'

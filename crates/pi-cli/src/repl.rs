@@ -13,12 +13,11 @@ use tokio::io::AsyncBufReadExt;
 use pi_coding::{Application, ApplicationEvent, Session, TrustDecision};
 
 use crate::commands::{list_models, list_sessions_in, resolve_model_spec};
+use crate::output::{error_line, parse_thinking_level, thinking_level_str};
 use crate::resume_catalog::{
     ResumeCatalogRequest, ResumeSelectionRequest, ResumeSelectionResult, effective_resume_sources,
     load_resume_catalog, switch_resume_selection,
 };
-use crate::output::{error_line, parse_thinking_level, thinking_level_str};
-
 
 /// Run the external editor for `/persona new`/`/persona edit` (line REPL: the
 /// editor runs in the foreground — the REPL owns no alternate screen), then
@@ -139,7 +138,10 @@ fn print_header(session: &Session) {
     }
 }
 
-async fn resume_application(application: &Application, input: &str) -> Result<ResumeSelectionResult> {
+async fn resume_application(
+    application: &Application,
+    input: &str,
+) -> Result<ResumeSelectionResult> {
     let session = application.session();
     let catalog = pi_coding::SessionCatalog::from_env()
         .map_err(anyhow::Error::new)?
@@ -186,19 +188,23 @@ async fn handle_slash(
             cmd,
             (!arg.is_empty()).then_some(arg),
         ) {
-            Ok(Some(command)) => match crate::interactive_commands::execute_interactive_settings_command(
-                application,
-                command,
-            )
-            .await
-            {
-                Ok(output) => println!("{output}"),
-                Err(error) => error_line(&format!("settings command failed: {error:#}")),
-            },
+            Ok(Some(command)) => {
+                match crate::interactive_commands::execute_interactive_settings_command(
+                    application,
+                    command,
+                )
+                .await
+                {
+                    Ok(output) => println!("{output}"),
+                    Err(error) => error_line(&format!("settings command failed: {error:#}")),
+                }
+            }
             Ok(None) => unreachable!("settings command name was matched"),
             Err(error) => error_line(&format!("{error:#}")),
         },
-        "scoped-models" => error_line("/scoped-models requires the full-screen TUI; use --models for line-oriented sessions"),
+        "scoped-models" => error_line(
+            "/scoped-models requires the full-screen TUI; use --models for line-oriented sessions",
+        ),
         "queue" => {
             let (steering, follow_up) = application.queued_messages().await;
             let total = steering.len() + follow_up.len();
@@ -208,7 +214,7 @@ async fn handle_slash(
                         println!("Queue is empty");
                     } else {
                         println!(
-                            "Pending prompts: {} steering, {} follow-up (/queue cancel clears them)",
+                            "Pending prompts: {} steering, {} follow-up (/queue send injects steering now · /queue cancel clears them)",
                             steering.len(),
                             follow_up.len()
                         );
@@ -248,11 +254,39 @@ async fn handle_slash(
                         );
                     }
                 }
-                other => error_line(&format!("/queue [cancel] (unknown action {other:?})")),
+                "send" => {
+                    if steering.is_empty() {
+                        if follow_up.is_empty() {
+                            println!("Queue is empty");
+                        } else {
+                            println!("No steering prompts to send");
+                        }
+                    } else {
+                        match application.send_queued_steering_now().await {
+                            Ok(result) => {
+                                if result.combined {
+                                    println!("Sent {} steering prompts together", result.sent);
+                                } else {
+                                    println!(
+                                        "Sent {} steering prompt{}",
+                                        result.sent,
+                                        if result.sent == 1 { "" } else { "s" }
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                error_line(&format!("Failed to send steering now: {error:#}"))
+                            }
+                        }
+                    }
+                }
+                other => error_line(&format!("/queue [send|cancel] (unknown action {other:?})")),
             }
         }
         "changelog" => println!("{}", include_str!("../../../CHANGELOG.md")),
-        "hotkeys" => println!("Enter submit · Ctrl-D quit · Ctrl-C abort · !command record bash · !!command exclude bash from context"),
+        "hotkeys" => println!(
+            "Enter submit · Ctrl-D quit · Ctrl-C abort · !command record bash · !!command exclude bash from context"
+        ),
         "theme" => error_line("/theme requires the full-screen TUI"),
         "login" => match crate::auth_commands::login(
             (!arg.is_empty()).then_some(arg),
@@ -278,7 +312,7 @@ async fn handle_slash(
             Ok(info) => println!("logged out of {}", info.provider_id),
             Err(error) => error_line(&format!("{error:#}")),
         },
-        "models" => list_models(parts.next()).await?,
+        "models" => list_models(parts.next(), application).await?,
         "model" if arg.is_empty() => match application.state().await.model {
             Some(model) => println!("current: {}/{}", model.provider, model.id),
             None => println!("no model selected"),
@@ -304,7 +338,7 @@ async fn handle_slash(
             let level = parse_thinking_level(arg);
             let change = application.set_thinking_level(level);
             println!("{}", change.message);
-        },
+        }
         "new" | "fresh" => {
             let outcome = application.new_session().await?;
             if !outcome.cancelled {
@@ -317,7 +351,7 @@ async fn handle_slash(
             } else {
                 println!("new session cancelled");
             }
-        },
+        }
         "name" if arg.is_empty() => println!(
             "{}",
             application
@@ -363,7 +397,9 @@ async fn handle_slash(
                         ..ResumeCatalogRequest::default()
                     },
                 ) {
-                    Ok(result) if result.rows.is_empty() => println!("No sessions for this directory."),
+                    Ok(result) if result.rows.is_empty() => {
+                        println!("No sessions for this directory.")
+                    }
                     Ok(result) => {
                         for row in result.rows {
                             let imported = if matches!(
@@ -385,28 +421,26 @@ async fn handle_slash(
                             );
                         }
                     }
-                    Err(error) => error_line(&format!("failed to list resumable sessions: {error}")),
+                    Err(error) => {
+                        error_line(&format!("failed to list resumable sessions: {error}"))
+                    }
                 },
                 Err(error) => error_line(&format!("failed to open session catalog: {error}")),
             }
         }
-        "resume" => {
-            match resume_application(application, arg).await {
-                Ok(result) if result.cancelled => println!("session resume cancelled"),
-                Ok(result) => println!("resumed {}", result.path.display()),
-                Err(error) => error_line(&format!("{error:#}")),
-            }
-        }
+        "resume" => match resume_application(application, arg).await {
+            Ok(result) if result.cancelled => println!("session resume cancelled"),
+            Ok(result) => println!("resumed {}", result.path.display()),
+            Err(error) => error_line(&format!("{error:#}")),
+        },
         "import" => {
             if arg.is_empty() {
                 error_line("usage: /import <path.jsonl>");
             } else {
-                let session_dir = session.session_dir();
-                std::fs::create_dir_all(&session_dir)?;
-                let imported = pi_coding::import_session_to(
+                let imported = pi_coding::import_session_into_directory(
                     pi_coding::SourceSessionFormat::Pi,
                     Path::new(arg),
-                    &session_dir,
+                    session.session_dir(),
                 )?;
                 let outcome = application.switch_session(&imported.path).await?;
                 if !outcome.cancelled {
@@ -462,11 +496,11 @@ async fn handle_slash(
             }
         }
         "fork" if arg.is_empty() => {
-            for message in application.fork_messages()? {
+            for message in application.fork_messages(None, None)?.messages {
                 println!(
                     "{}  {}",
                     message.entry_id,
-                    message.text.lines().next().unwrap_or_default()
+                    message.text
                 );
             }
         }
@@ -500,6 +534,37 @@ async fn handle_slash(
             "{}",
             serde_json::to_string_pretty(&application.session_tree()?)?
         ),
+        "code-review" => {
+            match crate::code_review::ReviewScope::parse((!arg.is_empty()).then_some(arg)) {
+                Ok(scope) => {
+                    let snapshot =
+                        crate::code_review::load_review_snapshot_for(session.cwd(), scope);
+                    print_review_snapshot(&snapshot);
+                }
+                Err(error) => error_line(&error),
+            }
+        }
+        "commit" => {
+            let parsed = crate::interactive_commands::parse_commit_inspect_invocation(
+                (!arg.is_empty()).then_some(arg),
+            );
+            match parsed {
+                Ok(crate::interactive_commands::CommitInspectInvocation::Picker) => {
+                    println!("The /commit picker is a full-screen TUI page; pass a ref here.");
+                }
+                Ok(crate::interactive_commands::CommitInspectInvocation::Commit { reference }) => {
+                    let snapshot = crate::code_review::load_review_snapshot_for(
+                        session.cwd(),
+                        crate::code_review::ReviewScope::Commit {
+                            commit: reference,
+                            label: String::new(),
+                        },
+                    );
+                    print_review_snapshot(&snapshot);
+                }
+                Err(error) => error_line(&error),
+            }
+        }
         "loop" | "loops" | "loop-update" | "loop-delete" | "loop-cancel" => {
             match crate::loop_commands::parse_interactive_loop_command(
                 cmd,
@@ -520,11 +585,17 @@ async fn handle_slash(
                 Err(error) => error_line(&format!("{error:#}")),
             }
         }
-        "goal" => match crate::goal_commands::parse_interactive_goal_command((!arg.is_empty()).then_some(arg)) {
-            Ok(command) => match crate::goal_commands::execute_interactive_goal_command(application, command).await {
-                Ok(output) => println!("{output}"),
-                Err(error) => error_line(&format!("{error:#}")),
-            },
+        "goal" => match crate::goal_commands::parse_interactive_goal_command(
+            (!arg.is_empty()).then_some(arg),
+        ) {
+            Ok(command) => {
+                match crate::goal_commands::execute_interactive_goal_command(application, command)
+                    .await
+                {
+                    Ok(output) => println!("{output}"),
+                    Err(error) => error_line(&format!("{error:#}")),
+                }
+            }
             Err(error) => error_line(&format!("{error:#}")),
         },
         "workflow" => {
@@ -616,20 +687,20 @@ async fn handle_slash(
                 Err(error) => error_line(&format!("{error:#}")),
             }
         }
-        "todo" => {
-            if arg.is_empty() || arg.eq_ignore_ascii_case("list") {
-                let text = crate::tui::format_todo_human_lines(&application.todo_state().phases);
-                println!("{text}");
-            } else {
-                match pi_coding::parse_todo_markdown(arg) {
-                    Ok(phases) => match application.set_todos(phases) {
-                        Ok(result) => println!("updated todo list: {}", result.summary),
-                        Err(error) => error_line(&format!("failed to set todos: {error:#}")),
-                    },
-                    Err(error) => error_line(&format!("invalid todo markdown: {error:#}")),
-                }
-            }
+        "todo" => match handle_repl_todo(application, arg).await {
+            Ok(output) => println!("{output}"),
+            Err(error) => error_line(&format!("/todo: {error:#}")),
+        },
+        "activity" => {
+            println!("/activity is a full-screen TUI page; use /jobs for the text job projection")
         }
+        "team" => match crate::team_commands::parse_team_command(arg) {
+            Ok(command) => match crate::team_commands::execute_team_command(command).await {
+                Ok(output) => println!("{output}"),
+                Err(error) => error_line(&format!("/team: {error:#}")),
+            },
+            Err(error) => error_line(&format!("/team: {error}")),
+        },
         "reload" => {
             let result = application.reload().await?;
             println!("reloaded resource generation {}", result.generation);
@@ -669,53 +740,48 @@ async fn handle_slash(
                 Err(error) => error_line(&format!("dump failed: {error:#}")),
             }
         }
-        "share" => {
-            match crate::interactive_commands::parse_share_invocation(arg) {
-                Ok(request) if request.encrypt => {
-                    let passphrase = match request.passphrase {
-                        Some(passphrase) => passphrase,
-                        None => match crate::interactive_commands::prompt_passphrase(
-                            "Enter share passphrase",
-                        ) {
-                            Ok(passphrase) => passphrase,
-                            Err(error) => {
-                                error_line(&format!("encrypted share cancelled: {error:#}"));
-                                return Ok(false);
-                            }
-                        },
-                    };
-                    match crate::interactive_commands::execute_encrypted_share(
-                        application,
-                        &passphrase,
-                    )
-                    .await
-                    {
-                        Ok(message) => println!("{message}"),
-                        Err(error) => error_line(&format!("encrypted share failed: {error:#}")),
-                    }
-                }
-                Ok(_) => {
-                    let mut events = application.subscribe();
-                    application.share_session();
-                    loop {
-                        match events.recv().await? {
-                            ApplicationEvent::ShareSucceeded { url } => {
-                                println!("{url}");
-                                break;
-                            }
-                            ApplicationEvent::ShareFailed { message } => {
-                                error_line(&message);
-                                break;
-                            }
-                            _ => {}
+        "share" => match crate::interactive_commands::parse_share_invocation(arg) {
+            Ok(request) if request.encrypt => {
+                let passphrase = match request.passphrase {
+                    Some(passphrase) => passphrase,
+                    None => match crate::interactive_commands::prompt_passphrase(
+                        "Enter share passphrase",
+                    ) {
+                        Ok(passphrase) => passphrase,
+                        Err(error) => {
+                            error_line(&format!("encrypted share cancelled: {error:#}"));
+                            return Ok(false);
                         }
+                    },
+                };
+                match crate::interactive_commands::execute_encrypted_share(application, &passphrase)
+                    .await
+                {
+                    Ok(message) => println!("{message}"),
+                    Err(error) => error_line(&format!("encrypted share failed: {error:#}")),
+                }
+            }
+            Ok(_) => {
+                let mut events = application.subscribe();
+                application.share_session();
+                loop {
+                    match events.recv().await? {
+                        ApplicationEvent::ShareSucceeded { url } => {
+                            println!("{url}");
+                            break;
+                        }
+                        ApplicationEvent::ShareFailed { message } => {
+                            error_line(&message);
+                            break;
+                        }
+                        _ => {}
                     }
                 }
-                Err(error) => error_line(&format!("{error:#}")),
             }
-        }
+            Err(error) => error_line(&format!("{error:#}")),
+        },
         "copy" => println!("{}", application.last_assistant_text().unwrap_or_default()),
-        "llama" => match crate::llama_commands::run_slash(arg).await {
+        "llama" => match crate::llama_commands::run_slash(arg, application).await {
             Ok(message) => println!("{message}"),
             Err(error) => error_line(&format!("{error:#}")),
         },
@@ -750,19 +816,21 @@ async fn handle_slash(
             println!(
                 "[collab] joined room {} as {}",
                 handle.room_id,
-                if handle.is_writable() { "control" } else { "view-only" }
+                if handle.is_writable() {
+                    "control"
+                } else {
+                    "view-only"
+                }
             );
             *collab_guest = Some(handle);
         }
-        "leave" => {
-            match collab_guest.take() {
-                Some(guest) => match guest.leave().await {
-                    Ok(()) => println!("[collab] left the room"),
-                    Err(error) => error_line(&format!("[collab] leave failed: {error:#}")),
-                },
-                None => error_line("not joined to any collab room"),
-            }
-        }
+        "leave" => match collab_guest.take() {
+            Some(guest) => match guest.leave().await {
+                Ok(()) => println!("[collab] left the room"),
+                Err(error) => error_line(&format!("[collab] leave failed: {error:#}")),
+            },
+            None => error_line("not joined to any collab room"),
+        },
         "run" => match crate::interactive_commands::parse_run_invocation(arg) {
             Ok((command, arguments)) => {
                 match crate::interactive_commands::invoke_extension_command(
@@ -797,33 +865,62 @@ async fn handle_slash(
             }
             Err(error) => error_line(&format!("{error:#}")),
         },
-        "ps" | "process" => match crate::process_commands::parse_interactive_process_command(cmd, (!arg.is_empty()).then_some(arg)) {
-            Ok(Some(command)) => match crate::process_commands::execute_interactive_process_command(application, command).await {
-                Ok(output) => println!("{output}"),
-                Err(error) => error_line(&format!("{error:#}")),
-            },
+        "ps" | "process" => match crate::process_commands::parse_interactive_process_command(
+            cmd,
+            (!arg.is_empty()).then_some(arg),
+        ) {
+            Ok(Some(command)) => {
+                match crate::process_commands::execute_interactive_process_command(
+                    application,
+                    command,
+                )
+                .await
+                {
+                    Ok(output) => println!("{output}"),
+                    Err(error) => error_line(&format!("{error:#}")),
+                }
+            }
             Ok(None) => unreachable!("matched process command"),
             Err(error) => error_line(&format!("{error:#}")),
-        }
+        },
         other => {
             let (commands, _) = crate::interactive_commands::executable_catalog(application);
-            match commands.iter().find(|command| command.name == other).map(|command| command.source) {
-                Some(crate::interactive_commands::CommandSource::Prompt | crate::interactive_commands::CommandSource::Skill) => {
-                    match crate::interactive_commands::expand_resource_command(application, other, arg) {
+            match commands
+                .iter()
+                .find(|command| command.name == other)
+                .map(|command| command.source)
+            {
+                Some(
+                    crate::interactive_commands::CommandSource::Prompt
+                    | crate::interactive_commands::CommandSource::Skill,
+                ) => {
+                    match crate::interactive_commands::expand_resource_command(
+                        application,
+                        other,
+                        arg,
+                    ) {
                         Ok(Some(expanded)) => run_turn(application, &expanded).await?,
-                        Ok(None) => error_line(&format!("command /{other} is no longer available; try /reload")),
+                        Ok(None) => error_line(&format!(
+                            "command /{other} is no longer available; try /reload"
+                        )),
                         Err(error) => error_line(&format!("failed to expand /{other}: {error:#}")),
                     }
                 }
                 Some(crate::interactive_commands::CommandSource::Extension) => {
                     let result = match application.extension_runtime() {
-                        Some(runtime) => runtime.invoke_command(other, arg.to_owned(), None, None).await,
+                        Some(runtime) => {
+                            runtime
+                                .invoke_command(other, arg.to_owned(), None, None)
+                                .await
+                        }
                         None => Err(anyhow::anyhow!("extension runtime is not loaded")),
                     };
                     match result {
                         Ok(value) if !value.is_null() => println!("{value}"),
                         Ok(_) => println!("ran /{other}"),
-                        Err(error) => error_line(&format!("extension command /{other} failed: {error:#}")),
+                        Err(error) => {
+                            error_line(&format!("extension command /{other} failed: {error:#}"))
+                        }
                     }
                 }
                 Some(crate::interactive_commands::CommandSource::Builtin) => {
@@ -835,12 +932,66 @@ async fn handle_slash(
                 None => {
                     let suggestion = crate::interactive_commands::closest_builtin(other)
                         .map_or_else(String::new, |name| format!("; did you mean /{name}?"));
-                    error_line(&format!("unknown command \"/{other}\"{suggestion} (try /help)"));
+                    error_line(&format!(
+                        "unknown command \"/{other}\"{suggestion} (try /help)"
+                    ));
                 }
             }
         }
     }
     Ok(false)
+}
+
+/// Print one loaded review snapshot: the comparison label, then the typed
+/// error, the changed files, or "No changes". Shared by `/code-review` and
+/// the `/commit <ref>` direct path so both line-mode surfaces stay identical.
+fn print_review_snapshot(snapshot: &crate::code_review::ReviewSnapshot) {
+    println!("{}", snapshot.comparison_label());
+    if let Some(error) = snapshot.error.as_deref() {
+        error_line(error);
+    } else if snapshot.files.is_empty() {
+        println!("No changes");
+    } else {
+        for file in &snapshot.files {
+            println!("  {}  {}", file.status.as_str(), file.path);
+        }
+    }
+}
+
+async fn handle_repl_todo(application: &Application, argument: &str) -> Result<String> {
+    match crate::todo_child_commands::parse_todo_command(argument).map_err(anyhow::Error::msg)? {
+        crate::todo_child_commands::TodoCommand::Open => {
+            let todo_summary = application.apply_todo(pi_coding::TodoOp::View)?.summary;
+            let child_effect = crate::todo_child_commands::execute_todo_child_command(
+                application,
+                crate::todo_child_commands::TodoChildCommand::List,
+            )
+            .await;
+            let child_summary = if child_effect.is_success {
+                child_effect.message
+            } else {
+                format!("Unavailable: {}", child_effect.message)
+            };
+            Ok(format!(
+                "Todo DAG\n{todo_summary}\n\nTodo children\n{child_summary}"
+            ))
+        }
+        crate::todo_child_commands::TodoCommand::Child(command) => {
+            let effect =
+                crate::todo_child_commands::execute_todo_child_command(application, command).await;
+            if effect.is_success {
+                Ok(effect.message)
+            } else {
+                anyhow::bail!(effect.message)
+            }
+        }
+        crate::todo_child_commands::TodoCommand::Dag(operation) => {
+            Ok(application.apply_todo(operation)?.summary)
+        }
+        crate::todo_child_commands::TodoCommand::Markdown(markdown) => Ok(application
+            .set_todos(pi_coding::parse_todo_markdown(&markdown)?)?
+            .summary),
+    }
 }
 
 fn parse_bash_command(input: &str) -> Option<(&str, bool)> {
@@ -894,9 +1045,9 @@ async fn run_turn(application: &Application, prompt: &str) -> Result<()> {
 /// (the REPL dispatch is sequential, so awaiting the single
 /// [`pi_coding::HANDOFF_SUMMARIZE_TIMEOUT`]-bounded provider call is safe).
 async fn run_handoff(application: &Application, argument: &str) -> Result<String> {
-    use crate::interactive_commands::{parse_handoff_invocation, HandoffInvocation};
+    use crate::interactive_commands::{HandoffInvocation, parse_handoff_invocation};
     let handoff = match parse_handoff_invocation(argument)? {
-        HandoffInvocation::Envelope => application.generate_handoff(),
+        HandoffInvocation::Envelope => application.generate_handoff()?,
         HandoffInvocation::Prose => application.generate_handoff_with_prose().await?,
     };
     Ok(handoff.render())
@@ -904,16 +1055,35 @@ async fn run_handoff(application: &Application, argument: &str) -> Result<String
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_bash_command, run_handoff};
+    use super::{handle_repl_todo, parse_bash_command, run_handoff};
     use std::path::Path;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use pi_ai::{
-        new_assistant_message_event_stream, AssistantMessage, ContentBlock, Model, StopReason,
-    };
     use pi_agent::{StreamFn, ThinkingLevel};
-    use pi_coding::{Application, Session, SessionOptions};
+    use pi_ai::{
+        AssistantMessage, ContentBlock, Model, StopReason, new_assistant_message_event_stream,
+        providers::{FauxProviderOptions, FauxProviderRegistration, register_faux_provider},
+    };
+    use pi_coding::{
+        Application, ResourceDiscovery, ResourceManager, ResourceManagerOptions, Session,
+        SessionOptions,
+    };
+
+    struct HandoffApplicationFixture {
+        application: Application,
+        _resources: ResourceManager,
+        _faux: FauxProviderRegistration,
+        _agent: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for HandoffApplicationFixture {
+        type Target = Application;
+
+        fn deref(&self) -> &Self::Target {
+            &self.application
+        }
+    }
 
     #[test]
     fn parses_recorded_and_context_excluded_bash() {
@@ -927,7 +1097,11 @@ mod tests {
 
     /// Session whose provider stream counts invocations and replies with a
     /// fixed text — a faux summarizer for the handoff-prose call.
-    fn counting_session(cwd: &Path, calls: Arc<AtomicUsize>, reply: &'static str) -> Session {
+    async fn counting_application(
+        cwd: &Path,
+        calls: Arc<AtomicUsize>,
+        reply: &'static str,
+    ) -> HandoffApplicationFixture {
         let stream_fn: StreamFn = Arc::new(move |_model, _context, _options| {
             calls.fetch_add(1, Ordering::SeqCst);
             let reply = reply.to_owned();
@@ -943,33 +1117,182 @@ mod tests {
                 stream
             })
         });
-        Session::new(SessionOptions {
-            model: Model::default(),
-            cwd: cwd.to_path_buf(),
-            system_prompt: String::new(),
-            thinking_level: ThinkingLevel::Off,
-            api_key: String::new(),
-            compaction: None,
-            stream_options: Default::default(),
-            tools: Some(Vec::new()),
-            before_tool_call: None,
-            after_tool_call: None,
-            stream_fn: Some(stream_fn),
-            auth_resolver: None,
-        })
-        .expect("session")
+        let suffix = uuid::Uuid::now_v7().simple().to_string();
+        let model = Model {
+            id: format!("handoff-{suffix}"),
+            name: "Handoff Test".to_owned(),
+            api: format!("handoff-api-{suffix}"),
+            provider: format!("faux-handoff-{suffix}"),
+            base_url: "http://localhost:0".to_owned(),
+            ..Model::default()
+        };
+        let faux = register_faux_provider(FauxProviderOptions {
+            api: model.api.clone(),
+            provider: model.provider.clone(),
+            models: vec![model.clone()],
+            chunk_size: 4,
+        });
+        let session = Session::new_with_additional_tools_filtered_and_discovery(
+            SessionOptions {
+                model,
+                cwd: cwd.to_path_buf(),
+                system_prompt: String::new(),
+                thinking_level: ThinkingLevel::Off,
+                api_key: "faux".to_owned(),
+                compaction: None,
+                stream_options: Default::default(),
+                tools: Some(Vec::new()),
+                before_tool_call: None,
+                after_tool_call: None,
+                stream_fn: Some(stream_fn),
+                auth_resolver: None,
+                auth_manager: None,
+            },
+            Vec::new(),
+            Default::default(),
+            ResourceDiscovery::Disabled,
+        )
+        .expect("handoff session");
+        let session_dir = cwd.join(".pi-test-sessions");
+        std::fs::create_dir_all(&session_dir).expect("isolated session directory");
+        session.set_session_dir(session_dir);
+        let agent = tempfile::tempdir().expect("agent dir");
+        std::fs::write(
+            agent.path().join("settings.json"),
+            r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+        )
+        .expect("sandbox settings");
+        let mut resource_options = ResourceManagerOptions::new(cwd);
+        resource_options.agent_dir = agent.path().to_path_buf();
+        resource_options.project_trust_override = Some(false);
+        resource_options.disable_extensions = true;
+        resource_options.disable_skills = true;
+        resource_options.disable_prompt_templates = true;
+        resource_options.disable_themes = true;
+        resource_options.disable_context_files = true;
+        let resources = ResourceManager::new(resource_options).expect("handoff resources");
+        session
+            .attach_resources(resources.clone())
+            .await
+            .expect("attach handoff resources");
+        let application = Application::new(session).await;
+        assert_eq!(
+            resources.generation(),
+            application
+                .resource_snapshot()
+                .expect("published handoff resources")
+                .generation,
+        );
+        HandoffApplicationFixture {
+            application,
+            _resources: resources,
+            _faux: faux,
+            _agent: agent,
+        }
+    }
+
+    #[tokio::test]
+    async fn unified_todo_routes_dag_and_markdown_without_a_child_command() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let application = counting_application(cwd.path(), calls, "unused").await;
+
+        handle_repl_todo(&application, "- [ ] land unified todo")
+            .await
+            .expect("markdown Todo");
+        let started = handle_repl_todo(&application, "START land unified todo")
+            .await
+            .expect("start Todo");
+        assert!(started.contains("land unified todo"), "{started}");
+        let done = handle_repl_todo(&application, "done land unified todo")
+            .await
+            .expect("done Todo");
+        assert!(
+            done.contains("1/1 done") || done.contains("Remaining items: none"),
+            "{done}"
+        );
+
+        let child_error = handle_repl_todo(&application, "select")
+            .await
+            .expect_err("child select requires id");
+        assert!(
+            child_error.to_string().contains("/todo select <id>"),
+            "{child_error:#}"
+        );
+        let unknown_error = handle_repl_todo(&application, "not markdown")
+            .await
+            .expect_err("unknown text follows Todo usage path");
+        assert!(
+            unknown_error.to_string().contains("Usage: /todo"),
+            "{unknown_error:#}"
+        );
+
+        let list_tail_error = handle_repl_todo(&application, "list extra")
+            .await
+            .expect_err("list tail must fail");
+        assert!(list_tail_error.to_string().contains("usage: /todo list"));
+
+        let selected_id_tail_error = handle_repl_todo(&application, "status child-1 extra")
+            .await
+            .expect_err("multiple optional ids must fail");
+        assert!(
+            selected_id_tail_error
+                .to_string()
+                .contains("usage: /todo status [id]")
+        );
+
+        for input in ["SEND continue work", "ADD child-1 implement feature"] {
+            let error = handle_repl_todo(&application, input)
+                .await
+                .expect_err("unconfigured Todo service must receive the parsed child command");
+            assert!(
+                error
+                    .to_string()
+                    .contains("Todo child service is unavailable"),
+                "{input}: {error:#}"
+            );
+        }
+
+        for (input, usage) in [
+            ("start", "/todo start <task>"),
+            ("done", "/todo done <task>"),
+            ("drop", "/todo drop <task>"),
+            ("clear extra", "/todo clear"),
+        ] {
+            let error = handle_repl_todo(&application, input)
+                .await
+                .expect_err("invalid DAG verb shape");
+            assert!(error.to_string().contains(usage), "{input}: {error:#}");
+        }
+        application.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn bare_todo_combines_dag_and_child_summaries() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let application = counting_application(cwd.path(), calls, "unused").await;
+
+        let output = handle_repl_todo(&application, "")
+            .await
+            .expect("bare Todo projection");
+        assert!(output.contains("Todo DAG\n"), "{output}");
+        assert!(output.contains("Todo list is empty."), "{output}");
+        assert!(output.contains("Todo children\n"), "{output}");
+        assert!(
+            output.contains("No Todo children.")
+                || output.contains("Unavailable: failed to list Todo children:"),
+            "{output}"
+        );
+        application.cleanup().await;
     }
 
     #[tokio::test]
     async fn handoff_prose_renders_envelope_plus_prose_and_bare_stays_envelope_only() {
         let cwd = tempfile::tempdir().expect("cwd");
         let calls = Arc::new(AtomicUsize::new(0));
-        let application = Application::new(counting_session(
-            cwd.path(),
-            calls.clone(),
-            "handoff prose reply",
-        ))
-        .await;
+        let application =
+            counting_application(cwd.path(), calls.clone(), "handoff prose reply").await;
 
         let prose = run_handoff(&application, "--prose")
             .await
@@ -988,9 +1311,7 @@ mod tests {
             "--prose runs exactly one summarizer call"
         );
 
-        let envelope = run_handoff(&application, "")
-            .await
-            .expect("bare handoff");
+        let envelope = run_handoff(&application, "").await.expect("bare handoff");
         assert!(
             envelope.contains("# Handoff"),
             "bare /handoff must render the envelope:\n{envelope}"
@@ -1012,8 +1333,7 @@ mod tests {
     async fn handoff_unknown_flag_is_rejected_without_provider_call() {
         let cwd = tempfile::tempdir().expect("cwd");
         let calls = Arc::new(AtomicUsize::new(0));
-        let application = Application::new(counting_session(cwd.path(), calls.clone(), "unused"))
-            .await;
+        let application = counting_application(cwd.path(), calls.clone(), "unused").await;
 
         let error = run_handoff(&application, "--bogus")
             .await

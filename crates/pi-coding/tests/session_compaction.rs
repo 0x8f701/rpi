@@ -57,6 +57,7 @@ async fn enabled_compaction_summarizes_after_completed_prompt() {
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: None,
+        auth_manager: None,
     })
     .expect("build compacting session");
     session
@@ -71,7 +72,10 @@ async fn enabled_compaction_summarizes_after_completed_prompt() {
         .await
         .expect("run prompt after compaction");
     assert_eq!(answer, "final answer", "history: {:?}", session.history());
-    assert!(matches!(session.history().first(), Some(Message::CompactionSummary(_))));
+    assert!(matches!(
+        session.history().first(),
+        Some(Message::CompactionSummary(_))
+    ));
     registration.unregister();
 }
 
@@ -106,6 +110,7 @@ async fn disabled_compaction_does_not_consume_summary_response() {
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: None,
+        auth_manager: None,
     })
     .expect("build non-compacting session");
     session
@@ -138,6 +143,7 @@ fn auto_compaction_toggle_is_truthful_without_initial_settings() {
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: None,
+        auth_manager: None,
     })
     .expect("build session");
 
@@ -212,6 +218,7 @@ async fn compaction_activity_is_set_only_while_summary_runs() {
         after_tool_call: None,
         stream_fn: Some(stream_fn),
         auth_resolver: None,
+        auth_manager: None,
     })
     .expect("build compacting session");
     session
@@ -242,23 +249,51 @@ async fn manual_compaction_emits_paired_success_events() {
     model.context_window = 200;
     model.max_tokens = 32;
     let registration = register_faux_provider(FauxProviderOptions {
-        api: model.api.clone(), provider: model.provider.clone(), models: vec![model.clone()], chunk_size: 32,
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+        models: vec![model.clone()],
+        chunk_size: 32,
     });
     registration.set_responses(vec![FauxResponse::text("manual checkpoint")]);
     let cwd = tempfile::tempdir().expect("temporary working directory");
     let session = Session::new(SessionOptions {
-        model, cwd: cwd.path().to_path_buf(), system_prompt: String::new(), thinking_level: ThinkingLevel::Off,
-        api_key: "faux".into(), compaction: Some(CompactionSettings { enabled: true, reserve_tokens: 20, keep_recent_tokens: 4, snap_keep_turns: 10 }),
-        stream_options: Default::default(), tools: Some(Vec::new()), before_tool_call: None, after_tool_call: None,
-        stream_fn: None, auth_resolver: None,
-    }).expect("build session");
+        model,
+        cwd: cwd.path().to_path_buf(),
+        system_prompt: String::new(),
+        thinking_level: ThinkingLevel::Off,
+        api_key: "faux".into(),
+        compaction: Some(CompactionSettings {
+            enabled: true,
+            reserve_tokens: 20,
+            keep_recent_tokens: 4,
+            snap_keep_turns: 10,
+        }),
+        stream_options: Default::default(),
+        tools: Some(Vec::new()),
+        before_tool_call: None,
+        after_tool_call: None,
+        stream_fn: None,
+        auth_resolver: None,
+        auth_manager: None,
+    })
+    .expect("build session");
     let history = vec![
         Message::user_text("older request ".repeat(20), 1),
-        Message::Assistant({ let mut message = AssistantMessage::pending(&session.model().expect("model")); message.content = vec![ContentBlock::text("older answer")]; message.stop_reason = StopReason::Stop; message }),
+        Message::Assistant({
+            let mut message = AssistantMessage::pending(&session.model().expect("model"));
+            message.content = vec![ContentBlock::text("older answer")];
+            message.stop_reason = StopReason::Stop;
+            message
+        }),
         Message::user_text("recent request", 3),
     ];
     let recorder = pi_coding::start_session_in(
-        cwd.path(), None, None, Some(cwd.path()), Some("manual-compaction-metadata"), None,
+        cwd.path(),
+        None,
+        None,
+        Some(cwd.path()),
+        Some("manual-compaction-metadata"),
+        None,
     )
     .expect("start recorder");
     for message in &history {
@@ -270,11 +305,31 @@ async fn manual_compaction_emits_paired_success_events() {
     let mut events = session.subscribe_session_events();
     let result = session.compact(None).await.expect("manual compact");
     assert_eq!(result.summary, "manual checkpoint");
-    assert!(matches!(events.recv().await.expect("start"), SessionEvent::CompactionStart { reason: CompactionReason::Manual }));
-    assert!(matches!(events.recv().await.expect("end"), SessionEvent::CompactionEnd { reason: CompactionReason::Manual, aborted: false, result: Some(_), .. }));
+    assert!(matches!(
+        events.recv().await.expect("start"),
+        SessionEvent::CompactionStart {
+            reason: CompactionReason::Manual
+        }
+    ));
+    assert!(matches!(
+        events.recv().await.expect("end"),
+        SessionEvent::CompactionEnd {
+            reason: CompactionReason::Manual,
+            aborted: false,
+            result: Some(_),
+            ..
+        }
+    ));
     let tree = pi_coding::load_session_tree(&session_path).expect("load recorded compaction");
-    let entry = tree.entries.iter().find(|entry| entry.entry_type == "compaction").expect("compaction entry");
-    assert_eq!(entry.details, serde_json::to_value(result.details.as_ref().expect("generated details")).ok());
+    let entry = tree
+        .entries
+        .iter()
+        .find(|entry| entry.entry_type == "compaction")
+        .expect("compaction entry");
+    assert_eq!(
+        entry.details,
+        serde_json::to_value(result.details.as_ref().expect("generated details")).ok()
+    );
     assert_eq!(entry.usage, None);
     assert_eq!(entry.from_hook, None);
     registration.unregister();
@@ -289,17 +344,28 @@ async fn hook_compaction_persists_details_usage_and_source() {
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
         api_key: String::new(),
-        compaction: Some(CompactionSettings { enabled: true, reserve_tokens: 20, keep_recent_tokens: 4, snap_keep_turns: 10 }),
+        compaction: Some(CompactionSettings {
+            enabled: true,
+            reserve_tokens: 20,
+            keep_recent_tokens: 4,
+            snap_keep_turns: 10,
+        }),
         stream_options: Default::default(),
         tools: Some(Vec::new()),
         before_tool_call: None,
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: None,
+        auth_manager: None,
     })
     .expect("build session");
     let recorder = pi_coding::start_session_in(
-        cwd.path(), None, None, Some(cwd.path()), Some("hook-compaction-metadata"), None,
+        cwd.path(),
+        None,
+        None,
+        Some(cwd.path()),
+        Some("hook-compaction-metadata"),
+        None,
     )
     .expect("start recorder");
     let first = Message::user_text("older request", 1);
@@ -310,18 +376,28 @@ async fn hook_compaction_persists_details_usage_and_source() {
         message.stop_reason = StopReason::Stop;
         message
     });
-    recorder.record_message(&assistant).expect("record assistant");
+    recorder
+        .record_message(&assistant)
+        .expect("record assistant");
     let recent = Message::user_text("recent request", 3);
     recorder.record_message(&recent).expect("record recent");
     let session_path = recorder.path();
     session.record(recorder).expect("attach recorder");
-    session.load_history(vec![first, assistant, recent]).await.expect("load history");
+    session
+        .load_history(vec![first, assistant, recent])
+        .await
+        .expect("load history");
 
     let details = CompactionDetails {
         read_files: vec!["src/lib.rs".to_owned()],
         modified_files: vec!["src/main.rs".to_owned()],
     };
-    let usage = Usage { input: 17, output: 5, total_tokens: 22, ..Usage::default() };
+    let usage = Usage {
+        input: 17,
+        output: 5,
+        total_tokens: 22,
+        ..Usage::default()
+    };
     let hook_result = CompactionResult {
         summary: "hook checkpoint".to_owned(),
         first_kept_entry_id: first_id,
@@ -333,13 +409,20 @@ async fn hook_compaction_persists_details_usage_and_source() {
     session.set_before_compaction(Some(Arc::new(move |_| {
         let hook_result = hook_result.clone();
         Box::pin(async move {
-            Ok(BeforeCompactionResult { cancel: false, compaction: Some(hook_result) })
+            Ok(BeforeCompactionResult {
+                cancel: false,
+                compaction: Some(hook_result),
+            })
         })
     })));
     session.compact(None).await.expect("hook compaction");
 
     let tree = pi_coding::load_session_tree(&session_path).expect("load hook compaction");
-    let entry = tree.entries.iter().find(|entry| entry.entry_type == "compaction").expect("compaction entry");
+    let entry = tree
+        .entries
+        .iter()
+        .find(|entry| entry.entry_type == "compaction")
+        .expect("compaction entry");
     assert_eq!(entry.details, serde_json::to_value(details).ok());
     assert_eq!(entry.usage, Some(usage));
     assert_eq!(entry.from_hook, Some(true));
@@ -349,23 +432,75 @@ async fn hook_compaction_persists_details_usage_and_source() {
 async fn overflow_compacts_once_then_retries_without_duplicate_user_turn() {
     let _guard = registry_guard();
     let mut model = Model::default();
-    model.id = "overflow-faux".into(); model.api = "overflow-faux-api".into(); model.provider = "faux".into();
-    model.base_url = "http://localhost:0".into(); model.context_window = 100; model.max_tokens = 32;
-    let registration = register_faux_provider(FauxProviderOptions { api: model.api.clone(), provider: model.provider.clone(), models: vec![model.clone()], chunk_size: 32 });
-    registration.set_responses(vec![FauxResponse::error("input exceeds the context window"), FauxResponse::text("overflow checkpoint"), FauxResponse::text("recovered answer")]);
+    model.id = "overflow-faux".into();
+    model.api = "overflow-faux-api".into();
+    model.provider = "faux".into();
+    model.base_url = "http://localhost:0".into();
+    model.context_window = 100;
+    model.max_tokens = 32;
+    let registration = register_faux_provider(FauxProviderOptions {
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+        models: vec![model.clone()],
+        chunk_size: 32,
+    });
+    registration.set_responses(vec![
+        FauxResponse::error("input exceeds the context window"),
+        FauxResponse::text("overflow checkpoint"),
+        FauxResponse::text("recovered answer"),
+    ]);
     let cwd = tempfile::tempdir().expect("temporary working directory");
-    let session = Session::new(SessionOptions { model, cwd: cwd.path().to_path_buf(), system_prompt: String::new(), thinking_level: ThinkingLevel::Off,
-        api_key: "faux".into(), compaction: Some(CompactionSettings { enabled: true, reserve_tokens: 20, keep_recent_tokens: 4, snap_keep_turns: 10 }),
-        stream_options: Default::default(), tools: Some(Vec::new()), before_tool_call: None, after_tool_call: None, stream_fn: None, auth_resolver: None }).expect("build session");
-    session.load_history(vec![Message::user_text("older context ".repeat(30), 1)]).await.expect("load history");
+    let session = Session::new(SessionOptions {
+        model,
+        cwd: cwd.path().to_path_buf(),
+        system_prompt: String::new(),
+        thinking_level: ThinkingLevel::Off,
+        api_key: "faux".into(),
+        compaction: Some(CompactionSettings {
+            enabled: true,
+            reserve_tokens: 20,
+            keep_recent_tokens: 4,
+            snap_keep_turns: 10,
+        }),
+        stream_options: Default::default(),
+        tools: Some(Vec::new()),
+        before_tool_call: None,
+        after_tool_call: None,
+        stream_fn: None,
+        auth_resolver: None,
+        auth_manager: None,
+    })
+    .expect("build session");
+    session
+        .load_history(vec![Message::user_text("older context ".repeat(30), 1)])
+        .await
+        .expect("load history");
     let mut events = session.subscribe_session_events();
-    let result = session.run("one user turn", Vec::new()).await.expect("overflow recovery");
+    let result = session
+        .run("one user turn", Vec::new())
+        .await
+        .expect("overflow recovery");
     assert_eq!(result.text, "recovered answer");
     assert_eq!(session.history().iter().filter(|message| matches!(message, Message::User(user) if user.content.iter().any(|block| matches!(block, ContentBlock::Text { text, .. } if text == "one user turn")))).count(), 1);
-    let mut saw_start = false; let mut saw_end = false;
+    let mut saw_start = false;
+    let mut saw_end = false;
     while let Ok(event) = events.try_recv() {
-        saw_start |= matches!(event, SessionEvent::CompactionStart { reason: CompactionReason::Overflow });
-        saw_end |= matches!(event, SessionEvent::CompactionEnd { reason: CompactionReason::Overflow, aborted: false, will_retry: true, result: Some(_), .. });
+        saw_start |= matches!(
+            event,
+            SessionEvent::CompactionStart {
+                reason: CompactionReason::Overflow
+            }
+        );
+        saw_end |= matches!(
+            event,
+            SessionEvent::CompactionEnd {
+                reason: CompactionReason::Overflow,
+                aborted: false,
+                will_retry: true,
+                result: Some(_),
+                ..
+            }
+        );
     }
     assert!(saw_start && saw_end);
     registration.unregister();
@@ -375,17 +510,58 @@ async fn overflow_compacts_once_then_retries_without_duplicate_user_turn() {
 async fn second_overflow_stops_with_actionable_error() {
     let _guard = registry_guard();
     let mut model = Model::default();
-    model.id = "overflow-stop-faux".into(); model.api = "overflow-stop-faux-api".into(); model.provider = "faux".into();
-    model.base_url = "http://localhost:0".into(); model.context_window = 100; model.max_tokens = 32;
-    let registration = register_faux_provider(FauxProviderOptions { api: model.api.clone(), provider: model.provider.clone(), models: vec![model.clone()], chunk_size: 32 });
-    registration.set_responses(vec![FauxResponse::error("input exceeds the context window"), FauxResponse::text("overflow checkpoint"), FauxResponse::error("input exceeds the context window")]);
+    model.id = "overflow-stop-faux".into();
+    model.api = "overflow-stop-faux-api".into();
+    model.provider = "faux".into();
+    model.base_url = "http://localhost:0".into();
+    model.context_window = 100;
+    model.max_tokens = 32;
+    let registration = register_faux_provider(FauxProviderOptions {
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+        models: vec![model.clone()],
+        chunk_size: 32,
+    });
+    registration.set_responses(vec![
+        FauxResponse::error("input exceeds the context window"),
+        FauxResponse::text("overflow checkpoint"),
+        FauxResponse::error("input exceeds the context window"),
+    ]);
     let cwd = tempfile::tempdir().expect("temporary working directory");
-    let session = Session::new(SessionOptions { model, cwd: cwd.path().to_path_buf(), system_prompt: String::new(), thinking_level: ThinkingLevel::Off,
-        api_key: "faux".into(), compaction: Some(CompactionSettings { enabled: true, reserve_tokens: 20, keep_recent_tokens: 4, snap_keep_turns: 10 }),
-        stream_options: Default::default(), tools: Some(Vec::new()), before_tool_call: None, after_tool_call: None, stream_fn: None, auth_resolver: None }).expect("build session");
-    session.load_history(vec![Message::user_text("older context ".repeat(30), 1)]).await.expect("load history");
-    let error = session.run("one user turn", Vec::new()).await.expect_err("second overflow stops");
-    assert!(error.to_string().contains("Reduce the prompt or start a new session"));
+    let session = Session::new(SessionOptions {
+        model,
+        cwd: cwd.path().to_path_buf(),
+        system_prompt: String::new(),
+        thinking_level: ThinkingLevel::Off,
+        api_key: "faux".into(),
+        compaction: Some(CompactionSettings {
+            enabled: true,
+            reserve_tokens: 20,
+            keep_recent_tokens: 4,
+            snap_keep_turns: 10,
+        }),
+        stream_options: Default::default(),
+        tools: Some(Vec::new()),
+        before_tool_call: None,
+        after_tool_call: None,
+        stream_fn: None,
+        auth_resolver: None,
+        auth_manager: None,
+    })
+    .expect("build session");
+    session
+        .load_history(vec![Message::user_text("older context ".repeat(30), 1)])
+        .await
+        .expect("load history");
+    let error = session
+        .run("one user turn", Vec::new())
+        .await
+        .expect_err("second overflow stops");
+    assert!(
+        error
+            .to_string()
+            .contains("Reduce the prompt or start a new session")
+    );
     registration.unregister();
 }
 
@@ -453,12 +629,19 @@ async fn compaction_resolves_auth_into_request_options_without_mutating_model() 
         after_tool_call: None,
         stream_fn: Some(stream_fn),
         auth_resolver: Some(resolver),
+        auth_manager: None,
     })
     .expect("build session");
     session
         .load_history(vec![
             Message::user_text("older request ".repeat(20), 1),
-            Message::Assistant({ let mut message = AssistantMessage::pending(&model); message.content = vec![ContentBlock::text("older response ".repeat(20))]; message.stop_reason = StopReason::Stop; message.timestamp = 2; message }),
+            Message::Assistant({
+                let mut message = AssistantMessage::pending(&model);
+                message.content = vec![ContentBlock::text("older response ".repeat(20))];
+                message.stop_reason = StopReason::Stop;
+                message.timestamp = 2;
+                message
+            }),
             Message::user_text("recent request", 3),
         ])
         .await
@@ -471,14 +654,30 @@ async fn compaction_resolves_auth_into_request_options_without_mutating_model() 
         .expect("capture lock")
         .take()
         .expect("captured compaction request");
-    assert!(request_model.headers.as_ref().is_none_or(std::collections::HashMap::is_empty));
-    assert_eq!(request_options.stream.api_key.as_deref(), Some("compaction-api-secret"));
+    assert!(
+        request_model
+            .headers
+            .as_ref()
+            .is_none_or(std::collections::HashMap::is_empty)
+    );
     assert_eq!(
-        request_options.stream.headers.get("X-Probe").map(String::as_str),
+        request_options.stream.api_key.as_deref(),
+        Some("compaction-api-secret")
+    );
+    assert_eq!(
+        request_options
+            .stream
+            .headers
+            .get("X-Probe")
+            .map(String::as_str),
         Some("compaction-header-secret")
     );
     assert_eq!(
-        request_options.stream.env.get("COMPACTION_AUTH_ENV").map(String::as_str),
+        request_options
+            .stream
+            .env
+            .get("COMPACTION_AUTH_ENV")
+            .map(String::as_str),
         Some("compaction-env-secret")
     );
 }
@@ -487,30 +686,89 @@ async fn compaction_resolves_auth_into_request_options_without_mutating_model() 
 async fn manual_compaction_retries_transient_summary_and_emits_ordered_events() {
     let _guard = registry_guard();
     let mut model = Model::default();
-    model.id = "summary-retry-faux".into(); model.api = "summary-retry-faux-api".into(); model.provider = "faux".into();
-    model.base_url = "http://localhost:0".into(); model.context_window = 200; model.max_tokens = 32;
-    let registration = register_faux_provider(FauxProviderOptions { api: model.api.clone(), provider: model.provider.clone(), models: vec![model.clone()], chunk_size: 32 });
-    registration.set_responses(vec![FauxResponse::error("503 Service unavailable"), FauxResponse::text("retried checkpoint")]);
+    model.id = "summary-retry-faux".into();
+    model.api = "summary-retry-faux-api".into();
+    model.provider = "faux".into();
+    model.base_url = "http://localhost:0".into();
+    model.context_window = 200;
+    model.max_tokens = 32;
+    let registration = register_faux_provider(FauxProviderOptions {
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+        models: vec![model.clone()],
+        chunk_size: 32,
+    });
+    registration.set_responses(vec![
+        FauxResponse::error("503 Service unavailable"),
+        FauxResponse::text("retried checkpoint"),
+    ]);
     let cwd = tempfile::tempdir().expect("temporary working directory");
-    let session = Session::new(SessionOptions { model, cwd: cwd.path().to_path_buf(), system_prompt: String::new(), thinking_level: ThinkingLevel::Off,
-        api_key: "faux".into(), compaction: Some(CompactionSettings { enabled: true, reserve_tokens: 20, keep_recent_tokens: 4, snap_keep_turns: 10 }),
-        stream_options: Default::default(), tools: Some(Vec::new()), before_tool_call: None, after_tool_call: None, stream_fn: None, auth_resolver: None }).expect("build session");
-    session.set_retry_settings(RetrySettings { enabled: true, max_retries: 1, base_delay_ms: 1 , ..Default::default() });
-    session.load_history(vec![Message::user_text("older request ".repeat(20), 1), Message::Assistant({ let mut message = AssistantMessage::pending(&session.model().expect("model")); message.content = vec![ContentBlock::text("older response ".repeat(20))]; message.stop_reason = StopReason::Stop; message.timestamp = 2; message }), Message::user_text("recent", 3)]).await.expect("load");
+    let session = Session::new(SessionOptions {
+        model,
+        cwd: cwd.path().to_path_buf(),
+        system_prompt: String::new(),
+        thinking_level: ThinkingLevel::Off,
+        api_key: "faux".into(),
+        compaction: Some(CompactionSettings {
+            enabled: true,
+            reserve_tokens: 20,
+            keep_recent_tokens: 4,
+            snap_keep_turns: 10,
+        }),
+        stream_options: Default::default(),
+        tools: Some(Vec::new()),
+        before_tool_call: None,
+        after_tool_call: None,
+        stream_fn: None,
+        auth_resolver: None,
+        auth_manager: None,
+    })
+    .expect("build session");
+    session.set_retry_settings(RetrySettings {
+        enabled: true,
+        max_retries: 1,
+        base_delay_ms: 1,
+        ..Default::default()
+    });
+    session
+        .load_history(vec![
+            Message::user_text("older request ".repeat(20), 1),
+            Message::Assistant({
+                let mut message = AssistantMessage::pending(&session.model().expect("model"));
+                message.content = vec![ContentBlock::text("older response ".repeat(20))];
+                message.stop_reason = StopReason::Stop;
+                message.timestamp = 2;
+                message
+            }),
+            Message::user_text("recent", 3),
+        ])
+        .await
+        .expect("load");
     let mut events = session.subscribe_session_events();
     let result = session.compact(None).await.expect("retried compact");
-    assert!(result.summary.ends_with("retried checkpoint"), "{}", result.summary);
+    assert!(
+        result.summary.ends_with("retried checkpoint"),
+        "{}",
+        result.summary
+    );
     let mut lifecycle = Vec::new();
     while let Ok(event) = events.try_recv() {
         match event {
             SessionEvent::CompactionStart { .. } => lifecycle.push("start"),
-            SessionEvent::SummarizationRetryScheduled { attempt: 1, .. } => lifecycle.push("scheduled"),
+            SessionEvent::SummarizationRetryScheduled { attempt: 1, .. } => {
+                lifecycle.push("scheduled")
+            }
             SessionEvent::SummarizationRetryAttemptStart { .. } => lifecycle.push("attempt"),
             SessionEvent::SummarizationRetryFinished => lifecycle.push("finished"),
-            SessionEvent::CompactionEnd { result: Some(_), .. } => lifecycle.push("end"),
+            SessionEvent::CompactionEnd {
+                result: Some(_), ..
+            } => lifecycle.push("end"),
             _ => {}
         }
     }
-    assert_eq!(lifecycle, ["start", "scheduled", "attempt", "finished", "end"]);
+    assert_eq!(
+        lifecycle,
+        ["start", "scheduled", "attempt", "finished", "end"]
+    );
     registration.unregister();
 }

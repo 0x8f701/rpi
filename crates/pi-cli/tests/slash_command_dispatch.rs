@@ -15,31 +15,28 @@ use std::time::{Duration, Instant};
 use pi_agent::ThinkingLevel;
 use pi_ai::Model;
 use pi_ai::providers::{FauxProviderOptions, register_faux_provider};
-use pi_coding::{Application, Session, SessionOptions, TrustDecision};
-use pi_cli::goal_commands::{
-    execute_interactive_goal_command, parse_interactive_goal_command,
-};
-use pi_cli::workflow_commands::{
-    InteractiveWorkflowCommand, WorkflowCommandEffect, parse_interactive_workflow_command,
-};
-use pi_cli::interactive_commands::{
-    BUILTIN_COMMANDS, PRIMARY_COMMAND_NAMES, builtin, executable_catalog, is_primary_command,
-    parse_chain_invocation, parse_collab_invocation, parse_interactive_persona_command,
-    parse_interactive_settings_command, parse_join_invocation, parse_run_invocation,
-    requires_arguments, usage, visible_catalog, CollabInvocation,
-};
+use pi_cli::code_review_panel::CodeReviewPanel;
 use pi_cli::collab_commands;
-use pi_cli::keybindings::KeyBindingsManager;
-use pi_cli::loop_commands::{
-    execute_interactive_loop_command, parse_interactive_loop_command,
+use pi_cli::goal_commands::{execute_interactive_goal_command, parse_interactive_goal_command};
+use pi_cli::interactive_commands::{
+    BUILTIN_COMMANDS, CollabInvocation, CommitInspectInvocation, CommandSource,
+    PRIMARY_COMMAND_NAMES, builtin, executable_catalog, is_primary_command,
+    parse_chain_invocation, parse_collab_invocation, parse_commit_inspect_invocation,
+    parse_interactive_persona_command, parse_interactive_settings_command, parse_join_invocation,
+    parse_run_invocation, requires_arguments, usage, visible_catalog,
 };
+use pi_cli::keybindings::KeyBindingsManager;
+use pi_cli::loop_commands::{execute_interactive_loop_command, parse_interactive_loop_command};
 use pi_cli::process_commands::{
     execute_interactive_process_command, parse_interactive_process_command,
 };
-use pi_cli::theme::ThemeManager;
-use tempfile::TempDir;
-use pi_cli::code_review_panel::CodeReviewPanel;
 use pi_cli::side_chat::{SideChatController, SideChatToolMode};
+use pi_cli::theme::ThemeManager;
+use pi_cli::workflow_commands::{
+    InteractiveWorkflowCommand, WorkflowCommandEffect, parse_interactive_workflow_command,
+};
+use pi_coding::{Application, Session, SessionOptions, TrustDecision};
+use tempfile::TempDir;
 
 /// Hard upper bound for one-shot git fixture setup in this file.
 const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(20);
@@ -157,7 +154,11 @@ impl Fixture {
         let cwd = TempDir::new().expect("temp cwd");
         let agent_dir = home.path().join(".pi");
         std::fs::create_dir_all(&agent_dir).expect("agent dir");
-        std::fs::write(agent_dir.join("settings.json"), b"{}").expect("seed settings");
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            br#"{"sandbox":{"mode":"danger-full-access"}}"#,
+        )
+        .expect("seed settings");
 
         let mut model = Model::default();
         model.id = format!("faux-slash-{tag}");
@@ -197,6 +198,7 @@ impl Fixture {
             after_tool_call: None,
             stream_fn: None,
             auth_resolver: None,
+            auth_manager: None,
         })
         .expect("session");
         session
@@ -204,6 +206,9 @@ impl Fixture {
             .await
             .expect("attach resources");
 
+        let session_dir = cwd.path().join("sessions");
+        std::fs::create_dir_all(&session_dir).expect("session dir");
+        session.set_session_dir(session_dir.clone());
         // Match print_mode / rpc fixtures: recorder under cwd, attach before Application.
         session
             .record(
@@ -211,7 +216,7 @@ impl Fixture {
                     cwd.path(),
                     Some(&model),
                     Some("off"),
-                    Some(cwd.path()),
+                    Some(&session_dir),
                     Some(&format!("slash-{tag}")),
                     None,
                 )
@@ -258,7 +263,11 @@ fn builtin_catalog_is_unique_and_usage_is_typed() {
     let before = names.len();
     names.sort_unstable();
     names.dedup();
-    assert_eq!(names.len(), before, "BUILTIN_COMMANDS must have unique names");
+    assert_eq!(
+        names.len(),
+        before,
+        "BUILTIN_COMMANDS must have unique names"
+    );
 
     for command in BUILTIN_COMMANDS {
         let rendered = usage(command);
@@ -303,31 +312,104 @@ fn builtin_catalog_is_unique_and_usage_is_typed() {
     );
 }
 
-/// Contract: visible help/completion is the explicit primary surface only.
+/// Contract: visible help/completion is the explicit 33-command primary surface
+/// only — exact count, source order, unique names, and builtin source for every
+/// entry. Authoritative list: `interactive_commands::PRIMARY_COMMAND_NAMES`.
 #[test]
 fn primary_command_surface_is_help_and_completion_only() {
     assert_eq!(
         PRIMARY_COMMAND_NAMES,
         &[
-            "settings", "model", "branch", "resume", "fork", "export", "dump", "handoff",
-            "agents", "role", "persona", "compact", "rewind", "checkpoint", "ps", "loop",
-            "goal", "workflow", "code-review", "btw", "queue", "live", "skill",
+            "settings",
+            "model",
+            "branch",
+            "resume",
+            "move",
+            "fork",
+            "export",
+            "dump",
+            "handoff",
+            "agents",
+            "role",
+            "persona",
+            "compact",
+            "rewind",
+            "checkpoint",
+            "ps",
+            "loop",
+            "goal",
+            "workflow",
+            "commit",
+            "code-review",
+            "btw",
+            "queue",
+            "live",
+            "skill",
+            "theme",
+            "thinking",
+            "todo",
+            "tree",
+            "trust",
+            "jobs",
+            "activity",
+            "irc",
         ]
     );
-    assert_eq!(PRIMARY_COMMAND_NAMES.len(), 23);
-    let visible = visible_catalog()
-        .into_iter()
-        .map(|command| command.name)
-        .collect::<Vec<_>>();
-    assert_eq!(visible, PRIMARY_COMMAND_NAMES);
+    assert_eq!(PRIMARY_COMMAND_NAMES.len(), 33);
+
+    let mut unique: Vec<&str> = PRIMARY_COMMAND_NAMES.to_vec();
+    let before = unique.len();
+    unique.sort_unstable();
+    unique.dedup();
     assert_eq!(
-        visible.iter().filter(|name| *name == "workflow").count(),
+        unique.len(),
+        before,
+        "PRIMARY_COMMAND_NAMES must have no duplicate entries"
+    );
+
+    let visible = visible_catalog();
+    let visible_names: Vec<String> = visible.iter().map(|command| command.name.clone()).collect();
+    assert_eq!(
+        visible_names, PRIMARY_COMMAND_NAMES,
+        "visible_catalog must equal PRIMARY_COMMAND_NAMES in source order"
+    );
+    assert!(
+        visible
+            .iter()
+            .all(|command| command.source == CommandSource::Builtin),
+        "every visible primary command must be backed by the builtin source"
+    );
+
+    assert_eq!(
+        visible
+            .iter()
+            .filter(|command| command.name == "workflow")
+            .count(),
         1,
         "workflow must appear exactly once in the primary surface"
     );
     assert!(is_primary_command("goal"));
+    assert!(is_primary_command("commit"));
     assert!(is_primary_command("workflow"));
-    assert!(is_primary_command("persona"), "persona is intentionally primary");
+    assert!(
+        is_primary_command("persona"),
+        "persona is intentionally primary"
+    );
+    assert!(!is_primary_command(concat!("todo", "-child")));
+    assert!(builtin(concat!("todo", "-child")).is_none());
+    assert_eq!(
+        visible
+            .iter()
+            .filter(|command| command.name == "todo")
+            .count(),
+        1,
+        "todo must appear exactly once in the primary surface"
+    );
+    assert_eq!(
+        usage(builtin("todo").expect("todo")),
+        "/todo [list|new [label]|select <id>|send [id] <message>|add <id> [options] <task>|status [id]|pause [id]|resume [id]|stop [id]|cancel [id]|archive <id>|start <task>|done <task>|drop <task>|clear|<markdown>]"
+    );
+    assert!(is_primary_command("activity"));
     assert!(!is_primary_command("workfloww"));
     assert!(!is_primary_command("skill:release"));
     assert!(!is_primary_command("help"));
@@ -512,7 +594,7 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
                         "ShareFailed must carry an actionable message"
                     );
                     assert!(
-                        message.contains("PI_OFFLINE"),
+                        message.contains("RPI_OFFLINE"),
                         "the offline contract must be the reported failure: {message}"
                     );
                     saw_failure = true;
@@ -567,7 +649,7 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
     // handoff — deterministic envelope renders a well-formed copyable block
     // without a model turn.
     {
-        let handoff = app.generate_handoff();
+        let handoff = app.generate_handoff().expect("handoff envelope");
         assert!(
             handoff.prose.is_none(),
             "envelope-only handoff must not run a provider call"
@@ -619,7 +701,10 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
     // theme — built-in theme catalog is non-empty and has an active name.
     {
         let themes = ThemeManager::load(Vec::new());
-        assert!(!themes.names().is_empty(), "theme catalog must not be empty");
+        assert!(
+            !themes.names().is_empty(),
+            "theme catalog must not be empty"
+        );
         assert!(
             !themes.active_name().is_empty(),
             "active theme name must be set"
@@ -629,7 +714,7 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
 
     // branch / fork — forkable message list is readable (empty is fine).
     {
-        let messages = app.fork_messages().expect("fork messages");
+        let messages = app.fork_messages(None, None).expect("fork messages").messages;
         assert!(
             messages.is_empty(),
             "fresh session has no forkable user messages: {messages:?}"
@@ -891,10 +976,7 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
         )
         .await
         .expect("cancel via subcommand");
-        assert_eq!(
-            sub_cancelled,
-            format!("cancelled loop {cancel_target_id}")
-        );
+        assert_eq!(sub_cancelled, format!("cancelled loop {cancel_target_id}"));
 
         let err = parse_interactive_loop_command("loop", Some("update only-id"))
             .expect_err("loop update needs interval or prompt");
@@ -907,12 +989,8 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
             ("delete", "delete requires id"),
             ("cancel", "cancel requires id"),
         ] {
-            let err = parse_interactive_loop_command("loop", Some(invocation))
-                .expect_err(label);
-            assert!(
-                err.to_string().contains("usage"),
-                "loop {label}: {err:#}"
-            );
+            let err = parse_interactive_loop_command("loop", Some(invocation)).expect_err(label);
+            assert!(err.to_string().contains("usage"), "loop {label}: {err:#}");
         }
         let err = parse_interactive_loop_command("loop", Some("create"))
             .expect_err("create requires interval + prompt");
@@ -984,7 +1062,10 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
         )
         .await
         .expect("goal pins after unpin");
-        assert_eq!(empty_pins, "no pins", "unpin must empty the pin list: {empty_pins}");
+        assert_eq!(
+            empty_pins, "no pins",
+            "unpin must empty the pin list: {empty_pins}"
+        );
         let paused = execute_interactive_goal_command(
             app,
             parse_interactive_goal_command(Some("pause")).expect("parse pause"),
@@ -1022,7 +1103,10 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
         let open = parse_interactive_workflow_command(None).expect("bare workflow");
         assert_eq!(open, InteractiveWorkflowCommand::OpenPage);
         // Panel-open precursor: OpenPage effect is the TUI handoff signal.
-        assert_eq!(WorkflowCommandEffect::OpenPage, WorkflowCommandEffect::OpenPage);
+        assert_eq!(
+            WorkflowCommandEffect::OpenPage,
+            WorkflowCommandEffect::OpenPage
+        );
 
         let list = parse_interactive_workflow_command(Some("list")).expect("list");
         assert_eq!(list, InteractiveWorkflowCommand::List);
@@ -1078,6 +1162,10 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
             "todo set must apply: {:?}",
             result.summary
         );
+        assert!(
+            builtin(concat!("todo", "-child")).is_none(),
+            "removed Todo child command must remain rejected"
+        );
         let listed = app.todo_state();
         assert!(
             !listed.phases.is_empty(),
@@ -1105,10 +1193,7 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
         let err = pi_cli::auth_commands::login(None, None, false)
             .await
             .expect_err("login requires provider outside TTY");
-        assert!(
-            err.to_string().contains("provider"),
-            "login error: {err:#}"
-        );
+        assert!(err.to_string().contains("provider"), "login error: {err:#}");
         let err = pi_cli::auth_commands::logout(None, None, false)
             .await
             .expect_err("logout requires provider outside TTY");
@@ -1122,7 +1207,7 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
 
     // llama — status fails clearly when router is unconfigured (no hang).
     {
-        let err = pi_cli::llama_commands::run_slash("status")
+        let err = pi_cli::llama_commands::run_slash("status", &app)
             .await
             .expect_err("unconfigured llama status");
         let message = err.to_string();
@@ -1132,7 +1217,7 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
                 || message.contains("llama"),
             "llama status error must be actionable: {message}"
         );
-        let err = pi_cli::llama_commands::run_slash("load")
+        let err = pi_cli::llama_commands::run_slash("load", &app)
             .await
             .expect_err("load requires model");
         assert!(
@@ -1195,6 +1280,22 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
         covered.insert("resume");
     }
 
+    // move — required-arg primary command; bare invocation surfaces the typed
+    // angle-bracket usage dispatch rejects with before any directory is touched.
+    {
+        let command = builtin("move").expect("move builtin");
+        assert_eq!(usage(command), "/move <absolute-existing-directory>");
+        assert!(
+            requires_arguments(command),
+            "move must remain a required-arg builtin"
+        );
+        assert!(
+            command.argument_hint.is_some(),
+            "move must advertise an <absolute-existing-directory> argument hint"
+        );
+        covered.insert("move");
+    }
+
     // ps / process — empty list, usage errors, start/stop bounded process.
     {
         let ps = execute_interactive_process_command(
@@ -1209,10 +1310,7 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
 
         let err = parse_interactive_process_command("process", None)
             .expect_err("process requires operation");
-        assert!(
-            err.to_string().contains("usage"),
-            "process usage: {err:#}"
-        );
+        assert!(err.to_string().contains("usage"), "process usage: {err:#}");
         let err = parse_interactive_process_command("process", Some("start"))
             .expect_err("start requires program");
         assert!(
@@ -1392,6 +1490,99 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
         );
         covered.insert("code-review");
     }
+    // commit — parse outcomes (bare picker / one ref / usage error) plus a
+    // pinned single-commit load on a real repo; reuses the code-review
+    // fixture repo above. Read-only: only list and snapshot readers run, so
+    // no product path here stages, checks out, or commits.
+    {
+        assert_eq!(
+            parse_commit_inspect_invocation(None),
+            Ok(CommitInspectInvocation::Picker)
+        );
+        assert_eq!(
+            parse_commit_inspect_invocation(Some("")),
+            Ok(CommitInspectInvocation::Picker)
+        );
+        assert_eq!(
+            parse_commit_inspect_invocation(Some("HEAD")),
+            Ok(CommitInspectInvocation::Commit {
+                reference: "HEAD".to_owned()
+            })
+        );
+        assert_eq!(
+            parse_commit_inspect_invocation(Some("a b")),
+            Err("Usage: /commit [<ref>]".to_owned())
+        );
+        assert!(is_primary_command("commit"));
+
+        let git = |args: &[&str]| {
+            let mut command = Command::new("git");
+            command.env_clear();
+            command
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(fixture.cwd.path())
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("HOME", fixture._home.path())
+                .env("USERPROFILE", fixture._home.path())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env(
+                    "GIT_CONFIG_GLOBAL",
+                    fixture.cwd.path().join("absent-global-git-config"),
+                )
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_AUTHOR_NAME", "Slash Dispatch")
+                .env("GIT_AUTHOR_EMAIL", "slash-dispatch@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Slash Dispatch")
+                .env("GIT_COMMITTER_EMAIL", "slash-dispatch@example.invalid");
+            let output = run_command_bounded(command);
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        std::fs::write(fixture.cwd.path().join("review.txt"), "after commit\n")
+            .expect("dirty review fixture");
+        git(&["add", "review.txt"]);
+        git(&["commit", "--no-verify", "-qm", "second commit for picker"]);
+
+        let list = pi_cli::code_review::list_recent_commits(fixture.cwd.path(), 5)
+            .expect("recent commit list");
+        assert_eq!(list.commits.len(), 2, "{:?}", list.commits);
+        assert!(!list.truncated);
+        assert_eq!(list.commits[0].subject, "second commit for picker");
+        assert_eq!(list.commits[0].parent_count, 1);
+        assert_eq!(list.commits[1].subject, "seed review fixture");
+
+        // /commit <ref> resolves once: the returned snapshot pins the scope
+        // to the immutable commit id, which refreshes must reuse.
+        let snapshot = pi_cli::code_review::load_review_snapshot_for(
+            fixture.cwd.path(),
+            pi_cli::code_review::ReviewScope::Commit {
+                commit: "HEAD".to_owned(),
+                label: String::new(),
+            },
+        );
+        assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+        assert!(
+            snapshot
+                .files
+                .iter()
+                .any(|file| file.path == "review.txt"),
+            "the pinned commit diff must contain the fixture file: {:?}",
+            snapshot.files
+        );
+        match &snapshot.scope {
+            pi_cli::code_review::ReviewScope::Commit { commit, label } => {
+                assert_ne!(commit, "HEAD", "scope must pin the resolved id");
+                assert!(!label.is_empty(), "core supplies the comparison label");
+                assert_eq!(list.commits[0].commit, *commit);
+            }
+            other => panic!("expected a pinned commit scope: {other:?}"),
+        }
+        covered.insert("commit");
+    }
 
     // btw — create the detached read-only side controller and cleanly shut it down.
     {
@@ -1488,8 +1679,8 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
             err.to_string().contains("usage"),
             "/persona run usage: {err:#}"
         );
-        let err = parse_interactive_persona_command(Some("reset"))
-            .expect_err("bare reset is a keyword");
+        let err =
+            parse_interactive_persona_command(Some("reset")).expect_err("bare reset is a keyword");
         assert!(
             err.to_string().contains("usage") || err.to_string().contains("persona"),
             "/persona reset keyword usage: {err:#}"
@@ -1561,10 +1752,7 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
         let command = builtin("leave").expect("leave builtin");
         assert_eq!(command.name, "leave");
         assert!(command.argument_hint.is_none());
-        assert!(
-            !requires_arguments(command),
-            "leave is a no-arg toggle"
-        );
+        assert!(!requires_arguments(command), "leave is a no-arg toggle");
         assert_eq!(usage(command), "/leave");
         covered.insert("leave");
     }
@@ -1585,12 +1773,46 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
         covered.insert("overlay");
     }
 
+    // team / thinking / jobs / activity / irc — TUI panel precursors: catalog
+    // presence, usage, and no-arg shape without starting a model turn.
+    {
+        let command = builtin("team").expect("team builtin");
+        assert!(!requires_arguments(command), "team is a no-arg panel command");
+        assert!(usage(command).starts_with("/team"));
+        covered.insert("team");
+    }
+    {
+        let command = builtin("thinking").expect("thinking builtin");
+        assert!(!requires_arguments(command), "thinking is a no-arg panel command");
+        assert_eq!(usage(command), "/thinking [off|minimal|low|medium|high|xhigh|max]");
+        covered.insert("thinking");
+    }
+    {
+        let command = builtin("jobs").expect("jobs builtin");
+        assert!(!requires_arguments(command), "jobs is a no-arg panel command");
+        assert_eq!(usage(command), "/jobs");
+        covered.insert("jobs");
+    }
+    {
+        let command = builtin("activity").expect("activity builtin");
+        assert!(!requires_arguments(command), "activity is a no-arg panel command");
+        assert_eq!(usage(command), "/activity");
+        covered.insert("activity");
+    }
+    {
+        let command = builtin("irc").expect("irc builtin");
+        assert!(!requires_arguments(command), "irc is a no-arg panel command");
+        assert_eq!(usage(command), "/irc");
+        covered.insert("irc");
+    }
+
     let expected = BUILTIN_COMMANDS
         .iter()
         .map(|command| command.name)
         .collect::<BTreeSet<_>>();
     assert_eq!(
-        covered, expected,
+        covered,
+        expected,
         "missing builtin coverage: {:?}; unexpected: {:?}",
         expected.difference(&covered).collect::<Vec<_>>(),
         covered.difference(&expected).collect::<Vec<_>>()
@@ -1610,7 +1832,10 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
 /// string shape the TUI surfaces via push_status (`Usage: /name <…>`).
 #[test]
 fn required_arg_builtins_render_tui_usage_status_shape() {
-    for command in BUILTIN_COMMANDS.iter().filter(|command| requires_arguments(command)) {
+    for command in BUILTIN_COMMANDS
+        .iter()
+        .filter(|command| requires_arguments(command))
+    {
         let status = format!("Usage: {}", usage(command));
         assert!(
             status.contains('<') && status.starts_with("Usage: /"),
@@ -1669,16 +1894,36 @@ async fn import_missing_path_is_typed_error() {
 struct RecordedFixture {
     cwd: TempDir,
     sessions: TempDir,
+    _agent: TempDir,
     application: Application,
+    registration: pi_ai::providers::FauxProviderRegistration,
 }
 
 impl RecordedFixture {
     async fn new(tag: &str, messages: &[&str]) -> Self {
         let cwd = TempDir::new().expect("cwd");
         let sessions = TempDir::new().expect("sessions");
+        let agent = TempDir::new().expect("agent");
+        let agent_dir = agent.path().to_path_buf();
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            br#"{"sandbox":{"mode":"danger-full-access"}}"#,
+        )
+        .expect("settings");
+        let mut model = Model::default();
+        model.id = format!("faux-recorded-{tag}");
+        model.api = format!("faux-recorded-{tag}");
+        model.provider = "faux".into();
+        model.base_url = "http://127.0.0.1:1".into();
+        let registration = register_faux_provider(FauxProviderOptions {
+            api: model.api.clone(),
+            provider: model.provider.clone(),
+            models: vec![model.clone()],
+            chunk_size: 4,
+        });
         let recorder = pi_coding::start_session_in(
             cwd.path(),
-            None,
+            Some(&model),
             Some("off"),
             Some(sessions.path()),
             Some(tag),
@@ -1692,11 +1937,11 @@ impl RecordedFixture {
         }
         recorder.persist_now().expect("persist session");
         let session = Session::new(SessionOptions {
-            model: Model::default(),
+            model,
             cwd: cwd.path().to_path_buf(),
             system_prompt: String::new(),
             thinking_level: ThinkingLevel::Off,
-            api_key: String::new(),
+            api_key: "faux".into(),
             compaction: None,
             stream_options: Default::default(),
             tools: Some(Vec::new()),
@@ -1704,15 +1949,33 @@ impl RecordedFixture {
             after_tool_call: None,
             stream_fn: None,
             auth_resolver: None,
+            auth_manager: None,
         })
         .expect("session");
+        let mut resource_options = pi_coding::ResourceManagerOptions::new(cwd.path());
+        resource_options.agent_dir = agent_dir;
+        resource_options.project_trust_override = Some(true);
+        resource_options.disable_extensions = true;
+        resource_options.disable_skills = true;
+        resource_options.disable_prompt_templates = true;
+        resource_options.disable_themes = true;
+        resource_options.disable_context_files = true;
+        resource_options.headless = true;
+        session
+            .attach_resources(
+                pi_coding::ResourceManager::new(resource_options).expect("resource manager"),
+            )
+            .await
+            .expect("attach resources");
         session.set_session_dir(sessions.path().to_path_buf());
         session.record(recorder).expect("attach recorder");
         let application = Application::new(session).await;
         Self {
             cwd,
             sessions,
+            _agent: agent,
             application,
+            registration,
         }
     }
 }
@@ -1739,8 +2002,14 @@ async fn rewind_by_index_truncates_journal_and_archives_tail() {
         .rewind(pi_coding::RewindTarget::Index(keep))
         .await
         .expect("rewind by index");
-    assert_eq!(outcome.retained_entries, keep, "retained count must match the cut");
-    assert_eq!(outcome.dropped_entries, 2, "two tail records must be dropped");
+    assert_eq!(
+        outcome.retained_entries, keep,
+        "retained count must match the cut"
+    );
+    assert_eq!(
+        outcome.dropped_entries, 2,
+        "two tail records must be dropped"
+    );
     assert!(
         outcome.archive_path.exists(),
         "the truncated tail must be archived to a sidecar file"
@@ -1755,8 +2024,14 @@ async fn rewind_by_index_truncates_journal_and_archives_tail() {
 
     // The archived tail must contain the dropped message text verbatim.
     let archive = std::fs::read_to_string(&outcome.archive_path).expect("read archive");
-    assert!(archive.contains("three"), "archive must hold the dropped 'three' record");
-    assert!(archive.contains("four"), "archive must hold the dropped 'four' record");
+    assert!(
+        archive.contains("three"),
+        "archive must hold the dropped 'three' record"
+    );
+    assert!(
+        archive.contains("four"),
+        "archive must hold the dropped 'four' record"
+    );
 
     app.cleanup().await;
 }
@@ -1790,9 +2065,9 @@ async fn checkpoint_then_rewind_by_name_round_trips() {
         Some("snap"),
         "the resolved checkpoint name must round-trip"
     );
-    // Journal: header, one, two, checkpoint-marker, note, note (6 entries).
-    // The checkpoint targets 'two' (index 2), so keep = 3 (header, one, two).
-    assert_eq!(outcome.retained_entries, 3);
+    // The recorder inserts a model-change entry before the two messages, so
+    // rewinding to the second message retains four journal records.
+    assert_eq!(outcome.retained_entries, 4);
     assert_eq!(outcome.dropped_entries, 3);
 
     // An unknown checkpoint name must surface an actionable error, not panic.
@@ -1864,7 +2139,10 @@ async fn share_encrypt_round_trips_to_encrypted_file() {
         .share_session_encrypted("correct horse battery", Some(&enc_path))
         .await
         .expect("encrypted share");
-    assert_eq!(result.ciphertext_path, enc_path, "ciphertext must land at the requested path");
+    assert_eq!(
+        result.ciphertext_path, enc_path,
+        "ciphertext must land at the requested path"
+    );
     assert!(enc_path.exists(), "the .jsonl.enc file must be written");
 
     let bytes = std::fs::read(&enc_path).expect("read enc");
@@ -1927,7 +2205,10 @@ async fn fresh_archives_current_session_and_switches_recorder() {
             .clone()
             .expect("session must be recording to a file"),
     );
-    assert!(before_file.exists(), "the source session file must exist before /fresh");
+    assert!(
+        before_file.exists(),
+        "the source session file must exist before /fresh"
+    );
 
     assert!(
         pi_cli::interactive_commands::execute_fresh(app)

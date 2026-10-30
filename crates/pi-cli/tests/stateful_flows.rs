@@ -72,6 +72,7 @@ fn session_options(model: Model, cwd: &Path, thinking: ThinkingLevel) -> Session
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: None,
+        auth_manager: None,
     }
 }
 
@@ -101,7 +102,11 @@ async fn application_with_resources(
 
     fs::create_dir_all(agent_dir).expect("agent dir");
     if !agent_dir.join("settings.json").exists() {
-        fs::write(agent_dir.join("settings.json"), "{}").expect("seed global settings");
+        fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+        )
+        .expect("seed global settings");
     }
     let mut options = ResourceManagerOptions::new(cwd);
     options.agent_dir = agent_dir.to_path_buf();
@@ -113,6 +118,9 @@ async fn application_with_resources(
     options.disable_context_files = true;
     let resources = ResourceManager::new(options).expect("resources");
     let session = Session::new(session_options(model, cwd, thinking)).expect("session");
+    let session_dir = cwd.join("sessions");
+    fs::create_dir_all(&session_dir).expect("session directory");
+    session.set_session_dir(session_dir);
     session
         .attach_resources(resources)
         .await
@@ -129,6 +137,7 @@ async fn recorded_application(
     responses: Vec<FauxResponse>,
     session_id: &str,
 ) -> (Application, FauxProviderRegistration, PathBuf) {
+    fs::create_dir_all(session_dir).expect("session directory");
     let (model, registration) = {
         let mut model = model;
         let suffix = unique("recorded");
@@ -185,15 +194,21 @@ async fn recorded_application(
     (application, registration, path)
 }
 
-fn usage_stream_session(cwd: &Path, usage: Usage) -> Session {
+fn usage_stream_session(cwd: &Path, usage: Usage) -> (Session, FauxProviderRegistration) {
     let model = Model {
         id: unique("goal-usage-model"),
         name: "Goal Usage Model".into(),
         api: unique("goal-usage-api"),
         provider: unique("goal-usage-provider"),
-        base_url: "http://localhost:0".into(),
+        base_url: "http://127.0.0.1:1".into(),
         ..Model::default()
     };
+    let registration = register_faux_provider(FauxProviderOptions {
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+        models: vec![model.clone()],
+        chunk_size: 4,
+    });
     let stream_fn: pi_agent::StreamFn = Arc::new(move |model, _context, _options| {
         let usage = usage.clone();
         Box::pin(async move {
@@ -209,7 +224,7 @@ fn usage_stream_session(cwd: &Path, usage: Usage) -> Session {
             stream
         })
     });
-    Session::new(SessionOptions {
+    let mut options = SessionOptions {
         model,
         cwd: cwd.to_path_buf(),
         system_prompt: String::new(),
@@ -222,8 +237,18 @@ fn usage_stream_session(cwd: &Path, usage: Usage) -> Session {
         after_tool_call: None,
         stream_fn: Some(stream_fn),
         auth_resolver: None,
-    })
-    .expect("usage session")
+        auth_manager: None,
+    };
+    options.auth_resolver = Some(Arc::new(|_model: Model| {
+        Box::pin(async move {
+            Ok(RequestAuth {
+                api_key: "faux".into(),
+                ..Default::default()
+            })
+        })
+    }));
+    let session = Session::new(options).expect("usage session");
+    (session, registration)
 }
 
 fn parse_settings(argument: &str) -> InteractiveSettingsCommand {
@@ -310,8 +335,18 @@ async fn settings_adapter_persists_project_and_global_scopes_with_restart_truth(
         &application,
         InteractiveSettingsCommand::Apply {
             scope: pi_coding::SettingsScope::Global,
+            key: "defaultModel".into(),
+            value: json!("anthropic/claude-sonnet-4-5:high"),
+        },
+    )
+    .await
+    .expect("apply restart model");
+    let restart = execute_interactive_settings_command(
+        &application,
+        InteractiveSettingsCommand::Apply {
+            scope: pi_coding::SettingsScope::Global,
             key: "defaultProvider".into(),
-            value: json!("future-provider"),
+            value: json!("anthropic"),
         },
     )
     .await
@@ -323,9 +358,10 @@ async fn settings_adapter_persists_project_and_global_scopes_with_restart_truth(
 
     let global = read_json(&agent_dir.join("settings.json"));
     assert_eq!(global["compaction"]["enabled"], false);
-    assert_eq!(global["defaultProvider"], "future-provider");
+    assert_eq!(global["defaultProvider"], "anthropic");
+    assert_eq!(global["defaultModel"], "anthropic/claude-sonnet-4-5:high");
 
-    let project = read_json(&cwd.path().join(".pi").join("settings.json"));
+    let project = read_json(&cwd.path().join(".rpi").join("settings.json"));
     assert_eq!(project["quietStartup"], true);
     assert!(
         project.get("defaultProvider").is_none(),
@@ -348,12 +384,16 @@ async fn settings_adapter_persists_project_and_global_scopes_with_restart_truth(
     .expect("reload resources");
     let snapshot = reloaded.snapshot();
     let settings = &snapshot.settings;
-    assert_eq!(settings.default_provider.as_deref(), Some("future-provider"));
     assert_eq!(
-        settings
-            .compaction
-            .as_ref()
-            .and_then(|value| value.enabled),
+        settings.default_provider.as_deref(),
+        Some("anthropic")
+    );
+    assert_eq!(
+        settings.default_model.as_deref(),
+        Some("anthropic/claude-sonnet-4-5:high")
+    );
+    assert_eq!(
+        settings.compaction.as_ref().and_then(|value| value.enabled),
         Some(false)
     );
     assert_eq!(settings.quiet_startup, Some(true));
@@ -485,7 +525,11 @@ async fn loop_adapter_restores_durable_tasks_and_avoids_double_fire() {
         .expect("switch back");
     assert!(!back.cancelled);
     let restored = application.loop_list().await.expect("restored loops");
-    assert_eq!(restored.len(), 1, "only durable loops restore: {restored:?}");
+    assert_eq!(
+        restored.len(),
+        1,
+        "only durable loops restore: {restored:?}"
+    );
     assert_eq!(restored[0].id, durable.id);
     assert_eq!(restored[0].prompt, "durable checkpoint");
     assert!(restored[0].durable);
@@ -503,10 +547,7 @@ async fn loop_adapter_restores_durable_tasks_and_avoids_double_fire() {
     ));
     assert!(loops_file.exists(), "durable loop state file must exist");
     let persisted = read_json(&loops_file);
-    let tasks = persisted["tasks"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let tasks = persisted["tasks"].as_array().cloned().unwrap_or_default();
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0]["id"], durable.id);
     assert_eq!(tasks[0]["prompt"], "durable checkpoint");
@@ -578,8 +619,10 @@ async fn model_and_thinking_runtime_clamp_and_next_turn_observe_change() {
         after_tool_call: None,
         stream_fn: Some(stream_fn),
         auth_resolver: None,
+        auth_manager: None,
     })
     .expect("session");
+    session.set_session_dir(session_dir.path().to_path_buf());
     let recorder = pi_coding::start_session_in(
         cwd.path(),
         Some(&reasoning),
@@ -681,7 +724,7 @@ async fn model_and_thinking_runtime_clamp_and_next_turn_observe_change() {
 async fn goal_adapter_projects_active_goal_and_pauses_at_budget_boundary() {
     let cwd = TempDir::new().expect("cwd");
     let session_dir = TempDir::new().expect("session dir");
-    let session = usage_stream_session(
+    let (session, _session_registration) = usage_stream_session(
         cwd.path(),
         Usage {
             input: 5,
@@ -692,6 +735,7 @@ async fn goal_adapter_projects_active_goal_and_pauses_at_budget_boundary() {
             ..Usage::default()
         },
     );
+    session.set_session_dir(session_dir.path().to_path_buf());
     let recorder = pi_coding::start_session_in(
         cwd.path(),
         session.model().as_ref(),
@@ -741,7 +785,9 @@ async fn goal_adapter_projects_active_goal_and_pauses_at_budget_boundary() {
 
     // Same-CWD resume rebuilds the goal runtime and keeps a budget-paused goal
     // paused (no auto-continue).
-    let resumed_session = usage_stream_session(cwd.path(), Usage::default());
+    let (resumed_session, _resumed_registration) =
+        usage_stream_session(cwd.path(), Usage::default());
+    resumed_session.set_session_dir(session_dir.path().to_path_buf());
     resumed_session
         .record(pi_coding::resume_session(&session_path).expect("resume recorder"))
         .expect("attach resume");
@@ -765,7 +811,8 @@ async fn goal_adapter_projects_active_goal_and_pauses_at_budget_boundary() {
 
     // Active-goal resume safety: create a fresh active goal, switch, and prove
     // resume pauses it with ResumeSafety rather than auto-continuing.
-    let active_session = usage_stream_session(cwd.path(), Usage::default());
+    let (active_session, _active_registration) = usage_stream_session(cwd.path(), Usage::default());
+    active_session.set_session_dir(session_dir.path().to_path_buf());
     let active_recorder = pi_coding::start_session_in(
         cwd.path(),
         active_session.model().as_ref(),
@@ -776,14 +823,17 @@ async fn goal_adapter_projects_active_goal_and_pauses_at_budget_boundary() {
     )
     .expect("active recorder");
     let active_path = active_recorder.path();
-    active_session.record(active_recorder).expect("attach active");
+    active_session
+        .record(active_recorder)
+        .expect("attach active");
     let active_app = Application::new(active_session).await;
     let original = active_app
         .goal_create("stay paused on resume", Some(50))
         .expect("create active");
     assert_eq!(original.lifecycle, GoalLifecycle::Active);
 
-    let safety_session = usage_stream_session(cwd.path(), Usage::default());
+    let (safety_session, _safety_registration) = usage_stream_session(cwd.path(), Usage::default());
+    safety_session.set_session_dir(session_dir.path().to_path_buf());
     safety_session
         .record(pi_coding::resume_session(&active_path).expect("resume active"))
         .expect("attach safety");
@@ -984,7 +1034,13 @@ async fn same_cwd_session_tree_branch_fork_clone_and_resume_lineage() {
     );
 
     // new_session resets the live transcript while remaining in the same CWD.
-    assert!(!application.new_session().await.expect("new session").cancelled);
+    assert!(
+        !application
+            .new_session()
+            .await
+            .expect("new session")
+            .cancelled
+    );
     let fresh = application.state().await;
     assert_eq!(fresh.message_count, 0);
     assert!(application.messages().is_empty());
@@ -1023,16 +1079,18 @@ async fn settings_inspect_and_search_are_read_only() {
     .await;
 
     let before = fs::read(agent_dir.join("settings.json")).expect("before");
-    let inspect = execute_interactive_settings_command(
-        &application,
-        parse_settings("list --global"),
-    )
-    .await
-    .expect("inspect");
+    let inspect =
+        execute_interactive_settings_command(&application, parse_settings("list --global"))
+            .await
+            .expect("inspect");
     assert!(inspect.contains("compaction.enabled"), "{inspect}");
     assert!(
-        inspect.to_ascii_lowercase().contains("\"scope\": \"global\"")
-            || inspect.to_ascii_lowercase().contains("\"scope\":\"global\""),
+        inspect
+            .to_ascii_lowercase()
+            .contains("\"scope\": \"global\"")
+            || inspect
+                .to_ascii_lowercase()
+                .contains("\"scope\":\"global\""),
         "{inspect}"
     );
 
@@ -1061,13 +1119,16 @@ async fn goal_adapter_lifecycle_commands_are_coherent() {
     let (model, registration) = faux_model("goal-life", false);
     let session =
         Session::new(session_options(model, cwd.path(), ThinkingLevel::Off)).expect("session");
+    let session_dir = cwd.path().join("sessions");
+    fs::create_dir_all(&session_dir).expect("session directory");
+    session.set_session_dir(session_dir.clone());
     session
         .record(
             pi_coding::start_session_in(
                 cwd.path(),
                 session.model().as_ref(),
                 Some("off"),
-                Some(cwd.path()),
+                Some(&session_dir),
                 Some("goal-life"),
                 None,
             )
@@ -1086,13 +1147,19 @@ async fn goal_adapter_lifecycle_commands_are_coherent() {
     )
     .await
     .expect("create");
-    assert_eq!(created, "Goal work started · active · 0/20 tokens · adapter goal");
+    assert_eq!(
+        created,
+        "Goal work started · active · 0/20 tokens · adapter goal"
+    );
     application.wait_for_idle().await;
 
     let paused = execute_interactive_goal_command(&application, InteractiveGoalCommand::Pause)
         .await
         .expect("pause");
-    assert_eq!(paused, "paused (manually paused) · 0/20 tokens · adapter goal");
+    assert_eq!(
+        paused,
+        "paused (manually paused) · 0/20 tokens · adapter goal"
+    );
     assert_eq!(
         application.goal_state().current.expect("goal").pause_reason,
         Some(GoalPauseReason::Manual)
@@ -1102,16 +1169,21 @@ async fn goal_adapter_lifecycle_commands_are_coherent() {
     application
         .goal_update_usage(GoalUsageDelta::new(4, 1))
         .expect("usage while paused");
-    let still_paused =
-        execute_interactive_goal_command(&application, InteractiveGoalCommand::Show)
-            .await
-            .expect("show paused");
-    assert_eq!(still_paused, "paused (manually paused) · 4/20 tokens · adapter goal");
+    let still_paused = execute_interactive_goal_command(&application, InteractiveGoalCommand::Show)
+        .await
+        .expect("show paused");
+    assert_eq!(
+        still_paused,
+        "paused (manually paused) · 4/20 tokens · adapter goal"
+    );
 
     let resumed = execute_interactive_goal_command(&application, InteractiveGoalCommand::Resume)
         .await
         .expect("resume");
-    assert_eq!(resumed, "Goal work started · active · 4/20 tokens · adapter goal");
+    assert_eq!(
+        resumed,
+        "Goal work started · active · 4/20 tokens · adapter goal"
+    );
     assert!(matches!(
         application.goal_continuation_decision(),
         GoalContinuationDecision::Continue {

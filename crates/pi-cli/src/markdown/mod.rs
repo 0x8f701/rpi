@@ -21,13 +21,15 @@ mod tests {
 
     #[test]
     fn table_alignment_golden() {
+        // Columns shrink to natural content width (Web parity) rather than
+        // stretching to the full available width; alignment still applies.
         let output = render(
             "| left | middle | right |\n| :--- | :---: | ---: |\n| a | b | c |",
             28,
         );
         assert_eq!(
             output.plain_text(),
-"┌───────┬─────────┬────────┐\n│ left  │ middle  │  right │\n├───────┼─────────┼────────┤\n│ a     │    b    │      c │\n└───────┴─────────┴────────┘"
+            "┌──────┬────────┬───────┐\n│ left │ middle │ right │\n├──────┼────────┼───────┤\n│ a    │   b    │     c │\n└──────┴────────┴───────┘"
         );
     }
 
@@ -42,7 +44,7 @@ mod tests {
         }
         assert_eq!(
             output.plain_text(),
-"┌─────────┬───────┐\n│ Name    │  Stat │\n├─────────┼───────┤\n│ Tokyo   │    ✅ │\n│ rocket  │    🚀 │\n└─────────┴───────┘"
+            "┌────────┬──────┐\n│ Name   │ Stat │\n├────────┼──────┤\n│ Tokyo  │   ✅ │\n│ rocket │   🚀 │\n└────────┴──────┘"
         );
     }
 
@@ -54,7 +56,7 @@ mod tests {
         );
         assert_eq!(
             output.plain_text(),
-"┌─────┬─────┐\n│ ite │ det │\n│ m   │ ail │\n├─────┼─────┤\n│ alp │ one │\n│ ha  │ two │\n│     │ thr │\n│     │ ee  │\n└─────┴─────┘"
+            "┌─────┬─────┐\n│ ite │ det │\n│ m   │ ail │\n├─────┼─────┤\n│ alp │ one │\n│ ha  │ two │\n│     │ thr │\n│     │ ee  │\n└─────┴─────┘"
         );
         assert!(
             output
@@ -78,10 +80,7 @@ mod tests {
     #[test]
     fn malformed_and_streaming_tables_stay_plain() {
         let malformed = render("| a | b |\n| -- | --- |\n| c | d |", 20);
-        assert_eq!(
-            malformed.plain_text(),
-            "| a | b |\n| -- | --- |\n| c | d |"
-        );
+        assert_eq!(malformed.plain_text(), "| a | b |\n| -- | --- |\n| c | d |");
 
         let streaming = render_markdown_streaming(
             "| a | b |\n| --- | --- |",
@@ -98,10 +97,18 @@ mod tests {
         let document = analyze_markdown(
             "# Header\n\n- [x] done\n  2. next\n\n````markdown\n```mermaid\nflowchart TD\n```\n````",
         );
-        assert!(matches!(document.blocks[0], MarkdownBlock::Heading { level: 1, .. }));
+        assert!(matches!(
+            document.blocks[0],
+            MarkdownBlock::Heading { level: 1, .. }
+        ));
         assert!(matches!(document.blocks[2], MarkdownBlock::List { .. }));
         match &document.blocks[4] {
-            MarkdownBlock::FencedCode { info, source, closed, .. } => {
+            MarkdownBlock::FencedCode {
+                info,
+                source,
+                closed,
+                ..
+            } => {
                 assert_eq!(info, "markdown");
                 assert!(source.contains("```mermaid"));
                 assert!(*closed);
@@ -116,9 +123,13 @@ mod tests {
             "```mermaid\nflowchart LR\nA[Start] -->|ok| B{Ready}\nB --> C((Ship))\n```",
             32,
         );
+        // Canvas renderer: LR flowchart at width 32 exceeds the cell budget,
+        // so it splits into two numbered panels with a boundary row for the
+        // cross-panel edge. Arrows overwrite target borders (▶B), and edge
+        // labels appear as bracketed glyphs on the canvas ([ok]).
         assert_eq!(
             output.plain_text(),
-            "┌─ mermaid · flowchart\n│ flowchart LR\n│ ┌─────────┐\n│ │A · Start│\n│ └─────────┘\n│ ◇ B · Ready ◇\n│ (C · Ship)\n│ edges\n│ A ─ok─▶ B\n│ B ───▶ C\n└─"
+            "┌─ mermaid · flowchart [part 1/…\n│ flowchart LR\n│ ┌─────────┐\n│ │A · Start├─[ok]─▶ B · Ready ◇\n│ └─────────┘\n│ boundary: B → … C\n└─\n┌─ mermaid · flowchart [part 2/…\n│ (C · Ship)\n└─"
         );
         assert!(output.diagnostics.is_empty());
     }
@@ -129,11 +140,53 @@ mod tests {
             "```mermaid\nsequenceDiagram\nparticipant A as Alice\nactor B as Bob\nA ->> B: hello\nB -->> A: ack\nA -) B: ping\nB --> A: pong\nA -x B: quit\nnote over A, B: working\nA => B: hmm\n```",
             48,
         );
-        assert_eq!(
-            output.plain_text(),
-            "┌─ mermaid · sequenceDiagram\n│ sequenceDiagram\n│ Alice ── Bob\n│ ────────────\n│ │ Alice │──▶│ Bob : hello │\n│ │ Bob   │···▶│ Alice : ack │\n│ │ Alice │──○│ Bob : ping │\n│ │ Bob   │···│ Alice : pong │\n│ │ Alice │──✕│ Bob : quit │\n│ │ [note over A, B: working] │\n│ │ A => B: hmm │\n└─"
+        // Canvas renderer: sequence diagrams render as a topology canvas with
+        // participant boxes, lifelines, and arrow lines connecting them. The
+        // old table-like projection (│ Alice │──▶│ Bob : hello │) is gone.
+        let text = output.plain_text();
+        assert!(text.contains("┌─ mermaid · sequenceDiagram"), "{text}");
+        assert!(text.contains("sequenceDiagram"), "{text}");
+        assert!(text.contains("Alice"), "{text}");
+        assert!(text.contains("Bob"), "{text}");
+        assert!(text.contains("hello"), "{text}");
+        assert!(text.contains("ack"), "{text}");
+        assert!(text.contains("ping"), "{text}");
+        assert!(text.contains("pong"), "{text}");
+        assert!(text.contains("quit"), "{text}");
+        assert!(text.contains("[note over A, B: working]"), "{text}");
+        assert!(text.contains("A => B: hmm"), "{text}");
+        assert!(text.contains('▶') && text.contains('◀'), "{text}");
+        assert!(text.contains('○'), "{text}");
+        assert!(text.contains('✕'), "{text}");
+        assert!(
+            !text.contains("│ Alice │──▶│"),
+            "legacy sequence projection leaked: {text}"
         );
-        assert!(output.diagnostics.is_empty());
+        // Single card, bounded width.
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.contains("┌─ mermaid ·"))
+                .count(),
+            1,
+            "{text}"
+        );
+        assert_eq!(
+            output
+                .lines
+                .iter()
+                .filter(|line| line.role == LineRole::MermaidBorder && line.text == "└─")
+                .count(),
+            1,
+            "{text}"
+        );
+        for line in &output.lines {
+            assert!(
+                UnicodeWidthStr::width(line.text.as_str()) <= 48,
+                "line exceeds width 48: {:?}",
+                line.text
+            );
+        }
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
     }
 
     #[test]
@@ -148,14 +201,18 @@ mod tests {
             },
         );
         assert_eq!(streamed.plain_text(), full.plain_text());
-        assert!(streamed.plain_text().contains("┌─ mermaid · sequenceDiagram"));
+        assert!(
+            streamed
+                .plain_text()
+                .contains("┌─ mermaid · sequenceDiagram")
+        );
     }
 
     #[test]
     fn unsupported_mermaid_kind_returns_visible_source_and_diagnostic() {
         let source = "gantt\ntitle A Gantt Diagram";
         let output = render(&format!("```mermaid\n{source}\n```"), 40);
-        assert!(output.plain_text().contains("┌─ mermaid · source fallback"));
+        assert!(output.plain_text().contains("mermaid · source fallback"));
         assert!(output.plain_text().contains("title A Gantt Diagram"));
         assert!(output.plain_text().contains("Only flowchart/graph"));
         assert!(matches!(
@@ -220,7 +277,14 @@ mod tests {
     #[test]
     fn compact_mermaid_edges_parse_without_spaces() {
         let chart = parse_mermaid("flowchart TD\nA-->B", MermaidLimits::default()).unwrap();
-        assert_eq!(chart.nodes.iter().map(|node| node.id.as_str()).collect::<Vec<_>>(), vec!["A", "B"]);
+        assert_eq!(
+            chart
+                .nodes
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["A", "B"]
+        );
         assert_eq!(chart.edges.len(), 1);
     }
 
@@ -301,7 +365,9 @@ mod tests {
         renderer.push_str("\n|Rust|multi-paradigm|");
         let final_text = renderer.output().plain_text();
         assert!(
-            final_text.contains('┌') && final_text.contains("Language") && final_text.contains("Rust"),
+            final_text.contains('┌')
+                && final_text.contains("Language")
+                && final_text.contains("Rust"),
             "completed table must render once: {final_text:?}"
         );
         assert_eq!(
@@ -343,7 +409,6 @@ mod tests {
         }
         assert_eq!(safe.output().plain_text(), expected);
     }
-
 
     #[test]
     fn unclosed_mermaid_fence_stays_visible_during_streaming() {
@@ -402,8 +467,16 @@ mod tests {
             roles.len() >= 4,
             "table must render top/separator/bottom borders plus content: {roles:?}"
         );
-        assert_eq!(roles.first(), Some(&LineRole::TableBorder), "top border: {roles:?}");
-        assert_eq!(roles.last(), Some(&LineRole::TableBorder), "bottom border: {roles:?}");
+        assert_eq!(
+            roles.first(),
+            Some(&LineRole::TableBorder),
+            "top border: {roles:?}"
+        );
+        assert_eq!(
+            roles.last(),
+            Some(&LineRole::TableBorder),
+            "bottom border: {roles:?}"
+        );
 
         // The single separator border is the only TableBorder between the ends.
         let separator = roles[1..roles.len() - 1]
@@ -413,12 +486,20 @@ mod tests {
             .expect("separator border between header and body");
         let header_roles = &roles[1..separator];
         let body_roles = &roles[separator + 1..roles.len() - 1];
-        assert!(!header_roles.is_empty(), "header section must wrap content: {roles:?}");
         assert!(
-            header_roles.iter().all(|role| *role == LineRole::TableHeader),
+            !header_roles.is_empty(),
+            "header section must wrap content: {roles:?}"
+        );
+        assert!(
+            header_roles
+                .iter()
+                .all(|role| *role == LineRole::TableHeader),
             "header section must be all TableHeader: {roles:?}"
         );
-        assert!(!body_roles.is_empty(), "body section must wrap content: {roles:?}");
+        assert!(
+            !body_roles.is_empty(),
+            "body section must wrap content: {roles:?}"
+        );
         assert!(
             body_roles.iter().all(|role| *role == LineRole::TableBody),
             "body section must be all TableBody: {roles:?}"
@@ -473,7 +554,7 @@ mod tests {
         );
         assert_eq!(
             output.plain_text(),
-"┌────────────────────┬─────────────────┐\n│ a                  │ b               │\n├────────────────────┼─────────────────┤\n│ x|y                │ z               │\n│ p|q                │ r               │\n└────────────────────┴─────────────────┘"
+            "┌─────┬───┐\n│ a   │ b │\n├─────┼───┤\n│ x|y │ z │\n│ p|q │ r │\n└─────┴───┘"
         );
     }
 
@@ -490,10 +571,7 @@ mod tests {
         assert_eq!(UnicodeWidthStr::width(conj.plain_text().as_str()), 2);
 
         let family = "👩\u{200d}👩\u{200d}👧\u{200d}👦";
-        let table = render(
-            &format!("| n | i |\n| --- | ---: |\n| z | {family} |"),
-            16,
-        );
+        let table = render(&format!("| n | i |\n| --- | ---: |\n| z | {family} |"), 16);
         assert!(
             table
                 .plain_lines()
@@ -508,8 +586,9 @@ mod tests {
     #[test]
     fn mermaid_edge_and_output_cell_limits_are_enforced() {
         // Contract: complexity budgets fail closed with source fallback rather
-        // than silently dropping edges; output-cell budgets never fall back —
-        // supported flowcharts split into bounded numbered panels instead.
+        // than silently dropping edges; an output-cell budget too small for a
+        // single node panel also fails closed with an OutputLimit source
+        // fallback (no silent split into sub-cell panels).
         let edges = render_markdown(
             "```mermaid\nflowchart TD\nA --> B\n```",
             &MarkdownRenderOptions {
@@ -545,20 +624,29 @@ mod tests {
                 ..MarkdownRenderOptions::default()
             },
         );
-        assert!(!cells.plain_text().contains("source fallback"));
-        assert!(cells.diagnostics.is_empty(), "{:?}", cells.diagnostics);
-        assert_eq!(
-            cells
-                .plain_text()
-                .lines()
-                .filter(|line| line.starts_with("┌─ mermaid · flowchart"))
-                .count(),
-            2,
-            "a two-node graph under a 1-cell budget must render two panels: {}",
+        // max_output_cells=1 is too small for even a single node panel, so
+        // the flowchart falls back to the source with an OutputLimit
+        // diagnostic rather than splitting into sub-cell panels.
+        assert!(
+            cells.plain_text().contains("source fallback"),
+            "{}",
             cells.plain_text()
         );
-        assert!(cells.plain_text().contains("[part 1/2]"), "{}", cells.plain_text());
-        assert!(cells.plain_text().contains("[part 2/2]"), "{}", cells.plain_text());
+        assert!(
+            cells.plain_text().contains("A[One] --> B[Two]"),
+            "{}",
+            cells.plain_text()
+        );
+        assert!(matches!(
+            cells.diagnostics.as_slice(),
+            [RenderDiagnostic::Mermaid {
+                diagnostic: MermaidDiagnostic {
+                    kind: MermaidDiagnosticKind::OutputLimit,
+                    ..
+                },
+                ..
+            }]
+        ));
     }
 
     #[test]
@@ -582,14 +670,40 @@ mod tests {
         // executable diagram chrome.
         let accepted = render("```mermaid-js\nflowchart TD\nA --> B\n```", 30);
         assert!(accepted.plain_text().contains("mermaid · flowchart"));
-        assert!(accepted.plain_text().contains("A ───▶ B"));
+        // Canvas renderer: TD (vertical) arrows are ▼, not ▶; the canvas has
+        // no literal "edges" section — every non-border line is MermaidNode.
+        assert!(
+            accepted.plain_text().contains("A · A"),
+            "{:?}",
+            accepted.plain_text()
+        );
+        assert!(
+            accepted.plain_text().contains("B · B"),
+            "{:?}",
+            accepted.plain_text()
+        );
+        assert!(
+            accepted.plain_text().contains('▼'),
+            "{:?}",
+            accepted.plain_text()
+        );
+        assert!(
+            !accepted
+                .plain_text()
+                .lines()
+                .any(|line| line.trim() == "│ edges")
+        );
         assert!(accepted.diagnostics.is_empty());
         assert_eq!(accepted.lines[0].role, LineRole::MermaidBorder);
         assert_eq!(accepted.lines[1].role, LineRole::MermaidNode);
-        assert!(accepted
-            .lines
-            .iter()
-            .any(|line| line.role == LineRole::MermaidEdge && line.text.contains('▶')));
+        // All non-border lines carry MermaidNode (canvas renderer).
+        assert!(
+            accepted
+                .lines
+                .iter()
+                .filter(|line| line.role == LineRole::MermaidNode)
+                .any(|line| line.text.contains('▼'))
+        );
 
         let rejected = render("```notmermaid\nflowchart TD\nA --> B\n```", 40);
         assert!(rejected.plain_text().contains("╭── code · notmermaid"));
@@ -640,7 +754,14 @@ mod tests {
         assert!(first.diagnostics.is_empty());
         assert!(first.plain_text().contains("Tokyo"));
         assert!(first.plain_text().contains("flowchart RL"));
-        assert!(first.plain_text().contains("A ─go─▶ B"));
+        // Canvas renderer: RL (horizontal, right-to-left) arrows are ◀, and
+        // edge labels appear as bracketed glyphs ([go]) on the canvas.
+        assert!(
+            first.plain_text().contains("[go]"),
+            "{:?}",
+            first.plain_text()
+        );
+        assert!(first.plain_text().contains('◀'), "{:?}", first.plain_text());
         assert!(
             first
                 .plain_lines()
@@ -663,7 +784,7 @@ mod tests {
         let short = render("| a | b |\n| --- | --- |\n| only |", 20);
         assert_eq!(
             short.plain_text(),
-"┌──────────┬───────┐\n│ a        │ b     │\n├──────────┼───────┤\n│ only     │       │\n└──────────┴───────┘"
+            "┌──────┬───┐\n│ a    │ b │\n├──────┼───┤\n│ only │   │\n└──────┴───┘"
         );
     }
 
@@ -672,23 +793,47 @@ mod tests {
         // Contract: graph BT + rounded/rect shapes + --- edges render with
         // distinct chrome (not collapsed to flowchart TD arrows only).
         let output = render("```mermaid\ngraph BT\nA(Round) --- B[Rect]\n```", 40);
+        // Canvas renderer: BU (bottom-up) vertical layout places B on top and
+        // A on bottom, with the undirected edge (---, no arrow) drawn as a
+        // vertical line using ┴ (source connector) and ┼ (no-arrow target).
+        // No literal "edges" section — every non-border line is MermaidNode.
         assert_eq!(
             output.plain_text(),
-            "┌─ mermaid · flowchart\n│ flowchart BU\n│ ╭─────────╮\n│ │A · Round│\n│ ╰─────────╯\n│ ┌────────┐\n│ │B · Rect│\n│ └────────┘\n│ edges\n│ A ──── B\n└─"
+            "┌─ mermaid · flowchart\n│ flowchart BU\n│ ┌────────┐\n│ │B · Rect│\n│ └────┼───┘\n│      │\n│      │\n│      │\n│      │\n│ ╭────┴────╮\n│ │A · Round│\n│ ╰─────────╯\n└─"
         );
         assert!(output.diagnostics.is_empty());
-        assert!(output
-            .lines
-            .iter()
-            .any(|line| line.role == LineRole::MermaidEdge && line.text.contains("────")));
-        assert!(output
-            .lines
-            .iter()
-            .take_while(|line| line.role != LineRole::MermaidEdge)
-            .all(|line| matches!(
-                line.role,
-                LineRole::MermaidBorder | LineRole::MermaidNode
-            )));
+        // Undirected edge: ┼ (no-arrow) at target, ┴ at source, │ for the line.
+        assert!(
+            output.plain_text().contains('┼'),
+            "{:?}",
+            output.plain_text()
+        );
+        assert!(
+            output.plain_text().contains('┴'),
+            "{:?}",
+            output.plain_text()
+        );
+        // No literal "edges" section in the canvas renderer.
+        assert!(
+            !output
+                .plain_text()
+                .lines()
+                .any(|line| line.trim() == "│ edges")
+        );
+        // All non-border lines carry MermaidNode (canvas renderer).
+        assert!(
+            output
+                .lines
+                .iter()
+                .filter(|line| line.role == LineRole::MermaidNode)
+                .all(|line| !line.text.trim().starts_with("edges"))
+        );
+        assert!(
+            output
+                .lines
+                .iter()
+                .all(|line| matches!(line.role, LineRole::MermaidBorder | LineRole::MermaidNode))
+        );
     }
 
     #[test]
@@ -727,27 +872,48 @@ mod tests {
 
     #[test]
     fn compact_mermaid_edge_renders_through_markdown_fence() {
-        // Contract: A-->B without spaces is not only parseable but visible in
-        // the public render path with correct edge role after the edges marker.
+        // Contract: A-->B without spaces is parseable and visible in the
+        // public render path. The canvas renderer draws TD (vertical) edges as
+        // ▼ glyphs on the canvas — there is no literal "edges" section, and
+        // every non-border line carries MermaidNode.
         let output = render("```mermaid\nflowchart TD\nA-->B\n```", 40);
-        assert!(output.plain_text().contains("A ───▶ B"));
+        assert!(
+            output.plain_text().contains("A · A"),
+            "{:?}",
+            output.plain_text()
+        );
+        assert!(
+            output.plain_text().contains("B · B"),
+            "{:?}",
+            output.plain_text()
+        );
+        assert!(
+            output.plain_text().contains('▼'),
+            "{:?}",
+            output.plain_text()
+        );
+        assert!(
+            !output
+                .plain_text()
+                .lines()
+                .any(|line| line.trim() == "│ edges")
+        );
         assert!(output.diagnostics.is_empty());
-        let edge_idx = output
-            .lines
-            .iter()
-            .position(|line| line.text.contains("edges"))
-            .expect("edges marker");
-        assert_eq!(output.lines[edge_idx].role, LineRole::MermaidEdge);
-        assert!(output.lines[edge_idx..]
-            .iter()
-            .filter(|line| line.text.contains('▶'))
-            .all(|line| line.role == LineRole::MermaidEdge));
-        assert!(output.lines[..edge_idx]
-            .iter()
-            .all(|line| matches!(
-                line.role,
-                LineRole::MermaidBorder | LineRole::MermaidNode
-            )));
+        // All non-border lines carry MermaidNode (canvas renderer).
+        assert!(
+            output
+                .lines
+                .iter()
+                .all(|line| matches!(line.role, LineRole::MermaidBorder | LineRole::MermaidNode))
+        );
+        // The vertical arrow glyph ▼ appears in a MermaidNode line.
+        assert!(
+            output
+                .lines
+                .iter()
+                .filter(|line| line.role == LineRole::MermaidNode)
+                .any(|line| line.text.contains('▼'))
+        );
     }
     #[test]
     fn atx_closing_hashes_require_whitespace_separator() {
@@ -818,7 +984,9 @@ Agent ..> AgentTool : via context\n\
         let output = render(source, 48);
         let text = output.plain_text();
         assert_eq!(
-            text.lines().filter(|line| line.contains("┌─ mermaid ·")).count(),
+            text.lines()
+                .filter(|line| line.contains("┌─ mermaid ·"))
+                .count(),
             1,
             "{text}"
         );
@@ -847,8 +1015,10 @@ Agent ..> AgentTool : via context\n\
     }
 
     #[test]
-    fn reported_labeled_subgraph_flowchart_renders_single_card() {
+    fn reported_labeled_subgraph_flowchart_renders_split_or_single_card() {
         // Exact user source: flowchart LR + subgraph records["SessionRecord types"].
+        // The canvas renderer may split into numbered panels when the rank
+        // exceeds the cell budget; cross-panel edges appear as boundary rows.
         let source = "```mermaid\n\
 flowchart LR\n\
 subgraph records[\"SessionRecord types\"]\n\
@@ -859,34 +1029,55 @@ X[User] --> A\n\
 ```";
         let output = render(source, 48);
         let text = output.plain_text();
-        assert_eq!(
-            text.lines().filter(|line| line.contains("┌─ mermaid ·")).count(),
-            1,
-            "{text}"
-        );
+        // Successful render (no source fallback, no diagnostic).
         assert!(text.contains("┌─ mermaid · flowchart"), "{text}");
         assert!(!text.contains("source fallback"), "{text}");
         assert!(!text.contains("! mermaid:"), "{text}");
         assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
-        assert!(text.contains("subgraph records · SessionRecord types"), "{text}");
+        // Every panel closes its own frame: card count equals footer count.
+        let card_count = text
+            .lines()
+            .filter(|line| line.contains("┌─ mermaid ·"))
+            .count();
+        let footer_count = output
+            .lines
+            .iter()
+            .filter(|line| line.role == LineRole::MermaidBorder && line.text.starts_with("└─"))
+            .count();
+        assert!(card_count >= 1, "{text}");
+        assert_eq!(card_count, footer_count, "{text}");
+        // Subgraph and node labels survive the split.
+        assert!(
+            text.contains("subgraph records · SessionRecord types"),
+            "{text}"
+        );
         assert!(text.contains("end subgraph records"), "{text}");
         assert!(text.contains("A · Session"), "{text}");
         assert!(text.contains("B · Message"), "{text}");
         assert!(text.contains("C · ToolCall"), "{text}");
         assert!(text.contains("X · User"), "{text}");
-        assert!(text.contains("A ───▶ B"), "{text}");
-        assert!(text.contains("B ───▶ C"), "{text}");
-        assert!(text.contains("X ───▶ A"), "{text}");
+        // Canvas renderer: edges are attached glyphs, not literal edge lines.
+        // Horizontal arrows (▶) overwrite target borders; cross-panel edges
+        // appear as boundary rows. No literal "edges" section.
+        assert!(!text.lines().any(|line| line.trim() == "│ edges"), "{text}");
+        // Every edge stays visible: either as an attached ▶ glyph or a
+        // boundary row.
+        let arrow_count = text.matches('▶').count();
+        let boundary_count = text
+            .lines()
+            .filter(|line| line.contains("boundary:"))
+            .count();
         assert_eq!(
+            arrow_count + boundary_count,
+            3,
+            "all 3 edges must stay visible: {text}"
+        );
+        // All non-border lines carry MermaidNode (canvas renderer).
+        assert!(
             output
                 .lines
                 .iter()
-                .filter(|line| {
-                    line.role == LineRole::MermaidBorder && line.text.starts_with("└─")
-                })
-                .count(),
-            1,
-            "{text}"
+                .all(|line| matches!(line.role, LineRole::MermaidBorder | LineRole::MermaidNode))
         );
     }
 
@@ -977,10 +1168,284 @@ X[User] --> A\n\
         );
 
         renderer.push_str("\n\nnext");
-        assert_eq!(renderer.frozen_source_bytes(), "# Frozen\n\nmutable tail\n".len());
+        assert_eq!(
+            renderer.frozen_source_bytes(),
+            "# Frozen\n\nmutable tail\n".len()
+        );
         assert_eq!(
             renderer.output(),
             render_markdown_streaming("# Frozen\n\nmutable tail\n\nnext", &options)
         );
+    }
+
+    /// Box-drawing / grid chrome that only ever legitimately appears inside a
+    /// laid-out table, code fence, or mermaid frame. Ordinary prose lines must
+    /// never carry any of these glyphs (prose is never routed through a
+    /// table/grid projection).
+    const GRID_CHROME: &[char] = &[
+        '┌', '┬', '┐', '├', '┼', '┤', '│', '└', '┴', '┘', '─', '╭', '╮', '╰', '╯', '╎', '╏', '│',
+    ];
+
+    /// Assert a rendered line carries no interior run of two or more spaces
+    /// after its leading indentation (the only multi-space run a bullet
+    /// continuation legitimately begins with). This catches soft-wrap
+    /// justification / column padding expanding single word separators into
+    /// "huge inter-word spacing".
+    fn assert_no_expanded_spaces(line: &str) {
+        let stripped = line.trim_start();
+        assert!(
+            !stripped.contains("  "),
+            "prose must never expand interior spaces: {line:?}"
+        );
+    }
+
+    #[test]
+    fn short_intro_bullets_keep_continuation_without_expanded_spaces_and_never_layout_as_table() {
+        // Exact semantic fixture: a short intro heading, then bullets mixing
+        // Chinese and English phrases, a long git hash, and repeated
+        // commit/apply-path tokens. Reported malformed render spreads the
+        // phrase fragments into widely spaced text and ends with a line of
+        // huge inter-word spacing.
+        let source = "intro\n\
+- recap apply Proposal backup bytes + 5 dual-proposer remint + sub\n\
+- commit 9f3a2b1c7d4e5f6a8b9c0d1e2f3a4b5c6d7e8f9a apply path\n\
+- repeated verify fingerprint cert rm /tmp/x.bin ready\n\
+\n\
+最后一行包含中文和 English words mixed together 非常长的一句话 that wraps with spaces.";
+        // Ordinary prose has no pipe separator, so it must never produce a
+        // table block — neither complete nor streaming analysis.
+        let document = analyze_markdown(source);
+        assert!(
+            document
+                .blocks
+                .iter()
+                .all(|block| !matches!(block, MarkdownBlock::Table(_))),
+            "prose must never be routed through table layout: {document:#?}"
+        );
+
+        for width in [16usize, 24, 40, 60] {
+            let output = render(source, width);
+            for line in &output.lines {
+                let text = line.text.as_str();
+                assert!(
+                    UnicodeWidthStr::width(text) <= width,
+                    "line exceeds width {width}: {text:?}"
+                );
+                match line.role {
+                    LineRole::Text | LineRole::ListMarker => {
+                        // Prose/list text: single-space separators only.
+                        assert_no_expanded_spaces(text);
+                        // No prose line may carry table/grid/fence chrome.
+                        assert!(
+                            !text.chars().any(|c| GRID_CHROME.contains(&c)),
+                            "prose routed through grid chrome at width {width}: {text:?}"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            // Bullet continuation rows must be indented (not detached into
+            // stray fragments) and must not repeat the bullet marker.
+            let lines = output.plain_lines();
+            for pair in lines.windows(2) {
+                let continuation = pair[1].as_str();
+                if continuation.starts_with(' ') && !continuation.trim().is_empty() {
+                    assert!(
+                        !continuation.trim_start().starts_with('•'),
+                        "continuation must not carry a fresh bullet marker: {continuation:?}"
+                    );
+                    assert_no_expanded_spaces(continuation);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_width_cjk_rust_table_code_fixture_is_coherent_and_bounded() {
+        let source = "# 测试标题\n\
+\n\
+这里是一段很长的中文文本，没有任何空格分割，用来验证在较窄宽度下 CJK 字符能否正确换行而不产生碎片化断裂 token。\n\
+\n\
+- 第一项 包含 mix English words 和中文\n\
+- 第二项 继续测试 12345 67890\n\
+\n\
+```rust\n\
+fn main() {\n\
+    let x = \"hello\";\n\
+    println!(\"{}\", x);\n\
+}\n\
+```\n\
+\n\
+| 列一 | 列二 |\n\
+| --- | --- |\n\
+| 内容甲 | 内容乙 |\n\
+| alpha | beta gamma |";
+
+        for width in [24usize, 32, 48, 80] {
+            let output = render(source, width);
+            let lines = &output.lines;
+            // Coherent and bounded: every row stays within the render width.
+            for line in lines {
+                assert!(
+                    UnicodeWidthStr::width(line.text.as_str()) <= width,
+                    "row exceeds width {width}: {:?}",
+                    line.text
+                );
+            }
+            // Prose (paragraph + CJK) never carries interior double spaces and
+            // never carries grid chrome.
+            for line in lines {
+                match line.role {
+                    LineRole::Text | LineRole::ListMarker => {
+                        assert_no_expanded_spaces(&line.text);
+                        assert!(
+                            !line.text.chars().any(|c| GRID_CHROME.contains(&c)),
+                            "prose routed through grid chrome: {:?}",
+                            line.text
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            // Code fence stays a single coherent frame: one top `╭`, one
+            // bottom `╰`, every body row width == frame width with side bars.
+            let code_fence_rows: Vec<&str> = lines
+                .iter()
+                .filter(|l| l.role == LineRole::CodeFence || l.role == LineRole::Code)
+                .map(|l| l.text.as_str())
+                .collect();
+            assert_eq!(
+                code_fence_rows
+                    .iter()
+                    .filter(|l| l.starts_with('╭'))
+                    .count(),
+                1,
+                "code top border must appear exactly once: {code_fence_rows:?}"
+            );
+            assert_eq!(
+                code_fence_rows
+                    .iter()
+                    .filter(|l| l.starts_with('╰'))
+                    .count(),
+                1,
+                "code bottom border must appear exactly once: {code_fence_rows:?}"
+            );
+            let frame_width = UnicodeWidthStr::width(code_fence_rows[0]);
+            for row in &code_fence_rows {
+                assert_eq!(
+                    UnicodeWidthStr::width(*row),
+                    frame_width,
+                    "all code body rows share one frame width: {row:?}"
+                );
+            }
+            for row in code_fence_rows.iter().filter(|l| l.starts_with('│')) {
+                assert!(
+                    row.ends_with('│') && UnicodeWidthStr::width(*row) == frame_width,
+                    "code body row must be side-bordered and frame-width: {row:?}"
+                );
+            }
+            // Table stays a single coherent frame: one `┌`, one `└`, one
+            // header separator, all rows share one width.
+            let table_rows: Vec<&str> = lines
+                .iter()
+                .filter(|l| {
+                    matches!(
+                        l.role,
+                        LineRole::TableBorder | LineRole::TableHeader | LineRole::TableBody
+                    )
+                })
+                .map(|l| l.text.as_str())
+                .collect();
+            assert!(!table_rows.is_empty(), "table must render at width {width}");
+            assert_eq!(
+                table_rows.iter().filter(|l| l.starts_with('┌')).count(),
+                1,
+                "table top border exactly once: {table_rows:?}"
+            );
+            assert_eq!(
+                table_rows.iter().filter(|l| l.starts_with('└')).count(),
+                1,
+                "table bottom border exactly once: {table_rows:?}"
+            );
+            assert!(
+                table_rows
+                    .iter()
+                    .any(|l| l.starts_with('├') && l.contains('┼')),
+                "header separator must render: {table_rows:?}"
+            );
+            let table_width = UnicodeWidthStr::width(table_rows[0]);
+            assert!(
+                table_width <= width,
+                "table width bounded: {table_width} > {width}"
+            );
+            for row in &table_rows {
+                assert_eq!(
+                    UnicodeWidthStr::width(*row),
+                    table_width,
+                    "all table rows share one frame width: {row:?}"
+                );
+            }
+            // All CJK characters survive: the paragraph source, re-wrapped, is
+            // preserved verbatim (no dropped or reordered glyphs).
+            let paragraph_source = "这里是一段很长的中文文本，没有任何空格分割，用来验证在较窄宽度下 CJK 字符能否正确换行而不产生碎片化断裂 token。";
+            let paragraph_glyphs: String = lines
+                .iter()
+                .filter(|l| l.role == LineRole::Text)
+                .map(|l| l.text.trim().to_owned())
+                .collect::<Vec<_>>()
+                .join("");
+            for character in paragraph_source.chars().filter(|c| !c.is_whitespace()) {
+                assert!(
+                    paragraph_glyphs.contains(character),
+                    "CJK/ASCII glyph lost in wrapping at width {width}: {character:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chunked_streaming_final_equals_settled_render() {
+        let source = "# 测试标题\n\
+这里是一段很长的中文文本，没有任何空格分割，用来验证在较窄宽度下 CJK 字符能否正确换行而不产生碎片化断裂 token。\n\
+\n\
+- recap apply Proposal backup bytes + 5 dual-proposer remint + sub\n\
+- commit 9f3a2b1c7d4e5f6a8b9c0d1e2f3a4b5c6d7e8f9a apply path\n\
+\n\
+```rust\n\
+fn main() {\n\
+    let x = \"hello\";\n\
+    println!(\"{}\", x);\n\
+}\n\
+```\n\
+| 列一 | 列二 |\n\
+| --- | --- |\n\
+| 内容甲 | 内容乙 |\n\
+| alpha | beta gamma |";
+
+        for width in [40usize, 60, 80] {
+            let options = MarkdownRenderOptions {
+                width,
+                ..MarkdownRenderOptions::default()
+            };
+            let expected = render_markdown(source, &options).plain_text();
+            let margins: Vec<usize> = source
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain(std::iter::once(source.len()))
+                .collect();
+            for step in [1usize, 3, 5, 11, 23] {
+                let mut renderer = StreamingMarkdownRenderer::new(options);
+                for idx in (0..margins.len().saturating_sub(1)).step_by(step) {
+                    let start = margins[idx];
+                    let end = margins[(idx + step).min(margins.len() - 1)];
+                    renderer.push_str(&source[start..end]);
+                }
+                assert_eq!(
+                    renderer.output().plain_text(),
+                    expected,
+                    "chunked streaming final must equal settled render at width {width}, step {step}"
+                );
+            }
+        }
     }
 }

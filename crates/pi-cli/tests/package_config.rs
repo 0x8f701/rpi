@@ -65,7 +65,11 @@ fn make_package(root: &Path) {
     )
     .unwrap();
     fs::create_dir_all(root.join("themes")).unwrap();
-    fs::write(root.join("themes/dark.json"), r#"{"name":"dark"}"#).unwrap();
+    fs::write(
+        root.join("themes/dark.json"),
+        r##"{"name":"dark","colors":{"accent":"#123456"}}"##,
+    )
+    .unwrap();
     fs::write(
         root.join("package.json"),
         r#"{"name":"test-pkg","pi":{"extensions":["extensions/*"],"skills":["skills/*.md"],"prompts":["prompts/*.md"],"themes":["themes/*.json"]}}"#,

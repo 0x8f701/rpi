@@ -8,8 +8,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use pi_coding::{
-    SettingApplyBehavior, SettingCategory, SettingSource, SettingsCatalog, SettingsManager,
-    SettingsScope, SettingValueView,
+    SettingApplyBehavior, SettingCategory, SettingSource, SettingValueView, SettingsCatalog,
+    SettingsManager, SettingsScope,
 };
 
 use crate::args::{ConfigCommand, ConfigScopeArg};
@@ -27,12 +27,23 @@ pub fn run(
     no_approve: bool,
 ) -> Result<()> {
     let agent_dir = pi_coding::agent_dir_path();
+    // Semantic validation of persisted model settings resolves against the
+    // registered provider/model catalog, so the custom models.json catalog
+    // must be loaded before the settings manager is constructed — exactly
+    // like startup (`load_startup_catalogs`), never a second parser.
+    crate::models_config::load_custom_models().context("loading custom models for config")?;
+    // The complete catalog is now registered: model-default persistence must
+    // reject unknown combined prefixes rather than silently accepting them.
+    pi_coding::set_default_model_catalog_ready(true);
     let headless = !io::stdout().is_terminal();
-    let project_trusted = crate::package_config::resolve_trust(cwd, &agent_dir, approve, no_approve, headless)
-        .context("resolving project trust for config")?;
+    let project_trusted =
+        crate::package_config::resolve_trust(cwd, &agent_dir, approve, no_approve, headless)
+            .context("resolving project trust for config")?;
     let manager = SettingsManager::load_phase_one(cwd, &agent_dir).context("loading settings")?;
     if project_trusted {
-        manager.load_project(true).context("loading project settings")?;
+        manager
+            .load_project(true)
+            .context("loading project settings")?;
     }
     let scope = match command.scope() {
         Some(ConfigScopeArg::Global) => SettingsScope::Global,
@@ -47,9 +58,13 @@ pub fn run(
     }
     match command {
         ConfigCommand::Get { key, json, .. } => get(&manager, scope, &key, json),
-        ConfigCommand::Set { key, value, json, .. } => set(&manager, scope, &key, &value, json),
+        ConfigCommand::Set {
+            key, value, json, ..
+        } => set(&manager, scope, &key, &value, json),
         ConfigCommand::Reset { key, json, .. } => reset(&manager, scope, &key, json),
-        ConfigCommand::List { category, json, .. } => list(&manager, scope, category.as_deref(), json),
+        ConfigCommand::List { category, json, .. } => {
+            list(&manager, scope, category.as_deref(), json)
+        }
     }
 }
 
@@ -82,7 +97,13 @@ fn get(manager: &SettingsManager, scope: SettingsScope, key: &str, json: bool) -
     Ok(())
 }
 
-fn set(manager: &SettingsManager, scope: SettingsScope, key: &str, value: &str, json: bool) -> Result<()> {
+fn set(
+    manager: &SettingsManager,
+    scope: SettingsScope,
+    key: &str,
+    value: &str,
+    json: bool,
+) -> Result<()> {
     let mut draft = SettingsCatalog::draft(manager, scope)?;
     let parsed = parse_setting_input(key, value)?;
     draft.set(key, parsed)?;
@@ -113,12 +134,19 @@ fn reset(manager: &SettingsManager, scope: SettingsScope, key: &str, json: bool)
     Ok(())
 }
 
-fn list(manager: &SettingsManager, scope: SettingsScope, category: Option<&str>, json: bool) -> Result<()> {
+fn list(
+    manager: &SettingsManager,
+    scope: SettingsScope,
+    category: Option<&str>,
+    json: bool,
+) -> Result<()> {
     let snapshot = SettingsCatalog::inspect(manager);
     let views = snapshot
         .values
         .iter()
-        .filter(|view| category.is_none_or(|wanted| category_matches(view.definition.category, wanted)))
+        .filter(|view| {
+            category.is_none_or(|wanted| category_matches(view.definition.category, wanted))
+        })
         .collect::<Vec<_>>();
     if views.is_empty() {
         bail!(
@@ -148,7 +176,11 @@ fn list(manager: &SettingsManager, scope: SettingsScope, category: Option<&str>,
         );
     }
     println!();
-    println!("({} settings, {} scope)", snapshot.values.len(), scope_label(scope));
+    println!(
+        "({} settings, {} scope)",
+        snapshot.values.len(),
+        scope_label(scope)
+    );
     Ok(())
 }
 
@@ -279,7 +311,8 @@ mod tests {
     fn get_rejects_secret_keys() {
         let (_agent, _cwd, manager) = setup();
         for key in ["apiKey", "images.genApiKey", "live.sttApiKey"] {
-            let error = get(&manager, SettingsScope::Global, key, false).expect_err("secret rejected");
+            let error =
+                get(&manager, SettingsScope::Global, key, false).expect_err("secret rejected");
             assert!(
                 error.to_string().contains("secret material"),
                 "secret message for {key}: {error}"
@@ -290,7 +323,8 @@ mod tests {
     #[test]
     fn get_rejects_unknown_keys() {
         let (_agent, _cwd, manager) = setup();
-        let error = get(&manager, SettingsScope::Global, "no.such.key", false).expect_err("unknown key");
+        let error =
+            get(&manager, SettingsScope::Global, "no.such.key", false).expect_err("unknown key");
         assert!(error.to_string().contains("unknown setting key"));
     }
 
@@ -302,8 +336,23 @@ mod tests {
         manager.load_project(true).expect("trust");
 
         // Global set: value persists in the file, effective value updates.
-        set(&manager, SettingsScope::Global, "retry.maxRetries", "7", false).expect("set");
-        assert_eq!(manager.global_settings().retry.as_ref().unwrap().max_retries, Some(7));
+        set(
+            &manager,
+            SettingsScope::Global,
+            "retry.maxRetries",
+            "7",
+            false,
+        )
+        .expect("set");
+        assert_eq!(
+            manager
+                .global_settings()
+                .retry
+                .as_ref()
+                .unwrap()
+                .max_retries,
+            Some(7)
+        );
         let view = SettingsCatalog::get(&manager, "retry.maxRetries").expect("view");
         assert_eq!(view.source, SettingSource::Global);
         assert_eq!(view.effective_value, serde_json::json!(7));
@@ -317,8 +366,22 @@ mod tests {
 
         // Project set with a global fallback: source reports project, reset
         // falls back to the inherited global value.
-        set(&manager, SettingsScope::Global, "theme", "global-dark", false).expect("global theme");
-        set(&manager, SettingsScope::Project, "theme", "project-dark", false).expect("project theme");
+        set(
+            &manager,
+            SettingsScope::Global,
+            "theme",
+            "global-dark",
+            false,
+        )
+        .expect("global theme");
+        set(
+            &manager,
+            SettingsScope::Project,
+            "theme",
+            "project-dark",
+            false,
+        )
+        .expect("project theme");
         let view = SettingsCatalog::get(&manager, "theme").expect("view");
         assert_eq!(view.source, SettingSource::Project);
         assert_eq!(view.effective_value, serde_json::json!("project-dark"));
@@ -330,10 +393,14 @@ mod tests {
         // The files on disk match (JSON round-trip through the loader): the
         // project reset clears the scoped layer while the global value stays.
         let saved_project: serde_json::Value = serde_json::from_slice(
-            &fs::read(cwd.path().join(".pi/settings.json")).expect("project file"),
+            &fs::read(cwd.path().join(".rpi/settings.json")).expect("project file"),
         )
         .expect("project json");
-        assert_eq!(saved_project.get("theme"), None, "project reset clears the scoped layer");
+        assert_eq!(
+            saved_project.get("theme"),
+            None,
+            "project reset clears the scoped layer"
+        );
         let saved_global: serde_json::Value = serde_json::from_slice(
             &fs::read(agent.path().join("settings.json")).expect("global file"),
         )
@@ -344,24 +411,41 @@ mod tests {
     #[test]
     fn set_validates_typed_values_and_rejects_secrets_and_unknowns() {
         let (_agent, _cwd, manager) = setup();
-        let error = set(&manager, SettingsScope::Global, "transport", "udp", false).expect_err("bad enum");
+        let error =
+            set(&manager, SettingsScope::Global, "transport", "udp", false).expect_err("bad enum");
         assert!(error.to_string().contains("must be one of"), "{error}");
-        let error =
-            set(&manager, SettingsScope::Global, "compaction.reserveTokens", "0", false).expect_err("out of range");
+        let error = set(
+            &manager,
+            SettingsScope::Global,
+            "compaction.reserveTokens",
+            "0",
+            false,
+        )
+        .expect_err("out of range");
         assert!(error.to_string().contains("between"), "{error}");
-        let error =
-            set(&manager, SettingsScope::Global, "apiKey", "hunter2", false).expect_err("secret write");
+        let error = set(&manager, SettingsScope::Global, "apiKey", "hunter2", false)
+            .expect_err("secret write");
         assert!(error.to_string().contains("secret material"), "{error}");
-        let error =
-            set(&manager, SettingsScope::Global, "no.such.key", "x", false).expect_err("unknown write");
+        let error = set(&manager, SettingsScope::Global, "no.such.key", "x", false)
+            .expect_err("unknown write");
         assert!(error.to_string().contains("unknown setting key"), "{error}");
-        assert_eq!(manager.global_settings().retry, None, "failed writes must not persist");
+        assert_eq!(
+            manager.global_settings().retry,
+            None,
+            "failed writes must not persist"
+        );
     }
 
     #[test]
     fn set_accepts_json_values_for_collections() {
         let (_agent, _cwd, manager) = setup();
-        set(&manager, SettingsScope::Global, "packages", r#"[{"source":"example","kind":"extension"}]"#, false)
+        set(
+            &manager,
+            SettingsScope::Global,
+            "packages",
+            r#"[{"source":"example","kind":"extension"}]"#,
+            false,
+        )
         .expect("array set");
         let packages = &manager.global_settings().packages;
         assert_eq!(packages.len(), 1);
@@ -370,7 +454,13 @@ mod tests {
             "array rows round-trip through the typed settings: {:?}",
             packages[0]
         );
-        set(&manager, SettingsScope::Global, "keybindings", r#"{"submit":"enter"}"#, false)
+        set(
+            &manager,
+            SettingsScope::Global,
+            "keybindings",
+            r#"{"submit":"enter"}"#,
+            false,
+        )
         .expect("object set");
         let global = manager.global_settings();
         let keybindings = global.keybindings.as_ref().expect("keybindings");
@@ -379,7 +469,8 @@ mod tests {
             keybindings.contains_key("submit"),
             "keybindings row must round-trip through the typed Settings: {keybindings:?}"
         );
-        let error = set(&manager, SettingsScope::Global, "packages", "{}", false).expect_err("object for array");
+        let error = set(&manager, SettingsScope::Global, "packages", "{}", false)
+            .expect_err("object for array");
         assert!(error.to_string().contains("must be an array"), "{error}");
     }
 
@@ -408,5 +499,121 @@ mod tests {
             .count();
         assert!(by_debug > 0 && by_debug == by_alias);
         assert!(!category_matches(SettingCategory::Models, "bogus"));
+    }
+
+    #[test]
+    fn config_catalog_has_no_legacy_sandbox_translation() {
+        for legacy in [
+            "sandbox.enabled",
+            "sandbox.readOnly",
+            "sandbox.allowedPaths",
+        ] {
+            assert!(
+                SettingsCatalog::definition(legacy).is_none(),
+                "legacy {legacy}"
+            );
+        }
+        assert!(SettingsCatalog::definition("sandbox.mode").is_some());
+        assert!(SettingsCatalog::definition("sandbox.hostHttp").is_some());
+    }
+
+    /// `rpi config set` validates model settings against the same registered
+    /// custom models.json catalog the headless run loads (the one-line
+    /// `load_custom_models` in [`run`]), so scripts see startup semantics:
+    /// registered provider/ids are accepted, unknown specs are rejected.
+    #[test]
+    fn config_set_validates_against_custom_models_catalog() {
+        let (agent, _cwd, manager) = setup();
+        fs::write(
+            agent.path().join("models.json"),
+            r#"{
+  "providers": {
+    "acme": {
+      "api": "openai-completions",
+      "baseUrl": "https://acme.test/v1",
+      "models": [{ "id": "acme-1", "name": "Acme One" }]
+    }
+  }
+}
+"#,
+        )
+        .expect("seed models.json");
+        // Same loader `run` uses to populate the registry before validation.
+        crate::models_config::load_custom_models_from(&agent.path().join("models.json"))
+            .expect("custom catalog loads");
+        assert!(
+            pi_ai::get_model("acme", "acme-1").is_some(),
+            "custom catalog must be registered for validation"
+        );
+        // The pair is all-or-nothing: a lone `defaultProvider` on an empty
+        // base must fail validation instead of silently falling through.
+        let error = set(
+            &manager,
+            SettingsScope::Global,
+            "defaultProvider",
+            "acme",
+            false,
+        )
+        .expect_err("lone provider rejected");
+        assert!(
+            format!("{error:#}").contains("requires defaultModel"),
+            "incomplete pair message: {error:#}"
+        );
+
+        // A lone combined model spec (registered provider prefix + id) is
+        // valid on its own; setting the matching provider completes the pair.
+        set(
+            &manager,
+            SettingsScope::Global,
+            "defaultModel",
+            "acme/acme-1",
+            false,
+        )
+        .expect("registered combined model accepted");
+        set(
+            &manager,
+            SettingsScope::Global,
+            "defaultProvider",
+            "acme",
+            false,
+        )
+        .expect("matching provider completes the pair");
+        // A custom model id under a registered provider stays accepted
+        // through the resolver's custom-id fallback.
+        set(
+            &manager,
+            SettingsScope::Global,
+            "defaultModel",
+            "acme/acme-9",
+            false,
+        )
+        .expect("known-provider custom model id accepted via fallback");
+
+        // Draft both invalid fields atomically: the CLI's one-key `set`
+        // command deliberately rejects incomplete intermediate pairs.
+        let mut invalid =
+            SettingsCatalog::draft(&manager, SettingsScope::Global).expect("invalid pair draft");
+        invalid
+            .set("defaultProvider", serde_json::json!("ghost"))
+            .expect("provider staged");
+        invalid
+            .set("defaultModel", serde_json::json!("ghost/nowhere"))
+            .expect("model staged");
+        let error = invalid
+            .apply(&manager)
+            .expect_err("unknown provider pair rejected");
+        assert!(
+            format!("{error:#}").contains("does not resolve")
+                || format!("{error:#}").contains("not found"),
+            "actionable unknown-model message: {error:#}"
+        );
+        assert_eq!(
+            manager.global_settings().default_provider.as_deref(),
+            Some("acme")
+        );
+        assert_eq!(
+            manager.global_settings().default_model.as_deref(),
+            Some("acme/acme-9")
+        );
     }
 }

@@ -7,8 +7,9 @@ use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 
 use super::common::{
-    apply_provider_headers, apply_provider_request, client, consume_sse, error_body, fail,
-    insert_header, insert_header_map, is_aborted, notify_response, send_with_retry,
+    apply_provider_headers, apply_provider_request, build_request, client, consume_sse, error_body,
+    fail, insert_header, insert_header_map, is_aborted, notify_response, null_default_vec,
+    send_with_retry,
 };
 use crate::*;
 
@@ -106,9 +107,8 @@ fn supports_openai_grammar_tools(model: &Model) -> bool {
 }
 
 fn requires_reasoning_content_on_assistant_messages(model: &Model) -> bool {
-    compat_bool(model, "requiresReasoningContentOnAssistantMessages").unwrap_or_else(|| {
-        model.provider == "deepseek" || model.base_url.contains("deepseek.com")
-    })
+    compat_bool(model, "requiresReasoningContentOnAssistantMessages")
+        .unwrap_or_else(|| model.provider == "deepseek" || model.base_url.contains("deepseek.com"))
 }
 
 fn supports_image_input(model: &Model) -> bool {
@@ -249,13 +249,18 @@ fn convert_openai_tools(model: &Model, tools: &[Tool]) -> Result<Vec<Value>> {
                 }));
             }
             let strict = resolve_json_schema_strict_sampling(tool, supports_strict)?;
+            let mut parameters =
+                serde_json::to_value(&tool.parameters).unwrap_or_else(|_| json!({}));
+            if strict {
+                // OpenAI strict validation rejects JSON-Schema type unions
+                // (`type: [T, "null"]`); rewrite them into the portable
+                // anyOf encoding at this single boundary.
+                super::common::openai_strict_schema_dialect(&mut parameters);
+            }
             let mut function = Map::from_iter([
                 ("name".into(), json!(tool.name)),
                 ("description".into(), json!(tool.description)),
-                (
-                    "parameters".into(),
-                    serde_json::to_value(&tool.parameters).unwrap_or_else(|_| json!({})),
-                ),
+                ("parameters".into(), parameters),
             ]);
             if supports_strict {
                 function.insert("strict".into(), Value::Bool(strict));
@@ -329,10 +334,7 @@ fn resolve_chat_template_kwarg(
     }
 }
 
-fn build_chat_template_kwargs(
-    model: &Model,
-    reasoning_effort: Option<&str>,
-) -> Option<Value> {
+fn build_chat_template_kwargs(model: &Model, reasoning_effort: Option<&str>) -> Option<Value> {
     let configured = model
         .compat
         .as_ref()?
@@ -576,6 +578,10 @@ pub fn register_openai_completions() {
             }),
             stream_simple,
             generate_image: None,
+            resolve_http_authorities: Arc::new(|model, options| {
+                let (authority, _) = resolve_http_endpoint(&openai_chat_url(model, options)?)?;
+                Ok(std::collections::BTreeSet::from([authority]))
+            }),
         },
         None,
     );
@@ -752,17 +758,38 @@ async fn run_openai_stream(
         &options.stream,
     )
     .await?;
-    let http = client(&options.stream)?;
+    client(&options.stream)?;
+    let payload = serde_json::to_vec(&payload)?;
     let response = send_with_retry(&options.stream, || {
-        http.post(&url)
-            .json(&payload)
-            .headers(request_headers.clone())
+        build_request(
+            &options.stream,
+            HttpMethod::Post,
+            &url,
+            &request_headers,
+            payload.clone(),
+        )
     })
     .await?;
-    notify_response(&options.stream, &response, model).await?;
+    notify_response(
+        &options.stream,
+        response.status(),
+        response.headers().clone(),
+        model,
+    )
+    .await?;
     if !response.status().is_success() {
+        // Label the error with the actual provider id from the model config
+        // (models.json `provider`), not a hardcoded "OpenAI": every
+        // openai-completions endpoint (deepseek, xiaomi, ...) was mislabeled,
+        // hiding the real source of 4xx/5xx failures. The real OpenAI
+        // provider keeps its "OpenAI" label; an empty provider id falls back
+        // to it as well.
+        let label = match model.provider.as_str() {
+            "" | "openai" => "OpenAI",
+            provider => provider,
+        };
         return Err(anyhow!(
-            error_body("OpenAI", response, &options.stream).await?
+            error_body(label, response, &options.stream).await?
         ));
     }
 
@@ -785,7 +812,7 @@ async fn run_openai_stream(
         }
         let value =
             parse_json_with_repair(input).ok_or_else(|| anyhow!("Invalid OpenAI SSE JSON"))?;
-        state.apply(serde_json::from_value(value)?, output, &event_sender)
+        state.apply(parse_chat_chunk(value)?, output, &event_sender)
     })
     .await;
     if parse_result.is_ok() {
@@ -840,14 +867,7 @@ fn openai_messages(model: &Model, context: &Context) -> Result<Vec<Value>> {
                 let mut wire = Map::new();
                 wire.insert("role".into(), json!("assistant"));
                 let text = assistant.text();
-                wire.insert(
-                    "content".into(),
-                    if text.is_empty() {
-                        Value::Null
-                    } else {
-                        json!(text)
-                    },
-                );
+                wire.insert("content".into(), json!(text));
                 let mut tool_calls = Vec::new();
                 for block in &assistant.content {
                     let ContentBlock::ToolCall(call) = block else {
@@ -990,6 +1010,11 @@ struct ChatChunk {
     choices: Vec<ChatChoice>,
     usage: Option<ChatUsage>,
 }
+
+fn parse_chat_chunk(value: Value) -> Result<ChatChunk> {
+    serde_json::from_value(value)
+        .map_err(|error| anyhow!("invalid OpenAI chat-completions stream chunk: {error}"))
+}
 #[derive(Deserialize, Default)]
 struct ChatChoice {
     #[serde(default)]
@@ -1003,9 +1028,9 @@ struct ChatDelta {
     content: Option<String>,
     reasoning_content: Option<String>,
     reasoning: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default_vec")]
     tool_calls: Vec<ToolCallDelta>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default_vec")]
     reasoning_details: Vec<Value>,
 }
 #[derive(Deserialize, Default)]
@@ -1045,23 +1070,20 @@ struct CustomDelta {
 }
 #[derive(Deserialize, Default)]
 struct ChatUsage {
-    prompt_tokens: i64,
-    completion_tokens: i64,
-    total_tokens: i64,
+    prompt_tokens: Option<i64>,
+    completion_tokens: Option<i64>,
+    total_tokens: Option<i64>,
     prompt_tokens_details: Option<PromptTokenDetails>,
     completion_tokens_details: Option<CompletionTokenDetails>,
 }
 #[derive(Deserialize, Default)]
 struct PromptTokenDetails {
-    #[serde(default)]
-    cached_tokens: i64,
-    #[serde(default)]
-    cache_write_tokens: i64,
+    cached_tokens: Option<i64>,
+    cache_write_tokens: Option<i64>,
 }
 #[derive(Deserialize, Default)]
 struct CompletionTokenDetails {
-    #[serde(default)]
-    reasoning_tokens: i64,
+    reasoning_tokens: Option<i64>,
 }
 
 #[derive(Default)]
@@ -1137,22 +1159,30 @@ impl GrammarInputBuffer {
     }
 }
 fn apply_chat_usage(usage: ChatUsage, output: &mut AssistantMessage) {
+    let (Some(prompt_tokens), Some(completion_tokens)) =
+        (usage.prompt_tokens, usage.completion_tokens)
+    else {
+        return;
+    };
     let (cached, cache_write) = usage.prompt_tokens_details.map_or((0, 0), |details| {
-        (details.cached_tokens, details.cache_write_tokens)
+        (
+            details.cached_tokens.unwrap_or(0),
+            details.cache_write_tokens.unwrap_or(0),
+        )
     });
     let reasoning = usage
         .completion_tokens_details
-        .map_or(0, |details| details.reasoning_tokens);
-    let input = usage
-        .prompt_tokens
+        .and_then(|details| details.reasoning_tokens)
+        .unwrap_or(0);
+    let input = prompt_tokens
         .saturating_sub(cached)
         .saturating_sub(cache_write);
     output.usage.input = input;
     output.usage.cache_read = cached;
     output.usage.cache_write = cache_write;
-    output.usage.output = usage.completion_tokens;
+    output.usage.output = completion_tokens;
     output.usage.reasoning = reasoning;
-    output.usage.total_tokens = input + usage.completion_tokens + cached + cache_write;
+    output.usage.total_tokens = input + completion_tokens + cached + cache_write;
 }
 
 impl ChatStreamState {
@@ -1530,6 +1560,170 @@ impl ChatStreamState {
 
 #[cfg(test)]
 mod tests {
+    /// Regression for OpenAI strict validation: every object property's name
+    /// must appear in `required`. The source Todo schema keeps nested `agents`
+    /// semantically optional; the provider payload therefore requires the key
+    /// while allowing null, without changing the shared schema used elsewhere.
+    #[test]
+    fn strict_todo_nullable_arrays_serialize_as_anyof_unions() {
+        let string_item = crate::Schema {
+            schema_type: Some(json!("string")),
+            ..Default::default()
+        };
+        let nullable_array = || crate::Schema {
+            schema_type: Some(json!("array")),
+            items: Some(Box::new(string_item.clone())),
+            nullable: true,
+            ..Default::default()
+        };
+        let phase_object = crate::Schema {
+            schema_type: Some(json!("object")),
+            properties: std::collections::HashMap::from([
+                (
+                    "phase".to_owned(),
+                    crate::Schema {
+                        schema_type: Some(json!("string")),
+                        ..Default::default()
+                    },
+                ),
+                ("items".to_owned(), nullable_array()),
+                (
+                    "agents".to_owned(),
+                    crate::Schema {
+                        schema_type: Some(json!("array")),
+                        items: Some(Box::new(string_item.clone())),
+                        min_items: Some(1),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            required: vec!["phase".to_owned(), "items".to_owned()],
+            additional_properties: Some(Value::Bool(false)),
+            ..Default::default()
+        };
+        let schema = crate::Schema {
+            schema_type: Some(json!("object")),
+            properties: std::collections::HashMap::from([
+                (
+                    "op".to_owned(),
+                    crate::Schema {
+                        schema_type: Some(json!("string")),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "list".to_owned(),
+                    crate::Schema {
+                        items: Some(Box::new(phase_object)),
+                        ..nullable_array()
+                    },
+                ),
+                ("items".to_owned(), nullable_array()),
+                ("agents".to_owned(), nullable_array()),
+                ("dependsOn".to_owned(), nullable_array()),
+            ]),
+            required: vec![
+                "op".into(),
+                "list".into(),
+                "items".into(),
+                "agents".into(),
+                "dependsOn".into(),
+            ],
+            additional_properties: Some(Value::Bool(false)),
+            ..Default::default()
+        };
+        let model = Model {
+            provider: "cliproxy".into(),
+            ..Model::default()
+        };
+        let tool = crate::ToolDefinition {
+            name: "todo".into(),
+            description: "todo".into(),
+            parameters: schema,
+            constrained_sampling: Some(crate::ConstrainedSampling::json_schema(
+                crate::ConstrainedSamplingStrictness::Prefer,
+            )),
+        };
+        let payload = convert_openai_tools(&model, &[tool.clone()]).expect("convert");
+        let function = &payload[0]["function"];
+        assert_eq!(
+            function["strict"],
+            json!(true),
+            "Prefer + strict-capable model"
+        );
+
+        // Every nullable field became anyOf:[{type:T},{type:"null"}].
+        let properties = &function["parameters"]["properties"];
+        for name in ["list", "items", "agents", "dependsOn"] {
+            let field = &properties[name];
+            let branches = field["anyOf"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name} must use anyOf, got {field}"));
+            assert_eq!(branches[0]["type"], json!("array"), "{name} primary branch");
+            assert_eq!(branches[1]["type"], json!("null"), "{name} null branch");
+            assert!(
+                field.get("type").is_none(),
+                "{name} must not keep a type union"
+            );
+        }
+
+        let list_items = &properties["list"]["anyOf"][0]["items"];
+        assert_eq!(list_items["type"], json!("object"));
+        let nested_required = list_items["required"].as_array().expect("nested required");
+        for name in ["phase", "items", "agents"] {
+            assert!(
+                nested_required.iter().any(|entry| entry == name),
+                "missing nested {name}"
+            );
+        }
+        let nested_agents = &list_items["properties"]["agents"];
+        assert_eq!(nested_agents["anyOf"][0]["type"], json!("array"));
+        assert_eq!(nested_agents["anyOf"][0]["minItems"], json!(1));
+        assert_eq!(nested_agents["anyOf"][1]["type"], json!("null"));
+        assert_eq!(list_items["additionalProperties"], json!(false));
+        assert_eq!(
+            function["parameters"]["required"],
+            json!(["op", "list", "items", "agents", "dependsOn"])
+        );
+        assert_eq!(function["parameters"]["additionalProperties"], json!(false));
+        assert_eq!(
+            properties["op"]["type"],
+            json!("string"),
+            "non-nullable fields untouched"
+        );
+    }
+
+    /// The dialect rewrite is strict-only: without strict sampling the
+    /// payload keeps the standard JSON-Schema type unions (what non-strict
+    /// OpenAI-compatible servers and gateways accept, and what the schema
+    /// round-trip tests lock in).
+    #[test]
+    fn non_strict_tools_keep_standard_type_unions() {
+        let schema = crate::Schema {
+            schema_type: Some(json!("array")),
+            items: Some(Box::new(crate::Schema {
+                schema_type: Some(json!("string")),
+                ..Default::default()
+            })),
+            nullable: true,
+            ..Default::default()
+        };
+        let model = Model {
+            provider: "openai".into(),
+            ..Model::default()
+        };
+        let tool = crate::ToolDefinition {
+            name: "probe".into(),
+            description: "probe".into(),
+            parameters: schema,
+            constrained_sampling: None,
+        };
+        let payload = convert_openai_tools(&model, &[tool]).expect("convert");
+        let field = &payload[0]["function"]["parameters"];
+        assert_eq!(field["type"], json!(["array", "null"]));
+        assert!(field.get("anyOf").is_none());
+    }
+
     use super::*;
     use std::sync::Arc;
     use tokio::{
@@ -1602,6 +1796,7 @@ mod tests {
             OpenAIOptions {
                 stream: StreamOptions {
                     api_key: Some("sk-test".into()),
+                    http_executor: Some(crate::http::test_http_executor()),
                     ..StreamOptions::default()
                 },
                 ..OpenAIOptions::default()
@@ -1725,9 +1920,11 @@ mod tests {
             payload(&ant_ling, Some("high"), 1024)["reasoning"],
             json!({"effort":"high"})
         );
-        assert!(payload(&ant_ling, Some("medium"), 1024)
-            .get("reasoning")
-            .is_none());
+        assert!(
+            payload(&ant_ling, Some("medium"), 1024)
+                .get("reasoning")
+                .is_none()
+        );
 
         let string_thinking = Model {
             reasoning: true,
@@ -1742,7 +1939,10 @@ mod tests {
             payload(&string_thinking, Some("high"), 1024)["thinking"],
             "mapped-high"
         );
-        assert_eq!(payload(&string_thinking, None, 1024)["thinking"], "disabled");
+        assert_eq!(
+            payload(&string_thinking, None, 1024)["thinking"],
+            "disabled"
+        );
 
         let chat_template = Model {
             reasoning: true,
@@ -1870,6 +2070,81 @@ mod tests {
     }
 
     #[test]
+    fn empty_assistant_text_replays_as_empty_string_with_tool_calls() {
+        let model = Model {
+            id: "deepseek-v4-flash".into(),
+            api: API_OPENAI_COMPLETIONS.into(),
+            provider: "deepseek".into(),
+            reasoning: true,
+            ..Model::default()
+        };
+        let context = Context {
+            messages: vec![Message::Assistant(AssistantMessage {
+                content: vec![ContentBlock::ToolCall(ToolCall {
+                    id: "call-1".into(),
+                    name: "lookup".into(),
+                    arguments: json!({"key": "value"}),
+                    thought_signature: None,
+                })],
+                api: model.api.clone(),
+                provider: model.provider.clone(),
+                model: model.id.clone(),
+                response_model: None,
+                response_id: None,
+                diagnostics: vec![],
+                usage: Usage::default(),
+                stop_reason: StopReason::ToolUse,
+                error_message: None,
+                raw_stop_reason: Some("tool_calls".into()),
+                timestamp: 1,
+            })],
+            ..Context::default()
+        };
+        let messages = openai_messages(&model, &context).expect("messages");
+        assert_eq!(messages[0]["content"], "");
+        assert!(messages[0]["content"].is_string(), "{}", messages[0]);
+        assert_eq!(messages[0]["reasoning_content"], "");
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "call-1");
+    }
+
+    #[test]
+    fn thinking_only_assistant_replays_empty_string_content() {
+        let model = Model {
+            id: "deepseek-v4-flash".into(),
+            api: API_OPENAI_COMPLETIONS.into(),
+            provider: "deepseek".into(),
+            reasoning: true,
+            ..Model::default()
+        };
+        let context = Context {
+            messages: vec![Message::Assistant(AssistantMessage {
+                content: vec![ContentBlock::Thinking {
+                    thinking: "internal plan".into(),
+                    thinking_signature: None,
+                    redacted: false,
+                }],
+                api: model.api.clone(),
+                provider: model.provider.clone(),
+                model: model.id.clone(),
+                response_model: None,
+                response_id: None,
+                diagnostics: vec![],
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                raw_stop_reason: Some("stop".into()),
+                timestamp: 1,
+            })],
+            ..Context::default()
+        };
+        let messages = openai_messages(&model, &context).expect("messages");
+        assert_eq!(messages[0]["content"], "");
+        assert!(messages[0]["content"].is_string(), "{}", messages[0]);
+        assert_eq!(messages[0]["reasoning_content"], "internal plan");
+        assert!(messages[0].get("tool_calls").is_none(), "{}", messages[0]);
+    }
+
+    #[test]
     fn image_tool_results_keep_tool_text_and_follow_with_user_images() {
         let model = Model {
             id: "vision".into(),
@@ -1914,7 +2189,10 @@ mod tests {
             timestamp: 2,
         };
         let context = Context {
-            messages: vec![Message::Assistant(assistant), Message::ToolResult(tool_result)],
+            messages: vec![
+                Message::Assistant(assistant),
+                Message::ToolResult(tool_result),
+            ],
             ..Context::default()
         };
         let messages = openai_messages(&model, &context).expect("messages");
@@ -2045,22 +2323,40 @@ mod tests {
         );
     }
 
-
     #[test]
     fn openai_strict_tools_require_typed_root_and_complete_required_list() {
         let mut optional = Schema::string();
         optional.nullable = true;
         let mut parameters = Schema::object_ordered(vec![("value".to_owned(), optional, true)]);
         parameters.additional_properties = Some(json!(false));
-        let model = Model { provider: "openai".into(), ..Model::default() };
-        let tools = convert_openai_tools(&model, &[Tool {
-            name: "strict_tool".into(), description: "strict schema".into(), parameters,
-            constrained_sampling: Some(ConstrainedSampling::json_schema(ConstrainedSamplingStrictness::Prefer)),
-        }]).expect("strict tool payload");
+        let model = Model {
+            provider: "openai".into(),
+            ..Model::default()
+        };
+        let tools = convert_openai_tools(
+            &model,
+            &[Tool {
+                name: "strict_tool".into(),
+                description: "strict schema".into(),
+                parameters,
+                constrained_sampling: Some(ConstrainedSampling::json_schema(
+                    ConstrainedSamplingStrictness::Prefer,
+                )),
+            }],
+        )
+        .expect("strict tool payload");
         assert_eq!(tools[0]["function"]["strict"], true);
         assert_eq!(tools[0]["function"]["parameters"]["type"], "object");
-        assert_eq!(tools[0]["function"]["parameters"]["required"], json!(["value"]));
-        assert_eq!(tools[0]["function"]["parameters"]["properties"]["value"]["type"], json!(["string", "null"]));
+        assert_eq!(
+            tools[0]["function"]["parameters"]["required"],
+            json!(["value"])
+        );
+        // Strict dialect: the nullable property is anyOf, not a type union
+        // (OpenAI strict rejects `type: ["string","null"]`).
+        let value = &tools[0]["function"]["parameters"]["properties"]["value"];
+        assert_eq!(value["anyOf"][0]["type"], json!("string"));
+        assert_eq!(value["anyOf"][1]["type"], json!("null"));
+        assert!(value.get("type").is_none());
     }
     #[test]
     fn openai_grammar_sampling_uses_custom_tools_only_when_supported() {
@@ -2371,12 +2667,8 @@ mod tests {
         };
         let headers = openai_request_headers(&model, &Context::default(), &options, "provider-key")
             .expect("headers");
-        let request = client(&options)
-            .expect("client")
-            .get("http://example.test")
-            .headers(headers)
-            .build()
-            .expect("request");
+        let request =
+            crate::http::test_http_request(HttpMethod::Get, "http://example.test", &headers);
         assert_eq!(request.headers().get_all("authorization").iter().count(), 1);
         assert_eq!(
             request
@@ -2474,12 +2766,8 @@ mod tests {
         };
         let headers = openai_request_headers(&model, &Context::default(), &options, "gateway-key")
             .expect("headers");
-        let request = client(&options)
-            .expect("client")
-            .get("http://example.test")
-            .headers(headers)
-            .build()
-            .expect("request");
+        let request =
+            crate::http::test_http_request(HttpMethod::Get, "http://example.test", &headers);
         assert_eq!(
             request
                 .headers()
@@ -2542,12 +2830,8 @@ mod tests {
         let options = StreamOptions::default();
         let headers =
             openai_request_headers(&model, &context, &options, "copilot-token").expect("headers");
-        let request = client(&options)
-            .expect("client")
-            .get("http://example.test")
-            .headers(headers)
-            .build()
-            .expect("request");
+        let request =
+            crate::http::test_http_request(HttpMethod::Get, "http://example.test", &headers);
         assert_eq!(
             request
                 .headers()
@@ -2639,6 +2923,7 @@ mod tests {
             OpenAIOptions {
                 stream: StreamOptions {
                     api_key: Some("sk-test".into()),
+                    http_executor: Some(crate::http::test_http_executor()),
                     ..StreamOptions::default()
                 },
                 ..OpenAIOptions::default()
@@ -2689,6 +2974,7 @@ mod tests {
             OpenAIOptions {
                 stream: StreamOptions {
                     api_key: Some("sk-test".into()),
+                    http_executor: Some(crate::http::test_http_executor()),
                     ..StreamOptions::default()
                 },
                 ..OpenAIOptions::default()
@@ -2750,6 +3036,7 @@ mod tests {
             OpenAIOptions {
                 stream: StreamOptions {
                     api_key: Some("sk-test".into()),
+                    http_executor: Some(crate::http::test_http_executor()),
                     ..StreamOptions::default()
                 },
                 ..OpenAIOptions::default()
@@ -2828,6 +3115,7 @@ mod tests {
             OpenAIOptions {
                 stream: StreamOptions {
                     api_key: Some("sk-test".into()),
+                    http_executor: Some(crate::http::test_http_executor()),
                     ..StreamOptions::default()
                 },
                 ..OpenAIOptions::default()
@@ -2891,6 +3179,7 @@ mod tests {
             OpenAIOptions {
                 stream: StreamOptions {
                     api_key: Some("sk-test".into()),
+                    http_executor: Some(crate::http::test_http_executor()),
                     ..StreamOptions::default()
                 },
                 ..OpenAIOptions::default()
@@ -3022,6 +3311,278 @@ mod tests {
         assert_eq!(ends, vec!["call-a", "call-b"]);
     }
 
+    /// Regression for the intermittent Web streaming error
+    /// `invalid type: null, expected a sequence`. OpenAI-compatible providers
+    /// (and gateways/proxies such as DeepSeek relays) always carry the
+    /// `tool_calls` key on chat-completions stream deltas and emit an
+    /// explicit `null` when the chunk has no tool call (e.g. a text-only or
+    /// finish chunk). `#[serde(default)]` alone only covers an ABSENT key, so
+    /// the explicit `null` used to abort the whole stream with serde's
+    /// `Vec` rejection — surfacing as the model stream error immediately
+    /// after streaming starts. The optional sequence fields now map `null`
+    /// to the same empty `Vec` as absence, and text continues streaming.
+    #[test]
+    fn null_tool_calls_and_reasoning_details_deltas_continue_streaming() {
+        // Pre-fix contract lock: a plain `Vec` deserialized from an explicit
+        // `null` rejects with exactly the observed serde text.
+        let pre_fix =
+            serde_json::from_value::<Vec<Value>>(Value::Null).expect_err("plain Vec rejects null");
+        let pre_fix_text = pre_fix.to_string();
+        assert!(
+            pre_fix_text.contains("invalid type: null")
+                && pre_fix_text.contains("expected a sequence"),
+            "pre-fix error must match the observed text: {pre_fix_text}"
+        );
+
+        // tool_calls: null (text-only chunk) must decode to empty and the text
+        // after it must stream through untouched.
+        let (output, events) = drive(vec![
+            chunk(r#"{"choices":[{"delta":{"content":"Hello","tool_calls":null}}]}"#),
+            chunk(r#"{"choices":[{"delta":{"content":" world","reasoning_details":null}}]}"#),
+            chunk(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#),
+        ]);
+        assert_eq!(output.stop_reason, StopReason::Stop);
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    AssistantMessageEvent::TextDelta { delta, .. } => Some(delta.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["Hello", " world"],
+            "text after null tool_calls/reasoning_details must still stream"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, AssistantMessageEvent::Error { .. })),
+            "no stream error events may be emitted"
+        );
+        assert!(tool_calls(&output).is_empty(), "null tool_calls -> empty");
+
+        // Absent keys keep working exactly as before.
+        let (absent_output, _) = drive(vec![
+            chunk(r#"{"choices":[{"delta":{"content":"plain"}}]}"#),
+            chunk(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#),
+        ]);
+        assert!(tool_calls(&absent_output).is_empty());
+    }
+
+    /// A non-array, non-null value for the optional delta sequences must stay
+    /// REJECTED: only `null`/absent map to empty, so a malformed required
+    /// shape never silently widens the contract. The rejection surfaces with
+    /// provider/chunk context on the stream error.
+    #[test]
+    fn malformed_delta_sequence_scalar_is_rejected() {
+        // `ChatChunk` has no `Debug` derive, so capture the error via match.
+        let error = match serde_json::from_str::<ChatChunk>(
+            r#"{"choices":[{"delta":{"tool_calls":"not-an-array"}}]}"#,
+        ) {
+            Ok(_) => panic!("scalar tool_calls must reject"),
+            Err(e) => e,
+        };
+        assert!(
+            error.to_string().contains("expected a sequence"),
+            "scalar tool_calls must fail as a sequence: {error}"
+        );
+        let reasoning_error = match serde_json::from_str::<ChatChunk>(
+            r#"{"choices":[{"delta":{"reasoning_details":{"not":"an array"}}}]}"#,
+        ) {
+            Ok(_) => panic!("object reasoning_details must reject"),
+            Err(e) => e,
+        };
+        assert!(
+            reasoning_error.to_string().contains("expected a sequence"),
+            "object reasoning_details must fail as a sequence: {reasoning_error}"
+        );
+    }
+
+    /// Regression at the exact provider seam the compaction summarizer drains
+    /// (`Session::complete_summary` -> `stream_fn`): a real OpenAI-compatible
+    /// SSE response whose text deltas explicitly carry `tool_calls: null` and
+    /// `reasoning_details: null` (the wire shape of DeepSeek relays and OpenAI
+    /// gateways on text-only chunks) must decode and commit the summary, never
+    /// abort with `invalid type: null, expected a sequence`. Fails against the
+    /// pre-`null_default_vec` semantics because the first delta would reject.
+    #[tokio::test]
+    async fn compact_seam_null_optional_arrays_commit_streamed_text() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let address = listener.local_addr().expect("mock address");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept mock request");
+            let mut bytes = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let count = socket.read(&mut buffer).await.expect("read mock request");
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buffer[..count]);
+                if let Some(split) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..split]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if bytes.len() >= split + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let body = concat!(
+                "data: {\"id\":\"compact-1\",\"model\":\"mock\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Checkpoint summary\",\"tool_calls\":null,\"reasoning_details\":null},\"finish_reason\":null}]}\n\n",
+                "data: {\"id\":\"compact-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" with null optional arrays\",\"tool_calls\":null,\"reasoning_details\":null},\"finish_reason\":null}]}\n\n",
+                "data: {\"id\":\"compact-1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n",
+                "data: [DONE]\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write mock response");
+        });
+        let model = Model {
+            id: "compact-seam".into(),
+            name: "Compact Seam".into(),
+            api: API_OPENAI_COMPLETIONS.into(),
+            provider: "openai".into(),
+            base_url: format!("http://{address}"),
+            ..Model::default()
+        };
+        let stream = stream_openai_completions(
+            model,
+            Context::default(),
+            OpenAIOptions {
+                stream: StreamOptions {
+                    api_key: Some("sk-test".into()),
+                    http_executor: Some(crate::http::test_http_executor()),
+                    ..StreamOptions::default()
+                },
+                ..OpenAIOptions::default()
+            },
+        )
+        .await;
+        while stream.next().await.is_some() {}
+        let result = stream.result().await.expect("final result");
+        // Pre-fix contract lock: a plain `Vec` deserialized from an explicit
+        // `null` rejects with exactly the observed serde text, so the chunks
+        // above would abort the stream without the optional-sequence fix.
+        let pre_fix =
+            serde_json::from_value::<Vec<Value>>(Value::Null).expect_err("plain Vec rejects null");
+        assert!(
+            pre_fix.to_string().contains("invalid type: null")
+                && pre_fix.to_string().contains("expected a sequence"),
+            "pre-fix error must match the observed text: {pre_fix}"
+        );
+        assert_eq!(result.stop_reason, StopReason::Stop);
+        assert_eq!(
+            result.text(),
+            "Checkpoint summary with null optional arrays",
+            "text after null tool_calls/reasoning_details must commit in full"
+        );
+        assert!(tool_calls(&result).is_empty(), "null tool_calls -> empty");
+    }
+
+    /// Scout contract for the compaction summarizer: a genuinely malformed
+    /// non-null value in the optional delta sequences must still REJECT — the
+    /// stream terminates with the contextual "invalid OpenAI chat-completions
+    /// stream chunk" error (which `Session::complete_summary` surfaces to the
+    /// compact caller), never a silent truncation or a widened schema.
+    #[tokio::test]
+    async fn compact_seam_malformed_optional_array_rejects_with_provider_context() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let address = listener.local_addr().expect("mock address");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept mock request");
+            let mut bytes = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let count = socket.read(&mut buffer).await.expect("read mock request");
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buffer[..count]);
+                if let Some(split) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..split]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if bytes.len() >= split + 4 + length {
+                        break;
+                    }
+                }
+            }
+            // `tool_calls` as a scalar (not null/array): must reject with
+            // provider/chunk context, not decode silently.
+            let body = concat!(
+                "data: {\"id\":\"bad-1\",\"choices\":[{\"delta\":{\"content\":\"x\",\"tool_calls\":\"not-an-array\"}}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write mock response");
+        });
+        let model = Model {
+            id: "compact-seam-bad".into(),
+            name: "Compact Seam Bad".into(),
+            api: API_OPENAI_COMPLETIONS.into(),
+            provider: "openai".into(),
+            base_url: format!("http://{address}"),
+            ..Model::default()
+        };
+        let stream = stream_openai_completions(
+            model,
+            Context::default(),
+            OpenAIOptions {
+                stream: StreamOptions {
+                    api_key: Some("sk-test".into()),
+                    http_executor: Some(crate::http::test_http_executor()),
+                    ..StreamOptions::default()
+                },
+                ..OpenAIOptions::default()
+            },
+        )
+        .await;
+        while stream.next().await.is_some() {}
+        let result = stream.result().await.expect("final result");
+        let error_text = result
+            .error_message
+            .as_deref()
+            .unwrap_or("no error message recorded");
+        assert!(
+            error_text.contains("invalid OpenAI chat-completions stream chunk"),
+            "malformed delta must surface with provider context: {error_text}"
+        );
+        assert!(
+            error_text.contains("expected a sequence"),
+            "the exact sequence rejection must remain visible: {error_text}"
+        );
+    }
+
     #[test]
     fn no_index_name_keyed_calls_stay_distinct_without_ids() {
         // No `index` and no `id`: the stabilizer keys by name. Two same-name calls
@@ -3140,5 +3701,328 @@ mod tests {
         );
         assert_eq!(output.usage.input, 7);
         assert_eq!(output.usage.output, 3);
+    }
+
+    #[test]
+    fn nullable_usage_counters_do_not_reject_valid_content() {
+        let parsed = parse_chat_chunk(json!({
+            "choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": null,
+                "completion_tokens": null,
+                "total_tokens": null,
+                "prompt_tokens_details": {
+                    "cached_tokens": null,
+                    "cache_write_tokens": null
+                },
+                "completion_tokens_details": {"reasoning_tokens": null}
+            }
+        }))
+        .expect("nullable counters are valid");
+
+        let (output, _events) = drive(vec![parsed]);
+        assert_eq!(output.text(), "ok");
+        assert_eq!(output.stop_reason, StopReason::Stop);
+        assert_eq!(output.usage, Usage::default());
+    }
+
+    #[test]
+    fn nullable_usage_counters_preserve_previous_complete_usage() {
+        let (output, _events) = drive(vec![
+            chunk(
+                r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,"prompt_tokens_details":{"cached_tokens":2,"cache_write_tokens":1},"completion_tokens_details":{"reasoning_tokens":3}}}"#,
+            ),
+            chunk(
+                r#"{"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":null,"completion_tokens":null,"total_tokens":null,"prompt_tokens_details":{"cached_tokens":null,"cache_write_tokens":null},"completion_tokens_details":{"reasoning_tokens":null}}}"#,
+            ),
+        ]);
+
+        assert_eq!(output.text(), "ok");
+        assert_eq!(output.usage.input, 7);
+        assert_eq!(output.usage.cache_read, 2);
+        assert_eq!(output.usage.cache_write, 1);
+        assert_eq!(output.usage.output, 5);
+        assert_eq!(output.usage.reasoning, 3);
+        assert_eq!(output.usage.total_tokens, 15);
+    }
+
+    #[test]
+    fn complete_usage_without_details_clears_previous_detail_counts() {
+        let (output, _events) = drive(vec![
+            chunk(
+                r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,"prompt_tokens_details":{"cached_tokens":2,"cache_write_tokens":1},"completion_tokens_details":{"reasoning_tokens":3}}}"#,
+            ),
+            chunk(
+                r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":20,"completion_tokens":8,"total_tokens":28}}"#,
+            ),
+        ]);
+
+        assert_eq!(output.usage.input, 20);
+        assert_eq!(output.usage.cache_read, 0);
+        assert_eq!(output.usage.cache_write, 0);
+        assert_eq!(output.usage.output, 8);
+        assert_eq!(output.usage.reasoning, 0);
+        assert_eq!(output.usage.total_tokens, 28);
+    }
+
+    #[test]
+    fn malformed_usage_counter_keeps_provider_context() {
+        let error = parse_chat_chunk(json!({
+            "choices": [{"delta": {"content": "ok"}}],
+            "usage": {"prompt_tokens": "not-a-number"}
+        }))
+        .err()
+        .expect("string counter must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("invalid OpenAI chat-completions stream chunk"),
+            "provider context missing: {message}"
+        );
+        assert!(
+            message.contains("invalid type: string") && message.contains("expected i64"),
+            "numeric type error missing: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_openai_provider_402_labels_error_with_provider_id() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let address = listener.local_addr().expect("mock address");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept mock request");
+            let mut bytes = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let count = socket.read(&mut buffer).await.expect("read mock request");
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buffer[..count]);
+                if let Some(split) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..split]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if bytes.len() >= split + 4 + length {
+                        break;
+                    }
+                }
+            }
+            // Mirrors the real DeepSeek 402 from the root-cause diagnostic.
+            let body =
+                r#"{"error":{"message":"Insufficient Balance","code":"invalid_request_error"}}"#;
+            let response = format!(
+                "HTTP/1.1 402 Payment Required\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write mock response");
+        });
+        let model = Model {
+            id: "deepseek-v4-pro".into(),
+            name: "DeepSeek V4 Pro".into(),
+            api: API_OPENAI_COMPLETIONS.into(),
+            provider: "deepseek".into(),
+            base_url: format!("http://{address}"),
+            ..Model::default()
+        };
+        let stream = stream_openai_completions(
+            model,
+            Context::default(),
+            OpenAIOptions {
+                stream: StreamOptions {
+                    api_key: Some("sk-test".into()),
+                    http_executor: Some(crate::http::test_http_executor()),
+                    ..StreamOptions::default()
+                },
+                ..OpenAIOptions::default()
+            },
+        )
+        .await;
+        let result = stream.result().await.expect("final result");
+        assert_eq!(result.stop_reason, StopReason::Error);
+        let error_text = result
+            .error_message
+            .as_deref()
+            .unwrap_or("no error message recorded");
+        assert!(
+            error_text.starts_with(
+                "deepseek API error 402: Insufficient Balance (invalid_request_error)"
+            ),
+            "non-2xx from a deepseek provider must be labeled with the provider id, not OpenAI: {error_text}"
+        );
+        assert!(
+            !error_text.starts_with("OpenAI API error"),
+            "hardcoded OpenAI label must not leak for non-OpenAI providers: {error_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_provider_402_keeps_openai_label() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let address = listener.local_addr().expect("mock address");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept mock request");
+            let mut bytes = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let count = socket.read(&mut buffer).await.expect("read mock request");
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buffer[..count]);
+                if let Some(split) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..split]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if bytes.len() >= split + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let body =
+                r#"{"error":{"message":"Insufficient Balance","code":"invalid_request_error"}}"#;
+            let response = format!(
+                "HTTP/1.1 402 Payment Required\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write mock response");
+        });
+        let model = Model {
+            id: "gpt-5".into(),
+            name: "GPT-5".into(),
+            api: API_OPENAI_COMPLETIONS.into(),
+            provider: "openai".into(),
+            base_url: format!("http://{address}"),
+            ..Model::default()
+        };
+        let stream = stream_openai_completions(
+            model,
+            Context::default(),
+            OpenAIOptions {
+                stream: StreamOptions {
+                    api_key: Some("sk-test".into()),
+                    http_executor: Some(crate::http::test_http_executor()),
+                    ..StreamOptions::default()
+                },
+                ..OpenAIOptions::default()
+            },
+        )
+        .await;
+        let result = stream.result().await.expect("final result");
+        assert_eq!(result.stop_reason, StopReason::Error);
+        let error_text = result
+            .error_message
+            .as_deref()
+            .unwrap_or("no error message recorded");
+        assert!(
+            error_text.starts_with(
+                "OpenAI API error 402: Insufficient Balance (invalid_request_error)"
+            ),
+            "the real OpenAI provider must keep the OpenAI label: {error_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_provider_id_402_falls_back_to_openai_label() {
+        // A model whose catalog entry carries no provider id (empty string)
+        // must fall back to the "OpenAI" label exactly like the real OpenAI
+        // provider — the empty arm of the label match is a public contract.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let address = listener.local_addr().expect("mock address");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept mock request");
+            let mut bytes = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let count = socket.read(&mut buffer).await.expect("read mock request");
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buffer[..count]);
+                if let Some(split) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..split]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if bytes.len() >= split + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let body =
+                r#"{"error":{"message":"Insufficient Balance","code":"invalid_request_error"}}"#;
+            let response = format!(
+                "HTTP/1.1 402 Payment Required\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write mock response");
+        });
+        let model = Model {
+            id: "gpt-5".into(),
+            name: "GPT-5".into(),
+            api: API_OPENAI_COMPLETIONS.into(),
+            provider: String::new(),
+            base_url: format!("http://{address}"),
+            ..Model::default()
+        };
+        let stream = stream_openai_completions(
+            model,
+            Context::default(),
+            OpenAIOptions {
+                stream: StreamOptions {
+                    api_key: Some("sk-test".into()),
+                    http_executor: Some(crate::http::test_http_executor()),
+                    ..StreamOptions::default()
+                },
+                ..OpenAIOptions::default()
+            },
+        )
+        .await;
+        let result = stream.result().await.expect("final result");
+        assert_eq!(result.stop_reason, StopReason::Error);
+        let error_text = result
+            .error_message
+            .as_deref()
+            .unwrap_or("no error message recorded");
+        assert!(
+            error_text.starts_with(
+                "OpenAI API error 402: Insufficient Balance (invalid_request_error)"
+            ),
+            "an empty provider id must fall back to the OpenAI label: {error_text}"
+        );
     }
 }

@@ -13,20 +13,20 @@
 use std::path::Path;
 use std::str::FromStr;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde_json::Value;
 
 use ast_grep_core::{Language, Node, Pattern, PatternError};
 use ast_grep_language::{LanguageExt, SupportLang};
 use pi_agent::{AbortSignal, AgentTool, AgentToolResult, ToolCapability};
 
-use crate::truncate::{format_size, truncate_head, DEFAULT_MAX_BYTES};
+use crate::truncate::{DEFAULT_MAX_BYTES, format_size, truncate_head};
 
-use super::{
-    arg_str, check_aborted, factory_workspace, s_object, s_string, text_result, walk, IgnoreStack,
-    WalkControl,
-};
 use super::paths::resolve_scoped_path;
+use super::{
+    GenerationCaptureFn, arg_str, captured_policy_fs, check_aborted, factory_workspace, s_object,
+    s_string, text_result,
+};
 
 /// Maximum matches reported before stopping (keeps agent context bounded).
 const MATCH_LIMIT: usize = 50;
@@ -70,7 +70,9 @@ pub(crate) fn ast_grep_tool(cwd: &str) -> AgentTool {
             ),
             (
                 "path",
-                s_string("File or directory to search (default: cwd). Confined to workspace roots."),
+                s_string(
+                    "File or directory to search (default: cwd). Confined to workspace roots.",
+                ),
             ),
             (
                 "lang",
@@ -90,11 +92,89 @@ Supports: {}.",
         DEFAULT_MAX_BYTES / 1024,
         enabled_lang_names()
     );
-    AgentTool::new("ast_grep", description, params, move |ctx| {
-        let workspace = workspace.clone();
-        async move { run_ast_grep(&workspace, ctx.arguments, ctx.abort) }
+    AgentTool::new("ast_grep", description, params, move |_ctx| async move {
+        Err(anyhow!("ast_grep requires an application generation"))
     })
     .with_capability(ToolCapability::Read)
+}
+
+pub(crate) fn ast_grep_tool_with_generation(
+    workspace: crate::WorkspaceRoots,
+    capture: GenerationCaptureFn,
+) -> AgentTool {
+    let params = s_object(
+        vec![
+            ("pattern", s_string("ast-grep pattern")),
+            ("path", s_string("Policy-authorized file to search")),
+            ("lang", s_string("Optional language override")),
+        ],
+        vec!["pattern", "path"],
+    );
+    AgentTool::new(
+        "ast_grep",
+        "Search one file structurally through retained policy filesystem authority.",
+        params,
+        move |ctx| {
+            let workspace = workspace.clone();
+            let capture = capture.clone();
+            async move {
+                let generation = capture()?;
+                run_ast_grep_captured(&workspace, &generation, ctx.arguments, ctx.abort)
+            }
+        },
+    )
+    .with_capability(ToolCapability::Read)
+}
+
+fn run_ast_grep_captured(
+    workspace: &crate::WorkspaceRoots,
+    generation: &std::sync::Arc<crate::application::generation::ApplicationGeneration>,
+    args: Value,
+    abort: AbortSignal,
+) -> Result<AgentToolResult> {
+    check_aborted(&abort)?;
+    let pattern = arg_str(&args, "pattern");
+    if pattern.trim().is_empty() {
+        return Err(anyhow!("pattern must not be empty"));
+    }
+    let requested = arg_str(&args, "path");
+    let absolute = std::path::PathBuf::from(resolve_scoped_path(&requested, workspace)?);
+    let lang_override = args
+        .get("lang")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let lang = resolve_lang(&requested, lang_override).ok_or_else(|| {
+        anyhow!(
+            "unsupported language for {requested}; pass `lang` (one of: {})",
+            enabled_lang_names()
+        )
+    })?;
+    let source = captured_policy_fs(generation)?.read_text_bounded(&absolute, 64 * 1024 * 1024)?;
+    let pattern =
+        Pattern::try_new(&pattern, lang).map_err(|error| pattern_error(error, &pattern))?;
+    let root = lang.ast_grep(&source);
+    let mut lines = Vec::new();
+    for matched in root.root().find_all(pattern).take(MATCH_LIMIT) {
+        check_aborted(&abort)?;
+        let position = matched.start_pos();
+        let first_line = matched
+            .text()
+            .split('\n')
+            .next()
+            .unwrap_or("")
+            .trim_end()
+            .to_owned();
+        lines.push(format!(
+            "{requested}:{}:{}: {first_line}",
+            position.line() + 1,
+            position.column(&*matched) + 1
+        ));
+    }
+    if lines.is_empty() {
+        Ok(text_result("No matches found"))
+    } else {
+        Ok(text_result(lines.join("\n")))
+    }
 }
 
 fn enabled_lang_names() -> String {
@@ -106,159 +186,11 @@ fn enabled_lang_names() -> String {
 }
 
 pub(crate) fn run_ast_grep(
-    workspace: &crate::WorkspaceRoots,
-    args: Value,
-    abort: AbortSignal,
+    _workspace: &crate::WorkspaceRoots,
+    _args: Value,
+    _abort: AbortSignal,
 ) -> Result<AgentToolResult> {
-    check_aborted(&abort)?;
-    let pattern = arg_str(&args, "pattern");
-    if pattern.trim().is_empty() {
-        return Err(anyhow!("pattern must not be empty"));
-    }
-    let root_path = match args
-        .get("path")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-    {
-        Some(p) => resolve_scoped_path(p, workspace)?,
-        None => workspace.cwd().to_string_lossy().into_owned(),
-    };
-    let lang_override = args
-        .get("lang")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty());
-
-    let info = std::fs::metadata(&root_path).map_err(|_| anyhow!("Path not found: {root_path}"))?;
-    check_aborted(&abort)?;
-
-    let mut lines: Vec<String> = Vec::new();
-    let mut match_count = 0usize;
-    let mut limit_reached = false;
-
-    if !info.is_dir() {
-        // Single-file (or single-target) mode: an unresolved language is a hard
-        // error, not a silent skip.
-        search_file(
-            &root_path,
-            &root_path,
-            &pattern,
-            lang_override,
-            true,
-            &mut lines,
-            &mut match_count,
-            &abort,
-        )?;
-    } else {
-        let mut ig = IgnoreStack::new(&root_path, false, true);
-        let mut hard_err: Option<anyhow::Error> = None;
-        walk(&root_path, &mut ig, &mut |abs, rel, is_dir| {
-            if abort.is_aborted() {
-                return WalkControl::Stop;
-            }
-            if is_dir {
-                return WalkControl::Continue;
-            }
-            if match_count >= MATCH_LIMIT {
-                limit_reached = true;
-                return WalkControl::Stop;
-            }
-            match search_file(
-                abs,
-                rel,
-                &pattern,
-                lang_override,
-                false,
-                &mut lines,
-                &mut match_count,
-                &abort,
-            ) {
-                Ok(()) => WalkControl::Continue,
-                Err(e) => {
-                    hard_err = Some(e);
-                    WalkControl::Stop
-                }
-            }
-        });
-        if let Some(e) = hard_err {
-            return Err(e);
-        }
-    }
-    check_aborted(&abort)?;
-
-    if match_count == 0 {
-        return Ok(text_result("No matches found"));
-    }
-    let raw_output = lines.join("\n");
-    let tr = truncate_head(&raw_output, usize::MAX, 0);
-    let mut output = tr.content;
-    let mut notices = Vec::new();
-    if limit_reached {
-        notices.push(format!(
-            "{MATCH_LIMIT} matches limit reached. Refine the pattern or scope to a smaller path"
-        ));
-    }
-    if tr.truncated {
-        notices.push(format!("{} limit reached", format_size(DEFAULT_MAX_BYTES)));
-    }
-    if !notices.is_empty() {
-        output.push_str("\n\n[");
-        output.push_str(&notices.join(". "));
-        output.push(']');
-    }
-    Ok(text_result(output))
-}
-
-/// Searches a single file. `require_lang` controls the unresolved-language
-/// outcome: error (single-target mode) vs. silent skip (directory walk).
-fn search_file(
-    abs: &str,
-    rel: &str,
-    pattern: &str,
-    lang_override: Option<&str>,
-    require_lang: bool,
-    lines: &mut Vec<String>,
-    match_count: &mut usize,
-    abort: &AbortSignal,
-) -> Result<()> {
-    if abort.is_aborted() {
-        return Ok(());
-    }
-    let lang = match resolve_lang(abs, lang_override) {
-        Some(l) => l,
-        None => {
-            if require_lang {
-                return Err(anyhow!(
-                    "unsupported language for {rel}; pass `lang` (one of: {})",
-                    enabled_lang_names()
-                ));
-            }
-            return Ok(());
-        }
-    };
-    let pat = Pattern::try_new(pattern, lang).map_err(|e| pattern_error(e, pattern))?;
-    let src = match std::fs::read_to_string(abs) {
-        Ok(s) => s,
-        Err(_) => return Ok(()), // unreadable/binary during a walk: skip
-    };
-    let root = lang.ast_grep(&src);
-    let root_node = root.root();
-    for matched in root_node.find_all(pat) {
-        if abort.is_aborted() {
-            return Ok(());
-        }
-        let pos = matched.start_pos();
-        let line = pos.line() + 1;
-        // `column` is O(line length); fine for reporting. 1-based char column.
-        let col = pos.column(&*matched) + 1;
-        let text = matched.text().to_string();
-        let first_line = text.split('\n').next().unwrap_or("").trim_end();
-        lines.push(format!("{rel}:{line}:{col}: {first_line}"));
-        *match_count += 1;
-        if *match_count >= MATCH_LIMIT {
-            return Ok(());
-        }
-    }
-    Ok(())
+    Err(anyhow!("ast_grep requires an application generation"))
 }
 
 /// Resolves the ast-grep language for `path`/override. `None` means "skip or
@@ -266,9 +198,7 @@ fn search_file(
 /// extension that maps to a disabled language, both yield `None`.
 fn resolve_lang(path: &str, lang_override: Option<&str>) -> Option<SupportLang> {
     if let Some(s) = lang_override {
-        return SupportLang::from_str(s)
-            .ok()
-            .filter(|l| is_enabled(l));
+        return SupportLang::from_str(s).ok().filter(|l| is_enabled(l));
     }
     SupportLang::from_path(Path::new(path)).filter(|l| is_enabled(l))
 }
@@ -282,6 +212,100 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::fs;
+    use std::path::Path;
+
+    struct GenerationFixture {
+        _agent: tempfile::TempDir,
+        _sessions: tempfile::TempDir,
+        _resources: crate::ResourceManager,
+        _session: crate::Session,
+        _application: crate::Application,
+        _faux: pi_ai::providers::FauxProviderRegistration,
+        workspace: crate::WorkspaceRoots,
+        capture: GenerationCaptureFn,
+    }
+
+    async fn generation_fixture(cwd: &Path) -> GenerationFixture {
+        let agent = tempfile::tempdir().expect("agent dir");
+        let sessions = tempfile::tempdir().expect("session dir");
+        fs::write(
+            agent.path().join("settings.json"),
+            r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+        )
+        .expect("sandbox settings");
+        let mut resource_options = crate::ResourceManagerOptions::new(cwd);
+        resource_options.agent_dir = agent.path().to_path_buf();
+        resource_options.project_trust_override = Some(true);
+        resource_options.disable_extensions = true;
+        resource_options.disable_skills = true;
+        resource_options.disable_prompt_templates = true;
+        resource_options.disable_themes = true;
+        resource_options.disable_context_files = true;
+        let resources = crate::ResourceManager::new(resource_options).expect("resources");
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let api = format!("ast-grep-{suffix}");
+        let provider = format!("ast-grep-{suffix}");
+        let model = pi_ai::Model {
+            id: format!("ast-grep-{suffix}"),
+            api: api.clone(),
+            provider: provider.clone(),
+            ..pi_ai::Model::default()
+        };
+        let faux =
+            pi_ai::providers::register_faux_provider(pi_ai::providers::FauxProviderOptions {
+                api,
+                provider,
+                models: vec![model.clone()],
+                chunk_size: 1,
+            });
+        let workspace =
+            crate::WorkspaceRoots::new(cwd, Vec::<std::path::PathBuf>::new()).expect("workspace");
+        let session =
+            crate::Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
+                crate::SessionOptions {
+                    model,
+                    cwd: cwd.to_path_buf(),
+                    system_prompt: String::new(),
+                    thinking_level: pi_agent::ThinkingLevel::Off,
+                    api_key: String::new(),
+                    compaction: None,
+                    stream_options: Default::default(),
+                    tools: Some(Vec::new()),
+                    before_tool_call: None,
+                    after_tool_call: None,
+                    stream_fn: None,
+                    auth_resolver: None,
+                    auth_manager: None,
+                },
+                Vec::new(),
+                crate::ToolSelection::default(),
+                crate::ResourceDiscovery::Disabled,
+                workspace.clone(),
+                None,
+            )
+            .expect("session");
+        session.set_session_dir(sessions.path().to_path_buf());
+        session
+            .attach_resources(resources.clone())
+            .await
+            .expect("attach resources");
+        let application = crate::Application::from_runtime_candidate(
+            crate::ApplicationRuntimeCandidate::new(session.clone()),
+        )
+        .await
+        .expect("publish ast grep application");
+        let capture = application.generation_capture_fn();
+        GenerationFixture {
+            _agent: agent,
+            _sessions: sessions,
+            _resources: resources,
+            _session: session,
+            _application: application,
+            _faux: faux,
+            workspace,
+            capture,
+        }
+    }
 
     fn tmpdir() -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("pi-astgrep-test-{}", uuid::Uuid::new_v4()));
@@ -289,86 +313,109 @@ mod tests {
         d
     }
 
-    fn run(workspace: &crate::WorkspaceRoots, args: Value) -> Result<String> {
-        let res = run_ast_grep(workspace, args, AbortSignal::none())?;
-        Ok(res.content.first().and_then(|b| match b {
-            pi_ai::ContentBlock::Text { text, .. } => Some(text.clone()),
-            _ => None,
-        }).unwrap_or_default())
+    fn text_of(result: AgentToolResult) -> String {
+        result
+            .content
+            .first()
+            .and_then(|block| match block {
+                pi_ai::ContentBlock::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 
-    #[test]
-    fn pattern_matches_rust_some_capture() {
+    fn run(fixture: &GenerationFixture, args: Value) -> Result<String> {
+        let generation = (fixture.capture)()?;
+        run_ast_grep_captured(&fixture.workspace, &generation, args, AbortSignal::none())
+            .map(text_of)
+    }
+
+    #[tokio::test]
+    async fn pattern_matches_rust_some_capture() {
         let d = tmpdir();
         fs::write(
             d.join("lib.rs"),
             "fn main() {\n    let x = Some(123);\n    let y = Some(456);\n}\n",
         )
         .unwrap();
-        let ws = crate::WorkspaceRoots::for_tool_factory(&d.to_string_lossy());
-        let out = run(&ws, json!({ "pattern": "Some($A)", "path": "lib.rs" })).unwrap();
+        let fixture = generation_fixture(&d).await;
+        let out = run(&fixture, json!({ "pattern": "Some($A)", "path": "lib.rs" })).unwrap();
         assert!(out.contains("lib.rs:2:13: Some(123)"), "{out}");
         assert!(out.contains("lib.rs:3:13: Some(456)"), "{out}");
     }
 
-    #[test]
-    fn no_match_returns_no_matches() {
+    #[tokio::test]
+    async fn no_match_returns_no_matches() {
         let d = tmpdir();
         fs::write(d.join("lib.rs"), "fn main() { let x = 1; }\n").unwrap();
-        let ws = crate::WorkspaceRoots::for_tool_factory(&d.to_string_lossy());
-        let out = run(&ws, json!({ "pattern": "Some($A)", "path": "lib.rs" })).unwrap();
+        let fixture = generation_fixture(&d).await;
+        let out = run(&fixture, json!({ "pattern": "Some($A)", "path": "lib.rs" })).unwrap();
         assert_eq!(out, "No matches found");
     }
 
-    #[test]
-    fn directory_walk_searches_supported_langs_and_skips_unknown_extensions() {
+    #[tokio::test]
+    async fn directory_walk_searches_supported_langs_and_skips_unknown_extensions() {
         let d = tmpdir();
         fs::write(d.join("a.rs"), "fn f() { Some(1) }\n").unwrap();
-        fs::write(d.join("b.py"), "x = Some(1)\n").unwrap(); // inferred as Python, searched too
-        fs::write(d.join("c.txt"), "Some(1)\n").unwrap(); // unsupported extension, skipped
-        let ws = crate::WorkspaceRoots::for_tool_factory(&d.to_string_lossy());
-        let out = run(&ws, json!({ "pattern": "Some($A)", "path": "." })).unwrap();
-        // Each supported file is parsed with its own grammar (per-file inference).
-        assert!(out.contains("a.rs:1:10: Some(1)"), "{out}");
-        assert!(out.contains("b.py:1:5: Some(1)"), "{out}");
-        // Unsupported extension is skipped, not errored, during a walk.
-        assert!(!out.contains("c.txt"), "{out}");
-        assert!(!out.contains("unsupported language"), "{out}");
+        fs::write(d.join("b.py"), "x = Some(1)\n").unwrap();
+        fs::write(d.join("c.txt"), "Some(1)\n").unwrap();
+        let fixture = generation_fixture(&d).await;
+        let rust = run(&fixture, json!({ "pattern": "Some($A)", "path": "a.rs" })).unwrap();
+        let python = run(&fixture, json!({ "pattern": "Some($A)", "path": "b.py" })).unwrap();
+        assert!(rust.contains("a.rs:1:10: Some(1)"), "{rust}");
+        assert!(python.contains("b.py:1:5: Some(1)"), "{python}");
+        let unsupported = run(&fixture, json!({ "pattern": "Some($A)", "path": "c.txt" }))
+            .expect_err("unsupported extension remains outside the searched language set")
+            .to_string();
+        assert!(
+            unsupported.contains("unsupported language"),
+            "{unsupported}"
+        );
     }
 
-    #[test]
-    fn invalid_pattern_is_rejected_with_actionable_error() {
+    #[tokio::test]
+    async fn invalid_pattern_is_rejected_with_actionable_error() {
         let d = tmpdir();
         fs::write(d.join("lib.rs"), "fn main() {}\n").unwrap();
-        let ws = crate::WorkspaceRoots::for_tool_factory(&d.to_string_lossy());
-        let err = run(&ws, json!({ "pattern": "$$$A", "path": "lib.rs" }))
+        let fixture = generation_fixture(&d).await;
+        let err = run(&fixture, json!({ "pattern": "$$$A", "path": "lib.rs" }))
             .unwrap_err()
             .to_string();
         assert!(err.contains("invalid ast-grep pattern"), "{err}");
         assert!(err.contains("$$$A"), "{err}");
     }
 
-    #[test]
-    fn single_file_unsupported_language_errors() {
+    #[tokio::test]
+    async fn single_file_unsupported_language_errors() {
         let d = tmpdir();
         fs::write(d.join("data.unknownext"), "whatever").unwrap();
-        let ws = crate::WorkspaceRoots::for_tool_factory(&d.to_string_lossy());
-        let err = run(&ws, json!({ "pattern": "Some($A)", "path": "data.unknownext" }))
-            .unwrap_err()
-            .to_string();
+        let fixture = generation_fixture(&d).await;
+        let err = run(
+            &fixture,
+            json!({ "pattern": "Some($A)", "path": "data.unknownext" }),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("unsupported language"), "{err}");
     }
 
-    #[test]
-    fn path_outside_workspace_roots_is_rejected() {
+    #[tokio::test]
+    async fn path_outside_workspace_roots_is_rejected() {
         let d = tmpdir();
         let outside = tmpdir();
         fs::write(outside.join("lib.rs"), "fn main() { Some(1) }\n").unwrap();
-        let ws = crate::WorkspaceRoots::for_tool_factory(&d.to_string_lossy());
-        let err = run(&ws, json!({ "pattern": "Some($A)", "path": outside.join("lib.rs") }))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("outside the workspace") || err.contains("escape"), "{err}");
+        let fixture = generation_fixture(&d).await;
+        let err = run(
+            &fixture,
+            json!({ "pattern": "Some($A)", "path": outside.join("lib.rs") }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.starts_with("path_outside_workspace:")
+                && err.contains("outside authorized workspace roots"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -377,13 +424,13 @@ mod tests {
         assert!(is_enabled(&SupportLang::TypeScript));
         assert!(is_enabled(&SupportLang::Tsx));
         assert!(is_enabled(&SupportLang::JavaScript));
-        assert!(!is_enabled(&SupportLang::Ruby)); // not compiled in
+        assert!(!is_enabled(&SupportLang::Ruby));
     }
 
     #[test]
     fn resolve_lang_override_unsupported_returns_none() {
         assert_eq!(resolve_lang("x.rs", Some("rust")), Some(SupportLang::Rust));
-        assert_eq!(resolve_lang("x.rs", Some("Ruby")), None); // valid lang name but disabled
+        assert_eq!(resolve_lang("x.rs", Some("Ruby")), None);
         assert_eq!(resolve_lang("x.rs", Some("nonsense")), None);
         assert_eq!(resolve_lang("x.rs", None), Some(SupportLang::Rust));
         assert_eq!(resolve_lang("x.unknownext", None), None);

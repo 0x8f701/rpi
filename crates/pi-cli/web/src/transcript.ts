@@ -15,15 +15,17 @@
 //     end), with a leading hint reporting the omitted line count — matching
 //     the TUI compact tool-card fold (crates/pi-cli/src/tool_card_adapter.rs:
 //     `BASH_CARD_OUTPUT_LIMIT = 10`, `DEFAULT_CARD_OUTPUT_LIMIT = 6`);
-//   * Task, Edit, and Todo tools use structured default views (Goal/
+//   * Task, Edit, Todo, and Read tools use structured default views (Goal/
 //     Constraints/Contract + children; path/op + details.diff; compact
-//     phase/task list) instead of dumping raw JSON args or the TUI summary
+//     phase/task list; skill frontmatter / path-range-count Read fold) instead
+//     of dumping raw JSON args, generic details, or the TUI summary
 //     prose — web mirror of job_card_adapter / tool_card_adapter (reference
 //     only; this file never changes TUI behavior).
 
 import type { ContentBlock } from './types';
+import { redactSecrets } from './redact';
 
-export type ToolCardStatus = 'running' | 'done' | 'error';
+export type ToolCardStatus = 'running' | 'done' | 'cancelled' | 'error';
 
 /** Live child row for a Task tool card (spawn ids + runtime status/activity). */
 export interface TaskCardChild {
@@ -33,9 +35,15 @@ export interface TaskCardChild {
   target: string;
   jobId?: string;
   agentId?: string;
+  parentId?: string;
+  todoTaskId?: string;
   status: string;
   activity?: string;
   result?: string;
+  /** Bounded failure reason; a FAILED child always shows this even when it
+   *  also produced partial output — the user must never see FAILED with no
+   *  explanation. */
+  error?: string;
 }
 
 export interface ToolMedia {
@@ -69,7 +77,15 @@ export interface UserAnalysis {
 
 export type Item =
   | { kind: 'user'; id: string; text: string; optimistic: boolean; images?: UserImage[]; analysis?: UserAnalysis }
-  | { kind: 'assistant'; id: string; status: 'streaming' | 'final'; blocks: ContentBlock[] }
+  | {
+      kind: 'assistant';
+      id: string;
+      status: 'streaming' | 'final';
+      blocks: ContentBlock[];
+      /** Persisted failure reason (pi-ai AssistantMessage.errorMessage);
+       *  aborted turns stay hidden here (TUI status-row contract). */
+      errorMessage?: string;
+    }
   | {
       kind: 'toolCard';
       id: string;
@@ -82,8 +98,8 @@ export type Item =
       details?: unknown;
       media?: ToolMedia[];
     }
-  | { kind: 'toolResult'; id: string; text: string }
-  | { kind: 'bash'; id: string; command: string; output: string; status?: 'done' | 'error' }
+  | { kind: 'toolResult'; id: string; toolCallId: string; text: string }
+  | { kind: 'bash'; id: string; command: string; output: string; status?: 'done' | 'cancelled' | 'error' }
   // Custom display:true backend messages (loops, projected notices).
   | { kind: 'custom'; id: string; label: string; text: string }
   // Typed orchestration IRC messages (child↔Main IRC, rendered as a typed
@@ -103,7 +119,51 @@ export type Item =
     }
   // branchSummary / compactionSummary backend messages (system notices).
   | { kind: 'summary'; id: string; label: string; text: string }
+  // A session handoff divider (customType 'handoff'): the <handoff-context>
+  // document the backend writes as the FIRST record of the new session.
+  | { kind: 'handoff-divider'; id: string; text: string }
   | { kind: 'approval'; id: string; method: string; title: string; message: string; extensionId?: string };
+
+export function transcriptPathContext(items: readonly Item[]): string {
+  const parts: string[] = [];
+  for (const item of items) {
+    switch (item.kind) {
+      case 'user':
+      case 'custom':
+      case 'summary':
+      case 'handoff-divider':
+        parts.push(item.text);
+        break;
+      case 'assistant':
+        for (const block of item.blocks) {
+          if (block.type === 'text' && typeof block.text === 'string' && block.text !== '') {
+            parts.push(block.text);
+          }
+        }
+        break;
+      case 'toolCard': {
+        parts.push(item.result);
+        if (item.args && typeof item.args === 'object' && !Array.isArray(item.args)) {
+          const path = (item.args as { path?: unknown }).path;
+          if (typeof path === 'string' && path !== '') parts.push(path);
+        }
+        break;
+      }
+      case 'toolResult':
+        parts.push(item.text);
+        break;
+      case 'bash':
+        parts.push(item.output);
+        break;
+      case 'irc':
+        parts.push(item.body);
+        break;
+      default:
+        break;
+    }
+  }
+  return parts.join('\n');
+}
 
 export function nextId(prefix: string): string {
   return `${prefix}${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
@@ -354,6 +414,19 @@ export const EDIT_DIFF_LINE_LIMIT = 80;
 /** Per-task content budget for the Todo card (the TUI Todo DAG panel wraps
  *  task lines per width; the web keeps one generous bounded line). */
 export const TODO_TASK_CHAR_LIMIT = 240;
+export const TASK_PREVIEW_CHAR_LIMIT = 72;
+
+export function firstLinePreview(text: string, limit = TASK_PREVIEW_CHAR_LIMIT): string {
+  const line = text.replace(/\r\n/g, '\n').split('\n').find((row) => row.trim() !== '') ?? '';
+  return boundText(line.trim(), limit);
+}
+
+export function taskChildActionLine(child: TaskCardChild): string {
+  if (child.activity && child.activity.trim() !== '') return firstLinePreview(child.activity);
+  if (child.result && child.result.trim() !== '') return firstLinePreview(child.result);
+  return firstLinePreview(child.target);
+}
+
 
 export interface BoundedOutput {
   text: string;
@@ -380,24 +453,54 @@ export function boundOutput(output: string, lineLimit: number): BoundedOutput {
   };
 }
 
+export function toolCardCompletionStatus(
+  isError: boolean,
+  content: unknown,
+  details: unknown,
+): Exclude<ToolCardStatus, 'running'> {
+  const detail = details !== null && typeof details === 'object' && !Array.isArray(details)
+    ? (details as Record<string, unknown>)
+    : null;
+  const detailStatus = typeof detail?.status === 'string' ? detail.status.toLowerCase() : '';
+  const cancelled = detail?.cancelled === true
+    || detailStatus === 'cancelled'
+    || detailStatus === 'canceled'
+    || (isError && /operation aborted|cancelled|canceled|tool call cancelled/i.test(contentText(content)));
+  return cancelled ? 'cancelled' : isError ? 'error' : 'done';
+}
+
+export function applyToolStartToItems(
+  items: Item[],
+  card: Extract<Item, { kind: 'toolCard' }>,
+): Item[] {
+  if (card.toolCallId === '') return [...items, card];
+  const index = items.findIndex(
+    (item) => item.kind === 'toolCard' && item.toolCallId === card.toolCallId,
+  );
+  if (index < 0) return [...items, card];
+  const existing = items[index];
+  if (existing.kind !== 'toolCard') return items;
+  const next = items.slice();
+  next[index] = {
+    ...existing,
+    id: existing.id || card.id,
+    toolName: existing.toolName || card.toolName,
+    args: existing.args ?? card.args,
+  };
+  return next;
+}
+
 export function applyToolSnapshot(
   items: Item[],
   toolCallId: string,
   output: string,
-  status?: 'done' | 'error',
+  status?: Exclude<ToolCardStatus, 'running'>,
   details?: unknown,
   media?: ToolMedia[],
 ): Item[] {
   return items.map((item) => {
     if (item.kind !== 'toolCard' || item.toolCallId !== toolCallId) return item;
-    const limit = item.toolName.toLowerCase() === 'bash' ? BASH_OUTPUT_LINE_LIMIT : TOOL_OUTPUT_LINE_LIMIT;
-    return {
-      ...item,
-      ...(status ? { status } : {}),
-      result: boundOutput(output, limit).text,
-      ...(details !== undefined ? { details } : {}),
-      ...(media && media.length > 0 ? { media } : {}),
-    };
+    return completeToolCard(item, output, status, details, media);
   });
 }
 
@@ -405,10 +508,11 @@ export function applyToolSnapshot(
  *  view (App.tsx onMessageStart toolResult suppression): when a matching
  *  toolCard exists the result renders inline on the card — details folded on
  *  when missing, never overwriting existing result/details — and NO separate
- *  toolResult row is appended; unmatched results stay readable as a bounded
- *  toolResult item. Shared with CollabGuestView so the guest transcript can
- *  never show one tool's output twice (host parity). `text` must already be
- *  bounded by the caller (TOOL_OUTPUT_LINE_LIMIT). */
+ *  toolResult row is appended; unmatched results stay readable as distinct
+ *  bounded toolResult items. Stable toolCallId identity suppresses only a
+ *  duplicate frame for the same logical call; empty identities never dedupe.
+ *  Shared with CollabGuestView so the guest transcript has host parity.
+ *  `text` must already be bounded by the caller (TOOL_OUTPUT_LINE_LIMIT). */
 export function applyToolResultToItems(
   items: Item[],
   toolCallId: string,
@@ -417,21 +521,29 @@ export function applyToolResultToItems(
   media?: ToolMedia[],
 ): Item[] {
   if (toolCallId === '') {
-    return [...items, { kind: 'toolResult', id: nextId('r'), text }];
+    return [...items, { kind: 'toolResult', id: nextId('r'), toolCallId, text }];
   }
-  const hasCard = items.some((item) => item.kind === 'toolCard' && item.toolCallId === toolCallId);
-  if (!hasCard) return [...items, { kind: 'toolResult', id: nextId('r'), text }];
-  if (details === undefined && (!media || media.length === 0)) return items;
-  return items.map((item) =>
-    item.kind === 'toolCard' && item.toolCallId === toolCallId
-      ? {
-          ...item,
-          details: item.details ?? details,
-          result: item.result || text,
-          ...(media && media.length > 0 ? { media: item.media?.length ? item.media : media } : {}),
-        }
-      : item,
+  const cards = items.filter(
+    (item): item is Extract<Item, { kind: 'toolCard' }> =>
+      item.kind === 'toolCard' && item.toolCallId === toolCallId,
   );
+  if (cards.length === 0) {
+    return items.some((item) => item.kind === 'toolResult' && item.toolCallId === toolCallId)
+      ? items
+      : [...items, { kind: 'toolResult', id: nextId('r'), toolCallId, text }];
+  }
+  const authoritativeId = cards[0].id;
+  return items.flatMap((item) => {
+    if (item.kind !== 'toolCard' || item.toolCallId !== toolCallId) return [item];
+    if (item.id !== authoritativeId) return [];
+    if (details === undefined && (!media || media.length === 0)) {
+      return [completeToolCard(item, item.result || text)];
+    }
+    const output = item.result || text;
+    const nextDetails = item.details ?? details;
+    const nextMedia = item.media?.length ? item.media : media;
+    return [completeToolCard(item, output, undefined, nextDetails, nextMedia)];
+  });
 }
 
 /** Identity of a user item for optimistic↔durable reconcile: the typed text
@@ -448,16 +560,41 @@ function userItemIdentity(item: { text: string; images?: UserImage[] }): string 
   return key;
 }
 
+function isDurableTranscriptItem(item: Item): boolean {
+  switch (item.kind) {
+    case 'user':
+      return !item.optimistic;
+    case 'assistant':
+      return item.status === 'final';
+    case 'toolCard':
+      return item.status !== 'running';
+    case 'toolResult':
+    case 'bash':
+    case 'custom':
+    case 'irc':
+    case 'summary':
+    case 'handoff-divider':
+    case 'approval':
+      return true;
+  }
+}
+
 export function mergeAuthoritativeItems(history: Item[], live: Item[], preserveInflight = true): Item[] {
+  const liveDurable = live.filter(isDurableTranscriptItem);
+  const authoritative = history.some(isDurableTranscriptItem)
+    ? history
+    : history.length > 0 && liveDurable.length === 0
+      ? history
+      : liveDurable;
   const historicalToolCallIds = new Set(
-    history
+    authoritative
       .filter((item): item is Extract<Item, { kind: 'toolCard' }> => item.kind === 'toolCard')
       .map((item) => item.toolCallId)
       .filter((toolCallId) => toolCallId !== ''),
   );
   const historicalUserCounts = new Map<string, number>();
   const liveDurableUserCounts = new Map<string, number>();
-  for (const item of history) {
+  for (const item of authoritative) {
     if (item.kind === 'user') {
       const identity = userItemIdentity(item);
       historicalUserCounts.set(identity, (historicalUserCounts.get(identity) ?? 0) + 1);
@@ -474,6 +611,7 @@ export function mergeAuthoritativeItems(history: Item[], live: Item[], preserveI
     const surplus = count - (liveDurableUserCounts.get(identity) ?? 0);
     if (surplus > 0) durableOptimisticSurplus.set(identity, surplus);
   }
+  const historicalItemIds = new Set(authoritative.map((item) => item.id));
   const transient = live.filter((item) => {
     if (preserveInflight && item.kind === 'assistant' && item.status === 'streaming') return true;
     if (preserveInflight && item.kind === 'user' && item.optimistic) {
@@ -483,11 +621,58 @@ export function mergeAuthoritativeItems(history: Item[], live: Item[], preserveI
       durableOptimisticSurplus.set(identity, surplus - 1);
       return false;
     }
+    if (item.kind === 'summary' && item.id.startsWith('todo-route-')) {
+      return !historicalItemIds.has(item.id);
+    }
     if (item.kind !== 'toolCard') return false;
     if (item.toolCallId === '') return preserveInflight;
     return !historicalToolCallIds.has(item.toolCallId);
   });
-  return transient.length === 0 ? history : [...history, ...transient];
+  // Terminal Task-child projections are authoritative over disk history:
+  // the recorder still carries queued/running for children an earlier
+  // authoritative generation already omission-settled, so a history
+  // replacement must never regress a settled child to queued/running.
+  // Authoritative job frames stay free to advance a status later.
+  const terminalProjections = new Map<string, Map<string, string>>();
+  for (const item of live) {
+    if (item.kind !== 'toolCard' || item.toolCallId === '') continue;
+    const view = resolveTaskCardView(item.args, item.details);
+    if (!view) continue;
+    for (const child of view.children) {
+      if (!child.jobId) continue;
+      const status = child.status.toLowerCase();
+      if (status === 'queued' || status === 'running') continue;
+      let byJobId = terminalProjections.get(item.toolCallId);
+      if (!byJobId) {
+        byJobId = new Map();
+        terminalProjections.set(item.toolCallId, byJobId);
+      }
+      byJobId.set(child.jobId, child.status);
+    }
+  }
+  if (terminalProjections.size === 0) {
+    return transient.length === 0 ? authoritative : [...authoritative, ...transient];
+  }
+  const merged = transient.length === 0 ? authoritative : [...authoritative, ...transient];
+  return merged.map((item) => {
+    if (item.kind !== 'toolCard' || item.toolCallId === '') return item;
+    const byJobId = terminalProjections.get(item.toolCallId);
+    if (!byJobId) return item;
+    const view = resolveTaskCardView(item.args, item.details);
+    if (!view) return item;
+    let changed = false;
+    const children = view.children.map((child) => {
+      if (!child.jobId) return child;
+      const terminal = byJobId.get(child.jobId);
+      if (!terminal) return child;
+      const status = projectedJobStatus(child.status, terminal);
+      if (status === child.status) return child;
+      changed = true;
+      return { ...child, status };
+    });
+    if (!changed) return item;
+    return withProjectedChildren(item, children);
+  });
 }
 
 export function shouldRestoreStreamingAssistant(messages: unknown): boolean {
@@ -499,6 +684,201 @@ export function shouldRestoreStreamingAssistant(messages: unknown): boolean {
     if (message.role === 'assistant') return false;
   }
   return false;
+}
+
+export type ReconnectTurnPlan =
+  | { kind: 'streaming'; assistantId: string | null }
+  | { kind: 'settled' };
+
+export function liveHasStreamingAssistant(items: readonly Item[]): boolean {
+  return items.some((item) => item.kind === 'assistant' && item.status === 'streaming');
+}
+
+export type StreamStallReconcile = 'idle' | 'refill-settled';
+
+export function planStreamStallReconcile(opts: {
+  snapshotStreaming: boolean | undefined;
+  liveHasStreamingAssistant: boolean;
+}): StreamStallReconcile {
+  if (opts.snapshotStreaming !== false) return 'idle';
+  if (!opts.liveHasStreamingAssistant) return 'idle';
+  return 'refill-settled';
+}
+
+export function planSettledStreamRefillRequest(opts: {
+  snapshotStreaming: boolean | undefined;
+  liveHasStreamingAssistant: boolean;
+  reconnectRefillSessionId: string | null;
+  targetSessionId: string;
+}): 'request' | 'idle' {
+  if (!opts.targetSessionId) return 'idle';
+  if (planStreamStallReconcile({
+    snapshotStreaming: opts.snapshotStreaming,
+    liveHasStreamingAssistant: opts.liveHasStreamingAssistant,
+  }) !== 'refill-settled') return 'idle';
+  if (opts.reconnectRefillSessionId === opts.targetSessionId) return 'idle';
+  return 'request';
+}
+
+export const STREAM_WATCHDOG_MS = 5000;
+
+export function planStreamWatchdogTick(opts: {
+  streaming: boolean;
+  lastEventAt: number;
+  now: number;
+  watchdogMs: number;
+}): 'get_state' | 'idle' {
+  if (opts.streaming !== true) return 'idle';
+  if (!Number.isFinite(opts.lastEventAt) || !Number.isFinite(opts.now)) return 'idle';
+  if (opts.now - opts.lastEventAt < opts.watchdogMs) return 'idle';
+  return 'get_state';
+}
+
+export function withoutSessionWatchdogTimer(
+  timers: Readonly<Record<string, number>>,
+  sessionId: string,
+): Record<string, number> {
+  if (!(sessionId in timers)) return { ...timers };
+  const next = { ...timers };
+  delete next[sessionId];
+  return next;
+}
+
+export type StreamStallEvent =
+  | { type: 'watchdog_probe_failed' }
+  | { type: 'watchdog_probe_alive' }
+  | { type: 'socket_drop'; streaming: boolean }
+  | { type: 'live_event' }
+  | { type: 'refill_finished' }
+  | { type: 'abort' }
+  | { type: 'snapshot_idle'; refill: 'request' | 'idle' };
+
+export function reduceStreamStall(stalled: boolean, event: StreamStallEvent): boolean {
+  switch (event.type) {
+    case 'watchdog_probe_failed':
+      return true;
+    case 'watchdog_probe_alive':
+      return false;
+    case 'socket_drop':
+      return event.streaming || stalled;
+    case 'live_event':
+    case 'refill_finished':
+    case 'abort':
+      return false;
+    case 'snapshot_idle':
+      return event.refill === 'request';
+  }
+}
+
+export function planStreamStallChrome(stalled: boolean): 'pulse' | 'hidden' {
+  return stalled ? 'pulse' : 'hidden';
+}
+
+export function createStreamWatchdog(opts: {
+  watchdogMs: number;
+  now: () => number;
+  schedule: (fn: () => void, ms: number) => number;
+  cancel: (id: number) => void;
+  isStreaming: (sid: string) => boolean;
+  onSilence: (sid: string) => void;
+}): {
+  arm: (sid: string) => void;
+  clear: (sid: string) => void;
+  probe: (sid: string) => void;
+} {
+  const lastEventAt: Record<string, number> = {};
+  const timers: Record<string, number> = {};
+  const clear = (sid: string): void => {
+    const id = timers[sid];
+    if (id !== undefined) opts.cancel(id);
+    delete timers[sid];
+  };
+  const fireIfSilent = (sid: string): boolean => {
+    if (!opts.isStreaming(sid)) {
+      clear(sid);
+      return false;
+    }
+    if (planStreamWatchdogTick({
+      streaming: true,
+      lastEventAt: lastEventAt[sid] ?? 0,
+      now: opts.now(),
+      watchdogMs: opts.watchdogMs,
+    }) !== 'get_state') return false;
+    clear(sid);
+    opts.onSilence(sid);
+    return true;
+  };
+  const arm = (sid: string): void => {
+    if (!opts.isStreaming(sid)) {
+      clear(sid);
+      return;
+    }
+    lastEventAt[sid] = opts.now();
+    clear(sid);
+    timers[sid] = opts.schedule(() => {
+      delete timers[sid];
+      if (!fireIfSilent(sid) && opts.isStreaming(sid)) arm(sid);
+    }, opts.watchdogMs);
+  };
+  const probe = (sid: string): void => {
+    fireIfSilent(sid);
+  };
+  return { arm, clear, probe };
+}
+
+export function planLiveSequenceGap(opts: {
+  cursor: number;
+  sequence: number;
+}): 'duplicate' | 'apply' | 'gap' {
+  if (opts.sequence <= opts.cursor) return 'duplicate';
+  if (opts.sequence !== opts.cursor + 1) return 'gap';
+  return 'apply';
+}
+
+export function planLiveGapCatchUp(opts: { recoveryInFlight: boolean }): 'start' | 'coalesce' {
+  return opts.recoveryInFlight ? 'coalesce' : 'start';
+}
+
+export function planStreamCatchUpToast(opts: {
+  toastOwned: boolean;
+  transport: boolean;
+  busyCapacity: boolean;
+}): 'silent' | 'toast' {
+  if (opts.toastOwned || opts.transport || opts.busyCapacity) return 'silent';
+  return 'toast';
+}
+
+export function messagesFromCatchUpResponse(data: unknown): unknown[] {
+  if (!data || typeof data !== 'object' || !Array.isArray((data as { messages?: unknown }).messages)) {
+    throw new Error('messages response missing messages');
+  }
+  return (data as { messages: unknown[] }).messages;
+}
+
+export function planGapCatchUpMergeStreaming(snapshotStreaming: boolean | undefined): boolean {
+  return snapshotStreaming === true;
+}
+
+export function planReconnectTurn(options: {
+  isStreaming: boolean;
+  liveItems: Item[];
+  activeAssistantId: string | undefined;
+}): ReconnectTurnPlan {
+  if (options.isStreaming !== true) return { kind: 'settled' };
+  const liveId = typeof options.activeAssistantId === 'string' && options.activeAssistantId !== ''
+    ? options.activeAssistantId
+    : null;
+  if (liveId) {
+    const match = options.liveItems.find(
+      (item) => item.kind === 'assistant' && item.status === 'streaming' && item.id === liveId,
+    );
+    if (match) return { kind: 'streaming', assistantId: liveId };
+  }
+  const anyStreaming = options.liveItems.find(
+    (item) => item.kind === 'assistant' && item.status === 'streaming',
+  );
+  if (anyStreaming) return { kind: 'streaming', assistantId: anyStreaming.id };
+  return { kind: 'streaming', assistantId: null };
 }
 
 /** Count occurrences of the literal two-character sequence `\n` (backslash
@@ -545,8 +925,7 @@ export function normalizeThinkingNewlines(text: string): string {
 }
 
 /** Finalize a live assistant when a run settles without `message_end`.
- * Streamed visible text is preserved (early-abort contract); final rendering
- * hides any persisted thinking blocks without deleting recorder content. */
+ * Streamed visible text is preserved (early-abort contract). */
 export function finalizeStreamingAssistant(items: Item[], targetId: string, streamedText: string): Item[] {
   if (targetId === '') return items;
   return items.map((item) => {
@@ -734,13 +1113,13 @@ export function mergeTaskSpawnDetails(children: TaskCardChild[], details: unknow
     if (!spawn) return child;
     const jobId = stringField(spawn, 'jobId', 'job_id') || child.jobId;
     const agentId = stringField(spawn, 'agentId', 'agent_id') || child.agentId || child.name;
-    const agent = stringField(spawn, 'agent') || child.agent;
     const status = stringField(spawn, 'status') || child.status;
     return {
       ...child,
       jobId: jobId || undefined,
       agentId: agentId || undefined,
-      agent: agent || child.agent,
+      parentId: child.parentId,
+      todoTaskId: child.todoTaskId,
       status: status || child.status,
     };
   });
@@ -761,42 +1140,78 @@ function projectedChildren(details: unknown): TaskCardChild[] | null {
         target: boundText(target, TASK_TARGET_CHAR_LIMIT),
         jobId: stringField(child, 'jobId', 'job_id') || undefined,
         agentId: stringField(child, 'agentId', 'agent_id') || undefined,
+        parentId: stringField(child, 'parentId', 'parent_id') || undefined,
+        todoTaskId: stringField(child, 'todoTaskId', 'todo_task_id') || undefined,
         status: stringField(child, 'status') || 'queued',
         activity: stringField(child, 'activity') || undefined,
         result: stringField(child, 'result') || undefined,
+        error: stringField(child, 'error') || undefined,
       };
     })
     .filter((child): child is TaskCardChild => child !== null);
   return children.length > 0 ? children : null;
 }
 
+function taskStatusFromChildren(children: TaskCardChild[]): ToolCardStatus | null {
+  if (children.length === 0) return null;
+  const statuses = children.map((child) => child.status.toLowerCase());
+  if (statuses.some((status) => status === 'queued' || status === 'running')) return 'running';
+  if (statuses.some((status) => status === 'failed' || status === 'error')) return 'error';
+  if (statuses.some((status) => status === 'cancelled' || status === 'canceled' || status === 'aborted')) {
+    return 'cancelled';
+  }
+  return 'done';
+}
+
 /** Resolve the Task card default view from args + optional details.
- *  Mirrors job_card_adapter: request children from tool start args, spawn
- *  ids/status from TaskSpawn[] end details, live rows from projected children. */
-export function resolveTaskCardView(args: unknown, details?: unknown): TaskCardView | null {
+ *  Args children are previews until a successful spawn or live child snapshot
+ *  establishes authority. A terminal pre-spawn rejection therefore renders
+ *  no queued children. */
+export function resolveTaskCardView(
+  args: unknown,
+  details?: unknown,
+  parentStatus: ToolCardStatus = 'running',
+): TaskCardView | null {
   const base = parseTaskCardArgs(args);
   if (!base) return null;
-  const withSpawns = mergeTaskSpawnDetails(base.children, details);
+  const spawns = spawnList(details);
   const live = projectedChildren(details);
-  if (!live) return { sections: base.sections, children: withSpawns };
+  if (!live && (!spawns || spawns.length === 0) && (parentStatus === 'error' || parentStatus === 'cancelled')) {
+    return { sections: base.sections, children: [] };
+  }
+  const withSpawns = mergeTaskSpawnDetails(base.children, details);
+  if (!live) {
+    const children = parentStatus === 'error' || parentStatus === 'cancelled'
+      ? withSpawns.filter((child) => child.jobId !== undefined)
+      : withSpawns;
+    return { sections: base.sections, children };
+  }
   const byKey = new Map<string, TaskCardChild>();
   for (const child of withSpawns) {
     byKey.set(child.jobId || child.agentId || child.name, child);
   }
-  const children = live.map((child) => {
+  const children = live.map((child, index) => {
     const prev = (child.jobId && byKey.get(child.jobId))
       || (child.agentId && byKey.get(child.agentId))
-      || byKey.get(child.name);
+      || byKey.get(child.name)
+      || withSpawns[index];
     if (!prev) return child;
     return {
-      ...prev,
       ...child,
-      target: child.target || prev.target,
+      name: child.name || prev.name,
+      agent: prev.agent,
+      target: prev.target || child.target,
       activity: child.activity || prev.activity,
       result: child.result || prev.result,
     };
   });
   return { sections: base.sections, children };
+}
+
+export function taskCardStatus(item: Extract<Item, { kind: 'toolCard' }>): ToolCardStatus {
+  if (item.toolName.toLowerCase() !== 'task') return item.status;
+  const view = resolveTaskCardView(item.args, item.details, item.status);
+  return view ? taskStatusFromChildren(view.children) ?? item.status : item.status;
 }
 
 /** Edit tool default view: path + operation + details.diff (not raw JSON). */
@@ -839,29 +1254,39 @@ export function parseCommandCardArgs(args: unknown): { command: string } | null 
 }
 
 /** Process tool card view: extracts a human-readable label from the `op` +
- *  `argv` / `id` / `label` args. `start` joins argv into a command line;
- *  other ops surface as `process {op} {id}`. When no `op` is present but
- *  `argv` or `label` exists (some process tools carry a bare argv/label
- *  without an op wrapper), the argv is joined or the label is used directly.
+ *  `argv` / `id` / `label` args. Process argv is serialized as a deterministic
+ *  POSIX-shell command so Copy preserves empty arguments, spaces, quotes,
+ *  metacharacters, and newlines without activating them as shell syntax.
+ *  Other ops surface as `process {op} {id}`; label-only cards use the label.
  *  Never dumps the raw args JSON. */
-export function parseProcessCardArgs(args: unknown): { label: string } | null {
+export function quoteProcessArg(arg: string): string {
+  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(arg)) return arg;
+  return `'${arg.replace(/'/g, `'"'"'`)}'`;
+}
+
+function processArgvCommand(argv: unknown[]): string | null {
+  if (argv.length === 0 || argv.some((value) => typeof value !== 'string')) return null;
+  return (argv as string[]).map(quoteProcessArg).join(' ');
+}
+
+export function parseProcessCardArgs(args: unknown): { label: string; command: string } | null {
   const record = asRecord(args);
   if (!record) return null;
   const op = typeof record.op === 'string' ? record.op : '';
   if (op === 'start' || (op === '' && Array.isArray(record.argv))) {
     const argv = Array.isArray(record.argv) ? record.argv : null;
-    if (argv && argv.length > 0) {
-      const parts = argv.filter((v): v is string => typeof v === 'string' && v !== '');
-      if (parts.length > 0) return { label: parts.join(' ') };
+    if (argv) {
+      const command = processArgvCommand(argv);
+      if (command !== null) return { label: command, command };
     }
-    if (op === 'start') return { label: 'process start' };
+    if (op === 'start') return { label: 'process start', command: 'process start' };
   }
   if (op !== '') {
     const id = typeof record.id === 'string' ? record.id : '';
-    return { label: id !== '' ? `process ${op} ${id}` : `process ${op}` };
+    return { label: id !== '' ? `process ${op} ${id}` : `process ${op}`, command: id !== '' ? `process ${op} ${id}` : `process ${op}` };
   }
   const label = typeof record.label === 'string' ? record.label : '';
-  if (label !== '') return { label };
+  if (label !== '') return { label, command: label };
   return null;
 }
 
@@ -879,6 +1304,8 @@ export function parseWriteCardArgs(
   let summary: string;
   if (status === 'error') {
     summary = result !== '' ? result : 'write failed';
+  } else if (status === 'cancelled') {
+    summary = result !== '' ? result : 'write cancelled';
   } else if (status === 'done') {
     summary = result !== '' ? result : 'wrote successfully';
   } else {
@@ -887,13 +1314,296 @@ export function parseWriteCardArgs(
   return { path, summary: boundText(summary, 120) };
 }
 
-/** Read tool card view: path from args. The result (bounded file content)
- *  renders as the output body. Never shows the raw `path` args JSON. */
+/** Read tool card default view. One projection shared by live snapshots
+ *  (`applyToolSnapshot` / `applyToolResultToItems`) and restored entries
+ *  (`messagesToItems`). The card retains the full upstream-bounded Read
+ *  output on `item.result`; compact (6 rows) versus expanded is derived
+ *  here at render time. Bare `skill://<name>` reads with frontmatter become
+ *  name / description / body (head-first fold, YAML never renders). Ordinary
+ *  successful reads keep path / line-range / returned-count vocabulary and a
+ *  tail fold. Failed/cancelled reads use the redacted path as the headline,
+ *  report zero returned lines, and keep the actionable body — they never
+ *  say `returned`. `agent://` / `history://` / `artifact://` classify without
+ *  the opaque key. Generic details and media/base64 never survive this
+ *  projection. */
+export type ReadUriKind = 'file' | 'skill' | 'agent' | 'history' | 'artifact';
+
+export interface ReadSkillView {
+  name: string;
+  description: string;
+  body: string;
+}
+
+export interface ReadCardView {
+  path: string;
+  kind: ReadUriKind;
+  title: string;
+  headline: string;
+  lineRange?: string;
+  linesReturned: number;
+  compactBody: string;
+  expandedBody: string;
+  omitted: number;
+  skill?: ReadSkillView;
+}
+
 export function parseReadCardArgs(args: unknown): { path: string } | null {
   const record = asRecord(args);
   if (!record) return null;
   const path = stringField(record, 'path', 'file');
   return path === '' ? null : { path };
+}
+
+/**
+ * Structured file-path provenance for a tool card click. Only read/write/edit
+ * args (`path`/`file`, plus read `offset` as a 1-indexed line) qualify.
+ * Result text, skill/agent/history/artifact URIs, RFC schemes, traversal, and
+ * unknown/empty paths never become an open target — the File Explorer probe
+ * still has to authorize the surviving workspace-relative form.
+ */
+export function authorizedToolResultOpenPath(
+  toolName: string,
+  args: unknown,
+): { path: string; line?: number } | null {
+  const name = toolName.toLowerCase();
+  if (name !== 'read' && name !== 'write' && name !== 'edit') return null;
+  const record = asRecord(args);
+  if (!record) return null;
+  const path = stringField(record, 'path', 'file');
+  if (path === '' || path === '(unknown path)') return null;
+  if (/[\u0000-\u001f\u007f]/.test(path) || /\s/.test(path)) return null;
+  if (path.split(/[/\\]+/).some((segment) => segment === '..')) return null;
+  if (path.charAt(0) === '#') return null;
+  const driveAbsolute = /^[A-Za-z]:[/\\]/.test(path);
+  if (!driveAbsolute && /^[A-Za-z][A-Za-z0-9+.-]*:/.test(path)) return null;
+  if (classifyReadUri(path).kind !== 'file') return null;
+  const result: { path: string; line?: number } = { path };
+  if (name === 'read') {
+    const offset = record.offset;
+    if (typeof offset === 'number' && Number.isFinite(offset) && offset >= 1 && offset <= 10_000_000) {
+      result.line = Math.floor(offset);
+    }
+  }
+  return result;
+}
+
+export function parseReadCard(args: unknown, result = '', status: ToolCardStatus = 'running'): ReadCardView | null {
+  const parsed = parseReadCardArgs(args);
+  if (!parsed) return null;
+  const classified = classifyReadUri(parsed.path);
+  const redactedPath = redactSecrets(classified.displayPath);
+  const source = result.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const failed = status === 'error' || status === 'cancelled';
+  if (failed) {
+    const folded = foldReadLines(source, false);
+    return {
+      path: redactedPath,
+      kind: classified.kind,
+      title: 'Read',
+      headline: redactedPath,
+      linesReturned: 0,
+      compactBody: folded.compact,
+      expandedBody: folded.expanded,
+      omitted: folded.omitted,
+    };
+  }
+  const skill = classified.kind === 'skill' ? parseSkillFrontmatter(source) : null;
+  if (skill) {
+    if (skill.name === '') skill.name = classified.skillName || redactedPath;
+    const folded = foldReadLines(skill.body, true);
+    return {
+      path: redactedPath,
+      kind: 'skill',
+      title: redactSecrets(skill.name),
+      headline: '',
+      linesReturned: folded.linesReturned,
+      compactBody: folded.compact,
+      expandedBody: folded.expanded,
+      omitted: folded.omitted,
+      skill: {
+        name: redactSecrets(skill.name),
+        description: redactSecrets(skill.description),
+        body: redactSecrets(skill.body),
+      },
+    };
+  }
+  const lineRange = readLineRange(source);
+  const contentLines = readContentLines(source);
+  const folded = foldReadLines(contentLines.join('\n'), false);
+  const rangeLabel = lineRange ? ` · lines ${lineRange}` : '';
+  const headline = `${redactedPath}${rangeLabel} · ${folded.linesReturned} returned`;
+  return {
+    path: redactedPath,
+    kind: classified.kind,
+    title: 'Read',
+    headline: redactSecrets(headline),
+    ...(lineRange ? { lineRange } : {}),
+    linesReturned: folded.linesReturned,
+    compactBody: folded.compact,
+    expandedBody: folded.expanded,
+    omitted: folded.omitted,
+  };
+}
+
+function completeToolCard(
+  item: Extract<Item, { kind: 'toolCard' }>,
+  output: string,
+  status?: Exclude<ToolCardStatus, 'running'>,
+  details?: unknown,
+  media?: ToolMedia[],
+): Extract<Item, { kind: 'toolCard' }> {
+  const next: Extract<Item, { kind: 'toolCard' }> = {
+    ...item,
+    ...(status ? { status } : {}),
+    result: item.toolName.toLowerCase() === 'read'
+      ? output
+      : boundOutput(output, item.toolName.toLowerCase() === 'bash' ? BASH_OUTPUT_LINE_LIMIT : TOOL_OUTPUT_LINE_LIMIT).text,
+  };
+  if (item.toolName.toLowerCase() === 'read') {
+    delete next.details;
+    if (media && media.length > 0) next.media = media;
+    else if (!item.media?.length) delete next.media;
+    return next;
+  }
+  if (details !== undefined) next.details = details;
+  if (media && media.length > 0) next.media = media;
+  return next;
+}
+
+function classifyReadUri(path: string): { kind: ReadUriKind; displayPath: string; skillName?: string } {
+  const skillRest = path.startsWith('skill://') ? path.slice('skill://'.length) : null;
+  if (skillRest !== null) {
+    if (skillRest !== '' && !skillRest.includes('/')) {
+      return { kind: 'skill', displayPath: skillRest, skillName: skillRest };
+    }
+    return { kind: 'file', displayPath: path };
+  }
+  for (const kind of ['agent', 'history', 'artifact'] as const) {
+    const prefix = `${kind}://`;
+    if (!path.startsWith(prefix)) continue;
+    const rest = path.slice(prefix.length);
+    const readable = readableAgentId(rest);
+    const fallback = kind === 'agent' ? 'Agent' : kind === 'history' ? 'History' : 'Artifact';
+    return { kind, displayPath: readable || fallback };
+  }
+  return { kind: 'file', displayPath: path };
+}
+
+function isFileTruncationNotice(line: string): boolean {
+  const trimmed = line.trim();
+  return trimmed.startsWith('[')
+    && trimmed.endsWith(']')
+    && trimmed.includes('Use offset=')
+    && trimmed.includes('to continue.')
+    && (trimmed.includes('more lines in file') || trimmed.includes('Showing lines'));
+}
+
+function readLineRange(content: string): string | undefined {
+  const lines = content.split('\n');
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index].trim();
+    if (!(line.startsWith('[') && line.endsWith(']'))) continue;
+    const showing = line.split('Showing lines ')[1];
+    if (showing) return showing.split(' of ')[0] || undefined;
+    const offsetPart = line.split('Use offset=')[1];
+    if (!offsetPart) continue;
+    let digits = '';
+    for (const character of offsetPart) {
+      if (character < '0' || character > '9') break;
+      digits += character;
+    }
+    const offset = Number(digits);
+    if (Number.isInteger(offset) && offset > 1) return `1-${offset - 1}`;
+    break;
+  }
+  return undefined;
+}
+
+function readContentLines(content: string): string[] {
+  const lines = content.split('\n');
+  const noticeAt = lines.findIndex((line) => isFileTruncationNotice(line));
+  if (noticeAt < 0) return lines;
+  const kept = lines.slice(0, noticeAt);
+  if (kept.length > 0 && kept[kept.length - 1].trim() === '') kept.pop();
+  return kept;
+}
+
+function foldReadLines(text: string, headFirst: boolean): {
+  compact: string;
+  expanded: string;
+  omitted: number;
+  linesReturned: number;
+} {
+  const expanded = redactSecrets(text);
+  const lines = expanded === '' ? [] : expanded.split('\n');
+  const linesReturned = lines.length;
+  if (linesReturned <= TOOL_OUTPUT_LINE_LIMIT) {
+    return { compact: expanded, expanded, omitted: 0, linesReturned };
+  }
+  const omitted = linesReturned - TOOL_OUTPUT_LINE_LIMIT;
+  const visible = headFirst
+    ? lines.slice(0, TOOL_OUTPUT_LINE_LIMIT)
+    : lines.slice(linesReturned - TOOL_OUTPUT_LINE_LIMIT);
+  const marker = `… ${omitted} more ${omitted === 1 ? 'line' : 'lines'}`;
+  return {
+    compact: redactSecrets(headFirst ? `${visible.join('\n')}\n${marker}` : `${marker}\n${visible.join('\n')}`),
+    expanded,
+    omitted,
+    linesReturned,
+  };
+}
+
+function parseSkillFrontmatter(content: string): ReadSkillView | null {
+  const normalized = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  if (!normalized.startsWith('---\n')) return null;
+  const rest = normalized.slice(4);
+  const headerEnd = rest.indexOf('\n---');
+  if (headerEnd < 0) return null;
+  const header = rest.slice(0, headerEnd);
+  const body = rest.slice(headerEnd + 4).trim();
+  let name = '';
+  let description = '';
+  const lines = header.split('\n');
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index].trim();
+    index += 1;
+    if (line === '' || line.startsWith('#')) continue;
+    const colon = line.indexOf(':');
+    if (colon < 0) continue;
+    const key = line.slice(0, colon);
+    const raw = line.slice(colon + 1).trim();
+    let value: string;
+    if (raw.startsWith('|') || raw.startsWith('>')) {
+      const folded = raw.startsWith('>');
+      const block: string[] = [];
+      while (index < lines.length && (lines[index].startsWith(' ') || lines[index].startsWith('\t'))) {
+        const trimmed = lines[index].trim();
+        index += 1;
+        if (trimmed === '') continue;
+        block.push(trimmed);
+      }
+      value = block.join(folded ? ' ' : '\n');
+    } else {
+      value = stripFrontmatterScalar(raw);
+    }
+    if (key === 'name') name = value;
+    else if (key === 'description') description = value;
+  }
+  return { name, description, body };
+}
+
+function stripFrontmatterScalar(value: string): string {
+  const trimmed = value.trim();
+  if (
+    trimmed.length >= 2
+    && ((trimmed.startsWith('"') && trimmed.endsWith('"'))
+      || (trimmed.startsWith("'") && trimmed.endsWith("'")))
+  ) {
+    return trimmed.slice(1, -1);
+  }
+  const comment = trimmed.split(' #')[0];
+  return (comment ?? trimmed).trim();
 }
 
 /** Hub tool card default view. The `hub` tool's raw args carry an op
@@ -1106,12 +1816,12 @@ export function parseHubCard(
 export type TodoTaskStatus = 'pending' | 'in_progress' | 'completed' | 'abandoned';
 
 /** One todo task on the card. Internal `id`/`ready`/`agent` never render;
- *  blocking reasons surface by their task content, not dependency ids. */
+ *  unsatisfied dependencies surface by task content, not dependency ids. */
 export interface TodoCardTaskView {
   content: string;
   status: TodoTaskStatus;
-  /** Human-readable blocking task contents; empty when unblocked. */
-  blockedBy: string[];
+  /** Human-readable unsatisfied dependency contents; empty when ready. */
+  waitingOn: string[];
 }
 
 export interface TodoCardPhaseView {
@@ -1154,23 +1864,23 @@ function todoTaskFromRecord(raw: unknown): TodoCardTaskView | null {
   if (!record) return null;
   const content = typeof record.content === 'string' ? record.content.trim() : '';
   if (content === '') return null;
-  const blockedBy: string[] = [];
-  if (Array.isArray(record.blockedBy)) {
-    for (const reason of record.blockedBy) {
+  const waitingOn: string[] = [];
+  if (Array.isArray(record.waitingOn)) {
+    for (const reason of record.waitingOn) {
       const detail = asRecord(reason);
       const text = detail ? stringField(detail, 'content') : '';
-      if (text !== '') blockedBy.push(boundText(text, TASK_ACTIVITY_CHAR_LIMIT));
+      if (text !== '') waitingOn.push(boundText(text, TASK_ACTIVITY_CHAR_LIMIT));
     }
   }
   return {
     content: boundText(content, TODO_TASK_CHAR_LIMIT),
     status: todoTaskStatus(record.status),
-    blockedBy,
+    waitingOn,
   };
 }
 
 /** Parse the phases snapshot of a `todo` tool result (`details.phases`, the
- *  pi-coding `TodoPhase[]` wire: `{name, tasks:[{content,status,blockedBy}]}`
+ *  pi-coding `TodoPhase[]` wire: `{name, tasks:[{content,status,waitingOn}]}`
  *  with camelCase keys). Defensive: malformed tasks/phases are skipped; a
  *  missing or empty array yields null so the caller can fall back. */
 export function parseTodoPhases(value: unknown): TodoCardPhaseView[] | null {
@@ -1202,7 +1912,7 @@ function todoPhaseFromInit(raw: unknown): TodoCardPhaseView | null {
     if (typeof item !== 'string') continue;
     const content = item.trim();
     if (content === '') continue;
-    tasks.push({ content: boundText(content, TODO_TASK_CHAR_LIMIT), status: 'pending', blockedBy: [] });
+    tasks.push({ content: boundText(content, TODO_TASK_CHAR_LIMIT), status: 'pending', waitingOn: [] });
   }
   if (name === '' && tasks.length === 0) return null;
   return { name, tasks };
@@ -1228,7 +1938,7 @@ function todoPhasesFromInitArgs(record: Record<string, unknown>): TodoCardPhaseV
     if (typeof item !== 'string') continue;
     const content = item.trim();
     if (content === '') continue;
-    tasks.push({ content: boundText(content, TODO_TASK_CHAR_LIMIT), status: 'pending', blockedBy: [] });
+    tasks.push({ content: boundText(content, TODO_TASK_CHAR_LIMIT), status: 'pending', waitingOn: [] });
   }
   if (phase === '' && tasks.length === 0) return null;
   return [{ name: phase, tasks }];
@@ -1293,12 +2003,12 @@ export function diffLines(diff: string): DiffLineView[] {
 }
 
 function childMatchesJob(child: TaskCardChild, job: Record<string, unknown>): boolean {
+  // Correlation requires an authoritative spawn identity (jobId) and an exact
+  // id match. name/agent/task never authorize attachment: a rejected/no-spawn
+  // card carries only args previews (no jobId), so an unrelated same-agent
+  // job_updated can never latch onto it and flip the terminal parent status.
   const jobId = stringField(job, 'id', 'jobId', 'job_id');
-  const agentId = stringField(job, 'agentId', 'agent_id');
-  if (child.jobId && jobId && child.jobId === jobId) return true;
-  if (child.agentId && agentId && child.agentId === agentId) return true;
-  if (child.name && agentId && child.name === agentId) return true;
-  return false;
+  return !!(child.jobId && jobId && child.jobId === jobId);
 }
 
 function jobResultSummary(job: Record<string, unknown>): string | undefined {
@@ -1313,10 +2023,32 @@ function jobResultSummary(job: Record<string, unknown>): string | undefined {
   return undefined;
 }
 
+function jobErrorSummary(job: Record<string, unknown>): string | undefined {
+  const result = asRecord(job.result);
+  if (!result) return undefined;
+  const error = stringField(result, 'error');
+  if (error.trim() === '') return undefined;
+  return boundText(error, TASK_RESULT_CHAR_LIMIT);
+}
+
+
+function projectedJobStatus(current: string, incoming: string): string {
+  const normalizedCurrent = current.toLowerCase();
+  const normalizedIncoming = incoming.toLowerCase();
+  const rank = (status: string) => {
+    if (status === 'queued') return 0;
+    if (status === 'running') return 1;
+    if (status === 'completed' || status === 'failed' || status === 'error'
+      || status === 'cancelled' || status === 'canceled' || status === 'aborted') return 2;
+    return -1;
+  };
+  return rank(normalizedIncoming) < rank(normalizedCurrent) ? current : incoming;
+}
 function withProjectedChildren(item: Extract<Item, { kind: 'toolCard' }>, children: TaskCardChild[]): Item {
   const spawns = spawnList(item.details);
   return {
     ...item,
+    status: taskStatusFromChildren(children) ?? item.status,
     details: {
       ...(spawns ? { spawns } : {}),
       children,
@@ -1342,8 +2074,11 @@ export function applyJobUpdated(items: Item[], frame: { job?: unknown }): Item[]
         jobId: stringField(job, 'id') || child.jobId,
         agentId: stringField(job, 'agentId', 'agent_id') || child.agentId,
         agent: stringField(job, 'agent') || child.agent,
-        status: status || child.status,
+        parentId: stringField(job, 'parentId', 'parent_id') || child.parentId,
+        todoTaskId: stringField(job, 'todoTaskId', 'todo_task_id') || child.todoTaskId,
+        status: status ? projectedJobStatus(child.status, status) : child.status,
         result: jobResultSummary(job) ?? child.result,
+        error: jobErrorSummary(job) ?? child.error,
       };
     });
     if (!changed) return item;
@@ -1351,28 +2086,94 @@ export function applyJobUpdated(items: Item[], frame: { job?: unknown }): Item[]
   });
 }
 
-/** Patch Task tool cards from a live `agent_updated` frame (name/status only). */
+/** Collect every exact Task-child jobId currently projected for a session.
+ * Captured synchronously when a `job_list` request is issued: the response
+ * may then omission-settle only children from this request cut, so a Task
+ * spawn/job_updated arriving inside the request window is never cancelled
+ * by the older authoritative list. */
+export function taskJobIds(items: Item[]): Set<string> {
+  const ids = new Set<string>();
+  for (const item of items) {
+    if (item.kind !== 'toolCard' || item.toolName.toLowerCase() !== 'task') continue;
+    const view = resolveTaskCardView(item.args, item.details);
+    if (!view) continue;
+    for (const child of view.children) {
+      if (child.jobId) ids.add(child.jobId);
+    }
+  }
+  return ids;
+}
+
+/** Reconcile Task cards against an authoritative job_list snapshot. Used
+ * after transcript restore/reconnect, where historical Task spawn details can
+ * still carry their initial queued status but no live job_updated event will
+ * be replayed for a job that already settled.
+ *
+ * `undefined` / non-array is unavailable (RPC failure / malformed) and is a
+ * no-op — never a mass-cancel. An array, including `[]`, is authoritative:
+ * listed jobs patch by exact jobId, then every spawned child still
+ * queued/running but absent from that set is cancelled without inventing a
+ * result. When `omissionEligible` is provided, only children whose jobId was
+ * captured at the request cut are omission-settled; children first seen
+ * inside the request window stay authoritative. name/agent/task never
+ * authorize attachment. Terminal children and rejected/no-jobId cards stay
+ * byte-for-byte. */
+export function applyJobSnapshot(items: Item[], jobs: unknown, omissionEligible?: ReadonlySet<string>): Item[] {
+  if (!Array.isArray(jobs)) return items;
+  const next = jobs.reduce<Item[]>(
+    (current, job) => applyJobUpdated(current, { job }),
+    items,
+  );
+  const authoritativeIds = new Set<string>();
+  for (const job of jobs) {
+    const record = asRecord(job);
+    if (!record) continue;
+    const jobId = stringField(record, 'id', 'jobId', 'job_id');
+    if (jobId !== '') authoritativeIds.add(jobId);
+  }
+  return next.map((item) => {
+    if (item.kind !== 'toolCard' || item.toolName.toLowerCase() !== 'task') return item;
+    const view = resolveTaskCardView(item.args, item.details);
+    if (!view) return item;
+    let changed = false;
+    const children = view.children.map((child) => {
+      if (!child.jobId) return child;
+      const status = child.status.toLowerCase();
+      if (status !== 'queued' && status !== 'running') return child;
+      if (authoritativeIds.has(child.jobId)) return child;
+      if (omissionEligible && !omissionEligible.has(child.jobId)) return child;
+      changed = true;
+      return { ...child, status: 'cancelled' };
+    });
+    if (!changed) return item;
+    return withProjectedChildren(item, children);
+  });
+}
+
+/** Patch Task tool-card display names from a live `agent_updated` frame.
+ * Job lifecycle remains authoritative through `job_updated`/`job_list` only:
+ * one agent identity may be revived for another job after an earlier job has
+ * settled, so its aggregate agent status cannot represent a specific child. */
 export function applyAgentUpdated(items: Item[], frame: { agent?: unknown }): Item[] {
   const agent = asRecord(frame.agent);
   if (!agent) return items;
   const agentId = stringField(agent, 'id');
   if (agentId === '') return items;
-  const status = stringField(agent, 'status');
   const displayName = stringField(agent, 'displayName', 'display_name');
+  if (displayName === '') return items;
   return items.map((item) => {
     if (item.kind !== 'toolCard' || item.toolName.toLowerCase() !== 'task') return item;
     const view = resolveTaskCardView(item.args, item.details);
     if (!view) return item;
     let changed = false;
     const children = view.children.map((child) => {
-      if (child.agentId !== agentId && child.name !== agentId) return child;
+      // name/agent/task never authorize attachment: only an authoritative
+      // spawn agentId matches. A rejected/no-spawn card's args-only preview
+      // carries no agentId, so an unrelated same-name agent_updated is a no-op
+      // and the terminal parent status is preserved.
+      if (child.agentId !== agentId || child.name === displayName) return child;
       changed = true;
-      return {
-        ...child,
-        agentId,
-        name: displayName || child.name,
-        status: status || child.status,
-      };
+      return { ...child, agentId, name: displayName };
     });
     if (!changed) return item;
     return withProjectedChildren(item, children);
@@ -1393,7 +2194,11 @@ export function applyMessageDelivered(items: Item[], frame: { message?: unknown 
     if (!view) return item;
     let changed = false;
     const children = view.children.map((child) => {
-      if (child.agentId !== from && child.name !== from) return child;
+      // name/agent/task never authorize attachment: only an authoritative
+      // spawn agentId matches. A rejected/no-spawn card's args-only preview
+      // carries no agentId, so an unrelated same-name message is a no-op and
+      // the terminal parent status is preserved.
+      if (child.agentId !== from) return child;
       changed = true;
       return { ...child, activity };
     });
@@ -1487,6 +2292,9 @@ interface CustomWire {
   display?: boolean;
   customType?: string;
   details?: unknown;
+  /** Structured payload for typed customs. The session-handoff record
+   *  carries the <handoff-context> document at `data.text`. */
+  data?: unknown;
 }
 
 /** Normalize a custom message into a renderable item, or null when it must
@@ -1497,6 +2305,16 @@ interface CustomWire {
  *  direction/from/to/body/replyTo, body bounded to IRC_BODY_LINE_LIMIT lines);
  *  every other display:true custom keeps the plain labeled row unchanged. */
 export function customToItem(m: CustomWire): Item | null {
+  // A session handoff divider renders REGARDLESS of `display`: the backend
+  // mints it deliberately as the new session's first record, and the doc
+  // (data.text, falling back to content) is the whole point of the item.
+  if (m.customType === 'handoff') {
+    const data = m.data !== null && typeof m.data === 'object' && !Array.isArray(m.data) ? m.data : null;
+    const dataText = data !== null && 'text' in data && typeof data.text === 'string' && data.text !== ''
+      ? data.text
+      : contentText(m.content);
+    return { kind: 'handoff-divider', id: nextId('h'), text: dataText };
+  }
   if (m.display !== true) return null;
   const irc = orchestrationIrcView(m);
   if (irc) {
@@ -1531,17 +2349,39 @@ export function customToItem(m: CustomWire): Item | null {
  *  Unknown/malformed records are skipped defensively; one bad record never
  *  breaks the transcript restore.
  */
+/** Failure reason of a settled assistant message with no renderable content
+ *  (wire `stopReason:"error"` + `errorMessage`); aborted turns keep the TUI
+ *  reserved-status-row contract and stay off the transcript. */
+export function assistantFailureMessage(stopReason: unknown, errorMessage: unknown): string | undefined {
+  if (stopReason !== 'error') return undefined;
+  if (typeof errorMessage !== 'string' || errorMessage.trim() === '') return undefined;
+  return errorMessage;
+}
+
 export function messagesToItems(messages: unknown): Item[] {
   const list = Array.isArray(messages) ? messages : [];
   const out: Item[] = [];
   const pendingToolCards = new Map<string, number>();
+  const entryMessage = (raw: unknown): { id?: string; message: unknown } => {
+    if (raw && typeof raw === 'object' && 'message' in raw) {
+      const entry = raw as { id?: unknown; message?: unknown };
+      return {
+        id: typeof entry.id === 'string' && entry.id !== '' ? entry.id : undefined,
+        message: entry.message,
+      };
+    }
+    return { message: raw };
+  };
   for (const raw of list) {
     try {
-      const m = (raw || {}) as {
+      const entry = entryMessage(raw);
+      const stableId = entry.id;
+      const m = (entry.message || {}) as {
         role?: string;
         content?: unknown;
         display?: boolean;
         customType?: string;
+        data?: unknown;
         summary?: string;
         command?: string;
         output?: string;
@@ -1550,13 +2390,15 @@ export function messagesToItems(messages: unknown): Item[] {
         isError?: boolean;
         exitCode?: number | null;
         cancelled?: boolean;
+        stopReason?: unknown;
+        errorMessage?: unknown;
       };
       switch (m.role) {
         case 'user': {
           const projected = userMessageProjection(m.content);
           out.push({
             kind: 'user',
-            id: nextId('u'),
+            id: stableId ?? nextId('u'),
             text: projected.text,
             optimistic: false,
             ...(projected.images.length > 0 ? { images: projected.images } : {}),
@@ -1580,8 +2422,16 @@ export function messagesToItems(messages: unknown): Item[] {
               visibleBlocks.push(rawBlock as ContentBlock);
             }
           }
-          if (visibleBlocks.length > 0) {
-            out.push({ kind: 'assistant', id: nextId('a'), status: 'final', blocks: visibleBlocks });
+          const failureMessage = assistantFailureMessage(m.stopReason, m.errorMessage);
+          const hasRenderableBlocks = visibleBlocks.some(
+            (block) => (block.type === 'text' && block.text) || (block.type === 'thinking' && block.thinking)
+          );
+          if (hasRenderableBlocks) {
+            out.push({ kind: 'assistant', id: stableId ?? nextId('a'), status: 'final', blocks: visibleBlocks });
+          } else if (failureMessage) {
+            out.push({ kind: 'assistant', id: stableId ?? nextId('a'), status: 'final', blocks: [], errorMessage: failureMessage });
+          } else if (visibleBlocks.length > 0) {
+            out.push({ kind: 'assistant', id: stableId ?? nextId('a'), status: 'final', blocks: visibleBlocks });
           }
           for (const toolCall of toolCalls) {
             const cardIndex = out.length;
@@ -1605,22 +2455,19 @@ export function messagesToItems(messages: unknown): Item[] {
           const cardIndex = toolCallId === '' ? undefined : pendingToolCards.get(toolCallId);
           const card = cardIndex === undefined ? undefined : out[cardIndex];
           if (card?.kind === 'toolCard') {
-            const limit = card.toolName.toLowerCase() === 'bash'
-              ? BASH_OUTPUT_LINE_LIMIT
-              : TOOL_OUTPUT_LINE_LIMIT;
-            const completedCard: Item = {
-              ...card,
-              status: m.isError === true ? 'error' : 'done',
-              result: boundOutput(result, limit).text,
-              details: m.details,
-              ...(media.length > 0 ? { media } : {}),
-            };
-            out.splice(cardIndex as number, 1, completedCard);
+            out.splice(cardIndex as number, 1, completeToolCard(
+              card,
+              result,
+              toolCardCompletionStatus(m.isError === true, m.content, m.details),
+              m.details,
+              media,
+            ));
             pendingToolCards.delete(toolCallId);
           } else {
             out.push({
               kind: 'toolResult',
-              id: nextId('r'),
+              id: stableId ?? nextId('r'),
+              toolCallId,
               text: boundOutput(result, TOOL_OUTPUT_LINE_LIMIT).text,
             });
           }
@@ -1632,15 +2479,17 @@ export function messagesToItems(messages: unknown): Item[] {
           // `content`. Bound the output to its tail like the TUI compact card.
           // exitCode/cancelled (camelCase wire) drive the status border:
           // non-zero exit or cancellation → error, otherwise → done.
-          const bashStatus: 'done' | 'error' | undefined =
-            m.cancelled === true || (typeof m.exitCode === 'number' && m.exitCode !== 0)
-              ? 'error'
-              : typeof m.exitCode === 'number'
-                ? 'done'
-                : undefined;
+          const bashStatus: 'done' | 'cancelled' | 'error' | undefined =
+            m.cancelled === true
+              ? 'cancelled'
+              : typeof m.exitCode === 'number' && m.exitCode !== 0
+                ? 'error'
+                : typeof m.exitCode === 'number'
+                  ? 'done'
+                  : undefined;
           out.push({
             kind: 'bash',
-            id: nextId('b'),
+            id: stableId ?? nextId('b'),
             command: m.command || '',
             output: boundOutput(m.output || '', BASH_OUTPUT_LINE_LIMIT).text,
             ...(bashStatus ? { status: bashStatus } : {}),
