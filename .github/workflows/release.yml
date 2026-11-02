@@ -733,7 +733,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y build-essential meson ninja-build libcap-dev
+          sudo apt-get install --no-install-recommends -y build-essential meson ninja-build libcap-dev bash-completion
           bwrap_source="$RUNNER_TEMP/bubblewrap"
           git init "$bwrap_source"
           git -C "$bwrap_source" remote add origin https://github.com/containers/bubblewrap.git
