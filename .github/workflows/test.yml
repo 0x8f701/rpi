@@ -747,7 +747,7 @@ jobs:
           git -C "$bwrap_source" fetch --depth=1 origin dc63ec667e6546f34e0b6c088cdf8ae7c7dea0f3
           git -C "$bwrap_source" checkout --detach FETCH_HEAD
           [ "$(git -C "$bwrap_source" rev-parse HEAD)" = dc63ec667e6546f34e0b6c088cdf8ae7c7dea0f3 ]
-          meson setup "$bwrap_source/build" "$bwrap_source" --buildtype=release --prefix=/usr
+          meson setup "$bwrap_source/build" "$bwrap_source" --buildtype=release --prefix=/usr -Dselinux=disabled
           ninja -C "$bwrap_source/build"
           sudo ninja -C "$bwrap_source/build" install
           [ "$(bwrap --version)" = "bubblewrap 0.10.0" ]

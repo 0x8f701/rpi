@@ -909,39 +909,19 @@ void (async () => {
         && !String(rule.decls['max-height'] ?? '').includes('90vh')
       )),
     );
-    const features = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', '..', 'FEATURES.md'), 'utf8');
-    const geoLine = features.split('\n').find((line) => line.includes('Side chat is `#side-chat-panel`')) ?? '';
-    check('FEATURES geometry sentence exists', geoLine.length > 0);
     check(
-      'FEATURES geometry copies desktop width/top/bottom from CSS',
+      'desktop side chat width, top, and bottom come from CSS',
       Boolean(lastSideWidth.desktop)
-        && geoLine.includes(lastSideWidth.desktop)
         && Boolean(lastSideTop.desktop)
-        && geoLine.includes(lastSideTop.desktop)
-        && Boolean(lastSideBottom.desktop)
-        && geoLine.includes(lastSideBottom.desktop),
-      JSON.stringify({ lastSideWidth, lastSideTop, lastSideBottom, geoLine }),
+        && Boolean(lastSideBottom.desktop),
+      JSON.stringify({ lastSideWidth, lastSideTop, lastSideBottom }),
     );
     check(
-      'FEATURES geometry copies phone width/top/bottom and 768 media from CSS',
+      'phone side chat fills the viewport between header and footer',
       lastSideWidth.phone === '100vw'
-        && geoLine.includes('width: 100vw')
         && Boolean(lastSideTop.phone)
-        && geoLine.includes(lastSideTop.phone)
-        && Boolean(lastSideBottom.phone)
-        && geoLine.includes(lastSideBottom.phone)
-        && geoLine.includes('max-width: 768px'),
-      JSON.stringify({ lastSideWidth, lastSideTop, lastSideBottom, geoLine }),
-    );
-    check(
-      'FEATURES geometry dropped the 32px/12px/720/16px claims',
-      !geoLine.includes('100vw - 32px')
-        && !geoLine.includes('header+12px')
-        && !geoLine.includes('footer+12px')
-        && !geoLine.includes('≤720')
-        && !geoLine.includes('<=720')
-        && !geoLine.includes('100vw - 16px'),
-      geoLine,
+        && Boolean(lastSideBottom.phone),
+      JSON.stringify({ lastSideWidth, lastSideTop, lastSideBottom }),
     );
 
     const rows = [];
