@@ -55,7 +55,7 @@ assert isinstance(r['commands']['data']['commands'], list)
 PRIMARY=[
     "settings","model","branch","resume","fork","export","dump","handoff",
     "agents","role","persona","compact","rewind","checkpoint","ps","loop",
-    "goal","workflow","code-review","btw","queue","live","skill",
+    "goal","workflow","review","btw","queue","live","skill",
     "theme","thinking","todo","tree","trust","jobs",
     "activity","irc",
 ]

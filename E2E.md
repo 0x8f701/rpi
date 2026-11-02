@@ -423,13 +423,13 @@ Default live timeout: `LIVE_TIMEOUT_SECONDS` (900s unless overridden; the parall
 
 Every user-reported regression maps to an executable lane. Lanes claim **observable behavior**, not source text.
 
-### 1. Command discovery (31 visible primary slash commands)
+### 1. Command discovery (32 visible primary slash commands)
 
 **Lane:** RPC + unit/integration + executed workflow RPC/tmux campaign. `/help`
-and slash completion expose the 31 primary commands. RPC `get_commands` exposes
+and slash completion expose the 32 primary commands. RPC `get_commands` exposes
 the collision-free executable superset (built-ins plus eligible prompts,
 skills, and extensions) and must contain every primary command. `/workflow` is
-one of the 31 primaries and owns the multi-workflow product surface.
+one of the 32 primaries and owns the multi-workflow product surface.
 
 **Commands:**
 
@@ -443,11 +443,11 @@ cargo +1.88.0 test -p pi-cli --test rpc_binary --locked
 
 **Expected visible primary set (exactly these names):**
 
-`settings`, `model`, `branch`, `resume`, `fork`, `export`, `dump`, `handoff`, `agents`, `role`, `persona`, `compact`, `rewind`, `checkpoint`, `ps`, `loop`, `goal`, `workflow`, `code-review`, `btw`, `queue`, `live`, `skill`, `theme`, `thinking`, `todo`, `tree`, `trust`, `jobs`, `activity`, `irc`
+`settings`, `model`, `branch`, `resume`, `fork`, `export`, `dump`, `handoff`, `agents`, `role`, `persona`, `compact`, `rewind`, `checkpoint`, `ps`, `loop`, `goal`, `workflow`, `show`, `review`, `btw`, `queue`, `live`, `skill`, `theme`, `thinking`, `todo`, `tree`, `trust`, `jobs`, `activity`, `irc`
 
 TUI slash discovery MUST surface exactly:
 
-`/settings`, `/model`, `/branch`, `/resume`, `/fork`, `/export`, `/dump`, `/handoff`, `/agents`, `/role`, `/persona`, `/compact`, `/rewind`, `/checkpoint`, `/ps`, `/loop`, `/goal`, `/workflow`, `/code-review`, `/btw`, `/queue`, `/live`, `/skill`, `/theme`, `/thinking`, `/todo`, `/tree`, `/trust`, `/jobs`, `/activity`, `/irc`
+`/settings`, `/model`, `/branch`, `/resume`, `/fork`, `/export`, `/dump`, `/handoff`, `/agents`, `/role`, `/persona`, `/compact`, `/rewind`, `/checkpoint`, `/ps`, `/loop`, `/goal`, `/workflow`, `/review`, `/show`, `/btw`, `/queue`, `/live`, `/skill`, `/theme`, `/thinking`, `/todo`, `/tree`, `/trust`, `/jobs`, `/activity`, `/irc`
 
 `/todo` is the sole public Todo command. Its grammar covers both the Todo DAG
 and embedded durable child sessions:

@@ -79,7 +79,7 @@ Read the coverage notice: truncated scans, unsupported or unreadable files, inco
 
 ## Commit review
 
-`/commit` reviews a commit without touching the worktree: bare `/commit` opens a recent-commit chooser (newest first, first-parent history, at most 100 rows), and choosing a row or entering `/commit <ref>` reviews that commit pinned to its resolved hash — a root commit diffs from the empty tree, a merge from its first parent. Nothing stages, checks out, or commits.
+`/show` reviews a commit without touching the worktree: bare `/show` opens a recent-commit chooser (newest first, first-parent history, at most 100 rows), and choosing a row or entering `/show <ref>` reviews that commit pinned to its resolved hash — a root commit diffs from the empty tree, a merge from its first parent. Nothing stages, checks out, or commits.
 
 ### Focused Auto Review and Highlight
 

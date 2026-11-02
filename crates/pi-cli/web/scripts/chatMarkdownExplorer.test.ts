@@ -627,7 +627,7 @@ const activeMapping: ActiveMapping = {
     appIds.has('file-explorer-refresh-btn')
       && appIds.has('file-explorer-tree-toggle')
       && appIds.has('file-explorer-drawer-close-btn')
-      && appIds.has('file-explorer-expand-btn')
+      && !appIds.has('file-explorer-expand-btn')
       && appIds.has('file-explorer-line-1')
       && !appIds.has('file-explorer-hide-btn'),
   );
@@ -690,7 +690,7 @@ function remoteRpcError(code: string | undefined, message = 'file is unavailable
   );
   check(
     'remote missing file names the bounded path',
-    chatMarkdownOpenFailureText(remoteRpcError('file_unavailable'), 'cited.rs') === '文件已不存在：cited.rs'
+    chatMarkdownOpenFailureText(remoteRpcError('file_unavailable'), 'cited.rs') === 'File not found: cited.rs'
     && chatMarkdownOpenFailureText(new Error('file is unavailable'), 'cited.rs') === 'file is unavailable',
   );
   check(

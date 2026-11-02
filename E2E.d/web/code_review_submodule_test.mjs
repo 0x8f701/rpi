@@ -228,7 +228,7 @@ async function main() {
       'WS did not reach connected',
     );
 
-    await page.fill('#prompt-input', `/code-review ${BASE_REF}`);
+    await page.fill('#prompt-input', `/review ${BASE_REF}`);
     await page.press('#prompt-input', 'Enter');
     await waitFor(
       page,

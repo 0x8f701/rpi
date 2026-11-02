@@ -467,27 +467,6 @@ pub enum ReviewScope {
 }
 
 impl ReviewScope {
-    pub const USAGE: &'static str = "Usage: /code-review [<base> | <from> <to>]";
-
-    pub fn parse(argument: Option<&str>) -> Result<Self, String> {
-        let revisions = argument
-            .into_iter()
-            .flat_map(str::split_whitespace)
-            .collect::<Vec<_>>();
-        match revisions.as_slice() {
-            [] => Ok(Self::WorkingTree),
-            [base] => Ok(Self::BaseToWorkingTree {
-                base: (*base).to_owned(),
-            }),
-            [from, to] => Ok(Self::Revisions {
-                from: (*from).to_owned(),
-                to: (*to).to_owned(),
-            }),
-            _ => Err(Self::USAGE.to_owned()),
-        }
-    }
-
-    #[must_use]
     pub fn label(&self) -> String {
         match self {
             Self::WorkingTree => "HEAD → working tree".to_owned(),
@@ -514,6 +493,118 @@ impl ReviewScope {
             Self::Commit { commit, .. } => format!("commit\0{commit}"),
         }
     }
+}
+
+/// One parsed `/review` invocation: an optional repository override (a
+/// workspace-relative directory) plus the diff scope inside it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewCommandTarget {
+    pub repo: Option<String>,
+    pub scope: ReviewScope,
+}
+
+pub const REVIEW_COMMAND_USAGE: &str = "Usage: /review [<repo>] [<base> | <from> <to>]";
+
+/// True when the operand names a policy-allowed existing directory under the
+/// session workspace: such a first operand reviews THAT nested repository
+/// (useful when the workspace root itself is not a repository).
+pub fn review_operand_is_directory(application: &pi_coding::Application, operand: &str) -> bool {
+    let workspace_root = application.session().cwd().to_path_buf();
+    let Ok((absolute, _)) = crate::file_explorer::resolve_scoped_path(&workspace_root, operand, true)
+    else {
+        return false;
+    };
+    application.inspect_generation_directory(&absolute).is_ok() && absolute.is_dir()
+}
+
+/// Parse `/review` operands. The first operand is a repository override when
+/// it names a workspace directory; otherwise it is the base revision and the
+/// grammar is `[<base> | <from> <to>]` over the session repository.
+pub fn parse_review_command(
+    argument: Option<&str>,
+    operand_is_directory: &impl Fn(&str) -> bool,
+) -> Result<ReviewCommandTarget, String> {
+    let operands: Vec<&str> = argument
+        .map(str::trim)
+        .filter(|argument| !argument.is_empty())
+        .map(|argument| argument.split_whitespace().collect())
+        .unwrap_or_default();
+    let usage = Err(REVIEW_COMMAND_USAGE.to_owned());
+    let (first, rest) = match operands.as_slice() {
+        [] => {
+            return Ok(ReviewCommandTarget {
+                repo: None,
+                scope: ReviewScope::WorkingTree,
+            })
+        }
+        [first, rest @ ..] => (first, rest),
+    };
+    if operand_is_directory(first) {
+        let scope = match rest {
+            [] => ReviewScope::WorkingTree,
+            [base] => ReviewScope::BaseToWorkingTree {
+                base: (*base).to_owned(),
+            },
+            [from, to] => ReviewScope::Revisions {
+                from: (*from).to_owned(),
+                to: (*to).to_owned(),
+            },
+            _ => return usage,
+        };
+        return Ok(ReviewCommandTarget {
+            repo: Some((*first).to_owned()),
+            scope,
+        });
+    }
+    match rest {
+        [] => Ok(ReviewCommandTarget {
+            repo: None,
+            scope: ReviewScope::BaseToWorkingTree {
+                base: (*first).to_owned(),
+            },
+        }),
+        [to] => Ok(ReviewCommandTarget {
+            repo: None,
+            scope: ReviewScope::Revisions {
+                from: (*first).to_owned(),
+                to: (*to).to_owned(),
+            },
+        }),
+        _ => usage,
+    }
+}
+
+/// The repository root one review runs against: the session cwd by default,
+/// or a workspace-relative repository directory the command named. Shared by
+/// the RPC service, the TUI panel, and the REPL so all three surfaces apply
+/// the identical policy check and repository-root requirement.
+pub fn review_repository_root(
+    application: &pi_coding::Application,
+    repo: Option<&str>,
+) -> anyhow::Result<PathBuf> {
+    let workspace_root = application.session().cwd().to_path_buf();
+    let Some(repo) = repo else {
+        return Ok(workspace_root);
+    };
+    if repo.trim().is_empty() {
+        return Err(anyhow::anyhow!(
+            "code_review_open `repo` must be a non-empty workspace-relative directory"
+        ));
+    }
+    let (absolute, _) = crate::file_explorer::resolve_scoped_path(&workspace_root, repo, true)?;
+    application
+        .inspect_generation_directory(&absolute)
+        .map_err(|error| crate::file_explorer::map_directory_error(&error))?;
+    let canonical = std::fs::canonicalize(&absolute)
+        .map_err(|_| anyhow::anyhow!("code review repository is unavailable"))?;
+    let sandbox = IsolatedGitSandbox::discover(&canonical)
+        .map_err(|_| anyhow::anyhow!("code review repository is unavailable"))?;
+    if sandbox.work_tree() != canonical {
+        return Err(anyhow::anyhow!(
+            "code review repository must be the repository root"
+        ));
+    }
+    Ok(canonical)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -7315,32 +7406,43 @@ deleted file mode 100644
     }
 
 
+
     #[test]
-    fn review_scope_accepts_zero_one_or_two_revisions() {
+    fn review_command_directory_operand_reviews_that_nested_repository() {
+        let is_dir = |operand: &str| operand == "psy-node" || operand == "audit";
+        let bare = parse_review_command(None, &is_dir).expect("bare");
+        assert_eq!(bare.repo, None);
+        assert_eq!(bare.scope, ReviewScope::WorkingTree);
+        let repo_tree = parse_review_command(Some("psy-node"), &is_dir).expect("repo working tree");
+        assert_eq!(repo_tree.repo.as_deref(), Some("psy-node"));
+        assert_eq!(repo_tree.scope, ReviewScope::WorkingTree);
+        let repo_base = parse_review_command(Some("psy-node base"), &is_dir).expect("repo base");
+        assert_eq!(repo_base.repo.as_deref(), Some("psy-node"));
         assert_eq!(
-            ReviewScope::parse(None).expect("working tree scope"),
-            ReviewScope::WorkingTree
+            repo_base.scope,
+            ReviewScope::BaseToWorkingTree { base: "base".to_owned() }
+        );
+        let repo_range = parse_review_command(Some("psy-node a b"), &is_dir).expect("repo range");
+        assert_eq!(repo_range.repo.as_deref(), Some("psy-node"));
+        assert_eq!(
+            repo_range.scope,
+            ReviewScope::Revisions { from: "a".to_owned(), to: "b".to_owned() }
         );
         assert_eq!(
-            ReviewScope::parse(Some("")).expect("empty args are working tree"),
-            ReviewScope::WorkingTree
+            parse_review_command(Some("psy-node a b c"), &is_dir),
+            Err(REVIEW_COMMAND_USAGE.to_owned())
+        );
+        let base = parse_review_command(Some("main"), &is_dir).expect("base");
+        assert_eq!(base.repo, None);
+        assert_eq!(base.scope, ReviewScope::BaseToWorkingTree { base: "main".to_owned() });
+        let range = parse_review_command(Some("main HEAD"), &is_dir).expect("range");
+        assert_eq!(
+            range.scope,
+            ReviewScope::Revisions { from: "main".to_owned(), to: "HEAD".to_owned() }
         );
         assert_eq!(
-            ReviewScope::parse(Some("main")).expect("single base"),
-            ReviewScope::BaseToWorkingTree {
-                base: "main".to_owned(),
-            }
-        );
-        assert_eq!(
-            ReviewScope::parse(Some("main feature")).expect("revision scope"),
-            ReviewScope::Revisions {
-                from: "main".to_owned(),
-                to: "feature".to_owned(),
-            }
-        );
-        assert_eq!(
-            ReviewScope::parse(Some("a b c")).expect_err("three revisions must fail"),
-            ReviewScope::USAGE
+            parse_review_command(Some("a b c"), &is_dir),
+            Err(REVIEW_COMMAND_USAGE.to_owned())
         );
     }
 
@@ -7358,16 +7460,6 @@ deleted file mode 100644
 
     fn short_id(id: &str) -> String {
         id.chars().take(12).collect()
-    }
-
-    #[test]
-    fn code_review_parse_does_not_accept_a_commit_operand() {
-        assert_eq!(
-            ReviewScope::parse(Some("HEAD")).expect("one token stays a base"),
-            ReviewScope::BaseToWorkingTree {
-                base: "HEAD".to_owned(),
-            }
-        );
     }
 
     #[test]
@@ -7483,11 +7575,6 @@ deleted file mode 100644
             "{invalid_error}"
         );
         assert!(invalid.files.is_empty());
-
-        assert_eq!(
-            ReviewScope::parse(Some("HEAD feature extra")).expect_err("mixed usage"),
-            ReviewScope::USAGE
-        );
         let listed = list_recent_commits(dir.path(), 2).expect_err("non-git list");
         assert!(listed.contains("not a git repository"), "{listed}");
     }

@@ -1164,10 +1164,10 @@ await (async () => {
 
   const emptyView = emptyFileExplorerViewState();
   const asked = fileExplorerWithPathSurface(emptyView, 'src/a.ts', 'ask');
-  check('ask survives on a non-preview file', fileExplorerContentSurface(asked, 'src/a.ts', 'file') === 'ask');
+  check('ask is not a content surface', fileExplorerContentSurface(asked, 'src/a.ts', 'file') === 'source');
   check('ask survives a later source setter', fileExplorerContentSurface(fileExplorerWithPathSurface(asked, 'src/a.ts', 'source'), 'src/a.ts', 'file') === 'source');
   const restored = fileExplorerWithPathSurface(fileExplorerWithPathSurface(asked, 'src/a.ts', 'source'), 'src/a.ts', 'ask');
-  check('ask can be restored on a non-preview file', fileExplorerContentSurface(restored, 'src/a.ts', 'file') === 'ask');
+  check('restoring ask still shows source', fileExplorerContentSurface(restored, 'src/a.ts', 'file') === 'source');
   const drafted = fileExplorerWithConversationDraft(restored, 'src/a.ts', 'keep me');
   check('draft lives in the existing view store', fileExplorerConversationDraft(drafted, 'src/a.ts') === 'keep me');
   const reopened = openFileTab([{ path: 'src/a.ts', view: 'file', conversationId: 'conv-1' }], 'src/a.ts');
@@ -1545,18 +1545,9 @@ await (async () => {
     /\.file-explorer\s*\{[^}]*top\s*:\s*var\(--app-header-height\)[^}]*height\s*:\s*auto[^}]*max-height\s*:\s*none/.test(css),
   );
   check(
-    'full-app expand keeps its names, hides the sibling header, and zeros the drawer top',
-    fileExplorerControlId(FILE_EXPLORER_TOGGLE_ID, 'expand-btn') === 'file-explorer-expand-btn'
-      && panel.includes('onToggleExpanded')
-      && panel.includes("expanded ? 'Restore file explorer' : 'Expand file explorer to the full app area'")
-      && app.includes('fileExplorerFullscreenActive')
-      && app.includes('hidden={filesFullscreen}')
-      && css.includes('header[hidden]')
-      && /\.app-layout--files-expanded \.file-explorer \{[^}]*top:\s*0/.test(css)
-      && css.includes('.app-layout--files-expanded .session-sidebar')
-      && css.includes('.app-layout--files-expanded .app-main')
-      && /\.app-layout--files-expanded \.file-explorer \{[^}]*width: 100vw;/.test(css)
-      && css.includes('.file-explorer__expand-btn.is-active'),
+    'the panel has no fullscreen expand button',
+    !panel.includes('file-explorer-expand-btn')
+      && !panel.includes('Expand file explorer to the full app area'),
   );
   check(
     'App markdown probe names the bounded referenced path only on the post-retry missing-file verdict',
@@ -1650,10 +1641,12 @@ await (async () => {
       && panel.includes('file-explorer__markdown'),
   );
   check(
-    'preview toggle lives on the content toolbar, not the Files header',
+    'source and preview live on the content toolbar',
     panel.includes('file-explorer__surface')
-      && panel.includes("role=\"radiogroup\"")
-      && panel.indexOf('file-explorer__body') < panel.indexOf('file-explorer__surface'),
+      && panel.includes('role="radiogroup"')
+      && panel.includes("aria-pressed={contentSurface === 'source'}")
+      && panel.includes('Source')
+      && panel.includes('Preview'),
   );
   check(
     'loaded/total footer is removed; internal paging stays',
@@ -1786,8 +1779,8 @@ await (async () => {
   check('missing path text is trimmed and never blank-inflated',
     markdownOpenBoundedPathText('  src/lib.rs  ') === 'src/lib.rs');
   check('stable missing-file toast names the bounded path',
-    markdownOpenMissingFileToast('src/lib.rs') === '文件已不存在：src/lib.rs'
-    && markdownOpenMissingFileToast(deep) === `文件已不存在：${bounded}`);
+    markdownOpenMissingFileToast('src/lib.rs') === 'File not found: src/lib.rs'
+    && markdownOpenMissingFileToast(deep) === `File not found: ${bounded}`);
 }
 
 // ---- behavioral: server echo identity for the unique-basename fallback ----
@@ -1813,8 +1806,8 @@ await (async () => {
     fileExplorerResolvedRequestPath('init.rs', '../outside/init.rs') === null
       && fileExplorerResolvedRequestPath('init.rs', 'C:/outside/init.rs') === null
       && fileExplorerResponseMatchesRequest('init.rs', '../outside/init.rs') === false);
-  check('multi-segment request never accepts an unrelated deeper echo',
-    fileExplorerResolvedRequestPath('realm/init.rs', 'db/realm/init.rs') === null
+  check('multi-segment request accepts the one deeper echo ending in it',
+    fileExplorerResolvedRequestPath('realm/init.rs', 'db/realm/init.rs') === 'db/realm/init.rs'
       && fileExplorerResponseMatchesRequest('src/lib.rs', 'other/src/lib.rs') === false);
   check('single-segment request never accepts a partial-suffix echo',
     fileExplorerResolvedRequestPath('init.rs', 'db/another.init.rs') === null);
@@ -2034,6 +2027,28 @@ await (async () => {
   check('changes wire exposes truncated', capped !== null && capped.truncated === true);
   const uncapped = normalizeChanges({ files: [], isRepo: true });
   check('changes wire defaults truncated false', uncapped !== null && uncapped.truncated === false);
+  const heads = normalizeChanges({
+    files: [],
+    isRepo: true,
+    repositories: [
+      { path: 'svc', head: 'a1b2c3d' },
+      { path: 'empty', head: null },
+      { path: '', head: 'bad' },
+      { path: 'x'.repeat(600), head: 'bad' },
+      'junk',
+    ],
+  });
+  check(
+    'nested repository heads parse with empty and hostile entries dropped',
+    heads !== null
+      && heads.repositories.length === 2
+      && heads.repositories[0].path === 'svc'
+      && heads.repositories[0].head === 'a1b2c3d'
+      && heads.repositories[1].path === 'empty'
+      && heads.repositories[1].head === null,
+  );
+  const noHeads = normalizeChanges({ files: [], isRepo: true });
+  check('absent repositories field defaults to empty', noHeads !== null && noHeads.repositories.length === 0);
   check('display path keeps relative identity', fileExplorerDisplayPath('src/a.ts') === 'src/a.ts');
   check('display path is workspace-relative under cwd', fileExplorerDisplayPath('/workspace/src/a.ts', '/workspace') === 'src/a.ts');
   check('display path collapses dot segments', fileExplorerDisplayPath('/workspace/./src/../a.ts', '/workspace') === 'a.ts');

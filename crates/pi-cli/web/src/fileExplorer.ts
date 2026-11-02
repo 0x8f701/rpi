@@ -78,7 +78,7 @@ export function stepFileExplorerTreePct(current: number, direction: -1 | 1): num
 export type FileExplorerEntryKind = 'file' | 'dir';
 
 export type FileExplorerChangeStatus = Extract<FileStatus, 'modified' | 'added' | 'deleted' | 'renamed'>;
-export type FileExplorerTabView = 'file' | 'diff';
+export type FileExplorerTabView = 'file' | 'diff' | 'dir';
 export type FileExplorerDrawerMode = 'closed' | 'collapsed' | 'open';
 
 export interface FileExplorerEntry {
@@ -109,11 +109,20 @@ export interface FileExplorerChange {
   oldPath?: string;
 }
 
+export interface FileExplorerRepoHead {
+  /** Workspace-relative repository directory. */
+  path: string;
+  /** Current HEAD short hash; null for a repository with no commits. */
+  head: string | null;
+}
+
 export interface FileExplorerChangesResult {
   files: FileExplorerChange[];
   isRepo: boolean;
   /** Backend caps the counted file list and reports truncation. */
   truncated: boolean;
+  /** Nested repositories under the workspace with their HEAD short hashes. */
+  repositories: FileExplorerRepoHead[];
 }
 
 export interface FileExplorerDiffResult {
@@ -401,7 +410,16 @@ export function normalizeChanges(raw: unknown): FileExplorerChangesResult | null
     const change = normalizeChange(item);
     if (change) files.push(change);
   }
-  return { files, isRepo: boolField(rec.isRepo), truncated: boolField(rec.truncated) };
+  const repositories: FileExplorerRepoHead[] = [];
+  if (Array.isArray(rec.repositories)) {
+    for (const item of rec.repositories) {
+      const entry = asRecord(item);
+      if (!entry || typeof entry.path !== 'string' || entry.path === '' || entry.path.length > 512) continue;
+      const head = typeof entry.head === 'string' && entry.head !== '' ? entry.head : null;
+      repositories.push({ path: entry.path, head });
+    }
+  }
+  return { files, isRepo: boolField(rec.isRepo), truncated: boolField(rec.truncated), repositories };
 }
 
 export function normalizeDiff(raw: unknown): FileExplorerDiffResult | null {
@@ -683,9 +701,9 @@ export function fileExplorerResolvedRequestPath(requestPath: string, pagePath: s
   if (response.startsWith('/')) return null;
   if (request.startsWith('/') && request.endsWith(`/${response}`)) return request;
   if (
-    !request.includes('/')
+    !request.startsWith('/')
     && fileExplorerEchoIsSafeRelative(pagePath)
-    && response.endsWith(`/${request}`)
+    && (response === request || response.endsWith(`/${request}`))
   ) {
     return response;
   }
@@ -2632,13 +2650,13 @@ export function fileExplorerContentSurface(
 ): FileExplorerContentSurface {
   if (fileKind !== 'file') return 'source';
   const stored = view.surfaceByPath?.[path];
-  // Map used to replace the file. It is a header dialog now, so a stored
-  // map surface falls through to Source or Preview.
-  if (stored === 'ask') return stored;
-  // Explicit Ask attach wins for ANY file (previewable or not).
+  // Ask is always attached beside the file, so it is not a content surface.
+  // A stored ask/map value falls through to Source, or Preview for a
+  // previewable file that was never switched to Source.
+  if (stored === 'source' || stored === 'ask') return 'source';
   if (fileExplorerPreviewKind(path) == null) return 'source';
-  if (stored == null || stored === 'map') return 'preview';
-  return stored;
+  if (stored == null || stored === 'map' || stored === 'preview') return 'preview';
+  return 'source';
 }
 
 export function fileExplorerWithPathSurface(
@@ -2784,7 +2802,7 @@ function normalizeMapDeclaration(raw: unknown): FileExplorerMapDeclaration | nul
     if (name == null) return null;
   }
   let doc: string | null = null;
-  if (rec.doc != null) {
+  if (typeof rec.doc === 'string' && rec.doc.length > 0) {
     doc = boundedText(rec.doc, FILE_EXPLORER_MAP_MAX_TEXT_CHARS);
     if (doc == null) return null;
   }
@@ -2903,8 +2921,11 @@ export function normalizeFileExplorerMap(
 ): FileExplorerMapResult | null {
   const rec = asRecord(raw);
   if (!rec) return null;
-  const path = boundedText(rec.path, FILE_EXPLORER_MAP_MAX_PATH_CHARS);
-  if (!path || !fileExplorerSamePath(path, expectedPath)) return null;
+  // `""` is the workspace root directory. boundedText rejects that, and a
+  // directory graph's path is the folder, not one of the file nodes.
+  if (typeof rec.path !== 'string' || rec.path.length > FILE_EXPLORER_MAP_MAX_PATH_CHARS) return null;
+  const path = rec.path;
+  if (!fileExplorerSamePath(path, expectedPath)) return null;
   let payloadJson: string | undefined;
   try {
     payloadJson = JSON.stringify(raw);
@@ -2926,17 +2947,44 @@ export function normalizeFileExplorerMap(
     seen.add(id);
     nodes.push(node);
   }
-  if (!seen.has(fileExplorerCanonicalPath(path))) return null;
+  const canonical = fileExplorerCanonicalPath(path);
+  const selected = canonical.length > 0 && seen.has(canonical);
+  const dirPrefix = canonical.length > 0 ? `${canonical}/` : '';
+  const underDirectory = nodes.every((node) => {
+    const id = fileExplorerCanonicalPath(node.path);
+    if (canonical.length === 0) return id.length > 0 && !id.startsWith('/');
+    return id.startsWith(dirPrefix);
+  });
+  // A file map must include the selected file. A directory map's path is
+  // the folder, and every node has to sit inside that folder.
+  if (!selected && !underDirectory) return null;
   const outgoing: FileExplorerMapEdge[] = [];
   for (const item of rec.outgoing) {
     const edge = normalizeMapEdge(item);
-    if (!edge || !fileExplorerSamePath(edge.source, path)) return null;
+    if (!edge) return null;
+    if (selected) {
+      if (!fileExplorerSamePath(edge.source, path)) return null;
+    } else if (!seen.has(fileExplorerCanonicalPath(edge.source))) {
+      return null;
+    }
+    if (!selected && edge.target.type === 'file' && !seen.has(fileExplorerCanonicalPath(edge.target.path))) {
+      return null;
+    }
     outgoing.push(edge);
   }
   const incoming: FileExplorerMapEdge[] = [];
   for (const item of rec.incoming) {
     const edge = normalizeMapEdge(item);
-    if (!edge || edge.target.type !== 'file' || !fileExplorerSamePath(edge.target.path, path)) return null;
+    if (!edge) return null;
+    if (selected) {
+      if (edge.target.type !== 'file' || !fileExplorerSamePath(edge.target.path, path)) return null;
+    } else if (
+      edge.target.type !== 'file'
+      || !seen.has(fileExplorerCanonicalPath(edge.source))
+      || !seen.has(fileExplorerCanonicalPath(edge.target.path))
+    ) {
+      return null;
+    }
     incoming.push(edge);
   }
   const coverage = normalizeMapCoverage(rec.coverage);

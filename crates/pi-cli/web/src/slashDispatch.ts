@@ -9,8 +9,9 @@
  * Supported surface (matches WEB_SUPPORTED_COMMANDS):
  *   /compact [--snap | instructions…]
  *   /skill <name>
- *   /code-review [<base> | <from> <to>]
- *   /commit [<ref>] — bare opens the recent-commit chooser, one ref reviews
+ *   /review [<repo>] [<base> | <from> <to>] — a first operand naming a
+ *   workspace directory reviews that nested repository
+ *   /show [<ref>] — bare opens the recent-commit chooser, one ref reviews
  *   that pinned commit (usage line mirrors interactive_commands.rs)
  *   /loop [list|cancel <id>|delete <id>|update <id> [interval] [prompt]|create <interval> <prompt>|<interval> <prompt>]
  *   /goal [show|inspect|create [--tokens N] <objective>|pause|resume|complete|drop|pin <text>|pins|unpin <index>]
@@ -20,7 +21,6 @@
  *   /todo [list|new [label]|select <id>|send [id] <message>|add <id> [options] <task>|status [id]|pause [id]|resume [id]|stop [id]|cancel [id]|archive <id>|start <task>|done <task>|drop <task>|clear|<markdown>]
  */
 
-import { parseCodeReviewArgs } from './codeReview';
 
 /** One parsed `/loop` invocation — mirrors `InteractiveLoopCommand` in
  *  crates/pi-cli/src/loop_commands.rs (the TUI parser is the authority). */
@@ -73,8 +73,8 @@ export type SlashAction =
   | { type: 'compact'; mode: 'snap' }
   | { type: 'compact'; mode: 'llm'; customInstructions: string }
   | { type: 'skill'; name: string }
-  | { type: 'code-review'; from?: string; to?: string; includeWorkingTree?: true }
-  | { type: 'commit'; ref?: string }
+  | { type: 'review'; operands: string[] }
+  | { type: 'show'; ref?: string }
   | { type: 'loop'; action: LoopAction }
   | { type: 'goal'; action: GoalAction }
   | { type: 'ps' }
@@ -499,32 +499,26 @@ export function resolveSlashAction(name: string, args: string): SlashAction {
       const first = skillName.split(/\s+/)[0] ?? skillName;
       return { type: 'skill', name: first };
     }
-    case 'code-review': {
-      const parsed = parseCodeReviewArgs(args);
-      if (!parsed.ok) {
-        return { type: 'error', message: parsed.error };
-      }
-      if (parsed.from && parsed.to) {
-        return { type: 'code-review', from: parsed.from, to: parsed.to };
-      }
-      if (parsed.from && parsed.includeWorkingTree) {
-        return { type: 'code-review', from: parsed.from, includeWorkingTree: true };
-      }
-      return { type: 'code-review' };
+    case 'review': {
+      // Operands stay raw: the FIRST one is a repository override when it
+      // names a workspace directory, and only the host can probe that
+      // (file_explorer_list); otherwise they are revisions of the session
+      // repository. Mirrors parse_review_command (code_review.rs).
+      return { type: 'review', operands: args.trim().split(/\s+/).filter(Boolean) };
     }
-    case 'commit': {
+    case 'show': {
       // Mirrors parse_commit_inspect_invocation (interactive_commands.rs):
       // bare opens the recent-commit chooser, one whitespace-delimited ref
       // reviews that pinned commit, any additional operand is the usage
       // error. Inspection only — no staging/checkout/commit here.
       const parts = args.trim().split(/\s+/).filter(Boolean);
       if (parts.length === 0) {
-        return { type: 'commit' };
+        return { type: 'show' };
       }
       if (parts.length === 1) {
-        return { type: 'commit', ref: parts[0] };
+        return { type: 'show', ref: parts[0] };
       }
-      return { type: 'error', message: 'Usage: /commit [<ref>]' };
+      return { type: 'error', message: 'Usage: /show [<ref>]' };
     }
     case 'loop': {
       const parsed = parseLoopArgs(args);

@@ -7,10 +7,9 @@ name: Release
 #     aarch64-apple-darwin, x86_64-apple-darwin, x86_64-pc-windows-msvc).
 #   Desktop: Linux amd64/arm64 .deb, macOS arm64/x86_64 .zip, and Windows
 #     x86_64 .zip. Each bundles the matching CLI binary. Packages are unsigned.
-#   Mobile: one Android APK, rpi-chat-<version>-android.apk, containing
-#     armeabi-v7a, arm64-v8a, x86, and x86_64. Signed from Actions secrets
-#     ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS,
-#     and ANDROID_KEY_PASSWORD. iOS is not published.
+#   Mobile: one Android release APK, rpi-chat-<version>-android.apk, containing
+#     armeabi-v7a, arm64-v8a, x86, and x86_64. Signed with the checked-in debug
+#     keystore unless android/keystore.properties supplies another. iOS is not published.
 # Publication requires the static sandbox contracts plus Linux, macOS x64/arm64,
 # and Windows runtime proofs, as well as every CLI, desktop, and Android asset.
 
@@ -646,53 +645,6 @@ jobs:
             "build-tools;34.0.0" \
             "ndk;26.1.10909125"
 
-      - name: Write the release keystore from Actions secrets
-        shell: bash
-        env:
-          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: |
-          python3 - <<'PY'
-          import base64, binascii, os, pathlib
-          def prop(value: str) -> str:
-              out = []
-              for ch in value:
-                  if ch in "\\ #!=" or ord(ch) < 32:
-                      out.append("\\u%04x" % ord(ch))
-                  else:
-                      out.append(ch)
-              return "".join(out)
-          required = [
-              "ANDROID_KEYSTORE_BASE64",
-              "ANDROID_KEYSTORE_PASSWORD",
-              "ANDROID_KEY_ALIAS",
-              "ANDROID_KEY_PASSWORD",
-          ]
-          missing = [name for name in required if not os.environ.get(name)]
-          if missing:
-              raise SystemExit("Android release signing secrets are missing: " + ", ".join(missing))
-          try:
-              keystore = base64.b64decode("".join(os.environ["ANDROID_KEYSTORE_BASE64"].split()), validate=True)
-          except binascii.Error:
-              raise SystemExit("ANDROID_KEYSTORE_BASE64 is not valid base64")
-          if not keystore:
-              raise SystemExit("ANDROID_KEYSTORE_BASE64 decoded empty")
-          dest = pathlib.Path("mobile/android/app/release.keystore")
-          dest.write_bytes(keystore)
-          dest.chmod(0o600)
-          props = pathlib.Path("mobile/android/keystore.properties")
-          props.write_text(
-              "storeFile=app/release.keystore\n"
-              f"storePassword={prop(os.environ['ANDROID_KEYSTORE_PASSWORD'])}\n"
-              f"keyAlias={prop(os.environ['ANDROID_KEY_ALIAS'])}\n"
-              f"keyPassword={prop(os.environ['ANDROID_KEY_PASSWORD'])}\n",
-              encoding="utf-8",
-          )
-          props.chmod(0o600)
-          PY
-
       - name: Assemble the release APK
         working-directory: mobile/android
         shell: bash
@@ -1071,7 +1023,7 @@ jobs:
 
             ### Mobile
 
-            Android: `rpi-chat-<version>-android.apk` is one sideload APK containing `armeabi-v7a`, `arm64-v8a`, `x86`, and `x86_64`. It is signed with the release keystore supplied to Actions. The application id is `com.rpichat`, versionName `1.0.0`, versionCode `5`. iOS is not published.
+            Android: `rpi-chat-<version>-android.apk` is one sideload APK containing `armeabi-v7a`, `arm64-v8a`, `x86`, and `x86_64`. It is a release build signed with the checked-in debug keystore. The application id is `com.rpichat`, versionName `1.0.0`, versionCode `5`. iOS is not published.
 
       - name: Verify remote draft inventory
         env:

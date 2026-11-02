@@ -89,7 +89,7 @@ function headerSlice(html: string): string {
   const html = renderExplorer();
   const head = headerSlice(html);
   check('a11y: Files title is static text outside the controls', head.includes('>Files<') && !html.includes('file-explorer-hide-btn') && !html.includes('file-explorer__title-button') && !head.includes(FILE_EXPLORER_TREE_TOGGLE_ID) && !head.includes('File surface'));
-  check('a11y: Map is a header action', head.includes('data-testid="file-explorer-map-toggle"') && head.includes('Map') && head.includes('aria-label="Dependency map"') && !head.includes('File surface'));
+  check('a11y: Graph is an icon-only header action', head.includes('data-testid="file-explorer-map-toggle"') && head.includes('aria-label="Graph"') && !head.includes('>Graph<') && !head.includes('◇') && !head.includes('File surface'));
   check('a11y: Refresh keeps its accessible name and has no text label', head.includes(`id="${FILE_EXPLORER_REFRESH_BTN_ID}"`) && head.includes('aria-label="Refresh"') && head.includes('title="Refresh"') && head.includes('aria-hidden="true"') && !head.includes('file-explorer__refresh-label') && !head.includes('Refreshing'));
   check('a11y: close button names Close file explorer', head.includes(`id="${FILE_EXPLORER_CLOSE_BTN_ID}"`) && head.includes('aria-label="Close file explorer"') && head.includes('title="Close file explorer"'));
   check('a11y: fullscreen is absent without onToggleExpanded', !head.includes('expand-btn'));
@@ -120,8 +120,8 @@ function headerSlice(html: string): string {
 {
   const html = renderExplorer({ onToggleExpanded: () => {} });
   const head = headerSlice(html);
-  check('a11y: fullscreen keeps its name', head.includes('aria-label="Expand file explorer to the full app area"') && head.includes('title="Expand to the full app area"') && !head.includes(FILE_EXPLORER_TREE_TOGGLE_ID));
-  check('a11y: fullscreen stays in the header actions', head.includes('expand-btn') && head.includes(FILE_EXPLORER_CLOSE_BTN_ID));
+  check('a11y: fullscreen control is absent from the header', !head.includes('expand-btn') && !head.includes('Expand file explorer to the full app area'));
+  check('a11y: close stays in the header actions', head.includes(FILE_EXPLORER_CLOSE_BTN_ID));
 }
 
 {
@@ -145,7 +145,7 @@ function headerSlice(html: string): string {
   }));
   const head = headerSlice(html);
   const content = html.slice(html.indexOf('data-testid="file-explorer-content"'));
-  check('a11y: Source|Preview radiogroup is outside the header', !head.includes('File surface') && content.includes('role="radiogroup"') && content.includes('aria-label="File surface"') && content.includes('>Source<') && content.includes('>Preview<'));
+  check('a11y: surface group lives outside the header', !head.includes('File surface'));
   check('a11y: header does not contain the tree toggle or Ask', !head.includes(FILE_EXPLORER_TREE_TOGGLE_ID) && !head.includes('>Ask<') && head.includes('aria-label="Refresh"') && head.includes(FILE_EXPLORER_CLOSE_BTN_ID));
 }
 {
@@ -1166,10 +1166,11 @@ await withDelayHarness(async (doc, root) => {
     { name: 'gone', path: 'gone', kind: 'dir' },
     { name: 'broken', path: 'broken', kind: 'dir' },
     { name: 'stale', path: 'stale', kind: 'dir' },
+    { name: 'svc', path: 'svc', kind: 'dir' },
   ];
   const sendCommand = (command: Record<string, unknown>) => {
     if (command.type === 'file_explorer_changes') {
-      return Promise.resolve({ files: [], isRepo: true, truncated: false });
+      return Promise.resolve({ files: [], isRepo: true, truncated: false, repositories: [{ path: 'svc', head: 'a1b2c3d' }] });
     }
     if (command.type !== 'file_explorer_list') return Promise.resolve({});
     const path = typeof command.path === 'string' ? command.path : '';
@@ -1227,6 +1228,8 @@ await withDelayHarness(async (doc, root) => {
   check('generic list error stays visible with Retry', errors.some((text) => text.includes('list failed') && text.includes('Retry')));
   check('transport failure keeps Connection lost and Retry', errors.some((text) => text.includes('Connection lost') && text.includes('Retry')));
   check('transport failure keeps the last listed file', doc.body.textContent?.includes('keep.ts') === true);
+  const hashBadge = doc.body.querySelector('[data-testid="file-explorer-repo-hash"]');
+  check('nested repo dir row shows its HEAD short hash', hashBadge !== null && hashBadge.textContent === 'a1b2c3d');
 });
 // ---------------------------------------------------------------------
 // Ask (file conversation): visible toggle, pure selection parser,
@@ -1280,7 +1283,7 @@ async function flushMicrotasks(): Promise<void> {
 
 {
   const html = renderExplorer();
-  check('ask: no toggle without an active tab', !html.includes('file-explorer-ask-toggle'));
+  check('ask: no dock without an active tab', !html.includes('file-explorer-ask-split') && !html.includes('file-explorer-ask-toggle'));
 }
 
 {
@@ -1295,11 +1298,9 @@ async function flushMicrotasks(): Promise<void> {
   }));
   const content = html.slice(html.indexOf('data-testid="file-explorer-content"'));
   const head = headerSlice(html);
-  const askAt = content.indexOf('file-explorer-ask-toggle');
-  check('ask: toggle renders on the content toolbar', askAt >= 0 && content.includes('aria-label="Ask about this file"') && content.includes('>Ask<') && !head.includes('file-explorer-ask-toggle'));
-  check('ask: non-previewable tab offers Source and Ask only', content.includes('>Source<') && !content.includes('>Preview<'));
-  check('ask: Source precedes Ask', content.indexOf('>Source<') >= 0 && content.indexOf('>Source<') < askAt);
-  check('ask: toggle starts unchecked on the source surface', /file-explorer-ask-toggle[^>]*aria-checked="false"/.test(content));
+  check('ask: open file has no Ask button', !content.includes('file-explorer-ask-toggle') && !content.includes('aria-label="Ask about this file"') && !head.includes('file-explorer-ask-toggle'));
+  check('ask: non-previewable tab shows no surface buttons', !content.includes('>Source<') && !content.includes('>Preview<'));
+  check('ask: dock is present beside source without a toggle', content.includes('data-testid="file-explorer-ask-split"') && content.includes('class="file-conversation"') && content.includes('file-explorer__code'));
   check('ask: source rows carry actual data-line numbers', html.includes('data-line="1"'));
 }
 {
@@ -1313,10 +1314,9 @@ async function flushMicrotasks(): Promise<void> {
     slot: askMarkdownSlot,
   }));
   const content = html.slice(html.indexOf('data-testid="file-explorer-content"'));
-  const sourceAt = content.indexOf('>Source<');
   const previewAt = content.indexOf('>Preview<');
-  const askAt = content.indexOf('file-explorer-ask-toggle');
-  check('ask: previewable content toolbar orders Source, Preview, Ask', sourceAt >= 0 && sourceAt < previewAt && previewAt < askAt);
+  check('ask: previewable toolbar offers Source and Preview', previewAt >= 0 && content.includes('>Source<') && !content.includes('file-explorer-ask-toggle'));
+  check('ask: previewable file still docks the conversation', content.includes('data-testid="file-explorer-ask-split"'));
 }
 
 {
@@ -1329,10 +1329,10 @@ async function flushMicrotasks(): Promise<void> {
     sessionId: 'sess-ask-on',
     slot: askOnSlot,
   }));
-  check('ask: active surface checks the toggle', /file-explorer-ask-toggle[^>]*aria-checked="true"/.test(html));
-  check('ask: dock mounts in the content split beside source', html.includes('data-testid="file-explorer-ask-split"')
+  check('ask: stored ask surface still shows source beside the dock', !html.includes('>Source<') && !html.includes('file-explorer-ask-toggle'));
+  check('ask: dock mounts beside the content column', html.includes('data-testid="file-explorer-ask-split"')
     && html.includes('class="file-conversation"')
-    && html.includes('file-explorer__content-split')
+    && html.indexOf('data-testid="file-explorer-content"') < html.indexOf('data-testid="file-explorer-ask-split"')
     && html.includes('file-explorer__code'));
   check('ask: placeholder snapshot binds the tab conversation id', html.includes('data-conversation-id="conv-static"') && html.includes('data-session-id="sess-ask-on"'));
 }
@@ -1344,7 +1344,7 @@ async function flushMicrotasks(): Promise<void> {
     sessionId: 'sess-ask-diff',
     slot: { tabs: [{ path: 'src/app.rs', view: 'diff' }], activePath: 'src/app.rs', mode: 'open' },
   }));
-  check('ask: diff view never offers the Ask toggle', !html.includes('file-explorer-ask-toggle'));
+  check('ask: diff view never docks Ask', !html.includes('file-explorer-ask-toggle') && !html.includes('file-explorer-ask-split'));
 }
 
 {
@@ -1575,10 +1575,7 @@ await withDelayHarness(async (doc, root) => {
   const selection: MiniSelection = { anchorNode: textNode, focusNode: line, isCollapsed: false };
   (doc.defaultView as MiniWindow).getSelection = () => selection;
   await act(async () => { code?.dispatchEvent({ type: 'mouseup', target: code }); });
-  const askToggle = doc.body.querySelector('[data-testid="file-explorer-ask-toggle"]');
-  check('ask send: toggle is visible and unchecked after open', askToggle != null && askToggle.getAttribute('aria-checked') === 'false');
-  await act(async () => { askToggle?.click(); });
-  check('ask send: activating the toggle mounts the dock split with source', askToggle?.getAttribute('aria-checked') === 'true'
+  check('ask send: opening the file mounts the dock beside source', doc.body.querySelector('[data-testid="file-explorer-ask-toggle"]') == null
     && doc.body.querySelector('[data-testid="file-explorer-ask-split"]') != null
     && doc.body.querySelector('.file-conversation') != null
     && doc.body.querySelector('.file-explorer__code') != null);

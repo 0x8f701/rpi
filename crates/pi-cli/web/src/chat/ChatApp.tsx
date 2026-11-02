@@ -567,7 +567,7 @@ export function runChatMarkdownOpenProbe(args: {
   isCurrentAttempt: () => boolean;
   send: (runnerId: string, command: RunnerCommand, options?: { sourceSessionId?: string }) => Promise<RpcResponse>;
   onProbeStarted: () => void;
-  onOpened: (relative: string, openLine: number | undefined) => void;
+  onOpened: (relative: string, openLine: number | undefined, kind: 'file' | 'directory') => void;
   onFailed: (error: unknown) => void;
   completion?: string;
 }): void {
@@ -598,9 +598,9 @@ export function runChatMarkdownOpenProbe(args: {
       });
       return response.data;
     },
-    (relative, openLine) => {
+    (relative, openLine, _owner, opened) => {
       if (!isCurrentAttempt()) return;
-      onOpened(relative, openLine);
+      onOpened(relative, openLine, opened?.kind === 'directory' ? 'directory' : 'file');
     },
     (error) => {
       if (!isCurrentAttempt()) return;
@@ -1525,13 +1525,13 @@ export function ChatApp() {
       completion,
       send: (runnerId, command, options) => registry.command(runnerId, command, options),
       onProbeStarted: () => { if (isCurrentAttempt()) setMarkdownProbeError(''); },
-      onOpened: (relative, openLine) => {
+      onOpened: (relative, openLine, kind) => {
         if (!isCurrentAttempt()) return;
         setMarkdownProbeError('');
         teamStore.selectProject(ownerBinding.project.id);
         teamStore.setFileOwner(ownerBinding.project.id, ownerBinding.mapping.id);
         teamStore.setContextPane(ownerBinding.project.id, 'files');
-        patchFileExplorer(ownerKey, (slot) => applyOpenPath(slot, relative, openLine));
+        patchFileExplorer(ownerKey, (slot) => applyOpenPath(slot, relative, openLine, kind === 'directory' ? 'dir' : 'file'));
       },
       onFailed: (error) => {
         if (!isCurrentAttempt()) return;

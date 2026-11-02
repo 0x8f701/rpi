@@ -75,7 +75,7 @@ TERM=xterm-256color \
     tmux send-keys -t "$session":0 Escape
     sleep 0.3
 
-    tmux send-keys -t "$session":0 -l '/code-review'
+    tmux send-keys -t "$session":0 -l '/review'
     tmux send-keys -t "$session":0 Enter
     wait_for 'Code review' 30
     wait_for "$DIRTY_FILE" 30

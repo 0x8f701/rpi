@@ -54,7 +54,6 @@ import {
   normalizeFileDiffPage,
   normalizeThreads,
   overlayReviewLifecycle,
-  parseCodeReviewArgs,
   codeReviewOpenCommand,
   codeReviewOpenSnapshotError,
   normalizeCodeReviewCommits,
@@ -791,26 +790,6 @@ check('RPC business failure remains inline', shouldRenderReviewError(Object.assi
   );
 }
 
-// ---- parseCodeReviewArgs arity ----
-{
-  check('empty args ok', parseCodeReviewArgs('').ok === true);
-  check('whitespace args ok', parseCodeReviewArgs('   ').ok === true);
-  const two = parseCodeReviewArgs('main feature');
-  check('two revs ok', two.ok === true && two.ok && two.from === 'main' && two.to === 'feature');
-  const one = parseCodeReviewArgs('main');
-  check(
-    'one rev is base-to-working-tree',
-    one.ok === true && one.ok && one.from === 'main' && one.to === undefined && one.includeWorkingTree === true,
-  );
-  const three = parseCodeReviewArgs('a b c');
-  check('three revs error', three.ok === false);
-  const spaced = parseCodeReviewArgs('  abc  def  ');
-  check(
-    'spaced two revs',
-    spaced.ok === true && spaced.ok && spaced.from === 'abc' && spaced.to === 'def',
-  );
-}
-
 const COMMIT_SHA40 = 'a'.repeat(40);
 const COMMIT_SHA64 = 'b'.repeat(64);
 const COMMIT_PARENT = 'c'.repeat(40);
@@ -847,7 +826,12 @@ const commitRowFixture = (over = {}) => ({
   const conflated = codeReviewOpenCommand({ commit: COMMIT_SHA40, from: 'main', to: 'HEAD', includeWorkingTree: true });
   check(
     'mixed operands are REJECTED, never silently narrowed to one scope',
-    conflated.ok === false && !conflated.ok && conflated.error === 'code_review_open commit excludes from, to, and includeWorkingTree',
+    conflated.ok === false && !conflated.ok && conflated.error === 'code_review_open commit excludes from, to, includeWorkingTree, and repo',
+  );
+  const commitWithRepo = codeReviewOpenCommand({ commit: COMMIT_SHA40, repo: 'svc' });
+  check(
+    'commit plus repository override rejects',
+    commitWithRepo.ok === false && commitWithRepo.error === 'code_review_open commit excludes from, to, includeWorkingTree, and repo',
   );
   const commitWithFrom = codeReviewOpenCommand({ commit: COMMIT_SHA40, from: 'main' });
   const commitWithWorkingTree = codeReviewOpenCommand({ commit: COMMIT_SHA40, includeWorkingTree: true });
@@ -978,7 +962,7 @@ const commitRowFixture = (over = {}) => ({
   const enterTyped = commitPickerEnterAction([], -1, ' HEAD~1 ');
   check('commit picker enter with no matching row picks the typed ref trimmed', enterTyped.kind === 'typed' && enterTyped.ref === 'HEAD~1');
   const enterInvalid = commitPickerEnterAction([], -1, 'a b c');
-  check('commit picker enter with a multi-token tail errors with the TUI usage line', enterInvalid.kind === 'invalid' && enterInvalid.message === 'Usage: /commit [<ref>]');
+  check('commit picker enter with a multi-token tail errors with the TUI usage line', enterInvalid.kind === 'invalid' && enterInvalid.message === 'Usage: /show [<ref>]');
   const enterNone = commitPickerEnterAction([], -1, '   ');
   check('commit picker enter with nothing active and nothing typed is a no-op', enterNone.kind === 'none');
   const enterClamped = commitPickerEnterAction(rows, 9, '');
@@ -2474,25 +2458,6 @@ const commitRowFixture = (over = {}) => ({
   check(
     'probe generic business error -> preserve without reopen',
     classifyReviewProbe(null, genericBusiness).kind === 'preserve',
-  );
-  // A reopen must carry the original one/two revision args: the panel calls
-  // openReview() which reads openArgs, so the decision only needs to fire it.
-  // Verify the two-revision arg shape round-trips through parseCodeReviewArgs
-  // (the open path the panel uses).
-  const twoRev = parseCodeReviewArgs('HEAD feature');
-  check(
-    'reopen path preserves two-revision args',
-    twoRev.ok === true && twoRev.from === 'HEAD' && twoRev.to === 'feature',
-  );
-  const zeroRev = parseCodeReviewArgs('');
-  check(
-    'reopen path preserves zero-revision (working tree) args',
-    zeroRev.ok === true && zeroRev.from === undefined && zeroRev.to === undefined && zeroRev.includeWorkingTree === undefined,
-  );
-  const oneRev = parseCodeReviewArgs('HEAD~1');
-  check(
-    'reopen path preserves one-revision base-to-working-tree args',
-    oneRev.ok === true && oneRev.from === 'HEAD~1' && oneRev.to === undefined && oneRev.includeWorkingTree === true,
   );
 }
 

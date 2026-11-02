@@ -1375,7 +1375,7 @@ fn validate_diff_target(
     }
 }
 
-fn map_directory_error(error: &anyhow::Error) -> anyhow::Error {
+pub(crate) fn map_directory_error(error: &anyhow::Error) -> anyhow::Error {
     match error.downcast_ref::<FsError>() {
         Some(FsError::UnsupportedEntryType) => FileExplorerError::DirectoryUnavailable.into(),
         Some(FsError::OutsideCapability | FsError::Denied | FsError::InvalidPath) => {
@@ -1394,6 +1394,10 @@ fn map_directory_error(error: &anyhow::Error) -> anyhow::Error {
         _ => anyhow!("directory is unavailable"),
     }
 }
+pub(crate) fn trusted_launcher_missing(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("launcher")
+}
+
 
 fn open_workspace_root(root: &Path) -> Result<Dir> {
     Dir::open_ambient_dir(root, ambient_authority()).map_err(|_| anyhow!("workspace is unavailable"))

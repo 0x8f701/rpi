@@ -195,13 +195,16 @@ import { nextId } from '../transcript';
 import { useSttRecorder } from '../useSttRecorder';
 
 export interface CodeReviewOpenArgs {
-  /** `/commit <ref>` scope: review the pinned commit — parent→commit (a root
+  /** `/show <ref>` scope: review the pinned commit — parent→commit (a root
    *  commit diffs from the empty tree; a merge from its first parent), pinned
    *  to the resolved hash. Mutually exclusive with from/to/includeWorkingTree. */
   commit?: string;
   from?: string;
   to?: string;
   includeWorkingTree?: true;
+  /** Workspace-relative repository directory to review (Files right-click on
+   *  a nested repository). Mutually exclusive with commit. */
+  repo?: string;
   alreadyOpen?: true;
 }
 
@@ -223,7 +226,7 @@ interface CodeReviewPanelProps {
    * command (including unmount close) so A→B cleanup cannot target B.
    */
   sessionId: string | null;
-  /** Scope captured when `/code-review [...]` or `/commit <ref>` opened the panel. */
+  /** Scope captured when `/review [...]` or `/show <ref>` opened the panel. */
   openArgs: CodeReviewOpenArgs;
   /**
    * Monotonically increasing authoritative connection epoch from App. A new
@@ -763,7 +766,7 @@ export function CodeReviewPanel({
         if (forceOpen) reopenInFlightRef.current = false;
         if (aliveRef.current && requestSeq === snapshotRequestSeqRef.current) setBusy(null);
       });
-  }, [applyData, closeReviewById, onToast, openArgs.commit, openArgs.from, openArgs.to, openArgs.includeWorkingTree, openArgs.alreadyOpen, reviewCommand, sendCommand]);
+  }, [applyData, closeReviewById, onToast, openArgs.commit, openArgs.from, openArgs.to, openArgs.includeWorkingTree, openArgs.repo, openArgs.alreadyOpen, reviewCommand, sendCommand]);
   openReviewRef.current = openReview;
 
   useEffect(() => {
@@ -2829,6 +2832,7 @@ export function CodeReviewPanel({
             isHidden={isNarrow && mobileTab !== 'thread'}
             busy={threadBusy}
             sessionId={sessionId}
+            reviewRepo={openArgs.repo}
             snapshotId={snapshot.snapshotId}
             reviewResults={snapshot.reviewFindings}
             selectedFinding={selectedFinding}
@@ -2854,6 +2858,7 @@ export function CodeReviewPanel({
             markdown={tldrPaneMarkdown}
             state={snapshot.tldrState}
             sessionId={sessionId ?? undefined}
+            reviewRepo={openArgs.repo}
             onStop={() => stopOperation('tldr')}
             onClose={() => setTldrOpen(false)}
           />

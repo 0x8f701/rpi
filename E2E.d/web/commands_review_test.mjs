@@ -53,8 +53,8 @@
 // Asserts the Web composer command surface + the real code-review
 // workspace against the seeded TEMP git repo + fixture skill:
 //   - #command-btn is LEFT of #prompt-input in the composer row
-//   - opening the command picker lists /compact, /skill, /code-review
-//   - choosing /code-review inserts the draft WITHOUT auto-submitting
+//   - opening the command picker lists /compact, /skill, /review
+//   - choosing /review inserts the draft WITHOUT auto-submitting
 //   - Enter opens the real review panel: HEAD→working-tree comparison label,
 //     the dirty file row, and the changed diff lines (deletion + addition)
 //   - the dirty file renders TWO separated hunks; the SECOND hunk's comment
@@ -107,7 +107,7 @@
 //     (≥2 frames ~1.5s apart) and polling stops after the panel closes
 //     (≥3.6s with zero snapshot frames and no duplicate close)
 //   - a session switch closes the owning review workspace (code_review_close
-//     stamped with the owning sessionId), and a bare /code-review in the
+//     stamped with the owning sessionId), and a bare /review in the
 //     target session never reuses the previous session's revision args
 //   - Escape with a draft shows the inline close confirm; "Keep editing"
 //     keeps the workspace + draft; Escape with no draft closes the panel
@@ -150,12 +150,12 @@
 //     error bubble + toast; /skill greet extra uses only the first token
 //     as the skill name; /skill bare is a usage-error toast with no RPC;
 //     /unknowncmd falls through to a normal prompt (user bubble + prompt RPC)
-//   - code-review error/close: /code-review HEAD~1 HEAD opens the panel with
-//     the from/to revisions and closes via the × button; /code-review
+//   - code-review error/close: /review HEAD~1 HEAD opens the panel with
+//     the from/to revisions and closes via the × button; /review
 //     <bad-ref> HEAD renders the real git revision error state with Retry
-//     and closes cleanly; /code-review a b c is a client-side arity toast
+//     and closes cleanly; /review a b c is a client-side arity toast
 //     that never opens the panel
-//   - the literal single-ref user path `/code-review origin/master` (the
+//   - the literal single-ref user path `/review origin/master` (the
 //     fixture seeds refs/remotes/origin/master LOCALLY — no remote URL, no
 //     network) dispatches EXACTLY ONE code_review_open with
 //     from=origin/master includeWorkingTree=true and no `to` key (the
@@ -209,7 +209,7 @@
 //   - warm reconnect slash ownership: with the displayed session a sibling of
 //     the listener primary, a forced socket close + auto-reconnect leaves
 //     display authority (and its command target) on the displayed session;
-//     `/code-review HEAD~1 HEAD` then dispatches code_review_open stamped with
+//     `/review HEAD~1 HEAD` then dispatches code_review_open stamped with
 //     the DISPLAYED session (never the re-bound primary) — and no
 //     code_review_open frame rides any other session, so the mounted panel
 //     cannot reopen the review in the primary — while the backend probe on the
@@ -4069,36 +4069,36 @@ async function main() {
     await laneShot(page, 'command-button-left.png', { fullPage: true });
     await runFileExplorerPreviewJourney(page);
 
-    // The picker lists /compact, /skill, /code-review (backend authority).
+    // The picker lists /compact, /skill, /review (backend authority).
     await openPicker(page);
     await waitFor(
       page,
       () => {
         const names = Array.from(document.querySelectorAll('.command-picker__option .command-picker__name')).map((el) => el.textContent.trim());
-        return names.includes('/compact') && names.includes('/skill') && names.includes('/code-review');
+        return names.includes('/compact') && names.includes('/skill') && names.includes('/review');
       },
-      'command picker did not list /compact, /skill, /code-review'
+      'command picker did not list /compact, /skill, /review'
     );
     const names = await pickerNames(page);
-    for (const required of ['/compact', '/skill', '/code-review']) {
+    for (const required of ['/compact', '/skill', '/review']) {
       if (!names.includes(required)) fail(`command picker missing ${required} (got ${names.join(', ')})`);
     }
     await laneShot(page, 'command-picker-open.png', { fullPage: true });
 
-    // Choose /code-review -> draft lands in the composer, NO auto-submit.
-    await chooseCommand(page, 'code-review');
+    // Choose /review -> draft lands in the composer, NO auto-submit.
+    await chooseCommand(page, 'review');
     await waitFor(
       page,
       () => {
         const v = document.getElementById('prompt-input')?.value.trim() || '';
-        return v.startsWith('/code-review');
+        return v.startsWith('/review');
       },
-      'choosing /code-review did not insert the draft into the composer'
+      'choosing /review did not insert the draft into the composer'
     );
     // No auto-submit: the panel must NOT have opened yet, and no user bubble
     // for the slash command appears in the transcript.
     const panelBefore = await page.evaluate(() => document.getElementById('code-review-panel') !== null);
-    if (panelBefore) fail('/code-review auto-submitted — panel opened without Enter');
+    if (panelBefore) fail('/review auto-submitted — panel opened without Enter');
     await laneShot(page, 'code-review-draft-no-submit.png', { fullPage: true });
 
     // Enter dispatches code_review_open -> the real review panel renders.
@@ -4186,7 +4186,7 @@ async function main() {
     assertCrLayoutRestored(crLayoutBeforeDesktop, crLayoutAfterDesktop, 'desktop close-restore');
     await laneShot(page, 'code-review-panel-close-restore-desktop.png');
     await openPicker(page);
-    await chooseCommand(page, 'code-review');
+    await chooseCommand(page, 'review');
     await page.press('#prompt-input', 'Enter');
     await waitFor(page, () => document.getElementById('code-review-panel') !== null, 'desktop reopen after the geometry close-restore cycle failed');
     await waitFor(
@@ -4339,11 +4339,11 @@ async function main() {
     );
     // Re-open the review panel via the command surface.
     await openPicker(page);
-    await chooseCommand(page, 'code-review');
+    await chooseCommand(page, 'review');
     await waitFor(
       page,
-      () => (document.getElementById('prompt-input')?.value.trim() || '').startsWith('/code-review'),
-      'thread reload: /code-review draft missing'
+      () => (document.getElementById('prompt-input')?.value.trim() || '').startsWith('/review'),
+      'thread reload: /review draft missing'
     );
     await page.press('#prompt-input', 'Enter');
     await waitFor(page, () => document.getElementById('code-review-panel') !== null, 'thread reload: panel did not reopen');
@@ -5580,7 +5580,7 @@ async function main() {
     );
     // Reopen a fresh panel so the live-textarea Close/Refresh gate starts
     // with no leftover draft and later lane steps are not polluted.
-    await page.fill('#prompt-input', '/code-review');
+    await page.fill('#prompt-input', '/review');
     await page.press('#prompt-input', 'Enter');
     await waitFor(
       page,
@@ -5895,13 +5895,13 @@ async function main() {
     // Reopen the panel in A with TWO revisions so revision args are captured.
     // The later bare open in B must not reuse them.
     await openPicker(page);
-    await chooseCommand(page, 'code-review');
+    await chooseCommand(page, 'review');
     await waitFor(
       page,
-      () => (document.getElementById('prompt-input')?.value.trim() || '').startsWith('/code-review'),
+      () => (document.getElementById('prompt-input')?.value.trim() || '').startsWith('/review'),
       'reopen draft missing before the session-switch gate'
     );
-    await page.fill('#prompt-input', '/code-review HEAD~1 HEAD');
+    await page.fill('#prompt-input', '/review HEAD~1 HEAD');
     await page.press('#prompt-input', 'Enter');
     await waitFor(
       page,
@@ -5950,13 +5950,13 @@ async function main() {
     if (closeFrames.length !== 1 || closeFrames[0].sessionId !== sidA) {
       fail('loaded-session view switch must close exactly the source-owned review workspace');
     }
-    // Target session B: a bare /code-review must NOT reuse A's revision args.
+    // Target session B: a bare /review must NOT reuse A's revision args.
     await openPicker(page);
-    await chooseCommand(page, 'code-review');
+    await chooseCommand(page, 'review');
     await waitFor(
       page,
-      () => (document.getElementById('prompt-input')?.value.trim() || '').startsWith('/code-review'),
-      'choosing /code-review in the target session did not insert the draft'
+      () => (document.getElementById('prompt-input')?.value.trim() || '').startsWith('/review'),
+      'choosing /review in the target session did not insert the draft'
     );
     await page.press('#prompt-input', 'Enter');
     await waitFor(
@@ -5970,7 +5970,7 @@ async function main() {
         const label = document.querySelector('.code-review__label')?.textContent || '';
         return label.includes('working tree');
       },
-      'bare /code-review in the target session did not open the working-tree scope',
+      'bare /review in the target session did not open the working-tree scope',
       20000
     );
     const labelB = await page.evaluate(() => document.querySelector('.code-review__label')?.textContent || '');
@@ -6034,7 +6034,7 @@ async function main() {
       );
     };
 
-    // Bare /commit on A, then switch to B before A's code_review_commits
+    // Bare /review on A, then switch to B before A's code_review_commits
     // response is released. The late list must not paint A's row or open a
     // review on B. A current row click while A is displayed must.
     await switchToSessionRow(sidA, 'commit picker: return to the owning session');
@@ -6046,17 +6046,17 @@ async function main() {
     );
     await page.evaluate(() => window.__rpiWarmReconnect.holdNextCommitList());
     const lateCommitMark = sentFrames.length;
-    await page.fill('#prompt-input', '/commit');
+    await page.fill('#prompt-input', '/show');
     await page.press('#prompt-input', 'Enter');
     await waitFor(
       page,
       () => document.querySelector('[aria-label="Recent commits"]') !== null,
-      'commit picker: bare /commit did not open the recent-commit chooser on A',
+      'commit picker: bare /show did not open the recent-commit chooser on A',
       20000,
     );
     const lateCommitRequest = sentFrames.slice(lateCommitMark).map(parseSentFrame)
       .find((frame) => frame?.type === 'code_review_commits' && frame.sessionId === sidA);
-    if (!lateCommitRequest) fail(`commit picker: bare /commit did not request code_review_commits for ${sidA}`);
+    if (!lateCommitRequest) fail(`commit picker: bare /show did not request code_review_commits for ${sidA}`);
     await waitFor(
       page,
       (id) => window.__rpiWarmReconnect.state.held.includes(`code_review_commits:${id}`),
@@ -6087,7 +6087,7 @@ async function main() {
     await switchToSessionRow(sidA, 'commit picker: return for the current-session row');
     const currentCommitMark = sentFrames.length;
     ownershipTrace.startSentIndex = currentCommitMark;
-    await page.fill('#prompt-input', '/commit');
+    await page.fill('#prompt-input', '/show');
     await page.press('#prompt-input', 'Enter');
     await waitFor(
       page,
@@ -6189,13 +6189,13 @@ async function main() {
     await switchToSessionRow(sidB, 'review ownership: switch to the sibling session');
     const siblingMark = sentFrames.length;
     await openPicker(page);
-    await chooseCommand(page, 'code-review');
+    await chooseCommand(page, 'review');
     await waitFor(
       page,
-      () => (document.getElementById('prompt-input')?.value.trim() || '').startsWith('/code-review'),
-      'review ownership: choosing /code-review in the sibling session did not insert the draft',
+      () => (document.getElementById('prompt-input')?.value.trim() || '').startsWith('/review'),
+      'review ownership: choosing /review in the sibling session did not insert the draft',
     );
-    await page.fill('#prompt-input', '/code-review HEAD~1 HEAD');
+    await page.fill('#prompt-input', '/review HEAD~1 HEAD');
     await page.press('#prompt-input', 'Enter');
     await waitFor(
       page,
@@ -6218,7 +6218,7 @@ async function main() {
     const siblingOpens = sentFrames.slice(siblingMark).map(parseSentFrame)
       .filter((frame) => frame?.type === 'code_review_open');
     if (siblingOpens.length !== 1 || siblingOpens[0].sessionId !== sidB) {
-      fail(`review ownership: the sibling session's /code-review must dispatch exactly one code_review_open stamped with ${sidB} (${JSON.stringify(siblingOpens)})`);
+      fail(`review ownership: the sibling session's /review must dispatch exactly one code_review_open stamped with ${sidB} (${JSON.stringify(siblingOpens)})`);
     }
     const returnMark = sentFrames.length;
     await switchToSessionRow(sidA, 'review ownership: return to the owning session again');
@@ -6363,11 +6363,11 @@ async function main() {
     await mobilePage.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
     const crLayoutBeforeMobile = await crAppLayout(mobilePage);
     await openPicker(mobilePage);
-    await chooseCommand(mobilePage, 'code-review');
+    await chooseCommand(mobilePage, 'review');
     await waitFor(
       mobilePage,
-      () => (document.getElementById('prompt-input')?.value.trim() || '').startsWith('/code-review'),
-      'choosing /code-review on mobile did not insert the draft'
+      () => (document.getElementById('prompt-input')?.value.trim() || '').startsWith('/review'),
+      'choosing /review on mobile did not insert the draft'
     );
     await mobilePage.press('#prompt-input', 'Enter');
     await waitFor(
@@ -6881,7 +6881,7 @@ async function main() {
       userBubblesBefore
     );
     // Wait for the fallthrough's own turn to settle (confirmed bubble +
-    // unified action back to Send) so the following /code-review Enter is
+    // unified action back to Send) so the following /review Enter is
     // never raced into a steer.
     await waitFor(
       page,
@@ -6903,13 +6903,13 @@ async function main() {
     // each variant opens it fresh, exercises the boundary, and closes it.
     // ------------------------------------------------------------------
 
-    // /code-review HEAD~1 HEAD: two revisions reach code_review_open and the
+    // /review HEAD~1 HEAD: two revisions reach code_review_open and the
     // comparison label renders "HEAD~1 → HEAD"; the × close button removes
     // the panel.
-    await page.fill('#prompt-input', '/code-review HEAD~1 HEAD');
+    await page.fill('#prompt-input', '/review HEAD~1 HEAD');
     const revBefore = sentFrames.length;
     await page.press('#prompt-input', 'Enter');
-    await waitFor(page, () => document.getElementById('code-review-panel') !== null, 'code-review panel did not open for /code-review HEAD~1 HEAD');
+    await waitFor(page, () => document.getElementById('code-review-panel') !== null, 'code-review panel did not open for /review HEAD~1 HEAD');
     // The revision-args open uses the same outer shell: it must still be a
     // full-viewport overlay, never a drawer-sized right rail.
     assertCrShellGeometry(await crShellGeometry(page), 'two-revision');
@@ -6932,7 +6932,7 @@ async function main() {
       await page.waitForTimeout(100);
     }
     if (!revFrame || revFrame.from !== 'HEAD~1' || revFrame.to !== 'HEAD') {
-      fail(`/code-review HEAD~1 HEAD must send code_review_open with from=HEAD~1 to=HEAD (got ${JSON.stringify(revFrame)})`);
+      fail(`/review HEAD~1 HEAD must send code_review_open with from=HEAD~1 to=HEAD (got ${JSON.stringify(revFrame)})`);
     }
     await waitFor(
       page,
@@ -6956,50 +6956,50 @@ async function main() {
     );
     await laneShot(page, 'code-review-revisions-closed.png', { fullPage: true });
 
-    // /code-review <bad-ref> HEAD: git resolution fails before the panel
+    // /review <bad-ref> HEAD: git resolution fails before the panel
     // opens. Toast the invalid-revision message and keep the composer draft.
-    await page.fill('#prompt-input', '/code-review invalid-ref-xyz HEAD');
+    await page.fill('#prompt-input', '/review invalid-ref-xyz HEAD');
     await page.press('#prompt-input', 'Enter');
     await waitFor(
       page,
       () => Array.from(document.querySelectorAll('.toast--error')).some((t) =>
         (t.textContent || '').includes('invalid source revision; expected a commit, branch, or tag')
       ),
-      '/code-review invalid-ref-xyz HEAD did not toast the invalid revision before opening a panel',
+      '/review invalid-ref-xyz HEAD did not toast the invalid revision before opening a panel',
       15000
     );
     await page.waitForTimeout(800);
     const panelAfterBadRef = await page.evaluate(() => document.getElementById('code-review-panel') !== null);
-    if (panelAfterBadRef) fail('/code-review invalid-ref-xyz HEAD opened the panel — invalid revisions must toast first');
+    if (panelAfterBadRef) fail('/review invalid-ref-xyz HEAD opened the panel — invalid revisions must toast first');
     const badRefValue = await page.evaluate(() => document.getElementById('prompt-input')?.value || '');
-    if (badRefValue !== '/code-review invalid-ref-xyz HEAD') {
-      fail(`/code-review invalid-ref-xyz HEAD must preserve the draft after the invalid revision toast (value=${JSON.stringify(badRefValue)})`);
+    if (badRefValue !== '/review invalid-ref-xyz HEAD') {
+      fail(`/review invalid-ref-xyz HEAD must preserve the draft after the invalid revision toast (value=${JSON.stringify(badRefValue)})`);
     }
     await laneShot(page, 'code-review-error.png', { fullPage: true });
 
-    // /code-review a b c: the client-side arity guard toasts the usage error
+    // /review a b c: the client-side arity guard toasts the usage error
     // and NEVER opens the panel (zero, one, or two revisions only).
-    await page.fill('#prompt-input', '/code-review a b c');
+    await page.fill('#prompt-input', '/review a b c');
     await page.press('#prompt-input', 'Enter');
     await waitFor(
       page,
       () => Array.from(document.querySelectorAll('.toast--error')).some((t) =>
-        (t.textContent || '').includes('usage: /code-review [<base> | <from> <to>]')
+        (t.textContent || '').includes('usage: /review [<repo>] [<base> | <from> <to>]')
       ),
-      '/code-review a b c did not surface the arity usage error toast',
+      '/review a b c did not surface the arity usage error toast',
       15000
     );
     await page.waitForTimeout(800);
     const panelAfterArity = await page.evaluate(() => document.getElementById('code-review-panel') !== null);
-    if (panelAfterArity) fail('/code-review a b c opened the panel — the arity guard must reject before any RPC');
+    if (panelAfterArity) fail('/review a b c opened the panel — the arity guard must reject before any RPC');
     const arityValue = await page.evaluate(() => document.getElementById('prompt-input')?.value || '');
-    if (arityValue !== '/code-review a b c') {
-      fail(`/code-review a b c must preserve the draft after the usage error (value=${JSON.stringify(arityValue)})`);
+    if (arityValue !== '/review a b c') {
+      fail(`/review a b c must preserve the draft after the usage error (value=${JSON.stringify(arityValue)})`);
     }
     await laneShot(page, 'code-review-arity-error.png', { fullPage: true });
 
     // ------------------------------------------------------------------
-    // /code-review origin/master: the EXACT literal single-ref user path.
+    // /review origin/master: the EXACT literal single-ref user path.
     // The fixture seeded refs/remotes/origin/master LOCALLY (git update-ref
     // — no remote URL, no network). A single <base> token must dispatch
     // EXACTLY ONE code_review_open with from=origin/master,
@@ -7032,10 +7032,10 @@ async function main() {
     }
     await page.locator('#prompt-input').focus();
     const crLayoutBeforeOrigin = await crAppLayout(page);
-    await page.fill('#prompt-input', '/code-review origin/master');
+    await page.fill('#prompt-input', '/review origin/master');
     const originBefore = sentFrames.length;
     await page.press('#prompt-input', 'Enter');
-    await waitFor(page, () => document.getElementById('code-review-panel') !== null, 'code-review panel did not open for /code-review origin/master');
+    await waitFor(page, () => document.getElementById('code-review-panel') !== null, 'code-review panel did not open for /review origin/master');
     // Settle window so a wrongly-duplicated open would be on the wire before
     // the exact-single assertion below scans the captured frames.
     await page.waitForTimeout(800);
@@ -7058,7 +7058,7 @@ async function main() {
       || originOpen.includeWorkingTree !== true
       || Object.hasOwn(originOpen, 'to')
       || originOpenCount !== 1) {
-      fail(`/code-review origin/master must dispatch exactly one code_review_open with from=origin/master includeWorkingTree=true and no to key (count=${originOpenCount}, got ${JSON.stringify(originOpen)})`);
+      fail(`/review origin/master must dispatch exactly one code_review_open with from=origin/master includeWorkingTree=true and no to key (count=${originOpenCount}, got ${JSON.stringify(originOpen)})`);
     }
     // Comparison label: backend comparisonLabel "origin/master → working
     // tree" for the BaseToWorkingTree scope (a missing ref would instead
@@ -7268,11 +7268,11 @@ async function main() {
       fail(`review ownership: third session identity is not distinct (${sidC})`);
     }
     await openPicker(page);
-    await chooseCommand(page, 'code-review');
+    await chooseCommand(page, 'review');
     await waitFor(
       page,
-      () => (document.getElementById('prompt-input')?.value.trim() || '').startsWith('/code-review'),
-      'review ownership: choosing /code-review in the third session did not insert the draft',
+      () => (document.getElementById('prompt-input')?.value.trim() || '').startsWith('/review'),
+      'review ownership: choosing /review in the third session did not insert the draft',
     );
     await page.press('#prompt-input', 'Enter');
     await waitFor(
@@ -7306,7 +7306,7 @@ async function main() {
     // displayed session, so the bootstrap's saved-restore leg is redundant and
     // nothing re-activates it. Slash dispatch stamps an EXPLICIT
     // `command.sessionId`, which WINS over the displayed command target, so a
-    // stamp taken from that re-bound ref sends /code-review into the primary's
+    // stamp taken from that re-bound ref sends /review into the primary's
     // workspace — where git answers `fatal: Needed a single revision` and the
     // Web toasts `invalid source revision; expected a commit, branch, or tag`.
     // A typed prompt carries no sessionId, which is why only the slash failed.
@@ -7345,18 +7345,18 @@ async function main() {
 
     const warmSlashMark = sentFrames.length;
     await openPicker(page);
-    await chooseCommand(page, 'code-review');
+    await chooseCommand(page, 'review');
     await waitFor(
       page,
-      () => (document.getElementById('prompt-input')?.value.trim() || '').startsWith('/code-review'),
-      'warm reconnect: choosing /code-review did not insert the draft',
+      () => (document.getElementById('prompt-input')?.value.trim() || '').startsWith('/review'),
+      'warm reconnect: choosing /review did not insert the draft',
     );
-    await page.fill('#prompt-input', '/code-review HEAD~1 HEAD');
+    await page.fill('#prompt-input', '/review HEAD~1 HEAD');
     await page.press('#prompt-input', 'Enter');
     await waitFor(
       page,
       () => document.getElementById('code-review-panel') !== null,
-      'warm reconnect: /code-review never opened the review panel',
+      'warm reconnect: /review never opened the review panel',
       30000,
     );
     const warmSlashOpens = sentFrames
@@ -7366,7 +7366,7 @@ async function main() {
     if (warmSlashOpens.length === 0) fail('warm reconnect: the slash dispatched no code_review_open frame');
     const slashOwner = warmSlashOpens[0].sessionId;
     if (slashOwner !== displayedBeforeReconnect) {
-      fail(`warm reconnect: /code-review was stamped for ${JSON.stringify(slashOwner)} instead of the displayed session ${displayedBeforeReconnect} (listener primary ${listenerPrimaryId}) — git resolves the revision in the primary's workspace`);
+      fail(`warm reconnect: /review was stamped for ${JSON.stringify(slashOwner)} instead of the displayed session ${displayedBeforeReconnect} (listener primary ${listenerPrimaryId}) — git resolves the revision in the primary's workspace`);
     }
     if (warmSlashOpens[0].from !== 'HEAD~1' || warmSlashOpens[0].to !== 'HEAD') {
       fail(`warm reconnect: code_review_open carried the wrong revisions (${JSON.stringify(warmSlashOpens[0])})`);
@@ -7391,7 +7391,7 @@ async function main() {
       const openResponse = receivedFrames
         .map((raw) => { try { return JSON.parse(raw); } catch { return null; } })
         .find((frame) => frame?.type === 'response' && frame.id === openId) || null;
-      fail(`warm reconnect: the displayed session ${displayedBeforeReconnect} holds no open review after /code-review (${error?.message || error}) sent=${JSON.stringify(warmSlashOpens[0])} response=${JSON.stringify(openResponse)}`);
+      fail(`warm reconnect: the displayed session ${displayedBeforeReconnect} holds no open review after /review (${error?.message || error}) sent=${JSON.stringify(warmSlashOpens[0])} response=${JSON.stringify(openResponse)}`);
     } finally {
       ownerProbe.close();
     }
@@ -7412,7 +7412,7 @@ async function main() {
         .filter((toast) => (toast.textContent || '').includes('invalid source revision')).length
     );
     if (wrongWorkspaceToasts !== 0) {
-      fail(`warm reconnect: /code-review resolved its revisions in the wrong workspace (${wrongWorkspaceToasts} invalid-revision toast(s))`);
+      fail(`warm reconnect: /review resolved its revisions in the wrong workspace (${wrongWorkspaceToasts} invalid-revision toast(s))`);
     }
     await laneShot(page, 'reconnect-review-displayed-session.png', { fullPage: true });
 
@@ -7569,13 +7569,13 @@ async function main() {
     await page.evaluate(() => window.__rpiWarmReconnect.holdNextSwitchSession());
     const deferredMark = sentFrames.length;
     await openPicker(page);
-    await chooseCommand(page, 'code-review');
+    await chooseCommand(page, 'review');
     await waitFor(
       page,
-      () => (document.getElementById('prompt-input')?.value.trim() || '').startsWith('/code-review'),
-      'deferred probe: choosing /code-review did not insert the draft',
+      () => (document.getElementById('prompt-input')?.value.trim() || '').startsWith('/review'),
+      'deferred probe: choosing /review did not insert the draft',
     );
-    await page.fill('#prompt-input', '/code-review HEAD~1 HEAD');
+    await page.fill('#prompt-input', '/review HEAD~1 HEAD');
     await page.press('#prompt-input', 'Enter');
     await waitFor(
       page,
@@ -7712,15 +7712,15 @@ async function main() {
     }
     const panelCloseMark = sentFrames.length;
     await openPicker(page);
-    await chooseCommand(page, 'code-review');
+    await chooseCommand(page, 'review');
     await waitFor(
       page,
-      () => (document.getElementById('prompt-input')?.value.trim() || '').startsWith('/code-review'),
-      'pending unmount: choosing /code-review did not insert the draft',
+      () => (document.getElementById('prompt-input')?.value.trim() || '').startsWith('/review'),
+      'pending unmount: choosing /review did not insert the draft',
     );
-    await page.fill('#prompt-input', '/code-review');
+    await page.fill('#prompt-input', '/review');
     const unmountDraft = await page.evaluate(() => document.getElementById('prompt-input')?.value || '');
-    if (unmountDraft.trim() !== '/code-review') {
+    if (unmountDraft.trim() !== '/review') {
       fail(`pending unmount: the composer draft was lost before submit (value=${JSON.stringify(unmountDraft)})`);
     }
     await page.press('#prompt-input', 'Enter');

@@ -1,4 +1,4 @@
-// Recent-commit chooser for `/commit` — a controlled popover that reuses the
+// Recent-commit chooser for `/show` — a controlled popover that reuses the
 // command-picker dialog geometry (`.command-picker` wrapper + `__popover`
 // opening upward from the composer) and its option/hint styling. The HOST
 // owns all data flow: it fetches `code_review_commits`, normalizes the wire
@@ -6,7 +6,7 @@
 // component only searches, keyboard-navigates, and reports the decision:
 //   - Enter picks the active row's full hash, or — when nothing matches —
 //     the typed text as a single-token ref ("HEAD~1"); a multi-token tail
-//     reports `Usage: /commit [<ref>]` via onError instead of a pick.
+//     reports `Usage: /show [<ref>]` via onError instead of a pick.
 //   - Escape (and outside mousedown) closes WITHOUT issuing any selection.
 //   - A selection fires onSelect(ref) exactly once; closing after a pick is
 //     the host's job (it owns `open`), so Escape is the only onClose source

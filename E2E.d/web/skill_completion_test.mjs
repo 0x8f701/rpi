@@ -158,9 +158,9 @@ async function main() {
       page,
       () => {
         const names = Array.from(document.querySelectorAll('.command-picker__option .command-picker__name')).map((el) => el.textContent.trim());
-        return names.includes('/compact') && names.includes('/skill') && names.includes('/code-review');
+        return names.includes('/compact') && names.includes('/skill') && names.includes('/review');
       },
-      'S1: picker did not list /compact /skill /code-review'
+      'S1: picker did not list /compact /skill /review'
     );
 
     // S2: REAL click on /skill drills into skills mode — and Skills STAYS

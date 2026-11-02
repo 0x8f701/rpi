@@ -178,7 +178,7 @@ struct PanelItem {
 enum SelectorPanelKind {
     /// Thinking level, transcript files, trust, and goal pickers.
     Normal,
-    /// Bare `/commit` recent-commit picker fed by `CommitListLoaded`.
+    /// Bare `/show` recent-commit picker fed by `CommitListLoaded`.
     CommitList,
 }
 
@@ -3287,6 +3287,10 @@ struct TuiState {
     code_review_load_generation: u64,
     code_review_load_in_flight: Option<(u64, u64, PathBuf)>,
     code_review_scope: ReviewScope,
+    /// Resolved repository root for the open review (session cwd, or a
+    /// workspace-relative repository operand of `/review`); the snapshot
+    /// capture and the panel diff loads run against this root.
+    code_review_root: Option<PathBuf>,
     /// Multi-tab side-chat container. Survives overlay close; cleaned on TUI exit.
     side_chat: Option<SideChatTabs>,
     /// Whether the side-chat overlay is currently visible.
@@ -3747,6 +3751,7 @@ impl TuiState {
             commit_picker_generation: 0,
             code_review_load_in_flight: None,
             code_review_scope: ReviewScope::WorkingTree,
+            code_review_root: None,
             side_chat: None,
             side_chat_open: false,
             agents_panel: None,
@@ -7528,7 +7533,10 @@ impl TuiState {
         self.code_review_load_generation = self.code_review_load_generation.wrapping_add(1);
         let controller_generation = self.code_review_controller_generation;
         let generation = self.code_review_load_generation;
-        let cwd = self.cwd_path.clone();
+        let cwd = self
+            .code_review_root
+            .clone()
+            .unwrap_or_else(|| self.cwd_path.clone());
         let scope = self.code_review_scope.clone();
         self.code_review_load_in_flight = Some((controller_generation, generation, cwd.clone()));
         if let Some(panel) = self.code_review_panel.as_mut() {
@@ -7546,6 +7554,7 @@ impl TuiState {
     async fn open_code_review_panel(
         &mut self,
         application: &Application,
+        repo: Option<String>,
         scope: ReviewScope,
         mouse: &mut impl CodeReviewMouseController,
     ) -> Result<()> {
@@ -7557,7 +7566,16 @@ impl TuiState {
             self.status = "Detach from the PTY before opening code review".to_owned();
             return Ok(());
         }
+        let review_root = match crate::code_review::review_repository_root(application, repo.as_deref())
+        {
+            Ok(root) => root,
+            Err(error) => {
+                self.push_status(format!("Cannot open code review: {error:#}"), true);
+                return Ok(());
+            }
+        };
         self.code_review_scope = scope;
+        self.code_review_root = Some(review_root.clone());
         self.shutdown_code_review().await;
         self.code_review_controller_generation =
             self.code_review_controller_generation.wrapping_add(1);
@@ -7569,7 +7587,7 @@ impl TuiState {
             }
         };
         let mut panel =
-            CodeReviewPanel::loading(self.cwd_path.clone(), self.code_review_scope.clone());
+            CodeReviewPanel::loading(review_root, self.code_review_scope.clone());
         panel.sync_controller(&controller);
         if let Ok((width, height)) = crossterm::terminal::size() {
             sync_code_review_layout(&mut panel, Rect::new(0, 0, width, height));
@@ -11521,8 +11539,15 @@ async fn dispatch_code_review_command(
     argument: Option<&str>,
     mouse: &mut impl CodeReviewMouseController,
 ) -> Result<()> {
-    match ReviewScope::parse(argument) {
-        Ok(scope) => state.open_code_review_panel(application, scope, mouse).await,
+    match crate::code_review::parse_review_command(
+        argument,
+        &|operand| crate::code_review::review_operand_is_directory(application, operand),
+    ) {
+        Ok(target) => {
+            state
+                .open_code_review_panel(application, target.repo, target.scope, mouse)
+                .await
+        }
         Err(error) => {
             state.push_status(error, true);
             Ok(())
@@ -11530,7 +11555,7 @@ async fn dispatch_code_review_command(
     }
 }
 
-/// `/commit` dispatch: bare opens the recent-commit picker, one ref opens the
+/// `/show` dispatch: bare opens the recent-commit picker, one ref opens the
 /// review page for that ref (the core loader pins the scope to the resolved
 /// commit id when the snapshot lands). Factored out of the composer submit
 /// match like [`dispatch_code_review_command`] so regressions can drive the
@@ -11548,15 +11573,10 @@ async fn dispatch_commit_command(
             Ok(())
         }
         Ok(crate::interactive_commands::CommitInspectInvocation::Commit { reference }) => {
-            state
-                .open_code_review_panel(
-                    application,
-                    ReviewScope::Commit {
-                        commit: reference,
-                        label: String::new(),
-                    },
-                    mouse,
-                )
+            state.open_code_review_panel(application, None, ReviewScope::Commit {
+                commit: reference,
+                label: String::new(),
+            }, mouse)
                 .await
         }
         Err(error) => {
@@ -11566,7 +11586,7 @@ async fn dispatch_commit_command(
     }
 }
 
-/// Bare `/commit`: open the picker immediately in its loading state and fetch
+/// Bare `/show`: open the picker immediately in its loading state and fetch
 /// the bounded recent-commit list on the blocking pool; the result returns as
 /// a generation/cwd-guarded background event (same pattern as the review
 /// snapshot load), so the key handler never blocks the UI loop on git. The
@@ -11621,15 +11641,10 @@ async fn open_commit_review_selection(
     mouse: &mut impl CodeReviewMouseController,
 ) -> Result<()> {
     state.panel = None;
-    state
-        .open_code_review_panel(
-            application,
-            ReviewScope::Commit {
-                commit,
-                label: String::new(),
-            },
-            mouse,
-        )
+    state.open_code_review_panel(application, None, ReviewScope::Commit {
+        commit,
+        label: String::new(),
+    }, mouse)
         .await
 }
 
@@ -12521,10 +12536,10 @@ async fn submit(
                     state.push_status(format!("Session name: {name}"), false);
                 }
             },
-            "code-review" => {
+            "review" => {
                 dispatch_code_review_command(application, state, arg, terminal).await?
             }
-            "commit" => {
+            "show" => {
                 dispatch_commit_command(application, state, arg, terminal).await?
             }
             "session" => {
@@ -21573,6 +21588,7 @@ mod tests {
             commit_picker_generation: 0,
             code_review_load_in_flight: None,
             code_review_scope: ReviewScope::WorkingTree,
+            code_review_root: None,
             side_chat: None,
             side_chat_open: false,
             settings_value_input: None,
@@ -21840,7 +21856,7 @@ mod tests {
             ["/skill:coordinate".to_owned(), "/skill:core".to_owned()],
             "skills follow commands, ordered by match rank: {values:?}"
         );
-        let prefix_hits = ["/code-review", "/commit", "/compact"];
+        let prefix_hits = ["/compact"];
         let prefix_positions = prefix_hits
             .iter()
             .map(|expected| {
@@ -21890,7 +21906,7 @@ mod tests {
         );
         assert!(
             *prefix_positions.last().unwrap() < first_nonprefix,
-            "/code-review, /commit, and /compact must precede non-prefix matches: {values:?}"
+            "/compact must precede non-prefix matches: {values:?}"
         );
         // Narrowing past the command matches still exposes the skill.
         state.editor.set_text("/coor");
@@ -26445,8 +26461,7 @@ mod tests {
                 "code review" => {
                     let mut mouse = TestCodeReviewMouse::default();
                     state.cwd_path = std::env::temp_dir();
-                    state
-                        .open_code_review_panel(&application, ReviewScope::WorkingTree, &mut mouse)
+                    state.open_code_review_panel(&application, None, ReviewScope::WorkingTree, &mut mouse)
                         .await
                         .expect("open review");
                 }
@@ -31220,6 +31235,7 @@ mod tests {
             commit_picker_generation: 0,
             code_review_load_in_flight: None,
             code_review_scope: ReviewScope::WorkingTree,
+            code_review_root: None,
             side_chat: None,
             side_chat_open: false,
             settings_value_input: None,
@@ -33385,8 +33401,7 @@ mod tests {
         let mut state = todo_test_state(Vec::new());
         // Non-repo cwd still opens the page with an in-panel error.
         state.cwd_path = std::env::temp_dir();
-        state
-            .open_code_review_panel(&application, ReviewScope::WorkingTree, &mut mouse)
+        state.open_code_review_panel(&application, None, ReviewScope::WorkingTree, &mut mouse)
             .await
             .expect("open review");
         assert!(state.code_review_panel.is_some());
@@ -33462,7 +33477,7 @@ mod tests {
         assert!(state.panel.is_none());
         let usage = state.composer_error.as_deref().expect("usage status");
         assert!(
-            usage.contains("Usage: /commit"),
+            usage.contains("Usage: /show"),
             "extra operands must surface usage: {usage}"
         );
 
@@ -33874,10 +33889,10 @@ mod tests {
         // The remaining characters land in the composer (handle_key's
         // printable fallback) and submitting dispatches the real
         // `/code-review` command path.
-        for character in "code-review".chars() {
+        for character in "review".chars() {
             state.editor.insert_char(character);
         }
-        assert_eq!(state.editor.text(), "/code-review");
+        assert_eq!(state.editor.text(), "/review");
         dispatch_code_review_command(&application, &mut state, None, &mut mouse)
             .await
             .expect("dispatch code review");
@@ -33918,8 +33933,7 @@ mod tests {
         let mut mouse = TestCodeReviewMouse::default();
         let mut state = todo_test_state(Vec::new());
         state.cwd_path = std::env::temp_dir();
-        state
-            .open_code_review_panel(&application, ReviewScope::WorkingTree, &mut mouse)
+        state.open_code_review_panel(&application, None, ReviewScope::WorkingTree, &mut mouse)
             .await
             .expect("open review");
 
@@ -34546,8 +34560,7 @@ mod tests {
         let mut state = todo_test_state(Vec::new());
         state.cwd_path = std::env::temp_dir();
         let mut mouse = TestCodeReviewMouse::default();
-        state
-            .open_code_review_panel(&application, ReviewScope::WorkingTree, &mut mouse)
+        state.open_code_review_panel(&application, None, ReviewScope::WorkingTree, &mut mouse)
             .await
             .expect("open review");
         assert!(mouse.active);
@@ -34578,8 +34591,7 @@ mod tests {
         let mut state = todo_test_state(Vec::new());
         state.cwd_path = cwd.path().to_path_buf();
         let mut mouse = TestCodeReviewMouse::default();
-        state
-            .open_code_review_panel(&application, ReviewScope::WorkingTree, &mut mouse)
+        state.open_code_review_panel(&application, None, ReviewScope::WorkingTree, &mut mouse)
             .await
             .expect("open review");
         assert!(mouse.active);
@@ -34625,8 +34637,7 @@ mod tests {
                 message: "Proceed?".to_owned(),
             },
         )));
-        state
-            .open_code_review_panel(&application, ReviewScope::WorkingTree, &mut mouse)
+        state.open_code_review_panel(&application, None, ReviewScope::WorkingTree, &mut mouse)
             .await
             .expect("reject dialog");
         assert!(state.code_review_panel.is_none());
@@ -34640,8 +34651,7 @@ mod tests {
             serde_json::from_value(serde_json::json!("00000000-0000-0000-0000-000000000024"))
                 .expect("process id");
         state.pty_attachment = Some(PtyAttachment::new(process_id, 0));
-        state
-            .open_code_review_panel(&application, ReviewScope::WorkingTree, &mut mouse)
+        state.open_code_review_panel(&application, None, ReviewScope::WorkingTree, &mut mouse)
             .await
             .expect("reject PTY");
         assert!(state.code_review_panel.is_none());

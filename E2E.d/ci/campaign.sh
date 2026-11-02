@@ -23,7 +23,7 @@ assert responses and all(x.get('success') is True for x in responses), rows
 PRIMARY=[
     "settings","model","branch","resume","fork","export","dump","handoff",
     "agents","role","persona","compact","rewind","checkpoint","ps","loop",
-    "goal","workflow","code-review","btw","queue","live","skill",
+    "goal","workflow","review","btw","queue","live","skill",
     "theme","thinking","todo","tree","trust","jobs",
     "activity","irc",
 ]

@@ -45,7 +45,6 @@ export function FileSelectionActions({
   blame,
   blameRef,
   blameStyle,
-  onAsk,
   onBlame,
   onClose,
 }: {
@@ -57,7 +56,6 @@ export function FileSelectionActions({
   /** Measured anchor box for the popup (bar-relative top/left plus clamped
    *  max sizes); undefined keeps the CSS pre-measure fallback. */
   blameStyle?: CSSProperties;
-  onAsk: () => void;
   onBlame: () => void;
   onClose: () => void;
 }) {
@@ -71,18 +69,6 @@ export function FileSelectionActions({
       onMouseDown={(event) => event.preventDefault()}
     >
       <span className="file-selection-actions__range">{fileSelectionRangeLabel(range)}</span>
-      <button
-        type="button"
-        className="file-selection-actions__btn"
-        data-testid="file-selection-ask"
-        aria-label="Ask"
-        title="Ask about the selected lines"
-        disabled={pending}
-        onClick={onAsk}
-      >
-        <span className="file-selection-actions__glyph" aria-hidden="true">✎</span>
-        Ask
-      </button>
       <button
         type="button"
         className="file-selection-actions__btn"

@@ -16,6 +16,7 @@ import {
   fileExplorerCanonicalPath,
   fileExplorerCommandForSession,
   fileExplorerReadCommand,
+  fileExplorerListCommand,
   fileExplorerResolvedRequestPath,
   normalizeRead,
 } from './fileExplorer';
@@ -594,6 +595,32 @@ function safeUrl(raw: string): string {
   return '';
 }
 
+/** Repository-relative path inside a git web URL, or null.
+ *  `https://host/org/repo/blob/<ref>/src/lib.rs#L12` → `src/lib.rs` at line 12.
+ *  Query strings and fragments other than `#L<line>` are dropped. */
+export function markdownGitWebPath(raw: string): MarkdownPathCandidate | null {
+  const trimmed = raw.trim();
+  if (!/^https?:\/\//i.test(trimmed)) return null;
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  const marker = url.pathname.match(/\/(?:blob|raw|src|tree)\/[^/]+\/(.+)$/);
+  if (!marker?.[1]) return null;
+  let path = marker[1];
+  try {
+    path = decodeURIComponent(path);
+  } catch {
+    return null;
+  }
+  if (/["'<>`]/.test(path)) return null;
+  const lineMatch = url.hash.match(/^#L(\d+)(?:C\d+)?$/i);
+  const withLine = lineMatch ? `${path}:${lineMatch[1]}` : path;
+  return parseWorkspacePathCandidate(withLine, 'code');
+}
+
 // Image sources: whitelisted-MIME base64 data URIs, http(s), or same-origin
 // relative paths. Nothing else (no javascript:, no mailto, no other schemes).
 function imageSrc(raw: string): string {
@@ -701,19 +728,14 @@ function inlineCodeHtml(escaped: string, completePath: CompleteMarkdownPath): st
   const resolution = completePath(path);
   const completion = resolution.kind === 'unique' ? resolution.completion : undefined;
   const lineAttr = candidate.line === undefined ? '' : ` data-md-line="${candidate.line}"`;
-  if (bare) {
-    if (resolution.kind === 'ambiguous') {
-      return `<code class="md-code" data-md-resolved="none">${escaped}</code>`;
-    }
-    // Invariant: ambiguous context stays render-unresolved and inert; absent
-    // context stamps the exact candidate — the basename is never guessed.
-    const stamped = completion && completion !== path ? completion : path;
-    return `<code class="md-code md-code-path" data-md-path="${escapeHtmlRaw(stamped)}"${lineAttr}>${escaped}</code>`;
+  if (bare && resolution.kind === 'ambiguous') {
+    return `<code class="md-code" data-md-resolved="none">${escaped}</code>`;
   }
   const completionAttr = completion && completion !== path
     ? ` data-md-completion="${escapeHtmlRaw(completion)}"`
     : '';
   return `<code class="md-code md-code-path" data-md-path="${escapeHtmlRaw(path)}"${lineAttr}${completionAttr}>${escaped}</code>`;
+
 }
 
 function inlineMd(escaped: string, completePath: CompleteMarkdownPath): string {
@@ -727,11 +749,10 @@ function inlineMd(escaped: string, completePath: CompleteMarkdownPath): string {
       : m; // invalid URL: keep the original (escaped) markdown literal
   });
   s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m, label: string, url: string) => {
-    let target = safeUrl(url);
-    // Workspace-relative `path` / `path:line` is not a safeUrl relative form
-    // (`./`, `../`, `/`, `#`). Href authority rejects every RFC `scheme:`
-    // form (including `ftp:12`) so this fallback cannot re-enable what
-    // safeUrl rejected; code spans keep Makefile:12 / file.ext:line.
+    const gitCandidate = markdownGitWebPath(url);
+    let target = gitCandidate
+      ? (gitCandidate.line === undefined ? gitCandidate.path : `${gitCandidate.path}:${gitCandidate.line}`)
+      : safeUrl(url);
     if (!target) {
       const hrefCandidate = parseWorkspacePathCandidate(url, 'href');
       if (hrefCandidate && (hrefCandidate.path.includes('/') || hrefCandidate.path.includes('\\'))) {
@@ -741,7 +762,7 @@ function inlineMd(escaped: string, completePath: CompleteMarkdownPath): string {
     if (!target) return label;
     // http(s) links keep safe navigation AND gain an explicit Download
     // affordance (fetch+blob only on click — never auto-download).
-    return `<a href="${target}" rel="noopener noreferrer">${label}</a>${httpDownloadButton(target)}`;
+    return `<a href="${escapeHtmlRaw(target)}" rel="noopener noreferrer">${label}</a>${httpDownloadButton(target)}`;
   });
   const slots: string[] = [];
   s = protectGeneratedMarkup(s, slots);
@@ -887,12 +908,12 @@ function renderLines(escaped: string, completePath: CompleteMarkdownPath): strin
  * ------------------------------------------------------------------ */
 
 /** Render raw markdown (table, math, mermaid, task lists, fences, ...). */
-export function renderMarkdown(raw: string, pathContext: string = raw): string {
+export function renderMarkdown(raw: string, pathContext: string = raw, workspaceCwd?: string | null): string {
   const completions = new Map<string, MarkdownNearbyPathResolution>();
   const completePath: CompleteMarkdownPath = (path) => {
     const cached = completions.get(path);
     if (cached !== undefined) return cached;
-    const completed = markdownNearbyPathResolution(path, pathContext);
+    const completed = markdownNearbyPathResolution(path, pathContext, workspaceCwd);
     completions.set(path, completed);
     return completed;
   };
@@ -947,7 +968,7 @@ export function thinkingFirstBlocks(blocks: readonly (ContentBlock | null | unde
 }
 
 /** Render one assistant message's content blocks (final, non-streaming). */
-export function renderBlocks(blocks: ContentBlock[], pathContext?: string): string {
+export function renderBlocks(blocks: ContentBlock[], pathContext?: string, workspaceCwd?: string | null): string {
   const context = pathContext ?? blocks
     .map((block) => (block && block.type === 'text' && typeof block.text === 'string' ? block.text : ''))
     .filter((text) => text !== '')
@@ -956,7 +977,7 @@ export function renderBlocks(blocks: ContentBlock[], pathContext?: string): stri
   for (const block of thinkingFirstBlocks(blocks)) {
     if (!block) continue;
     if (block.type === 'text' && typeof block.text === 'string' && block.text !== '') {
-      html += renderMarkdown(block.text, context);
+      html += renderMarkdown(block.text, context, workspaceCwd);
     } else if (block.type === 'thinking' && typeof block.thinking === 'string') {
       html += `<details class="thinking" open><summary class="thinking__summary">${thinkingSummaryHtml()}</summary><div class="thinking__body">${thinkingBodyInnerHtml(block.thinking, context)}</div></details>`;
     } else if (block.type === 'image') {
@@ -1859,6 +1880,14 @@ export interface MarkdownPathOwner {
   runnerId?: string;
   mappingId?: string;
   workspaceCwd?: string;
+  /** The repository a REVIEW is scoped to (its workspace-relative root).
+   *  Citations inside that review are repo-relative, so a missing click
+   *  falls back to `${reviewRepo}/${path}` before it is declared dead. */
+  reviewRepo?: string;
+}
+
+export interface MarkdownOpenedPath {
+  kind: 'file' | 'directory';
 }
 
 /** Receiver for workspace-relative path clicks and their rendered owner.
@@ -1975,14 +2004,14 @@ export function parseWorkspacePathCandidate(
 
 function isCodeSurfacePathLike(path: string, line: number | undefined): boolean {
   if (line !== undefined) return true;
-  if (path.includes('/') || path.includes('\\')) return true;
+  if (path.startsWith('origin/')) return false;
   const base = path.split(/[/\\]/).pop() ?? path;
   const dot = base.lastIndexOf('.');
   if (dot <= 0 || dot === base.length - 1) return false;
   const ext = base.slice(dot + 1);
   if (!/^[A-Za-z0-9]{1,10}$/.test(ext)) return false;
   if (codeLanguage(base) !== '') return true;
-  return ext.length >= 2;
+  return ext === 'bin' || ext === 'lock' || ext === 'txt';
 }
 
 /**
@@ -2073,6 +2102,7 @@ function nearbyPathExpandToken(
 function markdownNearbyPathResolution(
   suffix: string,
   rootText: string | null | undefined,
+  workspaceCwd?: string | null,
 ): MarkdownNearbyPathResolution {
   if (typeof suffix !== 'string' || suffix === '') return { kind: 'none' };
   const suffixCanonical = fileExplorerCanonicalPath(suffix);
@@ -2104,7 +2134,8 @@ function markdownNearbyPathResolution(
     const after = token.slice(suffixAt + suffix.length);
     if (!nearbyPathBasenameSuffixOk(after)) continue;
     const pathToken = token.slice(0, suffixAt + suffix.length);
-    const relative = markdownWorkspaceRelativePath(pathToken);
+    if (pathToken.includes('...') || pathToken.startsWith('origin/')) continue;
+    const relative = markdownWorkspaceRelativePath(pathToken, workspaceCwd);
     if (!relative) continue;
     const canonical = fileExplorerCanonicalPath(relative);
     if (canonical === suffixCanonical || canonical.length <= suffixCanonical.length || !canonical.endsWith(`/${suffixCanonical}`)) continue;
@@ -2121,8 +2152,9 @@ function markdownNearbyPathResolution(
 export function markdownNearbyPathCompletion(
   suffix: string,
   rootText: string | null | undefined,
+  workspaceCwd?: string | null,
 ): string | null {
-  const resolution = markdownNearbyPathResolution(suffix, rootText);
+  const resolution = markdownNearbyPathResolution(suffix, rootText, workspaceCwd);
   return resolution.kind === 'unique' ? resolution.completion : null;
 }
 
@@ -2133,9 +2165,10 @@ export function markdownNearbyPathCompletion(
 export function markdownCompletedWorkspacePath(
   path: string,
   rootText: string | null | undefined,
+  workspaceCwd?: string | null,
 ): string | null {
   if (typeof path !== 'string' || path === '') return null;
-  return markdownNearbyPathCompletion(path, rootText);
+  return markdownNearbyPathCompletion(path, rootText, workspaceCwd);
 }
 
 /**
@@ -2193,7 +2226,7 @@ export async function markdownOpenValidatedPath(
   line: number | undefined,
   owner: MarkdownPathOwner,
   send: (command: Record<string, unknown>) => Promise<unknown>,
-  open: (path: string, line: number | undefined, owner: MarkdownPathOwner) => void,
+  open: (path: string, line: number | undefined, owner: MarkdownPathOwner, opened?: MarkdownOpenedPath) => void,
   onError: (error: unknown) => void,
   completion?: string,
 ): Promise<void> {
@@ -2205,7 +2238,33 @@ export async function markdownOpenValidatedPath(
   try {
     response = await send(command);
   } catch (error) {
+    if ((error as { rpcCode?: unknown } | null)?.rpcCode === 'directory_unavailable') {
+      try {
+        await send(fileExplorerCommandForSession(sessionId, fileExplorerListCommand(relative)));
+        open(relative, undefined, owner, { kind: 'directory' });
+        return;
+      } catch (directoryError) {
+        onError(directoryError);
+        return;
+      }
+    }
     const typedMissing = (error as { rpcCode?: unknown } | null)?.rpcCode === 'file_unavailable';
+    const repoFallback = typedMissing && owner.reviewRepo && !relative.startsWith(`${owner.reviewRepo}/`)
+      ? `${owner.reviewRepo}/${relative}`
+      : null;
+    if (repoFallback) {
+      try {
+        response = await send(fileExplorerCommandForSession(sessionId, fileExplorerReadCommand(repoFallback, undefined, 1)));
+      } catch (repoError) {
+        onError(repoError);
+        return;
+      }
+      const resolvedRepo = markdownPathReadResolvedPath(repoFallback, response);
+      if (resolvedRepo) {
+        open(resolvedRepo, line, owner);
+        return;
+      }
+    }
     const fallback = typedMissing ? markdownWorkspaceRelativePath(completion ?? '', owner.workspaceCwd) : null;
     if (!typedMissing || !fallback || fallback === relative) {
       onError(error);
@@ -2247,7 +2306,7 @@ export function markdownOpenMissingFileVerdict(retried: boolean, error: unknown)
 }
 
 export function markdownOpenMissingFileToast(path: string): string {
-  return `文件已不存在：${markdownOpenBoundedPathText(path)}`;
+  return `File not found: ${markdownOpenBoundedPathText(path)}`;
 }
 
 /** Register a workspace-path click receiver. Same function is ref-counted
@@ -2295,7 +2354,7 @@ function notifyMarkdownOpenPath(
     ? null
     : fromStamp && fromStamp !== path
       ? fromStamp
-      : markdownCompletedWorkspacePath(path, fromStamp ? null : rootText);
+      : markdownCompletedWorkspacePath(path, fromStamp ? null : rootText, owner.workspaceCwd);
   const completion = discovered && discovered !== path ? discovered : undefined;
   let called = false;
   if (extra) {
@@ -2424,10 +2483,12 @@ export function dispatchMarkdownPathClick(
   const runnerId = ownerNode.getAttribute('data-runner-id')?.trim() || undefined;
   const mappingId = ownerNode.getAttribute('data-mapping-id')?.trim() || undefined;
   const workspaceCwd = ownerNode.getAttribute('data-workspace-cwd')?.trim() || undefined;
+  const reviewRepo = ownerNode.getAttribute('data-review-repo')?.trim() || undefined;
   const owner: MarkdownPathOwner = { sessionId };
   if (runnerId) owner.runnerId = runnerId;
   if (mappingId) owner.mappingId = mappingId;
   if (workspaceCwd) owner.workspaceCwd = workspaceCwd;
+  if (reviewRepo) owner.reviewRepo = reviewRepo;
 
   const toolPath = asPathClickNode(target.closest('[data-md-path]'));
   if (toolPath) {
@@ -2463,7 +2524,7 @@ export function dispatchMarkdownPathClick(
   const anchor = asPathClickNode(target.closest('a'));
   if (!anchor) return false;
   const href = (anchor.getAttribute('href') ?? '').trim();
-  const candidate = parseWorkspacePathCandidate(href, 'href');
+  const candidate = parseWorkspacePathCandidate(href, 'href') ?? markdownGitWebPath(href);
   if (!candidate || !notifyMarkdownOpenPath(candidate, owner, onOpenPath, ownerNode.textContent)) return false;
   event.preventDefault();
   return true;

@@ -2111,9 +2111,9 @@ async function main() {
     // ============ Phase H2: slash command dispatch ============
     // Web-supported slash surface (commands.ts parseSupportedCommand +
     // slashDispatch.ts resolveSlashAction): /compact (llm RPC), /compact
-    // --snap, /skill, /code-review (panel), /code-review <from> <to>
-    // (range args), /code-review <one arg> (base→working tree),
-    // /code-review a b c (usage toast), and an unknown /slash that
+    // --snap, /skill, /review (panel), /review <from> <to>
+    // (range args), /review <one arg> (base→working tree),
+    // /review a b c (usage toast), and an unknown /slash that
     // falls through as a NORMAL prompt (user bubble + assistant reply).
     // Every intercepted command renders a labeled summary bubble (or the
     // usage toast) — never an optimistic user bubble.
@@ -2256,13 +2256,13 @@ async function main() {
     );
     record('slash.skill-rpc');
 
-    // /code-review -> opens the review panel; close via its own Close button.
-    await page.fill('#prompt-input', '/code-review');
+    // /review -> opens the review panel; close via its own Close button.
+    await page.fill('#prompt-input', '/review');
     await page.press('#prompt-input', 'Enter');
     await waitFor(
       page,
       () => document.getElementById('code-review-panel') !== null,
-      'slash: /code-review never opened the review panel',
+      'slash: /review never opened the review panel',
       30000
     );
     record('slash.code-review-open');
@@ -2274,13 +2274,13 @@ async function main() {
     );
     record('slash.code-review-close');
 
-    // /code-review <from> <to> -> panel opens with the range args.
-    await page.fill('#prompt-input', '/code-review HEAD~1 HEAD');
+    // /review <from> <to> -> panel opens with the range args.
+    await page.fill('#prompt-input', '/review HEAD~1 HEAD');
     await page.press('#prompt-input', 'Enter');
     await waitFor(
       page,
       () => document.getElementById('code-review-panel') !== null,
-      'slash: /code-review range never opened the review panel',
+      'slash: /review range never opened the review panel',
       30000
     );
     record('slash.code-review-range');
@@ -2290,13 +2290,13 @@ async function main() {
       () => document.getElementById('code-review-panel') === null,
       'slash: code-review range panel never closed'
     );
-    // /code-review <one arg> -> panel opens as base→working tree.
-    await page.fill('#prompt-input', '/code-review HEAD');
+    // /review <one arg> -> panel opens as base→working tree.
+    await page.fill('#prompt-input', '/review HEAD');
     await page.press('#prompt-input', 'Enter');
     await waitFor(
       page,
       () => document.getElementById('code-review-panel') !== null,
-      'slash: one-arg /code-review never opened the review panel',
+      'slash: one-arg /review never opened the review panel',
       30000
     );
     record('slash.code-review-base');
@@ -2307,16 +2307,16 @@ async function main() {
       'slash: one-arg code-review panel never closed'
     );
 
-    // /code-review a b c -> usage error toast (zero, one, or two revisions).
-    await page.fill('#prompt-input', '/code-review a b c');
+    // /review a b c -> usage error toast (zero, one, or two revisions).
+    await page.fill('#prompt-input', '/review a b c');
     await page.press('#prompt-input', 'Enter');
     await waitFor(
       page,
       () =>
         Array.from(document.querySelectorAll('.toast--error')).some((t) =>
-          t.textContent.includes('usage: /code-review')
+          t.textContent.includes('usage: /review')
         ),
-      'slash: three-arg /code-review never produced the usage error toast',
+      'slash: three-arg /review never produced the usage error toast',
       10000
     );
     record('slash.code-review-usage-error');

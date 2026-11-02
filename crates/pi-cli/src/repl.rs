@@ -534,23 +534,36 @@ async fn handle_slash(
             "{}",
             serde_json::to_string_pretty(&application.session_tree()?)?
         ),
-        "code-review" => {
-            match crate::code_review::ReviewScope::parse((!arg.is_empty()).then_some(arg)) {
-                Ok(scope) => {
-                    let snapshot =
-                        crate::code_review::load_review_snapshot_for(session.cwd(), scope);
-                    print_review_snapshot(&snapshot);
+        "review" => {
+            match crate::code_review::parse_review_command(
+                (!arg.is_empty()).then_some(arg),
+                &|operand| crate::code_review::review_operand_is_directory(application, operand),
+            ) {
+                Ok(target) => {
+                    match crate::code_review::review_repository_root(
+                        application,
+                        target.repo.as_deref(),
+                    ) {
+                        Ok(cwd) => {
+                            let snapshot = crate::code_review::load_review_snapshot_for(
+                                &cwd,
+                                target.scope,
+                            );
+                            print_review_snapshot(&snapshot);
+                        }
+                        Err(error) => error_line(&error.to_string()),
+                    }
                 }
                 Err(error) => error_line(&error),
             }
         }
-        "commit" => {
+        "show" => {
             let parsed = crate::interactive_commands::parse_commit_inspect_invocation(
                 (!arg.is_empty()).then_some(arg),
             );
             match parsed {
                 Ok(crate::interactive_commands::CommitInspectInvocation::Picker) => {
-                    println!("The /commit picker is a full-screen TUI page; pass a ref here.");
+                    println!("The /show picker is a full-screen TUI page; pass a ref here.");
                 }
                 Ok(crate::interactive_commands::CommitInspectInvocation::Commit { reference }) => {
                     let snapshot = crate::code_review::load_review_snapshot_for(
@@ -944,7 +957,7 @@ async fn handle_slash(
 
 /// Print one loaded review snapshot: the comparison label, then the typed
 /// error, the changed files, or "No changes". Shared by `/code-review` and
-/// the `/commit <ref>` direct path so both line-mode surfaces stay identical.
+/// the `/show <ref>` direct path so both line-mode surfaces stay identical.
 fn print_review_snapshot(snapshot: &crate::code_review::ReviewSnapshot) {
     println!("{}", snapshot.comparison_label());
     if let Some(error) = snapshot.error.as_deref() {

@@ -329,7 +329,7 @@ async function main() {
       'command picker did not list /loop + /goal + /ps'
     );
     const names = await pickerNames(page);
-    for (const required of ['/loop', '/goal', '/ps', '/compact', '/skill', '/code-review']) {
+    for (const required of ['/loop', '/goal', '/ps', '/compact', '/skill', '/review']) {
       if (!names.includes(required)) fail(`command picker missing ${required} (got ${names.join(', ')})`);
     }
     record('lg.picker-lists-loop-goal');

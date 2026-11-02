@@ -658,8 +658,8 @@ TERM=xterm-256color \
     tmux send-keys -t "$session":0 Escape
     sleep 0.3
 
-    tmux send-keys -t "$session":0 -l '/code-review review-base'
-    wait_for '/code-review review-base' 10
+    tmux send-keys -t "$session":0 -l '/review review-base'
+    wait_for '/review review-base' 10
     tmux send-keys -t "$session":0 Enter
     wait_all 45 'Code review · review-base → working tree · 2 files' \
         'focus:tree · A Auto · H Highlight' \

@@ -138,8 +138,8 @@ pub const PRIMARY_COMMAND_NAMES: &[&str] = &[
     "loop",
     "goal",
     "workflow",
-    "commit",
-    "code-review",
+    "show",
+    "review",
     "btw",
     "queue",
     "live",
@@ -175,20 +175,20 @@ pub fn visible_catalog() -> Vec<InteractiveCommand> {
         .collect()
 }
 
-/// Parsed `/commit` operands.
+/// Parsed `/show` operands.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommitInspectInvocation {
-    /// Bare `/commit` — open the recent-commit chooser (fullscreen TUI).
+    /// Bare `/show` — open the recent-commit chooser (fullscreen TUI).
     Picker,
-    /// `/commit <ref>` — review that ref; the core loader resolves it once
+    /// `/show <ref>` — review that ref; the core loader resolves it once
     /// and pins the returned scope to the immutable commit id.
     Commit { reference: String },
 }
 
-/// Usage line for a malformed `/commit` invocation.
-pub const COMMIT_INSPECT_USAGE: &str = "Usage: /commit [<ref>]";
+/// Usage line for a malformed `/show` invocation.
+pub const COMMIT_INSPECT_USAGE: &str = "Usage: /show [<ref>]";
 
-/// Parse `/commit` arguments. Bare opens the recent-commit picker, one
+/// Parse `/show` arguments. Bare opens the recent-commit picker, one
 /// whitespace-delimited ref reviews that commit, and any additional operand
 /// is a usage error. Inspection only: nothing here stages, checks out, or
 /// commits.
@@ -1778,15 +1778,15 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         requires_arguments: false,
     },
     BuiltinCommand {
-        name: "commit",
+        name: "show",
         description: "Review one commit's diff in a fullscreen panel, or pick from recent commits",
         argument_hint: Some("[<ref>]"),
         requires_arguments: false,
     },
     BuiltinCommand {
-        name: "code-review",
-        description: "Browse a working-tree, base-to-working-tree, or two-revision Git diff in a fullscreen panel",
-        argument_hint: Some("[<base> | <from> <to>]"),
+        name: "review",
+        description: "Review a repository's Git diff (nested repository override or base/from-to revisions) in a fullscreen panel",
+        argument_hint: Some("[<repo>] [<base> | <from> <to>]"),
         requires_arguments: false,
     },
     BuiltinCommand {
@@ -2672,12 +2672,12 @@ mod tests {
             "/todo [list|new [label]|select <id>|send [id] <message>|add <id> [options] <task>|status [id]|pause [id]|resume [id]|stop [id]|cancel [id]|archive <id>|start <task>|done <task>|drop <task>|clear|<markdown>]"
         );
         assert_eq!(
-            usage(builtin("code-review").expect("code review command")),
-            "/code-review [<base> | <from> <to>]",
+            usage(builtin("review").expect("review command")),
+            "/review [<repo>] [<base> | <from> <to>]",
         );
         assert_eq!(
-            usage(builtin("commit").expect("commit command")),
-            "/commit [<ref>]",
+            usage(builtin("show").expect("show command")),
+            "/show [<ref>]",
         );
         assert_eq!(
             usage(builtin("process").expect("process command")),
@@ -2934,8 +2934,8 @@ mod tests {
                 "loop",
                 "goal",
                 "workflow",
-                "commit",
-                "code-review",
+                "show",
+                "review",
                 "btw",
                 "queue",
                 "live",
@@ -2963,7 +2963,7 @@ mod tests {
         assert!(is_primary_command("live"));
         assert!(is_primary_command("persona"));
         assert!(is_primary_command("move"));
-        assert!(is_primary_command("commit"));
+        assert!(is_primary_command("show"));
         assert!(!is_primary_command(concat!("todo", "-child")));
         assert!(builtin(concat!("todo", "-child")).is_none());
         assert!(is_primary_command("activity"));

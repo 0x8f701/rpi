@@ -2705,7 +2705,7 @@ fn binary_web_prompt_restores_and_switch_degrades_durable_mismatch() {
 async fn ws_evicts_slow_reader_without_blocking_fresh_clients() {
     // Mirrors modes::listen::SLOW_CLIENT_GRACE, kept literal here like
     // MAX_CONCURRENT_COMMANDS in the saturation test below.
-    const SLOW_CLIENT_GRACE: Duration = Duration::from_secs(5);
+    const SLOW_CLIENT_GRACE: Duration = Duration::from_secs(15);
     // Mirrors modes::listen::WS_CLOSE_TIMEOUT: how long the teardown waits
     // for the writer to deliver the 1008 close before aborting it.
     const WS_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);

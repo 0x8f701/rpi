@@ -81,6 +81,12 @@ pub fn dependency_map(app: &Application, path: &str) -> Result<DependencyMapResp
     let session = app.session();
     let root = session.cwd();
     let generation = app.capture_generation();
+    // A directory path is the opened folder's graph: one listing, edges
+    // only among the files in that directory. A file path still fails this
+    // open and falls through to the one-hop file map.
+    if let Ok(listing) = file_explorer::list_with_generation(&generation, root, path) {
+        return directory_graph(&generation, root, path, &listing);
+    }
     let (_, path) = file_explorer::resolve_scoped_path(root, path, false)?;
     let selected = read_source(&generation, root, &path)?;
     let mut sources = BTreeMap::new();
@@ -143,6 +149,55 @@ pub fn dependency_map(app: &Application, path: &str) -> Result<DependencyMapResp
     Ok(response)
 }
 
+/// One graph of the files directly inside `path`. Nested directories are
+/// not walked, and imports that leave this directory are omitted so the
+/// picture stays the folder the user opened.
+fn directory_graph(
+    generation: &ApplicationGeneration,
+    root: &Path,
+    path: &str,
+    listing: &file_explorer::ListResponse,
+) -> Result<DependencyMapResponse> {
+    let (_, relative) = file_explorer::resolve_scoped_path(root, path, true)?;
+    let mut sources = BTreeMap::new();
+    let mut coverage = MapCoverage {
+        visible_entries_only: true,
+        incomplete: true,
+        truncated: listing.truncated,
+        ..MapCoverage::default()
+    };
+    const MAX_DIRECTORY_FILES: usize = 80;
+    for entry in &listing.entries {
+        if entry.kind != "file" {
+            continue;
+        }
+        if extract_dependencies(&entry.path, "").language == MapLanguage::Unsupported {
+            coverage.unsupported_files += 1;
+            continue;
+        }
+        if sources.len() >= MAX_DIRECTORY_FILES {
+            coverage.truncated = true;
+            continue;
+        }
+        match read_source(generation, root, &entry.path) {
+            Ok(source) => {
+                record_source(&mut coverage, &source);
+                sources.insert(entry.path.clone(), source);
+            }
+            Err(error) if allowed_source_omission(&error) => coverage.unreadable_files += 1,
+            Err(error) => return Err(error),
+        }
+    }
+    let mut response = assemble_directory(&relative, &sources, coverage, &|candidate| {
+        candidate_exists(generation, root, candidate)
+    })?;
+    response.nodes.sort_by(|left, right| left.path.cmp(&right.path));
+    if serde_json::to_vec(&response)?.len() > 256 * 1024 {
+        return Err(anyhow!("dependency map exceeds response limit"));
+    }
+    Ok(response)
+}
+
 fn read_source(generation: &ApplicationGeneration, root: &Path, path: &str) -> Result<SourceDependencies> {
     let (absolute, relative) = file_explorer::resolve_scoped_path(root, path, false)?;
     let bytes = generation.read_file_bounded(&absolute, MAX_SOURCE_BYTES as u64)
@@ -185,6 +240,57 @@ fn assemble(path: &str, sources: &BTreeMap<String, SourceDependencies>, coverage
         })
     }).collect();
     Ok(DependencyMapResponse { path: path.to_owned(), nodes, outgoing, incoming, coverage })
+}
+
+fn assemble_directory(
+    path: &str,
+    sources: &BTreeMap<String, SourceDependencies>,
+    coverage: MapCoverage,
+    exists: &impl Fn(&str) -> Result<bool>,
+) -> Result<DependencyMapResponse> {
+    let mut outgoing = Vec::new();
+    let mut nodes = BTreeSet::new();
+    for (source_path, source) in sources {
+        nodes.insert(source_path.clone());
+        for evidence in &source.edges {
+            let target = resolve_edge(source_path, evidence, sources, exists)?;
+            let MapTarget::File { path: target_path } = &target else {
+                continue;
+            };
+            if !sources.contains_key(target_path) {
+                continue;
+            }
+            nodes.insert(target_path.clone());
+            outgoing.push(MapEdge {
+                source: source_path.clone(),
+                line: evidence.line,
+                specifier: evidence.specifier.clone(),
+                kind: evidence.kind,
+                target,
+            });
+        }
+    }
+    let nodes = nodes.into_iter().filter_map(|path| {
+        sources.get(&path).map(|source| MapNode {
+            path,
+            language: source.language,
+            parse: source.parse,
+            purpose: source.declarations.iter().filter_map(|declaration| {
+                declaration.doc.as_ref().map(|text| SourcePurpose {
+                    line: declaration.line,
+                    text: text.clone(),
+                })
+            }).collect(),
+            declarations: source.declarations.clone(),
+        })
+    }).collect();
+    Ok(DependencyMapResponse {
+        path: path.to_owned(),
+        nodes,
+        outgoing,
+        incoming: Vec::new(),
+        coverage,
+    })
 }
 
 fn unresolved(reason: &str) -> MapTarget {
@@ -423,6 +529,28 @@ mod tests {
         assert!(candidate_exists(&retained, dir.path(), "b.ts").expect("retained probe"));
         let listing = file_explorer::list_with_generation(&retained, dir.path(), "").expect("retained listing");
         assert!(listing.entries.iter().any(|entry| entry.path == "a.ts"));
+    }
+
+    #[tokio::test]
+    async fn directory_graph_stays_inside_the_opened_directory() {
+        let dir = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir(dir.path().join("src")).expect("src");
+        std::fs::write(dir.path().join("src/a.ts"), "import './b';\nimport 'left-pad';\n").expect("a");
+        std::fs::write(dir.path().join("src/b.ts"), "import './a';\nexport const b = 1;\n").expect("b");
+        std::fs::write(dir.path().join("other.ts"), "import './src/a';\n").expect("other");
+        let (app, _agent) = application(dir.path()).await;
+        let graph = dependency_map(&app, "src").expect("directory graph");
+        assert_eq!(graph.path, "src");
+        assert!(graph.incoming.is_empty());
+        assert!(graph.nodes.iter().any(|node| node.path == "src/a.ts"));
+        assert!(graph.nodes.iter().any(|node| node.path == "src/b.ts"));
+        assert!(graph.nodes.iter().all(|node| node.path.starts_with("src/")));
+        assert!(graph.outgoing.iter().any(|edge| {
+            edge.source == "src/a.ts" && edge.target == MapTarget::File { path: "src/b.ts".into() }
+        }));
+        assert!(graph.outgoing.iter().all(|edge| edge.source.starts_with("src/")
+            && matches!(edge.target, MapTarget::File { .. })));
+        assert!(!graph.outgoing.iter().any(|edge| edge.source == "other.ts"));
     }
 }
 

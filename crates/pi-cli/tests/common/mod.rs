@@ -55,6 +55,9 @@ pub struct FauxApp {
     pub application: Application,
     pub _registration: FauxProviderRegistration,
     pub cwd: TempDir,
+    /// Held so the agent resource root (outside the project boundary) lives
+    /// as long as the application does.
+    pub _agent_root: TempDir,
 }
 
 pub fn faux_model(label: &str) -> (Model, FauxProviderRegistration) {
@@ -95,7 +98,8 @@ pub async fn faux_application(label: &str) -> FauxApp {
     })
     .expect("session");
     prepare_session_store(&session, cwd.path());
-    let agent_dir = cwd.path().join("agent");
+    let agent_root = tempfile::tempdir().expect("agent resource root");
+    let agent_dir = agent_root.path().join("agent");
     std::fs::create_dir_all(&agent_dir).expect("agent directory");
     std::fs::write(
         agent_dir.join("settings.json"),
@@ -132,6 +136,7 @@ pub async fn faux_application(label: &str) -> FauxApp {
         application: Application::new(session).await,
         _registration: registration,
         cwd,
+        _agent_root: agent_root,
     }
 }
 

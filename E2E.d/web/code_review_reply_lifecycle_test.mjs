@@ -183,7 +183,7 @@ async function main() {
     await page.screenshot({ path: `${evidence}/01-bootstrap.png`, fullPage: true });
 
     // A2: open the review, select the dirty file + hunk, composer ready.
-    await page.fill('#prompt-input', '/code-review');
+    await page.fill('#prompt-input', '/review');
     await page.press('#prompt-input', 'Enter');
     await waitFor(
       page,

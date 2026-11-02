@@ -55,11 +55,11 @@ function check(name, cond, detail) {
       null,
       'not-an-object',
       { description: 'missing name dropped' },
-      { name: 'code-review', description: 'Browse a diff', source: 'builtin' }, // missing hints -> coerced
+      { name: 'review', description: 'Browse a diff', source: 'builtin' }, // missing hints -> coerced
     ],
   };
   const out = normalizeCommands(data);
-  check('valid entries kept in order', out.map((c) => c.name).join(',') === 'compact,skill,code-review', JSON.stringify(out.map((c) => c.name)));
+  check('valid entries kept in order', out.map((c) => c.name).join(',') === 'compact,skill,review', JSON.stringify(out.map((c) => c.name)));
   check('empty name filtered', !out.some((c) => c.name === ''));
   check('non-string name filtered', !out.some((c) => typeof c.name !== 'string'));
   check('null/non-object entries filtered', out.length === 3);
@@ -121,13 +121,13 @@ function check(name, cond, detail) {
 
 // ---- Web-executable surface filter: one public /todo root ----
 {
-  check('allowlist includes todo exactly once and no todo-child alias, plus the commit chooser',
-    Object.keys(WEB_SUPPORTED_COMMANDS).sort().join(',') === 'code-review,commit,compact,goal,irc,jobs,loop,ps,skill,todo');
+  check('allowlist includes todo exactly once and no todo-child alias, plus the show chooser',
+    Object.keys(WEB_SUPPORTED_COMMANDS).sort().join(',') === 'compact,goal,irc,jobs,loop,ps,review,show,skill,todo');
   const cmds = normalizeCommands({ commands: [
     { name: 'compact', source: 'builtin', requiresArguments: false },
     { name: 'goal', source: 'builtin' },
     { name: 'skill', source: 'builtin', requiresArguments: true },
-    { name: 'code-review', source: 'builtin', requiresArguments: false },
+    { name: 'review', source: 'builtin', requiresArguments: false },
     { name: 'loop', source: 'builtin', requiresArguments: true },
     { name: 'ps', source: 'builtin', requiresArguments: false },
     { name: 'todo', source: 'builtin', requiresArguments: false },
@@ -136,8 +136,8 @@ function check(name, cond, detail) {
     { name: 'btw', source: 'builtin' },
   ] });
   const supported = filterSupportedCommands(cmds);
-  check('supported filter keeps sole todo root', supported.map((c) => c.name).join(',') === 'compact,goal,skill,code-review,loop,ps,todo', JSON.stringify(supported.map((c) => c.name)));
-  check('supported filter preserves backend order', supported[0].name === 'compact' && supported[1].name === 'goal' && supported[2].name === 'skill' && supported[3].name === 'code-review' && supported[4].name === 'loop' && supported[5].name === 'ps' && supported[6].name === 'todo');
+  check('supported filter keeps sole todo root', supported.map((c) => c.name).join(',') === 'compact,goal,skill,review,loop,ps,todo', JSON.stringify(supported.map((c) => c.name)));
+  check('supported filter preserves backend order', supported[0].name === 'compact' && supported[1].name === 'goal' && supported[2].name === 'skill' && supported[3].name === 'review' && supported[4].name === 'loop' && supported[5].name === 'ps' && supported[6].name === 'todo');
   check('goal kept (dispatch wired)', supported.some((c) => c.name === 'goal'));
   check('loop kept (dispatch wired)', supported.some((c) => c.name === 'loop'));
   check('ps kept (dispatch wired)', supported.some((c) => c.name === 'ps'));
@@ -155,16 +155,16 @@ function check(name, cond, detail) {
   const cmds = filterSupportedCommands(normalizeCommands({ commands: [
     { name: 'compact', description: 'Manually compact session context', source: 'builtin', requiresArguments: false },
     { name: 'skill', description: 'Show a loaded skill', source: 'builtin', requiresArguments: true },
-    { name: 'code-review', description: 'Browse a Git diff', source: 'builtin', requiresArguments: false },
+    { name: 'review', description: 'Browse a Git diff', source: 'builtin', requiresArguments: false },
   ] }));
   check('empty query -> all supported', filterCommands(cmds, '').length === 3);
   check('whitespace query -> all supported', filterCommands(cmds, '   ').length === 3);
   check('name substring match (compact)', filterCommands(cmds, 'compact').map((c) => c.name).join(',') === 'compact');
-  check('name match is case-insensitive', filterCommands(cmds, 'CODE-REVIEW').map((c) => c.name).join(',') === 'code-review');
+  check('name match is case-insensitive', filterCommands(cmds, 'REVIEW').map((c) => c.name).join(',') === 'review');
   check('description substring match (skill via "loaded")', filterCommands(cmds, 'loaded').map((c) => c.name).join(',') === 'skill');
-  check('description match is case-insensitive', filterCommands(cmds, 'GIT').map((c) => c.name).join(',') === 'code-review');
+  check('description match is case-insensitive', filterCommands(cmds, 'GIT').map((c) => c.name).join(',') === 'review');
   check('no match -> []', filterCommands(cmds, 'nope-xyz').length === 0);
-  check('partial name match (code)', filterCommands(cmds, 'code').map((c) => c.name).join(',') === 'code-review');
+  check('partial name match (revi)', filterCommands(cmds, 'revi').map((c) => c.name).join(',') === 'review');
 }
 
 // ---- picker open intent: direct `/skill <query>` search from composer ----
@@ -207,7 +207,7 @@ function check(name, cond, detail) {
   // skill: requiresArguments=true -> trailing space.
   check('/skill (requiresArguments=true) -> trailing space', composeCommandText('skill', true) === '/skill ');
   // code-review: OPTIONAL args -> bare (no forced trailing space).
-  check('/code-review (requiresArguments=false) -> bare', composeCommandText('code-review', false) === '/code-review');
+  check('/review (requiresArguments=false) -> bare', composeCommandText('review', false) === '/review');
   // Goal/workflow (not supported, but the rule is generic) -> bare.
   check('/goal (requiresArguments=false) -> bare', composeCommandText('goal', false) === '/goal');
   check('/loop (requiresArguments=true) -> trailing space', composeCommandText('loop', true) === '/loop ');
@@ -225,10 +225,10 @@ function check(name, cond, detail) {
   check('/compact --snap -> args', JSON.stringify(parseSupportedCommand('/compact --snap')) === JSON.stringify({ name: 'compact', args: '--snap' }));
   check('/skill foo -> args', JSON.stringify(parseSupportedCommand('/skill foo')) === JSON.stringify({ name: 'skill', args: 'foo' }));
   check('/skill foo bar -> args tail preserved', JSON.stringify(parseSupportedCommand('/skill foo bar')) === JSON.stringify({ name: 'skill', args: 'foo bar' }));
-  check('/code-review bare -> empty args', JSON.stringify(parseSupportedCommand('/code-review')) === JSON.stringify({ name: 'code-review', args: '' }));
-  check('/code-review HEAD~1 HEAD -> args', JSON.stringify(parseSupportedCommand('/code-review HEAD~1 HEAD')) === JSON.stringify({ name: 'code-review', args: 'HEAD~1 HEAD' }));
-  check('/commit bare -> supported chooser command', JSON.stringify(parseSupportedCommand('/commit')) === JSON.stringify({ name: 'commit', args: '' }));
-  check('/commit <ref> -> args preserved for dispatch', JSON.stringify(parseSupportedCommand('/commit abc123def')) === JSON.stringify({ name: 'commit', args: 'abc123def' }));
+  check('/review bare -> empty args', JSON.stringify(parseSupportedCommand('/review')) === JSON.stringify({ name: 'review', args: '' }));
+  check('/review HEAD~1 HEAD -> args', JSON.stringify(parseSupportedCommand('/review HEAD~1 HEAD')) === JSON.stringify({ name: 'review', args: 'HEAD~1 HEAD' }));
+  check('/show bare -> supported chooser command', JSON.stringify(parseSupportedCommand('/show')) === JSON.stringify({ name: 'show', args: '' }));
+  check('/show <ref> -> args preserved for dispatch', JSON.stringify(parseSupportedCommand('/show abc123def')) === JSON.stringify({ name: 'show', args: 'abc123def' }));
   check('leading/trailing whitespace trimmed', JSON.stringify(parseSupportedCommand('  /compact  ')) === JSON.stringify({ name: 'compact', args: '' }));
   check('extra spaces between name and args collapsed', parseSupportedCommand('/skill    foo').args === 'foo');
   // Loop/goal parse like any other supported command; argument validation
@@ -258,14 +258,14 @@ function check(name, cond, detail) {
 // ---- appendDraft: picker draft insertion preserves editable text ----
 {
   // The E2E lane's step-3 scenario: an empty composer takes the draft as-is.
-  check('empty composer takes draft as-is', appendDraft('', '/code-review') === '/code-review');
-  check('whitespace-only composer takes draft as-is', appendDraft('   ', '/code-review') === '   /code-review');
+  check('empty composer takes draft as-is', appendDraft('', '/review') === '/review');
+  check('whitespace-only composer takes draft as-is', appendDraft('   ', '/review') === '   /review');
   // Existing draft text is preserved: the command goes on its own line.
-  check('non-empty composer gets newline separator', appendDraft('hello', '/code-review') === 'hello\n/code-review');
+  check('non-empty composer gets newline separator', appendDraft('hello', '/review') === 'hello\n/review');
   check('draft appended after trailing text', appendDraft('line1\nline2', '/compact') === 'line1\nline2\n/compact');
   // A value already ending in a newline never gains a blank line.
-  check('trailing newline not doubled', appendDraft('hello\n', '/code-review') === 'hello\n/code-review');
-  check('CRLF value keeps single separator', appendDraft('hello\r\n', '/code-review') === 'hello\r\n/code-review');
+  check('trailing newline not doubled', appendDraft('hello\n', '/review') === 'hello\n/review');
+  check('CRLF value keeps single separator', appendDraft('hello\r\n', '/review') === 'hello\r\n/review');
   check('empty draft appended verbatim', appendDraft('hello', '') === 'hello');
   // Same boundary on the other separator branch: a trailing-newline value is
   // also returned untouched — an empty draft must never inject anything.
@@ -278,7 +278,7 @@ function check(name, cond, detail) {
     commands: [
       { name: 'compact', description: 'Manually compact session context', source: 'builtin', argumentHint: '[--snap] [instructions]', requiresArguments: false },
       { name: 'skill', description: "Show a loaded skill's frontmatter summary", source: 'builtin', argumentHint: '<name>', requiresArguments: true },
-      { name: 'code-review', description: 'Browse a working-tree, base-to-working-tree, or two-revision Git diff in a fullscreen panel', source: 'builtin', argumentHint: '[<base> | <from> <to>]', requiresArguments: false },
+      { name: 'review', description: 'Browse a working-tree, base-to-working-tree, or two-revision Git diff in a fullscreen panel', source: 'builtin', argumentHint: '[<repo>] [<base> | <from> <to>]', requiresArguments: false },
       { name: 'loop', description: 'Run a prompt on a recurring interval', source: 'builtin', argumentHint: '[list|...|<interval> <prompt>]', requiresArguments: true },
       { name: 'goal', description: 'Create, inspect, pin, or drop the session goal', source: 'builtin', argumentHint: '[show|create ...]', requiresArguments: false },
       { name: 'ps', description: 'List supervised processes', source: 'builtin', argumentHint: null, requiresArguments: false },
@@ -287,14 +287,14 @@ function check(name, cond, detail) {
   };
   const cmds = filterSupportedCommands(normalizeCommands(payload));
   // Only the 7 Web-executable commands reach the menu, in backend order.
-  check('round-trip: only supported reach menu', cmds.map((c) => c.name).join(',') === 'compact,skill,code-review,loop,goal,ps,todo');
-  // Search for "review" lands on code-review alone.
-  check('round-trip: search review -> code-review', filterCommands(cmds, 'review').map((c) => c.name).join(',') === 'code-review');
+  check('round-trip: only supported reach menu', cmds.map((c) => c.name).join(',') === 'compact,skill,review,loop,goal,ps,todo');
+  // Search for "review" lands on review alone.
+  check('round-trip: search review -> review', filterCommands(cmds, 'review').map((c) => c.name).join(',') === 'review');
   // Selecting each composes the contract-correct draft text.
   const byName = Object.fromEntries(cmds.map((c) => [c.name, c]));
   check('round-trip: draft compact', composeCommandText(byName.compact.name, byName.compact.requiresArguments) === '/compact');
   check('round-trip: draft skill (trailing space)', composeCommandText(byName.skill.name, byName.skill.requiresArguments) === '/skill ');
-  check('round-trip: draft code-review (bare, optional args)', composeCommandText(byName['code-review'].name, byName['code-review'].requiresArguments) === '/code-review');
+  check('round-trip: draft review (bare, optional args)', composeCommandText(byName.review.name, byName.review.requiresArguments) === '/review');
   // requiresArguments drives the trailing space from the backend field: loop
   // (cannot run bare) drafts with a trailing space, goal (bare = show) drafts bare.
   check('round-trip: draft loop (trailing space)', composeCommandText(byName.loop.name, byName.loop.requiresArguments) === '/loop ');
@@ -305,17 +305,17 @@ function check(name, cond, detail) {
   // Submit parse round-trips the drafted text back to a dispatchable command.
   check('round-trip: parse /compact', JSON.stringify(parseSupportedCommand('/compact')) === JSON.stringify({ name: 'compact', args: '' }));
   check('round-trip: parse /skill foo', JSON.stringify(parseSupportedCommand('/skill foo')) === JSON.stringify({ name: 'skill', args: 'foo' }));
-  check('round-trip: parse /code-review', JSON.stringify(parseSupportedCommand('/code-review')) === JSON.stringify({ name: 'code-review', args: '' }));
+  check('round-trip: parse /review', JSON.stringify(parseSupportedCommand('/review')) === JSON.stringify({ name: 'review', args: '' }));
   check('round-trip: parse /loop 5m probe', JSON.stringify(parseSupportedCommand('/loop 5m probe')) === JSON.stringify({ name: 'loop', args: '5m probe' }));
   check('round-trip: parse /goal', JSON.stringify(parseSupportedCommand('/goal')) === JSON.stringify({ name: 'goal', args: '' }));
   check('round-trip: parse /ps', JSON.stringify(parseSupportedCommand('/ps')) === JSON.stringify({ name: 'ps', args: '' }));
   check('round-trip: parse /todo', JSON.stringify(parseSupportedCommand('/todo')) === JSON.stringify({ name: 'todo', args: '' }));
   // Acceptance flow: the selected draft lands in an EMPTY composer as the
-  // bare '/code-review' the E2E lane asserts, and still parses back to the
+  // bare '/review' the E2E lane asserts, and still parses back to the
   // dispatchable command (selection never auto-submits).
-  const e2eDraft = composeCommandText(byName['code-review'].name, byName['code-review'].requiresArguments);
-  check('round-trip: code-review draft into empty composer', appendDraft('', e2eDraft) === '/code-review');
-  check('round-trip: inserted draft still parses', JSON.stringify(parseSupportedCommand(appendDraft('', e2eDraft))) === JSON.stringify({ name: 'code-review', args: '' }));
+  const e2eDraft = composeCommandText(byName.review.name, byName.review.requiresArguments);
+  check('round-trip: review draft into empty composer', appendDraft('', e2eDraft) === '/review');
+  check('round-trip: inserted draft still parses', JSON.stringify(parseSupportedCommand(appendDraft('', e2eDraft))) === JSON.stringify({ name: 'review', args: '' }));
   // Same contract for the loop/goal drafts: selection only drafts, the typed
   // draft still parses back to the dispatchable command.
   check('round-trip: loop draft into empty composer', appendDraft('', composeCommandText(byName.loop.name, byName.loop.requiresArguments)) === '/loop ');
@@ -339,7 +339,7 @@ function check(name, cond, detail) {
     commands: [
       { name: 'compact', description: 'Manually compact', source: 'builtin', argumentHint: '[--snap] [instructions]', requiresArguments: false, skillName: null },
       { name: 'skill', description: "Show a loaded skill's frontmatter summary", source: 'builtin', argumentHint: '<name>', requiresArguments: true, skillName: null },
-      { name: 'code-review', description: 'Browse a Git diff', source: 'builtin', argumentHint: '[<base> | <from> <to>]', requiresArguments: false, skillName: null },
+      { name: 'review', description: 'Browse a Git diff', source: 'builtin', argumentHint: '[<repo>] [<base> | <from> <to>]', requiresArguments: false, skillName: null },
       { name: 'skill:greet', description: 'Greet skill for E2E', source: 'skill', skillName: 'greet' },
       { name: 'skill:research', description: 'Deep-dive codebase researcher', source: 'skill', skillName: 'research' },
       { name: 'prompt-only', description: 'A prompt template', source: 'prompt' },
@@ -363,8 +363,8 @@ function check(name, cond, detail) {
   // filterSupportedCommands: builtins + skill candidates + extensions, NO prompts.
   const supported = filterSupportedCommands(cmds);
   const supportedNames = supported.map((c) => c.name);
-  check('supported keeps compact/skill/code-review builtins',
-    ['compact', 'skill', 'code-review'].every((n) => supportedNames.includes(n)),
+  check('supported keeps compact/skill/review builtins',
+    ['compact', 'skill', 'review'].every((n) => supportedNames.includes(n)),
     JSON.stringify(supportedNames));
   check('supported keeps skill candidates',
     ['skill:greet', 'skill:research'].every((n) => supportedNames.includes(n)),
@@ -403,7 +403,7 @@ function check(name, cond, detail) {
   const cmds = filterSupportedCommands(normalizeCommands({ commands: [
     { name: 'compact', description: 'Manually compact', source: 'builtin', requiresArguments: false, skillName: null },
     { name: 'skill', description: "Show a loaded skill's frontmatter summary", source: 'builtin', argumentHint: '<name>', requiresArguments: true, skillName: null },
-    { name: 'code-review', description: 'Browse a Git diff', source: 'builtin', requiresArguments: false, skillName: null },
+    { name: 'review', description: 'Browse a Git diff', source: 'builtin', requiresArguments: false, skillName: null },
     { name: 'skill:greet', description: 'Greet skill for E2E', source: 'skill', skillName: 'greet' },
     { name: 'skill:research', description: 'Deep-dive codebase researcher', source: 'skill', skillName: 'research' },
   ] }));
@@ -438,7 +438,7 @@ function check(name, cond, detail) {
   const noSkillCmds = filterSupportedCommands(normalizeCommands({ commands: [
     { name: 'compact', description: 'Manually compact', source: 'builtin', requiresArguments: false, skillName: null },
     { name: 'skill', description: 'Show a skill', source: 'builtin', requiresArguments: true, skillName: null },
-    { name: 'code-review', description: 'Browse a diff', source: 'builtin', requiresArguments: false, skillName: null },
+    { name: 'review', description: 'Browse a diff', source: 'builtin', requiresArguments: false, skillName: null },
   ] }));
   check('no-skill: candidate list empty', skillCandidates(noSkillCmds).length === 0);
   check('no-skill: parent /skill still present', primaryCommands(noSkillCmds).some((c) => c.name === 'skill'));

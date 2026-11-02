@@ -111,7 +111,7 @@ async function main() {
       'WS did not reach connected',
     );
 
-    await page.fill('#prompt-input', '/code-review');
+    await page.fill('#prompt-input', '/review');
     await page.press('#prompt-input', 'Enter');
     await waitFor(
       page,

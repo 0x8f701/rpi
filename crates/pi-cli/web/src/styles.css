@@ -552,6 +552,8 @@ header {
   flex: none;
   min-height: auto;
   position: static;
+  content-visibility: auto;
+  contain-intrinsic-size: auto 120px;
 }
 .transcript-content details:not([open]) > *:not(summary) {
   display: none;
@@ -5923,26 +5925,49 @@ body:has(#subagents-panel) .file-explorer-resizer {
   height: 100%;
   overflow: hidden;
   padding: 8px;
-  border-left: 1px solid var(--border);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-deep);
 }
 .file-conversation__head {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 8px;
   flex: none;
+  min-height: 32px;
   font-weight: 600;
   font-size: 12px;
   color: var(--muted);
   letter-spacing: 0.3px;
 }
-.file-conversation__path {
-  flex: 1;
-  min-width: 0;
-  overflow-wrap: anywhere;
-  font-weight: 400;
-  letter-spacing: 0;
-  color: var(--dim);
-  font-size: 11px;
+.file-conversation__expand {
+  margin-left: auto;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
+}
+.file-conversation__expand:hover {
+  color: var(--fg);
+  border-color: var(--border-strong);
+  background: var(--bg-hover);
+}
+.file-explorer--ask-expanded .file-explorer__tree-viewport,
+.file-explorer--ask-expanded .file-explorer__divider,
+.file-explorer--ask-expanded .file-explorer__content-viewport {
+  display: none;
+}
+.file-explorer__body > .file-conversation {
+  flex: 1 1 240px;
+  width: auto;
+  min-width: 180px;
+  max-width: 360px;
+}
+.file-explorer--ask-expanded .file-explorer__body > .file-conversation {
+  flex: 1 1 auto;
+  width: 100%;
 }
 .file-conversation__context {
   flex: none;
@@ -5976,8 +6001,8 @@ body:has(#subagents-panel) .file-explorer-resizer {
 .file-conversation__actions {
   display: flex;
   align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
+  gap: 8px;
+  flex-wrap: nowrap;
   min-width: 0;
 }
 .file-conversation__action {
@@ -6015,13 +6040,16 @@ body:has(#subagents-panel) .file-explorer-resizer {
   font-size: 11px;
   margin-left: auto;
   min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 /* Explorer host wraps source and this dock. The content viewport is the
  * container: a narrow container stacks source above the dock; at a ≥640px
  * container they sit side by side. Header and composer stay flex:none. */
 .file-explorer__content-split {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   align-items: stretch;
   flex: 1 1 auto;
   min-width: 0;
@@ -6035,9 +6063,9 @@ body:has(#subagents-panel) .file-explorer-resizer {
 .file-explorer__content-split > .file-explorer__html-preview,
 .file-explorer__content-split > .file-explorer__svg-preview,
 .file-explorer__content-split > .file-explorer__diff {
-  flex: 1 1 40%;
+  flex: 1 1 auto;
   min-width: 0;
-  min-height: 120px;
+  min-height: 0;
   overflow: auto;
 }
 .file-explorer__source {
@@ -6055,7 +6083,7 @@ body:has(#subagents-panel) .file-explorer-resizer {
   min-height: 0;
 }
 .file-explorer__content-split > .file-conversation {
-  flex: 1 1 60%;
+  flex: 0 0 42%;
   width: auto;
   min-width: 0;
   min-height: 0;
@@ -6093,11 +6121,13 @@ body:has(#subagents-panel) .file-explorer-resizer {
   .file-explorer__content-split > .file-explorer__html-preview,
   .file-explorer__content-split > .file-explorer__svg-preview,
   .file-explorer__content-split > .file-explorer__diff {
-    display: none;
+    flex: 1 1 58%;
+    min-height: 140px;
   }
   .file-explorer__content-split > .file-conversation {
-    flex: 1 1 auto;
+    flex: 1 1 42%;
     min-width: 0;
+    min-height: 160px;
     max-width: none;
     border-left: none;
   }
@@ -7083,6 +7113,22 @@ body:has(#subagents-panel) .file-explorer-resizer {
   min-height: 72px;
   resize: vertical;
 }
+.side-chat__composer textarea,
+.file-conversation__input {
+  min-height: 72px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--fg);
+}
+.file-conversation__actions {
+  flex-wrap: nowrap;
+}
+.file-conversation__hint,
+.side-chat__composer-hint {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 /* --- Review parity: category tones, model/language selects, auto spinner,
  * --- Source|Preview surface. Mirrors .file-explorer__surface geometry.
  * --- danger = Critical, warn = Overdesign, info = Naming. A mixed aggregate
@@ -7186,9 +7232,9 @@ body:has(#subagents-panel) .file-explorer-resizer {
 .code-review-tldr {
   position: absolute;
   z-index: 4;
-  inset: 8px;
+  inset: 8px 8px auto 8px;
   width: auto;
-  max-height: none;
+  max-height: min(72vh, calc(100% - 16px));
   overflow: auto;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -7235,6 +7281,14 @@ body:has(#subagents-panel) .file-explorer-resizer {
 }
 .code-review-tldr__body {
   min-height: 0;
+}
+.code-review-tldr__body .md-table {
+  width: 100%;
+}
+.code-review-tldr__body .md-table th,
+.code-review-tldr__body .md-table td {
+  white-space: normal;
+  vertical-align: top;
 }
 .code-review-tldr__toggle {
   appearance: none;
@@ -7932,6 +7986,65 @@ body:has(#subagents-panel) .file-explorer-resizer {
   line-height: 1;
   cursor: pointer;
 }
+.file-explorer__repo-hash {
+  flex: none;
+  margin-left: auto;
+  margin-right: 1.8em;
+  padding-right: 4px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--muted);
+}
+.file-explorer__review-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.file-explorer__review-input {
+  min-height: 32px;
+  padding: 4px 8px;
+  font-size: 12px;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.file-explorer__review-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.file-explorer__review-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+.file-explorer__review-cancel,
+.file-explorer__review-submit {
+  appearance: none;
+  min-height: 32px;
+  padding: 4px 12px;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.file-explorer__review-cancel {
+  color: var(--muted);
+  background: transparent;
+}
+.file-explorer__review-cancel:hover,
+.file-explorer__review-submit:hover {
+  color: var(--fg);
+  background: var(--bg-hover);
+}
+.file-explorer__review-submit {
+  color: var(--fg);
+  background: var(--accent-dim);
+}
 .file-explorer__refresh-btn {
   appearance: none;
   flex: none;
@@ -7958,6 +8071,7 @@ body:has(#subagents-panel) .file-explorer-resizer {
 .file-explorer__refresh-glyph {
   display: inline-block;
   line-height: 1;
+  font-size: 16px;
 }
 .file-explorer__refresh-btn.is-refreshing .file-explorer__refresh-glyph {
   animation: file-explorer-refresh-glyph-spin 1s linear infinite;
@@ -8001,25 +8115,29 @@ body:has(#subagents-panel) .file-explorer-resizer {
   flex: none;
   align-items: stretch;
   min-width: 0;
-  border: none;
+  border: 1px solid var(--border);
+  border-bottom: none;
 }
 .file-explorer__surface-btn {
   appearance: none;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  height: var(--file-explorer-toolbar-h, 32px);
-  min-height: 0;
-  box-sizing: border-box;
+  height: 32px;
+  min-height: 32px;
   padding: 0 8px;
   font-size: 12px;
   line-height: 1;
   color: var(--muted);
   background: var(--bg);
-  border: 1px solid var(--border);
-  margin-left: -1px;
+  border: none;
+  border-right: 1px solid var(--border);
   cursor: pointer;
 }
+.file-explorer__surface-btn:last-child {
+  border-right: none;
+}
+
 .file-explorer__surface-btn:first-child {
   margin-left: 0;
 }
@@ -8044,6 +8162,7 @@ body:has(#subagents-panel) .file-explorer-resizer {
   min-width: 0;
   flex: 1;
   overflow: hidden;
+  padding: 8px;
   /* Inner tree/content split authority. Panel writes the live percent
    * (bounded 22–55, default 34) as this var; CSS is the only width
    * authority so tree, divider, and code pane cannot disagree. */
@@ -8054,7 +8173,7 @@ body:has(#subagents-panel) .file-explorer-resizer {
 .file-explorer__content-viewport {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 0;
   min-width: 0;
   min-height: 0;
 }
@@ -8071,8 +8190,11 @@ body:has(#subagents-panel) .file-explorer-resizer {
   flex: 0 0 var(--file-explorer-tree-pct, 34%);
   min-width: 22%;
   max-width: 55%;
-  padding-right: 8px;
   overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-deep);
+  padding: 4px;
 }
 /* Inner scroller: treeViewportRef binds to this list — the element that
  * actually scrolls — not the non-scroll viewport wrapper, so scroll
@@ -8120,9 +8242,13 @@ body:has(#subagents-panel) .file-explorer-resizer {
 .file-explorer__content-viewport {
   position: relative;
   flex: 1 1 auto;
-  padding-left: 8px;
+  min-width: 240px;
   overflow: hidden;
   container: file-explorer-content / inline-size;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-deep);
+  padding: 0;
 }
 /* Pane-loading shimmer hooks (markup owned by FileExplorerPanel.tsx):
  * a 12px captionless square, absolutely centered so appear/disappear never
@@ -8392,81 +8518,6 @@ body:has(#subagents-panel) .file-explorer-resizer {
 .file-explorer__map-diagram .md-mermaid-viewport svg[data-mermaid-wide='true'] {
   max-width: 100%;
 }
-.file-explorer__map-nodes {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  margin-top: 8px;
-}
-.file-explorer__map-node,
-.file-explorer__map-file {
-  appearance: none;
-  display: block;
-  width: 100%;
-  padding: 6px 8px;
-  font-size: 12px;
-  text-align: left;
-  color: var(--fg);
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-}
-.file-explorer__map-node:hover,
-.file-explorer__map-file:hover {
-  background: var(--bg-hover);
-  border-color: var(--border-strong);
-}
-.file-explorer__map-node:focus-visible,
-.file-explorer__map-file:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
-}
-.file-explorer__map-node.is-selected {
-  border-color: var(--accent);
-}
-.file-explorer__map-node-name {
-  display: block;
-  font-weight: 600;
-  overflow-wrap: anywhere;
-}
-.file-explorer__map-node-path,
-.file-explorer__map-node-evidence,
-.file-explorer__map-node-doc,
-.file-explorer__map-file-meta {
-  display: block;
-  color: var(--muted);
-  overflow-wrap: anywhere;
-}
-.file-explorer__map-node-path {
-  font-family: var(--font-mono);
-  font-size: 11px;
-}
-.file-explorer__map-node-evidence,
-.file-explorer__map-node-doc {
-  font-size: 11px;
-}
-.file-explorer__map-group {
-  margin-top: 10px;
-}
-.file-explorer__map-heading {
-  margin: 0 0 4px;
-  font-size: 12px;
-  color: var(--muted);
-}
-.file-explorer__map-file-name {
-  display: block;
-  font-family: var(--font-mono);
-  overflow-wrap: anywhere;
-}
-.file-explorer__map-external,
-.file-explorer__map-unresolved {
-  margin: 4px 0 0;
-  padding-left: 16px;
-  font-size: 11px;
-  color: var(--muted);
-  overflow-wrap: anywhere;
-}
 .file-explorer__map-coverage {
   margin: 10px 0 0;
   font-size: 12px;
@@ -8641,10 +8692,10 @@ body:has(#subagents-panel) .file-explorer-resizer {
 
 .file-explorer__code {
   margin: 0;
-  padding: 8px;
-  background: var(--bg-deep);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: 0;
   overflow-x: auto;
   overflow-y: auto;
   scrollbar-gutter: stable;
@@ -8727,9 +8778,13 @@ body:has(#subagents-panel) .file-explorer-resizer {
   position: sticky;
   left: 0;
   flex: none;
-  width: 3em;
+  width: auto;
+  min-width: 3em;
   text-align: right;
-  padding-right: 6px;
+  padding: 0 8px;
+  color: var(--dim);
+  user-select: none;
+  font-variant-numeric: tabular-nums;
   z-index: 1;
   background: var(--bg-deep);
 }
@@ -8818,10 +8873,6 @@ body:has(#subagents-panel) .file-explorer-resizer {
   .file-explorer__retry,
   .file-explorer__search-input,
   .file-explorer__surface-btn {
-    min-height: 44px;
-  }
-  .file-explorer__map-node,
-  .file-explorer__map-file {
     min-height: 44px;
   }
   .file-explorer__expand-btn,

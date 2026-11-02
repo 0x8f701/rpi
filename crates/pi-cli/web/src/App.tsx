@@ -95,6 +95,7 @@ import {
   closeFileConversationsDroppedBySlotPatch,
   fileExplorerCanonicalPath,
   fileExplorerCommandForSession,
+  fileExplorerListCommand,
   fileExplorerSyncPageCacheWithSlots,
   readFileExplorerSlot,
   updateFileExplorerSlot,
@@ -245,6 +246,7 @@ import {
   noteLiveViewportFold,
   noteLiveViewportScroll,
   planDemandProjectionDecision,
+  readTranscriptTextSelection,
   planParkedWindow,
   projectionStartForAnchor,
   projectTranscriptWindow,
@@ -910,8 +912,8 @@ export const TranscriptSurface = memo(function TranscriptSurface({
         atNewerEdge: scroll.scrollTop + scroll.clientHeight >= scroll.scrollHeight - TRANSCRIPT_PROJECTION_EDGE_PX,
         inSliceMode: sliceModeRef.current,
         sliceAnchor: sliceAnchorRef.current,
-        selection: null,
-        root: null,
+        selection: readTranscriptTextSelection(window.getSelection(), content),
+        root: content,
         gestureActive: false,
       });
       if (planned.kind === 'sliceCollapse') sliceModeRef.current = false;
@@ -939,9 +941,13 @@ export const TranscriptSurface = memo(function TranscriptSurface({
     const scroll = scrollRef.current;
     if (!scroll) return;
     scroll.addEventListener('scroll', onScroll, { passive: true });
+    const onPointerUp = () => {
+      if (activeRef.current) decide();
+    };
+    document.addEventListener('pointerup', onPointerUp);
     return () => {
       scroll.removeEventListener('scroll', onScroll);
-      if (shiftRafRef.current !== null) window.cancelAnimationFrame(shiftRafRef.current);
+      document.removeEventListener('pointerup', onPointerUp);
     };
   }, [active, getViewport, rk, scrollRef]);
   const stageRef = useRef<number | null>(null);
@@ -1304,7 +1310,7 @@ export function FinalAssistant({ blocks, errorMessage, sessionId = '', workspace
   }, [onLayoutChange]);
   return (
     <div className="msg msg--assistant" {...(itemId !== undefined ? transcriptItemStamp(itemId) : {})} data-session-id={sessionId} data-workspace-cwd={workspaceCwd}>
-      <div className="assistant-text" ref={textRef} dangerouslySetInnerHTML={{ __html: renderBlocks(blocks, pathContext) }} />
+      <div className="assistant-text" ref={textRef} dangerouslySetInnerHTML={{ __html: renderBlocks(blocks, pathContext, workspaceCwd) }} />
       {errorMessage ? <div className="msg--assistant__error" role="note">{safeText(errorMessage)}</div> : null}
     </div>
   );
@@ -2377,7 +2383,7 @@ export function App() {
 
 
 
-  // Revisions captured when `/code-review [<base> | <from> <to>]` opens the
+  // Revisions captured when `/review [<base> | <from> <to>]` opens the
   // panel. Cleared on close/session reset so a later bare open does not reuse
   // stale revs.
   const [codeReviewOpenArgs, setCodeReviewOpenArgs] = useState<CodeReviewOpenArgs>({});
@@ -2435,13 +2441,12 @@ export function App() {
   // apply, rename) keep the active session; a different non-empty id is a
   // session cutover that switches the ACTIVE view (per-session caches below).
   const sessionIdRef = useRef<string | null>(null);
+
   const fileExplorerSlot = readFileExplorerSlot(fileExplorerBySessionId, sessionId);
   const activeSessionCwd = sessionId ? sessionCwdBySessionId[sessionId] : undefined;
   const fileExplorerOpen = fileExplorerSlot.mode !== 'closed';
   // Full-app expand resets the moment the drawer closes (the panel unmounts).
-  useEffect(() => {
-    if (!fileExplorerOpen) setFileExplorerExpanded(false);
-  }, [fileExplorerOpen]);
+
   const [fileExplorerWidth, setFileExplorerWidth] = useState(() =>
     typeof window !== 'undefined' ? readStoredFileExplorerWidth(window.innerWidth) : FILE_EXPLORER_WIDTH_DEFAULT
   );
@@ -2922,6 +2927,13 @@ export function App() {
       }, opts?.timeoutMs ?? 7000);
     }
   }, []);
+  const patchOpenFileExplorer = useCallback((updater: Parameters<typeof patchFileExplorer>[1]) => {
+    const id = sessionIdRef.current;
+    if (id) patchFileExplorer(id, updater);
+  }, [patchFileExplorer]);
+  const reportFileConversationError = useCallback((message: string) => {
+    toast(message, true);
+  }, [toast]);
 
   const toastTransportOutage = useCallback((message: string): boolean => {
     const plan = planTransportOutageToast({
@@ -3274,7 +3286,12 @@ export function App() {
         line,
         { ...owner, workspaceCwd },
         (command) => sendCommand(command, undefined, { auxiliary: true }),
-        (relative, openLine) => openFileInDrawer(relative, openLine, owner.sessionId),
+        (relative, openLine, _owner, opened) => openFileInDrawer(
+          relative,
+          openLine,
+          owner.sessionId,
+          opened?.kind === 'directory' ? 'dir' : 'file',
+        ),
         (error) => {
           if (markdownOpenRejectionOwnership(error) !== 'local') return;
           // Post-retry `file_unavailable` is a stable verdict: the server's
@@ -6450,9 +6467,9 @@ export function App() {
     autoResizeRef.current?.flush(input);
   }, []);
 
-  /* ---------------- /commit picker + shared code-review opener ---------------- */
+  /* ---------------- /show picker + shared code-review opener ---------------- */
 
-  // Recent-commit chooser for bare `/commit`: one fetch per open, guarded by
+  // Recent-commit chooser for bare `/show`: one fetch per open, guarded by
   // the captured owner session AND a monotonic generation. Closing or
   // reopening the picker (or a session switch between open and settle)
   // invalidates the in-flight response, so a stale payload can never paint
@@ -6511,7 +6528,7 @@ export function App() {
   }, [sendCommand, toast]);
 
   /** Owner-stamped code-review open shared by `/code-review` and the
-   *  `/commit` picker: the probe resolves its revision in the workspace of
+   *  `/show` picker: the probe resolves its revision in the workspace of
    *  the session the user is LOOKING AT (displayed command target), its
    *  snapshot-error and moved-display-authority settles own the cleanup
    *  close, and success retains the args on the mounted panel. The composer
@@ -6576,6 +6593,44 @@ export function App() {
         toast(`Code review: ${err.message}`, true);
       });
   }, [flushComposerResize, openPanel, sendCommand, toast]);
+
+  /** `/review` dispatch: the FIRST operand is a repository override when it
+   *  names a workspace directory (probed once via file_explorer_list — only
+   *  the backend can see the filesystem), and the remaining operands are that
+   *  repository's base/from/to; otherwise the operands are revisions of the
+   *  session repository. Mirrors parse_review_command in code_review.rs. */
+  const dispatchReviewCommand = useCallback((operands: string[]) => {
+    const usage = () => toast('usage: /review [<repo>] [<base> | <from> <to>]', true);
+    if (operands.length === 0) {
+      void openCodeReview({});
+      return;
+    }
+    if (operands.length > 3) {
+      usage();
+      return;
+    }
+    const [first, second, third] = operands;
+    const reviewSid = composerCommandSessionId(displayStateRef.current?.commandTarget, sessionIdRef.current);
+    sendCommand(fileExplorerCommandForSession(reviewSid, fileExplorerListCommand(first)))
+      .then(() => {
+        const args: CodeReviewOpenArgs =
+          operands.length === 1
+            ? { repo: first }
+            : operands.length === 2
+              ? { repo: first, from: second, includeWorkingTree: true }
+              : { repo: first, from: second, to: third };
+        void openCodeReview(args);
+      })
+      .catch(() => {
+        if (operands.length === 1) {
+          void openCodeReview({ from: first, includeWorkingTree: true });
+        } else if (operands.length === 2) {
+          void openCodeReview({ from: first, to: second });
+        } else {
+          usage();
+        }
+      });
+  }, [openCodeReview, sendCommand, toast]);
 
   const updateOwnedAttachments = useCallback((
     owner: RuntimeIdentity | null,
@@ -6787,22 +6842,14 @@ export function App() {
             return;
           }
 
-          if (action.type === 'code-review') {
-            const openArgs: CodeReviewOpenArgs = {};
-            if (action.from && action.to) {
-              openArgs.from = action.from;
-              openArgs.to = action.to;
-            } else if (action.from && action.includeWorkingTree) {
-              openArgs.from = action.from;
-              openArgs.includeWorkingTree = true;
-            }
-            dispatched = openCodeReview(openArgs);
+          if (action.type === 'review') {
+            dispatchReviewCommand(action.operands);
             return;
           }
 
-          if (action.type === 'commit') {
-            // Direct `/commit <ref>` and a picker selection share the SAME
-            // owner-stamped opener; bare `/commit` opens the chooser and
+          if (action.type === 'show') {
+            // Direct `/show <ref>` and a picker selection share the SAME
+            // owner-stamped opener; bare `/show` opens the chooser and
             // fetches the displayed session's recent commits.
             if (action.ref) {
               dispatched = openCodeReview({ commit: action.ref });
@@ -8804,10 +8851,14 @@ export function App() {
           pageProtocol={typeof location !== 'undefined' ? location.protocol : 'http:'}
           downloadOrigin={typeof location !== 'undefined' ? location.origin : `http://${hostRef.current}`}
           onOpenPath={(path, line, view) => openFileInDrawer(path, line, sessionId ?? undefined, view)}
+          onOpenCodeReview={(path, from) => {
+            const args: CodeReviewOpenArgs = { repo: path, ...(from ? { from, includeWorkingTree: true } : {}) };
+            void openCodeReview(args);
+          }}
           expanded={fileExplorerExpanded}
           onToggleExpanded={() => setFileExplorerExpanded((prev) => !prev)}
-          onPatchSlot={(updater) => { if (sessionId) patchFileExplorer(sessionId, updater); }}
-          onConversationError={(message) => toast(message, true)}
+          onPatchSlot={patchOpenFileExplorer}
+          onConversationError={reportFileConversationError}
           onClose={() => {
             if (!sessionId) return;
             patchFileExplorer(sessionId, (slot) => applyDrawerMode(slot, 'closed'));

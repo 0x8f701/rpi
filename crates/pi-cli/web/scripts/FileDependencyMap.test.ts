@@ -115,6 +115,30 @@ check('cyclic payload fails closed', (() => {
   return normalizeFileExplorerMap(cyclic, 'src/app.ts') === null;
 })());
 check('missing selected node rejects', normalizeFileExplorerMap({ ...map, nodes: [node('src/util.ts')] }, 'src/app.ts') === null);
+const directoryMap = {
+  path: 'src',
+  nodes: [node('src/a.ts', { declarations: [], purpose: [] }), node('src/b.ts', { declarations: [], purpose: [] })],
+  outgoing: [{
+    source: 'src/a.ts',
+    line: 1,
+    specifier: './b',
+    kind: 'import',
+    target: { type: 'file', path: 'src/b.ts' },
+  }],
+  incoming: [],
+  coverage: coverage(),
+};
+check('directory graph accepts edges inside the folder', normalizeFileExplorerMap(directoryMap, 'src')?.outgoing.length === 1);
+check('directory graph rejects a node outside the folder', normalizeFileExplorerMap({
+  ...directoryMap,
+  nodes: [...directoryMap.nodes, node('other.ts', { declarations: [], purpose: [] })],
+}, 'src') === null);
+check('workspace root graph accepts an empty path', normalizeFileExplorerMap({
+  ...directoryMap,
+  path: '',
+  nodes: [node('a.ts', { declarations: [], purpose: [] })],
+  outgoing: [],
+}, '')?.path === '');
 
 const hostile = 'src/<img onerror=alert(1)>.ts" click n0 call evil()';
 const hostileMap = normalizeFileExplorerMap({
@@ -161,11 +185,8 @@ const html = renderToStaticMarkup(createElement(FileDependencyMap, {
   onOpenFile: (path: string) => { opened.push(path); },
 }));
 check('render keeps mermaid fence and opaque ids', html.includes('flowchart LR') && html.includes('n0') && !html.includes('click '));
-check('render separates external and unresolved', html.includes('external react') && html.includes('unresolved crate::hidden'));
-check('render shows declaration and doc line', html.includes('fn load:4') && html.includes(':4 Loads the file.'));
-check('render discloses incomplete coverage', html.includes('Visible workspace entries only') && html.includes('Coverage is incomplete.') && !html.includes('no dependencies'));
-check('node list is a file button', html.includes('file-explorer__map-file') && html.includes('src/util.ts'));
-check('render does not invent a purpose', !html.includes('generated') && html.includes('doc:4'));
+check('render is one diagram', !html.includes('file-explorer__map-node') && !html.includes('file-dependency-map-outgoing') && !html.includes('file-explorer__map-file'));
+check('render does not invent a purpose', !html.includes('generated'));
 
 console.log(`\nFileDependencyMap.test: ${ran} assertions, ${failures.length} failure(s)`);
 if (failures.length) {

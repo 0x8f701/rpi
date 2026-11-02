@@ -1985,30 +1985,6 @@ export function countFileThreads(threads: ReviewThread[], file: DiffFile): numbe
   return total;
 }
 
-/**
- * Parse `/code-review` argument tail into open revisions.
- * Accepts 0 tokens (HEAD→working tree), 1 token (`<base>`→working tree),
- * or exactly 2 (`from`, `to` commit-to-commit).
- * Returns an error message string when the arity is wrong.
- */
-export function parseCodeReviewArgs(
-  args: string,
-): { ok: true; from?: string; to?: string; includeWorkingTree?: true } | { ok: false; error: string } {
-  const trimmed = args.trim();
-  if (!trimmed) return { ok: true };
-  const parts = trimmed.split(/\s+/).filter(Boolean);
-  if (parts.length === 1) {
-    return { ok: true, from: parts[0], includeWorkingTree: true };
-  }
-  if (parts.length === 2) {
-    return { ok: true, from: parts[0], to: parts[1] };
-  }
-  return {
-    ok: false,
-    error: 'usage: /code-review [<base> | <from> <to>]',
-  };
-}
-
 export type CodeReviewOpenCommandResult =
   | { ok: true; command: Record<string, unknown> }
   | { ok: false; error: string };
@@ -2018,22 +1994,26 @@ export function codeReviewOpenCommand(args: {
   from?: string;
   to?: string;
   includeWorkingTree?: true;
+  repo?: string;
 }): CodeReviewOpenCommandResult {
-  // `/commit <ref>` scope: a pinned commit/revision is mutually exclusive
-  // with the from/to/includeWorkingTree operands — conflated operands are a
-  // REJECTED result, never a silently narrowed scope. An explicitly empty
-  // commit still rides the wire and fails clearly on the backend instead of
-  // silently opening a working-tree review.
+  // `/show <ref>` scope: a pinned commit/revision is mutually exclusive
+  // with the from/to/includeWorkingTree/repo operands — conflated operands
+  // are a REJECTED result, never a silently narrowed scope. An explicitly
+  // empty commit still rides the wire and fails clearly on the backend
+  // instead of silently opening a working-tree review.
   if (args.commit !== undefined) {
-    if (args.from !== undefined || args.to !== undefined || args.includeWorkingTree !== undefined) {
+    if (args.from !== undefined || args.to !== undefined || args.includeWorkingTree !== undefined || args.repo !== undefined) {
       return {
         ok: false,
-        error: 'code_review_open commit excludes from, to, and includeWorkingTree',
+        error: 'code_review_open commit excludes from, to, includeWorkingTree, and repo',
       };
     }
     return { ok: true, command: { type: 'code_review_open', commit: args.commit } };
   }
   const command: Record<string, unknown> = { type: 'code_review_open' };
+  if (args.repo) {
+    command.repo = args.repo;
+  }
   if (args.from && args.to) {
     command.from = args.from;
     command.to = args.to;
@@ -2050,7 +2030,7 @@ export function codeReviewOpenSnapshotError(data: unknown): string | null {
 }
 
 // ---------------------------------------------------------------------------
-// `/commit` chooser: recent-commit listing (`code_review_commits`) plus the
+// `/show` chooser: recent-commit listing (`code_review_commits`) plus the
 // picker search/selection decisions. Pure so the node lane exercises them
 // without a DOM; panels/CommitPicker.tsx only wires them to events.
 // ---------------------------------------------------------------------------
@@ -2196,7 +2176,7 @@ export function commitPickerEnterAction(
   if (row) return { kind: 'row', ref: row.commit };
   const ref = query.trim();
   if (!ref) return { kind: 'none' };
-  if (/\s/.test(ref)) return { kind: 'invalid', message: 'Usage: /commit [<ref>]' };
+  if (/\s/.test(ref)) return { kind: 'invalid', message: 'Usage: /show [<ref>]' };
   return { kind: 'typed', ref };
 }
 

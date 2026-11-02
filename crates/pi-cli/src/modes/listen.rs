@@ -68,9 +68,12 @@ const MAX_SUBSCRIBE_IDENTITY_CHARS: usize = 128;
 /// before the client is declared a slow reader and closed with 1008
 /// ("client is not reading messages"). A browser main-thread long task (e.g.
 /// a Mermaid render) can stall reading for hundreds of milliseconds while
-/// event bursts keep arriving; the grace absorbs that transient losslessly,
-/// and only a sustained no-read (a genuinely slow client) is evicted.
-const SLOW_CLIENT_GRACE: Duration = Duration::from_secs(5);
+/// event bursts keep arriving, and a heavily loaded host stalls the whole
+/// read/write loop for seconds at a time; the grace absorbs those transient
+/// stalls losslessly, and only a sustained no-read (a genuinely slow or dead
+/// client) is evicted — a dead client never reads, so a longer grace only
+/// delays its eviction instead of changing the outcome.
+const SLOW_CLIENT_GRACE: Duration = Duration::from_secs(15);
 /// Per-connection ordinary command capacity. One additional spawned task is
 /// reserved for safety recovery (notably code-review abort/close), while the
 /// total task set remains hard-bounded even under bypass-command flooding.
@@ -4338,13 +4341,37 @@ where
     };
 
     let close = match exit {
-        WebSocketExit::Graceful(frame) => WriterControl::Close(frame),
-        WebSocketExit::PeerInitiatedClose => WriterControl::FlushPeerClose,
-        WebSocketExit::SlowClient => WriterControl::Close(Some(slow_client_close_frame())),
+        WebSocketExit::Graceful(Some(frame)) => {
+            eprintln!("ws_close category={}", graceful_close_category(&frame));
+            WriterControl::Close(Some(frame))
+        }
+        WebSocketExit::Graceful(None) => {
+            eprintln!("ws_close category=eof");
+            WriterControl::Close(None)
+        }
+        WebSocketExit::PeerInitiatedClose => {
+            eprintln!("ws_close category=peer_close");
+            WriterControl::FlushPeerClose
+        }
+        WebSocketExit::SlowClient => {
+            eprintln!("ws_close category=slow_client");
+            WriterControl::Close(Some(slow_client_close_frame()))
+        }
     };
     let result = stop_websocket_writer(writer, writer_control_tx, outbound_tx, close).await;
     drop(tmux_owner);
     result
+}
+
+/// The close-code family of a graceful server-initiated close, for the
+/// `ws_close` log line: idle evictions, oversized frames, and rejected
+/// binary frames otherwise collapse into one indistinguishable bucket.
+fn graceful_close_category(frame: &CloseFrame) -> &'static str {
+    match frame.code {
+        CloseCode::Unsupported => "binary",
+        CloseCode::Size => "size",
+        _ => "idle",
+    }
 }
 
 async fn stop_websocket_writer(

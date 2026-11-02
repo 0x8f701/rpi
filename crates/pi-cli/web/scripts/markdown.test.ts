@@ -34,6 +34,7 @@ import {
   diffPathLanguage,
   highlightDiffLineFragments,
   parseWorkspacePathCandidate,
+  markdownGitWebPath,
   markdownWorkspaceRelativePath,
   markdownNearbyPathCompletion,
   markdownCompletedWorkspacePath,
@@ -2096,6 +2097,10 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
     parseWorkspacePathCandidate('checkpoint_tree.bin')?.path === 'checkpoint_tree.bin'
       && parseWorkspacePathCandidate('checkpoint_tree.bin')?.line === undefined,
   );
+
+  check('leaf.tag is not a file path', parseWorkspacePathCandidate('leaf.tag') === null);
+  check('a.new is not a file path', parseWorkspacePathCandidate('a.new') === null);
+  check('origin/audit..HEAD is not a file path', parseWorkspacePathCandidate('origin/audit..HEAD') === null);
   check(
     'screenshot line range opens at the start line',
     parseWorkspacePathCandidate('node_start_config.rs:37-41')?.path === 'node_start_config.rs'
@@ -2313,13 +2318,24 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
   const fl63Unique = 'see `foo.rs` beside src/foo.rs\nnext paragraph';
   const fl63UniqueHtml = renderMarkdown(fl63Unique);
   check(
-    'no-line unique basename is the resolved path without a line',
-    fl63UniqueHtml.includes('data-md-path="src/foo.rs"')
+    'no-line unique basename keeps the citation and stamps its completion',
+    fl63UniqueHtml.includes('data-md-path="foo.rs"')
+      && fl63UniqueHtml.includes('data-md-completion="src/foo.rs"')
       && fl63UniqueHtml.includes('>foo.rs</code>')
       && !fl63UniqueHtml.includes('data-md-line=')
       && !fl63UniqueHtml.includes('data-md-resolved='),
     fl63UniqueHtml,
   );
+  check(
+    'an absolute workspace path completes a short citation',
+    markdownNearbyPathCompletion(
+      'secp256k1/ecdsa/gadgets/biguint.rs',
+      'see /workspace/audit/psy-node/src/crypto/secp256k1/ecdsa/gadgets/biguint.rs:278',
+      '/workspace/audit',
+    ) === 'psy-node/src/crypto/secp256k1/ecdsa/gadgets/biguint.rs',
+  );
+
+  check('a git revision token is not a file path', parseWorkspacePathCandidate('origin/audit') === null);
   const fl63Abs = 'see `/tmp/work/outside-only.txt`\nnext pkg/outside-only.txt';
   const fl63AbsHtml = renderMarkdown(fl63Abs);
   check(
@@ -2838,10 +2854,10 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
   const grepContext = 'src/runtime/process_block.rs-472-    fn handle(\nsrc/runtime/process_block.rs-480-    }';
   const completedBasenameHtml = renderMarkdown('see `process_block.rs:472-480`', grepContext);
   check(
-    'unique nearby grep path is the open path',
+    'unique nearby grep path keeps the citation and stamps its completion',
     completedBasenameHtml.includes('class="md-code md-code-path"')
-      && completedBasenameHtml.includes('data-md-path="src/runtime/process_block.rs"')
-      && !completedBasenameHtml.includes('data-md-completion=')
+      && completedBasenameHtml.includes('data-md-path="process_block.rs"')
+      && completedBasenameHtml.includes('data-md-completion="src/runtime/process_block.rs"')
       && completedBasenameHtml.includes('data-md-line="472"')
       && completedBasenameHtml.includes('>process_block.rs:472-480</code>'),
     completedBasenameHtml,
@@ -2868,7 +2884,7 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
     ];
     for (const context of contexts) {
       const code = context.path
-        ? `<code class="md-code md-code-path" data-md-path="${context.path}" data-md-line="178">gatherer.rs:178-260</code>`
+        ? `<code class="md-code md-code-path" data-md-path="gatherer.rs" data-md-line="178" data-md-completion="${context.path}">gatherer.rs:178-260</code>`
         : '<code class="md-code" data-md-resolved="none">gatherer.rs:178-260</code>';
       const expected = `<p class="md-p">${code} source ${direct}</p>`;
       for (const render of [renderMarkdown, renderStreamingMarkdown]) {
@@ -3184,7 +3200,7 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
       opens.length === 0
         && errors.length === 1
         && markdownOpenMissingFileVerdict(true, errors[0]) === true
-        && markdownOpenMissingFileToast('missing.rs') === '文件已不存在：missing.rs',
+        && markdownOpenMissingFileToast('missing.rs') === 'File not found: missing.rs',
       JSON.stringify({ opens, errors }),
     );
 
@@ -3337,6 +3353,145 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
   }
 
   {
+    // A review-scoped citation: the review's repository override supplies the
+    // missing repo-relative prefix after the bare path is a typed missing file.
+    const probes: string[] = [];
+    const opens: string[] = [];
+    const errors: unknown[] = [];
+    const missingError = Object.assign(new Error('file is unavailable'), { rpc: true, rpcCode: 'file_unavailable' });
+    await markdownOpenValidatedPath(
+      'psy_node_redis/src/rewards.rs',
+      218,
+      { sessionId: 'session-a', workspaceCwd: '/workspace/audit', reviewRepo: 'psy-node' },
+      (command) => {
+        const path = (command as { path?: string }).path ?? '';
+        probes.push(path);
+        if (path === 'psy-node/psy_node_redis/src/rewards.rs') {
+          return Promise.resolve(validRead(path));
+        }
+        return Promise.reject(Object.assign(new Error('file is unavailable'), { rpc: true, rpcCode: 'file_unavailable' }));
+      },
+      (opened) => { opens.push(opened); },
+      (error) => { errors.push(error); },
+    );
+    check(
+      'typed missing citation falls back to the review repository prefix and opens the prefixed path',
+      probes.length === 2
+        && probes[0] === 'psy_node_redis/src/rewards.rs'
+        && probes[1] === 'psy-node/psy_node_redis/src/rewards.rs'
+        && opens.length === 1
+        && opens[0] === 'psy-node/psy_node_redis/src/rewards.rs'
+        && errors.length === 0,
+      JSON.stringify({ probes, opens, errors }),
+    );
+
+    // A path already inside the override prefix never double-prefixes.
+    probes.length = 0;
+    opens.length = 0;
+    errors.length = 0;
+    await markdownOpenValidatedPath(
+      'psy-node/src/lib.rs',
+      undefined,
+      { sessionId: 'session-a', workspaceCwd: '/workspace/audit', reviewRepo: 'psy-node' },
+      (command) => {
+        const path = (command as { path?: string }).path ?? '';
+        probes.push(path);
+        return Promise.reject(Object.assign(new Error('file is unavailable'), { rpc: true, rpcCode: 'file_unavailable' }));
+      },
+      (opened) => { opens.push(opened); },
+      (error) => { errors.push(error); },
+    );
+    check(
+      'a path already under the override prefix is not re-prefixed',
+      probes.length === 1
+        && probes[0] === 'psy-node/src/lib.rs'
+        && opens.length === 0
+        && errors.length === 1,
+      JSON.stringify({ probes, opens, errors }),
+    );
+  }
+
+  {
+    const git = markdownGitWebPath('https://git.example/org/repo/blob/main/src/db/init.rs#L218');
+    check(
+      'a git blob URL yields the repository path and line',
+      git?.path === 'src/db/init.rs' && git.line === 218,
+      JSON.stringify(git),
+    );
+    check(
+      'a git URL without a blob marker is not a workspace path',
+      markdownGitWebPath('https://git.example/org/repo') === null,
+    );
+    check(
+      'a git URL with traversal is rejected',
+      markdownGitWebPath('https://git.example/org/repo/blob/main/../../secret.rs') === null,
+    );
+    const html = renderMarkdown('[init](https://git.example/org/repo/blob/main/src/db/init.rs#L218)');
+    check(
+      'a git blob link renders as the repository path',
+      html.includes('href="src/db/init.rs:218"'),
+      html,
+    );
+  }
+
+  {
+    const probes: string[] = [];
+    const opens: string[] = [];
+    const errors: unknown[] = [];
+    await markdownOpenValidatedPath(
+      'db/init.rs',
+      218,
+      { sessionId: 'session-a', workspaceCwd: '/workspace/audit' },
+      (command) => {
+        const path = (command as { path?: string }).path ?? '';
+        probes.push(path);
+        return Promise.resolve(validRead('psy-node/src/db/init.rs'));
+      },
+      (opened) => { opens.push(opened); },
+      (error) => { errors.push(error); },
+    );
+    check(
+      'a partial path opens the unique echoed suffix',
+      probes.length === 1
+        && probes[0] === 'db/init.rs'
+        && opens.length === 1
+        && opens[0] === 'psy-node/src/db/init.rs'
+        && errors.length === 0,
+      JSON.stringify({ probes, opens, errors }),
+    );
+  }
+
+  {
+    const probes: string[] = [];
+    const opens: Array<{ path: string; kind?: string }> = [];
+    const errors: unknown[] = [];
+    await markdownOpenValidatedPath(
+      'src/db',
+      undefined,
+      { sessionId: 'session-a', workspaceCwd: '/workspace/audit' },
+      (command) => {
+        const typed = command as { type?: string; path?: string };
+        probes.push(`${typed.type}:${typed.path ?? ''}`);
+        if (typed.type === 'file_explorer_read') {
+          return Promise.reject(Object.assign(new Error('directory is unavailable'), { rpc: true, rpcCode: 'directory_unavailable' }));
+        }
+        return Promise.resolve({ entries: [], truncated: false });
+      },
+      (opened, _line, _owner, openedPath) => { opens.push({ path: opened, kind: openedPath?.kind }); },
+      (error) => { errors.push(error); },
+    );
+    check(
+      'a directory citation lists the directory and opens it as a directory',
+      probes.join(',') === 'file_explorer_read:src/db,file_explorer_list:src/db'
+        && opens.length === 1
+        && opens[0].path === 'src/db'
+        && opens[0].kind === 'directory'
+        && errors.length === 0,
+      JSON.stringify({ probes, opens, errors }),
+    );
+  }
+
+  {
     const rootProbes: Array<Record<string, unknown>> = [];
     const rootOpens: string[] = [];
     const rootErrors: unknown[] = [];
@@ -3377,11 +3532,10 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
     );
     await rootProbe;
     check(
-      'bare foo.rs probes only the unique contextual path, never a root basename',
+      'bare foo.rs probes the citation and opens the unique echoed path',
       rootProbes.length === 1
-        && rootProbes[0].path === 'src/foo.rs'
-        && !rootProbes.some((command) => command.path === 'foo.rs')
-        && rootOpens.join(',') === 'src/foo.rs:'
+        && rootProbes[0].path === 'foo.rs'
+        && rootOpens.join(',') === 'foo.rs:'
         && rootErrors.length === 0,
       JSON.stringify({ rootProbes, rootOpens, rootErrors }),
     );
@@ -3494,10 +3648,11 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
     const uniqueHtml = renderMarkdown('`Token.sol` beside src/Token.sol');
     const uniqueTag = renderedCodeTag(uniqueHtml, 'Token.sol');
     check(
-      'unique longer context keeps the completed stamp unchanged',
+      'unique longer context keeps the citation and stamps its completion',
       uniqueTag !== null
         && uniqueTag.cls === 'md-code md-code-path'
-        && uniqueTag.attrs['data-md-path'] === 'src/Token.sol'
+        && uniqueTag.attrs['data-md-path'] === 'Token.sol'
+        && uniqueTag.attrs['data-md-completion'] === 'src/Token.sol'
         && uniqueTag.attrs['data-md-resolved'] === undefined,
       uniqueHtml.slice(0, 300),
     );

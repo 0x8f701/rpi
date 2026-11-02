@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TUI code-review submodule journey: `/code-review review-base` must expand the
+# TUI code-review submodule journey: `/review review-base` must expand the
 # dirty `ext` gitlink into the child file (inner hunks, no Subproject block),
 # keep the `sib-clean` gitlink row even though its clean bump commit changes
 # tracked files (`notes.txt` must never appear), and fold/scroll/comment via keys.
@@ -179,8 +179,8 @@ TERM=xterm-256color \
     tmux_wait_for "$session" 25 'user-steering/mock' >"$evidence/boot.txt"
     tmux send-keys -t "$session":0 Escape
 
-    tmux send-keys -t "$session":0 -l '/code-review review-base'
-    wait_for '/code-review review-base' 10
+    tmux send-keys -t "$session":0 -l '/review review-base'
+    wait_for '/review review-base' 10
     tmux send-keys -t "$session":0 Enter
     wait_all 40 'Code review' 'review-base → working tree' '2 files' 'focus:tree' \
         'sib-clean' 'lib.txt' '@@' 'e expand' 'EXT-LIB-0040-EDITED'

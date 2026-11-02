@@ -90,9 +90,9 @@ const MD_TEXT = '**bold** and `code`';
   check(
     'side chat unique nearby cite is a path link',
     citeHtml.includes('md-code-path')
-      && citeHtml.includes('data-md-path="src/runtime/process_block.rs"')
+      && citeHtml.includes('data-md-path="process_block.rs"')
       && citeHtml.includes('data-md-line="472"')
-      && !citeHtml.includes('data-md-completion='),
+      && citeHtml.includes('data-md-completion="src/runtime/process_block.rs"'),
     citeHtml.slice(0, 800),
   );
   const homonymHtml = panel([

@@ -14,8 +14,8 @@ use crossterm::event::{
 use pi_agent::{Agent, AgentEvent};
 use pi_ai::{AssistantMessage, AssistantMessageEvent, ContentBlock, Message, Model, StopReason};
 use pi_coding::{
-    Application, SideChatFork, bind_code_review_orchestration_tools, redact::redact_bounded,
-    tools_include_mutation,
+    Application, SideChatFork, application::ApplicationGeneration, bind_code_review_orchestration_tools,
+    redact::redact_bounded, tools_include_mutation,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -29,7 +29,7 @@ use crate::code_review::{
     DiffFile, DiffGap, DiffHunk, DiffLine, DiffLineKind, FileContextBlobs, FileDiff, FileStatus,
     FileTree, GapExpandFrom, GapExpandState, HunkIdentity, ReviewPagingState, ReviewScope,
     ReviewSnapshot, TreeNodeKind, gap_expand_window, load_review_snapshot_capture, review_diff_gaps,
-    MAX_CONTEXT_EXPAND_LINES,
+    run_git_bounded_timeout, MAX_CONTEXT_EXPAND_LINES,
 };
 use crate::markdown::ratatui::{MarkdownRatatuiStyles, render_ratatui_markdown};
 use crate::theme::Theme;
@@ -1541,9 +1541,13 @@ impl std::error::Error for TldrError {}
 const TLDR_OVERVIEW_NONSPACE_CHARS: usize = 300;
 const MAX_TLDR_MARKDOWN_BYTES: usize = 32 * 1024;
 
-const TLDR_INSTRUCTIONS: &str = "Write one Markdown document about only the supplied current diff. Start with a compact overview of at most 300 non-whitespace characters, then a blank line, then details that cite files, symbols, and source lines present in the diff. Do not invent a purpose, commit message, author, date, or any metadata that is not in the comparison label or the diff. Do not use tools. Do not repeat unrelated conversation. If the diff is truncated or totals are incomplete, say so from the supplied flags only.";
+const TLDR_INSTRUCTIONS: &str = "Write exactly one Markdown table and no other prose. The columns are Repo, Uncommitted, and Commits. Use one row for every repository in the Repository facts section. Uncommitted is that repository's working tree from the facts, or clean. Commits are only the subjects listed in the facts. Do not invent a repository, file, author, or commit. If a fact says a command failed or was truncated, put that in the cell. Do not use tools. If the diff is truncated or totals are incomplete, say so inside the matching cell and only from the supplied flags.";
 
-fn tldr_prompt(snapshot: &ReviewSnapshot, language: Option<&str>) -> std::result::Result<String, TldrError> {
+fn tldr_prompt(
+    snapshot: &ReviewSnapshot,
+    language: Option<&str>,
+    repo_facts: &str,
+) -> std::result::Result<String, TldrError> {
     let language = language
         .map(|language| format!("\nRespond in the language tagged `{language}`.\n"))
         .unwrap_or_default();
@@ -1571,7 +1575,291 @@ fn tldr_prompt(snapshot: &ReviewSnapshot, language: Option<&str>) -> std::result
     if prompt.len() > crate::code_review::MAX_DIFF_BYTES {
         return Err(TldrError::PromptTooLarge);
     }
+    if !repo_facts.is_empty() {
+        let section = format!("\nRepository facts:\n{repo_facts}\n");
+        if prompt.len().saturating_add(section.len()) > crate::code_review::MAX_DIFF_BYTES {
+            return Err(TldrError::PromptTooLarge);
+        }
+        prompt.push_str(&section);
+    }
     Ok(prompt)
+}
+
+const MAX_SUMMARY_REPOS: usize = 16;
+const MAX_REPO_SCAN_DEPTH: usize = 3;
+
+/// Status and recent commits for the git repositories under the workspace
+/// roots. The summary table is filled from this text, not from a model guess.
+/// Discovery stays shallow so a large projects directory cannot turn Summary
+/// into a full-disk walk. A directory the session policy rejects is omitted
+/// and not walked.
+fn workspace_repo_facts(generation: &ApplicationGeneration, roots: &[std::path::PathBuf]) -> String {
+    let mut repos = Vec::new();
+    let mut incomplete = false;
+    for root in roots {
+        collect_git_repos(generation, root, 0, &mut repos, &mut incomplete);
+    }
+    repos.sort();
+    repos.dedup();
+    if repos.is_empty() {
+        let mut message = "No git repositories were found in the workspace.".to_owned();
+        if incomplete {
+            message.push_str("\nrepository discovery did not reach every directory.");
+        }
+        return message;
+    }
+    let omitted = repos.len().saturating_sub(MAX_SUMMARY_REPOS);
+    let mut out = String::new();
+    for repo in repos.iter().take(MAX_SUMMARY_REPOS) {
+        let name = repo
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "repository".to_owned());
+        out.push_str(&format!("repo: {name}\n"));
+        out.push_str("uncommitted:\n");
+        let status = git_status_fact_lines(generation, repo, 30);
+        out.push_str(&status.join("\n"));
+        out.push('\n');
+        out.push_str("commits:\n");
+        out.push_str(
+            &git_fact_lines(
+                repo,
+                &["log", "-n", "12", "--pretty=format:%h %s"],
+                12,
+                "none",
+            )
+            .join("\n"),
+        );
+        out.push_str("\n\n");
+    }
+    if omitted > 0 {
+        out.push_str("more repositories were not included.\n");
+    }
+    if incomplete {
+        out.push_str("repository discovery did not reach every directory.\n");
+    }
+    out
+}
+
+fn collect_git_repos(
+    generation: &ApplicationGeneration,
+    dir: &std::path::Path,
+    depth: usize,
+    out: &mut Vec<std::path::PathBuf>,
+    incomplete: &mut bool,
+) {
+    if depth > MAX_REPO_SCAN_DEPTH {
+        *incomplete = true;
+        return;
+    }
+    if out.len() > MAX_SUMMARY_REPOS {
+        return;
+    }
+    if generation.inspect_directory(dir).is_err() {
+        return;
+    }
+    let git = dir.join(".git");
+    let is_repo = git.is_dir() || git.is_file();
+    if is_repo {
+        out.push(dir.to_path_buf());
+    }
+    if depth == MAX_REPO_SCAN_DEPTH {
+        *incomplete = true;
+        return;
+    }
+    let mut read = match std::fs::read_dir(dir) {
+        Ok(read) => read,
+        Err(_) => {
+            *incomplete = true;
+            return;
+        }
+    };
+    loop {
+        let entry = match read.next() {
+            Some(Ok(entry)) => entry,
+            Some(Err(_)) => {
+                *incomplete = true;
+                continue;
+            }
+            None => break,
+        };
+        if out.len() > MAX_SUMMARY_REPOS {
+            return;
+        }
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => {
+                *incomplete = true;
+                continue;
+            }
+        };
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.')
+            || name == "node_modules"
+            || name == "target"
+            || name == "dist"
+            || name == "vendor"
+        {
+            continue;
+        }
+        let child = entry.path();
+        if is_repo {
+            if generation.inspect_directory(&child).is_err() {
+                continue;
+            }
+            let nested = child.join(".git");
+            if nested.is_dir() || nested.is_file() {
+                out.push(child);
+            }
+        } else {
+            collect_git_repos(generation, &child, depth + 1, out, incomplete);
+        }
+    }
+}
+
+fn git_fact_lines(repo: &std::path::Path, args: &[&str], max_lines: usize, empty_label: &str) -> Vec<String> {
+    let output = match run_git_bounded_timeout(
+        repo,
+        args,
+        8 * 1024,
+        None,
+        std::time::Duration::from_secs(2),
+    ) {
+        Ok(output) => output,
+        Err(_) => return vec!["unavailable".to_owned()],
+    };
+    if output.error.is_some() && output.stdout.is_empty() {
+        return vec!["unavailable".to_owned()];
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = Vec::new();
+    let mut clipped = false;
+    let mut source = text.lines();
+    while let Some(line) = source.next() {
+        if line.chars().count() > 180 {
+            clipped = true;
+        }
+        let clean: String = line
+            .chars()
+            .filter(|ch| *ch == '\t' || !ch.is_control())
+            .take(180)
+            .collect();
+        let clean = clean.trim().to_owned();
+        if clean.is_empty() {
+            continue;
+        }
+        lines.push(clean);
+        if lines.len() >= max_lines && source.next().is_some() {
+            lines.push("truncated".to_owned());
+            return lines;
+        }
+    }
+    if output.truncated || clipped {
+        lines.push("truncated".to_owned());
+    }
+    if lines.is_empty() {
+        vec![empty_label.to_owned()]
+    } else {
+        lines
+    }
+}
+
+fn status_path_allowed(generation: &ApplicationGeneration, repo: &std::path::Path, path: &str) -> bool {
+    let parent = std::path::Path::new(path).parent().unwrap_or(std::path::Path::new(""));
+    generation.inspect_directory(&repo.join(parent)).is_ok()
+}
+
+/// Porcelain `-z` records keep exact unquoted paths, so rename origins and
+/// targets are both policy-checked on the raw record before any display
+/// cleanup.
+fn git_status_fact_lines(generation: &ApplicationGeneration, repo: &std::path::Path, max_lines: usize) -> Vec<String> {
+    let output = match run_git_bounded_timeout(
+        repo,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        8 * 1024,
+        None,
+        std::time::Duration::from_secs(2),
+    ) {
+        Ok(output) => output,
+        Err(_) => return vec!["unavailable".to_owned()],
+    };
+    if output.error.is_some() && output.stdout.is_empty() {
+        return vec!["unavailable".to_owned()];
+    }
+    if output.truncated {
+        return vec!["unavailable".to_owned()];
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut fields = text.split('\0').peekable();
+    let mut lines = Vec::new();
+    let mut omitted = 0usize;
+    let mut clipped = false;
+    while let Some(record) = fields.next() {
+        if record.is_empty() {
+            continue;
+        }
+        let bytes = record.as_bytes();
+        if bytes.len() < 4 || bytes[2] != b' ' {
+            omitted += 1;
+            continue;
+        }
+        let status = &record[..2];
+        let target = &record[3..];
+        let renamed = bytes[0] == b'R' || bytes[0] == b'C' || bytes[1] == b'R' || bytes[1] == b'C';
+        let origin = if renamed {
+            match fields.next() {
+                Some(origin) if !origin.is_empty() => origin,
+                _ => {
+                    omitted += 1;
+                    continue;
+                }
+            }
+        } else {
+            ""
+        };
+        let target_allowed = status_path_allowed(generation, repo, target);
+        let origin_allowed = origin.is_empty() || status_path_allowed(generation, repo, origin);
+        if !target_allowed || !origin_allowed {
+            omitted += 1;
+            continue;
+        }
+        if lines.len() >= max_lines {
+            lines.push("truncated".to_owned());
+            break;
+        }
+        let raw = if origin.is_empty() {
+            format!("{status} {target}")
+        } else {
+            format!("{status} {origin} -> {target}")
+        };
+        if raw.chars().count() > 180 {
+            clipped = true;
+        }
+        let clean: String = raw
+            .chars()
+            .filter(|ch| *ch == '\t' || !ch.is_control())
+            .take(180)
+            .collect();
+        let clean = clean.trim().to_owned();
+        if !clean.is_empty() {
+            lines.push(clean);
+        }
+    }
+    if !lines.is_empty() && omitted > 0 {
+        lines.push("some entries omitted by policy".to_owned());
+    }
+    if clipped {
+        lines.push("truncated".to_owned());
+    }
+    if lines.is_empty() {
+        return vec![if omitted > 0 { "omitted".to_owned() } else { "clean".to_owned() }];
+    }
+    lines
 }
 
 fn accept_tldr_markdown(text: &str) -> std::result::Result<String, String> {
@@ -1583,10 +1871,13 @@ fn accept_tldr_markdown(text: &str) -> std::result::Result<String, String> {
         return Err(format!("TLDR markdown exceeds the {MAX_TLDR_MARKDOWN_BYTES}-byte limit"));
     }
     let markdown = trimmed.to_owned();
-    let overview = markdown.split("\n\n").next().unwrap_or(markdown.as_str());
-    let nonspace = overview.chars().filter(|ch| !ch.is_whitespace()).count();
-    if nonspace > TLDR_OVERVIEW_NONSPACE_CHARS {
-        return Err("TLDR overview exceeds 300 non-whitespace characters".to_owned());
+    let is_table = markdown.lines().any(|line| line.trim_start().starts_with('|'));
+    if !is_table {
+        let overview = markdown.split("\n\n").next().unwrap_or(markdown.as_str());
+        let nonspace = overview.chars().filter(|ch| !ch.is_whitespace()).count();
+        if nonspace > TLDR_OVERVIEW_NONSPACE_CHARS {
+            return Err("TLDR overview exceeds 300 non-whitespace characters".to_owned());
+        }
     }
     Ok(markdown)
 }
@@ -2049,7 +2340,9 @@ impl CodeReviewController {
         if self.tldr_state == TldrState::Running {
             return Err(TldrError::AlreadyRunning.into());
         }
-        let prompt = tldr_prompt(snapshot, language)?;
+        let filesystem = self.main_application.capture_generation();
+        let roots = self.main_application.session().workspace_roots().roots().to_vec();
+        let prompt = tldr_prompt(snapshot, language, "")?;
         if let Some(task) = self.tldr_task.take() {
             task.abort();
         }
@@ -2060,9 +2353,35 @@ impl CodeReviewController {
         self.tldr_error = None;
         self.tldr_pending_markdown.clear();
         let fork = self.fork.clone();
+        let snapshot = snapshot.clone();
+        let language = language.map(str::to_owned);
         let snapshot_id = snapshot.snapshot_id.clone();
         let tx = self.event_tx.clone();
         self.tldr_task = Some(tokio::spawn(async move {
+            let prompt = match tokio::task::spawn_blocking(move || workspace_repo_facts(&filesystem, &roots)).await {
+                Ok(facts) => match tldr_prompt(&snapshot, language.as_deref(), &facts) {
+                    Ok(prompt) => prompt,
+                    Err(_) => {
+                        let _ = tx.send(ReviewInternalEvent::Tldr {
+                            generation,
+                            snapshot_id,
+                            result: Err("repository facts exceed the summary prompt limit".to_owned()),
+                        });
+                        return;
+                    }
+                },
+                Err(error) => {
+                    let _ = tx.send(ReviewInternalEvent::Tldr {
+                        generation,
+                        snapshot_id,
+                        result: Err(format!(
+                            "repository facts stopped: {}",
+                            redact_bounded(&error.to_string(), 200)
+                        )),
+                    });
+                    return;
+                }
+            };
             let result = run_tldr(&fork, prompt).await;
             let _ = tx.send(ReviewInternalEvent::Tldr {
                 generation,
@@ -13970,32 +14289,179 @@ mod tests {
         }
     }
 
+    fn git_at(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .current_dir(dir)
+            .arg("-c")
+            .arg("user.email=test@example.com")
+            .arg("-c")
+            .arg("user.name=Test")
+            .arg("-c")
+            .arg("commit.gpgsign=false")
+            .args(args)
+            .status()
+            .expect("git");
+        assert!(status.success(), "git command failed");
+    }
+
+    async fn policy_workspace_application(cwd: &std::path::Path, settings_json: &str) -> anyhow::Result<Application> {
+        use pi_agent::ThinkingLevel;
+        use pi_coding::{
+            ResourceDiscovery, ResourceManager, ResourceManagerOptions, SessionOptions, ToolSelection, WorkspaceRoots,
+        };
+        pi_ai::providers::register_default_faux();
+        let model = pi_ai::get_model("faux", "faux-1").expect("registered faux model");
+        let workspace = WorkspaceRoots::new(cwd, std::iter::empty::<&std::path::Path>()).expect("roots");
+        let session = pi_coding::Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
+            SessionOptions {
+                model,
+                cwd: cwd.to_path_buf(),
+                system_prompt: String::new(),
+                thinking_level: ThinkingLevel::Off,
+                api_key: "faux".into(),
+                compaction: None,
+                stream_options: Default::default(),
+                tools: Some(Vec::new()),
+                before_tool_call: None,
+                after_tool_call: None,
+                stream_fn: None,
+                auth_resolver: None,
+                auth_manager: None,
+            },
+            Vec::new(),
+            ToolSelection::default(),
+            ResourceDiscovery::Disabled,
+            workspace,
+            None,
+        )?;
+        let agent = tempfile::tempdir().expect("agent dir");
+        std::fs::write(agent.path().join("settings.json"), settings_json).expect("settings");
+        let session_dir = cwd.join(".pi-test-sessions");
+        std::fs::create_dir_all(&session_dir).expect("session dir");
+        session.set_session_dir(session_dir);
+        let mut options = ResourceManagerOptions::new(cwd);
+        options.agent_dir = agent.path().to_path_buf();
+        options.project_trust_override = Some(true);
+        options.disable_extensions = true;
+        options.disable_skills = true;
+        options.disable_prompt_templates = true;
+        options.disable_themes = true;
+        options.disable_context_files = true;
+        let resources = ResourceManager::new(options).expect("resources");
+        session.attach_resources(resources).await.expect("attach resources");
+        Ok(Application::from_runtime_candidate(pi_coding::ApplicationRuntimeCandidate::new(session)).await?)
+    }
+
+    #[tokio::test]
+    async fn workspace_repo_facts_omits_policy_denied_repositories() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let root = cwd.path();
+        let visible = root.join("visible");
+        std::fs::create_dir(&visible).expect("visible");
+        std::fs::write(visible.join("readme.txt"), "visible").expect("readme");
+        git_at(&visible, &["init"]);
+        git_at(&visible, &["add", "readme.txt"]);
+        git_at(&visible, &["commit", "-m", "visible-subject"]);
+        std::fs::write(visible.join("visible-untracked.txt"), "open").expect("visible untracked");
+        let private = visible.join("private");
+        std::fs::create_dir(&private).expect("private dir");
+        std::fs::write(private.join("secret-inside.txt"), "secret").expect("secret inside");
+        let old = visible.join("old");
+        std::fs::create_dir(&old).expect("old dir");
+        std::fs::write(old.join("secret.txt"), "secret").expect("old secret");
+        git_at(&visible, &["add", "old/secret.txt"]);
+        git_at(&visible, &["commit", "-m", "history"]);
+        git_at(&visible, &["mv", "old/secret.txt", "moved-secret.txt"]);
+
+        let blocked = root.join("blocked");
+        std::fs::create_dir(&blocked).expect("blocked");
+        std::fs::write(blocked.join("keep.txt"), "keep").expect("keep");
+        git_at(&blocked, &["init"]);
+        git_at(&blocked, &["add", "keep.txt"]);
+        git_at(&blocked, &["commit", "-m", "secret-subject"]);
+        std::fs::write(blocked.join("secret-untracked.txt"), "secret").expect("secret untracked");
+
+        let nested = root.join("hidden").join("nested");
+        std::fs::create_dir_all(&nested).expect("nested");
+        std::fs::write(nested.join("keep.txt"), "keep").expect("nested keep");
+        git_at(&nested, &["init"]);
+        git_at(&nested, &["add", "keep.txt"]);
+        git_at(&nested, &["commit", "-m", "secret-nested-subject"]);
+
+        let settings = serde_json::json!({
+            "sandbox": {
+                "mode": "workspace-write",
+                "deniedPaths": [root.join("blocked"), root.join("hidden"), visible.join("private"), visible.join("old")],
+            }
+        })
+        .to_string();
+        let app = match policy_workspace_application(root, &settings).await {
+            Ok(app) => app,
+            Err(error) => {
+                if crate::file_explorer::trusted_launcher_missing(&error) {
+                    eprintln!("skipping confined summary test: trusted sandbox launcher unavailable");
+                    return;
+                }
+                panic!("confined summary fixture failed: {error:#}");
+            }
+        };
+        let facts = workspace_repo_facts(&app.capture_generation(), app.session().workspace_roots().roots());
+        assert!(facts.contains("visible-subject"), "{facts}");
+        assert!(facts.contains("visible-untracked.txt"), "{facts}");
+        assert!(!facts.contains("secret-subject"), "{facts}");
+        assert!(!facts.contains("secret-untracked.txt"), "{facts}");
+        assert!(!facts.contains("secret-nested-subject"), "{facts}");
+        assert!(!facts.contains("repo: blocked"), "{facts}");
+        assert!(!facts.contains("repo: nested"), "{facts}");
+        assert!(!facts.contains("repo: hidden"), "{facts}");
+        assert!(!facts.contains("private"), "{facts}");
+        assert!(!facts.contains("old/secret"), "{facts}");
+        assert!(!facts.contains("moved-secret.txt"), "{facts}");
+    }
+
+    /// A 31st allowed status record is dropped at the 30-line cap and must
+    /// carry the truncated marker instead of reading as complete.
+    #[tokio::test]
+    async fn git_status_fact_lines_marks_dropped_line_at_cap() {
+        let fixture = test_controller(silent_review_stream()).await;
+        let repo = tempfile::tempdir().expect("repo");
+        git_at(repo.path(), &["init"]);
+        for index in 0..31 {
+            std::fs::write(repo.path().join(format!("bulk-{index:02}.txt")), "x").expect("bulk file");
+        }
+        let facts = git_status_fact_lines(&fixture.application.capture_generation(), repo.path(), 30);
+        assert!(facts.contains(&"truncated".to_owned()), "{facts:?}");
+        assert!(facts.iter().any(|line| line.contains("bulk-29")), "{facts:?}");
+        assert!(!facts.iter().any(|line| line.contains("bulk-30")), "{facts:?}");
+    }
+
     /// Every supplied hunk must fit, even when the captured snapshot is partial.
     #[test]
     fn tldr_prompt_rejects_oversize_diff_and_carries_truncation_flags() {
         let mut snapshot = two_hunk_snapshot();
         snapshot.files.truncate(1);
         snapshot.files[0].hunks.truncate(1);
-        let base = tldr_prompt(&snapshot, None).expect("small prompt fits");
+        let base = tldr_prompt(&snapshot, None, "").expect("small prompt fits");
         let extension = crate::code_review::MAX_DIFF_BYTES - base.len();
         snapshot.files[0].hunks[0].lines[0].text.push_str(&"a".repeat(extension));
-        let exact = tldr_prompt(&snapshot, None).expect("exact byte boundary fits");
+        let exact = tldr_prompt(&snapshot, None, "").expect("exact byte boundary fits");
         assert_eq!(exact.len(), crate::code_review::MAX_DIFF_BYTES);
         snapshot.files[0].hunks[0].lines[0].text.push('a');
-        assert_eq!(tldr_prompt(&snapshot, None), Err(TldrError::PromptTooLarge));
+        assert_eq!(tldr_prompt(&snapshot, None, ""), Err(TldrError::PromptTooLarge));
         snapshot.truncated = true;
         snapshot.files[0].hunks[0].lines[0].text = "x".repeat(crate::code_review::MAX_DIFF_BYTES);
         assert_eq!(
-            tldr_prompt(&snapshot, None),
+            tldr_prompt(&snapshot, None, ""),
             Err(TldrError::PromptTooLarge),
             "a truncated capture cannot authorize omission of supplied hunks",
         );
         snapshot.summary_complete = false;
         snapshot.files[0].hunks[0].lines[0].text = "small supplied row".to_owned();
-        let partial = tldr_prompt(&snapshot, None).expect("small partial capture fits");
+        let partial = tldr_prompt(&snapshot, None, "").expect("small partial capture fits");
         assert!(partial.contains("truncated: true\n"));
         assert!(partial.contains("totalsComplete: false\n"));
         assert!(partial.contains("small supplied row"));
+        assert!(partial.contains("Markdown table"));
     }
 
     /// Exact output boundary: oversize TLDR markdown is rejected, never sliced.
@@ -14008,6 +14474,11 @@ mod tests {
         assert_eq!(accept_tldr_markdown(&exact).expect("exact byte boundary"), exact);
         let over = format!("{exact}x");
         assert!(accept_tldr_markdown(&over).is_err(), "oversize output must be rejected, not sliced");
+        let prose = "x".repeat(301);
+        assert!(accept_tldr_markdown(&prose).is_err(), "a prose overview stays capped");
+        let mut table = String::from("| Repo | Uncommitted | Commits |\n| --- | --- | --- |\n");
+        table.push_str(&format!("| demo | {} | abc subject |\n", "x".repeat(400)));
+        assert!(accept_tldr_markdown(&table).is_ok(), "a summary table is not an overview paragraph");
     }
 
     /// A `Length`-terminated reply is a partial answer: it must fail and

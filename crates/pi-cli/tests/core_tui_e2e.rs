@@ -1672,14 +1672,14 @@ fn pty_code_review_tree_mouse_lifecycle() {
 
     let open_at = probe.len();
     probe.clear_composer();
-    probe.type_chars("/code-review");
+    probe.type_chars("/review");
     assert!(
         probe
             .wait_for_live_after(open_at, Duration::from_secs(8), |live| {
-                live.contains("/code-review")
+                live.contains("/review")
             })
             .is_some(),
-        "composer must show /code-review on the live screen: {}",
+        "composer must show /review on the live screen: {}",
         probe.live_screen()
     );
     probe.send(b"\r");
@@ -1871,11 +1871,11 @@ fn pty_code_review_two_revision_range() {
     // before submission, proving argument plumbing reaches the panel dispatch.
     let open_at = probe.len();
     probe.clear_composer();
-    probe.type_chars("/code-review review-base review-target");
+    probe.type_chars("/review review-base review-target");
     assert!(
         probe
             .wait_for_live_after(open_at, Duration::from_secs(8), |live| {
-                live.contains("/code-review review-base review-target")
+                live.contains("/review review-base review-target")
             })
             .is_some(),
         "composer must show the two-revision command on the live screen: {}",

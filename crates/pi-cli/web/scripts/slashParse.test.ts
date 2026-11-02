@@ -45,21 +45,21 @@ function check(name, cond, detail) {
     const p = parseSupportedCommand('/skill');
     return p && p.name === 'skill' && p.args === '';
   })());
-  check('code-review bare', (() => {
-    const p = parseSupportedCommand('/code-review');
-    return p && p.name === 'code-review' && p.args === '';
+  check('review bare', (() => {
+    const p = parseSupportedCommand('/review');
+    return p && p.name === 'review' && p.args === '';
   })());
-  check('code-review two revs', (() => {
-    const p = parseSupportedCommand('/code-review main feature');
-    return p && p.name === 'code-review' && p.args === 'main feature';
+  check('review two revs', (() => {
+    const p = parseSupportedCommand('/review main feature');
+    return p && p.name === 'review' && p.args === 'main feature';
   })());
-  check('commit bare parses as a supported command', (() => {
-    const p = parseSupportedCommand('/commit');
-    return p && p.name === 'commit' && p.args === '';
+  check('show bare parses as a supported command', (() => {
+    const p = parseSupportedCommand('/show');
+    return p && p.name === 'show' && p.args === '';
   })());
-  check('commit ref tail stays intact for dispatch', (() => {
-    const p = parseSupportedCommand('/commit HEAD~1');
-    return p && p.name === 'commit' && p.args === 'HEAD~1';
+  check('show ref tail stays intact for dispatch', (() => {
+    const p = parseSupportedCommand('/show HEAD~1');
+    return p && p.name === 'show' && p.args === 'HEAD~1';
   })());
   check('loop with args', (() => {
     const p = parseSupportedCommand('/loop 5m check deploy');
@@ -150,43 +150,38 @@ function check(name, cond, detail) {
     skillBare.type === 'error' && /usage: \/skill/.test(skillBare.message),
   );
 
-  const crBare = resolveSlashAction('code-review', '');
+  const reviewBare = resolveSlashAction('review', '');
   check(
-    'code-review bare -> open no revs',
-    crBare.type === 'code-review' && !crBare.from && !crBare.to && !crBare.includeWorkingTree,
+    'review bare -> raw empty operands',
+    reviewBare.type === 'review' && reviewBare.operands.length === 0,
+  );
+  const reviewOne = resolveSlashAction('review', 'psy-node');
+  check(
+    'review one operand stays raw for the host directory probe',
+    reviewOne.type === 'review' && reviewOne.operands.join(',') === 'psy-node',
+  );
+  const reviewThree = resolveSlashAction('review', 'a b c');
+  check(
+    'review operands stay raw at any arity (the host owns the usage error)',
+    reviewThree.type === 'review' && reviewThree.operands.join(',') === 'a,b,c',
   );
 
-  const crTwo = resolveSlashAction('code-review', 'abc def');
+  const showBare = resolveSlashAction('show', '');
   check(
-    'code-review two revs',
-    crTwo.type === 'code-review' && crTwo.from === 'abc' && crTwo.to === 'def' && !crTwo.includeWorkingTree,
+    'show bare -> chooser action without a ref',
+    showBare.type === 'show' && showBare.ref === undefined,
   );
-
-  const crOne = resolveSlashAction('code-review', 'only');
+  const showRef = resolveSlashAction('show', 'abc123def');
   check(
-    'code-review one rev -> base-to-working-tree',
-    crOne.type === 'code-review' && crOne.from === 'only' && !crOne.to && crOne.includeWorkingTree === true,
+    'show single ref -> direct pinned scope',
+    showRef.type === 'show' && showRef.ref === 'abc123def',
   );
-
-  const crThree = resolveSlashAction('code-review', 'a b c');
-  check('code-review three revs -> error', crThree.type === 'error' && /usage: \/code-review/.test(crThree.message));
-
-  const commitBare = resolveSlashAction('commit', '');
+  const showSpaced = resolveSlashAction('show', '  HEAD~1  ');
+  check('show ref is a trimmed single token', showSpaced.type === 'show' && showSpaced.ref === 'HEAD~1');
+  const showExtra = resolveSlashAction('show', 'a b');
   check(
-    'commit bare -> chooser action without a ref',
-    commitBare.type === 'commit' && commitBare.ref === undefined,
-  );
-  const commitRef = resolveSlashAction('commit', 'abc123def');
-  check(
-    'commit single ref -> direct pinned scope',
-    commitRef.type === 'commit' && commitRef.ref === 'abc123def',
-  );
-  const commitSpaced = resolveSlashAction('commit', '  HEAD~1  ');
-  check('commit ref is a trimmed single token', commitSpaced.type === 'commit' && commitSpaced.ref === 'HEAD~1');
-  const commitExtra = resolveSlashAction('commit', 'a b');
-  check(
-    'commit extra args -> TUI-parity usage error',
-    commitExtra.type === 'error' && commitExtra.message === 'Usage: /commit [<ref>]',
+    'show extra args -> TUI-parity usage error',
+    showExtra.type === 'error' && showExtra.message === 'Usage: /show [<ref>]',
   );
 
   const unknown = resolveSlashAction('workflow', 'x');

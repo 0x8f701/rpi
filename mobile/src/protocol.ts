@@ -3262,7 +3262,7 @@ export function parseCodeReviewCommits(data: unknown): CodeReviewCommitsData | n
 // mobile/src/screens/ReviewPanel.tsx.
 //
 // Mirrors crates/pi-cli/web/src/codeReview.ts so the Android workspace behaves
-// like /web: the same `/code-review` scope grammar, the same fail-closed
+// like /web: the same `/review` scope grammar, the same fail-closed
 // projection of the shared review snapshot, the same hunk identity a
 // comment/abort targets, the same bounded per-file diff paging, and the same
 // idle-vs-batch snapshot polling cadence.
@@ -4116,7 +4116,7 @@ export function buildCodeReviewStopPayload(
   return { type: 'code_review_stop', operation };
 }
 
-export const CODE_REVIEW_SCOPE_USAGE = 'usage: /code-review [<base> | <from> <to>]';
+export const CODE_REVIEW_SCOPE_USAGE = 'usage: /review [<base> | <from> <to>]';
 
 export type CodeReviewScopeMode = 'workingTree' | 'base' | 'range' | 'commit';
 

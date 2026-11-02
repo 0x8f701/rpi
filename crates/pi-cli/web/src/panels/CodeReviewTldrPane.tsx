@@ -20,6 +20,9 @@ export interface CodeReviewTldrPaneProps {
   state: CodeReviewTldrState;
   /** Session stamped as the markdown path owner. Empty leaves chips inert. */
   sessionId?: string;
+  /** The reviewing repository override, stamped `data-review-repo` so
+   *  repo-relative citations resolve through it. */
+  reviewRepo?: string;
   onStop: () => void;
   onClose: () => void;
   /** Fires after Markdown/Mermaid/image layout mutations. */
@@ -38,6 +41,7 @@ export function CodeReviewTldrPane({
   markdown,
   state,
   sessionId = '',
+  reviewRepo,
   onStop,
   onClose,
   onLayoutChange,
@@ -55,6 +59,7 @@ export function CodeReviewTldrPane({
       aria-busy={running}
       data-tldr-state={state}
       data-session-id={sessionId}
+      data-review-repo={reviewRepo}
     >
       <div className="code-review-tldr__head">
         <span className="code-review-tldr__title">Summary</span>

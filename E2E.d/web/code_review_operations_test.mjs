@@ -564,7 +564,7 @@ async function journey() {
     }, env.RPI_TOKEN || '');
     await page.goto(env.RPI_URL, { waitUntil: 'domcontentloaded' });
     await page.locator('#send-btn:not([disabled])').waitFor();
-    await page.fill('#prompt-input', '/code-review HEAD'); await page.press('#prompt-input', 'Enter');
+    await page.fill('#prompt-input', '/review HEAD'); await page.press('#prompt-input', 'Enter');
     await page.locator('#code-review-panel').waitFor(); await select(files.critical);
     await page.locator('button.code-review__hunk-header').click();
     const language = page.getByLabel('Auto review reply language');
@@ -918,7 +918,7 @@ async function journey() {
       const receivedBefore = (await capture()).received.length;
       await page.getByRole('button', { name: 'Close code review panel', exact: true }).click();
       await page.locator('#code-review-panel').waitFor({ state: 'detached' });
-      await page.fill('#prompt-input', '/code-review HEAD'); await page.press('#prompt-input', 'Enter');
+      await page.fill('#prompt-input', '/review HEAD'); await page.press('#prompt-input', 'Enter');
       await page.locator('#code-review-panel').waitFor();
       await openHunk(files.critical);
       await wait(() => {

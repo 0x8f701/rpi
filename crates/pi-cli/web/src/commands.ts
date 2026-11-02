@@ -12,7 +12,7 @@
  * marks `requiresArguments`), and (e) parse a submitted input line back into a
  * supported command + argument tail for Main's dispatch wiring. No second
  * command catalog is hardcoded — the Web execution surface is the 10-name
- * builtin allowlist (compact/skill/code-review/commit/loop/goal/ps/jobs/irc/
+ * builtin allowlist (compact/skill/review/show/loop/goal/ps/jobs/irc/
  * todo) plus loaded skill candidates and trusted `source === "extension"`
  * commands.
  */
@@ -40,8 +40,8 @@ export interface CommandEntry {
 export const WEB_SUPPORTED_COMMANDS: Record<string, true> = {
   compact: true,
   skill: true,
-  'code-review': true,
-  commit: true,
+  review: true,
+  show: true,
   loop: true,
   goal: true,
   ps: true,

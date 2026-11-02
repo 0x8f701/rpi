@@ -100,13 +100,14 @@ android {
             keyPassword 'android'
         }
         release {
-            if (!keystorePropertiesFile.exists()) {
-                throw new GradleException("Release signing requires android/keystore.properties (copy keystore.properties.example; do not commit secrets).")
-            }
-            keyAlias keystoreProperties['keyAlias']
-            keyPassword keystoreProperties['keyPassword']
-            storeFile rootProject.file(keystoreProperties['storeFile'])
-            storePassword keystoreProperties['storePassword']
+            def releaseStore = keystorePropertiesFile.exists() ? keystoreProperties['storeFile'] : 'app/debug.keystore'
+            def releaseAlias = keystorePropertiesFile.exists() ? keystoreProperties['keyAlias'] : 'androiddebugkey'
+            def releaseStorePassword = keystorePropertiesFile.exists() ? keystoreProperties['storePassword'] : 'android'
+            def releaseKeyPassword = keystorePropertiesFile.exists() ? keystoreProperties['keyPassword'] : 'android'
+            storeFile rootProject.file(releaseStore)
+            keyAlias releaseAlias
+            storePassword releaseStorePassword
+            keyPassword releaseKeyPassword
         }
     }
     buildTypes {

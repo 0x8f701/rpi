@@ -8,7 +8,6 @@ import {
   nativeEventShiftKey,
   nextPasteEnterGuard,
 } from '../composerPaste';
-import { safeText } from '../redact';
 import { nextId } from '../transcript';
 import { createScrollPin, type ScrollPinController } from '../scrollPin';
 import {
@@ -188,10 +187,15 @@ export function FileConversationDock({
       data-workspace-cwd={ownerCwd}
     >
       <div className="file-conversation__head">
-        <span>File</span>
-        <span className="file-conversation__path" title={snapshot?.path ?? ''}>
-          {safeText(snapshot?.path ?? 'No file')}
-        </span>
+        <button
+          type="button"
+          className="file-conversation__expand"
+          title="Expand Ask"
+          aria-label="Expand Ask"
+          onClick={() => document.querySelector('.file-explorer')?.classList.toggle('file-explorer--ask-expanded')}
+        >
+          ⛶
+        </button>
       </div>
       {disclosure && (
         <div className="file-conversation__context">{disclosure}</div>
@@ -202,9 +206,7 @@ export function FileConversationDock({
         aria-live="polite"
         onScroll={onTranscriptScroll}
       >
-        {entries.length === 0 ? (
-          <div className="side-chat__empty">Ask about this file. The conversation stays with this file tab.</div>
-        ) : (
+        {entries.length === 0 ? null : (
           entries.map((entry) => (
             <ConversationEntryView
               key={entry.id}

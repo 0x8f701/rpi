@@ -70,6 +70,9 @@ export interface CodeReviewThreadDockProps {
    *  comment body resolve against an owner (the click dispatcher requires a
    *  non-empty `data-session-id` ancestor). */
   sessionId: string | null;
+  /** The reviewing repository override, stamped `data-review-repo` beside
+   *  every markdown owner stamp so repo-relative citations resolve. */
+  reviewRepo?: string;
   snapshotId: string;
   /** Snapshot's validated per-hunk review findings; the dock derives the
    *  selected hunk's issue list from it (null = unreviewed). */
@@ -139,6 +142,7 @@ export function CodeReviewThreadDock({
   isHidden,
   busy,
   sessionId,
+  reviewRepo,
   snapshotId,
   reviewResults,
   selectedFinding,
@@ -202,10 +206,10 @@ export function CodeReviewThreadDock({
    *  text instead of the whole thread. No `data-workspace-cwd` is stamped:
    *  the review wire never carries the repository root (the snapshot builder
    *  omits it), so an ABSOLUTE path reference in review prose stays inert —
-   *  the same behavior as a transcript click with no authoritative cwd. */
+   *  the same behavior as a transcript click with no authoritative cwd. The
+   *  review's own repository override (`/review <repo>`) IS stamped, so its
+   *  repo-relative citations resolve through that prefix. */
   const ownerSessionId = sessionId ?? '';
-
-
   // The selected hunk's review-finding buttons, in stored order; rendered
   // above the manual thread. Null when the hunk is unreviewed or clean.
   const findingButtons = useMemo(() => {
@@ -285,6 +289,7 @@ export function CodeReviewThreadDock({
               className="code-review__thread-content"
               ref={threadContentRef}
               data-session-id={ownerSessionId}
+              data-review-repo={reviewRepo}
             >
               {selectedThread?.stale && (
                 <div className="code-review__thread-stale">
@@ -304,6 +309,7 @@ export function CodeReviewThreadDock({
                     comment.partial ? ' is-partial' : ''
                   }`}
                   data-session-id={ownerSessionId}
+                  data-review-repo={reviewRepo}
                 >
                   <span className="code-review__comment-role">
                     {safeText(commentRoleLabel(comment.role, comment.model))}
@@ -325,6 +331,7 @@ export function CodeReviewThreadDock({
                 <div
                   className="code-review__comment code-review__comment--assistant is-partial"
                   data-session-id={ownerSessionId}
+                  data-review-repo={reviewRepo}
                 >
                   <span className="code-review__comment-role">
                     {safeText(commentRoleLabel('assistant', streamingModel))}
@@ -340,6 +347,7 @@ export function CodeReviewThreadDock({
                 <div
                   className="code-review__comment code-review__comment--assistant is-partial"
                   data-session-id={ownerSessionId}
+                  data-review-repo={reviewRepo}
                 >
                   <span className="code-review__comment-role">
                     {safeText(commentRoleLabel('assistant', streamingModel))}
@@ -361,7 +369,7 @@ export function CodeReviewThreadDock({
               onInput={(e) => onComposerInput(e.currentTarget)}
               onBlur={onDraftCommit}
               onKeyDown={onComposerKeyDown}
-              placeholder="Comment on this hunk…"
+              placeholder="Send on this hunk…"
               rows={3}
               aria-label="Hunk comment"
               disabled={composerLocked}
@@ -451,10 +459,10 @@ export function CodeReviewThreadDock({
                   className="code-review__action code-review__action--send"
                   disabled={composerLocked}
                   onClick={onSubmitComment}
-                  title="Submit comment (Enter)"
+                  title="Send (Enter)"
                 >
                   <span aria-hidden="true">➤</span>
-                  Comment
+                  Send
                 </button>
               )}
               <span className="code-review__composer-hint">

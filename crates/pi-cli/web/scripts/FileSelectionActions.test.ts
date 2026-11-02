@@ -154,21 +154,18 @@ const html = renderToStaticMarkup(createElement(FileSelectionActions, {
   onBlame: () => {},
   onClose: () => {},
 }));
-check('toolbar sits in its own container with Ask and Blame', html.includes('data-testid="file-selection-actions"')
+check('toolbar sits in its own container with Blame', html.includes('data-testid="file-selection-actions"')
   && html.includes('role="toolbar"')
-  && html.includes('aria-label="Ask"')
   && html.includes('aria-label="Blame"')
-  && html.includes('>Ask<')
   && html.includes('>Blame<'));
-check('pending disables both actions', html.includes('aria-busy="true"')
-  && (html.match(/disabled=""/g) ?? []).length === 2);
+check('pending disables Blame', html.includes('aria-busy="true"')
+  && (html.match(/disabled=""/g) ?? []).length === 1);
 check('null commit renders Uncommitted and the source line is text', html.includes('>Uncommitted<')
   && html.includes('>Ada Lovelace<')
   && html.includes('>const b = 2;<')
   && html.includes('data-line="12"'));
 check('close is a quiet control', html.includes('aria-label="Close selection"') && html.includes('>\u00D7</button>'));
-check('floating toolbar keeps Ask, Blame, and close reachable by name', html.includes('data-testid="file-selection-ask"')
-  && html.includes('data-testid="file-selection-blame"')
+check('floating toolbar keeps Blame and close reachable by name', html.includes('data-testid="file-selection-blame"')
   && html.includes('data-testid="file-selection-close"')
   && html.includes('data-testid="file-selection-blame-list"')
   && html.includes('aria-label="Close selection"'));

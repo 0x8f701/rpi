@@ -339,8 +339,8 @@ fn primary_command_surface_is_help_and_completion_only() {
             "loop",
             "goal",
             "workflow",
-            "commit",
-            "code-review",
+            "show",
+            "review",
             "btw",
             "queue",
             "live",
@@ -389,7 +389,7 @@ fn primary_command_surface_is_help_and_completion_only() {
         "workflow must appear exactly once in the primary surface"
     );
     assert!(is_primary_command("goal"));
-    assert!(is_primary_command("commit"));
+    assert!(is_primary_command("show"));
     assert!(is_primary_command("workflow"));
     assert!(
         is_primary_command("persona"),
@@ -1488,7 +1488,7 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
             "code-review panel must load the tracked working-tree change: {:?}",
             panel.snapshot()
         );
-        covered.insert("code-review");
+        covered.insert("review");
     }
     // commit — parse outcomes (bare picker / one ref / usage error) plus a
     // pinned single-commit load on a real repo; reuses the code-review
@@ -1511,9 +1511,9 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
         );
         assert_eq!(
             parse_commit_inspect_invocation(Some("a b")),
-            Err("Usage: /commit [<ref>]".to_owned())
+            Err("Usage: /show [<ref>]".to_owned())
         );
-        assert!(is_primary_command("commit"));
+        assert!(is_primary_command("show"));
 
         let git = |args: &[&str]| {
             let mut command = Command::new("git");
@@ -1581,7 +1581,7 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
             }
             other => panic!("expected a pinned commit scope: {other:?}"),
         }
-        covered.insert("commit");
+        covered.insert("show");
     }
 
     // btw — create the detached read-only side controller and cleanly shut it down.

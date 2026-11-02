@@ -4731,7 +4731,7 @@ const normalizeCodeReviewCommits = codeReviewModule.normalizeCodeReviewCommits;
   await pressKey('Enter');
   check(
     'enter with a multi-token tail errors instead of picking',
-    errors.length === 1 && errors[0] === 'Usage: /commit [<ref>]' && picked.length === 1,
+    errors.length === 1 && errors[0] === 'Usage: /show [<ref>]' && picked.length === 1,
   );
 
   await typeInSearch('');
@@ -4809,7 +4809,7 @@ const normalizeCodeReviewCommits = codeReviewModule.normalizeCodeReviewCommits;
   check(
     'the rejected scope toasts exactly once with the exclusion message and never enters the busy state',
     toasts.length === 1
-      && toasts[0].message === 'code_review_open commit excludes from, to, and includeWorkingTree'
+      && toasts[0].message === 'code_review_open commit excludes from, to, includeWorkingTree, and repo'
       && toasts[0].error === true
       && mini.document.body.querySelector('.code-review__loader') === null,
     JSON.stringify(toasts),

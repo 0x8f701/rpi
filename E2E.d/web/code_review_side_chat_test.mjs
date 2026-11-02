@@ -24,7 +24,7 @@
 //   A1  the fixture session is the authority: the active sidebar session id
 //       captured at bootstrap is returned as the owner of a get_state
 //       response (target session == fixture session)
-//   A2  /code-review opens and settles with a REAL diff: the panel renders
+//   A2  /review opens and settles with a REAL diff: the panel renders
 //       the HEAD→working tree comparison label and the controlled dirty
 //       fixture file appears as a selectable file row
 //   A3  a post-code-review get_state round-trips on the SAME socket
@@ -245,8 +245,8 @@ async function main() {
     }
     await page.screenshot({ path: `${evidence}/01-connected.png`, fullPage: true });
 
-    // A2: /code-review opens and settles with a real diff of the dirty file.
-    await page.fill('#prompt-input', '/code-review');
+    // A2: /review opens and settles with a real diff of the dirty file.
+    await page.fill('#prompt-input', '/review');
     await page.press('#prompt-input', 'Enter');
     await waitFor(
       page,
@@ -471,7 +471,7 @@ async function main() {
       consoleErrors: cleanConsole,
     }, null, 2));
 
-    console.log('web-code-review-side-chat: PASSED (A1 fixture-session get_state owner; A2 /code-review opens + real dirty-file diff; A3 post-CR get_state on the same generation; A4 side chat panel mounts + named chat created + active tab + composer ready; A5 real 1006 kill -> exactly one close/toast -> same-port --resume respawn -> recovery generation + panel stays mounted + toast clears; A6 zero browser console/page errors)');
+    console.log('web-code-review-side-chat: PASSED (A1 fixture-session get_state owner; A2 /review opens + real dirty-file diff; A3 post-CR get_state on the same generation; A4 side chat panel mounts + named chat created + active tab + composer ready; A5 real 1006 kill -> exactly one close/toast -> same-port --resume respawn -> recovery generation + panel stays mounted + toast clears; A6 zero browser console/page errors)');
   } finally {
     await browser.close().catch(() => {});
   }

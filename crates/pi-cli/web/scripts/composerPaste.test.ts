@@ -33,8 +33,8 @@ const twoLines = planLargeTextPaste('line one\nline two');
 check('two-line paste stays native', twoLines.type === 'native');
 check('one-line paste stays native', planLargeTextPaste('just one line').type === 'native');
 check('crlf two-line paste stays native', planLargeTextPaste('one\r\ntwo').type === 'native');
-check('code-review two-commit paste stays native', planLargeTextPaste('/code-review abc123 def456').type === 'native');
-check('code-review newline-separated commits stay native', planLargeTextPaste('/code-review abc123\ndef456').type === 'native');
+check('review two-commit paste stays native', planLargeTextPaste('/review abc123 def456').type === 'native');
+check('review newline-separated commits stay native', planLargeTextPaste('/review abc123\ndef456').type === 'native');
 check('line-count helper treats a\\nb as two lines', logicalLineCount('a\nb') === 2);
 check('empty text is zero lines', logicalLineCount('') === 0);
 

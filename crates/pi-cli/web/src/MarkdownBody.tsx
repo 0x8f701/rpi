@@ -19,12 +19,14 @@ import { renderMarkdown, hydrateMermaid } from './markdown';
 function MarkdownBodyInner({
   text,
   pathContext,
+  workspaceCwd,
   className,
   onLayoutChange,
   bodyRef,
 }: {
   text: string;
   pathContext?: string;
+  workspaceCwd?: string;
   className?: string;
   onLayoutChange?: () => void;
   /** Optional caller-owned ref: fold wrappers (IRC / hub) observe the root
@@ -41,7 +43,7 @@ function MarkdownBodyInner({
     },
     [bodyRef],
   );
-  const html = useMemo(() => renderMarkdown(text, pathContext ?? text), [text, pathContext]);
+  const html = useMemo(() => renderMarkdown(text, pathContext ?? text, workspaceCwd), [text, pathContext, workspaceCwd]);
   useEffect(() => {
     const node = innerRef.current;
     if (!node) return;

@@ -39,7 +39,7 @@
 //       dialog)
 //   C2  the ASSISTANT review reply (mock-routed markdown matrix) renders the
 //       same markdown + literal-hostile contract in its own comment
-//   L1  /code-review HEAD (single base) sends code_review_open with
+//   L1  /review HEAD (single base) sends code_review_open with
 //       from=HEAD, includeWorkingTree=true, and no `to` key
 //       (!Object.hasOwn(frame, 'to')); the comparison label is HEAD →
 //       working tree
@@ -66,7 +66,7 @@
 //       tab click drives the single-pane narrow UI (active tab flips, only
 //       the active pane is visible), Back-to-diff returns from the Thread
 //       pane, and resizing back to desktop removes the tab bar
-//   D1  a second /code-review open, whose FIRST code_review_open response is
+//   D1  a second /review open, whose FIRST code_review_open response is
 //       withheld RPI_OPEN_DELAY_MS (>30s — past the old fast-ack horizon that
 //       used to classify the still-OPEN socket as transport-stale and close
 //       it with a 4001), does NOT tear down the transport: the WebSocket
@@ -654,10 +654,10 @@ async function main() {
       'WS did not reach connected'
     );
 
-    // L1: /code-review HEAD (single base) → from=HEAD + includeWorkingTree,
+    // L1: /review HEAD (single base) → from=HEAD + includeWorkingTree,
     // no `to`; comparison label is HEAD → working tree.
     const openBefore = socketFrames.sent.length;
-    await page.fill('#prompt-input', '/code-review HEAD');
+    await page.fill('#prompt-input', '/review HEAD');
     await page.press('#prompt-input', 'Enter');
     await waitFor(page, () => document.getElementById('code-review-panel') !== null, 'code-review panel did not open');
     await waitFor(
@@ -694,7 +694,7 @@ async function main() {
       await page.waitForTimeout(100);
     }
     if (!headOpen || headOpen.from !== 'HEAD' || headOpen.includeWorkingTree !== true || Object.hasOwn(headOpen, 'to')) {
-      fail(`L1: /code-review HEAD must send code_review_open from=HEAD includeWorkingTree=true with no to key (got ${JSON.stringify(headOpen)})`);
+      fail(`L1: /review HEAD must send code_review_open from=HEAD includeWorkingTree=true with no to key (got ${JSON.stringify(headOpen)})`);
     }
     await page.screenshot({ path: `${evidence}/code-review-base-head.png`, fullPage: true });
 
@@ -1662,7 +1662,7 @@ async function main() {
       30000
     );
 
-    await page.fill('#prompt-input', '/code-review');
+    await page.fill('#prompt-input', '/review');
     await page.press('#prompt-input', 'Enter');
     await waitFor(
       page,
@@ -2015,7 +2015,7 @@ async function main() {
     };
     fs.writeFileSync(`${evidence}/code-review-delayed-open.json`, JSON.stringify(delaySummary, null, 2));
 
-    console.log('web-code-review-paging: PASSED (nested tree collapse/expand; authoritative header +N/-M totals with no `· truncated` chip; >4000-line diff paged with NO Load buttons — eager backend pages with exact cursor progression 0→…→8000, scroll-grown DOM window 4000→8200 to the terminal line, no banner/status; >20000-line UI-cap fixture pinned at 20000 with the precise Loaded 20,000 of 44,000 status; per-file byte-cap fixture loaded on selection with byteCapped=true on every page, exact nextCursor-linked chain, terminal hasMore=false over the parsed count, and the distinct byte-cap status; empty globally-truncated placeholder auto-loads via one terminal backend page with no truncated marker; loaded placeholder hunk beyond global truncation is selectable + commentable with an accepted thread card; user + assistant comment markdown bold/list/rust fence with hostile HTML literal and no side effect; /code-review HEAD single-base open + tool-path live Abort/dot then terminal idle + late rewritten snapshot stays idle + reconnect idle; responsive resize across the 900px breakpoint surfaces the Files/Diff/Thread tab bar, tab clicks drive the single-pane narrow UI, Back-to-diff returns, resize back removes the tab bar; >30s delayed code_review_open keeps the SAME socket generation alive — zero closes, mid + late get_state round-trips, JSON pong, no toast/inline error, panel settles to HEAD→working tree; real 1006 drop then produces exactly one close + one transport toast, reconnect advances the generation and the panel reconciles the retained controller with zero browser errors)');
+    console.log('web-code-review-paging: PASSED (nested tree collapse/expand; authoritative header +N/-M totals with no `· truncated` chip; >4000-line diff paged with NO Load buttons — eager backend pages with exact cursor progression 0→…→8000, scroll-grown DOM window 4000→8200 to the terminal line, no banner/status; >20000-line UI-cap fixture pinned at 20000 with the precise Loaded 20,000 of 44,000 status; per-file byte-cap fixture loaded on selection with byteCapped=true on every page, exact nextCursor-linked chain, terminal hasMore=false over the parsed count, and the distinct byte-cap status; empty globally-truncated placeholder auto-loads via one terminal backend page with no truncated marker; loaded placeholder hunk beyond global truncation is selectable + commentable with an accepted thread card; user + assistant comment markdown bold/list/rust fence with hostile HTML literal and no side effect; /review HEAD single-base open + tool-path live Abort/dot then terminal idle + late rewritten snapshot stays idle + reconnect idle; responsive resize across the 900px breakpoint surfaces the Files/Diff/Thread tab bar, tab clicks drive the single-pane narrow UI, Back-to-diff returns, resize back removes the tab bar; >30s delayed code_review_open keeps the SAME socket generation alive — zero closes, mid + late get_state round-trips, JSON pong, no toast/inline error, panel settles to HEAD→working tree; real 1006 drop then produces exactly one close + one transport toast, reconnect advances the generation and the panel reconciles the retained controller with zero browser errors)');
   } finally {
     await browser.close().catch(() => {});
   }

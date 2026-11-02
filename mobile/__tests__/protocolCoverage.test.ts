@@ -1433,7 +1433,7 @@ describe('commit view wire', () => {
       ok: true,
       command: { type: 'code_review_open', from: 'main', to: 'HEAD' },
     });
-    expect(CODE_REVIEW_SCOPE_USAGE).toBe('usage: /code-review [<base> | <from> <to>]');
+    expect(CODE_REVIEW_SCOPE_USAGE).toBe('usage: /review [<base> | <from> <to>]');
   });
 
   it('reads code_review_commits and refuses malformed or duplicated rows', () => {
