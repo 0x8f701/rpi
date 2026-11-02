@@ -1,4 +1,4 @@
-//! Upstream-compatible custom `models.json` and `auth.json` request configuration.
+//! rpi `models.json` and `auth.json` request configuration.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
@@ -6,16 +6,19 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, RwLock};
 
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{Context as _, Result, anyhow, bail, ensure};
+use futures_util::FutureExt as _;
 use serde::Deserialize;
 use serde_json::Value;
 
 use pi_ai::{
-    Model, ModelCost, ThinkingLevelMap, builtin_models, get_env_api_key, load_builtin_models,
-    replace_registered_models,
+    HttpExecutor, HttpMethod, HttpRequest, HttpResponse, Model, ModelCost, ResolvedHttpHost,
+    ResolvedHttpScheme, SharedHttpExecutor, ThinkingLevelMap, builtin_models, get_env_api_key,
+    load_builtin_models, replace_registered_models,
 };
 
-const ENV_AGENT_DIR: &str = "PI_CODING_AGENT_DIR";
+const ENV_PI_CODING_AGENT_DIR: &str = "PI_CODING_AGENT_DIR";
+const ENV_RPI_HOME: &str = "RPI_HOME";
 const MAX_CONFIG_FILE_BYTES: usize = 8 * 1024 * 1024;
 type ModelKey = (String, String);
 
@@ -107,18 +110,32 @@ impl From<ModelRequestAuth> for pi_coding::RequestAuth {
             headers: auth.headers,
             env: auth.env,
             available_model_ids: auth.available_model_ids,
+            kind: if auth.stored_oauth {
+                pi_coding::RequestAuthKind::StoredOAuth
+            } else {
+                pi_coding::RequestAuthKind::ApiKeyOrHeaders
+            },
         }
     }
 }
 
 #[must_use]
-pub fn session_auth_resolver(explicit_key: Option<String>) -> pi_coding::SessionAuthResolver {
+pub fn session_auth_resolver(
+    explicit_key: Option<String>,
+    auth_manager: std::sync::Arc<pi_coding::AuthManager>,
+) -> pi_coding::SessionAuthResolver {
     std::sync::Arc::new(move |model| {
         let explicit_key = explicit_key.clone();
+        let auth_manager = auth_manager.clone();
         Box::pin(async move {
-            resolve_available_model_request_auth_async(&model, explicit_key.as_deref(), None)
-                .await
-                .map(Into::into)
+            resolve_available_model_request_auth_with_manager(
+                &model,
+                explicit_key.as_deref(),
+                None,
+                &auth_manager,
+            )
+            .await
+            .map(Into::into)
         })
     })
 }
@@ -153,11 +170,26 @@ pub async fn resolve_available_model_request_auth_async(
     Ok(auth)
 }
 
+async fn resolve_available_model_request_auth_with_manager(
+    model: &Model,
+    explicit_key: Option<&str>,
+    env: Option<&HashMap<String, String>>,
+    auth_manager: &pi_coding::AuthManager,
+) -> Result<ModelRequestAuth> {
+    let auth =
+        resolve_model_request_auth_with_manager(model, explicit_key, env, auth_manager).await?;
+    ensure_model_available_for_request_auth(model, &auth)?;
+    Ok(auth)
+}
+
 pub async fn filter_models_for_resolved_auth_async(
     models: Vec<Model>,
     env: Option<&HashMap<String, String>>,
 ) -> Vec<Model> {
-    let Some(probe) = models.iter().find(|model| model.provider == "github-copilot") else {
+    let Some(probe) = models
+        .iter()
+        .find(|model| model.provider == "github-copilot")
+    else {
         return models;
     };
     let filter = if has_configured_auth(probe) {
@@ -200,14 +232,17 @@ pub fn auth_json_path() -> Option<PathBuf> {
 
 fn agent_config_path(file_name: &str) -> Option<PathBuf> {
     let override_dir = AGENT_DIR_OVERRIDE.with(|override_dir| override_dir.borrow().clone());
-    let env_dir = std::env::var_os(ENV_AGENT_DIR)
+    let agent_dir_env = std::env::var_os(ENV_PI_CODING_AGENT_DIR)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let rpi_home_env = std::env::var_os(ENV_RPI_HOME)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from);
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .filter(|value| !value.is_empty())
         .map(PathBuf::from);
-    resolve_agent_config_path(override_dir, env_dir, home, file_name)
+    resolve_agent_config_path(override_dir, agent_dir_env, rpi_home_env, home, file_name)
 }
 
 #[must_use]
@@ -216,7 +251,7 @@ pub fn resolve_models_json_path(
     env_dir: Option<PathBuf>,
     home: Option<PathBuf>,
 ) -> Option<PathBuf> {
-    resolve_agent_config_path(override_dir, env_dir, home, "models.json")
+    resolve_agent_config_path(override_dir, env_dir, None, home, "models.json")
 }
 
 #[must_use]
@@ -225,18 +260,24 @@ pub fn resolve_auth_json_path(
     env_dir: Option<PathBuf>,
     home: Option<PathBuf>,
 ) -> Option<PathBuf> {
-    resolve_agent_config_path(override_dir, env_dir, home, "auth.json")
+    resolve_agent_config_path(override_dir, env_dir, None, home, "auth.json")
 }
 
 fn resolve_agent_config_path(
     override_dir: Option<PathBuf>,
-    env_dir: Option<PathBuf>,
+    agent_dir_env: Option<PathBuf>,
+    rpi_home_env: Option<PathBuf>,
     home: Option<PathBuf>,
     file_name: &str,
 ) -> Option<PathBuf> {
+    let fallback = home
+        .filter(|directory| !directory.as_os_str().is_empty())
+        .map(|directory| directory.join(".rpi"));
     override_dir
-        .or(env_dir)
-        .or_else(|| home.map(|directory| directory.join(".pi").join("agent")))
+        .filter(|directory| !directory.as_os_str().is_empty())
+        .or_else(|| agent_dir_env.filter(|directory| !directory.as_os_str().is_empty()))
+        .or_else(|| rpi_home_env.filter(|directory| !directory.as_os_str().is_empty()))
+        .or(fallback)
         .map(|directory| pi_coding::apply_profile(directory).join(file_name))
 }
 #[must_use]
@@ -244,38 +285,133 @@ pub fn radius_catalog_store_path() -> Option<PathBuf> {
     agent_config_path("models-store.json")
 }
 
-pub async fn load_radius_catalog(
-    allow_network: bool,
-) -> Result<Option<pi_ai::providers::RadiusCatalogSnapshot>> {
+pub async fn restore_radius_catalog() -> Result<Option<pi_ai::providers::RadiusCatalogSnapshot>> {
     let Some(store_path) = radius_catalog_store_path() else {
         return Ok(None);
     };
-    load_radius_catalog_from(&store_path, allow_network).await
+    restore_radius_catalog_from(&store_path).await
 }
 
-pub async fn load_radius_catalog_from(
+pub async fn restore_radius_catalog_from(
     store_path: &Path,
-    allow_network: bool,
 ) -> Result<Option<pi_ai::providers::RadiusCatalogSnapshot>> {
-    let catalog = pi_ai::providers::RadiusCatalog::with_store(
+    radius_catalog(store_path)?.restore_stored_snapshot_quarantining_invalid()
+}
+
+/// Refresh the Radius catalog through the standalone compiled operator
+/// transport. A cached snapshot remains authoritative when the live request
+/// fails; the returned warning is already secret-free and may be shown to the
+/// operator.
+pub async fn refresh_radius_catalog() -> Result<Option<String>> {
+    let Some(store_path) = radius_catalog_store_path() else {
+        return Ok(None);
+    };
+    let executor = Arc::new(RadiusOperatorExecutor {
+        transport: pi_coding::operator_http::OperatorHttpTransport::new()?,
+    }) as SharedHttpExecutor;
+    let api_key = resolve_provider_api_key_async("radius", None).await?;
+    refresh_radius_catalog_from(&store_path, api_key.as_deref(), executor).await
+}
+
+async fn refresh_radius_catalog_from(
+    store_path: &Path,
+    api_key: Option<&str>,
+    executor: SharedHttpExecutor,
+) -> Result<Option<String>> {
+    let catalog = radius_catalog(store_path)?;
+    let restored = catalog.restore_stored_snapshot_quarantining_invalid()?;
+    let Some(api_key) = api_key else {
+        return Ok(None);
+    };
+    match catalog
+        .refresh(
+            &api_key,
+            executor,
+            pi_ai::providers::RadiusRefreshOptions::default(),
+        )
+        .await
+    {
+        Ok(_) => Ok(None),
+        Err(error) if restored.is_some() => Ok(Some(error.to_string())),
+        Err(error) => Err(error),
+    }
+}
+
+fn radius_catalog(store_path: &Path) -> Result<pi_ai::providers::RadiusCatalog> {
+    pi_ai::providers::RadiusCatalog::with_store(
         "radius",
         pi_ai::providers::DEFAULT_RADIUS_GATEWAY,
         store_path,
-    )?;
-    let restored = catalog.restore_stored_snapshot_quarantining_invalid()?;
-    if !allow_network {
-        return Ok(restored);
-    }
-    let Some(api_key) = resolve_provider_api_key_async("radius", None).await? else {
-        return Ok(restored);
-    };
-    match catalog
-        .refresh(&api_key, pi_ai::providers::RadiusRefreshOptions::default())
-        .await
-    {
-        Ok(snapshot) => Ok(Some(snapshot)),
-        Err(_) if restored.is_some() => Ok(restored),
-        Err(error) => Err(error),
+    )
+}
+
+struct RadiusOperatorExecutor {
+    transport: Arc<pi_coding::operator_http::OperatorHttpTransport>,
+}
+
+impl HttpExecutor for RadiusOperatorExecutor {
+    fn execute<'a>(
+        &'a self,
+        request: HttpRequest,
+    ) -> futures_util::future::BoxFuture<'a, Result<HttpResponse>> {
+        async move {
+            let parts = request.into_parts();
+            ensure!(
+                parts.method == HttpMethod::Get,
+                "invalid Radius operator request"
+            );
+            ensure!(
+                parts.authority.scheme() == ResolvedHttpScheme::Https
+                    && matches!(
+                        parts.authority.host(),
+                        ResolvedHttpHost::Dns(host) if host == "radius.pi.dev"
+                    )
+                    && parts.authority.port() == 443
+                    && parts.path_and_query == "/v1/config"
+                    && parts.body.is_empty()
+                    && parts.max_response_bytes.get()
+                        == pi_coding::operator_http::OPERATOR_RADIUS_RESPONSE_LIMIT as u64,
+                "invalid Radius operator authority"
+            );
+            let bearer = parts
+                .headers
+                .iter()
+                .find(|(name, _)| name == http::header::AUTHORIZATION)
+                .and_then(|(_, value)| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .ok_or_else(|| anyhow!("missing Radius operator credential"))?;
+            let operation = pi_coding::operator_http::OperatorHttpRequest::RadiusCatalog {
+                bearer: pi_coding::operator_http::SecretValue::new(bearer.to_owned())?,
+            };
+            let response = match parts.abort_signal {
+                Some(token) => tokio::select! {
+                    biased;
+                    _ = token.cancelled() => return Err(anyhow!("Request was aborted")),
+                    response = self.transport.execute(operation) => response,
+                },
+                None => self.transport.execute(operation).await,
+            }?;
+            let pi_coding::operator_http::OperatorHttpResponse::Structured(response) = response
+            else {
+                bail!("invalid Radius operator response");
+            };
+            ensure!(
+                response.operation() == pi_coding::operator_http::OperatorOperation::RadiusCatalog,
+                "invalid Radius operator response"
+            );
+            let status = response.status();
+            let body = response.into_body().into_vec();
+            let headers = http::HeaderMap::from_iter([(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("application/json"),
+            )]);
+            Ok(HttpResponse::new(
+                status,
+                headers,
+                Box::pin(futures_util::stream::once(async move { Ok(body) })),
+            ))
+        }
+        .boxed()
     }
 }
 
@@ -287,7 +423,7 @@ pub fn load_custom_models() -> Result<()> {
         None => apply_snapshot(HashMap::new(), HashMap::new(), Vec::new(), None),
     }?;
     if pi_ai::get_models(pi_ai::LLAMA_PROVIDER_ID).is_empty() {
-        pi_coding::LlamaManager::default().load_cached_catalog()?;
+        pi_coding::LlamaManager::global()?.load_cached_catalog()?;
     }
     Ok(())
 }
@@ -343,11 +479,14 @@ pub async fn resolve_provider_api_key_async(
     }
     if let Some(entries) = stored {
         let active_scope = pi_coding::active_auth_scope();
-        if let Some(stored) =
-            select_stored_credential(provider, &entries, active_scope.as_deref())?
+        if let Some(stored) = select_stored_credential(provider, &entries, active_scope.as_deref())?
         {
             match stored {
-                StoredCredential::ApiKey { key, env: stored_env, .. } => {
+                StoredCredential::ApiKey {
+                    key,
+                    env: stored_env,
+                    ..
+                } => {
                     if let Some(key) = resolve_stored_api_key(&key, &stored_env, provider, env)? {
                         return Ok(Some(key));
                     }
@@ -376,22 +515,24 @@ pub fn has_configured_auth(model: &Model) -> bool {
         return true;
     }
     if model.provider == pi_ai::LLAMA_PROVIDER_ID {
-        return pi_coding::ProviderAuthAdapter::is_configured(
-            &pi_coding::LlamaAuthAdapter::default(),
-        )
-        .unwrap_or(false);
+        return pi_coding::LlamaAuthAdapter::global()
+            .and_then(|adapter| pi_coding::ProviderAuthAdapter::is_configured(&adapter))
+            .unwrap_or(false);
     }
     let config = state.providers.get(&model.provider);
     let has_key = state
         .runtime_keys
         .get(&model.provider)
         .is_some_and(|key| !key.trim().is_empty())
-        || state.stored_credentials.get(&model.provider).is_some_and(|entries| {
-            entries.iter().any(|credential| match credential {
-                StoredCredential::ApiKey { key, .. } => !key.trim().is_empty(),
-                StoredCredential::OAuth { .. } => true,
+        || state
+            .stored_credentials
+            .get(&model.provider)
+            .is_some_and(|entries| {
+                entries.iter().any(|credential| match credential {
+                    StoredCredential::ApiKey { key, .. } => !key.trim().is_empty(),
+                    StoredCredential::OAuth { .. } => true,
+                })
             })
-        })
         || config
             .and_then(|provider| provider.api_key.as_deref())
             .is_some_and(|key| !key.trim().is_empty())
@@ -408,6 +549,15 @@ pub fn has_configured_auth(model: &Model) -> bool {
     }
     has_recognized_auth_header(&model.api, &headers)
 }
+/// Public-catalog membership for user-facing model lists (RPC
+/// `get_available_models`, later the TUI model picker): the faux backend is
+/// test-only and must never be offered for selection, even though
+/// `has_configured_auth` still treats it as authenticated so faux sessions
+/// and in-test faux streams keep working.
+#[must_use]
+pub fn is_public_model(model: &Model) -> bool {
+    model.api != pi_ai::API_FAUX && has_configured_auth(model)
+}
 /// Resolve request-scoped custom authentication. Stored credentials and
 /// header templates are expanded here, not at catalog load, so request-time
 /// environment values are honored.
@@ -417,7 +567,7 @@ pub fn resolve_model_request_auth(
     env: Option<&HashMap<String, String>>,
 ) -> Result<ModelRequestAuth> {
     if model.provider == pi_ai::LLAMA_PROVIDER_ID {
-        let adapter = pi_coding::LlamaAuthAdapter::default();
+        let adapter = pi_coding::LlamaAuthAdapter::global()?;
         let api_key = explicit_key
             .filter(|key| !key.trim().is_empty())
             .map(ToOwned::to_owned)
@@ -510,6 +660,20 @@ pub async fn resolve_model_request_auth_async(
     explicit_key: Option<&str>,
     env: Option<&HashMap<String, String>>,
 ) -> Result<ModelRequestAuth> {
+    let path = state_read()
+        .auth_path
+        .clone()
+        .ok_or_else(|| anyhow!("auth.json path is unavailable"))?;
+    let manager = pi_coding::AuthManager::new(path)?;
+    resolve_model_request_auth_with_manager(model, explicit_key, env, &manager).await
+}
+
+async fn resolve_model_request_auth_with_manager(
+    model: &Model,
+    explicit_key: Option<&str>,
+    env: Option<&HashMap<String, String>>,
+    manager: &pi_coding::AuthManager,
+) -> Result<ModelRequestAuth> {
     let active_scope = pi_coding::active_auth_scope();
     let stored_oauth = {
         let state = state_read();
@@ -528,11 +692,6 @@ pub async fn resolve_model_request_auth_async(
     if !stored_oauth {
         return resolve_model_request_auth(model, explicit_key, env);
     }
-    let path = state_read()
-        .auth_path
-        .clone()
-        .ok_or_else(|| anyhow!("auth.json path is unavailable"))?;
-    let manager = pi_coding::AuthManager::new(path)?;
     let stored = manager
         .resolve_stored(&model.provider, env)
         .await?
@@ -1029,9 +1188,12 @@ fn read_bounded_config(path: &Path, name: &str) -> Result<Option<String>> {
             path.display()
         );
     }
-    String::from_utf8(bytes)
-        .map(Some)
-        .with_context(|| format!("Failed to load {name}: file is not UTF-8\nFile: {}", path.display()))
+    String::from_utf8(bytes).map(Some).with_context(|| {
+        format!(
+            "Failed to load {name}: file is not UTF-8\nFile: {}",
+            path.display()
+        )
+    })
 }
 
 fn load_stored_credentials(path: &Path) -> Result<HashMap<String, Vec<StoredCredential>>> {
@@ -1058,14 +1220,20 @@ fn load_stored_credentials(path: &Path) -> Result<HashMap<String, Vec<StoredCred
             // "scopes"; anything else is the scoped section.
             if value.get("type").is_some() {
                 let credential = parse_stored_credential(provider, value, path, None)?;
-                credentials.entry(provider.clone()).or_default().push(credential);
+                credentials
+                    .entry(provider.clone())
+                    .or_default()
+                    .push(credential);
             } else {
                 parse_scopes_section(&mut credentials, value, path)?;
             }
             continue;
         }
         let credential = parse_stored_credential(provider, value, path, None)?;
-        credentials.entry(provider.clone()).or_default().push(credential);
+        credentials
+            .entry(provider.clone())
+            .or_default()
+            .push(credential);
     }
     Ok(credentials)
 }
@@ -1082,9 +1250,8 @@ fn parse_scopes_section(
         )
     })?;
     for (scope, providers) in scopes {
-        let scope = pi_coding::validate_scope_label(scope).with_context(|| {
-            format!("Invalid auth.json scope\nFile: {}", path.display())
-        })?;
+        let scope = pi_coding::validate_scope_label(scope)
+            .with_context(|| format!("Invalid auth.json scope\nFile: {}", path.display()))?;
         let providers = providers.as_object().ok_or_else(|| {
             anyhow!(
                 "Invalid auth.json credential for provider in scope {scope:?}: expected an object\nFile: {}",
@@ -1110,9 +1277,9 @@ fn parse_stored_credential(
     scope: Option<&str>,
 ) -> Result<StoredCredential> {
     let scope = scope.map(str::to_owned);
-    let credential = value.as_object().ok_or_else(|| {
-        invalid_stored_credential(provider, path, "credential must be an object")
-    })?;
+    let credential = value
+        .as_object()
+        .ok_or_else(|| invalid_stored_credential(provider, path, "credential must be an object"))?;
     match credential.get("type").and_then(Value::as_str) {
         Some("oauth") => {
             for field in ["access", "refresh"] {
@@ -1164,7 +1331,11 @@ fn parse_stored_credential(
                     ));
                 }
             };
-            Ok(StoredCredential::ApiKey { key: key.to_owned(), env, scope })
+            Ok(StoredCredential::ApiKey {
+                key: key.to_owned(),
+                env,
+                scope,
+            })
         }
         Some(_) => Err(invalid_stored_credential(
             provider,
@@ -1237,6 +1408,130 @@ fn strip_json_comments(input: &str) -> String {
 mod tests {
     use super::*;
 
+    struct ExactRadiusExecutor;
+
+    impl HttpExecutor for ExactRadiusExecutor {
+        fn execute<'a>(
+            &'a self,
+            request: HttpRequest,
+        ) -> futures_util::future::BoxFuture<'a, Result<HttpResponse>> {
+            async move {
+                let parts = request.into_parts();
+                assert_eq!(parts.method, HttpMethod::Get);
+                assert_eq!(parts.authority.scheme(), ResolvedHttpScheme::Https);
+                assert_eq!(
+                    parts.authority.host(),
+                    &ResolvedHttpHost::Dns("radius.pi.dev".to_owned())
+                );
+                assert_eq!(parts.authority.port(), 443);
+                assert_eq!(parts.path_and_query, "/v1/config");
+                assert_eq!(
+                    parts.max_response_bytes.get(),
+                    pi_coding::operator_http::OPERATOR_RADIUS_RESPONSE_LIMIT as u64
+                );
+                assert_eq!(
+                    parts
+                        .headers
+                        .iter()
+                        .find(|(name, _)| name == http::header::AUTHORIZATION)
+                        .and_then(|(_, value)| value.to_str().ok()),
+                    Some("Bearer radius-test-secret")
+                );
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "baseUrl": "https://stream.radius.test/v1",
+                    "models": [{
+                        "id": "operator-bound",
+                        "name": "Operator Bound",
+                        "reasoning": true,
+                        "input": ["text"],
+                        "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0},
+                        "contextWindow": 32000,
+                        "maxTokens": 4096
+                    }]
+                }))?;
+                Ok(HttpResponse::new(
+                    http::StatusCode::OK,
+                    http::HeaderMap::new(),
+                    Box::pin(futures_util::stream::once(async move { Ok(body) })),
+                ))
+            }
+            .boxed()
+        }
+    }
+
+    #[test]
+    fn config_paths_prefer_pi_coding_agent_dir_over_rpi_home() {
+        let compatibility = PathBuf::from("<pi-coding-agent-dir>");
+        let rpi_home = PathBuf::from("<rpi-home>");
+        let home = PathBuf::from("<home>");
+        assert_eq!(
+            resolve_agent_config_path(
+                None,
+                Some(compatibility.clone()),
+                Some(rpi_home.clone()),
+                Some(home.clone()),
+                "models.json",
+            ),
+            Some(compatibility.join("models.json")),
+        );
+        assert_eq!(
+            resolve_agent_config_path(
+                None,
+                Some(PathBuf::new()),
+                Some(rpi_home.clone()),
+                Some(home.clone()),
+                "models.json",
+            ),
+            Some(rpi_home.join("models.json")),
+            "empty PI_CODING_AGENT_DIR must fall through to RPI_HOME",
+        );
+        assert_eq!(
+            resolve_agent_config_path(None, None, None, Some(home.clone()), "auth.json"),
+            Some(home.join(".rpi/auth.json")),
+            "empty compatibility variables must fall through to HOME/.rpi",
+        );
+    }
+
+    #[test]
+    fn explicit_config_override_stays_above_environment_roots() {
+        let explicit = PathBuf::from("<explicit>");
+        assert_eq!(
+            resolve_agent_config_path(
+                Some(explicit.clone()),
+                Some(PathBuf::from("<pi-coding-agent-dir>")),
+                Some(PathBuf::from("<rpi-home>")),
+                Some(PathBuf::from("<home>")),
+                "auth.json",
+            ),
+            Some(explicit.join("auth.json")),
+        );
+        assert_eq!(
+            resolve_agent_config_path(None, None, None, None, "models.json"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn radius_live_refresh_uses_exact_operator_authority_and_bound() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store_path = directory.path().join("models-store.json");
+        let result = refresh_radius_catalog_from(
+            &store_path,
+            Some("radius-test-secret"),
+            Arc::new(ExactRadiusExecutor),
+        )
+        .await;
+        assert_eq!(result.expect("Radius refresh"), None);
+        assert_eq!(
+            pi_ai::get_model("radius", "operator-bound")
+                .expect("refreshed Radius model")
+                .base_url,
+            "https://stream.radius.test/v1"
+        );
+        let persisted = fs::read_to_string(store_path).expect("persisted Radius catalog");
+        assert!(!persisted.contains("radius-test-secret"));
+    }
+
     #[test]
     fn config_values_support_templates_and_escapes() {
         let env = HashMap::from([("TOKEN".to_owned(), "test-value".to_owned())]);
@@ -1308,7 +1603,9 @@ mod tests {
 
         let codex = credentials.get("openai-codex").expect("codex entries");
         assert_eq!(codex.len(), 1);
-        assert!(matches!(codex[0], StoredCredential::OAuth { ref scope } if scope.as_deref() == Some("work")));
+        assert!(
+            matches!(codex[0], StoredCredential::OAuth { ref scope } if scope.as_deref() == Some("work"))
+        );
     }
 
     #[test]
@@ -1343,24 +1640,23 @@ mod tests {
 
         // Without the mark the gate fails closed (no key, no recognized
         // header).
-        let error =
-            resolve_model_request_auth(&model, None, None).expect_err("keyless non-extension model must be refused");
+        let error = resolve_model_request_auth(&model, None, None)
+            .expect_err("keyless non-extension model must be refused");
         assert!(format!("{error:#}").contains("no API key found"));
 
         // Register the api as extension-provided → auth resolves without a
         // key, and unregistering restores the gate.
-        let stream: pi_ai::StreamFn = Arc::new(|_, _, _| {
-            Box::pin(async { pi_ai::new_assistant_message_event_stream() })
-        });
-        let simple: pi_ai::SimpleStreamFn = Arc::new(|_, _, _| {
-            Box::pin(async { pi_ai::new_assistant_message_event_stream() })
-        });
+        let stream: pi_ai::StreamFn =
+            Arc::new(|_, _, _| Box::pin(async { pi_ai::new_assistant_message_event_stream() }));
+        let simple: pi_ai::SimpleStreamFn =
+            Arc::new(|_, _, _| Box::pin(async { pi_ai::new_assistant_message_event_stream() }));
         pi_ai::register_extension_provider(
             pi_ai::ApiProvider {
                 api: "extension-llm".into(),
                 stream,
                 stream_simple: simple,
                 generate_image: None,
+                resolve_http_authorities: Arc::new(|_, _| Ok(std::collections::BTreeSet::new())),
             },
             "models-config-extension-source".into(),
         );

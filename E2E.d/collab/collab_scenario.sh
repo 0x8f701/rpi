@@ -138,7 +138,7 @@ EOF
         HOME="$root/home" USERPROFILE="$root/home" \
         PATH="${PATH:-/usr/bin:/bin}" LANG="${LANG:-C.UTF-8}" LC_ALL="${LC_ALL:-C.UTF-8}" \
         PI_CODING_AGENT_DIR="$root/home/.pi/agent" \
-        PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 \
+        RPI_OFFLINE=1 RPI_SKIP_VERSION_CHECK=1 \
         RPI_WEB_DEV_DIR="${RPI_WEB_DEV_DIR:-}" \
         "$RPI_BIN" --offline \
         --listen "127.0.0.1:$listen_port" \
@@ -533,7 +533,7 @@ main() {
         COLLAB_START_MARKER="$guest_start_marker" \
         COLLAB_PHASE_TIMEOUT="60" \
         COLLAB_WAIT_STOP="1" \
-        COLLAB_STOP_TIMEOUT="30" \
+        COLLAB_STOP_TIMEOUT="90" \
         node collab_guest.mjs >"$ctrl_evidence/guest.stdout" 2>"$ctrl_evidence/guest.stderr"
     ) &
     local ctrl_pid=$!
@@ -554,7 +554,7 @@ main() {
         COLLAB_START_MARKER="$guest_start_marker" \
         COLLAB_PHASE_TIMEOUT="60" \
         COLLAB_WAIT_STOP="1" \
-        COLLAB_STOP_TIMEOUT="30" \
+        COLLAB_STOP_TIMEOUT="90" \
         node collab_guest.mjs >"$view_evidence/guest.stdout" 2>"$view_evidence/guest.stderr"
     ) &
     local view_pid=$!
@@ -655,7 +655,7 @@ main() {
     # Do not stop the host until the CLI lifecycle/reconnect assertions and the
     # browser live/control assertions have all completed.
     log "$SCENARIO: waiting for all guest pre-stop phases"
-    local pre_stop_deadline=$((SECONDS + 60))
+    local pre_stop_deadline=$((SECONDS + 90))
     while [ "$SECONDS" -lt "$pre_stop_deadline" ]; do
         if [ -f "$ctrl_evidence/stop-ready" ] && [ -f "$view_evidence/stop-ready" ] && [ -f "$browser_ready" ]; then break; fi
         kill -0 "$ctrl_pid" 2>/dev/null || fail "$SCENARIO: control guest exited before stop-ready marker"

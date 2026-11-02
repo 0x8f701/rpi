@@ -53,6 +53,7 @@ export function PersonasPanel({ sendCommand, onClose }: PersonasPanelProps) {
   const [rows, setRows] = useState<PersonaRowWire[]>([]);
   const [enabled, setEnabled] = useState(false);
   const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
   const [error, setError] = useState('');
   const [toast, setToast] = useState('');
   // Detail modal: persona under inspection.
@@ -74,6 +75,17 @@ export function PersonasPanel({ sendCommand, onClose }: PersonasPanelProps) {
   // Per-row run task drafts + which row has the inline run input open.
   const [runDrafts, setRunDrafts] = useState<Record<string, string>>({});
   const [runOpen, setRunOpen] = useState<string | null>(null);
+
+  const claimBusy = () => {
+    if (busyRef.current) return false;
+    busyRef.current = true;
+    setBusy(true);
+    return true;
+  };
+  const releaseBusy = () => {
+    busyRef.current = false;
+    setBusy(false);
+  };
 
   const load = () => {
     setError('');
@@ -187,7 +199,7 @@ export function PersonasPanel({ sendCommand, onClose }: PersonasPanelProps) {
       setEditorError('persona definition content is required');
       return;
     }
-    setBusy(true);
+    if (!claimBusy()) return;
     setEditorError('');
     const command =
       editor.mode === 'new'
@@ -205,10 +217,11 @@ export function PersonasPanel({ sendCommand, onClose }: PersonasPanelProps) {
       // content, or a missing definition surfaces HERE as an error and the
       // editor stays open with the draft intact.
       .catch((err: Error) => setEditorError(err.message || 'save failed'))
-      .finally(() => setBusy(false));
+      .finally(() => releaseBusy());
   };
 
   const selectPersona = (name: string) => {
+    if (!claimBusy()) return;
     setError('');
     sendCommand({ type: 'persona_select', name })
       .then((data) => {
@@ -216,13 +229,14 @@ export function PersonasPanel({ sendCommand, onClose }: PersonasPanelProps) {
         setToast(safeText(message));
         load();
       })
-      .catch((err: Error) => setError(`persona_select failed: ${err.message}`));
+      .catch((err: Error) => setError(`persona_select failed: ${err.message}`))
+      .finally(() => releaseBusy());
   };
 
   const runPersona = (name: string) => {
     const task = (runDrafts[name] || '').trim();
     if (!task) return;
-    setBusy(true);
+    if (!claimBusy()) return;
     setError('');
     sendCommand(buildPersonaRunCommand(name, task))
       .then((data) => {
@@ -233,11 +247,15 @@ export function PersonasPanel({ sendCommand, onClose }: PersonasPanelProps) {
           throw new Error('task_spawn returned no jobs');
         }
         setToast(`spawned ${name} as job ${first.jobId || '(unknown)'}`);
-        setRunDrafts((prev) => ({ ...prev, [name]: '' }));
+        setRunDrafts((prev) => {
+          const current = prev[name] || '';
+          if (current.trim() !== task) return prev;
+          return { ...prev, [name]: '' };
+        });
         setRunOpen(null);
       })
       .catch((err: Error) => setError(`task_spawn failed: ${err.message}`))
-      .finally(() => setBusy(false));
+      .finally(() => releaseBusy());
   };
 
   const requestDestructive = (name: string, kind: 'remove' | 'purge') => {
@@ -246,12 +264,12 @@ export function PersonasPanel({ sendCommand, onClose }: PersonasPanelProps) {
 
   const confirmDestructive = (kind: 'remove' | 'purge') => {
     if (!confirm) return;
+    if (!claimBusy()) return;
     const command =
       kind === 'remove'
         ? { type: 'persona_remove', name: confirm.name, confirm: true }
         : { type: 'persona_purge', name: confirm.name, confirm: true };
     const label = kind === 'remove' ? 'removed' : 'purged';
-    setBusy(true);
     setError('');
     sendCommand(command)
       .then((data) => {
@@ -261,10 +279,11 @@ export function PersonasPanel({ sendCommand, onClose }: PersonasPanelProps) {
         load();
       })
       .catch((err: Error) => setError(`persona_${kind} failed: ${err.message}`))
-      .finally(() => setBusy(false));
+      .finally(() => releaseBusy());
   };
 
   const clearPreference = () => {
+    if (!claimBusy()) return;
     setError('');
     sendCommand({ type: 'persona_clear' })
       .then((data) => {
@@ -272,7 +291,8 @@ export function PersonasPanel({ sendCommand, onClose }: PersonasPanelProps) {
         setToast(safeText(message));
         load();
       })
-      .catch((err: Error) => setError(`persona_clear failed: ${err.message}`));
+      .catch((err: Error) => setError(`persona_clear failed: ${err.message}`))
+      .finally(() => releaseBusy());
   };
 
   // Dialog keyboard: Escape closes; Tab traps focus inside the dialog.
@@ -540,6 +560,7 @@ export function PersonasPanel({ sendCommand, onClose }: PersonasPanelProps) {
                 </button>
               </div>
             </div>
+            <div className="subagent-details__body">
             {viewError !== '' ? (
               <div className="subagent-details__error" data-details-error>
                 {safeText(viewError)}
@@ -585,6 +606,7 @@ export function PersonasPanel({ sendCommand, onClose }: PersonasPanelProps) {
             ) : (
               <div className="subagent-details__history">(loading definition…)</div>
             )}
+            </div>
           </div>
         </div>
       )}
@@ -620,6 +642,7 @@ export function PersonasPanel({ sendCommand, onClose }: PersonasPanelProps) {
                 </button>
               </div>
             </div>
+            <div className="subagent-details__body">
             <div className="subagent-details__section">
               <div className="subagent-details__label">Name</div>
               {editor.mode === 'new' ? (
@@ -696,6 +719,7 @@ export function PersonasPanel({ sendCommand, onClose }: PersonasPanelProps) {
                 {safeText(editorError)}
               </div>
             )}
+            </div>
             <div className="subagent-details__head-actions personas-editor__save-row">
               <button
                 id="persona-editor-save"
@@ -755,6 +779,7 @@ export function PersonasPanel({ sendCommand, onClose }: PersonasPanelProps) {
                 </button>
               </div>
             </div>
+            <div className="subagent-details__body">
             <div className="subagent-details__section">
               <div className="subagent-details__label">Remove vs purge</div>
               <div className="subagent-details__activity" data-persona-confirm-remove-note>
@@ -763,6 +788,7 @@ export function PersonasPanel({ sendCommand, onClose }: PersonasPanelProps) {
               <div className="subagent-details__activity" data-persona-confirm-purge-note>
                 Purge: {PURGE_NOTE}
               </div>
+            </div>
             </div>
             <div className="subagent-details__head-actions personas-confirm__actions">
               <button

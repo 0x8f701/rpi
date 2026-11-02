@@ -1,4 +1,5 @@
-//! Unified session source catalog for native Pi sessions and foreign imports.
+//! Unified session source catalog for native rpi sessions and immutable
+//! external sources, including Pi, imported into rpi-owned session files.
 //!
 //! This module is intentionally independent of CLI args and TUI pickers. It
 //! discovers sessions across supported roots, builds list/search rows, resolves
@@ -14,36 +15,39 @@ mod tests;
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::sync::{LazyLock, Mutex};
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, Metadata};
-use std::path::{Path, PathBuf};
 use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 
-use thiserror::Error;
 use sha2::{Digest, Sha256};
+use thiserror::Error;
 use walkdir::WalkDir;
 
-use crate::import::{
-    emit_parsed_session_at_with_lineage, omp_chain_member_probe_under_root_public,
-    open_source_direct, open_source_under_root, parse_omp_chain_public,
-    parse_opened_source_public, source_id_under_root_public, ImportedMessage, ImportedSession,
-    ImportLineage, ImportSessionError, ParsedSessionPublic, SourceSessionFormat,
-};
-use crate::default_session_dir;
 use crate::PreparedSessionResume;
+use crate::default_session_dir;
+use crate::SessionKind;
+use crate::import::{
+    ImportLineage, ImportSessionError, ImportedMessage, ImportedSession, ParsedSessionPublic,
+    SourceSessionFormat, emit_source_into_directory_with_lineage,
+    omp_chain_member_probe_under_root_public, open_source_direct, open_source_under_root,
+    parse_omp_chain_public, parse_opened_source_public, source_id_under_root_public,
+};
 
 use self::discovery::{
     contains_component, is_grok_summary_depth, is_native_tree_session, matches_source_pattern,
     path_lexically_under_root, path_under_depth, selected_sources,
 };
 use self::helpers::{
-    canonical_fingerprint, content_fingerprint, display_name, format_epoch,
-    compare_rows_newest, metadata_epoch, normalize_cwd, normalize_summary,
+    canonical_fingerprint, compare_rows_newest, content_fingerprint, display_name, format_epoch,
+    is_slock_agent_cwd, metadata_epoch, normalize_cwd, normalize_summary, pi_content_fingerprint,
     row_matches_query, sort_rows_newest, truncate_summary,
 };
 pub(crate) use self::helpers::{expand_tilde, make_absolute};
 use self::lineage::{read_native_header_lite, read_native_lineage, read_native_list_info};
+pub(crate) use self::lineage::text_has_genuine_content;
 
 pub(super) const LINEAGE_CUSTOM_TYPE: &str = "import_lineage";
 
@@ -94,7 +98,8 @@ impl Ord for DiscoveredCandidate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionSourceKind {
-    NativePi,
+    Rpi,
+    Pi,
     Omp,
     Codex,
     Claude,
@@ -103,8 +108,9 @@ pub enum SessionSourceKind {
 }
 
 impl SessionSourceKind {
-    pub const ALL: [Self; 6] = [
-        Self::NativePi,
+    pub const ALL: [Self; 7] = [
+        Self::Rpi,
+        Self::Pi,
         Self::Omp,
         Self::Codex,
         Self::Claude,
@@ -112,18 +118,23 @@ impl SessionSourceKind {
         Self::Droid,
     ];
 
-    pub const FOREIGN: [Self; 5] = [
+    pub const FOREIGN: [Self; 6] = [
+        Self::Pi,
         Self::Omp,
         Self::Codex,
         Self::Claude,
         Self::Grok,
         Self::Droid,
     ];
+
+    #[allow(non_upper_case_globals)]
+    pub const NativePi: Self = Self::Rpi;
 
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::NativePi => "pi",
+            Self::Rpi => "rpi",
+            Self::Pi => "pi",
             Self::Omp => "omp",
             Self::Codex => "codex",
             Self::Claude => "claude",
@@ -136,7 +147,8 @@ impl SessionSourceKind {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::NativePi => "pi",
+            Self::Rpi => "rpi",
+            Self::Pi => "pi",
             Self::Omp => "omp",
             Self::Codex => "codex",
             Self::Claude => "claude",
@@ -147,13 +159,22 @@ impl SessionSourceKind {
 
     #[must_use]
     pub const fn is_native(self) -> bool {
-        matches!(self, Self::NativePi)
+        matches!(self, Self::Rpi)
+    }
+
+    #[must_use]
+    pub const fn is_importable(self) -> bool {
+        matches!(
+            self,
+            Self::Pi | Self::Omp | Self::Codex | Self::Claude | Self::Grok | Self::Droid
+        )
     }
 
     #[must_use]
     pub const fn to_import_format(self) -> Option<SourceSessionFormat> {
         match self {
-            Self::NativePi => None,
+            Self::Rpi => None,
+            Self::Pi => Some(SourceSessionFormat::Pi),
             Self::Omp => Some(SourceSessionFormat::Omp),
             Self::Codex => Some(SourceSessionFormat::Codex),
             Self::Claude => Some(SourceSessionFormat::Claude),
@@ -165,7 +186,7 @@ impl SessionSourceKind {
     #[must_use]
     pub const fn from_import_format(format: SourceSessionFormat) -> Self {
         match format {
-            SourceSessionFormat::Pi => Self::NativePi,
+            SourceSessionFormat::Pi => Self::Pi,
             SourceSessionFormat::Omp => Self::Omp,
             SourceSessionFormat::Codex => Self::Codex,
             SourceSessionFormat::Claude => Self::Claude,
@@ -186,7 +207,8 @@ impl std::str::FromStr for SessionSourceKind {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "pi" | "native" | "nativepi" | "native_pi" => Ok(Self::NativePi),
+            "rpi" | "native" | "nativepi" | "native_pi" => Ok(Self::Rpi),
+            "pi" => Ok(Self::Pi),
             "omp" => Ok(Self::Omp),
             "codex" => Ok(Self::Codex),
             "claude" => Ok(Self::Claude),
@@ -229,7 +251,10 @@ impl ImportLineageKey {
     #[must_use]
     pub fn identity_key(&self) -> (SessionSourceKind, String) {
         if self.source_session_id.is_empty() {
-            (self.source, format!("path:{}", self.source_path_fingerprint))
+            (
+                self.source,
+                format!("path:{}", self.source_path_fingerprint),
+            )
         } else {
             (self.source, format!("id:{}", self.source_session_id))
         }
@@ -274,6 +299,23 @@ pub struct CatalogRow {
     pub name: Option<String>,
     pub status: CatalogRowStatus,
     pub import_lineage: Option<ImportLineageKey>,
+    pub has_parent_session: bool,
+    /// Authoritative header provenance (`sessionKind`). Workflow-internal
+    /// kinds are excluded from user-facing list/search but stay in `scan`
+    /// and durable storage.
+    pub session_kind: SessionKind,
+    /// True when the session's recorded cwd sits under a Slock ephemeral
+    /// agent workspace (`.slock/agents/<id>`): Codex/Slock orchestration
+    /// infrastructure, not a user project. Classified from the cwd alone so
+    /// the foreign source row and its imported native copy (whose header
+    /// carries the source cwd) group together; real project roots stay real.
+    pub agent_session: bool,
+    /// True when the parsed message stream carries no genuine content: every
+    /// meaningful turn is bootstrap-only material (`<environment_context>`,
+    /// `<user_info>`, `<system-reminder>`, AGENTS/project instruction
+    /// envelopes). Zero-message (header-only) sessions are not flagged.
+    /// View signal only — never a backend filter or deletion.
+    pub bootstrap_only: bool,
     /// Concatenated corpus used by fuzzy search.
     pub search_text: String,
     /// Isolated message corpus matched by the TUI selector without crossing
@@ -358,6 +400,8 @@ pub enum CatalogError {
         input: String,
         matches: Vec<(SessionSourceKind, PathBuf)>,
     },
+    #[error("session source is read-only and cannot be resumed by rpi: {0}")]
+    ReadOnlySource(SessionSourceKind),
     #[error(transparent)]
     Import(#[from] ImportSessionError),
     #[error("I/O error at {path}: {source}")]
@@ -366,9 +410,113 @@ pub enum CatalogError {
         #[source]
         source: std::io::Error,
     },
+    #[error("session is workflow-internal and not user-switchable")]
+    WorkflowInternalSession,
+}
+#[cfg(test)]
+thread_local! {
+    static LINEAGE_INDEX_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+thread_local! {
+    static IMPORT_AFTER_LOOKUP_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Local filesystem catalog of native and foreign coding-agent sessions.
+
+#[derive(Debug, Clone)]
+/// A cached catalog row keyed by (source, path) and validated against the
+/// file's mtime+size. The parsed row is reused across scans while the file
+// is unchanged; any change (append, rewrite, delete+recreate) produces a new
+/// (mtime, size) pair and forces a re-parse.
+struct CachedCatalogRow {
+    modified_ns: i128,
+    size: u64,
+    inserted: u64,
+    row: Option<CatalogRow>,
+}
+
+fn catalog_row_cache(
+) -> &'static Mutex<HashMap<(SessionSourceKind, PathBuf), CachedCatalogRow>> {
+    static CACHE: LazyLock<Mutex<HashMap<(SessionSourceKind, PathBuf), CachedCatalogRow>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    &CACHE
+}
+
+/// Bounded per-file row cache: 447-file catalogs re-scan every poll, and
+/// each full-file JSON re-parse costs milliseconds; the cache keeps the warm
+/// scan proportional to the number of CHANGED files instead.
+const CATALOG_ROW_CACHE_LIMIT: usize = 8192;
+
+fn metadata_mtime_ns(metadata: &std::fs::Metadata) -> i128 {
+    use std::time::UNIX_EPOCH;
+    let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+    match modified.duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_nanos() as i128,
+        Err(error) => -(error.duration().as_nanos() as i128),
+    }
+}
+
+/// Recompute a foreign row's import status against the CURRENT lineage
+/// index: the cached payload is content-derived, but the AlreadyImported vs
+/// Foreign decision depends on which native rows exist right now.
+fn foreign_row_status_refresh(
+    row: &mut CatalogRow,
+    lineage_index: &HashMap<
+        (SessionSourceKind, String),
+        Vec<(String, PathBuf, ImportLineageKey)>,
+    >,
+) {
+    let Some(lineage) = row.import_lineage.as_ref() else {
+        return;
+    };
+    row.status = lineage_index
+        .get(&lineage.identity_key())
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|(_, _, stored)| foreign_fingerprint_matches(lineage, stored))
+        })
+        .map(
+            |(native_id, native_path, _)| CatalogRowStatus::AlreadyImported {
+                native_id: native_id.clone(),
+                native_path: native_path.clone(),
+            },
+        )
+        .unwrap_or(CatalogRowStatus::Foreign);
+}
+
+/// Store (or replace) a parsed row in the shared cache and enforce the bound.
+fn cache_catalog_row(
+    key: (SessionSourceKind, PathBuf),
+    modified_ns: i128,
+    size: u64,
+    row: Option<CatalogRow>,
+) {
+    let mut cache = catalog_row_cache().lock().expect("catalog row cache");
+    static STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let inserted = STAMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if cache.len() >= CATALOG_ROW_CACHE_LIMIT && !cache.contains_key(&key) {
+        // Evict the oldest eighth by insertion stamp.
+        let mut stamps: Vec<(u64, (SessionSourceKind, PathBuf))> = cache
+            .iter()
+            .map(|(key, cached)| (cached.inserted, key.clone()))
+            .collect();
+        stamps.sort_unstable_by_key(|(stamp, _)| *stamp);
+        let evict = stamps.len() / 8 + 1;
+        for (_, key) in stamps.into_iter().take(evict) {
+            cache.remove(&key);
+        }
+    }
+    cache.insert(
+        key,
+        CachedCatalogRow {
+            modified_ns,
+            size,
+            inserted,
+            row,
+        },
+    );
+}
 #[derive(Debug, Clone)]
 pub struct SessionCatalog {
     user_home: PathBuf,
@@ -397,7 +545,7 @@ impl SessionCatalog {
         let user_home = make_absolute(user_home.into());
         let sessions_home = make_absolute(expand_tilde(sessions_home.into(), &user_home));
         Self {
-            native_agent_dir: sessions_home.join(".pi/agent"),
+            native_agent_dir: user_home.join(".rpi"),
             native_session_root: None,
             codex_home: sessions_home.join(".codex"),
             claude_config_dir: sessions_home.join(".claude"),
@@ -407,7 +555,8 @@ impl SessionCatalog {
     }
 
     /// Production entry point: honors `SESSIONS_HOME`, `HOME`/`USERPROFILE`,
-    /// `PI_CODING_AGENT_DIR`, `CODEX_HOME`, and `CLAUDE_CONFIG_DIR`.
+    /// `PI_CODING_AGENT_DIR`, `RPI_HOME`, the active rpi profile, `CODEX_HOME`,
+    /// and `CLAUDE_CONFIG_DIR`.
     pub fn from_env() -> Result<Self, CatalogError> {
         let user_home = env::var_os("HOME")
             .or_else(|| env::var_os("USERPROFILE"))
@@ -418,9 +567,7 @@ impl SessionCatalog {
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| user_home.clone());
-        let native_agent_dir = env::var_os("PI_CODING_AGENT_DIR")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from);
+        let native_agent_dir = crate::resources::agent_dir_base();
         let codex_home = env::var_os("CODEX_HOME")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from);
@@ -430,7 +577,7 @@ impl SessionCatalog {
         Ok(Self::from_env_paths(
             sessions_home,
             user_home,
-            native_agent_dir,
+            Some(native_agent_dir),
             codex_home,
             claude_config_dir,
         ))
@@ -444,9 +591,11 @@ impl SessionCatalog {
         claude_config_dir: Option<PathBuf>,
     ) -> Self {
         let mut catalog = Self::with_homes(sessions_home, user_home.clone());
-        if let Some(path) = native_agent_dir {
-            catalog.native_agent_dir = make_absolute(expand_tilde(path, &user_home));
-        }
+        let native_agent_dir = native_agent_dir.unwrap_or_else(|| user_home.join(".rpi"));
+        catalog.native_agent_dir = crate::resources::apply_profile(make_absolute(expand_tilde(
+            native_agent_dir,
+            &user_home,
+        )));
         if let Some(path) = codex_home {
             catalog.codex_home = make_absolute(expand_tilde(path, &user_home));
         }
@@ -507,13 +656,36 @@ impl SessionCatalog {
                     .unwrap_or_else(|| self.native_agent_dir.join("sessions")),
                 "*.jsonl",
             ),
+            SessionSourceKind::Pi => (self.user_home.join(".pi/agent/sessions"), "*.jsonl"),
             SessionSourceKind::Omp => (self.sessions_home.join(".omp/agent/sessions"), "*.jsonl"),
             SessionSourceKind::Codex => (self.codex_home.join("sessions"), "rollout-*.jsonl"),
             SessionSourceKind::Claude => (self.claude_config_dir.join("projects"), "*.jsonl"),
             SessionSourceKind::Grok => (self.sessions_home.join(".grok/sessions"), "summary.json"),
             SessionSourceKind::Droid => (self.sessions_home.join(".factory/sessions"), "*.jsonl"),
         };
-        SessionSourceRoot { kind, path, pattern }
+        SessionSourceRoot {
+            kind,
+            path,
+            pattern,
+        }
+    }
+
+    /// Lexical or canonical overlap between the native rpi catalog root and
+    /// the immutable Pi catalog root, including symlink aliases.
+    #[must_use]
+    pub fn native_and_pi_roots_overlap(&self) -> bool {
+        catalog_roots_overlap(
+            &self.root_for(SessionSourceKind::NativePi).path,
+            &self.root_for(SessionSourceKind::Pi).path,
+        )
+    }
+
+    /// True when `path` is owned by the immutable Pi catalog, lexically or
+    /// after canonicalization. Overlapping native roots must not relabel
+    /// these files as rpi/no-copy.
+    #[must_use]
+    pub fn is_pi_catalog_path(&self, path: &Path) -> bool {
+        path_resolves_under_root(path, &self.root_for(SessionSourceKind::Pi).path)
     }
 
     #[must_use]
@@ -550,10 +722,7 @@ impl SessionCatalog {
             };
             if newest.len() < SESSION_CATALOG_CANDIDATE_LIMIT {
                 newest.push(Reverse(candidate));
-            } else if newest
-                .peek()
-                .is_some_and(|oldest| candidate > oldest.0)
-            {
+            } else if newest.peek().is_some_and(|oldest| candidate > oldest.0) {
                 newest.pop();
                 newest.push(Reverse(candidate));
             }
@@ -576,6 +745,9 @@ impl SessionCatalog {
     }
 
     fn safe_session_metadata(&self, kind: SessionSourceKind, path: &Path) -> Option<Metadata> {
+        if kind.is_native() && self.is_pi_catalog_path(path) {
+            return None;
+        }
         let root = self.root_for(kind).path;
         if !matches_source_pattern(kind, path)
             || contains_component(path, &root, ".rsync-partial")
@@ -597,7 +769,7 @@ impl SessionCatalog {
             // `<cwd-dir>/<session>.jsonl` only. OMP's native listAllSessions
             // globs `*/*.jsonl`; deeper paths are subagent/task child trees
             // that must never enter the resume catalog.
-            SessionSourceKind::NativePi | SessionSourceKind::Omp => {
+            SessionSourceKind::NativePi | SessionSourceKind::Pi | SessionSourceKind::Omp => {
                 is_native_tree_session(path, &root)
             }
             SessionSourceKind::Grok => is_grok_summary_depth(path, &root),
@@ -611,7 +783,10 @@ impl SessionCatalog {
             SessionSourceKind::NativePi if self.native_session_root.is_some() => 1,
             // OMP matches native listAllSessions (`*/*.jsonl`): walk only the
             // two-component tree and never enter parent-session child dirs.
-            SessionSourceKind::NativePi | SessionSourceKind::Claude | SessionSourceKind::Omp => 2,
+            SessionSourceKind::NativePi
+            | SessionSourceKind::Pi
+            | SessionSourceKind::Claude
+            | SessionSourceKind::Omp => 2,
             SessionSourceKind::Codex => 4,
             SessionSourceKind::Grok => 3,
             SessionSourceKind::Droid => 1,
@@ -634,10 +809,13 @@ impl SessionCatalog {
         let selected = selected_sources(sources, true);
         let lineage_index = self.build_lineage_index();
         let mut source_rows = Vec::with_capacity(selected.len());
-        for kind in selected {
+        let mut discovered: std::collections::HashSet<(SessionSourceKind, PathBuf)> =
+            std::collections::HashSet::new();
+        for kind in &selected {
             let mut rows = Vec::with_capacity(SESSION_CATALOG_CANDIDATE_LIMIT);
-            for path in self.discover(kind) {
-                match self.row_from_path(kind, &path, &lineage_index) {
+            for path in self.discover(*kind) {
+                discovered.insert((*kind, path.clone()));
+                match self.row_from_path(*kind, &path, &lineage_index) {
                     Ok(Some(row)) => rows.push(row),
                     Ok(None) | Err(_) => continue,
                 }
@@ -645,14 +823,40 @@ impl SessionCatalog {
             sort_rows_newest(&mut rows);
             source_rows.push(rows);
         }
+        // Incremental-rescan pruning: cache rows for the sources THIS scan
+        // covered whose files disappeared are dropped, so a deleted file
+        // disappears from the listing and the cache cannot grow unbounded
+        // across moved/renamed stores. Unrelated sources keep their entries.
+        catalog_row_cache().lock().expect("catalog row cache").retain(
+            |(kind, path), _| !(selected.contains(kind) && !discovered.contains(&(*kind, path.clone()))),
+        );
         merge_source_rows(source_rows)
     }
+    pub fn row_for_exact_path(
+        &self,
+        kind: SessionSourceKind,
+        path: &Path,
+    ) -> Result<CatalogRow, CatalogError> {
+        let path = make_absolute(path.to_path_buf());
+        if !self.discover(kind).contains(&path) {
+            return Err(CatalogError::SessionNotFound(path.display().to_string()));
+        }
+        self.row_from_path(kind, &path, &HashMap::new())?
+            .ok_or_else(|| CatalogError::SessionNotFound(path.display().to_string()))
+    }
+
 
     /// Unified list used by future `/resume` pickers.
     #[must_use]
     pub fn list(&self, options: &CatalogListOptions) -> Vec<CatalogRow> {
         let rows = self.scan(&options.sources);
-        self.finish_rows(rows, options.include_foreign, options.dedupe, options.named_only, options.cwd_scope.as_deref())
+        self.finish_rows(
+            rows,
+            options.include_foreign,
+            options.dedupe,
+            options.named_only,
+            options.cwd_scope.as_deref(),
+        )
     }
 
     /// Fuzzy multi-token search over id/name/summary/cwd/path/source/messages.
@@ -694,20 +898,19 @@ impl SessionCatalog {
         rows
     }
 
-    /// Keep newest row per source/cwd/summary (or source/id when summary empty).
+    /// Keep the preferred row per identity, bounded by [`SESSION_CATALOG_ROW_LIMIT`].
+    ///
+    /// Native kinds/statuses key on source + session_id so parent/fork sessions
+    /// that inherit the same cwd/name/summary stay distinct. Foreign rows keep
+    /// source/cwd/summary (or source/id when cwd or summary is empty) so Codex
+    /// import and OMP rotation still collapse.
     #[must_use]
     pub fn dedupe_rows(rows: &[CatalogRow]) -> Vec<CatalogRow> {
         let mut best = Vec::<((SessionSourceKind, String, String), CatalogRow)>::with_capacity(
             SESSION_CATALOG_ROW_LIMIT,
         );
         for row in rows {
-            let normalized_summary = normalize_summary(&row.summary);
-            let cwd_empty = row.cwd.as_os_str().is_empty();
-            let key = if cwd_empty || normalized_summary.is_empty() {
-                (row.kind, row.session_id.clone(), String::new())
-            } else {
-                (row.kind, normalize_cwd(&row.cwd), normalized_summary)
-            };
+            let key = Self::dedupe_key(row);
             if let Some((_, existing)) = best.iter_mut().find(|(existing, _)| *existing == key) {
                 if Self::dedupe_prefers(row, existing) {
                     *existing = row.clone();
@@ -731,6 +934,18 @@ impl SessionCatalog {
         let mut result = best.into_iter().map(|(_, row)| row).collect::<Vec<_>>();
         sort_rows_newest(&mut result);
         result
+    }
+
+    fn dedupe_key(row: &CatalogRow) -> (SessionSourceKind, String, String) {
+        if row.kind.is_native() || row.status.is_native() {
+            return (row.kind, row.session_id.clone(), String::new());
+        }
+        let normalized_summary = normalize_summary(&row.summary);
+        if row.cwd.as_os_str().is_empty() || normalized_summary.is_empty() {
+            (row.kind, row.session_id.clone(), String::new())
+        } else {
+            (row.kind, normalize_cwd(&row.cwd), normalized_summary)
+        }
     }
 
     /// Whether `candidate` should replace `existing` for the same dedupe key.
@@ -772,6 +987,9 @@ impl SessionCatalog {
         let candidate = make_absolute(candidate);
         if candidate.is_file() {
             for kind in SessionSourceKind::ALL {
+                if kind.is_native() && self.is_pi_catalog_path(&candidate) {
+                    continue;
+                }
                 if self.is_safe_session_path(kind, &candidate)
                     || (kind.is_native() && candidate.extension() == Some(OsStr::new("jsonl")))
                 {
@@ -781,11 +999,16 @@ impl SessionCatalog {
                     }
                 }
             }
-            // Direct native Pi file outside the configured tree still resumes natively.
-            if candidate.extension() == Some(OsStr::new("jsonl")) {
+            // Direct native rpi file outside the configured tree still resumes natively,
+            // but never when the path is owned by the immutable Pi catalog.
+            if candidate.extension() == Some(OsStr::new("jsonl"))
+                && !self.is_pi_catalog_path(&candidate)
+            {
                 return Ok((SessionSourceKind::NativePi, candidate));
             }
-            return Err(CatalogError::SessionNotFound(candidate.display().to_string()));
+            return Err(CatalogError::SessionNotFound(
+                candidate.display().to_string(),
+            ));
         }
 
         let input_text = input
@@ -820,12 +1043,17 @@ impl SessionCatalog {
         let input = input.as_ref();
         let candidate = make_absolute(expand_tilde(input.to_path_buf(), &self.user_home));
         if candidate.is_file() {
+            if kind.is_native() && self.is_pi_catalog_path(&candidate) {
+                return Err(CatalogError::ReadOnlySource(SessionSourceKind::Pi));
+            }
             if self.is_safe_session_path(kind, &candidate)
                 || (kind.is_native() && candidate.extension() == Some(OsStr::new("jsonl")))
             {
                 return Ok(candidate);
             }
-            return Err(CatalogError::SessionNotFound(candidate.display().to_string()));
+            return Err(CatalogError::SessionNotFound(
+                candidate.display().to_string(),
+            ));
         }
         let input_text = input
             .to_str()
@@ -837,21 +1065,61 @@ impl SessionCatalog {
             [path] => Ok(path.clone()),
             _ => Err(CatalogError::AmbiguousSession {
                 input: input_text,
-                matches: matches
-                    .into_iter()
-                    .map(|path| (kind, path))
-                    .collect(),
+                matches: matches.into_iter().map(|path| (kind, path)).collect(),
             }),
         }
     }
 
-    /// Resolve and securely prepare a native session for resume while retaining
-    /// the same opened inode for parse and append.
+    /// Header provenance of one native rpi session path; unreadable or
+    /// foreign-layout files classify as User. Caller decides activation.
+    #[must_use]
+    pub fn native_session_kind(&self, path: impl AsRef<Path>) -> SessionKind {
+        let path = path.as_ref();
+        let root = self.root_for(SessionSourceKind::NativePi).path;
+        let opened = if path_lexically_under_root(path, &root) {
+            open_source_under_root(SourceSessionFormat::Pi, &root, path)
+        } else {
+            open_source_direct(SourceSessionFormat::Pi, path)
+        };
+        opened
+            .ok()
+            .and_then(|opened| read_native_header_lite(opened.into_primary(), path).ok())
+            .map(|header| header.session_kind)
+            .unwrap_or(SessionKind::User)
+    }
+
+    /// Resolve and securely prepare an rpi session for resume while retaining
+    /// the same opened inode for parse and append. Pi's source tree is catalog
+    /// only: an explicit path cannot relabel it as an ad-hoc rpi JSONL.
+
+    /// Resolve and securely prepare an rpi session for resume while retaining
     pub fn prepare_native_resume(
         &self,
         input: impl AsRef<Path>,
     ) -> Result<PreparedSessionResume, CatalogError> {
         let path = self.resolve_for(SessionSourceKind::NativePi, input)?;
+        let pi_root = self.root_for(SessionSourceKind::Pi).path;
+        if path_resolves_under_root(&path, &pi_root) {
+            return Err(CatalogError::ReadOnlySource(SessionSourceKind::Pi));
+        }
+        let native_root = self.root_for(SessionSourceKind::NativePi).path;
+        let kind = open_source_under_root(SourceSessionFormat::Pi, &native_root, &path)
+            .or_else(|_| open_source_direct(SourceSessionFormat::Pi, &path))
+            .map_err(CatalogError::from)
+            .and_then(|opened| {
+                read_native_header_lite(opened.into_primary(), &path).map_err(|reason| {
+                    CatalogError::Import(ImportSessionError::InvalidInput {
+                        format: SourceSessionFormat::Pi,
+                        path: path.clone(),
+                        reason,
+                    })
+                })
+            })
+            .map(|header| header.session_kind)
+            .unwrap_or(SessionKind::User);
+        if kind.is_workflow_internal() {
+            return Err(CatalogError::WorkflowInternalSession);
+        }
         let root = self.root_for(SessionSourceKind::NativePi).path;
         if path_lexically_under_root(&path, &root) {
             PreparedSessionResume::prepare_under_root(&root, &path).map_err(|error| {
@@ -907,12 +1175,7 @@ impl SessionCatalog {
     /// session, and content fingerprint come from [`parse_omp_chain_public`],
     /// shared by both import and row status so malformed or adjacency-rejected
     /// ancestors are excluded identically on both sides.
-    fn omp_chain_probe_bounded(
-        &self,
-        leaf: &Path,
-        limit: usize,
-        max_bytes: u64,
-    ) -> Vec<PathBuf> {
+    fn omp_chain_probe_bounded(&self, leaf: &Path, limit: usize, max_bytes: u64) -> Vec<PathBuf> {
         let root = self.root_for(SessionSourceKind::Omp).path;
         let format = SourceSessionFormat::Omp;
         let mut chain = Vec::new();
@@ -926,8 +1189,7 @@ impl SessionCatalog {
             if !visited.insert(cursor.clone()) {
                 break;
             }
-            let Ok(probe) = omp_chain_member_probe_under_root_public(format, &root, &cursor)
-            else {
+            let Ok(probe) = omp_chain_member_probe_under_root_public(format, &root, &cursor) else {
                 // Unreadable/oversize/noise-padded member: keep it (the leaf
                 // is unconditional; an ancestor was already validated on the
                 // way in) but stop extending the chain.
@@ -972,7 +1234,20 @@ impl SessionCatalog {
     ) -> Result<ResolvedSession, CatalogError> {
         let source_path = self.resolve_for(kind, input.as_ref())?;
         if kind.is_native() {
+            if self.is_pi_catalog_path(&source_path) {
+                return Err(CatalogError::ReadOnlySource(SessionSourceKind::Pi));
+            }
             return self.resume_native(&source_path);
+        }
+        if kind == SessionSourceKind::Pi {
+            Self::ensure_import_roots_disjoint(
+                kind,
+                &self.root_for(SessionSourceKind::Pi).path,
+                &self.root_for(SessionSourceKind::NativePi).path,
+            )?;
+        }
+        if !kind.is_importable() {
+            return Err(CatalogError::ReadOnlySource(kind));
         }
         let format = kind
             .to_import_format()
@@ -989,7 +1264,11 @@ impl SessionCatalog {
             parse_omp_chain_public(&root, &chain, SESSION_CATALOG_OMP_CHAIN_MAX_BYTES)?
         } else {
             let opened = open_source_under_root(format, &root, &source_path)?;
-            let fingerprint = content_fingerprint(opened.metadata());
+            let fingerprint = if kind == SessionSourceKind::Pi {
+                pi_content_fingerprint(&opened)?
+            } else {
+                content_fingerprint(opened.metadata())
+            };
             let parsed = parse_opened_source_public(format, opened)?;
             (parsed, fingerprint)
         };
@@ -1006,17 +1285,6 @@ impl SessionCatalog {
                 .into_owned(),
             content_fingerprint: Some(content_fingerprint_value),
         };
-        if let Some((native_id, native_path)) = self.find_existing_import(&lineage) {
-            return Ok(existing_import_result(
-                kind,
-                source_path,
-                source_session_id,
-                parsed,
-                native_id,
-                native_path,
-                preferred_cwd,
-            ));
-        }
 
         let cwd = if parsed.cwd.as_os_str().is_empty() {
             preferred_cwd
@@ -1044,12 +1312,30 @@ impl SessionCatalog {
                 .join("sessions")
                 .join(format!("--{encoded}--"))
         };
-        fs::create_dir_all(&output_dir).map_err(|source| CatalogError::Io {
-            path: output_dir.clone(),
-            source,
-        })?;
+        Self::ensure_import_roots_disjoint(kind, &root, &output_dir)?;
         let native_id = deterministic_import_id(&lineage);
-        let output = output_dir.join(format!("import_{native_id}.jsonl"));
+        let output_name = format!("import_{native_id}.jsonl");
+        let output = output_dir.join(&output_name);
+        let existing = self
+            .existing_import_at(&output, &lineage, &native_id)?
+            .or_else(|| self.find_existing_import(&lineage));
+        if let Some((native_id, native_path)) = existing {
+            return Ok(existing_import_result(
+                kind,
+                source_path,
+                source_session_id,
+                parsed,
+                native_id,
+                native_path,
+                preferred_cwd,
+            ));
+        }
+        #[cfg(test)]
+        IMPORT_AFTER_LOOKUP_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook(&output);
+            }
+        });
         let import_lineage = ImportLineage {
             source: format,
             source_session_id: lineage.source_session_id.clone(),
@@ -1057,41 +1343,30 @@ impl SessionCatalog {
             content_fingerprint: lineage.content_fingerprint.clone(),
             imported_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         };
-        match emit_parsed_session_at_with_lineage(
+        let members = if kind == SessionSourceKind::Omp {
+            self.omp_chain_paths(&source_path)
+                .into_iter()
+                .map(|path| open_source_under_root(format, &root, &path))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            vec![open_source_under_root(format, &root, &source_path)?]
+        };
+        match emit_source_into_directory_with_lineage(
             format,
             source_path.clone(),
-            parsed.clone(),
-            make_absolute(cwd),
+            members,
             native_id.clone(),
-            output.clone(),
+            Some(make_absolute(cwd.clone()).as_path()),
+            &output_dir,
+            &output_name,
             &import_lineage,
         ) {
             Ok(imported) => Ok(ResolvedSession::from(imported)),
             Err(ImportSessionError::Io { source, .. })
                 if source.kind() == ErrorKind::AlreadyExists =>
             {
-                let opened = open_source_under_root(
-                    SourceSessionFormat::Pi,
-                    &self.root_for(SessionSourceKind::NativePi).path,
-                    &output,
-                )?;
-                let Some((existing, existing_id)) =
-                    read_native_lineage(opened.into_primary(), &output)
-                else {
-                    return Err(CatalogError::Import(ImportSessionError::InvalidInput {
-                        format: SourceSessionFormat::Pi,
-                        path: output,
-                        reason: "concurrent import result has no valid lineage".to_owned(),
-                    }));
-                };
-                if existing.identity_key() != lineage.identity_key() || existing_id != native_id {
-                    return Err(CatalogError::Import(ImportSessionError::InvalidInput {
-                        format: SourceSessionFormat::Pi,
-                        path: output,
-                        reason: "concurrent import result lineage does not match the source"
-                            .to_owned(),
-                    }));
-                }
+                let (existing_id, existing) =
+                    self.validate_existing_import_at(&output, &lineage, &native_id)?;
                 Ok(existing_import_result(
                     kind,
                     source_path,
@@ -1106,6 +1381,20 @@ impl SessionCatalog {
         }
     }
 
+    fn ensure_import_roots_disjoint(
+        source: SessionSourceKind,
+        source_root: &Path,
+        output_root: &Path,
+    ) -> Result<(), CatalogError> {
+        if catalog_roots_overlap(source_root, output_root) {
+            return Err(CatalogError::Import(ImportSessionError::InvalidOutput {
+                path: make_absolute(output_root.to_path_buf()),
+                reason: format!("rpi import output overlaps the immutable {source} session source"),
+            }));
+        }
+        Ok(())
+    }
+
     /// Convenience: resolve kind automatically then import-or-resume.
     pub fn import_or_resume_any(
         &self,
@@ -1117,14 +1406,16 @@ impl SessionCatalog {
     }
 
     /// Build a lineage multimap from native Pi sessions already on disk: one
-    /// identity key may map to SEVERAL imports (an OMP chain change re-imports
-    /// under the same leaf identity but a different chain fingerprint), each
-    /// retaining its stored lineage so callers can exact-match the current
-    /// chain fingerprint instead of collapsing to the last path sorted.
+    /// identity key may map to SEVERAL imports (a foreign source content change
+    /// re-imports under the same identity but a different content fingerprint),
+    /// each retaining its stored lineage so callers can exact-match the current
+    /// content fingerprint instead of collapsing to the last path sorted.
     #[must_use]
     pub fn build_lineage_index(
         &self,
     ) -> HashMap<(SessionSourceKind, String), Vec<(String, PathBuf, ImportLineageKey)>> {
+        #[cfg(test)]
+        LINEAGE_INDEX_BUILD_COUNT.with(|count| count.set(count.get() + 1));
         let mut index: HashMap<
             (SessionSourceKind, String),
             Vec<(String, PathBuf, ImportLineageKey)>,
@@ -1134,9 +1425,7 @@ impl SessionCatalog {
             let Ok(opened) = open_source_under_root(SourceSessionFormat::Pi, &root, &path) else {
                 continue;
             };
-            if let Some((lineage, native_id)) =
-                read_native_lineage(opened.into_primary(), &path)
-            {
+            if let Some((lineage, native_id)) = read_native_lineage(opened.into_primary(), &path) {
                 index
                     .entry(lineage.identity_key())
                     .or_default()
@@ -1146,27 +1435,76 @@ impl SessionCatalog {
         index
     }
 
+    fn existing_import_at(
+        &self,
+        output: &Path,
+        lineage: &ImportLineageKey,
+        native_id: &str,
+    ) -> Result<Option<(String, PathBuf)>, CatalogError> {
+        match fs::symlink_metadata(output) {
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(CatalogError::Io {
+                path: output.to_path_buf(),
+                source,
+            }),
+            Ok(_) => self
+                .validate_existing_import_at(output, lineage, native_id)
+                .map(Some),
+        }
+    }
+
+    fn validate_existing_import_at(
+        &self,
+        output: &Path,
+        lineage: &ImportLineageKey,
+        native_id: &str,
+    ) -> Result<(String, PathBuf), CatalogError> {
+        let root = self.root_for(SessionSourceKind::NativePi).path;
+        let opened = open_source_under_root(SourceSessionFormat::Pi, &root, output)?;
+        let Some((stored, stored_id)) = read_native_lineage(opened.into_primary(), output) else {
+            return Err(CatalogError::Import(ImportSessionError::InvalidInput {
+                format: SourceSessionFormat::Pi,
+                path: output.to_path_buf(),
+                reason: "existing import has no valid lineage".to_owned(),
+            }));
+        };
+        if stored_id != native_id
+            || stored.identity_key() != lineage.identity_key()
+            || !foreign_fingerprint_matches(lineage, &stored)
+        {
+            return Err(CatalogError::Import(ImportSessionError::InvalidInput {
+                format: SourceSessionFormat::Pi,
+                path: output.to_path_buf(),
+                reason: "existing import lineage does not match the source".to_owned(),
+            }));
+        }
+        Ok((stored_id, output.to_path_buf()))
+    }
+
     fn find_existing_import(&self, lineage: &ImportLineageKey) -> Option<(String, PathBuf)> {
         let index = self.build_lineage_index();
         if let Some(entries) = index.get(&lineage.identity_key()) {
             // Scan EVERY same-identity native and return the first whose
-            // stored lineage matches the current chain fingerprint; a stale
+            // stored lineage matches the current content fingerprint; a stale
             // sibling (different fingerprint) never shadows the matching one.
             return entries.iter().find_map(|(native_id, native_path, stored)| {
-                omp_fingerprint_matches(lineage, stored)
+                foreign_fingerprint_matches(lineage, stored)
                     .then(|| (native_id.clone(), native_path.clone()))
             });
         }
         // Fallback: same source path fingerprint under any id key.
-        index.values().flatten().find_map(|(native_id, native_path, stored)| {
-            if stored.source != lineage.source
-                || stored.source_path_fingerprint != lineage.source_path_fingerprint
-                || !omp_fingerprint_matches(lineage, stored)
-            {
-                return None;
-            }
-            Some((native_id.clone(), native_path.clone()))
-        })
+        index
+            .values()
+            .flatten()
+            .find_map(|(native_id, native_path, stored)| {
+                if stored.source != lineage.source
+                    || stored.source_path_fingerprint != lineage.source_path_fingerprint
+                    || !foreign_fingerprint_matches(lineage, stored)
+                {
+                    return None;
+                }
+                Some((native_id.clone(), native_path.clone()))
+            })
     }
 
     fn resume_native(&self, path: &Path) -> Result<ResolvedSession, CatalogError> {
@@ -1183,6 +1521,9 @@ impl SessionCatalog {
                 reason,
             })
         })?;
+        if header.session_kind.is_workflow_internal() {
+            return Err(CatalogError::WorkflowInternalSession);
+        }
         Ok(ResolvedSession {
             kind: SessionSourceKind::NativePi,
             source_path: path.to_path_buf(),
@@ -1207,6 +1548,7 @@ impl SessionCatalog {
         let mut rows = rows
             .into_iter()
             .filter(|row| include_foreign || row.kind.is_native())
+            .filter(|row| !row.session_kind.is_workflow_internal())
             .filter(|row| {
                 if !named_only {
                     return true;
@@ -1262,8 +1604,8 @@ impl SessionCatalog {
             {
                 // Still allow prefix matches on names when id parse fails.
             }
-            let id_matches = !session_id.is_empty()
-                && (session_id == input || session_id.starts_with(input));
+            let id_matches =
+                !session_id.is_empty() && (session_id == input || session_id.starts_with(input));
             let name_matches = file_stem == input
                 || file_stem.starts_with(input)
                 || file_stem.contains(input)
@@ -1301,7 +1643,31 @@ impl SessionCatalog {
         }
         let modified_epoch = metadata_epoch(&metadata);
         let size = metadata.len();
-
+        // Incremental rescan: reuse the parsed row while the file's
+        // (mtime, size) pair is unchanged; any append/rewrite/delete+recreate
+        // produces a new pair and forces a full re-parse. Foreign rows
+        // additionally re-derive their AlreadyImported/Foreign status against
+        // the CURRENT lineage index so an import that lands between scans is
+        // never served stale.
+        let modified_ns = metadata_mtime_ns(&metadata);
+        let cache_key = (kind, path.to_path_buf());
+        {
+            let cache = catalog_row_cache().lock().expect("catalog row cache");
+            if let Some(cached) = cache.get(&cache_key)
+                && cached.modified_ns == modified_ns
+                && cached.size == size
+            {
+                let Some(row) = cached.row.clone() else {
+                    return Ok(None);
+                };
+                if kind.is_native() {
+                    return Ok(Some(row));
+                }
+                let mut row = row;
+                foreign_row_status_refresh(&mut row, lineage_index);
+                return Ok(Some(row));
+            }
+        }
         if kind.is_native() {
             let root = self.root_for(kind).path;
             let info = match open_source_under_root(SourceSessionFormat::Pi, &root, path)
@@ -1315,8 +1681,7 @@ impl SessionCatalog {
                             reason,
                         })
                     })
-                })
-            {
+                }) {
                 Ok(info) => info,
                 Err(_) => return Ok(None),
             };
@@ -1337,11 +1702,17 @@ impl SessionCatalog {
                 info.cwd.display(),
                 path.display()
             );
-            return Ok(Some(CatalogRow {
+            // Bootstrap-only: the session carries meaningful turns but none
+            // of them hold genuine content — every message is injected
+            // bootstrap material. A header-only session (zero messages) is
+            // not bootstrap-only.
+            let bootstrap_only =
+                info.message_count > 0 && info.genuine_message_count == 0;
+            let row = CatalogRow {
                 kind,
                 session_id: info.id,
                 summary,
-                cwd: info.cwd,
+                cwd: info.cwd.clone(),
                 modified_epoch,
                 display_time: format_epoch(modified_epoch),
                 path: path.to_path_buf(),
@@ -1350,9 +1721,15 @@ impl SessionCatalog {
                 name: info.name,
                 status: CatalogRowStatus::Native,
                 import_lineage: info.lineage,
+                has_parent_session: info.has_parent_session,
+                session_kind: info.session_kind,
+                agent_session: is_slock_agent_cwd(&info.cwd),
+                bootstrap_only,
                 search_text,
                 message_blob: info.first_message.clone(),
-            }));
+            };
+            cache_catalog_row(cache_key, modified_ns, size, Some(row.clone()));
+            return Ok(Some(row));
         }
 
         let format = kind
@@ -1387,8 +1764,16 @@ impl SessionCatalog {
                 Err(_) => return Ok(None),
             };
             let size = opened.aggregate_size();
+            let fingerprint = if kind == SessionSourceKind::Pi {
+                match pi_content_fingerprint(&opened) {
+                    Ok(fingerprint) => fingerprint,
+                    Err(_) => return Ok(None),
+                }
+            } else {
+                content_fingerprint(&metadata)
+            };
             match parse_opened_source_public(format, opened) {
-                Ok(parsed) => (parsed, Some(content_fingerprint(&metadata)), size),
+                Ok(parsed) => (parsed, Some(fingerprint), size),
                 Err(_) => return Ok(None),
             }
         };
@@ -1425,14 +1810,16 @@ impl SessionCatalog {
         let status = lineage_index
             .get(&lineage.identity_key())
             .and_then(|entries| {
-                entries.iter().find(|(_, _, stored)| {
-                    omp_fingerprint_matches(&lineage, stored)
-                })
+                entries
+                    .iter()
+                    .find(|(_, _, stored)| foreign_fingerprint_matches(&lineage, stored))
             })
-            .map(|(native_id, native_path, _)| CatalogRowStatus::AlreadyImported {
-                native_id: native_id.clone(),
-                native_path: native_path.clone(),
-            })
+            .map(
+                |(native_id, native_path, _)| CatalogRowStatus::AlreadyImported {
+                    native_id: native_id.clone(),
+                    native_path: native_path.clone(),
+                },
+            )
             .unwrap_or(CatalogRowStatus::Foreign);
         let message_blob = parsed
             .messages
@@ -1449,12 +1836,26 @@ impl SessionCatalog {
             parsed.cwd.display(),
             path.display()
         );
-        Ok(Some(CatalogRow {
+        // Bootstrap-only: the parsed turn list is non-empty yet no turn
+        // carries genuine content (injected context / AGENTS instruction
+        // envelopes) — the Codex/Slock ephemeral-agent shape where a spawn
+        // recorded context but never received a genuine prompt. The genuine
+        // count is scanned losslessly over every content block (all text
+        // blocks plus supported non-text such as images), so a later genuine
+        // text block or an image-only genuine turn clears the flag even when
+        // the lossy first-text projection would miss it.
+        let bootstrap_only =
+            parsed.meaningful_count > 0 && parsed.genuine_count == 0;
+        let row = CatalogRow {
             kind,
             session_id,
             summary,
             size,
             message_count: Some(parsed.meaningful_count),
+            has_parent_session: false,
+            session_kind: SessionKind::User,
+            agent_session: is_slock_agent_cwd(&parsed.cwd),
+            bootstrap_only,
             cwd: parsed.cwd,
             modified_epoch,
             display_time: format_epoch(modified_epoch),
@@ -1464,8 +1865,30 @@ impl SessionCatalog {
             import_lineage: Some(lineage),
             search_text,
             message_blob,
-        }))
+        };
+        cache_catalog_row(cache_key, modified_ns, metadata.len(), Some(row.clone()));
+        Ok(Some(row))
     }
+}
+
+fn catalog_roots_overlap(left: &Path, right: &Path) -> bool {
+    let left = make_absolute(left.to_path_buf());
+    let right = make_absolute(right.to_path_buf());
+    let lexical_overlap = left.starts_with(&right) || right.starts_with(&left);
+    let canonical_overlap = fs::canonicalize(&left)
+        .ok()
+        .zip(fs::canonicalize(&right).ok())
+        .is_some_and(|(left, right)| left.starts_with(&right) || right.starts_with(&left));
+    lexical_overlap || canonical_overlap
+}
+
+fn path_resolves_under_root(path: &Path, root: &Path) -> bool {
+    path_lexically_under_root(path, root)
+        || fs::canonicalize(root).ok().is_some_and(|root| {
+            fs::canonicalize(path)
+                .ok()
+                .is_some_and(|resolved| resolved.starts_with(root))
+        })
 }
 
 fn merge_source_rows(sources: Vec<Vec<CatalogRow>>) -> Vec<CatalogRow> {
@@ -1512,12 +1935,19 @@ fn deterministic_import_id(lineage: &ImportLineageKey) -> String {
     digest.update(source.as_str().as_bytes());
     digest.update(b"\0");
     digest.update(identity.as_bytes());
-    if lineage.source == SessionSourceKind::Omp {
-        // The OMP chain fingerprint participates in the id so a changed
-        // ancestor produces a distinct native import instead of colliding
-        // with (and reusing) the stale copy at the old deterministic path.
-        digest.update(b"\0chain:");
-        digest.update(lineage.content_fingerprint.as_deref().unwrap_or_default().as_bytes());
+    if lineage.source.is_importable() {
+        // Every foreign import's content fingerprint participates in the id so
+        // a changed source produces a distinct native import instead of
+        // colliding with (and reusing) the stale copy at the old deterministic
+        // path. For OMP this covers the whole accepted rotation chain.
+        digest.update(b"\0content:");
+        digest.update(
+            lineage
+                .content_fingerprint
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+        );
     }
     let bytes = digest.finalize();
     let mut uuid_bytes = [0_u8; 16];
@@ -1528,15 +1958,12 @@ fn deterministic_import_id(lineage: &ImportLineageKey) -> String {
 }
 
 /// Whether the stored native lineage matches the current selection's content
-/// fingerprint. Non-OMP sources always match (identity-based reuse policy);
-/// OMP requires the stored chain fingerprint to equal the current chain
-/// fingerprint so a changed ancestor re-imports instead of reusing a stale
-/// native copy.
-fn omp_fingerprint_matches(selection: &ImportLineageKey, stored: &ImportLineageKey) -> bool {
-    if selection.source != SessionSourceKind::Omp {
-        return true;
-    }
-    stored.content_fingerprint.is_some()
+/// fingerprint. Every importable foreign source requires the stored import's
+/// content fingerprint to equal the current source's content fingerprint, so
+/// a changed source is re-imported instead of reusing a stale native copy.
+fn foreign_fingerprint_matches(selection: &ImportLineageKey, stored: &ImportLineageKey) -> bool {
+    selection.content_fingerprint.is_some()
+        && stored.content_fingerprint.is_some()
         && stored.content_fingerprint == selection.content_fingerprint
 }
 
@@ -1574,4 +2001,3 @@ fn existing_import_result(
 pub fn dedupe_catalog_rows(rows: &[CatalogRow]) -> Vec<CatalogRow> {
     SessionCatalog::dedupe_rows(rows)
 }
-

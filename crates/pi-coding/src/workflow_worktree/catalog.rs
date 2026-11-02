@@ -1,8 +1,6 @@
 //! Durable catalog storage and repository-scoped operation locking.
 
-use std::collections::{BTreeSet, HashMap};
-use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::thread;
@@ -13,22 +11,22 @@ use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{RepoDiscovery, WorkflowWorktreeIdentity, WorktreeError};
+use crate::fs::{
+    CapabilityAccess, CapabilityRootLease, FileIdentity, FileMode, FsError, Replacement,
+    RootCreation,
+};
 
-const CATALOG_DIR_NAME: &str = "pi-workflow";
+use super::{WorkflowWorktreeIdentity, WorktreeError};
+
+pub(super) const CATALOG_DIR_NAME: &str = "pi-workflow";
 const CATALOG_FILE_NAME: &str = "worktrees.json";
 const CATALOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
-const REPO_LOCK_FILE_NAME: &str = "pi-workflow-worktree.lock";
+pub(super) const REPO_LOCK_FILE_NAME: &str = "pi-workflow-worktree.lock";
 const REPO_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
-const STALE_REPO_LOCK_AGE: Duration = Duration::from_secs(10 * 60);
 const LOCK_FILE_MAX_BYTES: u64 = 4096;
 
-/// Keys currently locked by this process. The key is the canonical common git
-/// directory, so different repositories never block each other. The registry
-/// mutex is held only while inserting/removing a key; the filesystem lock is
-/// always acquired afterward.
-static PROCESS_REPO_LOCKS: LazyLock<(Mutex<BTreeSet<PathBuf>>, Condvar)> =
-    LazyLock::new(|| (Mutex::new(BTreeSet::new()), Condvar::new()));
+static PROCESS_REPO_LOCKS: LazyLock<(Mutex<HashSet<FileIdentity>>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(HashSet::new()), Condvar::new()));
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct WorktreeCatalog {
@@ -94,7 +92,7 @@ struct LockRecord {
 }
 
 struct ProcessRepoLock {
-    key: PathBuf,
+    key: FileIdentity,
 }
 
 impl Drop for ProcessRepoLock {
@@ -105,66 +103,44 @@ impl Drop for ProcessRepoLock {
     }
 }
 
-/// Holds the process-local repository slot and the matching cross-process lock
-/// file. The token check prevents an old guard from deleting a successor's lock
-/// if the filesystem entry was externally replaced.
 pub(super) struct RepoLock {
-    path: PathBuf,
+    lease: CapabilityRootLease,
     token: String,
     _process: ProcessRepoLock,
 }
 
 impl Drop for RepoLock {
     fn drop(&mut self) {
-        if lock_token_matches(&self.path, &self.token) {
-            let _ = fs::remove_file(&self.path);
+        if lock_token_matches(&self.lease, &self.token) {
+            let _ = self.lease.remove_file(Path::new(REPO_LOCK_FILE_NAME));
         }
     }
 }
 
-pub(super) fn acquire_repo_lock(common_git_dir: &Path) -> Result<RepoLock, WorktreeError> {
-    let key = canonical_lock_key(common_git_dir)?;
-    let process = acquire_process_lock(key.clone())?;
-    let path = key.join(REPO_LOCK_FILE_NAME);
-    reject_symlink_components(&path)?;
-
+pub(super) fn acquire_repo_lock(lease: &CapabilityRootLease) -> Result<RepoLock, WorktreeError> {
+    let process = acquire_process_lock(lease.identity())?;
     let token = Uuid::new_v4().simple().to_string();
     let record = LockRecord {
         pid: std::process::id(),
         token: token.clone(),
         created_at_ms: unix_millis(),
     };
-    let bytes = serde_json::to_vec(&record)
+    let mut bytes = serde_json::to_vec(&record)
         .map_err(|error| WorktreeError::Other(anyhow!("serializing repository lock: {error}")))?;
+    bytes.push(b'\n');
     let started = Instant::now();
-
     loop {
-        match private_create_new(&path) {
+        match lease.create_new(Path::new(REPO_LOCK_FILE_NAME), FileMode::Private) {
             Ok(mut file) => {
-                let result = file
-                    .write_all(&bytes)
-                    .and_then(|()| file.write_all(b"\n"))
-                    .and_then(|()| file.sync_all());
-                if let Err(error) = result {
-                    let _ = fs::remove_file(&path);
-                    return Err(WorktreeError::Other(anyhow!(
-                        "writing repository worktree lock: {error}"
-                    )));
-                }
+                file.write_all(&bytes).map_err(capability_error)?;
+                file.finish().map_err(capability_error)?;
                 return Ok(RepoLock {
-                    path,
+                    lease: lease.clone(),
                     token,
                     _process: process,
                 });
             }
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                if lock_is_stale(&path) {
-                    match fs::remove_file(&path) {
-                        Ok(()) => continue,
-                        Err(remove_error) if remove_error.kind() == ErrorKind::NotFound => continue,
-                        Err(_) => {}
-                    }
-                }
+            Err(error) if is_already_exists(&error) => {
                 if started.elapsed() >= REPO_LOCK_TIMEOUT {
                     return Err(WorktreeError::Other(anyhow!(
                         "timed out waiting for repository worktree lock"
@@ -172,70 +148,20 @@ pub(super) fn acquire_repo_lock(common_git_dir: &Path) -> Result<RepoLock, Workt
                 }
                 thread::sleep(Duration::from_millis(25));
             }
-            Err(error) => {
-                return Err(WorktreeError::Other(anyhow!(
-                    "creating repository worktree lock: {error}"
-                )));
-            }
+            Err(error) => return Err(capability_error(error)),
         }
     }
 }
 
-pub(super) fn catalog_path(
-    override_path: Option<&Path>,
-    discovery: &RepoDiscovery,
-) -> PathBuf {
-    override_path.map_or_else(
-        || {
-            discovery
-                .common_git_dir
-                .join(CATALOG_DIR_NAME)
-                .join(CATALOG_FILE_NAME)
-        },
-        Path::to_path_buf,
-    )
-}
-
-pub(super) fn load_catalog(path: &Path) -> Result<WorktreeCatalog, WorktreeError> {
-    reject_symlink_components(path)?;
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            return Ok(WorktreeCatalog::default());
-        }
-        Err(error) => {
-            return Err(WorktreeError::Other(anyhow!(
-                "opening worktree ownership catalog: {error}"
-            )));
-        }
+pub(super) fn load_catalog(lease: &CapabilityRootLease) -> Result<WorktreeCatalog, WorktreeError> {
+    let Some(catalog) = catalog_lease_existing(lease)? else {
+        return Ok(WorktreeCatalog::default());
     };
-    let length = file
-        .metadata()
-        .map_err(|error| {
-            WorktreeError::Other(anyhow!(
-                "reading worktree ownership catalog metadata: {error}"
-            ))
-        })?
-        .len();
-    if length > CATALOG_MAX_BYTES {
-        return Err(WorktreeError::Other(anyhow!(
-            "worktree ownership catalog exceeds {CATALOG_MAX_BYTES} bytes"
-        )));
-    }
-
-    let mut bytes = Vec::with_capacity(usize::try_from(length).unwrap_or(0));
-    file.take(CATALOG_MAX_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| {
-            WorktreeError::Other(anyhow!(
-                "reading worktree ownership catalog: {error}"
-            ))
-        })?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > CATALOG_MAX_BYTES {
-        return Err(WorktreeError::Other(anyhow!(
-            "worktree ownership catalog exceeds {CATALOG_MAX_BYTES} bytes"
-        )));
-    }
+    let bytes = match catalog.read_bounded(Path::new(CATALOG_FILE_NAME), CATALOG_MAX_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) if is_missing(&error) => return Ok(WorktreeCatalog::default()),
+        Err(error) => return Err(capability_error(error)),
+    };
     let stored: StoredWorktreeCatalog = serde_json::from_slice(&bytes).map_err(|error| {
         WorktreeError::Other(anyhow!("parsing worktree ownership catalog: {error}"))
     })?;
@@ -243,99 +169,120 @@ pub(super) fn load_catalog(path: &Path) -> Result<WorktreeCatalog, WorktreeError
         entries: stored
             .entries
             .into_iter()
-            .map(|(workflow_id, identity)| (workflow_id, identity.into()))
+            .map(|(id, identity)| (id, identity.into()))
             .collect(),
     })
 }
 
-pub(super) fn with_catalog_mut<F>(path: &Path, mutate: F) -> Result<(), WorktreeError>
+/// Raw catalog bytes for rebind state classification; `None` when the catalog
+/// has never been written under this managed root. Unlike [`load_catalog`],
+/// this preserves the exact on-disk bytes so a relocated copy can be compared
+/// byte-for-byte against its source.
+pub(super) fn read_catalog_bytes(
+    lease: &CapabilityRootLease,
+) -> Result<Option<Vec<u8>>, WorktreeError> {
+    let Some(catalog) = catalog_lease_existing(lease)? else {
+        return Ok(None);
+    };
+    match catalog.read_bounded(Path::new(CATALOG_FILE_NAME), CATALOG_MAX_BYTES) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if is_missing(&error) => Ok(None),
+        Err(error) => Err(capability_error(error)),
+    }
+}
+
+/// Parse raw catalog bytes into the in-memory catalog. Fail-closed on any
+/// serialization drift: a corrupt catalog never degrades into an empty one.
+pub(super) fn parse_catalog_bytes(bytes: &[u8]) -> Result<WorktreeCatalog, WorktreeError> {
+    let stored: StoredWorktreeCatalog = serde_json::from_slice(bytes).map_err(|error| {
+        WorktreeError::Other(anyhow!("parsing worktree ownership catalog: {error}"))
+    })?;
+    Ok(WorktreeCatalog {
+        entries: stored
+            .entries
+            .into_iter()
+            .map(|(id, identity)| (id, identity.into()))
+            .collect(),
+    })
+}
+
+pub(super) fn with_catalog_mut<F>(
+    lease: &CapabilityRootLease,
+    mutate: F,
+) -> Result<(), WorktreeError>
 where
     F: FnOnce(&mut WorktreeCatalog) -> Result<(), WorktreeError>,
 {
-    let mut catalog = load_catalog(path)?;
+    let mut catalog = load_catalog(lease)?;
     mutate(&mut catalog)?;
-    write_catalog_atomic(path, &catalog)
+    write_catalog_atomic(lease, &catalog)
 }
 
 fn write_catalog_atomic(
-    path: &Path,
+    lease: &CapabilityRootLease,
     catalog: &WorktreeCatalog,
 ) -> Result<(), WorktreeError> {
     let stored = StoredWorktreeCatalog {
         entries: catalog
             .entries
             .iter()
-            .map(|(workflow_id, identity)| {
-                (workflow_id.clone(), StoredWorktreeIdentity::from(identity))
-            })
+            .map(|(id, identity)| (id.clone(), identity.into()))
             .collect(),
     };
     let bytes = serde_json::to_vec(&stored)
         .map_err(|error| WorktreeError::Other(anyhow!("serializing worktree catalog: {error}")))?;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > CATALOG_MAX_BYTES {
         return Err(WorktreeError::Other(anyhow!(
-            "serialized worktree catalog exceeds {} bytes",
-            CATALOG_MAX_BYTES
+            "serialized worktree catalog exceeds {CATALOG_MAX_BYTES} bytes"
         )));
     }
-
-    let parent = path.parent().ok_or_else(|| {
-        WorktreeError::Other(anyhow!("worktree ownership catalog has no parent directory"))
-    })?;
-    create_dir_chain_no_symlink(parent)?;
-    reject_symlink_components(path)?;
-
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(CATALOG_FILE_NAME);
-    let temporary = parent.join(format!(
-        ".{file_name}.{}.tmp",
-        Uuid::new_v4().simple()
-    ));
-
-    let result = (|| -> Result<(), WorktreeError> {
-        let mut file = private_create_new(&temporary).map_err(|error| {
-            WorktreeError::Other(anyhow!(
-                "creating temporary worktree ownership catalog: {error}"
-            ))
-        })?;
-        file.write_all(&bytes).map_err(|error| {
-            WorktreeError::Other(anyhow!(
-                "writing temporary worktree ownership catalog: {error}"
-            ))
-        })?;
-        file.sync_all().map_err(|error| {
-            WorktreeError::Other(anyhow!(
-                "syncing temporary worktree ownership catalog: {error}"
-            ))
-        })?;
-        fs::rename(&temporary, path).map_err(|error| {
-            WorktreeError::Other(anyhow!(
-                "activating worktree ownership catalog: {error}"
-            ))
-        })?;
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| {
-                WorktreeError::Other(anyhow!(
-                    "syncing worktree ownership catalog directory: {error}"
-                ))
-            })?;
-        Ok(())
-    })();
-
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+    let catalog_lease = catalog_lease(lease)?;
+    let relative = PathBuf::from(CATALOG_FILE_NAME);
+    let expected = match catalog_lease.metadata(&relative) {
+        Ok(metadata) => Some(metadata.identity),
+        Err(error) if is_missing(&error) => None,
+        Err(error) => return Err(capability_error(error)),
+    };
+    catalog_lease
+        .replace_file(Replacement {
+            relative,
+            expected,
+            bytes,
+            mode: FileMode::Private,
+        })
+        .map_err(capability_error)?;
+    Ok(())
 }
 
-fn acquire_process_lock(key: PathBuf) -> Result<ProcessRepoLock, WorktreeError> {
+fn catalog_lease(lease: &CapabilityRootLease) -> Result<CapabilityRootLease, WorktreeError> {
+    lease
+        .lease_directory(
+            Path::new(CATALOG_DIR_NAME),
+            CapabilityAccess::PrivateReadWrite,
+            RootCreation::CreateDirectory,
+        )
+        .map_err(capability_error)
+}
+
+fn catalog_lease_existing(
+    lease: &CapabilityRootLease,
+) -> Result<Option<CapabilityRootLease>, WorktreeError> {
+    match lease.lease_directory(
+        Path::new(CATALOG_DIR_NAME),
+        CapabilityAccess::PrivateReadWrite,
+        RootCreation::Existing,
+    ) {
+        Ok(catalog) => Ok(Some(catalog)),
+        Err(error) if is_missing(&error) => Ok(None),
+        Err(error) => Err(capability_error(error)),
+    }
+}
+
+fn acquire_process_lock(key: FileIdentity) -> Result<ProcessRepoLock, WorktreeError> {
     let started = Instant::now();
     let mut active = PROCESS_REPO_LOCKS.0.lock();
     loop {
-        if active.insert(key.clone()) {
+        if active.insert(key) {
             return Ok(ProcessRepoLock { key });
         }
         let elapsed = started.elapsed();
@@ -350,72 +297,12 @@ fn acquire_process_lock(key: PathBuf) -> Result<ProcessRepoLock, WorktreeError> 
     }
 }
 
-fn canonical_lock_key(path: &Path) -> Result<PathBuf, WorktreeError> {
-    reject_symlink_components(path)?;
-    fs::canonicalize(path).map_err(|error| {
-        WorktreeError::Other(anyhow!(
-            "canonicalizing common git directory: {error}"
-        ))
-    })
-}
-
-fn lock_is_stale(path: &Path) -> bool {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return false;
-    };
-    if !metadata.file_type().is_file() {
-        return false;
-    }
-    let Ok(modified) = metadata.modified() else {
-        return false;
-    };
-    if !modified
-        .elapsed()
-        .is_ok_and(|age| age >= STALE_REPO_LOCK_AGE)
-    {
-        return false;
-    }
-
-    match read_lock_record(path) {
-        Some(record) => !process_is_alive(record.pid),
-        None => true,
-    }
-}
-
-fn lock_token_matches(path: &Path, token: &str) -> bool {
-    read_lock_record(path).is_some_and(|record| record.token == token)
-}
-
-fn read_lock_record(path: &Path) -> Option<LockRecord> {
-    let mut file = File::open(path).ok()?;
-    if file.metadata().ok()?.len() > LOCK_FILE_MAX_BYTES {
-        return None;
-    }
-    let mut bytes = Vec::new();
-    file.take(LOCK_FILE_MAX_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if u64::try_from(bytes.len()).ok()? > LOCK_FILE_MAX_BYTES {
-        return None;
-    }
-    serde_json::from_slice(&bytes).ok()
-}
-
-#[cfg(unix)]
-fn process_is_alive(pid: u32) -> bool {
-    let Ok(pid) = i32::try_from(pid) else {
-        return true;
-    };
-    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
-        Ok(()) | Err(nix::errno::Errno::EPERM) => true,
-        Err(nix::errno::Errno::ESRCH) => false,
-        Err(_) => true,
-    }
-}
-
-#[cfg(not(unix))]
-fn process_is_alive(_pid: u32) -> bool {
-    true
+fn lock_token_matches(lease: &CapabilityRootLease, token: &str) -> bool {
+    lease
+        .read_bounded(Path::new(REPO_LOCK_FILE_NAME), LOCK_FILE_MAX_BYTES)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<LockRecord>(&bytes).ok())
+        .is_some_and(|record| record.token == token)
 }
 
 fn unix_millis() -> u64 {
@@ -426,78 +313,26 @@ fn unix_millis() -> u64 {
         .unwrap_or(0)
 }
 
-fn create_dir_chain_no_symlink(path: &Path) -> Result<(), WorktreeError> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|error| WorktreeError::Other(error.into()))?
-            .join(path)
-    };
-    let mut current = PathBuf::new();
-    for component in absolute.components() {
-        current.push(component.as_os_str());
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(WorktreeError::Symlink);
-            }
-            Ok(metadata) if !metadata.is_dir() => {
-                return Err(WorktreeError::Other(anyhow!(
-                    "catalog parent component is not a directory"
-                )));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                fs::create_dir(&current).map_err(|create_error| {
-                    WorktreeError::Other(anyhow!(
-                        "creating catalog directory: {create_error}"
-                    ))
-                })?;
-            }
-            Err(error) => {
-                return Err(WorktreeError::Other(anyhow!(
-                    "inspecting catalog directory: {error}"
-                )));
-            }
+fn is_missing(error: &FsError) -> bool {
+    matches!(
+        error,
+        FsError::System {
+            kind: std::io::ErrorKind::NotFound,
+            ..
         }
-    }
-    Ok(())
+    )
 }
 
-fn reject_symlink_components(path: &Path) -> Result<(), WorktreeError> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|error| WorktreeError::Other(error.into()))?
-            .join(path)
-    };
-    let mut current = PathBuf::new();
-    for component in absolute.components() {
-        current.push(component.as_os_str());
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(WorktreeError::Symlink);
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => break,
-            Err(error) => {
-                return Err(WorktreeError::Other(anyhow!(
-                    "inspecting catalog path component: {error}"
-                )));
-            }
+fn is_already_exists(error: &FsError) -> bool {
+    matches!(
+        error,
+        FsError::System {
+            kind: std::io::ErrorKind::AlreadyExists,
+            ..
         }
-    }
-    Ok(())
+    )
 }
 
-fn private_create_new(path: &Path) -> std::io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options.open(path)
+fn capability_error(error: FsError) -> WorktreeError {
+    WorktreeError::Other(anyhow!("workflow worktree capability failed: {error}"))
 }

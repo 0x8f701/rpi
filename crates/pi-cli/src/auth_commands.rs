@@ -125,7 +125,7 @@ pub async fn logout_cli(provider: Option<&str>, scope: Option<&str>) -> Result<(
     Ok(())
 }
 
-fn manager() -> Result<AuthManager> {
+pub(crate) fn manager() -> Result<AuthManager> {
     let path = auth_json_path().ok_or_else(|| anyhow::anyhow!("auth.json path is unavailable"))?;
     AuthManager::new(path)
 }

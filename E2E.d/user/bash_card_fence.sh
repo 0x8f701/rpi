@@ -51,6 +51,7 @@ main() {
     register_tmux_session "$session"
 
     port="$(start_mock "$root")"
+    mkdir -p "$root/home/.pi/agent"
     cat >"$root/home/.pi/agent/models.json" <<EOF
 {
   "providers": {
@@ -68,7 +69,7 @@ EOF
     tmux new-session -d -s "$session" -x 140 -y 42 -c "$root/workspace" \
         "env HOME='$root/home' USERPROFILE='$root/home' \
 PI_CODING_AGENT_DIR='$root/home/.pi/agent' \
-PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 \
+RPI_OFFLINE=1 RPI_SKIP_VERSION_CHECK=1 \
 TERM=xterm-256color \
 '$RPI_BIN' --offline --model user-bash-card/mock --api-key user-mock-key; printf '===TUI-DONE-bash-card-fence===\n'"
 

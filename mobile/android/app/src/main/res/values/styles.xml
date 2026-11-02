@@ -1,0 +1,8 @@
+<resources>
+    <style name="AppTheme" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowBackground">#101214</item>
+        <item name="android:statusBarColor">#1a1d20</item>
+        <item name="android:navigationBarColor">#101214</item>
+        <item name="android:editTextBackground">@drawable/rn_edit_text_material</item>
+    </style>
+</resources>

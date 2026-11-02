@@ -9,6 +9,13 @@ use pi_ai::Model;
 use pi_ai::providers::{FauxProviderOptions, FauxResponse, register_faux_provider};
 use pi_coding::{Application, Session, SessionOptions};
 
+/// Hermetic session-store fixture (see approvals `prepare_session_store`).
+fn prepare_session_store(session: &Session, cwd: &std::path::Path) {
+    let session_dir = cwd.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session directory");
+    session.set_session_dir(session_dir);
+}
+
 /// A print-mode run must stream the faux assistant text to the writer.
 #[tokio::test]
 async fn print_mode_streams_faux_text() {
@@ -41,8 +48,10 @@ async fn print_mode_streams_faux_text() {
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: None,
+        auth_manager: None,
     })
     .expect("build session");
+    prepare_session_store(&session, cwd.path());
     let application = Application::new(session).await;
 
     let mut out = Vec::new();
@@ -72,6 +81,7 @@ async fn print_mode_expands_text_and_image_arguments() {
     model.api = "faux-print-files-test".into();
     model.provider = "faux".into();
     model.base_url = "http://localhost:0".into();
+    model.input = vec!["text".into(), "image".into()];
 
     let reg = register_faux_provider(FauxProviderOptions {
         api: "faux-print-files-test".into(),
@@ -105,8 +115,10 @@ async fn print_mode_expands_text_and_image_arguments() {
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: None,
+        auth_manager: None,
     })
     .expect("build session");
+    prepare_session_store(&session, cwd.path());
     let application = Application::new(session.clone()).await;
 
     let mut out = Vec::new();
@@ -168,8 +180,10 @@ async fn print_mode_goal_command_starts_agent_turn() {
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: None,
+        auth_manager: None,
     })
     .expect("session");
+    prepare_session_store(&session, cwd.path());
     session
         .record(
             pi_coding::start_session_in(
@@ -193,9 +207,18 @@ async fn print_mode_goal_command_starts_agent_turn() {
     )
     .await
     .expect("goal command");
-    assert!(result.starts_with("Goal work started · active · 0/20 tokens · ship cleanly"), "{result}");
+    assert!(
+        result.starts_with("Goal work started · active · 0/20 tokens · ship cleanly"),
+        "{result}"
+    );
     application.wait_for_idle().await;
-    assert!(session.history().iter().any(|message| matches!(message, pi_ai::Message::Assistant(_))), "goal command must run the agent");
+    assert!(
+        session
+            .history()
+            .iter()
+            .any(|message| matches!(message, pi_ai::Message::Assistant(_))),
+        "goal command must run the agent"
+    );
     assert_eq!(String::from_utf8(output).unwrap(), format!("{result}\n"));
     registration.unregister();
 }

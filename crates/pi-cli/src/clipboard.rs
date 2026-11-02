@@ -611,8 +611,8 @@ mod tests {
 
     #[test]
     fn text_is_used_when_no_image_is_available() {
-        let selected = prefer_image_then_text(Ok(None), Ok(Some("hello".to_owned())))
-            .expect("prefer text");
+        let selected =
+            prefer_image_then_text(Ok(None), Ok(Some("hello".to_owned()))).expect("prefer text");
         assert_eq!(selected, Some(ClipboardContent::Text("hello".to_owned())));
     }
 
@@ -631,8 +631,8 @@ mod tests {
 
     #[test]
     fn malformed_image_bytes_are_actionable() {
-        let error = image_from_bytes(b"not-an-image".to_vec(), "image/png")
-            .expect_err("reject malformed");
+        let error =
+            image_from_bytes(b"not-an-image".to_vec(), "image/png").expect_err("reject malformed");
         let message = error.to_string();
         assert!(
             message.contains("not a supported image") || message.contains("could not"),

@@ -10,9 +10,9 @@ use parking_lot::Mutex;
 use pi_agent::ToolCapability;
 use pi_ai::{ContentBlock, Model, StopReason, ToolCall};
 use pi_coding::{
-    AgentCatalog, AgentDefinition, AgentDefinitionSource, CapabilityCeiling,
-    ChildSessionFactory, ChildSessionRequest, JobSnapshot, JobStatus, OrchestrationConfig,
-    OrchestrationRuntime, Session, SessionOptions, TaskItem, TaskSpawn,
+    AgentCatalog, AgentDefinition, AgentDefinitionSource, CapabilityCeiling, ChildSessionFactory,
+    ChildSessionRequest, JobSnapshot, JobStatus, OrchestrationConfig, OrchestrationRuntime,
+    Session, SessionOptions, TaskItem, TaskSpawn,
 };
 use serde_json::{Value, json};
 
@@ -21,20 +21,28 @@ fn contract_definition(
     max_tool_calls: Option<usize>,
     timeout_secs: Option<u64>,
 ) -> AgentDefinition {
-    AgentDefinition { name: "task".to_owned(),
-    description: "contract test role".to_owned(),
-    system_prompt: "complete the assignment".to_owned(),
-    tools: None,
-    autoload_skills: Vec::new(),
-    model: None,
-    thinking_level: None,
-    max_turns,
-    max_tool_calls,
-    timeout_secs,
-    disallowed_tools: Vec::new(),
-    capability_ceiling: None,
-    source: AgentDefinitionSource::Bundled,
-    path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None }
+    AgentDefinition {
+        name: "task".to_owned(),
+        description: "contract test role".to_owned(),
+        system_prompt: "complete the assignment".to_owned(),
+        tools: None,
+        autoload_skills: Vec::new(),
+        model: None,
+        thinking_level: None,
+        max_turns,
+        max_tool_calls,
+        timeout_secs,
+        disallowed_tools: Vec::new(),
+        capability_ceiling: None,
+        source: AgentDefinitionSource::Bundled,
+        path: None,
+        trusted: true,
+        kind: pi_coding::AgentDefinitionKind::Agent,
+        personality: None,
+        soft_budget: None,
+        knowledge_roots: Vec::new(),
+        user_proxy: false,
+    }
 }
 
 struct ScriptedTurn {
@@ -120,15 +128,15 @@ fn scripted_runtime_with_budget(
                 after_tool_call: None,
                 stream_fn: Some(stream_fn),
                 auth_resolver: None,
+                auth_manager: None,
             })
         })
     });
-    let mut config = OrchestrationConfig::new(
-        AgentCatalog::from_agents(vec![definition]),
-        artifact_dir,
-    );
+    let mut config =
+        OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition]), artifact_dir);
     config.idle_ttl = None;
     config.soft_budget = soft_budget;
+    config.max_tools_per_agent = 64;
     config.parent_model = Model {
         id: "role-contract-test".to_owned(),
         name: "Role Contract Test".to_owned(),
@@ -194,7 +202,10 @@ async fn max_turns_stops_child_with_clear_reason() {
         "the soft-limit marker is reserved for the soft budget, never a contract stop"
     );
     let result = job.result.expect("settled result");
-    assert_eq!(result.output, "second", "child stopped after its second turn");
+    assert_eq!(
+        result.output, "second",
+        "child stopped after its second turn"
+    );
     let error = result.error.expect("contract must surface a clear reason");
     assert!(error.contains("maxTurns"), "{error}");
     assert!(error.contains("2"), "{error}");
@@ -227,7 +238,10 @@ async fn max_tool_calls_stops_child_with_clear_reason() {
         "the soft-limit marker is reserved for the soft budget, never a contract stop"
     );
     let result = job.result.expect("settled result");
-    assert_eq!(result.output, "first", "child stopped after its single allowed tool call");
+    assert_eq!(
+        result.output, "first",
+        "child stopped after its single allowed tool call"
+    );
     let error = result.error.expect("contract must surface a clear reason");
     assert!(error.contains("maxToolCalls"), "{error}");
     assert!(error.contains("1"), "{error}");
@@ -374,6 +388,7 @@ async fn timeout_aborts_hanging_child_with_clear_reason() {
                 after_tool_call: None,
                 stream_fn: Some(stream_fn),
                 auth_resolver: None,
+                auth_manager: None,
             })
         })
     });
@@ -382,6 +397,7 @@ async fn timeout_aborts_hanging_child_with_clear_reason() {
         artifacts.path(),
     );
     config.idle_ttl = None;
+    config.max_tools_per_agent = 64;
     let runtime = OrchestrationRuntime::new(config, factory).expect("runtime");
 
     let job = spawn_and_settle(&runtime, "TimeoutChild").await;
@@ -405,8 +421,12 @@ async fn timeout_aborts_hanging_child_with_clear_reason() {
 ///
 /// The cwd `TempDir` is returned so the factory's snapshot cwd stays alive for
 /// the duration of the test (child `Session::new` canonicalizes the cwd).
-fn production_child_factory(
-) -> (OrchestrationRuntime, ChildSessionFactory, Model, tempfile::TempDir) {
+fn production_child_factory() -> (
+    OrchestrationRuntime,
+    ChildSessionFactory,
+    Model,
+    tempfile::TempDir,
+) {
     let cwd = tempfile::tempdir().expect("cwd");
     let model = Model::default();
     let parent = Session::new(SessionOptions {
@@ -422,6 +442,7 @@ fn production_child_factory(
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: None,
+        auth_manager: None,
     })
     .expect("parent session");
     let factory = OrchestrationRuntime::child_factory_from_session(&parent);
@@ -431,14 +452,19 @@ fn production_child_factory(
         artifacts.path(),
     );
     config.idle_ttl = None;
-    let runtime = OrchestrationRuntime::new(config, Arc::new(|_| {
-        Box::pin(async { Err(anyhow::anyhow!("unused factory")) })
-    }))
+    let runtime = OrchestrationRuntime::new(
+        config,
+        Arc::new(|_| Box::pin(async { Err(anyhow::anyhow!("unused factory")) })),
+    )
     .expect("runtime");
     (runtime, factory, model, cwd)
 }
 
-fn child_request(model: Model, definition: AgentDefinition, names: Option<Vec<String>>) -> ChildSessionRequest {
+fn child_request(
+    model: Model,
+    definition: AgentDefinition,
+    names: Option<Vec<String>>,
+) -> ChildSessionRequest {
     ChildSessionRequest {
         child_id: "Child".to_owned(),
         parent_id: "Main".to_owned(),
@@ -449,8 +475,13 @@ fn child_request(model: Model, definition: AgentDefinition, names: Option<Vec<St
         system_prompt: "p".to_owned(),
         requested_tool_names: names,
         orchestration_tools: Vec::new(),
+        persona_skill_store: None,
+        persona_skills: Arc::new(Vec::new()),
+        shared_skills: Arc::new(Vec::new()),
         thinking_level: None,
         model,
+        resolved_model_sequence: Vec::new(),
+        resolved_model_selected_index: 0,
         output_schema: None,
         schema_mode: None,
         yield_state: std::sync::Arc::new(pi_coding::YieldState::default()),
@@ -473,10 +504,16 @@ async fn disallowed_tools_remove_tools_by_name_at_spawn() {
     );
     let session = factory(request).await.expect("child session");
     let tools = session.get_all_tools();
-    let names = tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>();
+    let names = tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
     assert!(names.contains(&"read"), "{names:?}");
     assert!(names.contains(&"edit"), "{names:?}");
-    assert!(!names.contains(&"bash"), "disallowed tool must be filtered: {names:?}");
+    assert!(
+        !names.contains(&"bash"),
+        "disallowed tool must be filtered: {names:?}"
+    );
 }
 
 #[tokio::test]
@@ -492,7 +529,9 @@ async fn capability_ceiling_filters_child_tools_by_capability() {
     let session = factory(request).await.expect("child session");
     let tools = session.get_all_tools();
     assert!(
-        tools.iter().all(|tool| tool.capability != ToolCapability::Write),
+        tools
+            .iter()
+            .all(|tool| tool.capability != ToolCapability::Write),
         "ceiling must drop Write tools: {:?}",
         tools
             .iter()
@@ -526,7 +565,10 @@ async fn disallowed_and_ceiling_combine_at_spawn() {
     for tool in tools.iter().filter(|tool| tool.name != "yield") {
         assert_ne!(tool.name, "bash", "disallowed tool must never appear");
         assert!(
-            matches!(tool.capability, ToolCapability::Read | ToolCapability::Write),
+            matches!(
+                tool.capability,
+                ToolCapability::Read | ToolCapability::Write
+            ),
             "exec coding tools must be dropped by the ceiling: {} {:?}",
             tool.name,
             tool.capability,
@@ -549,6 +591,7 @@ fn context(id: &str, arguments: Value) -> pi_agent::ToolCallContext {
         on_update: Arc::new(|_| {}),
         abort,
         model: None,
+        approval_token: None,
     }
 }
 
@@ -557,12 +600,10 @@ fn context(id: &str, arguments: Value) -> pi_agent::ToolCallContext {
 async fn spawn_via_task_tool(runtime: &OrchestrationRuntime, name: &str, task: &str) -> TaskSpawn {
     let tools = runtime.agent_tools("Main", 0);
     let task_tool = tool(&tools, "task");
-    let spawn_result = (task_tool.execute)(context(
-        "spawn-role",
-        json!({ "name": name, "task": task }),
-    ))
-    .await
-    .expect("task spawn result");
+    let spawn_result =
+        (task_tool.execute)(context("spawn-role", json!({ "name": name, "task": task })))
+            .await
+            .expect("task spawn result");
     let mut spawns: Vec<TaskSpawn> =
         serde_json::from_value(spawn_result.details).expect("spawn details");
     spawns.remove(0)
@@ -583,6 +624,7 @@ async fn selected_role_becomes_default_for_unnamed_task_spawns() {
         artifacts.path(),
     );
     config.idle_ttl = None;
+    config.max_tools_per_agent = 64;
     let runtime = OrchestrationRuntime::new(
         config,
         Arc::new(|_| Box::pin(async { Err(anyhow::anyhow!("unused factory")) })),
@@ -636,6 +678,7 @@ async fn selected_role_ignored_when_disabled_by_settings() {
         artifacts.path(),
     );
     config.idle_ttl = None;
+    config.max_tools_per_agent = 64;
     config.agent_settings.insert(
         "reviewer".to_owned(),
         pi_coding::AgentRuntimeSettings {

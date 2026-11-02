@@ -12,11 +12,12 @@
 //!
 //! # Environment expansion
 //!
-//! `$NAME` and `${NAME}` references in every string value of the settings
-//! document are replaced with the matching process-environment value,
-//! recursively through nested objects and arrays (including retained unknown
-//! fields). Expansion applies **only when projecting the effective runtime
-//! view** ([`SettingsManager::settings`], consumed by sessions): the
+//! `$NAME` and `${NAME}` references in settings string values are replaced with
+//! the matching process-environment value, recursively through nested objects
+//! and arrays. Credential grant definitions and MCP credential-grant references
+//! remain literal authority identifiers and are never environment-expanded.
+//! Expansion applies only when projecting the effective runtime view
+//! ([`SettingsManager::settings`], consumed by sessions): the
 //! persisted layers ([`SettingsManager::global_settings`] /
 //! [`SettingsManager::project_settings`]) keep the pre-expansion document
 //! literal, so writing settings re-serializes the raw references and never
@@ -31,20 +32,28 @@
 //! atomic (temp-file-in-same-dir + rename) with owner-only `0600`
 //! permissions.
 
+mod unique_wire;
+pub use unique_wire::McpEnvironmentWire;
+
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
 use parking_lot::RwLock;
 use pi_agent::{ApprovalMode, QueueMode, ThinkingLevel};
 use pi_ai::{CacheRetention, SimpleStreamOptions, ThinkingBudgets, Transport};
+use pi_sandbox::{HostHttpClass, HostHttpScheme, IpScope, NetworkPolicy, SandboxMode, SpawnFamily};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
+use crate::fs::{CapabilityRootLease, EntryKind, FileMode, Replacement};
+use crate::resolve::{ResolvedModel, resolve_model_pattern};
 use crate::resources::{CONFIG_DIR_NAME, agent_dir_path};
 use crate::session_catalog::SessionSourceKind;
 
@@ -241,43 +250,123 @@ pub struct SoftBudgetSettings {
     pub yield_after: Option<usize>,
 }
 
-/// Opt-in Linux filesystem sandbox for the bash tool (`settings.sandbox`).
-///
-/// The sandbox confines bash commands to the configured allowed paths using
-/// `unshare` mount/pid/net namespaces (network is loopback-only unless
-/// `network` is true). It is same-user confinement, not isolation: the command
-/// runs with the caller's uid and can write to the bind-mounted allowed paths.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SandboxSettings {
-    /// Run bash in the filesystem sandbox by default. The per-call
-    /// `sandboxed` bash parameter overrides this for a single command.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
-    /// Share the host network inside the sandbox. Default (false): fresh
-    /// network namespace with loopback only.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub network: Option<bool>,
-    /// Mount the allowed paths read-only inside the sandbox (bind mounts with
-    /// `MS_RDONLY`). Default (false): allowed paths stay writable. When true
-    /// the deny-by-default filesystem still applies and every allowed path is
-    /// read-only, while the sandbox's private HOME/TMPDIR remain writable so
-    /// commands can cache and create temp files.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub read_only: Option<bool>,
-    /// Paths visible inside the sandbox (bind-mounted read-write). Defaults to
-    /// the session working directory plus the agent directory. Relative paths
-    /// resolve from the session working directory.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub allowed_paths: Option<Vec<String>>,
-    /// Paths hidden inside the sandbox (empty overlay), even when nested under
-    /// an allowed path. Relative paths resolve from the session working
-    /// directory.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub denied_paths: Option<Vec<String>>,
-    /// Unknown fields are preserved verbatim (round-trips through drafts).
-    #[serde(default, flatten)]
-    pub extra: Map<String, Value>,
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResourceLimitSettingsWire {
+    pub address_space_bytes: Option<u64>,
+    pub cpu_seconds: Option<u64>,
+    pub file_size_bytes: Option<u64>,
+    pub open_files: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WritableRootWire {
+    pub root: PathBuf,
+    #[serde(default)]
+    pub protected_descendants: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostHttpDestinationWire {
+    pub class: HostHttpClass,
+    pub scheme: HostHttpScheme,
+    pub host: HostHttpHostWire,
+    pub port: u16,
+    pub allowed_ip_scopes: Vec<IpScope>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum HostHttpHostWire {
+    Dns { name: String },
+    Ip { address: IpAddr },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostHttpPolicySettings {
+    #[serde(
+        default,
+        deserialize_with = "unique_wire::deserialize_host_http_destinations"
+    )]
+    pub destinations: Vec<HostHttpDestinationWire>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CredentialGrantDefinitionSettings {
+    pub id: String,
+    pub provider: String,
+    pub scope: Option<String>,
+    pub audience: CredentialAudienceWire,
+    pub output: CredentialGrantOutputConfigWire,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CredentialAudienceWire {
+    McpServer { name: String },
+    SpawnFamily { family: SpawnFamily },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OAuthGrantRefreshWire {
+    IfExpired,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "credentialType", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CredentialGrantOutputConfigWire {
+    ApiKey {
+        environment: String,
+    },
+    OAuthAccessToken {
+        environment: String,
+        refresh: OAuthGrantRefreshWire,
+    },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SandboxSettingsWire {
+    pub mode: Option<SandboxMode>,
+    pub network: Option<NetworkPolicy>,
+    #[serde(default)]
+    pub read_only_roots: Vec<PathBuf>,
+    #[serde(default)]
+    pub writable_roots: Vec<WritableRootWire>,
+    #[serde(default)]
+    pub denied_paths: Vec<PathBuf>,
+    pub host_http: Option<HostHttpPolicySettings>,
+    #[serde(
+        default,
+        deserialize_with = "unique_wire::deserialize_credential_grants"
+    )]
+    pub credential_grants: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "unique_wire::deserialize_credential_grant_definitions"
+    )]
+    pub credential_grant_definitions: Vec<CredentialGrantDefinitionSettings>,
+    pub limits: Option<ResourceLimitSettingsWire>,
+}
+
+impl SandboxSettingsWire {
+    #[must_use]
+    pub fn resolved_mode(&self) -> SandboxMode {
+        self.mode.unwrap_or(SandboxMode::DangerFullAccess)
+    }
+}
+
+#[must_use]
+pub fn resolved_sandbox_mode(settings: Option<&SandboxSettingsWire>) -> SandboxMode {
+    settings.map_or(
+        SandboxMode::DangerFullAccess,
+        SandboxSettingsWire::resolved_mode,
+    )
 }
 
 /// Workflow/subagent isolation backend (`settings.orchestration.isolation`).
@@ -303,6 +392,9 @@ pub struct OrchestrationSettings {
     pub process: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tasks: Option<bool>,
+    /// Interactive Main Todo tool. Default on (`None`/`true`); `false` opts
+    /// the Main session out. Workflow planner/runtime children force-enable
+    /// their internal Todo independently of this flag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub todo: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -315,14 +407,6 @@ pub struct OrchestrationSettings {
     pub mailbox_capacity: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tools_per_agent: Option<usize>,
-    /// Run orchestration subagent children in the Linux filesystem sandbox
-    /// (opt-in; default off). When true, every process a child spawns (its
-    /// bash tool) is confined to the workspace, the agent directory, and
-    /// `sandbox.allowedPaths`, with the same deny-by-default filesystem,
-    /// fail-closed validation, and loopback-only network (unless
-    /// `sandbox.network` is true) as the bash sandbox.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sandboxed: Option<bool>,
     /// Workflow isolation backend used instead of a git worktree. Default
     /// `worktree`; `overlayfs` uses an overlay (source repo as the read-only
     /// lower layer) with a private writable upper layer; `none` runs workflows
@@ -516,7 +600,10 @@ impl std::fmt::Debug for LiveRuntimeSettings {
             .field("stt_base_url", &configured_label(&self.stt_base_url))
             .field("stt_api_key", &"[REDACTED]")
             .field("stt_model", &self.stt_model)
-            .field("realtime_base_url", &configured_label(&self.realtime_base_url))
+            .field(
+                "realtime_base_url",
+                &configured_label(&self.realtime_base_url),
+            )
             .field("realtime_api_key", &"[REDACTED]")
             .field("realtime_model", &self.realtime_model)
             .field("voice", &self.voice)
@@ -603,6 +690,7 @@ pub struct RuntimeSettingsSnapshot {
     pub stream_options: SimpleStreamOptions,
     pub branch_summary: EffectiveBranchSummarySettings,
     pub tui: TuiRuntimeSettings,
+    pub plantuml_server: Option<String>,
     /// Effective hold-to-talk voice configuration for `/live`. The STT
     /// endpoint/key are user-configured; Debug output redacts the key.
     pub live: LiveRuntimeSettings,
@@ -618,13 +706,12 @@ pub struct RuntimeSettingsSnapshot {
     /// Soft budget carried into [`crate::OrchestrationConfig::soft_budget`]
     /// when the orchestration runtime is built. Unlimited by default.
     pub orchestration_soft_budget: crate::JobSoftBudget,
-    /// When true, orchestration subagent children run their process spawns
-    /// inside the filesystem sandbox (workspace + agent dir +
-    /// `sandbox.allowedPaths` visible; deny-by-default otherwise).
-    pub orchestration_sandboxed: bool,
     /// Workflow isolation backend (`settings.orchestration.isolation`):
     /// `worktree` (default), `overlayfs`, or `none`.
     pub orchestration_isolation: crate::WorkflowIsolationSetting,
+    /// Live `settings.visionModel` spec. Delegation reads this so a LIVE
+    /// `/settings set visionModel` takes effect without a resource restage.
+    pub vision_model: Option<String>,
 }
 
 /// Web-facing projection of the effective live voice settings — the ONLY
@@ -679,7 +766,6 @@ pub struct RuntimeSettingsState {
     pub compaction_snap_keep_turns: i64,
     pub transport: Transport,
     pub timeout_ms: Option<u64>,
-    pub websocket_connect_timeout_ms: Option<u64>,
     pub provider_max_retries: usize,
     pub max_retry_delay_ms: Option<u64>,
     pub temperature: Option<f64>,
@@ -694,6 +780,7 @@ pub struct RuntimeSettingsState {
     pub auto_resize_images: bool,
     pub block_images: bool,
     pub theme: Option<String>,
+    pub plantuml_server: Option<String>,
     pub keybindings: BTreeMap<String, KeyBindingValue>,
     pub quiet_startup: bool,
     pub show_thinking: bool,
@@ -709,7 +796,6 @@ pub struct RuntimeSettingsState {
     pub orchestration_mailbox_capacity: usize,
     pub orchestration_max_tools_per_agent: usize,
     pub orchestration_soft_budget: crate::JobSoftBudget,
-    pub orchestration_sandboxed: bool,
     pub orchestration_isolation: crate::WorkflowIsolationSetting,
     /// Effective hold-to-talk voice configuration as the WEB wire may see it
     /// (the [`WebLiveSettings`] projection): `enabled`, `mode`,
@@ -736,19 +822,22 @@ impl RuntimeSettingsSnapshot {
             compaction_snap_keep_turns: self.compaction.snap_keep_turns,
             transport: self.stream_options.stream.transport,
             timeout_ms: self.stream_options.stream.timeout_ms,
-            websocket_connect_timeout_ms: self.stream_options.stream.websocket_connect_timeout_ms,
             provider_max_retries: self.stream_options.stream.max_retries,
             max_retry_delay_ms: self.stream_options.stream.max_retry_delay_ms,
             temperature: self.stream_options.stream.temperature,
             max_tokens: self.stream_options.stream.max_tokens,
             cache_retention: self.stream_options.stream.cache_retention,
             responses_stateful_chain: self.stream_options.responses_stateful_chain,
-            thinking_budgets: self.stream_options.thinking_budgets.as_ref().map(|budgets| ThinkingBudgetsConfig {
-                minimal: budgets.minimal,
-                low: budgets.low,
-                medium: budgets.medium,
-                high: budgets.high,
-            }),
+            thinking_budgets: self
+                .stream_options
+                .thinking_budgets
+                .as_ref()
+                .map(|budgets| ThinkingBudgetsConfig {
+                    minimal: budgets.minimal,
+                    low: budgets.low,
+                    medium: budgets.medium,
+                    high: budgets.high,
+                }),
             branch_summary_reserve_tokens: self.branch_summary.reserve_tokens,
             branch_summary_skip_prompt: self.branch_summary.skip_prompt,
             show_images: self.tui.show_images,
@@ -756,6 +845,7 @@ impl RuntimeSettingsSnapshot {
             auto_resize_images: self.tui.auto_resize_images,
             block_images: self.tui.block_images,
             theme: self.tui.theme.clone(),
+            plantuml_server: self.plantuml_server.clone(),
             keybindings: self.tui.keybindings.clone(),
             quiet_startup: self.tui.quiet_startup,
             show_thinking: self.tui.show_thinking,
@@ -771,7 +861,6 @@ impl RuntimeSettingsSnapshot {
             orchestration_mailbox_capacity: self.orchestration_mailbox_capacity,
             orchestration_max_tools_per_agent: self.orchestration_max_tools_per_agent,
             orchestration_soft_budget: self.orchestration_soft_budget,
-            orchestration_sandboxed: self.orchestration_sandboxed,
             orchestration_isolation: self.orchestration_isolation,
             live: self.live.web_live(),
         }
@@ -785,38 +874,138 @@ pub struct SupportedSetting {
 }
 
 pub const SUPPORTED_SETTINGS_COVERAGE: &[SupportedSetting] = &[
-    SupportedSetting { key: "approvalMode", application: "session_run_blueprint host approval hook" },
-    SupportedSetting { key: "sessionDir", application: "effective_session_dir" },
-    SupportedSetting { key: "sessionImportSources", application: "effective_session_import_sources" },
-    SupportedSetting { key: "sessionTtlDays", application: "startup session TTL pruning" },
-    SupportedSetting { key: "steeringMode", application: "steering_mode" },
-    SupportedSetting { key: "followUpMode", application: "follow_up_mode" },
-    SupportedSetting { key: "retry", application: "retry_settings/apply_session_options" },
-    SupportedSetting { key: "compaction", application: "apply_session_options" },
-    SupportedSetting { key: "transport", application: "apply_session_options" },
-    SupportedSetting { key: "timeoutMs", application: "apply_session_options" },
-    SupportedSetting { key: "maxRetryDelayMs", application: "apply_session_options" },
-    SupportedSetting { key: "temperature", application: "apply_session_options" },
-    SupportedSetting { key: "maxTokens", application: "apply_session_options" },
-    SupportedSetting { key: "cacheRetention", application: "apply_session_options" },
-    SupportedSetting { key: "responsesStatefulChain", application: "apply_session_options" },
-    SupportedSetting { key: "thinkingBudgets", application: "apply_session_options" },
-    SupportedSetting { key: "scopedModels", application: "scoped_model_patterns" },
-    SupportedSetting { key: "enabledModels", application: "scoped_model_patterns" },
-    SupportedSetting { key: "terminal", application: "tui_runtime" },
-    SupportedSetting { key: "images", application: "tui_runtime" },
-    SupportedSetting { key: "theme", application: "tui_runtime/resource validation" },
-    SupportedSetting { key: "keybindings", application: "tui_runtime" },
-    SupportedSetting { key: "branchSummary", application: "branch_summary_settings" },
-    SupportedSetting { key: "quietStartup", application: "tui_runtime" },
-    SupportedSetting { key: "hideThinkingBlock", application: "tui_runtime" },
-    SupportedSetting { key: "showThinking", application: "tui_runtime" },
-    SupportedSetting { key: "exposeSessionEnvironment", application: "expose_session_environment" },
-    SupportedSetting { key: "doubleEscapeAction", application: "tui_runtime" },
-    SupportedSetting { key: "orchestration", application: "orchestration tool gates" },
-    SupportedSetting { key: "live", application: "live_runtime (/live hold-to-talk STT client)" },
-    SupportedSetting { key: "hooks", application: "session host hooks (session/turn/tool-call firing points)" },
-    SupportedSetting { key: "permissionRules", application: "host approval hook path-level rule evaluation" },
+    SupportedSetting {
+        key: "approvalMode",
+        application: "session_run_blueprint host approval hook",
+    },
+    SupportedSetting {
+        key: "sessionDir",
+        application: "effective_session_dir",
+    },
+    SupportedSetting {
+        key: "sessionImportSources",
+        application: "effective_session_import_sources",
+    },
+    SupportedSetting {
+        key: "sessionTtlDays",
+        application: "startup session TTL pruning",
+    },
+    SupportedSetting {
+        key: "steeringMode",
+        application: "steering_mode",
+    },
+    SupportedSetting {
+        key: "followUpMode",
+        application: "follow_up_mode",
+    },
+    SupportedSetting {
+        key: "retry",
+        application: "retry_settings/apply_session_options",
+    },
+    SupportedSetting {
+        key: "compaction",
+        application: "apply_session_options",
+    },
+    SupportedSetting {
+        key: "transport",
+        application: "apply_session_options",
+    },
+    SupportedSetting {
+        key: "timeoutMs",
+        application: "apply_session_options",
+    },
+    SupportedSetting {
+        key: "maxRetryDelayMs",
+        application: "apply_session_options",
+    },
+    SupportedSetting {
+        key: "temperature",
+        application: "apply_session_options",
+    },
+    SupportedSetting {
+        key: "maxTokens",
+        application: "apply_session_options",
+    },
+    SupportedSetting {
+        key: "cacheRetention",
+        application: "apply_session_options",
+    },
+    SupportedSetting {
+        key: "responsesStatefulChain",
+        application: "apply_session_options",
+    },
+    SupportedSetting {
+        key: "thinkingBudgets",
+        application: "apply_session_options",
+    },
+    SupportedSetting {
+        key: "scopedModels",
+        application: "scoped_model_patterns",
+    },
+    SupportedSetting {
+        key: "enabledModels",
+        application: "scoped_model_patterns",
+    },
+    SupportedSetting {
+        key: "terminal",
+        application: "tui_runtime",
+    },
+    SupportedSetting {
+        key: "images",
+        application: "tui_runtime",
+    },
+    SupportedSetting {
+        key: "theme",
+        application: "tui_runtime/resource validation",
+    },
+    SupportedSetting {
+        key: "keybindings",
+        application: "tui_runtime",
+    },
+    SupportedSetting {
+        key: "branchSummary",
+        application: "branch_summary_settings",
+    },
+    SupportedSetting {
+        key: "quietStartup",
+        application: "tui_runtime",
+    },
+    SupportedSetting {
+        key: "hideThinkingBlock",
+        application: "tui_runtime",
+    },
+    SupportedSetting {
+        key: "showThinking",
+        application: "tui_runtime",
+    },
+    SupportedSetting {
+        key: "exposeSessionEnvironment",
+        application: "expose_session_environment",
+    },
+    SupportedSetting {
+        key: "doubleEscapeAction",
+        application: "tui_runtime",
+    },
+    SupportedSetting {
+        key: "orchestration",
+        application: "orchestration tool gates",
+    },
+    SupportedSetting {
+        key: "live",
+        application: "live_runtime (/live hold-to-talk STT client)",
+    },
+    SupportedSetting {
+        key: "hooks",
+        application: "session host hooks (session/turn/tool-call firing points)",
+    },
+    SupportedSetting {
+        key: "permissionRules",
+        application: "host approval hook path-level rule evaluation",
+    },
+    SupportedSetting {
+        key: "visionModel",
+        application: "session vision-image delegation",
+    },
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -856,9 +1045,9 @@ impl HookEvent {
 #[serde(rename_all = "camelCase")]
 pub struct HookConfig {
     pub event: HookEvent,
-    /// Exact or substring match on the event subject (tool name, message
-    /// role, or canonical project path). Absent matchers fire for every
-    /// subject of the event.
+    /// Exact match on the event subject (tool name, message role, or
+    /// canonical project path). Absent matchers fire for every subject of
+    /// the event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matcher: Option<String>,
     /// Command argv (no shell); must be non-empty.
@@ -1007,7 +1196,7 @@ pub enum McpTransport {
 /// disabled server is never spawned: the registry filters it out at configure
 /// time, so it has no session slot and never appears in `mcp list_servers`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct McpServerConfig {
     /// Unique server name used by the `mcp` tool (`mcp call <name> ...`).
     pub name: String,
@@ -1028,14 +1217,15 @@ pub struct McpServerConfig {
     /// stdio.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    /// Extra environment variables for the stdio child process. Never echoed
-    /// back in tool output.
+    /// Extra non-secret environment variables for the stdio child process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub env: Option<BTreeMap<String, String>>,
-    /// Unknown fields are retained so a Grok/Claude MCP config round-trips
-    /// without data loss.
-    #[serde(default, flatten)]
-    pub extra: Map<String, Value>,
+    pub env: Option<unique_wire::McpEnvironmentWire>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "unique_wire::deserialize_credential_grants"
+    )]
+    pub credential_grants: Vec<String>,
 }
 
 /// `skip_serializing_if` predicate for the [`McpServerConfig::disabled`] flag:
@@ -1067,6 +1257,8 @@ pub struct Settings {
     pub default_provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_language: Option<String>,
     /// Active credential scope used to select stored auth.json credentials.
     /// The `PI_AUTH_SCOPE` environment variable overrides this at runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1087,6 +1279,8 @@ pub struct Settings {
     pub session_ttl_days: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plantuml_server: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction: Option<CompactionConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1132,8 +1326,6 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_idle_timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub websocket_connect_timeout_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scoped_models: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keybindings: Option<BTreeMap<String, KeyBindingValue>>,
@@ -1172,7 +1364,7 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub permission_rules: Vec<PermissionRule>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sandbox: Option<SandboxSettings>,
+    pub sandbox: Option<SandboxSettingsWire>,
     /// External memory backend configuration (`memory.backend`, `memory.hindsight*`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemorySettings>,
@@ -1204,22 +1396,72 @@ impl Settings {
         let memory = self.memory.as_ref();
         crate::MemoryConfig {
             backend: memory.and_then(|value| value.backend).unwrap_or_default(),
-            hindsight_api_url: memory.and_then(|value| value.hindsight_api_url.as_deref()).map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned),
-            hindsight_api_token: memory.and_then(|value| value.hindsight_api_token.as_deref()).map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned),
-            hindsight_allow_insecure: memory.and_then(|value| value.hindsight_allow_insecure).unwrap_or(false),
-            hindsight_bank_id: memory.and_then(|value| value.hindsight_bank_id.as_deref()).map(str::trim).filter(|value| !value.is_empty()).unwrap_or(crate::memory::DEFAULT_HINDSIGHT_BANK_ID).to_owned(),
-            hindsight_bank_id_prefix: memory.and_then(|value| value.hindsight_bank_id_prefix.as_deref()).map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned),
-            hindsight_scoping: memory.and_then(|value| value.hindsight_scoping).unwrap_or_default(),
-            hindsight_bank_mission: memory.and_then(|value| value.hindsight_bank_mission.as_deref()).map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned),
-            hindsight_retain_mission: memory.and_then(|value| value.hindsight_retain_mission.as_deref()).map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned),
-            hindsight_injection: memory.and_then(|value| value.hindsight_injection).unwrap_or(false),
-            hindsight_recall_budget: memory.and_then(|value| value.hindsight_recall_budget).unwrap_or_default(),
-            hindsight_recall_max_tokens: memory.and_then(|value| value.hindsight_recall_max_tokens).unwrap_or(crate::memory::DEFAULT_HINDSIGHT_RECALL_MAX_TOKENS),
-            hindsight_recall_types: memory.and_then(|value| value.hindsight_recall_types.clone()).unwrap_or_else(|| crate::memory::DEFAULT_HINDSIGHT_RECALL_TYPES.iter().map(|value| (*value).to_owned()).collect()),
-            hindsight_request_timeout_ms: memory.and_then(|value| value.hindsight_request_timeout_ms).unwrap_or(crate::memory::DEFAULT_HINDSIGHT_REQUEST_TIMEOUT_MS),
-            hindsight_recall_timeout_ms: memory.and_then(|value| value.hindsight_recall_timeout_ms).unwrap_or(crate::memory::DEFAULT_HINDSIGHT_RECALL_TIMEOUT_MS),
-            hindsight_retain_timeout_ms: memory.and_then(|value| value.hindsight_retain_timeout_ms).unwrap_or(crate::memory::DEFAULT_HINDSIGHT_RETAIN_TIMEOUT_MS),
-            hindsight_reflect_timeout_ms: memory.and_then(|value| value.hindsight_reflect_timeout_ms).unwrap_or(crate::memory::DEFAULT_HINDSIGHT_REFLECT_TIMEOUT_MS),
+            hindsight_api_url: memory
+                .and_then(|value| value.hindsight_api_url.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+            hindsight_api_token: memory
+                .and_then(|value| value.hindsight_api_token.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+            hindsight_allow_insecure: memory
+                .and_then(|value| value.hindsight_allow_insecure)
+                .unwrap_or(false),
+            hindsight_bank_id: memory
+                .and_then(|value| value.hindsight_bank_id.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(crate::memory::DEFAULT_HINDSIGHT_BANK_ID)
+                .to_owned(),
+            hindsight_bank_id_prefix: memory
+                .and_then(|value| value.hindsight_bank_id_prefix.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+            hindsight_scoping: memory
+                .and_then(|value| value.hindsight_scoping)
+                .unwrap_or_default(),
+            hindsight_bank_mission: memory
+                .and_then(|value| value.hindsight_bank_mission.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+            hindsight_retain_mission: memory
+                .and_then(|value| value.hindsight_retain_mission.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+            hindsight_injection: memory
+                .and_then(|value| value.hindsight_injection)
+                .unwrap_or(false),
+            hindsight_recall_budget: memory
+                .and_then(|value| value.hindsight_recall_budget)
+                .unwrap_or_default(),
+            hindsight_recall_max_tokens: memory
+                .and_then(|value| value.hindsight_recall_max_tokens)
+                .unwrap_or(crate::memory::DEFAULT_HINDSIGHT_RECALL_MAX_TOKENS),
+            hindsight_recall_types: memory
+                .and_then(|value| value.hindsight_recall_types.clone())
+                .unwrap_or_else(|| {
+                    crate::memory::DEFAULT_HINDSIGHT_RECALL_TYPES
+                        .iter()
+                        .map(|value| (*value).to_owned())
+                        .collect()
+                }),
+            hindsight_request_timeout_ms: memory
+                .and_then(|value| value.hindsight_request_timeout_ms)
+                .unwrap_or(crate::memory::DEFAULT_HINDSIGHT_REQUEST_TIMEOUT_MS),
+            hindsight_recall_timeout_ms: memory
+                .and_then(|value| value.hindsight_recall_timeout_ms)
+                .unwrap_or(crate::memory::DEFAULT_HINDSIGHT_RECALL_TIMEOUT_MS),
+            hindsight_retain_timeout_ms: memory
+                .and_then(|value| value.hindsight_retain_timeout_ms)
+                .unwrap_or(crate::memory::DEFAULT_HINDSIGHT_RETAIN_TIMEOUT_MS),
+            hindsight_reflect_timeout_ms: memory
+                .and_then(|value| value.hindsight_reflect_timeout_ms)
+                .unwrap_or(crate::memory::DEFAULT_HINDSIGHT_REFLECT_TIMEOUT_MS),
         }
     }
 
@@ -1231,8 +1473,8 @@ impl Settings {
 
     /// Session sources eligible for automatic discovery and resolution.
     ///
-    /// Native Pi sessions are always included. Foreign sources are opt-in and
-    /// retain their configured order.
+    /// Native rpi sessions are always included. Immutable external sources
+    /// are opt-in and retain their configured order.
     #[must_use]
     pub fn effective_session_import_sources(&self) -> Vec<SessionSourceKind> {
         let configured = self.session_import_sources.as_deref().unwrap_or_default();
@@ -1252,13 +1494,13 @@ impl Settings {
 impl Settings {
     #[must_use]
     pub fn merged(&self, overrides: &Self) -> Self {
-        let base = serde_json::to_value(self).unwrap_or_else(|_| Value::Object(Map::new()));
+        let base = serde_json::to_value(self).expect("settings serialize for merge");
         let overlay =
-            serde_json::to_value(overrides).unwrap_or_else(|_| Value::Object(Map::new()));
+            serde_json::to_value(overrides).expect("settings overrides serialize for merge");
         let mut merged = serde_json::from_value::<Settings>(deep_merge(base, overlay))
-            .unwrap_or_else(|_| self.clone());
+            .expect("merged settings deserialize");
         // Agent entries need field-aware merge so a global model clear tombstone
-        // (`Some("")`) is not overwritten by a project-level model promotion.
+        // (`Some(\"\")`) is not overwritten by a project-level model promotion.
         merged.agents = merge_agent_settings_maps(&self.agents, &overrides.agents);
         merged
     }
@@ -1273,10 +1515,15 @@ impl Settings {
                 keep_recent_tokens: compaction
                     .keep_recent_tokens
                     .unwrap_or(defaults.keep_recent_tokens),
-                snap_keep_turns: compaction.snap_keep_turns.unwrap_or(defaults.snap_keep_turns),
+                snap_keep_turns: compaction
+                    .snap_keep_turns
+                    .unwrap_or(defaults.snap_keep_turns),
             });
         }
-        let provider_retry = self.retry.as_ref().and_then(|retry| retry.provider.as_ref());
+        let provider_retry = self
+            .retry
+            .as_ref()
+            .and_then(|retry| retry.provider.as_ref());
         if let Some(value) = self.transport {
             options.stream_options.stream.transport = value;
         }
@@ -1286,9 +1533,6 @@ impl Settings {
             .or(self.http_idle_timeout_ms)
         {
             options.stream_options.stream.timeout_ms = Some(value);
-        }
-        if let Some(value) = self.websocket_connect_timeout_ms {
-            options.stream_options.stream.websocket_connect_timeout_ms = Some(value);
         }
         if let Some(value) = provider_retry.and_then(|retry| retry.max_retries) {
             options.stream_options.stream.max_retries = value;
@@ -1337,6 +1581,7 @@ impl Settings {
             after_tool_call: None,
             stream_fn: None,
             auth_resolver: None,
+            auth_manager: None,
         };
         session_options.stream_options.stream.transport = Transport::Auto;
         session_options.stream_options.stream.max_retry_delay_ms = Some(60_000);
@@ -1352,6 +1597,7 @@ impl Settings {
             stream_options: session_options.stream_options,
             branch_summary: self.branch_summary_settings(),
             tui: self.tui_runtime(),
+            plantuml_server: self.plantuml_server.clone(),
             live: self.live_runtime(),
             expose_session_environment: self.expose_session_environment(),
             process_tool_enabled: self.process_tool_enabled(),
@@ -1367,22 +1613,30 @@ impl Settings {
             orchestration_mailbox_capacity: orchestration
                 .and_then(|settings| settings.mailbox_capacity)
                 .unwrap_or(crate::DEFAULT_MAILBOX_CAPACITY),
+            // Snapshot default stays the legacy explicit-list cap. Workflow
+            // children raise the live OrchestrationConfig separately; inherited
+            // `tools: None` sets are exempt at spawn.
             orchestration_max_tools_per_agent: orchestration
                 .and_then(|settings| settings.max_tools_per_agent)
                 .unwrap_or(crate::DEFAULT_MAX_TOOLS_PER_AGENT),
             orchestration_soft_budget: orchestration
                 .and_then(|settings| settings.soft_budget.as_ref())
-                .map_or_else(crate::JobSoftBudget::default, |budget| crate::JobSoftBudget {
-                    max_requests: budget.max_requests,
-                    max_tokens: budget.max_tokens,
-                    yield_after: budget.yield_after,
+                .map_or_else(crate::JobSoftBudget::default, |budget| {
+                    crate::JobSoftBudget {
+                        max_requests: budget.max_requests,
+                        max_tokens: budget.max_tokens,
+                        yield_after: budget.yield_after,
+                    }
                 }),
-            orchestration_sandboxed: orchestration
-                .and_then(|settings| settings.sandboxed)
-                .unwrap_or(false),
             orchestration_isolation: orchestration
                 .and_then(|settings| settings.isolation)
                 .unwrap_or_default(),
+            vision_model: self
+                .vision_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|spec| !spec.is_empty())
+                .map(str::to_owned),
         })
     }
 
@@ -1437,7 +1691,9 @@ impl Settings {
 
     #[must_use]
     pub fn scoped_model_patterns(&self) -> Option<&[String]> {
-        self.scoped_models.as_deref().or(self.enabled_models.as_deref())
+        self.scoped_models
+            .as_deref()
+            .or(self.enabled_models.as_deref())
     }
 
     #[must_use]
@@ -1455,7 +1711,9 @@ impl Settings {
 
     #[must_use]
     pub fn agent_model_override(&self, name: &str) -> Option<&str> {
-        self.agents.get(name).and_then(AgentRuntimeSettings::model_override)
+        self.agents
+            .get(name)
+            .and_then(AgentRuntimeSettings::model_override)
     }
 
     /// Insert or update one agent entry, removing it when it collapses to defaults.
@@ -1477,7 +1735,11 @@ impl Settings {
                 .unwrap_or(true),
             image_width_cells: self
                 .image_width_cells
-                .or_else(|| self.terminal.as_ref().and_then(|value| value.image_width_cells))
+                .or_else(|| {
+                    self.terminal
+                        .as_ref()
+                        .and_then(|value| value.image_width_cells)
+                })
                 .unwrap_or(60),
             auto_resize_images: self
                 .auto_resize_images
@@ -1589,11 +1851,13 @@ impl Settings {
             .unwrap_or(false)
     }
 
+    /// Interactive Main Todo tool. Default on so the model can
+    /// create/modify/clear todos in natural language (OMP parity);
+    /// `orchestration.todo: false` opts the Main session out. Workflow
+    /// planner/runtime children force-enable their internal Todo even when
+    /// this returns false.
     #[must_use]
     pub fn todo_tool_enabled(&self) -> bool {
-        // The todo tool is on by default so the model can create/modify/clear
-        // todos in natural language (OMP parity); `orchestration.todo: false`
-        // opts out.
         self.orchestration
             .as_ref()
             .and_then(|value| value.todo)
@@ -1645,7 +1909,9 @@ pub fn permission_verdict(
         let target_verdict = match rule.action {
             PermissionRuleAction::Allow => PermissionVerdict::Allow,
             PermissionRuleAction::Ask => PermissionVerdict::Ask,
-            PermissionRuleAction::Deny => PermissionVerdict::Deny(denied_reason(tool, &raw_target, rule)),
+            PermissionRuleAction::Deny => {
+                PermissionVerdict::Deny(denied_reason(tool, &raw_target, rule))
+            }
         };
         if verdict_rank(&target_verdict) > verdict_rank(&verdict) {
             verdict = target_verdict;
@@ -1856,7 +2122,8 @@ pub struct SettingsManager {
 #[derive(Clone)]
 struct SettingsState {
     paths: SettingsPaths,
-    /// Persisted global settings with environment references left **literal**
+    global_root: Option<CapabilityRootLease>,
+    project_root: Option<CapabilityRootLease>,
     /// (the pre-expansion document). Writing settings re-serializes this
     /// layer, so expanded secrets are never persisted.
     global: Settings,
@@ -1876,7 +2143,30 @@ impl SettingsManager {
     /// Phase one: load only trusted user-global settings. Project settings are
     /// deliberately not opened until [`Self::load_project`] receives trust.
     pub fn load_phase_one(cwd: impl AsRef<Path>, agent_dir: impl AsRef<Path>) -> Result<Self> {
-        Self::load_phase_one_with(cwd, agent_dir, env_lookup)
+        Self::load_phase_one_with(cwd, agent_dir, None, None, env_lookup)
+    }
+
+    pub(crate) fn load_phase_one_with_agent_root(
+        cwd: impl AsRef<Path>,
+        agent_dir: impl AsRef<Path>,
+        agent_root: CapabilityRootLease,
+    ) -> Result<Self> {
+        Self::load_phase_one_with(cwd, agent_dir, Some(agent_root), None, env_lookup)
+    }
+
+    pub(crate) fn load_phase_one_with_roots(
+        cwd: impl AsRef<Path>,
+        agent_dir: impl AsRef<Path>,
+        agent_root: CapabilityRootLease,
+        project_root: Option<CapabilityRootLease>,
+    ) -> Result<Self> {
+        Self::load_phase_one_with(
+            cwd,
+            agent_dir,
+            Some(agent_root),
+            project_root,
+            env_lookup,
+        )
     }
 
     /// [`Self::load_phase_one`] with an injectable environment lookup so
@@ -1885,17 +2175,20 @@ impl SettingsManager {
     fn load_phase_one_with(
         cwd: impl AsRef<Path>,
         agent_dir: impl AsRef<Path>,
+        global_root: Option<CapabilityRootLease>,
+        project_root: Option<CapabilityRootLease>,
         lookup: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
     ) -> Result<Self> {
         let paths = SettingsPaths::new(cwd, agent_dir);
-        // The persisted layers keep the pre-expansion document: env references
-        // stay literal so writing settings never persists expanded secrets.
-        // Expansion applies only when projecting the effective runtime view
-        // (see `recompute`).
-        let global = load_settings_file(&paths.global, SettingsScope::Global)?;
+        let global = match global_root.as_ref() {
+            Some(root) => load_settings_from_root(root, &paths.global, SettingsScope::Global)?,
+            None => load_settings_file(&paths.global, SettingsScope::Global)?,
+        };
         let lookup: Arc<dyn Fn(&str) -> Option<String> + Send + Sync> = Arc::new(lookup);
         let mut state = SettingsState {
             paths,
+            global_root,
+            project_root,
             global,
             project: Settings::default(),
             overrides: Settings::default(),
@@ -1918,12 +2211,17 @@ impl SettingsManager {
     /// Phase two: load project settings only when the project is trusted.
     /// Revoking trust immediately drops all project-derived values.
     pub fn load_project(&self, trusted: bool) -> Result<()> {
-        let path = self.inner.read().paths.project.clone();
+        let state = self.inner.read();
+        let path = state.paths.project.clone();
         let project = if trusted {
-            load_settings_file(&path, SettingsScope::Project)?
+            match state.project_root.as_ref() {
+                Some(root) => load_project_settings_from_root(root, &path)?,
+                None => load_settings_file(&path, SettingsScope::Project)?,
+            }
         } else {
             Settings::default()
         };
+        drop(state);
         let mut state = self.inner.write();
         state.project_trusted = trusted;
         state.project = project;
@@ -1934,9 +2232,17 @@ impl SettingsManager {
     /// Validate both eligible scopes before changing the active snapshot.
     pub fn reload(&self) -> Result<()> {
         let state = self.inner.read().clone();
-        let global = load_settings_file(&state.paths.global, SettingsScope::Global)?;
+        let global = match state.global_root.as_ref() {
+            Some(root) => {
+                load_settings_from_root(root, &state.paths.global, SettingsScope::Global)?
+            }
+            None => load_settings_file(&state.paths.global, SettingsScope::Global)?,
+        };
         let project = if state.project_trusted {
-            load_settings_file(&state.paths.project, SettingsScope::Project)?
+            match state.project_root.as_ref() {
+                Some(root) => load_project_settings_from_root(root, &state.paths.project)?,
+                None => load_settings_file(&state.paths.project, SettingsScope::Project)?,
+            }
         } else {
             Settings::default()
         };
@@ -1974,7 +2280,6 @@ impl SettingsManager {
         self.inner.read().overrides.clone()
     }
 
-
     #[must_use]
     pub fn paths(&self) -> SettingsPaths {
         self.inner.read().paths.clone()
@@ -1999,13 +2304,20 @@ impl SettingsManager {
     }
 
     pub fn update_global(&self, update: impl FnOnce(&mut Settings)) -> Result<()> {
-        let (path, mut candidate) = {
+        let (path, root, mut candidate) = {
             let state = self.inner.read();
-            (state.paths.global.clone(), state.global.clone())
+            (
+                state.paths.global.clone(),
+                state.global_root.clone(),
+                state.global.clone(),
+            )
         };
         update(&mut candidate);
         validate_settings(&candidate, SettingsScope::Global, &path)?;
-        write_settings_file(&path, &candidate, SettingsScope::Global)?;
+        match root.as_ref() {
+            Some(root) => write_settings_to_root(root, &path, &candidate, SettingsScope::Global)?,
+            None => write_settings_file(&path, &candidate, SettingsScope::Global)?,
+        }
         let mut state = self.inner.write();
         state.global = candidate;
         recompute(&mut state);
@@ -2045,17 +2357,61 @@ fn recompute(state: &mut SettingsState) {
         .merged(&state.overrides);
 }
 
-/// Expand environment references in a persisted settings layer for the
-/// runtime view. The input layer is untouched (it stays literal so writes
-/// never persist expanded secrets).
-fn expand_settings_with(
-    settings: &Settings,
-    lookup: &dyn Fn(&str) -> Option<String>,
-) -> Settings {
-    let mut value =
-        serde_json::to_value(settings).expect("settings serialize for env expansion");
+/// runtime view. Credential definitions and MCP grant references remain literal.
+fn expand_settings_with(settings: &Settings, lookup: &dyn Fn(&str) -> Option<String>) -> Settings {
+    let mut value = serde_json::to_value(settings).expect("settings serialize for env expansion");
+    let authority_fields = take_authority_fields(&mut value);
     expand_env_in_value_with(&mut value, lookup);
+    restore_authority_fields(&mut value, authority_fields);
     serde_json::from_value(value).expect("expanded settings deserialize")
+}
+
+fn take_authority_fields(value: &mut Value) -> (Option<Value>, Vec<Option<Value>>) {
+    let Some(root) = value.as_object_mut() else {
+        return (None, Vec::new());
+    };
+    let definitions = root
+        .get_mut("sandbox")
+        .and_then(Value::as_object_mut)
+        .and_then(|sandbox| sandbox.remove("credentialGrantDefinitions"));
+    let grants = root
+        .get_mut("mcpServers")
+        .and_then(Value::as_array_mut)
+        .map(|servers| {
+            servers
+                .iter_mut()
+                .map(|server| {
+                    server
+                        .as_object_mut()
+                        .and_then(|server| server.remove("credentialGrants"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    (definitions, grants)
+}
+
+fn restore_authority_fields(
+    value: &mut Value,
+    (definitions, grants): (Option<Value>, Vec<Option<Value>>),
+) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+    if let Some(definitions) = definitions
+        && let Some(sandbox) = root.get_mut("sandbox").and_then(Value::as_object_mut)
+    {
+        sandbox.insert("credentialGrantDefinitions".to_owned(), definitions);
+    }
+    if let Some(servers) = root.get_mut("mcpServers").and_then(Value::as_array_mut) {
+        for (server, grants) in servers.iter_mut().zip(grants) {
+            if let Some(grants) = grants
+                && let Some(server) = server.as_object_mut()
+            {
+                server.insert("credentialGrants".to_owned(), grants);
+            }
+        }
+    }
 }
 
 /// Merge per-agent maps with tombstone-aware field semantics.
@@ -2067,7 +2423,10 @@ fn merge_agent_settings_maps(
     base: &BTreeMap<String, AgentRuntimeSettings>,
     overlay: &BTreeMap<String, AgentRuntimeSettings>,
 ) -> BTreeMap<String, AgentRuntimeSettings> {
-    let mut names = base.keys().cloned().collect::<std::collections::BTreeSet<_>>();
+    let mut names = base
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
     names.extend(overlay.keys().cloned());
     let mut out = BTreeMap::new();
     for name in names {
@@ -2122,118 +2481,7 @@ fn deep_merge(base: Value, overlay: Value) -> Value {
 
 const MAX_SETTINGS_FILE_BYTES: u64 = 1024 * 1024;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct LegacyAgentMigration {
-    /// True when any legacy-only entry was merged into `agents`.
-    merged: bool,
-    /// True when at least one name existed in both layers (canonical kept).
-    conflicts: usize,
-    /// True when the on-disk shape still carries legacy overrides that should be rewritten.
-    needs_rewrite: bool,
-}
-
-fn migrate_legacy_agent_overrides(settings: &mut Settings) -> Result<LegacyAgentMigration> {
-    let Some(subagents_value) = settings.extra.get("subagents").cloned() else {
-        return Ok(LegacyAgentMigration::default());
-    };
-    let Some(subagents) = subagents_value.as_object() else {
-        // Preserve unknown non-object subagents payloads untouched.
-        return Ok(LegacyAgentMigration::default());
-    };
-    let Some(overrides_value) = subagents.get("agentOverrides") else {
-        return Ok(LegacyAgentMigration::default());
-    };
-    let Some(overrides) = overrides_value.as_object() else {
-        bail!(
-            "subagents.agentOverrides must be an object of per-agent overrides; \
-             migrate entries to top-level agents or fix the settings file"
-        );
-    };
-
-    let mut migration = LegacyAgentMigration {
-        needs_rewrite: true,
-        ..LegacyAgentMigration::default()
-    };
-
-    for (name, value) in overrides {
-        let name = name.trim();
-        if name.is_empty() {
-            bail!("subagents.agentOverrides contains an empty agent name");
-        }
-        let legacy = parse_legacy_agent_override(name, value)?;
-        if legacy.is_default() {
-            continue;
-        }
-        if settings.agents.contains_key(name) {
-            // Canonical top-level agents always win on conflict.
-            migration.conflicts += 1;
-            continue;
-        }
-        settings.agents.insert(name.to_owned(), legacy);
-        migration.merged = true;
-    }
-
-    // Drop only agentOverrides; preserve any other unknown subagents fields.
-    let mut remaining = subagents.clone();
-    remaining.remove("agentOverrides");
-    if remaining.is_empty() {
-        settings.extra.remove("subagents");
-    } else {
-        settings
-            .extra
-            .insert("subagents".to_owned(), Value::Object(remaining));
-    }
-    Ok(migration)
-}
-
-fn parse_legacy_agent_override(name: &str, value: &Value) -> Result<AgentRuntimeSettings> {
-    let object = value.as_object().ok_or_else(|| {
-        anyhow!("subagents.agentOverrides.{name} must be an object with enabled/model/tools fields")
-    })?;
-    let enabled = match object.get("enabled") {
-        None => None,
-        Some(Value::Bool(value)) => Some(*value),
-        Some(other) => bail!(
-            "subagents.agentOverrides.{name}.enabled must be a boolean, got {other}"
-        ),
-    };
-    let model = match object.get("model") {
-        None => None,
-        Some(Value::String(value)) => Some(value.clone()),
-        Some(Value::Null) => Some(String::new()),
-        Some(other) => bail!(
-            "subagents.agentOverrides.{name}.model must be a string, got {other}"
-        ),
-    };
-    let tools = match object.get("tools") {
-        None => None,
-        Some(Value::Array(items)) => {
-            let mut tools = Vec::with_capacity(items.len());
-            for item in items {
-                let tool = item.as_str().ok_or_else(|| {
-                    anyhow!("subagents.agentOverrides.{name}.tools entries must be strings")
-                })?;
-                if tool.trim().is_empty() {
-                    bail!("subagents.agentOverrides.{name}.tools contains an empty tool name");
-                }
-                tools.push(tool.to_owned());
-            }
-            Some(tools)
-        }
-        Some(other) => bail!(
-            "subagents.agentOverrides.{name}.tools must be an array of strings, got {other}"
-        ),
-    };
-    // Unknown per-agent keys are intentionally ignored (not promoted into extra).
-    Ok(AgentRuntimeSettings {
-        enabled,
-        model,
-        tools,
-    })
-}
-
-/// Process-wide dedupe keys for settings diagnostics (legacy migration path
-/// strings, or `path\0subagents.<key>` for ignored agent-config fields).
+/// Process-wide dedupe keys for settings diagnostics.
 static SETTINGS_DIAGNOSTIC_WARNED_KEYS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
@@ -2272,51 +2520,6 @@ fn emit_settings_diagnostic(dedupe_key: String, message: String) {
     eprintln!("{message}");
 }
 
-/// Migration from `subagents.agentOverrides` to top-level `agents` is fully
-/// automatic and silent. rpi keeps pi's config paths for compatibility, so
-/// legacy config formats are supported without warning.
-fn warn_legacy_agent_migration(_path: &Path, _migration: &LegacyAgentMigration) {}
-
-/// Known nested keys under `subagents` that look like agent configuration but
-/// are not migrated (only `agentOverrides` is). Arbitrary metadata is retained
-/// silently; these names always warn so mis-nested config is not silent.
-const UNSUPPORTED_SUBAGENTS_AGENT_KEYS: &[&str] =
-    &["agents", "models", "agentModels", "tools", "defaults"];
-
-fn value_looks_like_agent_runtime_config(value: &Value) -> bool {
-    let Some(object) = value.as_object() else {
-        return false;
-    };
-    object.contains_key("enabled") || object.contains_key("model") || object.contains_key("tools")
-}
-
-/// True when a remaining `subagents.<key>` value looks like agent configuration:
-/// a single agent runtime object, or a map of agent-name → runtime objects.
-fn value_looks_like_agent_config_tree(value: &Value) -> bool {
-    if value_looks_like_agent_runtime_config(value) {
-        return true;
-    }
-    let Some(object) = value.as_object() else {
-        return false;
-    };
-    !object.is_empty() && object.values().any(value_looks_like_agent_runtime_config)
-}
-
-fn is_unsupported_agentish_subagents_field(key: &str, value: &Value) -> bool {
-    if UNSUPPORTED_SUBAGENTS_AGENT_KEYS.contains(&key) {
-        return true;
-    }
-    // `agentOverrides` is handled by migration + its own deprecation warning.
-    if key == "agentOverrides" {
-        return false;
-    }
-    value_looks_like_agent_config_tree(value)
-}
-
-/// Unsupported agent-config-looking keys under `subagents` are silently
-/// ignored. rpi keeps pi's config format for compatibility; no warning.
-fn warn_unsupported_subagents_fields(_path: &Path, _settings: &Settings) {}
-
 /// Arm the process-wide settings diagnostic capture on the current thread.
 ///
 /// When armed, subsequent calls to [`emit_settings_diagnostic`] on this thread
@@ -2331,14 +2534,10 @@ pub fn arm_settings_diagnostic_capture() {
 }
 
 pub fn drain_settings_diagnostics() -> Vec<String> {
-    SETTINGS_DIAGNOSTIC_WARN_CAPTURE.with(|capture| {
-        capture.borrow_mut().take().unwrap_or_default()
-    })
+    SETTINGS_DIAGNOSTIC_WARN_CAPTURE.with(|capture| capture.borrow_mut().take().unwrap_or_default())
 }
 #[cfg(test)]
 fn capture_settings_diagnostics<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
-    // Unique temp paths make process-wide path state safe without clearing:
-    // each capture body only asserts on warnings for the paths it loads.
     arm_settings_diagnostic_capture();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
     let messages = drain_settings_diagnostics();
@@ -2348,40 +2547,71 @@ fn capture_settings_diagnostics<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
     }
 }
 
-#[cfg(test)]
-fn capture_legacy_agent_migration_warnings<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
-    capture_settings_diagnostics(f)
-}
-#[cfg(test)]
-fn capture_is_explicitly_armed_and_drained_once() {
-    let dir = tempfile::tempdir().expect("dir");
-    let path = dir.path().join("settings.json");
-    fs::write(
-        &path,
-        r#"{"subagents":{"agentOverrides":{"reviewer":{"enabled":true}}}}"#,
-    )
-    .expect("settings");
-
-    arm_settings_diagnostic_capture();
-    load_settings_file(&path, SettingsScope::Global).expect("load");
-    let warnings = drain_settings_diagnostics();
-
-    assert_eq!(warnings.len(), 0, "legacy migration is silent: {warnings:?}");
-    assert!(
-        drain_settings_diagnostics().is_empty(),
-        "drain must clear the capture"
-    );
+fn load_settings_from_root(
+    root: &CapabilityRootLease,
+    canonical: &Path,
+    scope: SettingsScope,
+) -> Result<Settings> {
+    let file = match retained_settings_file(root)? {
+        Some(file) => file,
+        None => return Ok(Settings::default()),
+    };
+    let path = canonical.with_file_name(file.0);
+    let bytes = file
+        .1
+        .read_bounded(MAX_SETTINGS_FILE_BYTES)
+        .with_context(|| format!("reading {} settings {}", scope_name(scope), path.display()))?;
+    parse_settings_bytes(&path, &bytes, scope)
 }
 
+fn load_project_settings_from_root(
+    root: &CapabilityRootLease,
+    canonical: &Path,
+) -> Result<Settings> {
+    match root.lease_directory(
+        Path::new(CONFIG_DIR_NAME),
+        crate::fs::CapabilityAccess::ReadOnly,
+        crate::fs::RootCreation::Existing,
+    ) {
+        Ok(config_root) => load_settings_from_root(&config_root, canonical, SettingsScope::Project),
+        Err(crate::fs::FsError::System {
+            kind: std::io::ErrorKind::NotFound,
+            ..
+        }) => Ok(Settings::default()),
+        Err(error) => Err(error).context("opening retained project settings root"),
+    }
+}
 
-
-
+fn retained_settings_file(
+    root: &CapabilityRootLease,
+) -> Result<Option<(String, crate::fs::CapabilityFile)>> {
+    for name in ["settings.toml", "settings.json"] {
+        match root.open_file_allowing_link(Path::new(name)) {
+            Ok(file) => return Ok(Some((name.to_owned(), file))),
+            Err(crate::fs::FsError::System {
+                kind: std::io::ErrorKind::NotFound,
+                ..
+            }) => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "opening global settings {}",
+                        root.display_root().join(name).display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(None)
+}
 
 fn load_settings_file(path: &Path, scope: SettingsScope) -> Result<Settings> {
     let path = resolve_settings_path(path);
     let file = match File::open(&path) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Settings::default()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Settings::default());
+        }
         Err(error) => {
             return Err(error).with_context(|| {
                 format!("opening {} settings {}", scope_name(scope), path.display())
@@ -2390,7 +2620,13 @@ fn load_settings_file(path: &Path, scope: SettingsScope) -> Result<Settings> {
     };
     let size = file
         .metadata()
-        .with_context(|| format!("reading metadata for {} settings {}", scope_name(scope), path.display()))?
+        .with_context(|| {
+            format!(
+                "reading metadata for {} settings {}",
+                scope_name(scope),
+                path.display()
+            )
+        })?
         .len();
     if size > MAX_SETTINGS_FILE_BYTES {
         bail!(
@@ -2401,11 +2637,11 @@ fn load_settings_file(path: &Path, scope: SettingsScope) -> Result<Settings> {
             size,
         );
     }
-    let mut content = String::with_capacity(usize::try_from(size).unwrap_or(0));
+    let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
     file.take(MAX_SETTINGS_FILE_BYTES + 1)
-        .read_to_string(&mut content)
+        .read_to_end(&mut bytes)
         .with_context(|| format!("reading {} settings {}", scope_name(scope), path.display()))?;
-    if content.len() as u64 > MAX_SETTINGS_FILE_BYTES {
+    if bytes.len() as u64 > MAX_SETTINGS_FILE_BYTES {
         bail!(
             "{} settings {} exceeds maximum size of {} bytes",
             scope_name(scope),
@@ -2413,39 +2649,35 @@ fn load_settings_file(path: &Path, scope: SettingsScope) -> Result<Settings> {
             MAX_SETTINGS_FILE_BYTES,
         );
     }
-    let file_label = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("settings");
-    // Parse into a generic document and deserialize into the typed Settings
-    // (whose `extra` maps retain unknown fields) WITHOUT expanding environment
-    // references: the persisted layers stay literal, and expansion happens
-    // only when projecting the effective runtime view (`expand_settings_with`
-    // in `recompute`). Writing settings therefore never persists expanded
-    // secrets.
-    let document: Value = if is_toml_settings_path(&path) {
-        let value: toml::Value = toml::from_str(&content).with_context(|| {
-            format!("Failed to parse {file_label}\nFile: {}", path.display())
-        })?;
-        toml_to_json(value)
-    } else {
-        serde_json::from_str(&content).with_context(|| {
-            format!("Failed to parse {file_label}\nFile: {}", path.display())
-        })?
-    };
-    let mut settings: Settings = serde_json::from_value(document).with_context(|| {
-        format!("Failed to deserialize {file_label}\nFile: {}", path.display())
-    })?;
-    let migration = migrate_legacy_agent_overrides(&mut settings).with_context(|| {
+    parse_settings_bytes(&path, &bytes, scope)
+}
+
+fn parse_settings_bytes(path: &Path, bytes: &[u8], scope: SettingsScope) -> Result<Settings> {
+    let content = std::str::from_utf8(bytes).with_context(|| {
         format!(
-            "invalid {} settings {} while migrating subagents.agentOverrides",
+            "reading {} settings {} as UTF-8",
             scope_name(scope),
             path.display()
         )
     })?;
-    validate_settings(&settings, scope, &path)?;
-    warn_legacy_agent_migration(&path, &migration);
-    warn_unsupported_subagents_fields(&path, &settings);
+    let file_label = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("settings");
+    let settings: Settings = if is_toml_settings_path(path) {
+        let value: toml::Value = toml::from_str(content)
+            .with_context(|| format!("Failed to parse {file_label}\nFile: {}", path.display()))?;
+        serde_json::from_value(toml_to_json(value)).with_context(|| {
+            format!(
+                "Failed to deserialize {file_label}\nFile: {}",
+                path.display()
+            )
+        })?
+    } else {
+        serde_json::from_str(content)
+            .with_context(|| format!("Failed to parse settings.json\nFile: {}", path.display()))?
+    };
+    validate_settings(&settings, scope, path)?;
     Ok(settings)
 }
 
@@ -2479,14 +2711,17 @@ fn toml_to_json(value: toml::Value) -> Value {
     match value {
         toml::Value::String(string) => Value::String(string),
         toml::Value::Integer(integer) => Value::Number(integer.into()),
-        toml::Value::Float(float) => {
-            Value::Number(serde_json::Number::from_f64(float).unwrap_or_else(|| serde_json::Number::from(0)))
-        }
+        toml::Value::Float(float) => Value::Number(
+            serde_json::Number::from_f64(float).unwrap_or_else(|| serde_json::Number::from(0)),
+        ),
         toml::Value::Boolean(boolean) => Value::Bool(boolean),
         toml::Value::Datetime(datetime) => Value::String(datetime.to_string()),
         toml::Value::Array(items) => Value::Array(items.into_iter().map(toml_to_json).collect()),
         toml::Value::Table(table) => Value::Object(
-            table.into_iter().map(|(key, value)| (key, toml_to_json(value))).collect(),
+            table
+                .into_iter()
+                .map(|(key, value)| (key, toml_to_json(value)))
+                .collect(),
         ),
     }
 }
@@ -2627,10 +2862,11 @@ fn valid_env_name(name: &str) -> bool {
 }
 
 pub(crate) const SESSION_IMPORT_SOURCE_VALUES: &[&str] =
-    &["omp", "codex", "claude", "grok", "droid"];
+    &["pi", "omp", "codex", "claude", "grok", "droid"];
 
 fn session_import_source_kind(value: &str) -> Option<SessionSourceKind> {
     match value {
+        "pi" => Some(SessionSourceKind::Pi),
         "omp" => Some(SessionSourceKind::Omp),
         "codex" => Some(SessionSourceKind::Codex),
         "claude" => Some(SessionSourceKind::Claude),
@@ -2640,7 +2876,217 @@ fn session_import_source_kind(value: &str) -> Option<SessionSourceKind> {
     }
 }
 
-pub(crate) fn validate_settings(settings: &Settings, scope: SettingsScope, path: &Path) -> Result<()> {
+/// Process-wide marker that the full model catalog (built-ins plus the custom
+/// models.json snapshot) has been applied. Catalog-ready surfaces — rpi
+/// startup and any config/draft surface that loads the catalog first — set
+/// this once, after which default-pair validation (including every settings
+/// persistence path in the process) runs the strict
+/// [`DefaultModelCatalogMode::CatalogReady`] authority and rejects unknown
+/// combined prefixes instead of silently persisting them.
+static DEFAULT_MODEL_CATALOG_READY: AtomicBool = AtomicBool::new(false);
+
+/// Marks the process-wide model catalog as fully loaded (or unloaded during
+/// tests). See [`DEFAULT_MODEL_CATALOG_READY`].
+pub fn set_default_model_catalog_ready(ready: bool) {
+    DEFAULT_MODEL_CATALOG_READY.store(ready, Ordering::Release);
+}
+
+/// Whether the full model catalog has been applied in this process.
+#[must_use]
+pub fn default_model_catalog_ready() -> bool {
+    DEFAULT_MODEL_CATALOG_READY.load(Ordering::Acquire)
+}
+
+/// How the default-pair authority treats the currently registered model
+/// catalog.
+///
+/// [`DefaultModelCatalogMode::CatalogAgnostic`] preserves the generic loading
+/// semantics required by processes that have not applied a custom models.json
+/// catalog yet: a lone combined prefix that cannot be confirmed as a
+/// registered provider is accepted as-shaped and re-validated by startup.
+/// [`DefaultModelCatalogMode::CatalogReady`] is the strict path for startup
+/// and persistence surfaces that already loaded the full catalog: unknown
+/// combined prefixes fail instead of being silently accepted or persisted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DefaultModelCatalogMode {
+    CatalogAgnostic,
+    CatalogReady,
+}
+
+/// The outcome of interpreting the persisted `defaultProvider`/`defaultModel`
+/// pair through trimmed views. The exact on-disk strings are never rewritten.
+#[derive(Clone, Debug)]
+pub enum ResolvedDefaultModelPair {
+    /// Neither default is configured; the caller's own fallback applies.
+    Absent,
+    /// A `$` environment reference survives in the persisted layer and is
+    /// resolved against the expanded runtime view at startup (sanctioned
+    /// fail-open). Catalog-ready surfaces reject it as an unresolved
+    /// expansion instead of treating it as absent.
+    DeferredEnv,
+    /// A lone combined defaultModel whose first slash segment is not a
+    /// registered provider and which does not resolve in the current
+    /// catalog. Only produced in
+    /// [`DefaultModelCatalogMode::CatalogAgnostic`]; startup re-validates it
+    /// against the full catalog.
+    UnconfirmedCombined(String),
+    /// The pair resolved to a concrete catalog model (or the sanctioned
+    /// custom-id fallback) plus the parsed `:<thinkingLevel>` suffix.
+    Resolved(ResolvedModel),
+}
+
+fn registered_provider_canonical(prefix: &str) -> Option<String> {
+    pi_ai::get_providers()
+        .into_iter()
+        .find(|registered| registered.eq_ignore_ascii_case(prefix))
+}
+
+/// Single authority for interpreting the persisted `defaultProvider` /
+/// `defaultModel` pair, shared by settings validation and startup model
+/// selection.
+///
+/// Values are read through trimmed views; the persisted strings are never
+/// rewritten. Slash handling is deferred to [`resolve_model_pattern`]: a
+/// slash prefix is a provider only when it names a registered provider, so
+/// OpenRouter-style slash ids (`"openrouter"` + `"ai21/jamba-large-1.7"`)
+/// and slash-bearing custom ids under a known provider stay intact. When
+/// `defaultProvider` is present, the resolved provider must equal it
+/// case-insensitively; a combined spec whose registered prefix disagrees is
+/// rejected outright rather than re-qualified under the configured provider.
+/// `defaultProvider` always needs a companion `defaultModel`, and a lone
+/// bare model id is an incomplete pair that fails instead of silently
+/// falling through to the first authenticated model. A `$` reference is
+/// accepted unchanged only in
+/// [`DefaultModelCatalogMode::CatalogAgnostic`]; the catalog-ready mode
+/// treats a surviving reference as an unresolved expansion and fails.
+pub fn resolve_default_model_pair(
+    settings: &Settings,
+    mode: DefaultModelCatalogMode,
+) -> Result<ResolvedDefaultModelPair> {
+    let provider = settings
+        .default_provider
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    let model = settings
+        .default_model
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    match (provider.is_empty(), model.is_empty()) {
+        (true, true) => Ok(ResolvedDefaultModelPair::Absent),
+        (false, true) => bail!(
+            "settings defaultProvider {provider:?} requires defaultModel to be set as well; set defaultModel to a bare model id or a provider/model spec"
+        ),
+        (_, false) if provider.contains('$') || model.contains('$') => match mode {
+            DefaultModelCatalogMode::CatalogAgnostic => Ok(ResolvedDefaultModelPair::DeferredEnv),
+            DefaultModelCatalogMode::CatalogReady => bail!(
+                "settings default model {provider:?}/{model:?} still contains a $ environment reference; the expanded runtime view is required"
+            ),
+        },
+        (true, false) => {
+            // A lone bare model id is an incomplete pair: the consumer cannot
+            // pick a provider from settings alone and would silently fall
+            // through. A lone combined spec is self-sufficient, effort suffix
+            // included.
+            match model.split_once('/') {
+                None => bail!(
+                    "settings defaultModel {model:?} requires defaultProvider to be set as well; set defaultProvider or use a provider/model spec"
+                ),
+                Some((prefix, _)) if registered_provider_canonical(prefix).is_some() => {
+                    resolve_model_pattern(model)
+                        .map(ResolvedDefaultModelPair::Resolved)
+                        .map_err(|error| {
+                            anyhow!("defaultModel {model:?} does not resolve: {error}")
+                        })
+                }
+                // Custom providers from models.json are only registered in
+                // processes that loaded the catalog. An unconfirmed prefix is
+                // accepted as-shaped in the catalog-agnostic mode and
+                // re-validated by the startup resolver; the catalog-ready
+                // mode (startup, persistence after the catalog load) rejects
+                // it unless it matches a raw slash catalog id.
+                Some(_) => match resolve_model_pattern(model) {
+                    Ok(resolved) => Ok(ResolvedDefaultModelPair::Resolved(resolved)),
+                    Err(_) if mode == DefaultModelCatalogMode::CatalogAgnostic => Ok(
+                        ResolvedDefaultModelPair::UnconfirmedCombined(model.to_owned()),
+                    ),
+                    Err(error) => bail!(
+                        "defaultModel {model:?} does not name a registered provider and does not resolve: {error}"
+                    ),
+                },
+            }
+        }
+        (false, false) => {
+            // Resolve the raw model value first so OpenRouter-style slash ids
+            // and slash-bearing catalog ids are interpreted by the resolver,
+            // not by pair composition. A slash-bearing raw spec that resolves
+            // under a different registered provider is a genuine provider
+            // disagreement and must not be re-qualified (that could
+            // synthesize a custom id under the configured provider and mask
+            // the disagreement). A bare id that resolved elsewhere may be
+            // ambiguous across providers, and a failing raw spec may still be
+            // a custom id under the configured provider: both qualify through
+            // `{provider}/{model}`.
+            match resolve_model_pattern(model) {
+                Ok(resolved) if resolved.model.provider.eq_ignore_ascii_case(provider) => {
+                    return Ok(ResolvedDefaultModelPair::Resolved(resolved));
+                }
+                Ok(resolved) if model.contains('/') => bail!(
+                    "settings defaultModel {model:?} resolves under provider {:?}, which does not match defaultProvider {provider:?}",
+                    resolved.model.provider
+                ),
+                _ => {}
+            }
+            let spec = format!("{provider}/{model}");
+            let resolved = resolve_model_pattern(&spec).map_err(|error| {
+                anyhow!("default model {provider}/{model} does not resolve: {error}")
+            })?;
+            if !resolved.model.provider.eq_ignore_ascii_case(provider) {
+                bail!(
+                    "settings defaultModel {model:?} resolves under provider {:?}, which does not match defaultProvider {provider:?}",
+                    resolved.model.provider
+                );
+            }
+            Ok(ResolvedDefaultModelPair::Resolved(resolved))
+        }
+    }
+}
+
+/// Semantic validation of the optional `defaultProvider`/`defaultModel` pair,
+/// delegating entirely to [`resolve_default_model_pair`]. Generic settings
+/// loading stays catalog-agnostic (a custom models.json catalog may not be
+/// applied in this process yet); once a surface marks the catalog ready
+/// ([`set_default_model_catalog_ready`]), validation — including every
+/// persistence path — rejects unknown combined prefixes strictly.
+///
+/// File parse and persistence see the persisted document. A `$` reference is
+/// sanctioned there ([`ResolvedDefaultModelPair::DeferredEnv`]) and is
+/// rejected only on the expanded runtime view.
+fn validate_default_model_pair(settings: &Settings) -> Result<()> {
+    let persisted_env = settings
+        .default_provider
+        .as_deref()
+        .is_some_and(|value| value.contains('$'))
+        || settings
+            .default_model
+            .as_deref()
+            .is_some_and(|value| value.contains('$'));
+    // File parse sees the persisted document. `$` expands when the runtime
+    // view is built; catalog-ready rejection of a leftover `$` happens there.
+    let mode = if persisted_env || !default_model_catalog_ready() {
+        DefaultModelCatalogMode::CatalogAgnostic
+    } else {
+        DefaultModelCatalogMode::CatalogReady
+    };
+    resolve_default_model_pair(settings, mode).map(|_| ())
+}
+
+pub(crate) fn validate_settings(
+    settings: &Settings,
+    scope: SettingsScope,
+    path: &Path,
+) -> Result<()> {
     if scope == SettingsScope::Project && settings.approval_mode.is_some() {
         bail!(
             "invalid project settings {}: approvalMode is global-only",
@@ -2661,9 +3107,11 @@ pub(crate) fn validate_settings(settings: &Settings, scope: SettingsScope, path:
             );
         }
     }
-    if settings.enabled_models.as_ref().is_some_and(|patterns| {
-        patterns.iter().any(|pattern| pattern.trim().is_empty())
-    }) {
+    if settings
+        .enabled_models
+        .as_ref()
+        .is_some_and(|patterns| patterns.iter().any(|pattern| pattern.trim().is_empty()))
+    {
         bail!(
             "invalid {} settings {}: enabledModels contains an empty pattern",
             scope_name(scope),
@@ -2684,12 +3132,12 @@ pub(crate) fn validate_settings(settings: &Settings, scope: SettingsScope, path:
             || selector.confidence_margin < 0
         {
             bail!(
-                "invalid {} settings {}: selector score thresholds must not be negative",
+                "invalid {} settings {}: selector score thresholds must be non-negative",
                 scope_name(scope),
                 path.display()
             );
         }
-        if selector.classifier.max_tokens <= 0 || selector.classifier.max_tokens > 256 {
+        if selector.classifier.max_tokens < 1 || selector.classifier.max_tokens > 256 {
             bail!(
                 "invalid {} settings {}: selector.classifier.maxTokens must be between 1 and 256",
                 scope_name(scope),
@@ -2717,13 +3165,54 @@ pub(crate) fn validate_settings(settings: &Settings, scope: SettingsScope, path:
             );
         }
     }
-    validate_operational_settings(settings).with_context(|| {
-        format!("invalid {} settings {}", scope_name(scope), path.display())
-    })?;
+    validate_default_model_pair(settings)
+        .with_context(|| format!("invalid {} settings {}", scope_name(scope), path.display()))?;
+    validate_operational_settings(settings)
+        .with_context(|| format!("invalid {} settings {}", scope_name(scope), path.display()))?;
     Ok(())
 }
 
+/// Single authority for code-review language tags (trimmed printable ASCII, 1..=32 bytes).
+pub fn validate_review_language(tag: &str) -> Result<&str> {
+    let tag = tag.trim();
+    if tag.is_empty() || tag.len() > 32 {
+        bail!("reviewLanguage must be between 1 and 32 characters");
+    }
+    if !tag.bytes().all(|byte| (0x20..=0x7e).contains(&byte)) {
+        bail!("reviewLanguage must contain only printable ASCII characters");
+    }
+    Ok(tag)
+}
+
+pub fn validate_plantuml_server(raw: &str) -> Result<Option<&str>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.len() > 2048 {
+        bail!("plantumlServer must be at most 2048 characters");
+    }
+    let parsed = url::Url::parse(trimmed).map_err(|_| anyhow!("plantumlServer must be an http or https URL"))?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        bail!("plantumlServer must be an http or https URL");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        bail!("plantumlServer must not include credentials");
+    }
+    Ok(Some(trimmed))
+}
+
 fn validate_operational_settings(settings: &Settings) -> Result<()> {
+    // The parser's `Option` field cannot distinguish an explicit JSON null from
+    // a missing key; both deserialize to `None`, and `None` means "resolve zh
+    // at the consumer boundary". Explicit set operations reject null at the
+    // settings-catalog boundary instead.
+    if let Some(tag) = settings.review_language.as_deref() {
+        validate_review_language(tag)?;
+    }
+    if let Some(server) = settings.plantuml_server.as_deref() {
+        validate_plantuml_server(server)?;
+    }
     for (index, rule) in settings.permission_rules.iter().enumerate() {
         if rule.path.trim().is_empty() {
             bail!("permissionRules[{index}].path must not be empty");
@@ -2732,32 +3221,52 @@ fn validate_operational_settings(settings: &Settings) -> Result<()> {
             bail!("permissionRules[{index}].tools must not be empty when present");
         }
     }
-    if let Some(sandbox) = &settings.sandbox {
-        for (field, paths) in [
-            ("sandbox.allowedPaths", sandbox.allowed_paths.as_deref().unwrap_or_default()),
-            ("sandbox.deniedPaths", sandbox.denied_paths.as_deref().unwrap_or_default()),
-        ] {
-            if paths.iter().any(|path| path.trim().is_empty()) {
-                bail!("{field} must not contain empty paths");
-            }
-        }
-    }
-    if settings.compaction.as_ref().and_then(|value| value.reserve_tokens).is_some_and(|value| value <= 0) {
+    if settings
+        .compaction
+        .as_ref()
+        .and_then(|value| value.reserve_tokens)
+        .is_some_and(|value| value <= 0)
+    {
         bail!("compaction.reserveTokens must be greater than zero");
     }
-    if settings.compaction.as_ref().and_then(|value| value.keep_recent_tokens).is_some_and(|value| value < 0) {
+    if settings
+        .compaction
+        .as_ref()
+        .and_then(|value| value.keep_recent_tokens)
+        .is_some_and(|value| value < 0)
+    {
         bail!("compaction.keepRecentTokens must be non-negative");
     }
-    if settings.compaction.as_ref().and_then(|value| value.snap_keep_turns).is_some_and(|value| value < 1) {
+    if settings
+        .compaction
+        .as_ref()
+        .and_then(|value| value.snap_keep_turns)
+        .is_some_and(|value| value < 1)
+    {
         bail!("compaction.snapKeepTurns must be at least 1");
     }
-    if settings.branch_summary.as_ref().and_then(|value| value.reserve_tokens).is_some_and(|value| value <= 0) {
+    if settings
+        .branch_summary
+        .as_ref()
+        .and_then(|value| value.reserve_tokens)
+        .is_some_and(|value| value <= 0)
+    {
         bail!("branchSummary.reserveTokens must be greater than zero");
     }
-    if settings.retry.as_ref().and_then(|value| value.base_delay_ms).or(settings.base_delay_ms).is_some_and(|value| value == 0) {
+    if settings
+        .retry
+        .as_ref()
+        .and_then(|value| value.base_delay_ms)
+        .or(settings.base_delay_ms)
+        .is_some_and(|value| value == 0)
+    {
         bail!("retry.baseDelayMs must be greater than zero");
     }
-    if let Some(chains) = settings.retry.as_ref().and_then(|value| value.fallback_chains.as_ref()) {
+    if let Some(chains) = settings
+        .retry
+        .as_ref()
+        .and_then(|value| value.fallback_chains.as_ref())
+    {
         for (key, chain) in chains {
             if key.trim().is_empty() {
                 bail!("retry.fallbackChains contains an empty key");
@@ -2773,25 +3282,47 @@ fn validate_operational_settings(settings: &Settings) -> Result<()> {
                 if crate::is_retry_fallback_wildcard_key(trimmed) {
                     continue;
                 }
-                if crate::parse_retry_fallback_selector(trimmed, None::<&crate::CatalogModelLookup>).is_none() {
+                if crate::parse_retry_fallback_selector(trimmed, None::<&crate::CatalogModelLookup>)
+                    .is_none()
+                {
                     bail!("retry.fallbackChains entry '{key}' has invalid selector '{trimmed}'");
                 }
             }
         }
     }
-    if settings.temperature.is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value)) {
+    if settings
+        .temperature
+        .is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value))
+    {
         bail!("temperature must be finite and between 0 and 2");
     }
     if settings.max_tokens.is_some_and(|value| value <= 0) {
         bail!("maxTokens must be greater than zero");
     }
-    if settings.image_width_cells.or_else(|| settings.terminal.as_ref().and_then(|value| value.image_width_cells)).is_some_and(|value| value == 0) {
+    if settings
+        .image_width_cells
+        .or_else(|| {
+            settings
+                .terminal
+                .as_ref()
+                .and_then(|value| value.image_width_cells)
+        })
+        .is_some_and(|value| value == 0)
+    {
         bail!("imageWidthCells must be greater than zero");
     }
-    if settings.theme.as_ref().is_some_and(|value| value.trim().is_empty()) {
+    if settings
+        .theme
+        .as_ref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
         bail!("theme must not be empty");
     }
-    if settings.session_dir.as_ref().is_some_and(|value| value.as_os_str().is_empty()) {
+    if settings
+        .session_dir
+        .as_ref()
+        .is_some_and(|value| value.as_os_str().is_empty())
+    {
         bail!("sessionDir must not be empty");
     }
     if settings.session_ttl_days.is_some_and(|days| days == 0) {
@@ -2811,7 +3342,11 @@ fn validate_operational_settings(settings: &Settings) -> Result<()> {
             }
         }
     }
-    if settings.scoped_models.as_ref().is_some_and(|patterns| patterns.iter().any(|pattern| pattern.trim().is_empty())) {
+    if settings
+        .scoped_models
+        .as_ref()
+        .is_some_and(|patterns| patterns.iter().any(|pattern| pattern.trim().is_empty()))
+    {
         bail!("scopedModels contains an empty pattern");
     }
     if let Some(hooks) = &settings.hooks {
@@ -2835,28 +3370,49 @@ fn validate_operational_settings(settings: &Settings) -> Result<()> {
     }) {
         bail!("thinkingBudgets values must be greater than zero");
     }
-    if settings.keybindings.as_ref().is_some_and(|bindings| bindings.iter().any(|(action, chords)| {
-        action.trim().is_empty() || match chords {
-            KeyBindingValue::One(chord) => chord.trim().is_empty(),
-            KeyBindingValue::Many(chords) => chords.is_empty() || chords.iter().any(|chord| chord.trim().is_empty()),
-        }
-    })) {
+    if settings.keybindings.as_ref().is_some_and(|bindings| {
+        bindings.iter().any(|(action, chords)| {
+            action.trim().is_empty()
+                || match chords {
+                    KeyBindingValue::One(chord) => chord.trim().is_empty(),
+                    KeyBindingValue::Many(chords) => {
+                        chords.is_empty() || chords.iter().any(|chord| chord.trim().is_empty())
+                    }
+                }
+        })
+    }) {
         bail!("keybindings contains an empty action or chord");
     }
-    if settings.agents.iter().any(|(name, _)| name.trim().is_empty()) {
+    if settings
+        .agents
+        .iter()
+        .any(|(name, _)| name.trim().is_empty())
+    {
         bail!("agents contains an empty name");
     }
     if let Some(orchestration) = &settings.orchestration {
-        if orchestration.max_concurrency.is_some_and(|value| value == 0 || value > 64) {
+        if orchestration
+            .max_concurrency
+            .is_some_and(|value| value == 0 || value > 64)
+        {
             bail!("orchestration.maxConcurrency must be between 1 and 64");
         }
-        if orchestration.max_recursion_depth.is_some_and(|value| value > 16) {
+        if orchestration
+            .max_recursion_depth
+            .is_some_and(|value| value > 16)
+        {
             bail!("orchestration.maxRecursionDepth must be at most 16");
         }
-        if orchestration.mailbox_capacity.is_some_and(|value| value == 0 || value > 10_000) {
+        if orchestration
+            .mailbox_capacity
+            .is_some_and(|value| value == 0 || value > 10_000)
+        {
             bail!("orchestration.mailboxCapacity must be between 1 and 10000");
         }
-        if orchestration.max_tools_per_agent.is_some_and(|value| value == 0 || value > 64) {
+        if orchestration
+            .max_tools_per_agent
+            .is_some_and(|value| value == 0 || value > 64)
+        {
             bail!("orchestration.maxToolsPerAgent must be between 1 and 64");
         }
         if let Some(soft_budget) = orchestration.soft_budget.as_ref() {
@@ -2888,11 +3444,17 @@ fn validate_operational_settings(settings: &Settings) -> Result<()> {
         }
         match server.transport {
             McpTransport::Stdio => {
-                if server.command.as_ref().is_none_or(|command| command.trim().is_empty()) {
+                if server
+                    .command
+                    .as_ref()
+                    .is_none_or(|command| command.trim().is_empty())
+                {
                     bail!("mcpServers[{index}] (stdio) requires a non-empty command");
                 }
                 if server.url.is_some() {
-                    bail!("mcpServers[{index}] (stdio) must not set url (url is for the sse transport)");
+                    bail!(
+                        "mcpServers[{index}] (stdio) must not set url (url is for the sse transport)"
+                    );
                 }
             }
             McpTransport::Sse => {
@@ -2906,7 +3468,9 @@ fn validate_operational_settings(settings: &Settings) -> Result<()> {
                     bail!("mcpServers[{index}] (sse) url must start with http:// or https://");
                 }
                 if server.command.is_some() {
-                    bail!("mcpServers[{index}] (sse) must not set command (command is for the stdio transport)");
+                    bail!(
+                        "mcpServers[{index}] (sse) must not set command (command is for the stdio transport)"
+                    );
                 }
             }
         }
@@ -2914,6 +3478,42 @@ fn validate_operational_settings(settings: &Settings) -> Result<()> {
     Ok(())
 }
 
+fn write_settings_to_root(
+    root: &CapabilityRootLease,
+    canonical: &Path,
+    settings: &Settings,
+    scope: SettingsScope,
+) -> Result<()> {
+    let selected = retained_settings_file(root)?;
+    let (file_name, expected) = match selected {
+        Some((name, file)) => (name, Some(file.identity())),
+        None => ("settings.json".to_owned(), None),
+    };
+    let path = canonical.with_file_name(&file_name);
+    let bytes = if is_toml_settings_path(&path) {
+        let mut bytes = toml_settings_string(settings)?.into_bytes();
+        bytes.push(b'\n');
+        bytes
+    } else {
+        let mut bytes = serde_json::to_vec_pretty(settings).with_context(|| {
+            format!(
+                "serializing {} settings {}",
+                scope_name(scope),
+                path.display()
+            )
+        })?;
+        bytes.push(b'\n');
+        bytes
+    };
+    root.replace_file_allowing_live_leaf_link(Replacement {
+        relative: PathBuf::from(file_name),
+        expected,
+        bytes,
+        mode: FileMode::Private,
+    })
+    .with_context(|| format!("writing {} settings {}", scope_name(scope), path.display()))?;
+    Ok(())
+}
 fn write_settings_file(path: &Path, settings: &Settings, scope: SettingsScope) -> Result<()> {
     let path = resolve_settings_path(path);
     let mut bytes = if is_toml_settings_path(&path) {
@@ -2922,25 +3522,43 @@ fn write_settings_file(path: &Path, settings: &Settings, scope: SettingsScope) -
         bytes
     } else {
         let mut bytes = serde_json::to_vec_pretty(settings).with_context(|| {
-            format!("serializing {} settings {}", scope_name(scope), path.display())
+            format!(
+                "serializing {} settings {}",
+                scope_name(scope),
+                path.display()
+            )
         })?;
         bytes.push(b'\n');
         bytes
     };
-    atomic_write(&path, &bytes).with_context(|| {
-        format!("writing {} settings {}", scope_name(scope), path.display())
-    })
+    atomic_write(&path, &bytes)
+        .with_context(|| format!("writing {} settings {}", scope_name(scope), path.display()))
 }
 
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path
+    let resolved_path = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Some(
+            fs::canonicalize(path)
+                .with_context(|| format!("resolving symlink target {}", path.display()))?,
+        ),
+        Ok(_) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspecting {}", path.display()));
+        }
+    };
+    let write_path = resolved_path.as_deref().unwrap_or(path);
+    let parent = write_path
         .parent()
-        .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
+        .ok_or_else(|| anyhow!("path has no parent: {}", write_path.display()))?;
     fs::create_dir_all(parent)
         .with_context(|| format!("creating directory {}", parent.display()))?;
     let temp_path = parent.join(format!(
         ".{}.{}.tmp",
-        path.file_name().and_then(|name| name.to_str()).unwrap_or("pi"),
+        write_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("pi"),
         Uuid::new_v4().simple()
     ));
     let result = (|| -> Result<()> {
@@ -2965,8 +3583,13 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         file.sync_all()
             .with_context(|| format!("syncing temporary file {}", temp_path.display()))?;
         drop(file);
-        fs::rename(&temp_path, path)
-            .with_context(|| format!("replacing {} with {}", path.display(), temp_path.display()))?;
+        fs::rename(&temp_path, write_path).with_context(|| {
+            format!(
+                "replacing {} with {}",
+                write_path.display(),
+                temp_path.display()
+            )
+        })?;
         File::open(parent)
             .and_then(|directory| directory.sync_all())
             .with_context(|| format!("syncing directory {}", parent.display()))?;
@@ -2989,6 +3612,134 @@ const fn scope_name(scope: SettingsScope) -> &'static str {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn review_language_missing_is_none_and_explicit_values_round_trip() {
+        // Derived `Default` leaves the raw field absent; the effective zh
+        // default is resolved at the consumer/catalog display boundary.
+        assert_eq!(Settings::default().review_language, None);
+        let missing: Settings = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(missing.review_language, None);
+        let serialized = serde_json::to_value(missing).unwrap();
+        assert!(serialized.get("reviewLanguage").is_none(), "{serialized}");
+
+        for tag in ["zh", "de", "zh-CN"] {
+            let configured: Settings =
+                serde_json::from_value(json!({"reviewLanguage": tag})).unwrap();
+            assert_eq!(configured.review_language.as_deref(), Some(tag));
+            // An explicit tag — including zh itself — must survive
+            // serialization so a lower scope never reveals a higher scope's
+            // different value.
+            assert_eq!(serde_json::to_value(&configured).unwrap()["reviewLanguage"], tag);
+            validate_settings(&configured, SettingsScope::Global, Path::new("settings.json"))
+                .expect("explicit review language validates");
+        }
+        validate_settings(&Settings::default(), SettingsScope::Global, Path::new("settings.json"))
+            .expect("missing reviewLanguage validates and resolves zh at the consumer");
+    }
+
+    #[test]
+    fn review_language_invalid_values_fail_validation() {
+        let path = Path::new("settings.json");
+        for invalid in ["", "  ", "en\nUS", "中文", "abcdefghijklmnopqrstuvwxyz1234567"] {
+            let settings = Settings {
+                review_language: Some(invalid.to_owned()),
+                ..Settings::default()
+            };
+            let error = validate_settings(&settings, SettingsScope::Global, path)
+                .expect_err("invalid review language must fail");
+            assert!(
+                format!("{error:#}").contains("reviewLanguage"),
+                "{invalid}: {error:#}"
+            );
+        }
+        let valid = Settings {
+            review_language: Some("zh-Hant-TW-123456789".to_owned()),
+            ..Settings::default()
+        };
+        validate_settings(&valid, SettingsScope::Global, path)
+            .expect("printable ASCII within 1..=32 validates");
+    }
+
+    #[test]
+    fn review_language_null_and_missing_share_parser_contract() {
+        let path = Path::new("settings.json");
+        // The parser's Option field cannot distinguish an explicit JSON null
+        // from a missing key: both deserialize to None. Null rejection is an
+        // explicit-set-operation concern enforced at the settings-catalog
+        // boundary, not load validation.
+        for document in [r#"{"reviewLanguage":null}"#, r#"{}"#] {
+            let settings: Settings = serde_json::from_str(document)
+                .expect("null and missing both deserialize through the Option field");
+            assert_eq!(settings.review_language, None, "{document}");
+            validate_settings(&settings, SettingsScope::Global, path)
+                .expect("None resolves zh at the consumer boundary and validates");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_symlink_and_replaces_resolved_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("settings directory");
+        let target_directory = directory.path().join("target");
+        let link_directory = directory.path().join("link");
+        fs::create_dir_all(&target_directory).expect("target directory");
+        fs::create_dir_all(&link_directory).expect("link directory");
+        let target = target_directory.join("settings.json");
+        let link = link_directory.join("settings.json");
+        fs::write(&target, b"{\"theme\":\"light\"}\n").expect("initial target settings");
+        symlink(&target, &link).expect("settings symlink");
+
+        atomic_write(&link, b"{\"theme\":\"dark\"}\n").expect("atomic settings write");
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("symlink metadata")
+                .file_type()
+                .is_symlink(),
+            "settings path must remain a symlink"
+        );
+        assert_eq!(fs::read_link(&link).expect("symlink target"), target);
+        assert_eq!(
+            fs::read(&target).expect("updated target settings"),
+            b"{\"theme\":\"dark\"}\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_rejects_dangling_symlink_without_replacing_it() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("settings directory");
+        let missing_target = directory.path().join("missing-settings.json");
+        let link = directory.path().join("settings.json");
+        symlink(&missing_target, &link).expect("dangling settings symlink");
+
+        let error = atomic_write(&link, b"{\"theme\":\"dark\"}\n")
+            .expect_err("dangling symlink must fail closed");
+
+        assert!(
+            format!("{error:#}").contains("resolving symlink target"),
+            "{error:#}"
+        );
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("dangling symlink metadata")
+                .file_type()
+                .is_symlink(),
+            "dangling settings path must remain a symlink"
+        );
+        assert_eq!(
+            fs::read_link(&link).expect("dangling symlink target"),
+            missing_target
+        );
+        assert!(
+            !missing_target.exists(),
+            "dangling target must not be created"
+        );
+    }
 
     #[test]
     fn memory_config_applies_defaults_and_overrides() {
@@ -2997,10 +3748,16 @@ mod tests {
         assert!(config.hindsight_api_url.is_none());
         assert!(config.hindsight_api_token.is_none());
         assert!(!config.hindsight_allow_insecure);
-        assert_eq!(config.hindsight_bank_id, crate::memory::DEFAULT_HINDSIGHT_BANK_ID);
+        assert_eq!(
+            config.hindsight_bank_id,
+            crate::memory::DEFAULT_HINDSIGHT_BANK_ID
+        );
         assert_eq!(config.hindsight_scoping, HindsightScoping::PerProjectTagged);
         assert_eq!(config.hindsight_recall_budget, HindsightBudget::Mid);
-        assert_eq!(config.hindsight_recall_types, crate::memory::DEFAULT_HINDSIGHT_RECALL_TYPES);
+        assert_eq!(
+            config.hindsight_recall_types,
+            crate::memory::DEFAULT_HINDSIGHT_RECALL_TYPES
+        );
 
         let settings = Settings {
             memory: Some(MemorySettings {
@@ -3024,7 +3781,10 @@ mod tests {
         };
         let config = settings.memory_config();
         assert_eq!(config.backend, MemoryBackend::Hindsight);
-        assert_eq!(config.hindsight_api_url.as_deref(), Some("https://memory.example.test/"));
+        assert_eq!(
+            config.hindsight_api_url.as_deref(),
+            Some("https://memory.example.test/")
+        );
         assert_eq!(config.hindsight_api_token.as_deref(), Some("secret-value"));
         assert_eq!(config.hindsight_bank_id, "main");
         assert_eq!(config.hindsight_bank_id_prefix.as_deref(), Some("team"));
@@ -3060,9 +3820,13 @@ mod tests {
             }),
             ..Default::default()
         };
-        let serialized =
-            serde_json::to_value(settings.runtime_settings().expect("runtime settings").state())
-                .expect("serialize web state");
+        let serialized = serde_json::to_value(
+            settings
+                .runtime_settings()
+                .expect("runtime settings")
+                .state(),
+        )
+        .expect("serialize web state");
         // Endpoints and credentials never cross the Web wire.
         for leaked in [
             "sttBaseUrl",
@@ -3074,7 +3838,10 @@ mod tests {
             "stt.example.test",
             "rt.example.test",
         ] {
-            assert!(!serialized.to_string().contains(leaked), "{leaked:?} leaked: {serialized}");
+            assert!(
+                !serialized.to_string().contains(leaked),
+                "{leaked:?} leaked: {serialized}"
+            );
         }
         let live = &serialized["live"];
         // The UI gates and labels are projected; the block is EXACTLY the
@@ -3085,7 +3852,12 @@ mod tests {
         assert_eq!(live["realtimeConfigured"], json!(true));
         assert_eq!(live["realtimeModel"], json!("gpt-realtime-1.5"));
         assert_eq!(live["voice"], json!("sol"));
-        let keys = live.as_object().expect("object").keys().cloned().collect::<Vec<_>>();
+        let keys = live
+            .as_object()
+            .expect("object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
         assert_eq!(keys.len(), 6, "{keys:?}");
 
         // Unconfigured halves project false (the browser gates on booleans).
@@ -3094,12 +3866,19 @@ mod tests {
             live.realtime_base_url = None;
             live.realtime_api_key = None;
         }
-        let serialized =
-            serde_json::to_value(settings.runtime_settings().expect("runtime settings").state())
-                .expect("serialize web state");
+        let serialized = serde_json::to_value(
+            settings
+                .runtime_settings()
+                .expect("runtime settings")
+                .state(),
+        )
+        .expect("serialize web state");
         assert_eq!(serialized["live"]["sttConfigured"], json!(true));
         assert_eq!(serialized["live"]["realtimeConfigured"], json!(false));
-        assert!(!serialized.to_string().contains("rt.example.test"), "{serialized}");
+        assert!(
+            !serialized.to_string().contains("rt.example.test"),
+            "{serialized}"
+        );
     }
 
     #[test]
@@ -3129,8 +3908,14 @@ mod tests {
         ] {
             assert!(!debug.contains(leaked), "{leaked:?} leaked: {debug}");
         }
-        assert!(debug.contains("[CONFIGURED]"), "configured label missing: {debug}");
-        assert!(debug.contains("[REDACTED]"), "key redaction missing: {debug}");
+        assert!(
+            debug.contains("[CONFIGURED]"),
+            "configured label missing: {debug}"
+        );
+        assert!(
+            debug.contains("[REDACTED]"),
+            "key redaction missing: {debug}"
+        );
 
         // Unset endpoints print the unset label, never a URL or empty value.
         let unset = LiveRuntimeSettings {
@@ -3147,13 +3932,21 @@ mod tests {
     fn enabled_models_persist_atomically_and_preserve_order() {
         let agent = tempfile::tempdir().expect("agent dir");
         let cwd = tempfile::tempdir().expect("cwd");
-        let manager = SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("settings manager");
-        manager.update_global(|settings| {
-            settings.enabled_models = Some(vec!["provider/two".to_owned(), "provider/one".to_owned()]);
-        }).expect("persist enabled models");
+        let manager =
+            SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("settings manager");
+        manager
+            .update_global(|settings| {
+                settings.enabled_models =
+                    Some(vec!["provider/two".to_owned(), "provider/one".to_owned()]);
+            })
+            .expect("persist enabled models");
 
-        let reloaded = SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("reload settings");
-        assert_eq!(reloaded.settings().enabled_models, Some(vec!["provider/two".to_owned(), "provider/one".to_owned()]));
+        let reloaded =
+            SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("reload settings");
+        assert_eq!(
+            reloaded.settings().enabled_models,
+            Some(vec!["provider/two".to_owned(), "provider/one".to_owned()])
+        );
         assert!(reloaded.paths().global.exists());
     }
 
@@ -3161,8 +3954,8 @@ mod tests {
     fn selector_settings_persist_and_validate_limits() {
         let agent = tempfile::tempdir().expect("agent dir");
         let cwd = tempfile::tempdir().expect("cwd");
-        let manager = SettingsManager::load_phase_one(cwd.path(), agent.path())
-            .expect("settings manager");
+        let manager =
+            SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("settings manager");
         manager
             .update_global(|settings| {
                 settings.selector = Some(crate::SelectorSettings {
@@ -3177,8 +3970,8 @@ mod tests {
                 });
             })
             .expect("persist selector settings");
-        let reloaded = SettingsManager::load_phase_one(cwd.path(), agent.path())
-            .expect("reload settings");
+        let reloaded =
+            SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("reload settings");
         assert_eq!(reloaded.settings().selector.unwrap().max_results, 3);
 
         let mut invalid = Settings::default();
@@ -3186,10 +3979,12 @@ mod tests {
             max_results: 0,
             ..crate::SelectorSettings::default()
         });
-        assert!(validate_settings(&invalid, SettingsScope::Global, &manager.paths().global)
-            .expect_err("zero max results must fail")
-            .to_string()
-            .contains("selector.maxResults"));
+        assert!(
+            validate_settings(&invalid, SettingsScope::Global, &manager.paths().global)
+                .expect_err("zero max results must fail")
+                .to_string()
+                .contains("selector.maxResults")
+        );
     }
 
     #[test]
@@ -3209,7 +4004,9 @@ mod tests {
         }
 
         // The default stays the git worktree.
-        let default_snapshot = Settings::default().runtime_settings().expect("default runtime");
+        let default_snapshot = Settings::default()
+            .runtime_settings()
+            .expect("default runtime");
         assert_eq!(
             default_snapshot.orchestration_isolation,
             crate::WorkflowIsolationSetting::Worktree
@@ -3218,8 +4015,8 @@ mod tests {
         // Persist/reload round trip preserves the selection.
         let agent = tempfile::tempdir().expect("agent dir");
         let cwd = tempfile::tempdir().expect("cwd");
-        let manager = SettingsManager::load_phase_one(cwd.path(), agent.path())
-            .expect("settings manager");
+        let manager =
+            SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("settings manager");
         manager
             .update_global(|settings| {
                 settings.orchestration = Some(crate::OrchestrationSettings {
@@ -3228,21 +4025,23 @@ mod tests {
                 });
             })
             .expect("persist isolation setting");
-        let reloaded = SettingsManager::load_phase_one(cwd.path(), agent.path())
-            .expect("reload settings");
+        let reloaded =
+            SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("reload settings");
         let reloaded_isolation = reloaded
             .settings()
             .orchestration
             .as_ref()
             .and_then(|orchestration| orchestration.isolation)
             .expect("isolation survives reload");
-        assert_eq!(reloaded_isolation, crate::WorkflowIsolationSetting::Overlayfs);
+        assert_eq!(
+            reloaded_isolation,
+            crate::WorkflowIsolationSetting::Overlayfs
+        );
 
         // An unknown enum value fails deserialization (fail-closed), so the
         // backend can never be silently mistyped into the default.
         assert!(
-            serde_json::from_str::<Settings>(r#"{"orchestration":{"isolation":"btrfs"}}"#)
-                .is_err(),
+            serde_json::from_str::<Settings>(r#"{"orchestration":{"isolation":"btrfs"}}"#).is_err(),
             "unknown isolation values must be rejected"
         );
     }
@@ -3270,7 +4069,9 @@ mod tests {
         assert_eq!(snapshot.orchestration_soft_budget.yield_after, Some(3));
 
         // A default (unset) soft budget stays unlimited.
-        let default_snapshot = Settings::default().runtime_settings().expect("default runtime");
+        let default_snapshot = Settings::default()
+            .runtime_settings()
+            .expect("default runtime");
         assert_eq!(
             default_snapshot.orchestration_soft_budget,
             crate::JobSoftBudget::default()
@@ -3279,8 +4080,8 @@ mod tests {
         // Persist/reload round trip preserves the knobs.
         let agent = tempfile::tempdir().expect("agent dir");
         let cwd = tempfile::tempdir().expect("cwd");
-        let manager = SettingsManager::load_phase_one(cwd.path(), agent.path())
-            .expect("settings manager");
+        let manager =
+            SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("settings manager");
         manager
             .update_global(|settings| {
                 settings.orchestration = Some(crate::OrchestrationSettings {
@@ -3293,8 +4094,8 @@ mod tests {
                 });
             })
             .expect("persist soft budget settings");
-        let reloaded = SettingsManager::load_phase_one(cwd.path(), agent.path())
-            .expect("reload settings");
+        let reloaded =
+            SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("reload settings");
         let reloaded_settings = reloaded.settings();
         let reloaded_budget = reloaded_settings
             .orchestration
@@ -3310,10 +4111,9 @@ mod tests {
             ("maxTokens", r#"{"maxTokens":0}"#),
             ("yieldAfter", r#"{"yieldAfter":0}"#),
         ] {
-            let zero: Settings = serde_json::from_str(&format!(
-                r#"{{"orchestration":{{"softBudget":{json}}}}}"#
-            ))
-            .expect("zero soft budget parses");
+            let zero: Settings =
+                serde_json::from_str(&format!(r#"{{"orchestration":{{"softBudget":{json}}}}}"#))
+                    .expect("zero soft budget parses");
             let error = validate_settings(&zero, SettingsScope::Global, Path::new("settings.json"))
                 .expect_err("zero soft budget must fail validation");
             assert!(
@@ -3325,10 +4125,9 @@ mod tests {
 
     #[test]
     fn orchestration_preferred_agent_parses_flows_and_persists() {
-        let settings: Settings = serde_json::from_str(
-            r#"{"orchestration":{"preferredAgent":"reviewer"}}"#,
-        )
-        .expect("parse preferred agent settings");
+        let settings: Settings =
+            serde_json::from_str(r#"{"orchestration":{"preferredAgent":"reviewer"}}"#)
+                .expect("parse preferred agent settings");
         assert_eq!(
             settings
                 .orchestration
@@ -3339,8 +4138,8 @@ mod tests {
 
         let agent = tempfile::tempdir().expect("agent dir");
         let cwd = tempfile::tempdir().expect("cwd");
-        let manager = SettingsManager::load_phase_one(cwd.path(), agent.path())
-            .expect("settings manager");
+        let manager =
+            SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("settings manager");
         manager
             .update_global(|settings| {
                 settings.orchestration = Some(crate::OrchestrationSettings {
@@ -3349,8 +4148,8 @@ mod tests {
                 });
             })
             .expect("persist preferred agent");
-        let reloaded = SettingsManager::load_phase_one(cwd.path(), agent.path())
-            .expect("reload settings");
+        let reloaded =
+            SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("reload settings");
         assert_eq!(
             reloaded
                 .settings()
@@ -3392,8 +4191,8 @@ mod tests {
     fn approval_mode_defaults_to_yolo_and_round_trips_lowercase() {
         assert_eq!(ApprovalMode::default(), ApprovalMode::Yolo);
 
-        let settings: Settings = serde_json::from_str(r#"{"approvalMode":"write"}"#)
-            .expect("deserialize approval mode");
+        let settings: Settings =
+            serde_json::from_str(r#"{"approvalMode":"write"}"#).expect("deserialize approval mode");
         assert_eq!(settings.approval_mode, Some(ApprovalMode::Write));
         let encoded = serde_json::to_value(&settings).expect("serialize settings");
         assert_eq!(encoded["approvalMode"], "write");
@@ -3413,8 +4212,11 @@ mod tests {
     fn project_approval_mode_cannot_weaken_global_policy() {
         let agent = tempfile::tempdir().expect("agent dir");
         let cwd = tempfile::tempdir().expect("cwd");
-        fs::write(agent.path().join("settings.json"), r#"{"approvalMode":"ask"}"#)
-            .expect("global settings");
+        fs::write(
+            agent.path().join("settings.json"),
+            r#"{"approvalMode":"ask"}"#,
+        )
+        .expect("global settings");
         fs::create_dir_all(cwd.path().join(CONFIG_DIR_NAME)).expect("project settings dir");
         fs::write(
             cwd.path().join(CONFIG_DIR_NAME).join("settings.json"),
@@ -3424,7 +4226,9 @@ mod tests {
 
         let manager = SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("global");
         assert_eq!(manager.settings().approval_mode, Some(ApprovalMode::Ask));
-        let error = manager.load_project(true).expect_err("project approval mode rejected");
+        let error = manager
+            .load_project(true)
+            .expect_err("project approval mode rejected");
         assert!(error.to_string().contains("approvalMode"), "{error:#}");
         assert_eq!(manager.settings().approval_mode, Some(ApprovalMode::Ask));
     }
@@ -3465,16 +4269,27 @@ mod tests {
         .expect("project settings");
 
         let manager = SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("settings");
-        assert_eq!(manager.settings().session_dir.as_deref(), Some(Path::new("global-sessions")));
-        manager.load_project(true).expect("trusted project settings");
-        assert_eq!(manager.settings().session_dir.as_deref(), Some(Path::new("project-sessions")));
+        assert_eq!(
+            manager.settings().session_dir.as_deref(),
+            Some(Path::new("global-sessions"))
+        );
+        manager
+            .load_project(true)
+            .expect("trusted project settings");
+        assert_eq!(
+            manager.settings().session_dir.as_deref(),
+            Some(Path::new("project-sessions"))
+        );
     }
 
     #[test]
     fn session_ttl_days_is_typed_optional_and_rejects_zero() {
         assert_eq!(Settings::default().session_ttl_days, None);
         let absent = serde_json::to_value(Settings::default()).expect("serialize absent ttl");
-        assert!(absent.get("sessionTtlDays").is_none(), "absent ttl must not serialize");
+        assert!(
+            absent.get("sessionTtlDays").is_none(),
+            "absent ttl must not serialize"
+        );
 
         let typed: Settings = serde_json::from_str(r#"{"sessionTtlDays":45}"#)
             .expect("deserialize typed session ttl days");
@@ -3487,7 +4302,10 @@ mod tests {
         assert!(format!("{error:#}").contains("sessionTtlDays"), "{error:#}");
 
         let negative = serde_json::from_str::<Settings>(r#"{"sessionTtlDays":-1}"#);
-        assert!(negative.is_err(), "negative TTL must not deserialize into u64");
+        assert!(
+            negative.is_err(),
+            "negative TTL must not deserialize into u64"
+        );
     }
 
     #[test]
@@ -3509,9 +4327,8 @@ mod tests {
         let encoded_empty = serde_json::to_value(&empty).expect("serialize empty sources");
         assert_eq!(encoded_empty["sessionImportSources"], serde_json::json!([]));
 
-        let configured: Settings =
-            serde_json::from_str(r#"{"sessionImportSources":["codex"]}"#)
-                .expect("deserialize configured source");
+        let configured: Settings = serde_json::from_str(r#"{"sessionImportSources":["codex"]}"#)
+            .expect("deserialize configured source");
         let merged = configured.merged(&empty);
         assert_eq!(merged.session_import_sources, Some(Vec::new()));
         assert_eq!(
@@ -3523,7 +4340,7 @@ mod tests {
     #[test]
     fn session_import_sources_allowed_union_round_trips_camel_case() {
         let settings: Settings = serde_json::from_str(
-            r#"{"sessionImportSources":["omp","codex","claude","grok","droid"]}"#,
+            r#"{"sessionImportSources":["pi","omp","codex","claude","grok","droid"]}"#,
         )
         .expect("deserialize allowed session import sources");
         validate_settings(&settings, SettingsScope::Global, Path::new("settings.json"))
@@ -3532,6 +4349,7 @@ mod tests {
             settings.effective_session_import_sources(),
             vec![
                 SessionSourceKind::NativePi,
+                SessionSourceKind::Pi,
                 SessionSourceKind::Omp,
                 SessionSourceKind::Codex,
                 SessionSourceKind::Claude,
@@ -3543,7 +4361,7 @@ mod tests {
         let encoded = serde_json::to_value(&settings).expect("serialize settings");
         assert_eq!(
             encoded["sessionImportSources"],
-            serde_json::json!(["omp", "codex", "claude", "grok", "droid"])
+            serde_json::json!(["pi", "omp", "codex", "claude", "grok", "droid"])
         );
         assert!(encoded.get("session_import_sources").is_none());
     }
@@ -3551,15 +4369,14 @@ mod tests {
     #[test]
     fn session_import_sources_reject_invalid_alias_and_duplicate_values() {
         assert!(
-            serde_json::from_str::<Settings>(r#"{"sessionImportSources":["codex",1]}"#)
-                .is_err(),
+            serde_json::from_str::<Settings>(r#"{"sessionImportSources":["codex",1]}"#).is_err(),
             "sessionImportSources must deserialize as a string list"
         );
 
         for (sources, expected) in [
             (vec![""], "unsupported source"),
             (vec!["   "], "unsupported source"),
-            (vec!["pi"], "unsupported source"),
+            (vec!["rpi"], "unsupported source"),
             (vec!["native"], "unsupported source"),
             (vec!["hyper"], "unsupported source"),
             (vec!["grok/hyper"], "unsupported source"),
@@ -3568,17 +4385,12 @@ mod tests {
             (vec!["omp", "omp"], "duplicate source"),
         ] {
             let settings = Settings {
-                session_import_sources: Some(
-                    sources.into_iter().map(str::to_owned).collect(),
-                ),
+                session_import_sources: Some(sources.into_iter().map(str::to_owned).collect()),
                 ..Settings::default()
             };
-            let error = validate_settings(
-                &settings,
-                SettingsScope::Global,
-                Path::new("settings.json"),
-            )
-            .expect_err("invalid session import sources must fail");
+            let error =
+                validate_settings(&settings, SettingsScope::Global, Path::new("settings.json"))
+                    .expect_err("invalid session import sources must fail");
             let error = format!("{error:#}");
             assert!(error.contains("sessionImportSources"), "{error}");
             assert!(error.contains(expected), "{error}");
@@ -3589,7 +4401,8 @@ mod tests {
     fn agent_runtime_settings_persist_atomically() {
         let agent = tempfile::tempdir().expect("agent dir");
         let cwd = tempfile::tempdir().expect("cwd");
-        let manager = SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("settings manager");
+        let manager =
+            SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("settings manager");
         manager
             .update_global(|settings| {
                 settings.set_agent_settings(
@@ -3597,8 +4410,8 @@ mod tests {
                     AgentRuntimeSettings {
                         enabled: Some(false),
                         model: Some("anthropic/claude-sonnet-4-5".to_owned()),
-                tools: None,
-            },
+                        tools: None,
+                    },
                 );
             })
             .expect("persist agent settings");
@@ -3696,7 +4509,8 @@ mod tests {
     fn untrusted_project_agent_write_is_refused() {
         let agent = tempfile::tempdir().expect("agent dir");
         let cwd = tempfile::tempdir().expect("cwd");
-        let manager = SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("settings manager");
+        let manager =
+            SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("settings manager");
         let error = manager
             .update_project(|settings| {
                 settings.set_agent_settings(
@@ -3704,8 +4518,8 @@ mod tests {
                     AgentRuntimeSettings {
                         enabled: Some(false),
                         model: None,
-                tools: None,
-            },
+                        tools: None,
+                    },
                 );
             })
             .expect_err("untrusted project write must fail")
@@ -3714,7 +4528,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_agent_overrides_merge_enabled_model_and_tools() {
+    fn pi_agent_overrides_are_preserved_but_not_applied() {
         let dir = tempfile::tempdir().expect("dir");
         let path = dir.path().join("settings.json");
         fs::write(
@@ -3726,187 +4540,29 @@ mod tests {
                   "reviewer": {
                     "enabled": false,
                     "model": "anthropic/claude-sonnet-4-5",
-                    "tools": ["read", "grep"],
-                    "futureFlag": true
+                    "tools": ["read", "grep"]
                   }
-                },
-                "otherLegacy": {"keep": true}
+                }
               }
             }"#,
         )
-        .expect("write legacy settings");
+        .expect("write pi settings shape");
 
         let loaded = load_settings_file(&path, SettingsScope::Global).expect("load");
-        let entry = loaded.agent_settings("reviewer").expect("migrated reviewer");
-        assert_eq!(entry.enabled, Some(false));
-        assert_eq!(entry.model.as_deref(), Some("anthropic/claude-sonnet-4-5"));
-        assert_eq!(
-            entry.tools.as_deref(),
-            Some(["read".to_owned(), "grep".to_owned()].as_slice())
+
+        assert!(
+            loaded.agents.is_empty(),
+            "pi agent overrides must not migrate"
         );
-        let subagents = loaded.extra.get("subagents").expect("subagents retained");
-        assert!(subagents.get("agentOverrides").is_none());
-        assert_eq!(
-            subagents.get("otherLegacy").and_then(|value| value.get("keep")),
-            Some(&Value::Bool(true))
+        assert!(
+            loaded
+                .extra
+                .get("subagents")
+                .and_then(|value| value.get("agentOverrides"))
+                .is_some(),
+            "unknown pi settings must remain round-trippable"
         );
         assert_eq!(loaded.theme.as_deref(), Some("keep-me"));
-    }
-
-    #[test]
-    fn canonical_agents_win_conflicts_over_legacy_overrides() {
-        let dir = tempfile::tempdir().expect("dir");
-        let path = dir.path().join("settings.json");
-        fs::write(
-            &path,
-            r#"{
-              "agents": {
-                "reviewer": {"enabled": true, "model": "openai/gpt-4.1"}
-              },
-              "subagents": {
-                "agentOverrides": {
-                  "reviewer": {
-                    "enabled": false,
-                    "model": "anthropic/claude-sonnet-4-5",
-                    "tools": ["bash"]
-                  },
-                  "task": {"enabled": false, "tools": ["read"]}
-                }
-              }
-            }"#,
-        )
-        .expect("write conflict settings");
-
-        let loaded = load_settings_file(&path, SettingsScope::Global).expect("load");
-        let reviewer = loaded.agent_settings("reviewer").expect("reviewer");
-        assert_eq!(reviewer.enabled, Some(true), "canonical enabled must win");
-        assert_eq!(reviewer.model.as_deref(), Some("openai/gpt-4.1"));
-        assert!(
-            reviewer.tools.is_none(),
-            "legacy tools must not override canonical absence"
-        );
-
-        let task = loaded.agent_settings("task").expect("legacy-only task merged");
-        assert_eq!(task.enabled, Some(false));
-        assert_eq!(
-            task.tools.as_deref(),
-            Some(["read".to_owned()].as_slice())
-        );
-    }
-
-    #[test]
-    fn legacy_agent_overrides_rewrite_on_save_is_canonical() {
-        let agent = tempfile::tempdir().expect("agent");
-        let cwd = tempfile::tempdir().expect("cwd");
-        let path = agent.path().join("settings.json");
-        fs::write(
-            &path,
-            r#"{
-              "subagents": {
-                "agentOverrides": {
-                  "reviewer": {
-                    "enabled": false,
-                    "model": "anthropic/claude-sonnet-4-5"
-                  }
-                },
-                "keepMe": 1
-              }
-            }"#,
-        )
-        .expect("seed legacy");
-
-        let manager = SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("load");
-        assert!(!manager.settings().is_agent_enabled("reviewer"));
-        assert_eq!(
-            manager.settings().agent_model_override("reviewer"),
-            Some("anthropic/claude-sonnet-4-5")
-        );
-
-        manager
-            .update_global(|settings| {
-                settings.quiet_startup = Some(true);
-            })
-            .expect("save");
-
-        let raw = fs::read_to_string(&path).expect("read rewritten");
-        assert!(
-            !raw.contains("agentOverrides"),
-            "legacy key must be gone after save: {raw}"
-        );
-        assert!(raw.contains("\"agents\""), "canonical agents present: {raw}");
-        assert!(raw.contains("\"reviewer\""), "migrated agent persisted: {raw}");
-        assert!(
-            raw.contains("\"keepMe\""),
-            "unknown subagents fields preserved: {raw}"
-        );
-
-        let reloaded = SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("reload");
-        assert!(!reloaded.settings().is_agent_enabled("reviewer"));
-        assert_eq!(
-            reloaded.settings().agent_model_override("reviewer"),
-            Some("anthropic/claude-sonnet-4-5")
-        );
-    }
-
-    #[test]
-    fn legacy_agent_overrides_warning_is_deduped_per_path() {
-        let dir = tempfile::tempdir().expect("dir");
-        let path = dir.path().join("settings.json");
-        fs::write(
-            &path,
-            r#"{
-              "subagents": {
-                "agentOverrides": {
-                  "reviewer": {
-                    "enabled": false,
-                    "model": "anthropic/claude-sonnet-4-5"
-                  }
-                }
-              }
-            }"#,
-        )
-        .expect("write legacy settings");
-
-        let (loaded, warnings) = capture_legacy_agent_migration_warnings(|| {
-            let first = load_settings_file(&path, SettingsScope::Global).expect("load 1");
-            let second = load_settings_file(&path, SettingsScope::Global).expect("load 2");
-            let third = load_settings_file(&path, SettingsScope::Global).expect("load 3");
-            (first, second, third)
-        });
-        let (first, second, third) = loaded;
-
-        assert_eq!(warnings.len(), 0, "legacy migration is silent: {warnings:?}");
-        assert_eq!(first.agent_settings("reviewer"), second.agent_settings("reviewer"));
-        assert_eq!(second.agent_settings("reviewer"), third.agent_settings("reviewer"));
-        assert_eq!(
-            first.agent_settings("reviewer").and_then(|entry| entry.model.clone()),
-            Some("anthropic/claude-sonnet-4-5".to_owned())
-        );
-    }
-
-    #[test]
-    fn legacy_agent_overrides_warning_is_separate_per_settings_path() {
-        let dir = tempfile::tempdir().expect("dir");
-        let global = dir.path().join("global-settings.json");
-        let project = dir.path().join("project-settings.json");
-        let body = r#"{
-          "subagents": {
-            "agentOverrides": {
-              "reviewer": {"enabled": false}
-            }
-          }
-        }"#;
-        fs::write(&global, body).expect("write global");
-        fs::write(&project, body).expect("write project");
-
-        let (_, warnings) = capture_legacy_agent_migration_warnings(|| {
-            load_settings_file(&global, SettingsScope::Global).expect("global");
-            load_settings_file(&project, SettingsScope::Project).expect("project");
-            load_settings_file(&global, SettingsScope::Global).expect("global reload");
-            load_settings_file(&project, SettingsScope::Project).expect("project reload");
-        });
-
-        assert_eq!(warnings.len(), 0, "legacy migration is silent: {warnings:?}");
     }
 
     #[test]
@@ -3934,11 +4590,24 @@ mod tests {
         });
         let (first, second) = loaded;
 
-        assert_eq!(warnings.len(), 0, "unsupported subagents fields are silent: {warnings:?}");
-        assert!(first.agents.is_empty(), "ignored nested agents must not migrate");
         assert_eq!(
-            first.extra.get("subagents").and_then(|value| value.get("agents")),
-            second.extra.get("subagents").and_then(|value| value.get("agents")),
+            warnings.len(),
+            0,
+            "unsupported subagents fields are silent: {warnings:?}"
+        );
+        assert!(
+            first.agents.is_empty(),
+            "ignored nested agents must not migrate"
+        );
+        assert_eq!(
+            first
+                .extra
+                .get("subagents")
+                .and_then(|value| value.get("agents")),
+            second
+                .extra
+                .get("subagents")
+                .and_then(|value| value.get("agents")),
             "unsupported fields remain in extra"
         );
         assert_eq!(
@@ -3989,7 +4658,13 @@ mod tests {
             .expect("save");
 
         let raw = fs::read_to_string(&path).expect("read rewritten");
-        for key in ["agentModels", "tools", "defaults", "reviewer", "otherLegacy"] {
+        for key in [
+            "agentModels",
+            "tools",
+            "defaults",
+            "reviewer",
+            "otherLegacy",
+        ] {
             assert!(
                 raw.contains(&format!("\"{key}\"")),
                 "canonical save must preserve unknown subagents field {key}: {raw}"
@@ -4042,8 +4717,6 @@ mod tests {
         );
     }
 
-
-
     #[test]
     fn settings_file_size_boundary_is_accepted() {
         let dir = tempfile::tempdir().expect("settings dir");
@@ -4060,7 +4733,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("settings dir");
         let path = dir.path().join("settings.json");
         let file = File::create(&path).expect("create settings");
-        file.set_len(MAX_SETTINGS_FILE_BYTES + 1).expect("extend settings");
+        file.set_len(MAX_SETTINGS_FILE_BYTES + 1)
+            .expect("extend settings");
         let error = load_settings_file(&path, SettingsScope::Global)
             .expect_err("oversized settings must fail")
             .to_string();
@@ -4093,12 +4767,18 @@ mod tests {
         assert_eq!(hooks.len(), 2);
         assert_eq!(hooks[0].event, HookEvent::PreToolCall);
         assert_eq!(hooks[0].matcher.as_deref(), Some("read"));
-        assert_eq!(hooks[0].command, vec!["/opt/hooks/guard".to_owned(), "--strict".to_owned()]);
+        assert_eq!(
+            hooks[0].command,
+            vec!["/opt/hooks/guard".to_owned(), "--strict".to_owned()]
+        );
         assert_eq!(hooks[0].timeout_ms, Some(1200));
         assert_eq!(hooks[0].enabled, Some(false));
         assert_eq!(hooks[0].fail_closed, Some(true));
         assert_eq!(
-            hooks[0].extra.get("futureField").and_then(|value| value.get("keep")),
+            hooks[0]
+                .extra
+                .get("futureField")
+                .and_then(|value| value.get("keep")),
             Some(&Value::Bool(true)),
             "unknown hook-entry fields must be retained"
         );
@@ -4111,8 +4791,14 @@ mod tests {
         let decoded: Settings = serde_json::from_value(encoded).expect("re-deserialize");
         assert_eq!(decoded, settings, "hooks config must round-trip losslessly");
         let raw_again = serde_json::to_string(&decoded).expect("re-serialize");
-        assert!(raw_again.contains("\"futureField\""), "unknown hook field survives: {raw_again}");
-        assert!(raw_again.contains("\"unknownTopLevel\""), "unknown top-level field survives: {raw_again}");
+        assert!(
+            raw_again.contains("\"futureField\""),
+            "unknown hook field survives: {raw_again}"
+        );
+        assert!(
+            raw_again.contains("\"unknownTopLevel\""),
+            "unknown top-level field survives: {raw_again}"
+        );
         assert!(raw_again.contains("\"pre_tool_call\""));
         assert!(raw_again.contains("\"session_end\""));
     }
@@ -4123,7 +4809,10 @@ mod tests {
             serde_json::from_str(r#"{"hooks":[{"event":"turn_start","command":["x"]}]}"#)
                 .expect("turn_start accepted");
         assert_eq!(settings.hooks.as_ref().expect("hooks").len(), 1);
-        assert_eq!(serde_json::from_str::<HookEvent>("\"post_tool_call\"").expect("post event"), HookEvent::PostToolCall);
+        assert_eq!(
+            serde_json::from_str::<HookEvent>("\"post_tool_call\"").expect("post event"),
+            HookEvent::PostToolCall
+        );
         assert!(
             serde_json::from_str::<HookEvent>("\"mid_tool_call\"").is_err(),
             "unknown events must be rejected at deserialize time"
@@ -4133,8 +4822,12 @@ mod tests {
     #[test]
     fn hooks_validation_rejects_empty_command_and_zero_timeout() {
         let manager = SettingsManager::load_phase_one(
-            std::env::temp_dir().join(format!("hooks-validate-{}", Uuid::now_v7())).as_path(),
-            std::env::temp_dir().join(format!("hooks-validate-agent-{}", Uuid::now_v7())).as_path(),
+            std::env::temp_dir()
+                .join(format!("hooks-validate-{}", Uuid::now_v7()))
+                .as_path(),
+            std::env::temp_dir()
+                .join(format!("hooks-validate-agent-{}", Uuid::now_v7()))
+                .as_path(),
         )
         .expect("settings manager");
         let path = manager.paths().global;
@@ -4168,68 +4861,57 @@ mod tests {
         }]);
         let error = validate_settings(&zero_timeout, SettingsScope::Global, &path)
             .expect_err("zero timeout must fail");
-        assert!(
-            format!("{error:#}").contains("timeoutMs"),
-            "error: {error}"
-        );
+        assert!(format!("{error:#}").contains("timeoutMs"), "error: {error}");
 
         let valid = Settings::default();
         validate_settings(&valid, SettingsScope::Global, &path).expect("defaults valid");
     }
 
     #[test]
-    fn mcp_servers_round_trip_with_unknown_field_preservation() {
-        let raw = r#"{
+    fn mcp_servers_reject_unknown_fields() {
+        let error = serde_json::from_str::<Settings>(
+            r#"{
+            "mcpServers": [{
+                "name": "filesystem",
+                "transport": "stdio",
+                "command": "npx",
+                "futureField": {"keep": true}
+            }]
+        }"#,
+        )
+        .expect_err("unknown MCP fields must fail");
+        assert!(
+            error.to_string().contains("unknown field `futureField`"),
+            "{error}"
+        );
+
+        let settings: Settings = serde_json::from_str(
+            r#"{
             "mcpServers": [
                 {
                     "name": "filesystem",
                     "transport": "stdio",
                     "command": "npx",
-                    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
-                    "env": { "MCP_DEBUG": "1" },
-                    "futureField": { "keep": true }
+                    "args": ["-y", "@modelcontextprotocol/server-filesystem"],
+                    "env": {"MCP_DEBUG": "1"},
+                    "credentialGrants": ["filesystem.read"]
                 },
                 {
                     "name": "github",
                     "transport": "sse",
                     "url": "https://mcp.example.com/github"
                 }
-            ],
-            "unknownTopLevel": {"keep": 1}
-        }"#;
-        let settings: Settings = serde_json::from_str(raw).expect("deserialize mcpServers");
-        let servers = &settings.mcp_servers;
-        assert_eq!(servers.len(), 2);
-        assert_eq!(servers[0].name, "filesystem");
-        assert_eq!(servers[0].transport, McpTransport::Stdio);
-        assert_eq!(servers[0].command.as_deref(), Some("npx"));
+            ]
+        }"#,
+        )
+        .expect("exact MCP schema");
         assert_eq!(
-            servers[0].args.as_deref(),
-            Some(&["-y".to_owned(), "@modelcontextprotocol/server-filesystem".to_owned(), "/tmp".to_owned()][..])
+            settings.mcp_servers[0].credential_grants,
+            ["filesystem.read"]
         );
-        assert_eq!(
-            servers[0].env.as_ref().and_then(|env| env.get("MCP_DEBUG")),
-            Some(&"1".to_owned())
-        );
-        assert_eq!(
-            servers[0].extra.get("futureField").and_then(|value| value.get("keep")),
-            Some(&Value::Bool(true)),
-            "unknown mcp server fields must be retained"
-        );
-        assert_eq!(servers[1].name, "github");
-        assert_eq!(servers[1].transport, McpTransport::Sse);
-        assert_eq!(servers[1].url.as_deref(), Some("https://mcp.example.com/github"));
-        assert!(servers[1].command.is_none());
-
-        // Round-trip: serialize, re-deserialize, and compare with the original.
         let encoded = serde_json::to_value(&settings).expect("serialize settings");
         let decoded: Settings = serde_json::from_value(encoded).expect("re-deserialize");
-        assert_eq!(decoded, settings, "mcpServers config must round-trip losslessly");
-        let raw_again = serde_json::to_string(&decoded).expect("re-serialize");
-        assert!(raw_again.contains("\"futureField\""), "unknown server field survives: {raw_again}");
-        assert!(raw_again.contains("\"unknownTopLevel\""), "unknown top-level field survives: {raw_again}");
-        assert!(raw_again.contains("\"mcpServers\""), "mcpServers survives: {raw_again}");
-        assert!(raw_again.contains("\"@modelcontextprotocol/server-filesystem\""));
+        assert_eq!(decoded, settings);
     }
 
     #[test]
@@ -4257,14 +4939,21 @@ mod tests {
         );
 
         let decoded: Settings = serde_json::from_str(&serialized).expect("re-deserialize");
-        assert_eq!(decoded, settings, "disabled flag must round-trip losslessly");
+        assert_eq!(
+            decoded, settings,
+            "disabled flag must round-trip losslessly"
+        );
     }
 
     #[test]
     fn mcp_servers_validation_rejects_misconfiguration() {
         let manager = SettingsManager::load_phase_one(
-            std::env::temp_dir().join(format!("mcp-validate-{}", Uuid::now_v7())).as_path(),
-            std::env::temp_dir().join(format!("mcp-validate-agent-{}", Uuid::now_v7())).as_path(),
+            std::env::temp_dir()
+                .join(format!("mcp-validate-{}", Uuid::now_v7()))
+                .as_path(),
+            std::env::temp_dir()
+                .join(format!("mcp-validate-agent-{}", Uuid::now_v7()))
+                .as_path(),
         )
         .expect("settings manager");
         let path = manager.paths().global;
@@ -4278,7 +4967,7 @@ mod tests {
                 args: None,
                 url: None,
                 env: None,
-                extra: Map::new(),
+                credential_grants: Vec::new(),
             }
         }
 
@@ -4290,7 +4979,10 @@ mod tests {
         }];
         let error = validate_settings(&empty_name, SettingsScope::Global, &path)
             .expect_err("empty name must fail");
-        assert!(format!("{error:#}").contains("mcpServers[0].name"), "error: {error}");
+        assert!(
+            format!("{error:#}").contains("mcpServers[0].name"),
+            "error: {error}"
+        );
 
         // Empty command (stdio).
         let mut empty_command = Settings::default();
@@ -4300,7 +4992,10 @@ mod tests {
         }];
         let error = validate_settings(&empty_command, SettingsScope::Global, &path)
             .expect_err("empty command must fail");
-        assert!(format!("{error:#}").contains("requires a non-empty command"), "error: {error}");
+        assert!(
+            format!("{error:#}").contains("requires a non-empty command"),
+            "error: {error}"
+        );
 
         // stdio + url conflict.
         let mut stdio_url = Settings::default();
@@ -4310,7 +5005,10 @@ mod tests {
         }];
         let error = validate_settings(&stdio_url, SettingsScope::Global, &path)
             .expect_err("stdio+url must fail");
-        assert!(format!("{error:#}").contains("must not set url"), "error: {error}");
+        assert!(
+            format!("{error:#}").contains("must not set url"),
+            "error: {error}"
+        );
 
         // sse without url.
         let mut sse_no_url = Settings::default();
@@ -4321,7 +5019,10 @@ mod tests {
         }];
         let error = validate_settings(&sse_no_url, SettingsScope::Global, &path)
             .expect_err("sse without url must fail");
-        assert!(format!("{error:#}").contains("requires a non-empty url"), "error: {error}");
+        assert!(
+            format!("{error:#}").contains("requires a non-empty url"),
+            "error: {error}"
+        );
 
         // sse with a non-http url.
         let mut sse_bad_url = Settings::default();
@@ -4333,7 +5034,10 @@ mod tests {
         }];
         let error = validate_settings(&sse_bad_url, SettingsScope::Global, &path)
             .expect_err("non-http sse url must fail");
-        assert!(format!("{error:#}").contains("http:// or https://"), "error: {error}");
+        assert!(
+            format!("{error:#}").contains("http:// or https://"),
+            "error: {error}"
+        );
 
         // sse + command conflict.
         let mut sse_command = Settings::default();
@@ -4344,14 +5048,20 @@ mod tests {
         }];
         let error = validate_settings(&sse_command, SettingsScope::Global, &path)
             .expect_err("sse+command must fail");
-        assert!(format!("{error:#}").contains("must not set command"), "error: {error}");
+        assert!(
+            format!("{error:#}").contains("must not set command"),
+            "error: {error}"
+        );
 
         // Duplicate names.
         let mut duplicates = Settings::default();
         duplicates.mcp_servers = vec![server("dup"), server("dup")];
         let error = validate_settings(&duplicates, SettingsScope::Global, &path)
             .expect_err("duplicate names must fail");
-        assert!(format!("{error:#}").contains("duplicate name"), "error: {error}");
+        assert!(
+            format!("{error:#}").contains("duplicate name"),
+            "error: {error}"
+        );
 
         // A well-formed stdio entry validates.
         let mut valid = Settings::default();
@@ -4379,7 +5089,10 @@ mod tests {
         ];
         let error = validate_settings(&disabled_duplicate, SettingsScope::Global, &path)
             .expect_err("duplicate names must fail even when disabled");
-        assert!(format!("{error:#}").contains("duplicate name"), "error: {error}");
+        assert!(
+            format!("{error:#}").contains("duplicate name"),
+            "error: {error}"
+        );
     }
 
     #[test]
@@ -4394,10 +5107,16 @@ mod tests {
                     disabled: false,
                     transport: McpTransport::Stdio,
                     command: Some("npx".to_owned()),
-                    args: Some(vec!["-y".to_owned(), "@modelcontextprotocol/server-filesystem".to_owned()]),
+                    args: Some(vec![
+                        "-y".to_owned(),
+                        "@modelcontextprotocol/server-filesystem".to_owned(),
+                    ]),
                     url: None,
-                    env: Some(BTreeMap::from([("MCP_DEBUG".to_owned(), "1".to_owned())])),
-                    extra: Map::new(),
+                    env: Some(McpEnvironmentWire::from_iter([(
+                        "MCP_DEBUG".to_owned(),
+                        "1".to_owned(),
+                    )])),
+                    credential_grants: Vec::new(),
                 }];
             })
             .expect("persist mcpServers");
@@ -4441,53 +5160,164 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_settings_persist_through_manager_round_trip() {
+    fn sandbox_settings_persist_omission_and_danger_full_access_defaults() {
         let agent = tempfile::tempdir().expect("agent dir");
         let cwd = tempfile::tempdir().expect("cwd");
         let manager = SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("manager");
+        assert_eq!(
+            resolved_sandbox_mode(manager.settings().sandbox.as_ref()),
+            SandboxMode::DangerFullAccess
+        );
         manager
             .update_global(|settings| {
-                settings.sandbox = Some(SandboxSettings {
-                    enabled: Some(true),
-                    network: Some(false),
-                    read_only: Some(true),
-                    allowed_paths: Some(vec!["/work".to_owned(), "relative".to_owned()]),
-                    denied_paths: Some(vec!["/work/secret".to_owned()]),
-                    extra: Map::new(),
+                settings.sandbox = Some(SandboxSettingsWire {
+                    mode: Some(SandboxMode::ReadOnly),
+                    network: Some(NetworkPolicy::None),
+                    read_only_roots: vec![PathBuf::from("/opt/tools")],
+                    writable_roots: Vec::new(),
+                    denied_paths: vec![PathBuf::from("/workspace/private")],
+                    host_http: None,
+                    credential_grants: Vec::new(),
+                    credential_grant_definitions: Vec::new(),
+                    limits: None,
                 });
             })
             .expect("persist sandbox");
         let reloaded = SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("reload");
-        let settings = reloaded.settings();
-        let sandbox = settings.sandbox.as_ref().expect("sandbox persisted");
-        assert_eq!(sandbox.enabled, Some(true));
-        assert_eq!(sandbox.network, Some(false));
-        assert_eq!(sandbox.read_only, Some(true));
-        assert_eq!(
-            sandbox.allowed_paths.as_deref(),
-            Some(&["/work".to_owned(), "relative".to_owned()][..])
+        let sandbox = reloaded.settings().sandbox.expect("sandbox persisted");
+        assert_eq!(sandbox.resolved_mode(), SandboxMode::ReadOnly);
+        assert_eq!(sandbox.network, Some(NetworkPolicy::None));
+        assert_eq!(sandbox.read_only_roots, [PathBuf::from("/opt/tools")]);
+        assert!(
+            sandbox.host_http.is_none(),
+            "omitted hostHttp must remain omitted"
         );
-        assert_eq!(sandbox.denied_paths.as_deref(), Some(&["/work/secret".to_owned()][..]));
     }
 
     #[test]
-    fn sandbox_settings_reject_empty_path_entries() {
-        let settings = Settings {
-            sandbox: Some(SandboxSettings {
-                enabled: Some(true),
-                network: None,
-                read_only: None,
-                allowed_paths: Some(vec!["/work".to_owned(), "  ".to_owned()]),
-                denied_paths: None,
-                extra: Map::new(),
-            }),
-            ..Default::default()
-        };
-        let error = validate_settings(&settings, SettingsScope::Global, Path::new("/tmp/settings.json"))
-            .expect_err("empty allowed path must fail validation");
+    fn sandbox_config_errors_remain_configuration_errors() {
+        let error = serde_json::from_value::<Settings>(json!({
+            "sandbox": {"enabled": true}
+        }))
+        .expect_err("removed sandbox keys must be rejected");
         assert!(
-            format!("{error:#}").contains("sandbox.allowedPaths"),
-            "got: {error:#}"
+            error.to_string().contains("unknown field `enabled`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn duplicate_mcp_env_key_is_rejected() {
+        let agent = tempfile::tempdir().expect("agent");
+        let cwd = tempfile::tempdir().expect("cwd");
+        fs::write(
+            agent.path().join("settings.json"),
+            r#"{"mcpServers":[{"name":"local","command":"server","env":{"TOKEN":"one","TOKEN":"two"}}]}"#,
+        )
+        .expect("settings");
+        let error = match SettingsManager::load_phase_one(cwd.path(), agent.path()) {
+            Ok(_) => panic!("duplicate MCP environment keys must fail"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("duplicate normalized MCP environment key"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn host_http_omission_and_explicit_empty_remain_distinct() {
+        let omitted: Settings = serde_json::from_value(json!({"sandbox": {}})).expect("omitted");
+        let explicit: Settings = serde_json::from_value(json!({
+            "sandbox": {"hostHttp": {"destinations": []}}
+        }))
+        .expect("explicit empty");
+        assert!(omitted.sandbox.expect("sandbox").host_http.is_none());
+        assert_eq!(
+            explicit.sandbox.expect("sandbox").host_http,
+            Some(HostHttpPolicySettings::default())
+        );
+    }
+
+    #[test]
+    fn sandbox_merge_preserves_omitted_versus_explicit_host_http() {
+        let global: Settings = serde_json::from_value(json!({
+            "sandbox": {"hostHttp": {"destinations": []}}
+        }))
+        .expect("global");
+        let project: Settings = serde_json::from_value(json!({
+            "sandbox": {"mode": "read-only"}
+        }))
+        .expect("project");
+        let merged = global.merged(&project);
+        let sandbox = merged.sandbox.expect("sandbox");
+        assert_eq!(sandbox.mode, Some(SandboxMode::ReadOnly));
+        assert_eq!(sandbox.host_http, Some(HostHttpPolicySettings::default()));
+
+        let absent = Settings::default().merged(&project);
+        assert!(absent.sandbox.expect("sandbox").host_http.is_none());
+    }
+
+    #[test]
+    fn duplicate_grants_and_host_destinations_are_rejected() {
+        let duplicate_grants = serde_json::from_value::<Settings>(json!({
+            "sandbox": {"credentialGrants": ["github.api", "github.api"]}
+        }))
+        .expect_err("duplicate grants");
+        assert!(
+            duplicate_grants
+                .to_string()
+                .contains("duplicate credential grant reference")
+        );
+
+        let duplicate_definitions = serde_json::from_value::<Settings>(json!({
+            "sandbox": {"credentialGrantDefinitions": [
+                {
+                    "id": "github.one",
+                    "provider": "github",
+                    "scope": null,
+                    "audience": {"kind": "mcp-server", "name": "github"},
+                    "output": {"credentialType": "api-key", "environment": "GITHUB_TOKEN"}
+                },
+                {
+                    "id": "github.two",
+                    "provider": "github",
+                    "scope": null,
+                    "audience": {"kind": "mcp-server", "name": "github"},
+                    "output": {"credentialType": "api-key", "environment": "GITHUB_TOKEN"}
+                }
+            ]}
+        }))
+        .expect_err("duplicate audience output");
+        assert!(
+            duplicate_definitions
+                .to_string()
+                .contains("duplicate credential grant audience and output environment")
+        );
+
+        let duplicate_destinations = serde_json::from_value::<Settings>(json!({
+            "sandbox": {"hostHttp": {"destinations": [
+                {
+                    "class": "github-api",
+                    "scheme": "https",
+                    "host": {"kind": "dns", "name": "api.github.com"},
+                    "port": 443,
+                    "allowedIpScopes": ["global"]
+                },
+                {
+                    "class": "github-api",
+                    "scheme": "https",
+                    "host": {"kind": "dns", "name": "API.GITHUB.COM"},
+                    "port": 443,
+                    "allowedIpScopes": ["global"]
+                }
+            ]}}
+        }))
+        .expect_err("duplicate canonical destinations");
+        assert!(
+            duplicate_destinations
+                .to_string()
+                .contains("duplicate canonical host HTTP destination")
         );
     }
 
@@ -4526,7 +5356,10 @@ mod tests {
         assert_eq!(rules[0].path, private_path);
         assert_eq!(rules[0].tools, None);
         assert_eq!(
-            rules[0].extra.get("futureField").and_then(|value| value.get("keep")),
+            rules[0]
+                .extra
+                .get("futureField")
+                .and_then(|value| value.get("keep")),
             Some(&Value::Bool(true)),
             "unknown rule-entry fields must be retained"
         );
@@ -4546,8 +5379,14 @@ mod tests {
         .expect("parse with extra top-level");
         let serialized = serde_json::to_string(&settings).expect("serialize");
         let reloaded: Settings = serde_json::from_str(&serialized).expect("re-parse");
-        assert_eq!(reloaded.permission_rules[0].action, PermissionRuleAction::Deny);
-        assert_eq!(reloaded.extra.get("futureTopLevel"), Some(&Value::Number(7.into())));
+        assert_eq!(
+            reloaded.permission_rules[0].action,
+            PermissionRuleAction::Deny
+        );
+        assert_eq!(
+            reloaded.extra.get("futureTopLevel"),
+            Some(&Value::Number(7.into()))
+        );
     }
 
     #[test]
@@ -4573,7 +5412,10 @@ mod tests {
         };
         let error = validate_settings(&empty_path, SettingsScope::Global, &path)
             .expect_err("empty path must fail");
-        assert!(format!("{error:#}").contains("permissionRules[0].path"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("permissionRules[0].path"),
+            "{error:#}"
+        );
 
         let empty_tools = Settings {
             permission_rules: vec![PermissionRule {
@@ -4586,7 +5428,10 @@ mod tests {
         };
         let error = validate_settings(&empty_tools, SettingsScope::Global, &path)
             .expect_err("empty tools must fail");
-        assert!(format!("{error:#}").contains("permissionRules[0].tools"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("permissionRules[0].tools"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -4733,7 +5578,12 @@ mod tests {
         let cwd = Path::new("/");
         let rules = [rule(PermissionRuleAction::Deny, "/")];
         assert_eq!(
-            permission_verdict("read", &json!({"path": "skill://trusted/asset.txt"}), cwd, &rules),
+            permission_verdict(
+                "read",
+                &json!({"path": "skill://trusted/asset.txt"}),
+                cwd,
+                &rules
+            ),
             PermissionVerdict::NoMatch
         );
         assert_eq!(
@@ -4849,6 +5699,7 @@ mod tests {
             &toml,
             r#"
 defaultProvider = "anthropic"
+defaultModel = "claude-sonnet-4-5"
 theme = "dark"
 sessionImportSources = ["omp", "grok"]
 future = { nested = 1 }
@@ -4873,11 +5724,17 @@ tools = ["read", "grep"]
             Some(&["omp".to_owned(), "grok".to_owned()][..])
         );
         assert_eq!(
-            settings.compaction.as_ref().and_then(|config| config.enabled),
+            settings
+                .compaction
+                .as_ref()
+                .and_then(|config| config.enabled),
             Some(true)
         );
         assert_eq!(
-            settings.compaction.as_ref().and_then(|config| config.reserve_tokens),
+            settings
+                .compaction
+                .as_ref()
+                .and_then(|config| config.reserve_tokens),
             Some(2000)
         );
         let reviewer = settings.agents.get("reviewer").expect("reviewer agent");
@@ -4887,7 +5744,10 @@ tools = ["read", "grep"]
             Some(&["read".to_owned(), "grep".to_owned()][..])
         );
         assert_eq!(
-            settings.extra.get("future").and_then(|value| value.get("nested")),
+            settings
+                .extra
+                .get("future")
+                .and_then(|value| value.get("nested")),
             Some(&serde_json::json!(1))
         );
 
@@ -4900,7 +5760,10 @@ tools = ["read", "grep"]
             "no canonical JSON file is created next to settings.toml"
         );
         let written = fs::read_to_string(&toml).expect("read toml settings");
-        assert!(written.contains("theme = \"light\""), "TOML write: {written}");
+        assert!(
+            written.contains("theme = \"light\""),
+            "TOML write: {written}"
+        );
         assert!(
             written.contains("defaultProvider = \"anthropic\""),
             "TOML write keeps other fields: {written}"
@@ -4908,7 +5771,10 @@ tools = ["read", "grep"]
 
         let reloaded = SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("reload");
         assert_eq!(reloaded.settings().theme.as_deref(), Some("light"));
-        assert_eq!(reloaded.settings().default_provider.as_deref(), Some("anthropic"));
+        assert_eq!(
+            reloaded.settings().default_provider.as_deref(),
+            Some("anthropic")
+        );
     }
 
     #[test]
@@ -4917,37 +5783,351 @@ tools = ["read", "grep"]
         let cwd = tempfile::tempdir().expect("cwd");
         fs::write(
             agent.path().join("settings.json"),
-            r#"{"defaultProvider":"openai","theme":"dark","extensions":["a","b"]}"#,
+            r#"{"defaultProvider":"openai","defaultModel":"gpt-5.5","theme":"dark","extensions":["a","b"]}"#,
         )
         .expect("json settings");
 
         let manager = SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("manager");
-        assert_eq!(manager.settings().default_provider.as_deref(), Some("openai"));
+        assert_eq!(
+            manager.settings().default_provider.as_deref(),
+            Some("openai")
+        );
         assert_eq!(manager.settings().theme.as_deref(), Some("dark"));
-        assert_eq!(manager.settings().extensions, vec!["a".to_owned(), "b".to_owned()]);
+        assert_eq!(
+            manager.settings().extensions,
+            vec!["a".to_owned(), "b".to_owned()]
+        );
 
         manager
             .update_global(|settings| settings.theme = Some("light".to_owned()))
             .expect("persist json settings");
-        let written = fs::read_to_string(agent.path().join("settings.json")).expect("read json settings");
+        let written =
+            fs::read_to_string(agent.path().join("settings.json")).expect("read json settings");
         let parsed: Value = serde_json::from_str(&written).expect("write stays JSON");
         assert_eq!(parsed["theme"], "light");
         assert_eq!(parsed["defaultProvider"], "openai");
     }
 
     #[test]
+    fn default_model_pair_accepts_historical_combined_suffix_case_and_custom_ids() {
+        let path = Path::new("settings.json");
+        let pair = |provider: &str, model: &str| Settings {
+            default_provider: Some(provider.to_owned()),
+            default_model: Some(model.to_owned()),
+            ..Settings::default()
+        };
+        let cases = [
+            ("anthropic", "claude-sonnet-4-5"),
+            // Combined form with an optional thinking suffix.
+            ("anthropic", "anthropic/claude-sonnet-4-5:high"),
+            // Registered-provider detection is case-insensitive.
+            ("Anthropic", "ANTHROPIC/claude-sonnet-4-5"),
+            // Custom ids under a registered provider stay valid.
+            ("xai", "my-custom-grok"),
+            // OpenRouter-style slash ids under their registry provider.
+            ("openrouter", "ai21/jamba-large-1.7"),
+        ];
+        for (provider, model) in cases {
+            let settings = pair(provider, model);
+            validate_settings(&settings, SettingsScope::Global, path)
+                .unwrap_or_else(|error| panic!("pair {provider}/{model} must validate: {error:#}"));
+            // Validation never rewrites stored values.
+            assert_eq!(settings.default_provider.as_deref(), Some(provider));
+            assert_eq!(settings.default_model.as_deref(), Some(model));
+        }
+    }
+
+    #[test]
+    fn default_model_pair_rejects_unknown_mismatched_and_incomplete_pairs() {
+        let path = Path::new("settings.json");
+        let settings = |provider: Option<&str>, model: Option<&str>| Settings {
+            default_provider: provider.map(str::to_owned),
+            default_model: model.map(str::to_owned),
+            ..Settings::default()
+        };
+        let error = validate_settings(
+            &settings(Some("future-provider"), Some("future-model")),
+            SettingsScope::Global,
+            path,
+        )
+        .expect_err("unknown provider/spec must fail");
+        assert!(
+            format!("{error:#}").contains("does not resolve"),
+            "{error:#}"
+        );
+
+        let error = validate_settings(
+            &settings(Some("openai"), Some("anthropic/claude-sonnet-4-5")),
+            SettingsScope::Global,
+            path,
+        )
+        .expect_err("mismatched combined provider must fail");
+        assert!(
+            format!("{error:#}").contains("does not match defaultProvider"),
+            "{error:#}"
+        );
+
+        for (provider, model) in [
+            (Some("anthropic"), None),
+            // A bare model id without a provider is an incomplete pair.
+            (None, Some("claude-sonnet-4-5")),
+            // Whitespace-only counts as absent: still an incomplete pair.
+            (Some("anthropic"), Some("  ")),
+            (Some("  "), Some("claude-sonnet-4-5")),
+        ] {
+            let error = validate_settings(&settings(provider, model), SettingsScope::Global, path)
+                .expect_err("incomplete pair must fail");
+            assert!(
+                format!("{error:#}").contains("requires defaultModel")
+                    || format!("{error:#}").contains("requires defaultProvider"),
+                "{error:#}"
+            );
+        }
+
+        // Both cleared (including whitespace-only) is a valid absent pair.
+        validate_settings(&settings(None, None), SettingsScope::Global, path).expect("absent pair");
+        validate_settings(
+            &settings(Some("  "), Some("  ")),
+            SettingsScope::Global,
+            path,
+        )
+        .expect("whitespace pair is absent");
+
+        // A lone combined defaultModel is self-sufficient, effort suffix
+        // included, without defaultProvider.
+        validate_settings(
+            &settings(None, Some("anthropic/claude-sonnet-4-5")),
+            SettingsScope::Global,
+            path,
+        )
+        .expect("lone combined model");
+        validate_settings(
+            &settings(None, Some("anthropic/claude-sonnet-4-5:high")),
+            SettingsScope::Global,
+            path,
+        )
+        .expect("lone combined model with effort suffix");
+        validate_settings(
+            &settings(None, Some("xai/my-custom-grok")),
+            SettingsScope::Global,
+            path,
+        )
+        .expect("lone combined custom id");
+        // A prefix the current process cannot confirm as a registered
+        // provider (custom models.json catalogs load later) is accepted
+        // as-shaped and re-validated by the startup resolver.
+        validate_settings(
+            &settings(None, Some("cliproxy/gpt-5.6-sol")),
+            SettingsScope::Global,
+            path,
+        )
+        .expect("unconfirmed combined prefix is shape-accepted");
+    }
+
+    #[test]
+    fn default_pair_authority_covers_openrouter_slash_custom_ids_and_trimmed_views() {
+        let pair = |provider: &str, model: &str| Settings {
+            default_provider: Some(provider.to_owned()),
+            default_model: Some(model.to_owned()),
+            ..Settings::default()
+        };
+
+        // OpenRouter provider with a raw slash id: the resolver owns slash
+        // interpretation, so the whole id stays intact.
+        let resolved = resolve_default_model_pair(
+            &pair("openrouter", "ai21/jamba-large-1.7"),
+            DefaultModelCatalogMode::CatalogAgnostic,
+        )
+        .expect("openrouter raw slash id resolves");
+        let ResolvedDefaultModelPair::Resolved(resolved) = resolved else {
+            panic!("expected a resolved pair");
+        };
+        assert_eq!(resolved.model.provider, "openrouter");
+        assert_eq!(resolved.model.id, "ai21/jamba-large-1.7");
+
+        // Slash-bearing custom id under a known provider resolves through the
+        // custom-id fallback instead of being read as a provider prefix.
+        let resolved = resolve_default_model_pair(
+            &pair("xai", "team/custom-grok"),
+            DefaultModelCatalogMode::CatalogAgnostic,
+        )
+        .expect("slash-bearing custom id resolves");
+        let ResolvedDefaultModelPair::Resolved(resolved) = resolved else {
+            panic!("expected a resolved pair");
+        };
+        assert_eq!(resolved.model.provider, "xai");
+        assert_eq!(resolved.model.id, "team/custom-grok");
+
+        // Surrounding whitespace resolves equivalently through trimmed views.
+        let resolved = resolve_default_model_pair(
+            &pair("  anthropic  ", "  claude-sonnet-4-5  "),
+            DefaultModelCatalogMode::CatalogReady,
+        )
+        .expect("trimmed pair resolves");
+        let ResolvedDefaultModelPair::Resolved(resolved) = resolved else {
+            panic!("expected a resolved pair");
+        };
+        assert_eq!(resolved.model.provider, "anthropic");
+        assert_eq!(resolved.model.id, "claude-sonnet-4-5");
+
+        // Trimmed views never rewrite the persisted strings.
+        let spaced = pair("  anthropic  ", "  claude-sonnet-4-5  ");
+        resolve_default_model_pair(&spaced, DefaultModelCatalogMode::CatalogReady)
+            .expect("trimmed pair resolves");
+        assert_eq!(spaced.default_provider.as_deref(), Some("  anthropic  "));
+        assert_eq!(
+            spaced.default_model.as_deref(),
+            Some("  claude-sonnet-4-5  ")
+        );
+
+        // Whitespace-only halves are an absent pair.
+        let absent =
+            resolve_default_model_pair(&pair("  ", "  "), DefaultModelCatalogMode::CatalogReady)
+                .expect("whitespace pair is absent");
+        assert!(matches!(absent, ResolvedDefaultModelPair::Absent));
+    }
+
+    #[test]
+    fn default_pair_authority_rejects_unknown_prefixes_only_when_catalog_ready() {
+        let pair = |provider: Option<&str>, model: Option<&str>| Settings {
+            default_provider: provider.map(str::to_owned),
+            default_model: model.map(str::to_owned),
+            ..Settings::default()
+        };
+
+        // Catalog-agnostic loading keeps accepting the unconfirmed combined
+        // prefix as-shaped for later startup re-validation...
+        let unconfirmed = resolve_default_model_pair(
+            &pair(None, Some("ghost/nowhere")),
+            DefaultModelCatalogMode::CatalogAgnostic,
+        )
+        .expect("agnostic loading accepts the shape");
+        assert!(
+            matches!(unconfirmed, ResolvedDefaultModelPair::UnconfirmedCombined(ref spec) if spec == "ghost/nowhere"),
+            "expected an unconfirmed combined spec: {unconfirmed:?}"
+        );
+
+        // ...while the catalog-ready path (startup, persistence after the
+        // catalog load) rejects it outright.
+        let error = resolve_default_model_pair(
+            &pair(None, Some("ghost/nowhere")),
+            DefaultModelCatalogMode::CatalogReady,
+        )
+        .expect_err("catalog-ready validation rejects the unknown combined prefix");
+        assert!(
+            format!("{error:#}").contains("does not name a registered provider"),
+            "{error:#}"
+        );
+
+        let error = resolve_default_model_pair(
+            &pair(Some("ghost"), Some("nowhere")),
+            DefaultModelCatalogMode::CatalogReady,
+        )
+        .expect_err("catalog-ready validation rejects the unknown provider pair");
+        assert!(
+            format!("{error:#}").contains("does not resolve"),
+            "{error:#}"
+        );
+
+        // A surviving `$` reference is sanctioned in the persisted layer but
+        // must fail (not fall through) on a catalog-ready surface.
+        let deferred = resolve_default_model_pair(
+            &pair(Some("$PROVIDER_XYZ"), Some("$MODEL_XYZ")),
+            DefaultModelCatalogMode::CatalogAgnostic,
+        )
+        .expect("env references defer in the persisted layer");
+        assert!(matches!(deferred, ResolvedDefaultModelPair::DeferredEnv));
+        let error = resolve_default_model_pair(
+            &pair(Some("$PROVIDER_XYZ"), Some("$MODEL_XYZ")),
+            DefaultModelCatalogMode::CatalogReady,
+        )
+        .expect_err("catalog-ready validation rejects an unresolved env reference");
+        assert!(
+            format!("{error:#}").contains("environment reference"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn default_model_pair_invalid_defaults_fail_load_update_and_reload() {
+        let agent = tempfile::tempdir().expect("agent dir");
+        let cwd = tempfile::tempdir().expect("cwd");
+        fs::write(
+            agent.path().join("settings.json"),
+            r#"{"defaultProvider":"future-provider","defaultModel":"future-model"}"#,
+        )
+        .expect("invalid persisted pair");
+        let Err(error) = SettingsManager::load_phase_one(cwd.path(), agent.path()) else {
+            panic!("unknown default pair must fail persisted load");
+        };
+
+        fs::write(
+            agent.path().join("settings.json"),
+            r#"{"defaultProvider":"xai","defaultModel":"my-custom-grok"}"#,
+        )
+        .expect("valid persisted pair");
+        let manager = SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("manager");
+        assert_eq!(manager.settings().default_provider.as_deref(), Some("xai"));
+        assert_eq!(
+            manager.settings().default_model.as_deref(),
+            Some("my-custom-grok")
+        );
+
+        // An invalid pair cannot land: update fails and the file is untouched.
+        let before = fs::read(agent.path().join("settings.json")).expect("before");
+        let error = manager
+            .update_global(|settings| {
+                settings.default_provider = Some("openai".to_owned());
+                settings.default_model = Some("anthropic/claude-sonnet-4-5".to_owned());
+            })
+            .expect_err("mismatched pair must fail update");
+        assert!(
+            format!("{error:#}").contains("does not match defaultProvider"),
+            "{error:#}"
+        );
+        assert_eq!(
+            fs::read(agent.path().join("settings.json")).expect("after"),
+            before
+        );
+
+        // A valid combined pair with a thinking suffix persists and reloads
+        // with its exact stored strings (restart-scoped, no live switch).
+        manager
+            .update_global(|settings| {
+                settings.default_provider = Some("anthropic".to_owned());
+                settings.default_model = Some("anthropic/claude-sonnet-4-5:high".to_owned());
+            })
+            .expect("persist combined default");
+        let reloaded = SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("reload");
+        assert_eq!(
+            reloaded.settings().default_provider.as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(
+            reloaded.settings().default_model.as_deref(),
+            Some("anthropic/claude-sonnet-4-5:high")
+        );
+    }
+
+    #[test]
     fn settings_toml_sibling_wins_over_settings_json() {
         let agent = tempfile::tempdir().expect("agent dir");
         let cwd = tempfile::tempdir().expect("cwd");
-        fs::write(agent.path().join("settings.json"), r#"{"theme":"json"}"#).expect("json settings");
+        fs::write(agent.path().join("settings.json"), r#"{"theme":"json"}"#)
+            .expect("json settings");
         fs::write(agent.path().join("settings.toml"), "theme = \"toml\"\n").expect("toml settings");
         let manager = SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("manager");
         assert_eq!(manager.settings().theme.as_deref(), Some("toml"));
 
         // Without the TOML sibling the canonical JSON file is used.
         let json_only = tempfile::tempdir().expect("agent dir");
-        fs::write(json_only.path().join("settings.json"), r#"{"theme":"json"}"#).expect("json settings");
-        let manager = SettingsManager::load_phase_one(cwd.path(), json_only.path()).expect("manager");
+        fs::write(
+            json_only.path().join("settings.json"),
+            r#"{"theme":"json"}"#,
+        )
+        .expect("json settings");
+        let manager =
+            SettingsManager::load_phase_one(cwd.path(), json_only.path()).expect("manager");
         assert_eq!(manager.settings().theme.as_deref(), Some("json"));
     }
 
@@ -4959,7 +6139,10 @@ tools = ["read", "grep"]
         fs::write(&json, "theme = \"dark\"\n").expect("write toml-shaped content");
         let error = load_settings_file(&json, SettingsScope::Global)
             .expect_err("JSON extension with TOML content must fail");
-        assert!(format!("{error:#}").contains("Failed to parse settings.json"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("Failed to parse settings.json"),
+            "{error:#}"
+        );
 
         // A .toml file containing JSON syntax must fail as TOML.
         let toml_dir = tempfile::tempdir().expect("dir");
@@ -4967,21 +6150,30 @@ tools = ["read", "grep"]
         fs::write(&toml, r#"{"theme":"dark"}"#).expect("write json-shaped content");
         let error = load_settings_file(&toml, SettingsScope::Global)
             .expect_err("TOML extension with JSON content must fail");
-        assert!(format!("{error:#}").contains("Failed to parse settings.toml"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("Failed to parse settings.toml"),
+            "{error:#}"
+        );
 
         // Extensionless files parse as JSON.
         let bare_dir = tempfile::tempdir().expect("dir");
         let bare = bare_dir.path().join("settings");
         fs::write(&bare, r#"{"theme":"dark"}"#).expect("write extensionless settings");
-        let settings = load_settings_file(&bare, SettingsScope::Global).expect("extensionless parses as JSON");
+        let settings =
+            load_settings_file(&bare, SettingsScope::Global).expect("extensionless parses as JSON");
         assert_eq!(settings.theme.as_deref(), Some("dark"));
 
         // Non-canonical names are used verbatim: a sibling .toml does not win.
         let custom_dir = tempfile::tempdir().expect("dir");
-        fs::write(custom_dir.path().join("custom.json"), r#"{"theme":"json"}"#).expect("custom json");
-        fs::write(custom_dir.path().join("custom.toml"), "theme = \"toml\"\n").expect("custom toml");
-        let settings = load_settings_file(&custom_dir.path().join("custom.json"), SettingsScope::Global)
-            .expect("non-canonical names are used verbatim");
+        fs::write(custom_dir.path().join("custom.json"), r#"{"theme":"json"}"#)
+            .expect("custom json");
+        fs::write(custom_dir.path().join("custom.toml"), "theme = \"toml\"\n")
+            .expect("custom toml");
+        let settings = load_settings_file(
+            &custom_dir.path().join("custom.json"),
+            SettingsScope::Global,
+        )
+        .expect("non-canonical names are used verbatim");
         assert_eq!(settings.theme.as_deref(), Some("json"));
     }
 
@@ -4993,6 +6185,7 @@ tools = ["read", "grep"]
             &toml,
             r#"
 defaultProvider = "$PROVIDER"
+defaultModel = "$MODEL"
 theme = "${THEME_DIR}/dark"
 extensions = ["$EXT_ONE", "${EXT_TWO}"]
 "#,
@@ -5000,6 +6193,7 @@ extensions = ["$EXT_ONE", "${EXT_TWO}"]
         .expect("toml settings");
         let lookup = |name: &str| match name {
             "PROVIDER" => Some("openai".to_owned()),
+            "MODEL" => Some("claude-sonnet-4-5".to_owned()),
             "THEME_DIR" => Some("/themes".to_owned()),
             "EXT_ONE" => Some("one".to_owned()),
             "EXT_TWO" => Some("two".to_owned()),
@@ -5009,6 +6203,7 @@ extensions = ["$EXT_ONE", "${EXT_TWO}"]
         // persist expanded values...
         let settings = load_settings_file(&toml, SettingsScope::Global).expect("load");
         assert_eq!(settings.default_provider.as_deref(), Some("$PROVIDER"));
+        assert_eq!(settings.default_model.as_deref(), Some("$MODEL"));
         assert_eq!(settings.theme.as_deref(), Some("${THEME_DIR}/dark"));
         assert_eq!(
             settings.extensions,
@@ -5017,8 +6212,12 @@ extensions = ["$EXT_ONE", "${EXT_TWO}"]
         // ...and projecting the runtime view resolves them.
         let expanded = expand_settings_with(&settings, &lookup);
         assert_eq!(expanded.default_provider.as_deref(), Some("openai"));
+        assert_eq!(expanded.default_model.as_deref(), Some("claude-sonnet-4-5"));
         assert_eq!(expanded.theme.as_deref(), Some("/themes/dark"));
-        assert_eq!(expanded.extensions, vec!["one".to_owned(), "two".to_owned()]);
+        assert_eq!(
+            expanded.extensions,
+            vec!["one".to_owned(), "two".to_owned()]
+        );
     }
 
     #[test]
@@ -5030,10 +6229,25 @@ extensions = ["$EXT_ONE", "${EXT_TWO}"]
         fs::write(
             &path,
             r#"{
-                "defaultProvider": "x",
+                "defaultProvider": "anthropic",
+                "defaultModel": "claude-sonnet-4-5",
                 "hooks": [{"event": "session_start", "command": ["$HOOK_BIN", "run", "${HOOK_ARGS}"]}],
-                "sandbox": {"allowedPaths": ["$PROJECT_ROOT", "${CACHE_DIR}/pi"]},
-                "mcpServers": [{"name": "local", "command": "$MCP_CMD", "args": ["-y", "${MCP_PKG}"]}]
+                "sandbox": {
+                    "readOnlyRoots": ["$PROJECT_ROOT", "${CACHE_DIR}/pi"],
+                    "credentialGrantDefinitions": [{
+                        "id": "literal.grant",
+                        "provider": "$PROVIDER_LITERAL",
+                        "scope": null,
+                        "audience": {"kind": "mcp-server", "name": "local"},
+                        "output": {"credentialType": "api-key", "environment": "TOKEN"}
+                    }]
+                },
+                "mcpServers": [{
+                    "name": "local",
+                    "command": "$MCP_CMD",
+                    "args": ["-y", "${MCP_PKG}"],
+                    "credentialGrants": ["literal.grant"]
+                }]
             }"#,
         )
         .expect("json settings");
@@ -5048,27 +6262,59 @@ extensions = ["$EXT_ONE", "${EXT_TWO}"]
         };
         // Loading keeps the pre-expansion document literal...
         let settings = load_settings_file(&path, SettingsScope::Global).expect("load");
-        let hook = settings.hooks.as_ref().expect("hooks").first().expect("hook");
-        assert_eq!(hook.command, vec!["$HOOK_BIN".to_owned(), "run".to_owned(), "${HOOK_ARGS}".to_owned()]);
-        // ...and projecting the runtime view resolves nested collections.
-        let expanded = expand_settings_with(&settings, &lookup);
-        let hook = expanded.hooks.as_ref().expect("hooks").first().expect("hook");
+        let hook = settings
+            .hooks
+            .as_ref()
+            .expect("hooks")
+            .first()
+            .expect("hook");
         assert_eq!(
             hook.command,
-            vec!["/usr/local/bin/hook".to_owned(), "run".to_owned(), "--verbose".to_owned()]
+            vec![
+                "$HOOK_BIN".to_owned(),
+                "run".to_owned(),
+                "${HOOK_ARGS}".to_owned()
+            ]
         );
-        let allowed = expanded
+        // ...and projecting the runtime view resolves nested collections.
+        let expanded = expand_settings_with(&settings, &lookup);
+        let hook = expanded
+            .hooks
+            .as_ref()
+            .expect("hooks")
+            .first()
+            .expect("hook");
+        assert_eq!(
+            hook.command,
+            vec![
+                "/usr/local/bin/hook".to_owned(),
+                "run".to_owned(),
+                "--verbose".to_owned()
+            ]
+        );
+        let read_only_roots = &expanded.sandbox.as_ref().expect("sandbox").read_only_roots;
+        assert_eq!(
+            read_only_roots,
+            &[PathBuf::from(project_root), PathBuf::from("/var/cache/pi")]
+        );
+        let definitions = &expanded
             .sandbox
             .as_ref()
-            .and_then(|sandbox| sandbox.allowed_paths.as_ref())
-            .expect("allowed paths");
-        assert_eq!(allowed, &[project_root, "/var/cache/pi".to_owned()]);
+            .expect("sandbox")
+            .credential_grant_definitions;
+        assert_eq!(definitions[0].provider, "$PROVIDER_LITERAL");
         let mcp = expanded.mcp_servers.first().expect("mcp server");
         assert_eq!(mcp.command.as_deref(), Some("npx"));
         assert_eq!(
             mcp.args.as_deref(),
-            Some(&["-y".to_owned(), "@modelcontextprotocol/server-filesystem".to_owned()][..])
+            Some(
+                &[
+                    "-y".to_owned(),
+                    "@modelcontextprotocol/server-filesystem".to_owned()
+                ][..]
+            )
         );
+        assert_eq!(mcp.credential_grants, ["literal.grant"]);
     }
 
     #[test]
@@ -5079,6 +6325,7 @@ extensions = ["$EXT_ONE", "${EXT_TWO}"]
             &path,
             r#"{
                 "defaultProvider": "$MISSING_PROVIDER_XYZ",
+                "defaultModel": "$MISSING_MODEL_XYZ",
                 "theme": "${ALSO_MISSING_XYZ}/dark",
                 "extensions": ["$MISSING_EXT_XYZ", "stable"]
             }"#,
@@ -5086,18 +6333,22 @@ extensions = ["$EXT_ONE", "${EXT_TWO}"]
         .expect("json settings");
         // Loading keeps missing references verbatim in the persisted layer...
         let settings = load_settings_file(&path, SettingsScope::Global).expect("load");
-        assert_eq!(settings.default_provider.as_deref(), Some("$MISSING_PROVIDER_XYZ"));
+        assert_eq!(
+            settings.default_provider.as_deref(),
+            Some("$MISSING_PROVIDER_XYZ")
+        );
         assert_eq!(settings.theme.as_deref(), Some("${ALSO_MISSING_XYZ}/dark"));
         assert_eq!(
             settings.extensions,
             vec!["$MISSING_EXT_XYZ".to_owned(), "stable".to_owned()]
         );
         // ...and projecting the runtime view reports them once.
-        let (_, diagnostics) = capture_settings_diagnostics(|| {
-            expand_settings_with(&settings, &|_name| None)
-        });
+        let (_, diagnostics) =
+            capture_settings_diagnostics(|| expand_settings_with(&settings, &|_name| None));
         assert!(
-            diagnostics.iter().any(|message| message.contains("MISSING_PROVIDER_XYZ")),
+            diagnostics
+                .iter()
+                .any(|message| message.contains("MISSING_PROVIDER_XYZ")),
             "missing var is reported once: {diagnostics:?}"
         );
     }
@@ -5110,6 +6361,7 @@ extensions = ["$EXT_ONE", "${EXT_TWO}"]
             &path,
             r#"{
                 "defaultProvider": "costs $5 and ${UNSET_X}",
+                "defaultModel": "claude-sonnet-4-5",
                 "autoRetry": true,
                 "maxRetries": 3,
                 "temperature": 0.7,
@@ -5119,13 +6371,19 @@ extensions = ["$EXT_ONE", "${EXT_TWO}"]
         )
         .expect("json settings");
         let settings = load_settings_file(&path, SettingsScope::Global).expect("load");
-        assert_eq!(settings.default_provider.as_deref(), Some("costs $5 and ${UNSET_X}"));
+        assert_eq!(
+            settings.default_provider.as_deref(),
+            Some("costs $5 and ${UNSET_X}")
+        );
         assert_eq!(settings.auto_retry, Some(true));
         assert_eq!(settings.max_retries, Some(3));
         assert_eq!(settings.temperature, Some(0.7));
         assert_eq!(settings.session_ttl_days, Some(30));
         assert_eq!(
-            settings.compaction.as_ref().and_then(|config| config.reserve_tokens),
+            settings
+                .compaction
+                .as_ref()
+                .and_then(|config| config.reserve_tokens),
             Some(1000)
         );
     }
@@ -5140,8 +6398,8 @@ extensions = ["$EXT_ONE", "${EXT_TWO}"]
         )
         .expect("toml settings");
         let lookup = |name: &str| (name == "EXPANDED_THEME").then(|| "dark".to_owned());
-        let manager =
-            SettingsManager::load_phase_one_with(cwd.path(), agent.path(), lookup).expect("manager");
+        let manager = SettingsManager::load_phase_one_with(cwd.path(), agent.path(), None, None, lookup)
+            .expect("manager");
         assert_eq!(manager.settings().theme.as_deref(), Some("dark"));
 
         let mut overrides = Settings::default();
@@ -5171,15 +6429,18 @@ extensions = ["$EXT_ONE", "${EXT_TWO}"]
             "MCP_TOKEN" => Some("supersecret-value".to_owned()),
             _ => None,
         };
-        let manager =
-            SettingsManager::load_phase_one_with(cwd.path(), agent.path(), lookup).expect("manager");
+        let manager = SettingsManager::load_phase_one_with(cwd.path(), agent.path(), None, None, lookup)
+            .expect("manager");
 
         // The runtime view (consumed by sessions) is expanded.
         let runtime = manager.settings();
         assert_eq!(runtime.theme.as_deref(), Some("nord"));
         let mcp = runtime.mcp_servers.first().expect("mcp server");
         assert_eq!(
-            mcp.env.as_ref().and_then(|env| env.get("MCP_TOKEN")).map(String::as_str),
+            mcp.env
+                .as_ref()
+                .and_then(|env| env.get("MCP_TOKEN"))
+                .map(String::as_str),
             Some("supersecret-value")
         );
 
@@ -5188,7 +6449,10 @@ extensions = ["$EXT_ONE", "${EXT_TWO}"]
         assert_eq!(persisted.theme.as_deref(), Some("$THEME_NAME"));
         let mcp = persisted.mcp_servers.first().expect("mcp server");
         assert_eq!(
-            mcp.env.as_ref().and_then(|env| env.get("MCP_TOKEN")).map(String::as_str),
+            mcp.env
+                .as_ref()
+                .and_then(|env| env.get("MCP_TOKEN"))
+                .map(String::as_str),
             Some("$MCP_TOKEN")
         );
 
@@ -5238,22 +6502,55 @@ extensions = ["$EXT_ONE", "${EXT_TWO}"]
         )
         .expect("agent settings");
         let lookup = |name: &str| (name == "TOKEN").then(|| "secret".to_owned());
-        let manager =
-            SettingsManager::load_phase_one_with(cwd.path(), agent.path(), lookup).expect("manager");
+        let manager = SettingsManager::load_phase_one_with(cwd.path(), agent.path(), None, None, lookup)
+            .expect("manager");
         manager.reload().expect("reload");
         let persisted = manager.global_settings();
         let mcp = persisted.mcp_servers.first().expect("mcp server");
         assert_eq!(
-            mcp.env.as_ref().and_then(|env| env.get("TOKEN")).map(String::as_str),
+            mcp.env
+                .as_ref()
+                .and_then(|env| env.get("TOKEN"))
+                .map(String::as_str),
             Some("$TOKEN"),
             "reload must keep the literal reference in the persistence view"
         );
         let runtime = manager.settings();
         let mcp = runtime.mcp_servers.first().expect("mcp server");
         assert_eq!(
-            mcp.env.as_ref().and_then(|env| env.get("TOKEN")).map(String::as_str),
+            mcp.env
+                .as_ref()
+                .and_then(|env| env.get("TOKEN"))
+                .map(String::as_str),
             Some("secret"),
             "reload must keep the expanded value in the runtime view"
+        );
+    }
+
+    #[test]
+    fn todo_tool_enabled_defaults_on_and_false_opts_interactive_main_out() {
+        assert!(
+            Settings::default().todo_tool_enabled(),
+            "unset orchestration.todo defaults on for interactive Main"
+        );
+        let mut settings = Settings::default();
+        settings.orchestration = Some(OrchestrationSettings {
+            todo: Some(false),
+            ..OrchestrationSettings::default()
+        });
+        assert!(
+            !settings.todo_tool_enabled(),
+            "orchestration.todo: false opts interactive Main out"
+        );
+        let snapshot = settings.runtime_settings().expect("runtime snapshot");
+        assert!(
+            !snapshot.todo_tool_enabled,
+            "runtime snapshot must mirror the interactive Main setting"
+        );
+        assert_eq!(
+            snapshot.orchestration_max_tools_per_agent,
+            crate::DEFAULT_MAX_TOOLS_PER_AGENT,
+            "snapshot default stays the legacy explicit-list cap"
         );
     }
 }

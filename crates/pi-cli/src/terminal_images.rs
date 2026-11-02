@@ -127,7 +127,11 @@ fn run_tmux_version_command() -> Option<String> {
 pub fn parse_tmux_version(output: &str) -> Option<(u32, u32)> {
     let mut parts = output.split_whitespace();
     let first = parts.next()?;
-    let version = if first == "tmux" { parts.next()? } else { first };
+    let version = if first == "tmux" {
+        parts.next()?
+    } else {
+        first
+    };
     let version = version.strip_prefix("next-").unwrap_or(version);
     let mut digits = version.split(|c: char| !c.is_ascii_digit());
     let major = digits.next()?.parse().ok()?;
@@ -173,7 +177,10 @@ pub fn detect_protocol(environment: &TerminalEnvironment) -> Option<TerminalImag
         if is_partial_kitty_terminal(environment) || !has_kitty_environment_evidence(environment) {
             return None;
         }
-        let version = environment.tmux_version.as_deref().and_then(parse_tmux_version);
+        let version = environment
+            .tmux_version
+            .as_deref()
+            .and_then(parse_tmux_version);
         let kitty_passthrough = version.is_some_and(|(major, minor)| {
             major > TMUX_KITTY_SUPPORT.0
                 || (major == TMUX_KITTY_SUPPORT.0 && minor >= TMUX_KITTY_SUPPORT.1)
@@ -211,7 +218,9 @@ pub fn wrap_tmux_passthrough(bytes: &[u8]) -> Vec<u8> {
     if bytes.starts_with(TMUX_PASSTHROUGH_PREFIX) {
         return bytes.to_vec();
     }
-    let mut wrapped = Vec::with_capacity(bytes.len() + TMUX_PASSTHROUGH_PREFIX.len() + TMUX_PASSTHROUGH_SUFFIX.len());
+    let mut wrapped = Vec::with_capacity(
+        bytes.len() + TMUX_PASSTHROUGH_PREFIX.len() + TMUX_PASSTHROUGH_SUFFIX.len(),
+    );
     wrapped.extend_from_slice(TMUX_PASSTHROUGH_PREFIX);
     for &byte in bytes {
         wrapped.push(byte);
@@ -278,7 +287,9 @@ impl ImageDisplayConfig {
     #[must_use]
     pub fn from_terminal_settings(settings: Option<&pi_coding::TerminalSettings>) -> Self {
         Self {
-            show_images: settings.and_then(|settings| settings.show_images).unwrap_or(true),
+            show_images: settings
+                .and_then(|settings| settings.show_images)
+                .unwrap_or(true),
             width_cells: settings
                 .and_then(|settings| settings.image_width_cells)
                 .unwrap_or(DEFAULT_IMAGE_WIDTH_CELLS)
@@ -309,8 +320,16 @@ impl TerminalCellSize {
     pub fn normalized(self) -> Self {
         let fallback = Self::default();
         Self {
-            width_pixels: if self.width_pixels == 0 { fallback.width_pixels } else { self.width_pixels },
-            height_pixels: if self.height_pixels == 0 { fallback.height_pixels } else { self.height_pixels },
+            width_pixels: if self.width_pixels == 0 {
+                fallback.width_pixels
+            } else {
+                self.width_pixels
+            },
+            height_pixels: if self.height_pixels == 0 {
+                fallback.height_pixels
+            } else {
+                self.height_pixels
+            },
         }
     }
 }
@@ -370,7 +389,13 @@ pub struct ImagePlacement {
 
 impl ImagePlacement {
     #[must_use]
-    pub fn new(layout: ImageLayout, data: impl Into<String>, mime_type: impl Into<String>, x: u16, y: u16) -> Self {
+    pub fn new(
+        layout: ImageLayout,
+        data: impl Into<String>,
+        mime_type: impl Into<String>,
+        x: u16,
+        y: u16,
+    ) -> Self {
         Self {
             layout,
             data: data.into(),
@@ -507,7 +532,9 @@ impl TerminalImageRenderer {
         {
             return None;
         }
-        let max_encoded = image_pipeline::MAX_IMAGE_BYTES.div_ceil(3).saturating_mul(4);
+        let max_encoded = image_pipeline::MAX_IMAGE_BYTES
+            .div_ceil(3)
+            .saturating_mul(4);
         if data.is_empty() || data.len() > max_encoded {
             return None;
         }
@@ -611,8 +638,7 @@ impl TerminalImageRenderer {
             write_kitty_delete(writer, id, self.tmux_passthrough)?;
             self.transmitted.remove(&asset);
         }
-        self.prepared
-            .retain(|asset, _| live_assets.contains(asset));
+        self.prepared.retain(|asset, _| live_assets.contains(asset));
 
         for placement in placements {
             let identity = RenderIdentity::from(placement);
@@ -630,7 +656,8 @@ impl TerminalImageRenderer {
             }
             let (kitty_id, placement_id) = match self.protocol {
                 Some(TerminalImageProtocol::Kitty) => {
-                    let image_id = if let Some(&id) = self.transmitted.get(&placement.layout.asset) {
+                    let image_id = if let Some(&id) = self.transmitted.get(&placement.layout.asset)
+                    {
                         id
                     } else {
                         let id = self.allocate_kitty_id();
@@ -678,10 +705,13 @@ impl TerminalImageRenderer {
                 Some(TerminalImageProtocol::Sixel) | None => {}
             }
             writer.write_all(b"\x1b8")?;
-            self.active.insert(identity, ActiveKittyPlacement {
-                image_id: kitty_id,
-                placement_id,
-            });
+            self.active.insert(
+                identity,
+                ActiveKittyPlacement {
+                    image_id: kitty_id,
+                    placement_id,
+                },
+            );
         }
         writer.flush()
     }
@@ -832,7 +862,11 @@ fn resize_for_layout(image: DynamicImage, asset: AssetKey) -> DynamicImage {
     }
 }
 
-fn write_kitty_escape<W: Write>(writer: &mut W, passthrough: bool, escape: &[u8]) -> io::Result<()> {
+fn write_kitty_escape<W: Write>(
+    writer: &mut W,
+    passthrough: bool,
+    escape: &[u8],
+) -> io::Result<()> {
     if passthrough {
         writer.write_all(&wrap_tmux_passthrough(escape))
     } else {
@@ -905,7 +939,10 @@ fn write_kitty_delete_placement<W: Write>(
     passthrough: bool,
 ) -> io::Result<()> {
     let mut escape = Vec::with_capacity(48);
-    write!(escape, "\x1b_Ga=d,d=i,i={image_id},p={placement_id},q=2\x1b\\")?;
+    write!(
+        escape,
+        "\x1b_Ga=d,d=i,i={image_id},p={placement_id},q=2\x1b\\"
+    )?;
     write_kitty_escape(writer, passthrough, &escape)
 }
 
@@ -953,7 +990,10 @@ mod tests {
 
     #[test]
     fn terminal_settings_apply_defaults_and_overrides() {
-        assert_eq!(ImageDisplayConfig::from_terminal_settings(None), ImageDisplayConfig::default());
+        assert_eq!(
+            ImageDisplayConfig::from_terminal_settings(None),
+            ImageDisplayConfig::default()
+        );
         let settings = pi_coding::TerminalSettings {
             show_images: Some(false),
             image_width_cells: Some(0),
@@ -961,10 +1001,12 @@ mod tests {
         };
         assert_eq!(
             ImageDisplayConfig::from_terminal_settings(Some(&settings)),
-            ImageDisplayConfig { show_images: false, width_cells: 1 }
+            ImageDisplayConfig {
+                show_images: false,
+                width_cells: 1
+            }
         );
     }
-
 
     #[test]
     fn detection_requires_explicit_protocol_evidence_and_rejects_multiplexers() {
@@ -1041,11 +1083,7 @@ mod tests {
                 tmux_version: version.map(str::to_owned),
                 ..kitty.clone()
             };
-            assert_eq!(
-                detect_protocol(&tmux),
-                expected,
-                "tmux_version={version:?}"
-            );
+            assert_eq!(detect_protocol(&tmux), expected, "tmux_version={version:?}");
         }
         let tmux_without_outer_terminal_evidence = TerminalEnvironment {
             tmux: Some("/tmp/tmux".to_owned()),
@@ -1080,7 +1118,6 @@ mod tests {
         assert!(once.starts_with(b"\x1bPtmux;"));
     }
 
-
     /// Strip tmux's DCS passthrough wrapper the same way tmux does: consume
     /// doubled ESC pairs inside the payload and terminate on the first
     /// unescaped `ESC \`.
@@ -1093,10 +1130,7 @@ mod tests {
             let bytes = rest.as_bytes();
             let mut i = 0;
             let end = loop {
-                assert!(
-                    i + 1 < bytes.len(),
-                    "unterminated tmux passthrough segment"
-                );
+                assert!(i + 1 < bytes.len(), "unterminated tmux passthrough segment");
                 if bytes[i] == 0x1b {
                     if bytes[i + 1] == 0x1b {
                         i += 2;
@@ -1303,9 +1337,7 @@ mod tests {
             // positioning CSI inside the placement segment also contains a
             // `;`, so isolate the payload by splitting after the `\x1b_G`
             // APC introducer rather than on the first `;` in the segment.
-            let Some(after_apc) = protocol_frame
-                .split_once("\u{1b}_G")
-                .map(|(_, rest)| rest)
+            let Some(after_apc) = protocol_frame.split_once("\u{1b}_G").map(|(_, rest)| rest)
             else {
                 continue;
             };
@@ -1331,7 +1363,10 @@ mod tests {
         renderer
             .present(&mut changed, frame(2), std::slice::from_ref(&placement))
             .unwrap();
-        assert!(changed.is_empty(), "unchanged placements survive frame identity changes");
+        assert!(
+            changed.is_empty(),
+            "unchanged placements survive frame identity changes"
+        );
 
         // When the asset leaves the frame set, its exact placement and image
         // id are deleted without touching another client's images.
@@ -1380,7 +1415,9 @@ mod tests {
             ImagePlacement::new(layout, &data, "image/png", 1, 12),
         ];
         let mut output = Vec::new();
-        renderer.present(&mut output, frame(1), &placements).unwrap();
+        renderer
+            .present(&mut output, frame(1), &placements)
+            .unwrap();
         let output = String::from_utf8(output).unwrap();
         assert_eq!(
             output.matches("a=t,").count(),
@@ -1395,8 +1432,15 @@ mod tests {
             .filter_map(|command| command.split(',').next())
             .collect::<HashSet<_>>();
         assert_eq!(placement_ids.len(), 3, "each placement has an isolated id");
-        assert!(!output.contains("a=d"), "no deletions while the asset is live");
-        assert_eq!(output.matches("\u{1b}7").count(), 3, "cursor save per placement");
+        assert!(
+            !output.contains("a=d"),
+            "no deletions while the asset is live"
+        );
+        assert_eq!(
+            output.matches("\u{1b}7").count(),
+            3,
+            "cursor save per placement"
+        );
     }
 
     #[test]
@@ -1431,23 +1475,56 @@ mod tests {
         let data = png(16, 16);
         let mut renderer = TerminalImageRenderer::new(Some(TerminalImageProtocol::Kitty));
         let layout = renderer
-            .layout(&data, "image/png", ImageDisplayConfig { show_images: true, width_cells: 4 }, 80, 24, TerminalCellSize::default())
+            .layout(
+                &data,
+                "image/png",
+                ImageDisplayConfig {
+                    show_images: true,
+                    width_cells: 4,
+                },
+                80,
+                24,
+                TerminalCellSize::default(),
+            )
             .unwrap();
         let first = ImagePlacement::new(layout, &data, "image/png", 1, 1);
         let moved = ImagePlacement::new(layout, &data, "image/png", 20, 8);
         let mut initial = Vec::new();
         renderer.present(&mut initial, frame(1), &[first]).unwrap();
         let initial = String::from_utf8(initial).unwrap();
-        let image_id = initial.split("a=t,").nth(1).unwrap().split("i=").nth(1).unwrap().split(',').next().unwrap();
-        let old_placement_id = initial.split("a=p,i=").nth(1).unwrap().split(",p=").nth(1).unwrap().split(',').next().unwrap();
+        let image_id = initial
+            .split("a=t,")
+            .nth(1)
+            .unwrap()
+            .split("i=")
+            .nth(1)
+            .unwrap()
+            .split(',')
+            .next()
+            .unwrap();
+        let old_placement_id = initial
+            .split("a=p,i=")
+            .nth(1)
+            .unwrap()
+            .split(",p=")
+            .nth(1)
+            .unwrap()
+            .split(',')
+            .next()
+            .unwrap();
 
         let mut repositioned = Vec::new();
-        renderer.present(&mut repositioned, frame(2), &[moved]).unwrap();
+        renderer
+            .present(&mut repositioned, frame(2), &[moved])
+            .unwrap();
         let repositioned = String::from_utf8(repositioned).unwrap();
         assert!(repositioned.contains(&format!("a=d,d=i,i={image_id},p={old_placement_id},q=2")));
         assert!(repositioned.contains(&format!("a=p,i={image_id},p=")));
         assert!(repositioned.contains("\u{1b}[9;21H"));
-        assert!(!repositioned.contains("a=t,"), "moving reuses transmitted data");
+        assert!(
+            !repositioned.contains("a=t,"),
+            "moving reuses transmitted data"
+        );
         assert!(!repositioned.contains("d=A"));
     }
 
@@ -1456,12 +1533,52 @@ mod tests {
         let data = png(8, 8);
         let render_ids = || {
             let mut renderer = TerminalImageRenderer::new(Some(TerminalImageProtocol::Kitty));
-            let layout = renderer.layout(&data, "image/png", ImageDisplayConfig { show_images: true, width_cells: 2 }, 80, 24, TerminalCellSize::default()).unwrap();
+            let layout = renderer
+                .layout(
+                    &data,
+                    "image/png",
+                    ImageDisplayConfig {
+                        show_images: true,
+                        width_cells: 2,
+                    },
+                    80,
+                    24,
+                    TerminalCellSize::default(),
+                )
+                .unwrap();
             let mut bytes = Vec::new();
-            renderer.present(&mut bytes, frame(1), &[ImagePlacement::new(layout, &data, "image/png", 0, 0)]).unwrap();
+            renderer
+                .present(
+                    &mut bytes,
+                    frame(1),
+                    &[ImagePlacement::new(layout, &data, "image/png", 0, 0)],
+                )
+                .unwrap();
             let output = String::from_utf8(bytes).unwrap();
-            let image_id = output.split("a=t,").nth(1).unwrap().split("i=").nth(1).unwrap().split(',').next().unwrap().parse::<u32>().unwrap();
-            let placement_id = output.split("a=p,i=").nth(1).unwrap().split(",p=").nth(1).unwrap().split(',').next().unwrap().parse::<u32>().unwrap();
+            let image_id = output
+                .split("a=t,")
+                .nth(1)
+                .unwrap()
+                .split("i=")
+                .nth(1)
+                .unwrap()
+                .split(',')
+                .next()
+                .unwrap()
+                .parse::<u32>()
+                .unwrap();
+            let placement_id = output
+                .split("a=p,i=")
+                .nth(1)
+                .unwrap()
+                .split(",p=")
+                .nth(1)
+                .unwrap()
+                .split(',')
+                .next()
+                .unwrap()
+                .parse::<u32>()
+                .unwrap();
             (image_id, placement_id)
         };
         let first = render_ids();
@@ -1475,9 +1592,11 @@ mod tests {
         assert_ne!(first.0, 0);
         assert_ne!(first.1, 0);
         assert_ne!(first.0, first.1);
-        assert_ne!(first, second, "independent renderer namespaces must not start at fixed ids");
+        assert_ne!(
+            first, second,
+            "independent renderer namespaces must not start at fixed ids"
+        );
     }
-
 
     #[test]
     fn iterm_protocol_bytes_are_isolated_and_cached() {

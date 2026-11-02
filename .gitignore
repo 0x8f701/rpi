@@ -8,6 +8,7 @@ crates/pi-cli/web/.transcript-test-build/
 crates/pi-cli/web/.panel-shots/
 /examples/target
 *.log
+/docs/qa-evidence/
 /.pi/artifacts/
 /diagram-output/
 session.html
@@ -26,3 +27,41 @@ credentials*
 __pycache__
 book
 .web-test-build/
+.pi
+.rpi
+# Playwright-generated run metadata; never tracked.
+/test-results/
+# Local one-off E2E scratch (dot-prefixed); permanent lanes are unprefixed.
+E2E.d/web/.*
+
+tmp
+sessions
+# Local agent working state — never commit.
+TASKS.md
+MEMORY.md
+ISSUES.md
+/PLAN.md
+PLAN.md/
+docs/audit-77-commits-test-coverage.md
+docs/bat6x-todo-product-test-design.md
+docs/coverage-audit-integration.md
+docs/omlo-blocker-shortlist.md
+docs/qa-acceptance-matrix.md
+docs/qa-closeout-report.md
+docs/tmux-web-terminal-design.md
+docs/todo-child-e2e-lane-design.md
+docs/tui-real-terminal-qa-protocol.md
+mobile/RELEASE.md
+# Local feature-test logs (hosts, LAN, operator paths) — never commit.
+INTERACTION.md
+INTERACTION-shots/
+# Android/RN generated and machine-local files — never commit.
+mobile/android/local.properties
+mobile/android/keystore.properties
+mobile/android/app/release.keystore
+mobile/android/.gradle/
+mobile/android/app/build/
+mobile/android/build/
+mobile/.cxx/
+
+crates/pi-cli/desktop/dist-deb/

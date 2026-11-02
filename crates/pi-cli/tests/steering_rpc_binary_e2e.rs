@@ -75,8 +75,8 @@ impl RpcSession {
         let mut child = rpc_cmd()
             .args(["--offline", "--model", "faux/faux-1"])
             .env("HOME", home.path())
-            .env("PI_OFFLINE", "1")
-            .env("PI_SKIP_VERSION_CHECK", "1")
+            .env("RPI_OFFLINE", "1")
+            .env("RPI_SKIP_VERSION_CHECK", "1")
             .env("PI_FAUX_RESPONSE", faux_response)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -130,9 +130,7 @@ impl RpcSession {
                 }
                 Ok(RpcLine::Eof) => {
                     let status = self.child.try_wait().ok().flatten();
-                    panic!(
-                        "rpi rpc stdout closed before next JSONL record (status={status:?})"
-                    );
+                    panic!("rpi rpc stdout closed before next JSONL record (status={status:?})");
                 }
                 Ok(RpcLine::Error(error)) => panic!("reading rpi rpc stdout: {error}"),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -290,7 +288,10 @@ fn idle_steer_is_queued_then_delivered_by_next_prompt() {
     }
     let settled = settled.expect("prompt turn must emit agent_settled");
     assert_eq!(settled, json!({"type": "agent_settled"}));
-    assert!(saw_prompt_response, "prompt response missing: {collected:?}");
+    assert!(
+        saw_prompt_response,
+        "prompt response missing: {collected:?}"
+    );
 
     // 4) The queue drained and both user prompts are recorded.
     session.write_line(r#"{"type":"get_state","id":"state-2"}"#);
@@ -317,11 +318,15 @@ fn idle_steer_is_queued_then_delivered_by_next_prompt() {
     assert_success(&messages, "get_messages", "messages-1");
     let texts = user_texts(&messages["data"]);
     assert!(
-        texts.iter().any(|text| text.contains("course correction alpha")),
+        texts
+            .iter()
+            .any(|text| text.contains("course correction alpha")),
         "steered prompt must be recorded in the transcript: {texts:?}"
     );
     assert!(
-        texts.iter().any(|text| text.contains("main assignment alpha")),
+        texts
+            .iter()
+            .any(|text| text.contains("main assignment alpha")),
         "assignment must be recorded in the transcript: {texts:?}"
     );
 
@@ -377,9 +382,15 @@ fn mid_stream_steer_is_delivered_before_settle() {
     }
     let settled = settled.expect("the run must settle with the steered turn consumed");
     assert_eq!(settled, json!({"type": "agent_settled"}));
-    assert!(saw_prompt_response, "prompt response missing: {collected:?}");
+    assert!(
+        saw_prompt_response,
+        "prompt response missing: {collected:?}"
+    );
     assert!(saw_steer_response, "steer response missing: {collected:?}");
-    assert!(saw_stream_event, "expected streaming events before settle: {collected:?}");
+    assert!(
+        saw_stream_event,
+        "expected streaming events before settle: {collected:?}"
+    );
 
     // The queue drained and the steered prompt reached the transcript.
     session.write_line(r#"{"type":"get_state","id":"state-mid"}"#);
@@ -406,11 +417,15 @@ fn mid_stream_steer_is_delivered_before_settle() {
     assert_success(&messages, "get_messages", "messages-mid");
     let texts = user_texts(&messages["data"]);
     assert!(
-        texts.iter().any(|text| text.contains("mid-turn correction beta")),
+        texts
+            .iter()
+            .any(|text| text.contains("mid-turn correction beta")),
         "mid-stream steered prompt must be recorded: {texts:?}"
     );
     assert!(
-        texts.iter().any(|text| text.contains("long assignment beta")),
+        texts
+            .iter()
+            .any(|text| text.contains("long assignment beta")),
         "assignment must be recorded: {texts:?}"
     );
 

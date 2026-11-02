@@ -7,18 +7,20 @@
 # Spawns the real `rpi --listen` binary with a token file and the loopback
 # mock provider (--scenario sessions; content-routed replies so concurrently
 # running session runtimes stay deterministic), opens `/web` in a real
-# playwright browser, and asserts (see sessions_test.mjs for the T0.x–T7.x
+# playwright browser, and asserts (see sessions_test.mjs for the T0.x–T8.x
 # assertion matrix):
 #   T1  slow session A keeps streaming while B is active and B's prompt
 #       round-trips; background unread; unread clears on switch-back;
 #       authoritative transcript restore
 #   T2  abort + toast isolation (aborting B never affects A's stream)
-#   T4  8-session cap, no eviction, error surfaced
+#   T4  bounded 8-runtime pool with deterministic idle LRU replacement and durable catalog row
 #   T5  Todo/Goal/Workflow state never leaks across sessions
-#   T6  desktop rail collapse/reopen, sidebar New/Manage/switch, header has
-#       NO feature buttons
+#   T6  desktop rail collapse/reopen, Manage Session lifecycle/sidebar switch,
+#       header has NO feature buttons
 #   T7  Android 390x844 drawer: hamburger opens, session pick closes the
 #       drawer and restores the picked session's transcript
+#   T8  UI fork places the selected user turn in the composer only, survives
+#       refresh as one durable active row, and stays isolated from its parent
 #
 # The lane FAILS (non-zero) whenever playwright/chromium cannot be used —
 # RPI_WEB_FORCE_PLAYWRIGHT is irrelevant here because there is no fallback.
@@ -40,7 +42,7 @@ main() {
     case "${1:-run}" in
         list|--list|--dry-run)
             printf '%s\n' \
-                'web-sessions - multi-session: concurrent streaming, source-session routing, background unread, abort/toast isolation, 8-session cap, Todo/Goal/Workflow isolation, desktop collapse rail, mobile drawer pick-close (PLAYWRIGHT-ONLY, hard-fail)'
+                'web-sessions - multi-session: concurrent streaming, source-session routing, background unread, abort/toast isolation, 8-session idle LRU cap, Todo/Goal/Workflow isolation, desktop collapse rail, mobile drawer pick-close, fork composer draft (PLAYWRIGHT-ONLY, hard-fail)'
             return 0
             ;;
         run|all) ;;
@@ -63,6 +65,16 @@ main() {
     git -C "$root/workspace" commit -q -m "web sessions seed"
     evidence="$EVIDENCE_ROOT/$SCENARIO"
     printf '%s\n' "$TOKEN" >"$root/token"
+    cat >"$root/home/.rpi/settings.json" <<'EOF'
+{
+  "orchestration": {
+    "tasks": true,
+    "maxConcurrency": 2,
+    "maxRecursionDepth": 2,
+    "isolation": "none"
+  }
+}
+EOF
 
     port="$(MOCK_SCENARIO=sessions web_start_mock "$root" "$evidence")"
     web_spawn_rpi "$root" "$evidence" "$port"
@@ -71,7 +83,11 @@ main() {
 
     # Hard playwright run: exit 1 from web_run_playwright means the npm
     # install failed — for THIS lane that is a real failure (no fallback).
-    web_run_playwright "$url" "$evidence" "$root/playwright" "$SCRIPT_DIR/sessions_test.mjs" || pw_status=$?
+    mkdir -p "$root/playwright/lib"
+    cp "$SCRIPT_DIR/lib/p0_resource_driver.mjs" "$root/playwright/lib/p0_resource_driver.mjs"
+    cp "$SCRIPT_DIR/lib/p0_resource_metrics.mjs" "$root/playwright/lib/p0_resource_metrics.mjs"
+    cp "$SCRIPT_DIR/lib/p0_native_session.mjs" "$root/playwright/lib/p0_native_session.mjs"
+    web_run_playwright "$url" "$evidence" "$root/playwright" "$SCRIPT_DIR/sessions_test.mjs" RPI_MOCK_PORT="$port" || pw_status=$?
     if [ "$pw_status" -ne 0 ]; then
         fail "$SCENARIO: playwright lane failed (exit $pw_status) — sessions lane is playwright-only"
     fi

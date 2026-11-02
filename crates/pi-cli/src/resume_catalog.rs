@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use pi_coding::{
     Application, CatalogError, CatalogListOptions, CatalogRow, CatalogRowStatus,
-    CatalogSearchOptions, CatalogSort, ResolvedSession, SessionCatalog, SessionSourceKind,
+    CatalogSearchOptions, CatalogSort, ResolvedSession, SessionCatalog, SessionKind,
+    SessionSourceKind,
 };
 
 /// Query used to populate a unified resume selector.
@@ -65,8 +66,9 @@ pub fn effective_resume_sources(application: &Application) -> Vec<SessionSourceK
     )
 }
 
-const WEB_DEFAULT_RESUME_SOURCES: [SessionSourceKind; 4] = [
+const WEB_DEFAULT_RESUME_SOURCES: [SessionSourceKind; 5] = [
     SessionSourceKind::NativePi,
+    SessionSourceKind::Pi,
     SessionSourceKind::Omp,
     SessionSourceKind::Codex,
     SessionSourceKind::Grok,
@@ -109,6 +111,18 @@ pub struct ResumeSelectorRow {
     /// Isolated message corpus matched by the selector without crossing into
     /// cwd/path; `search_text` remains for stable identity ordering.
     pub message_blob: String,
+    pub has_parent_session: bool,
+    /// Authoritative header provenance; workflow-internal rows are already
+    /// excluded upstream by the catalog but the flag stays consumable.
+    pub session_kind: SessionKind,
+    /// True when the session's cwd sits under a `.slock/agents/<id>` Slock
+    /// ephemeral agent workspace (Codex/Slock orchestration, not a user
+    /// project). View signal for selector grouping; never a filter.
+    pub agent_session: bool,
+    /// True when the session carries parsed messages but none contain
+    /// genuine content (bootstrap-only: environment context, user info,
+    /// system reminders, AGENTS/project instructions). View signal only.
+    pub bootstrap_only: bool,
 }
 
 impl From<CatalogRow> for ResumeSelectorRow {
@@ -128,6 +142,10 @@ impl From<CatalogRow> for ResumeSelectorRow {
             status: row.status,
             search_text: row.search_text,
             message_blob: row.message_blob,
+            has_parent_session: row.has_parent_session,
+            session_kind: row.session_kind,
+            agent_session: row.agent_session,
+            bootstrap_only: row.bootstrap_only,
         }
     }
 }
@@ -157,7 +175,6 @@ impl From<&ResumeSelectorRow> for ResumeSelectorTarget {
     }
 }
 
-
 /// Selection may come from a catalog row or a path/id typed by the user.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResumeSelectionRequest {
@@ -176,6 +193,10 @@ pub struct ResumeSelectionResult {
     pub native_no_copy: bool,
     pub message_count: Option<usize>,
     pub cancelled: bool,
+    /// User-facing notice carried through from `SessionChangeOutcome::notice`
+    /// when a same-CWD resume completed with orchestration left unbound after
+    /// a durable policy mismatch. `None` on a normal resume/cancellation.
+    pub notice: Option<String>,
 }
 
 /// List/search/sort the unified catalog for a selector.
@@ -184,7 +205,12 @@ pub fn load_resume_catalog(
     request: &ResumeCatalogRequest,
 ) -> Result<ResumeCatalogResult, CatalogError> {
     let sources = normalize_resume_sources(&request.sources);
-    let rows = match request.query.as_deref().map(str::trim).filter(|query| !query.is_empty()) {
+    let rows = match request
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+    {
         Some(query) => catalog.search(
             query,
             &CatalogSearchOptions {
@@ -211,42 +237,26 @@ pub fn load_resume_catalog(
     })
 }
 
-/// Web catalog rows prefer the native imported copy over its foreign source.
-/// The source remains discoverable until import; after import the native row
-/// is the only actionable representation in the Web control plane.
-#[must_use]
-pub fn coalesce_web_import_rows(rows: Vec<ResumeSelectorRow>) -> Vec<ResumeSelectorRow> {
-    let native_paths = rows
-        .iter()
-        .filter(|row| row.source.is_native())
-        .map(|row| row.path.clone())
-        .collect::<std::collections::HashSet<_>>();
-    rows.into_iter()
-        .filter(|row| match &row.status {
-            CatalogRowStatus::AlreadyImported { native_path, .. } => {
-                !native_paths.contains(native_path)
-            }
-            CatalogRowStatus::Native | CatalogRowStatus::Foreign => true,
-        })
-        .collect()
-}
 
 const WEB_NOISE_SESSION_MAX_BYTES: u64 = 10 * 1024;
 
 /// Hide small persisted rows that contain no user/assistant messages from the
-/// Web catalog. The size guard matches the product's 10 KiB noise threshold,
-/// while the zero-message requirement preserves short but recoverable turns.
+/// Web catalog, except native child journals whose retained header proves a
+/// `parentSession` lineage. Root forks intentionally exclude the selected
+/// prompt and may otherwise be header-only after recreation.
 /// Temp-workspace rows are NOT dropped here: they are flagged `temporary` by
-/// [`partition_web_noise_rows`] so the sidebar can hide them by default
-/// without losing them (searchable, and loaded/active sessions stay visible).
+/// [`partition_web_noise_rows`] so the sidebar can hide them by default.
 #[must_use]
 pub fn filter_web_noise_rows(rows: Vec<ResumeSelectorRow>) -> Vec<ResumeSelectorRow> {
     rows.into_iter()
         .filter(|row| {
-            row.size >= WEB_NOISE_SESSION_MAX_BYTES || row.message_count != Some(0)
+            row.size >= WEB_NOISE_SESSION_MAX_BYTES
+                || row.message_count != Some(0)
+                || (row.source.is_native() && row.has_parent_session)
         })
         .collect()
 }
+
 
 /// Split Web AllProjects rows into regular rows and temporary-workspace rows:
 /// unnamed, tiny, native Pi sessions whose cwd sits lexically under the OS
@@ -296,24 +306,31 @@ pub fn resolve_resume_selection(
     let sources = normalize_resume_sources(sources);
     match request {
         ResumeSelectionRequest::Target(target) => match &target.status {
-            CatalogRowStatus::Native => Ok(ResumeSelectionResult {
-                source: SessionSourceKind::NativePi,
-                path: target.source_path.clone(),
-                imported: false,
-                reused_existing: true,
-                native_no_copy: true,
-                message_count: None,
-                cancelled: false,
-            }),
+            CatalogRowStatus::Native => {
+                if catalog
+                    .native_session_kind(&target.source_path)
+                    .is_workflow_internal()
+                {
+                    return Err(CatalogError::WorkflowInternalSession);
+                }
+                Ok(ResumeSelectionResult {
+                    source: SessionSourceKind::NativePi,
+                    path: target.source_path.clone(),
+                    imported: false,
+                    reused_existing: true,
+                    native_no_copy: true,
+                    message_count: None,
+                    cancelled: false,
+                    notice: None,
+                })
+            }
             CatalogRowStatus::AlreadyImported { native_path, .. } => {
                 ensure_source_enabled(target.source, &sources, &target.source_path)?;
-                if target.source == SessionSourceKind::Omp {
-                    // OMP chain freshness is fingerprint-gated inside
-                    // import_or_resume. A row is exact when listed, but its
-                    // accepted chain can change before the click (for example,
-                    // when an ancestor is rewritten). Re-enter import_or_resume:
-                    // it reuses the native copy when the current chain
-                    // fingerprint still matches and re-imports otherwise.
+                if target.source.is_importable() {
+                    // A listed foreign source can change before activation.
+                    // Re-enter the shared import path for every foreign kind:
+                    // unchanged lineage reuses the validated native copy,
+                    // while changed content produces a fresh immutable import.
                     return imported_result(catalog.import_or_resume(
                         target.source,
                         &target.source_path,
@@ -328,6 +345,7 @@ pub fn resolve_resume_selection(
                     native_no_copy: false,
                     message_count: None,
                     cancelled: false,
+                    notice: None,
                 })
             }
             CatalogRowStatus::Foreign => {
@@ -342,6 +360,9 @@ pub fn resolve_resume_selection(
         ResumeSelectionRequest::Input(input) => {
             let (kind, path) = resolve_input_from_sources(catalog, input, &sources)?;
             if kind.is_native() {
+                if catalog.native_session_kind(&path).is_workflow_internal() {
+                    return Err(CatalogError::WorkflowInternalSession);
+                }
                 return Ok(ResumeSelectionResult {
                     source: kind,
                     path,
@@ -350,6 +371,7 @@ pub fn resolve_resume_selection(
                     native_no_copy: true,
                     message_count: None,
                     cancelled: false,
+                    notice: None,
                 });
             }
             imported_result(catalog.import_or_resume(kind, path, preferred_cwd)?)
@@ -379,7 +401,11 @@ pub async fn switch_resume_selection(
             .await
             .context("rebinding workflow storage after session switch")?;
     }
-    Ok(ResumeSelectionResult { cancelled: outcome.cancelled, ..result })
+    Ok(ResumeSelectionResult {
+        cancelled: outcome.cancelled,
+        notice: outcome.notice,
+        ..result
+    })
 }
 
 fn ensure_source_enabled(
@@ -402,19 +428,28 @@ fn resolve_input_from_sources(
     let candidate = expand_catalog_input(catalog, input_path);
     if candidate.is_file() {
         let classified = SessionSourceKind::ALL.into_iter().find(|kind| {
+            if kind.is_native() && catalog.is_pi_catalog_path(&candidate) {
+                return false;
+            }
             catalog.is_safe_session_path(*kind, &candidate)
                 || candidate.starts_with(catalog.root_for(*kind).path)
         });
         if let Some(kind) = classified {
             ensure_source_enabled(kind, sources, &candidate)?;
-            return catalog.resolve_for(kind, &candidate).map(|path| (kind, path));
+            return catalog
+                .resolve_for(kind, &candidate)
+                .map(|path| (kind, path));
         }
-        if candidate.extension() == Some(OsStr::new("jsonl")) {
+        if candidate.extension() == Some(OsStr::new("jsonl"))
+            && !catalog.is_pi_catalog_path(&candidate)
+        {
             return catalog
                 .resolve_for(SessionSourceKind::NativePi, &candidate)
                 .map(|path| (SessionSourceKind::NativePi, path));
         }
-        return Err(CatalogError::SessionNotFound(candidate.display().to_string()));
+        return Err(CatalogError::SessionNotFound(
+            candidate.display().to_string(),
+        ));
     }
 
     let mut matches = Vec::new();
@@ -422,7 +457,9 @@ fn resolve_input_from_sources(
         match catalog.resolve_for(*kind, input_path) {
             Ok(path) => matches.push((*kind, path)),
             Err(CatalogError::SessionNotFound(_)) => {}
-            Err(CatalogError::AmbiguousSession { matches: ambiguous, .. }) => {
+            Err(CatalogError::AmbiguousSession {
+                matches: ambiguous, ..
+            }) => {
                 matches.extend(ambiguous);
             }
             Err(error) => return Err(error),
@@ -466,6 +503,7 @@ fn imported_result(resolved: ResolvedSession) -> Result<ResumeSelectionResult, C
         native_no_copy: resolved.native_no_copy,
         message_count: Some(resolved.messages.len()),
         cancelled: false,
+        notice: None,
     })
 }
 
@@ -537,7 +575,10 @@ mod tests {
     /// Write an OMP rotation chain (root → leaf) where every file after the
     /// first carries a `parentSession` header pointing at the previous file.
     fn write_omp_chain(catalog: &SessionCatalog, count: usize) -> Vec<PathBuf> {
-        let directory = catalog.root_for(SessionSourceKind::Omp).path.join("--chain--");
+        let directory = catalog
+            .root_for(SessionSourceKind::Omp)
+            .path
+            .join("--chain--");
         fs::create_dir_all(&directory).expect("omp chain dir");
         let mut files = Vec::new();
         for index in 0..count {
@@ -545,9 +586,7 @@ mod tests {
             let path = directory.join(format!("{id}.jsonl"));
             let parent = files
                 .last()
-                .map(|previous: &PathBuf| {
-                    format!(r#","parentSession":"{}""#, previous.display())
-                })
+                .map(|previous: &PathBuf| format!(r#","parentSession":"{}""#, previous.display()))
                 .unwrap_or_default();
             fs::write(
                 &path,
@@ -577,6 +616,7 @@ mod tests {
             web_resume_sources_from_settings(&pi_coding::Settings::default()),
             [
                 SessionSourceKind::NativePi,
+                SessionSourceKind::Pi,
                 SessionSourceKind::Omp,
                 SessionSourceKind::Codex,
                 SessionSourceKind::Grok,
@@ -586,10 +626,8 @@ mod tests {
 
     #[test]
     fn web_explicit_empty_sources_remain_native_only() {
-        let settings: pi_coding::Settings = serde_json::from_str(
-            r#"{"sessionImportSources":[]}"#,
-        )
-        .expect("explicit empty sources");
+        let settings: pi_coding::Settings =
+            serde_json::from_str(r#"{"sessionImportSources":[]}"#).expect("explicit empty sources");
         assert_eq!(
             web_resume_sources_from_settings(&settings),
             [SessionSourceKind::NativePi]
@@ -598,10 +636,9 @@ mod tests {
 
     #[test]
     fn web_explicit_sources_replace_the_fallback() {
-        let settings: pi_coding::Settings = serde_json::from_str(
-            r#"{"sessionImportSources":["codex"]}"#,
-        )
-        .expect("explicit Codex source");
+        let settings: pi_coding::Settings =
+            serde_json::from_str(r#"{"sessionImportSources":["codex"]}"#)
+                .expect("explicit Codex source");
         assert_eq!(
             web_resume_sources_from_settings(&settings),
             [SessionSourceKind::NativePi, SessionSourceKind::Codex]
@@ -609,7 +646,242 @@ mod tests {
     }
 
     #[test]
-    fn web_catalog_prefers_imported_native_row_over_foreign_lineage_row() {
+    fn web_explicit_pi_source_covers_immutable_pi_catalog() {
+        let settings: pi_coding::Settings =
+            serde_json::from_str(r#"{"sessionImportSources":["pi"]}"#).expect("explicit Pi source");
+        assert_eq!(
+            web_resume_sources_from_settings(&settings),
+            [SessionSourceKind::NativePi, SessionSourceKind::Pi]
+        );
+    }
+
+    fn write_pi_session(catalog: &SessionCatalog, id: &str) -> PathBuf {
+        let path = catalog
+            .root_for(SessionSourceKind::Pi)
+            .path
+            .join("project")
+            .join(format!("{id}.jsonl"));
+        fs::create_dir_all(path.parent().expect("Pi session parent"))
+            .expect("create Pi session root");
+        fs::write(
+            &path,
+            format!(
+                concat!(
+                    r#"{{"type":"session","version":3,"id":"{id}","timestamp":"2026-01-01T00:00:00Z","cwd":"<workspace>"}}"#,
+                    "\n",
+                    r#"{{"type":"message","id":"u","parentId":null,"timestamp":"2026-01-01T00:00:01Z","message":{{"role":"user","content":"pi overlap"}}}}"#,
+                    "\n"
+                ),
+                id = id
+            ),
+        )
+        .expect("write Pi session");
+        path
+    }
+
+    fn assert_typed_pi_input_never_native_no_copy(catalog: &SessionCatalog, path: &Path) {
+        assert!(catalog.native_and_pi_roots_overlap());
+        let result = resolve_resume_selection(
+            catalog,
+            &ResumeSelectionRequest::Input(path.to_string_lossy().into_owned()),
+            None,
+            &[SessionSourceKind::NativePi, SessionSourceKind::Pi],
+        );
+        match result {
+            Ok(selection) => {
+                assert_eq!(selection.source, SessionSourceKind::Pi);
+                assert!(!selection.native_no_copy);
+                assert_ne!(selection.path, path);
+            }
+            Err(CatalogError::Import(_)) | Err(CatalogError::SessionNotFound(_)) => {}
+            Err(error) => panic!("typed Pi path must not resume native/no-copy: {error:?}"),
+        }
+    }
+
+    #[test]
+    fn typed_pi_path_under_equal_root_overlap_is_not_native_no_copy() {
+        let home = tempfile::tempdir().expect("home");
+        let shared = home.path().join(".pi/agent/sessions");
+        fs::create_dir_all(&shared).expect("shared catalog root");
+        let catalog = SessionCatalog::new(home.path()).with_native_session_root(&shared);
+        let path = write_pi_session(&catalog, "equal-root");
+        assert_typed_pi_input_never_native_no_copy(&catalog, &path);
+    }
+
+    #[test]
+    fn typed_pi_path_under_native_inside_pi_overlap_is_not_native_no_copy() {
+        let home = tempfile::tempdir().expect("home");
+        let pi_root = home.path().join(".pi/agent/sessions");
+        let native_root = pi_root.join("rpi-native");
+        fs::create_dir_all(&native_root).expect("nested native root");
+        let catalog = SessionCatalog::new(home.path()).with_native_session_root(&native_root);
+        let path = write_pi_session(&catalog, "native-inside-pi");
+        assert_typed_pi_input_never_native_no_copy(&catalog, &path);
+    }
+
+    #[test]
+    fn typed_pi_path_under_pi_inside_native_overlap_is_not_native_no_copy() {
+        let home = tempfile::tempdir().expect("home");
+        let native_root = home.path().join(".pi/agent");
+        fs::create_dir_all(native_root.join("sessions")).expect("native parent of Pi");
+        let catalog = SessionCatalog::new(home.path()).with_native_session_root(&native_root);
+        let path = write_pi_session(&catalog, "pi-inside-native");
+        assert_typed_pi_input_never_native_no_copy(&catalog, &path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn typed_pi_path_under_canonical_symlink_alias_is_not_native_no_copy() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::tempdir().expect("home");
+        let pi_root = home.path().join(".pi/agent/sessions");
+        fs::create_dir_all(&pi_root).expect("pi catalog root");
+        let alias = home.path().join("native-alias");
+        symlink(&pi_root, &alias).expect("alias native root onto Pi");
+        let catalog = SessionCatalog::new(home.path()).with_native_session_root(&alias);
+        let path = write_pi_session(&catalog, "symlink-alias");
+        let alias_path = alias.join("project/symlink-alias.jsonl");
+        assert_typed_pi_input_never_native_no_copy(&catalog, &path);
+        assert_typed_pi_input_never_native_no_copy(&catalog, &alias_path);
+    }
+
+    #[test]
+    fn web_typed_pi_path_imports_without_mutating_the_source() {
+        let home = tempfile::tempdir().expect("home");
+        let catalog = SessionCatalog::new(home.path());
+        let source = catalog
+            .root_for(SessionSourceKind::Pi)
+            .path
+            .join("project/pi-importable.jsonl");
+        fs::create_dir_all(source.parent().expect("Pi session parent"))
+            .expect("create Pi session root");
+        fs::write(
+            &source,
+            concat!(
+                r#"{"type":"session","version":3,"id":"pi-importable","timestamp":"2026-01-01T00:00:00Z","cwd":"<workspace>"}"#,
+                "\n",
+                r#"{"type":"message","id":"u","parentId":null,"timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":"pi import prompt"}}"#,
+                "\n"
+            ),
+        )
+        .expect("write Pi session");
+        let source_bytes = fs::read(&source).expect("Pi source bytes");
+        let source_modified = fs::metadata(&source)
+            .expect("Pi source metadata")
+            .modified()
+            .expect("mtime");
+
+        let rows = load_resume_catalog(
+            &catalog,
+            &ResumeCatalogRequest {
+                sources: vec![SessionSourceKind::NativePi, SessionSourceKind::Pi],
+                ..ResumeCatalogRequest::default()
+            },
+        )
+        .expect("Pi catalog listing")
+        .rows;
+        assert!(rows.iter().any(|row| row.source == SessionSourceKind::Pi));
+
+        let selection = resolve_resume_selection(
+            &catalog,
+            &ResumeSelectionRequest::Input(source.to_string_lossy().into_owned()),
+            None,
+            &[SessionSourceKind::NativePi, SessionSourceKind::Pi],
+        )
+        .expect("Pi path imports");
+        assert_eq!(selection.source, SessionSourceKind::Pi);
+        assert!(selection.imported);
+        assert!(!selection.native_no_copy);
+        assert_ne!(selection.path, source);
+        assert_eq!(selection.message_count, Some(1));
+        assert_eq!(fs::read(&source).expect("Pi source after"), source_bytes);
+        assert_eq!(
+            fs::metadata(&source)
+                .expect("Pi source metadata after")
+                .modified()
+                .expect("mtime after"),
+            source_modified,
+        );
+        assert!(catalog.is_safe_session_path(SessionSourceKind::NativePi, &selection.path));
+    }
+
+    #[test]
+    fn pi_already_imported_target_revalidates_lineage_before_reuse() {
+        let home = tempfile::tempdir().expect("home");
+        let catalog = SessionCatalog::new(home.path());
+        let source = write_pi_session(&catalog, "pi-stale-row");
+        let sources = [SessionSourceKind::NativePi, SessionSourceKind::Pi];
+        let first = resolve_resume_selection(
+            &catalog,
+            &ResumeSelectionRequest::Input(source.to_string_lossy().into_owned()),
+            None,
+            &sources,
+        )
+        .expect("first Pi import");
+        assert!(first.imported);
+
+        fs::write(
+            &source,
+            format!(
+                concat!(
+                    r#"{{"type":"session","version":3,"id":"pi-stale-row","timestamp":"2026-01-01T00:00:00Z","cwd":"<workspace>"}}"#,
+                    "\n",
+                    r#"{{"type":"message","id":"u","parentId":null,"timestamp":"2026-01-01T00:00:01Z","message":{{"role":"user","content":"pi changed after listing"}}}}"#,
+                    "\n"
+                )
+            ),
+        )
+        .expect("change Pi source");
+
+        let changed = resolve_resume_selection(
+            &catalog,
+            &ResumeSelectionRequest::Target(ResumeSelectorTarget {
+                source: SessionSourceKind::Pi,
+                source_path: source.clone(),
+                status: CatalogRowStatus::AlreadyImported {
+                    native_id: "stale".to_owned(),
+                    native_path: first.path.clone(),
+                },
+            }),
+            None,
+            &sources,
+        )
+        .expect("changed Pi source reimports");
+        assert!(changed.imported);
+        assert_ne!(changed.path, first.path);
+        assert!(
+            fs::read_to_string(&changed.path)
+                .expect("changed import body")
+                .contains("pi changed after listing")
+        );
+
+        let reused = resolve_resume_selection(
+            &catalog,
+            &ResumeSelectionRequest::Target(ResumeSelectorTarget {
+                source: SessionSourceKind::Pi,
+                source_path: source,
+                status: CatalogRowStatus::AlreadyImported {
+                    native_id: "fresh".to_owned(),
+                    native_path: changed.path.clone(),
+                },
+            }),
+            None,
+            &sources,
+        )
+        .expect("unchanged Pi source reuses import");
+        assert!(!reused.imported);
+        assert!(reused.reused_existing);
+        assert_eq!(reused.path, changed.path);
+    }
+
+    /// Product decision: imported foreign rows STAY VISIBLE next to their
+    /// native copy. After an import the listing carries BOTH rows: the
+    /// native copy (Native) and the foreign source (AlreadyImported with the
+    /// native copy's path) so the sidebar can badge the import and resolve
+    /// either representation.
+    #[test]
+    fn imported_foreign_row_remains_listed_with_already_imported_status() {
         let home = tempfile::tempdir().expect("home");
         let catalog = SessionCatalog::new(home.path());
         let source = write_codex(&catalog, "web-coalesce", "foreign summary");
@@ -630,12 +902,23 @@ mod tests {
         .expect("catalog")
         .rows;
 
-        let web_rows = coalesce_web_import_rows(rows);
-        assert_eq!(web_rows.len(), 1);
-        assert_eq!(web_rows[0].source, SessionSourceKind::NativePi);
-        assert!(matches!(web_rows[0].status, CatalogRowStatus::Native));
+        let native_row = rows
+            .iter()
+            .find(|row| row.source == SessionSourceKind::NativePi)
+            .expect("the native imported copy stays listed");
+        assert!(matches!(native_row.status, CatalogRowStatus::Native));
+        let foreign_row = rows
+            .iter()
+            .find(|row| row.source == SessionSourceKind::Codex)
+            .expect("the imported foreign row remains listed");
+        let CatalogRowStatus::AlreadyImported { native_path, .. } = &foreign_row.status else {
+            panic!("the foreign row must carry AlreadyImported status: {:?}", foreign_row.status);
+        };
+        assert_eq!(
+            native_path, &native_row.path,
+            "AlreadyImported points at the native copy so the frontend can resolve it"
+        );
     }
-
     #[test]
     fn web_noise_filter_uses_strict_ten_kib_and_zero_messages() {
         fn row(size: u64, message_count: Option<usize>) -> ResumeSelectorRow {
@@ -654,6 +937,10 @@ mod tests {
                 status: CatalogRowStatus::Native,
                 search_text: String::new(),
                 message_blob: String::new(),
+                has_parent_session: false,
+                session_kind: SessionKind::User,
+                agent_session: false,
+                bootstrap_only: false,
             }
         }
         let rows = vec![
@@ -662,11 +949,52 @@ mod tests {
             row(1, Some(1)),
             row(1, None),
         ];
+
         let visible = filter_web_noise_rows(rows);
         assert_eq!(visible.len(), 3);
-        assert!(visible.iter().any(|row| row.size == 10_240 && row.message_count == Some(0)));
+        assert!(
+            visible
+                .iter()
+                .any(|row| row.size == 10_240 && row.message_count == Some(0))
+        );
         assert!(visible.iter().any(|row| row.message_count == Some(1)));
         assert!(visible.iter().any(|row| row.message_count.is_none()));
+    }
+
+    #[test]
+    fn web_noise_filter_keeps_only_parent_linked_zero_message_native_rows() {
+        let home = tempfile::tempdir().expect("home");
+        let native = tempfile::tempdir().expect("native root");
+        let catalog = SessionCatalog::new(home.path()).with_native_session_root(native.path());
+        let directory = native.path();
+        fs::create_dir_all(directory).expect("native parent");
+        let cwd = real_workspace_cwd();
+        let cwd_json = serde_json::to_string(&cwd).expect("serialize cwd");
+        fs::write(
+            directory.join("noise.jsonl"),
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"noise\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":{cwd_json}}}\n"
+            ),
+        )
+        .expect("noise fixture");
+        fs::write(
+            directory.join("fork.jsonl"),
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"fork\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":{cwd_json},\"parentSession\":\"parent.jsonl\"}}\n"
+            ),
+        )
+        .expect("fork fixture");
+        let rows = load_resume_catalog(&catalog, &ResumeCatalogRequest::default())
+            .expect("catalog")
+            .rows;
+        assert!(
+            rows.iter()
+                .find(|row| row.session_id == "fork")
+                .is_some_and(|row| row.has_parent_session)
+        );
+        let visible = filter_web_noise_rows(rows);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].session_id, "fork");
     }
 
     fn noise_row(
@@ -689,6 +1017,10 @@ mod tests {
             message_count,
             name: name.map(str::to_owned),
             status: CatalogRowStatus::Native,
+            has_parent_session: false,
+            session_kind: SessionKind::User,
+            agent_session: false,
+            bootstrap_only: false,
             search_text: String::new(),
             message_blob: String::new(),
         }
@@ -745,21 +1077,22 @@ mod tests {
         assert_eq!(filter_web_noise_rows(rows.clone()).len(), 2);
         let (regular, temporary) = partition_web_noise_rows(rows);
         assert_eq!(regular.len(), 2);
-        assert!(temporary.is_empty(), "non-temp short rows are never temporary");
+        assert!(
+            temporary.is_empty(),
+            "non-temp short rows are never temporary"
+        );
     }
 
     #[test]
     fn web_noise_partition_keeps_named_temp_rows_regular() {
         let temp = temp_workspace_cwd();
-        let rows = vec![
-            noise_row(
-                SessionSourceKind::NativePi,
-                &temp,
-                512,
-                Some(1),
-                Some("my experiment"),
-            ),
-        ];
+        let rows = vec![noise_row(
+            SessionSourceKind::NativePi,
+            &temp,
+            512,
+            Some(1),
+            Some("my experiment"),
+        )];
         assert_eq!(filter_web_noise_rows(rows.clone()).len(), 1);
         let (regular, temporary) = partition_web_noise_rows(rows);
         assert_eq!(regular.len(), 1, "named rows are never temporary");
@@ -814,7 +1147,11 @@ mod tests {
         assert_eq!(temporary.len(), 1);
         assert_eq!(temporary[0].size, WEB_NOISE_SESSION_MAX_BYTES - 1);
         assert_eq!(regular.len(), 2);
-        assert!(regular.iter().all(|row| row.size >= WEB_NOISE_SESSION_MAX_BYTES));
+        assert!(
+            regular
+                .iter()
+                .all(|row| row.size >= WEB_NOISE_SESSION_MAX_BYTES)
+        );
     }
 
     #[test]
@@ -827,12 +1164,7 @@ mod tests {
             "harness probe",
             &temp_workspace_cwd(),
         );
-        write_native_with_cwd(
-            &catalog,
-            "user-short",
-            "hello there",
-            &real_workspace_cwd(),
-        );
+        write_native_with_cwd(&catalog, "user-short", "hello there", &real_workspace_cwd());
         let rows = load_resume_catalog(&catalog, &ResumeCatalogRequest::default())
             .expect("native catalog")
             .rows;
@@ -1153,13 +1485,16 @@ mod tests {
                 ..ResumeCatalogRequest::default()
             },
         )
-            .expect("reloaded catalog")
-            .rows;
+        .expect("reloaded catalog")
+        .rows;
         let row = rows
             .iter()
             .find(|row| row.source == SessionSourceKind::Codex)
             .expect("codex row");
-        assert!(matches!(row.status, CatalogRowStatus::AlreadyImported { .. }));
+        assert!(matches!(
+            row.status,
+            CatalogRowStatus::AlreadyImported { .. }
+        ));
         let second = resolve_resume_selection(
             &catalog,
             &ResumeSelectionRequest::Target(ResumeSelectorTarget::from(row)),
@@ -1221,15 +1556,24 @@ mod tests {
             &sources,
         )
         .expect("stale target must re-enter import");
-        assert_ne!(fresh.path, stale_path, "stale native copy must not be selected");
-        assert!(fresh.imported, "ancestor mutation must produce a fresh import");
+        assert_ne!(
+            fresh.path, stale_path,
+            "stale native copy must not be selected"
+        );
+        assert!(
+            fresh.imported,
+            "ancestor mutation must produce a fresh import"
+        );
         assert!(fresh.path.is_file());
         let fresh_body = fs::read_to_string(&fresh.path).expect("fresh body");
         assert!(
             fresh_body.contains("rc-chain-1 prompt MUTATED"),
             "updated ancestor transcript required in the fresh import"
         );
-        assert!(fresh_body.contains("rc-chain-0 prompt"), "full chain retained");
+        assert!(
+            fresh_body.contains("rc-chain-0 prompt"),
+            "full chain retained"
+        );
 
         // A fresh scan row (exact fingerprint match) resolves to the same
         // fresh import without a duplicate.
@@ -1253,7 +1597,10 @@ mod tests {
             &sources,
         )
         .expect("fresh row selection");
-        assert_eq!(direct.path, fresh.path, "fresh row resolves the matching import");
+        assert_eq!(
+            direct.path, fresh.path,
+            "fresh row resolves the matching import"
+        );
         assert!(direct.reused_existing);
     }
 
@@ -1261,8 +1608,7 @@ mod tests {
     fn foreign_import_uses_exact_native_session_root() {
         let home = tempfile::tempdir().expect("home");
         let native = tempfile::tempdir().expect("native root");
-        let catalog = SessionCatalog::new(home.path())
-            .with_native_session_root(native.path());
+        let catalog = SessionCatalog::new(home.path()).with_native_session_root(native.path());
         let source = write_codex(&catalog, "custom-root", "import here");
         let result = resolve_resume_selection(
             &catalog,
@@ -1318,4 +1664,175 @@ mod tests {
         assert!(matches!(error, CatalogError::AmbiguousSession { .. }));
     }
 
+    /// The selector row layer passes the external-session classification
+    /// through untouched: a Codex/Slock agent workspace row (`.slock/agents/`)
+    /// with only bootstrap content carries both flags; a genuine user session
+    /// in a real project carries neither. Flags are additive view signals —
+    /// both rows stay listed, nothing is filtered.
+    #[test]
+    fn resume_rows_carry_external_session_classification() {
+        let home = tempfile::tempdir().expect("home");
+        let codex_home = home.path().join("codex-home");
+        let catalog = SessionCatalog::new(home.path()).with_codex_home(&codex_home);
+        let agent_cwd = home.path().join(".slock/agents/agent-7");
+        fs::create_dir_all(&agent_cwd).expect("agent workspace");
+
+        let bootstrap_text =
+            "<environment_context>\nagent mode\n</environment_context><user_instructions>follow AGENTS.md</user_instructions>";
+        let agent_path = catalog.root_for(SessionSourceKind::Codex).path;
+        fs::create_dir_all(&agent_path).expect("codex root");
+        fs::write(
+            agent_path.join("rollout-agent.jsonl"),
+            format!(
+                concat!(
+                    r#"{{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{{"id":"agent-row","cwd":{} }}}}"#,
+                    "\n",
+                    r#"{{"timestamp":"2026-02-01T00:00:01Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":{}}}]}}}}"#,
+                    "\n"
+                ),
+                serde_json::to_string(&agent_cwd.to_string_lossy()).expect("cwd"),
+                serde_json::to_string(bootstrap_text).expect("text"),
+            ),
+        )
+        .expect("agent fixture");
+        let user_path = write_codex(&catalog, "user-session", "fix the login bug");
+        let _ = user_path;
+
+        let rows = load_resume_catalog(
+            &catalog,
+            &ResumeCatalogRequest {
+                sources: vec![SessionSourceKind::Codex],
+                ..ResumeCatalogRequest::default()
+            },
+        )
+        .expect("catalog")
+        .rows;
+        assert_eq!(rows.len(), 2, "no backend filtering: {rows:?}");
+
+        let agent = rows
+            .iter()
+            .find(|row| row.session_id == "agent-row")
+            .expect("agent row");
+        assert!(agent.agent_session, "agent workspace row: {:?}", agent.cwd);
+        assert!(agent.bootstrap_only, "bootstrap-only content row");
+
+        let user = rows
+            .iter()
+            .find(|row| row.session_id == "user-session")
+            .expect("user row");
+        assert!(!user.agent_session, "real project cwd stays real");
+        assert!(!user.bootstrap_only, "genuine prompt is not bootstrap-only");
+    }
+
+    fn write_native_with_kind(
+        catalog: &SessionCatalog,
+        id: &str,
+        session_kind: SessionKind,
+    ) -> PathBuf {
+        let path = catalog
+            .root_for(SessionSourceKind::NativePi)
+            .path
+            .join("--work--")
+            .join(format!("{id}.jsonl"));
+        fs::create_dir_all(path.parent().expect("native parent")).expect("native parent");
+        fs::write(
+            &path,
+            format!(
+                concat!(
+                    r#"{{"type":"session","version":3,"id":"{}","timestamp":"2026-01-01T00:00:00Z","cwd":"<workspace>/work","sessionKind":"{}"}}"#,
+                    "\n",
+                    r#"{{"type":"message","id":"u","parentId":null,"message":{{"role":"user","content":"workflow turn"}}}}"#,
+                    "\n"
+                ),
+                id,
+                session_kind.header_value()
+            ),
+        )
+        .expect("native fixture");
+        path
+    }
+
+    #[test]
+    fn load_resume_catalog_hides_workflow_internal_rows_and_reports_user_kind() {
+        let home = tempfile::tempdir().expect("home");
+        let catalog = SessionCatalog::new(home.path());
+        write_native(&catalog, "user-row", "genuine user prompt");
+        write_native_with_kind(&catalog, "supervisor-row", SessionKind::WorkflowSupervisor);
+
+        let rows = load_resume_catalog(
+            &catalog,
+            &ResumeCatalogRequest {
+                sources: vec![SessionSourceKind::NativePi],
+                ..ResumeCatalogRequest::default()
+            },
+        )
+        .expect("catalog")
+        .rows;
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["user-row"],
+            "workflow-internal rows never reach the selector"
+        );
+        assert_eq!(rows[0].session_kind, SessionKind::User);
+    }
+
+    #[test]
+    fn target_and_typed_input_activation_reject_workflow_internal_sessions() {
+        let home = tempfile::tempdir().expect("home");
+        let catalog = SessionCatalog::new(home.path());
+        write_native(&catalog, "user-row", "genuine user prompt");
+        write_native_with_kind(&catalog, "supervisor-row", SessionKind::WorkflowSupervisor);
+        let supervisor_path = catalog
+            .root_for(SessionSourceKind::NativePi)
+            .path
+            .join("--work--")
+            .join("supervisor-row.jsonl");
+
+        let target = resolve_resume_selection(
+            &catalog,
+            &ResumeSelectionRequest::Target(ResumeSelectorTarget {
+                source: SessionSourceKind::NativePi,
+                source_path: supervisor_path.clone(),
+                status: CatalogRowStatus::Native,
+            }),
+            None,
+            &[SessionSourceKind::NativePi],
+        );
+        assert!(
+            matches!(target, Err(CatalogError::WorkflowInternalSession)),
+            "target activation must reject workflow-internal rows: {target:?}"
+        );
+
+        let typed = resolve_resume_selection(
+            &catalog,
+            &ResumeSelectionRequest::Input(supervisor_path.display().to_string()),
+            None,
+            &[SessionSourceKind::NativePi],
+        );
+        assert!(
+            matches!(typed, Err(CatalogError::WorkflowInternalSession)),
+            "typed path activation must reject workflow-internal rows: {typed:?}"
+        );
+
+        let user_typed = resolve_resume_selection(
+            &catalog,
+            &ResumeSelectionRequest::Input(
+                catalog
+                    .root_for(SessionSourceKind::NativePi)
+                    .path
+                    .join("--work--")
+                    .join("user-row.jsonl")
+                    .display()
+                    .to_string(),
+            ),
+            None,
+            &[SessionSourceKind::NativePi],
+        );
+        assert!(
+            matches!(&user_typed, Ok(selection) if selection.source == SessionSourceKind::NativePi && selection.native_no_copy),
+            "user session activation stays eligible: {user_typed:?}"
+        );
+    }
 }

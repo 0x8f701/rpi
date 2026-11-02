@@ -5,16 +5,15 @@ use pi_agent::{AfterToolCallFn, AgentTool, BeforeToolCallFn, StreamFn, ThinkingL
 use pi_ai::{Model, SimpleStreamOptions};
 
 use crate::{
-    Application, ExtensionLoadReport, ExtensionPermissionSet, ExtensionRuntime, ResourceDiscovery,
-    ResourceManager, ResourceManagerOptions, Session, SessionAuthResolver, SessionOptions,
-    SessionRecorder, Settings, ToolSelection,
+    Application, ExtensionPermissionSet, ExtensionRuntime, ResourceDiscovery, ResourceManager,
+    ResourceManagerOptions, Session, SessionAuthResolver, SessionOptions, SessionRecorder,
+    Settings, ToolSelection,
 };
 
 #[derive(Clone)]
 pub struct PreparedExtensionRuntime {
     pub runtime: ExtensionRuntime,
     pub permissions: ExtensionPermissionSet,
-    pub load_report: Option<ExtensionLoadReport>,
 }
 
 impl PreparedExtensionRuntime {
@@ -23,21 +22,13 @@ impl PreparedExtensionRuntime {
         Self {
             runtime,
             permissions,
-            load_report: None,
         }
-    }
-
-    #[must_use]
-    pub fn with_load_report(mut self, report: ExtensionLoadReport) -> Self {
-        self.load_report = Some(report);
-        self
     }
 }
 
 #[derive(Clone)]
 pub struct AgentSession {
     pub application: Application,
-    pub extensions_result: Option<ExtensionLoadReport>,
     pub model_fallback_message: Option<String>,
 }
 
@@ -253,16 +244,7 @@ impl AgentSessionBuilder {
         } else {
             None
         };
-        let extensions_result = self
-            .extensions
-            .as_ref()
-            .and_then(|prepared| prepared.load_report.clone());
-        let extension_tools = self
-            .extensions
-            .as_ref()
-            .map_or_else(Vec::new, |prepared| prepared.runtime.agent_tools());
-        let mut additional_tools = self.additional_tools;
-        additional_tools.extend(extension_tools);
+        let additional_tools = self.additional_tools;
 
         let mut options = SessionOptions {
             model: self.model,
@@ -277,6 +259,7 @@ impl AgentSessionBuilder {
             after_tool_call: self.after_tool_call,
             stream_fn: self.stream_fn,
             auth_resolver: self.auth_resolver,
+            auth_manager: None,
         };
         let todo_enabled = self
             .settings
@@ -306,12 +289,8 @@ impl AgentSessionBuilder {
                     (context.provider.as_deref(), context.model_id.as_deref())
                 && (options.model.provider != provider || options.model.id != model_id)
             {
-                let restored = restore_recorded_model(
-                    provider,
-                    model_id,
-                    options.auth_resolver.clone(),
-                )
-                .await;
+                let restored =
+                    restore_recorded_model(provider, model_id, options.auth_resolver.clone()).await;
                 if let Some((model, api_key)) = restored {
                     options.model = model;
                     options.api_key = api_key;
@@ -347,33 +326,25 @@ impl AgentSessionBuilder {
         if let Some(resources) = self.resources {
             session.attach_resources(resources).await?;
         }
-        if let Some((context, has_thinking_entry)) = resume_state
-            && !context.messages.is_empty()
-        {
-            session.load_history(context.messages).await?;
-            if !has_thinking_entry
-                && let Some(recorder) = self.recorder.as_ref()
-            {
+        if let Some((context, has_thinking_entry)) = resume_state {
+            let recorder = self
+                .recorder
+                .take()
+                .expect("resume recorder is set with its restore flag");
+            if !has_thinking_entry {
                 recorder.record_thinking_level(thinking_level_name(session.thinking_level()))?;
             }
-        }
-        if let Some(recorder) = self.recorder {
+            session.resume_recording(recorder, context.messages).await?;
+        } else if let Some(recorder) = self.recorder {
             session.record(recorder)?;
         }
-        let application = match self.extensions {
-            Some(prepared) => {
-                Application::new_with_extensions(
-                    session.clone(),
-                    prepared.runtime,
-                    prepared.permissions,
-                )
-                .await
-            }
-            None => Application::new(session.clone()).await,
-        };
+        let mut candidate = crate::ApplicationRuntimeCandidate::new(session.clone());
+        if let Some(prepared) = self.extensions {
+            candidate = candidate.with_extensions(prepared.runtime, prepared.permissions);
+        }
+        let application = Application::from_runtime_candidate(candidate).await?;
         Ok(AgentSession {
             application,
-            extensions_result,
             model_fallback_message,
         })
     }

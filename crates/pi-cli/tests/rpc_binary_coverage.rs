@@ -98,8 +98,8 @@ impl RpcSession {
             .args(["--offline", "--model", "faux/faux-1"])
             .args(post_args)
             .env("HOME", home.path())
-            .env("PI_OFFLINE", "1")
-            .env("PI_SKIP_VERSION_CHECK", "1")
+            .env("RPI_OFFLINE", "1")
+            .env("RPI_SKIP_VERSION_CHECK", "1")
             .env("PI_FAUX_RESPONSE", FAUX_REPLY)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -130,9 +130,7 @@ impl RpcSession {
 
     fn write_line(&mut self, line: &str) {
         let stdin = self.child.stdin.as_mut().expect("stdin pipe");
-        stdin
-            .write_all(line.as_bytes())
-            .expect("write rpc stdin");
+        stdin.write_all(line.as_bytes()).expect("write rpc stdin");
         if !line.ends_with('\n') {
             stdin.write_all(b"\n").expect("write rpc LF");
         }
@@ -250,7 +248,10 @@ fn assert_success(line: &Value, command: &str, id: &str) {
 
 fn assert_failure(line: &Value, command: &str, id: Option<&str>, error_substr: &str) {
     assert_eq!(line["type"], "response", "failure envelope type: {line}");
-    assert_eq!(line["success"], false, "failure must set success=false: {line}");
+    assert_eq!(
+        line["success"], false,
+        "failure must set success=false: {line}"
+    );
     assert_eq!(line["command"], command, "failure command field: {line}");
     match id {
         Some(expected) => assert_eq!(
@@ -318,10 +319,7 @@ fn tree_entries_fork_clone_fork_messages_name_and_export() {
         list.len() >= 4,
         "two prompt turns must record model/thinking/user/assistant entries: {entries}"
     );
-    let first_id = list[0]["id"]
-        .as_str()
-        .expect("entry id string")
-        .to_owned();
+    let first_id = list[0]["id"].as_str().expect("entry id string").to_owned();
     let all_ids: Vec<&str> = list
         .iter()
         .filter_map(|entry| entry["id"].as_str())
@@ -352,7 +350,11 @@ fn tree_entries_fork_clone_fork_messages_name_and_export() {
     let tail_list = tail["data"]["entries"]
         .as_array()
         .expect("tail entries array");
-    assert_eq!(tail_list.len(), list.len() - 1, "since must skip the first entry");
+    assert_eq!(
+        tail_list.len(),
+        list.len() - 1,
+        "since must skip the first entry"
+    );
     assert!(
         tail_list
             .iter()
@@ -550,7 +552,10 @@ fn process_pty_lifecycle_write_keys_resize_logs_and_signals() {
     }
     let spawn = spawn_response.expect("process_spawn response");
     assert_success(&spawn, "process_spawn", "pty-spawn");
-    assert!(saw_started, "process_spawn must emit process_started on the wire");
+    assert!(
+        saw_started,
+        "process_spawn must emit process_started on the wire"
+    );
     let process_id = spawn["data"]["id"]
         .as_str()
         .expect("process id string")
@@ -700,16 +705,15 @@ fn process_pty_lifecycle_write_keys_resize_logs_and_signals() {
         is_response(line) && line.get("id").and_then(Value::as_str) == Some("stop-send")
     });
     assert_success(&stopped, "process_stop", "stop-send");
-    session.write_line(&format!(
-        r#"{{"type":"process_wait","id":"stop-wait","processId":"{stop_id}","timeoutMs":3000}}"#
-    ));
-    let (_events, stop_wait) = session.read_until(deadline, |line| {
-        is_response(line) && line.get("id").and_then(Value::as_str) == Some("stop-wait")
-    });
-    assert_success(&stop_wait, "process_wait", "stop-wait");
     assert!(
-        stop_wait["data"].get("state").and_then(Value::as_str).is_some(),
-        "stopped process must reach a terminal state: {stop_wait}"
+        stopped["data"]
+            .get("state")
+            .and_then(Value::as_str)
+            .is_some_and(|state| state == "exited"
+                || state == "timed_out"
+                || state == "expired"
+                || state == "failed"),
+        "process_stop must return the terminal ProcessInfo: {stopped}"
     );
 
     let output = session.finish();
@@ -746,13 +750,11 @@ fn set_todos_round_trip_emits_todo_updated_event() {
     let response = response.expect("set_todos response");
     assert_success(&response, "set_todos", "todos-1");
     assert_eq!(
-        response["data"]["phases"][0]["name"],
-        "Plan",
+        response["data"]["phases"][0]["name"], "Plan",
         "set_todos data: {response}"
     );
     assert_eq!(
-        response["data"]["phases"][0]["tasks"][0]["status"],
-        "in_progress",
+        response["data"]["phases"][0]["tasks"][0]["status"], "in_progress",
         "todo status wire: {response}"
     );
     assert_eq!(
@@ -777,13 +779,11 @@ fn set_todos_round_trip_emits_todo_updated_event() {
     });
     assert_success(&state, "get_state", "todos-state");
     assert_eq!(
-        state["data"]["todoPhases"][0]["name"],
-        "Plan",
+        state["data"]["todoPhases"][0]["name"], "Plan",
         "get_state todoPhases: {state}"
     );
     assert_eq!(
-        state["data"]["todoPhases"][0]["tasks"][1]["id"],
-        "task-do",
+        state["data"]["todoPhases"][0]["tasks"][1]["id"], "task-do",
         "get_state todo tasks: {state}"
     );
 
@@ -805,11 +805,26 @@ fn mode_model_and_follow_up_controls_round_trip() {
     let deadline = Instant::now() + Duration::from_secs(30);
 
     for (id, line) in [
-        ("steer-mode", r#"{"type":"set_steering_mode","id":"steer-mode","mode":"one-at-a-time"}"#),
-        ("follow-mode", r#"{"type":"set_follow_up_mode","id":"follow-mode","mode":"all"}"#),
-        ("auto-compact", r#"{"type":"set_auto_compaction","id":"auto-compact","enabled":true}"#),
-        ("auto-retry", r#"{"type":"set_auto_retry","id":"auto-retry","enabled":true}"#),
-        ("abort-retry", r#"{"type":"abort_retry","id":"abort-retry"}"#),
+        (
+            "steer-mode",
+            r#"{"type":"set_steering_mode","id":"steer-mode","mode":"one-at-a-time"}"#,
+        ),
+        (
+            "follow-mode",
+            r#"{"type":"set_follow_up_mode","id":"follow-mode","mode":"all"}"#,
+        ),
+        (
+            "auto-compact",
+            r#"{"type":"set_auto_compaction","id":"auto-compact","enabled":true}"#,
+        ),
+        (
+            "auto-retry",
+            r#"{"type":"set_auto_retry","id":"auto-retry","enabled":true}"#,
+        ),
+        (
+            "abort-retry",
+            r#"{"type":"abort_retry","id":"abort-retry"}"#,
+        ),
     ] {
         session.write_line(line);
         let (_events, response) = session.read_until(deadline, |line| {
@@ -834,8 +849,7 @@ fn mode_model_and_follow_up_controls_round_trip() {
         "followUpMode: {state}"
     );
     assert_eq!(
-        state["data"]["autoCompactionEnabled"],
-        true,
+        state["data"]["autoCompactionEnabled"], true,
         "autoCompactionEnabled: {state}"
     );
 
@@ -858,7 +872,8 @@ fn mode_model_and_follow_up_controls_round_trip() {
     );
 
     // set_model (valid path — the invalid-field path is covered elsewhere).
-    session.write_line(r#"{"type":"set_model","id":"model-1","provider":"faux","modelId":"faux-1"}"#);
+    session
+        .write_line(r#"{"type":"set_model","id":"model-1","provider":"faux","modelId":"faux-1"}"#);
     let (_events, model) = session.read_until(deadline, |line| {
         is_response(line) && line.get("id").and_then(Value::as_str) == Some("model-1")
     });
@@ -888,7 +903,10 @@ fn mode_model_and_follow_up_controls_round_trip() {
     });
     assert_success(&think, "cycle_thinking_level", "cycle-think");
     assert!(
-        think["data"].get("requested").and_then(Value::as_str).is_some()
+        think["data"]
+            .get("requested")
+            .and_then(Value::as_str)
+            .is_some()
             || think["data"].is_null(),
         "cycle_thinking_level must report the requested level: {think}"
     );
@@ -947,12 +965,16 @@ fn loop_cancel_removes_scheduled_task() {
     });
     assert_success(&empty, "loop_list", "loop-cancel-after");
     assert!(
-        empty["data"].as_array().expect("empty loop list").is_empty(),
+        empty["data"]
+            .as_array()
+            .expect("empty loop list")
+            .is_empty(),
         "cancelled loop must leave the list empty: {empty}"
     );
 
     // Unknown task id: cancel reports false rather than failing the wire.
-    session.write_line(r#"{"type":"loop_cancel","id":"loop-cancel-unknown","taskId":"no-such-task"}"#);
+    session
+        .write_line(r#"{"type":"loop_cancel","id":"loop-cancel-unknown","taskId":"no-such-task"}"#);
     let (_events, unknown) = session.read_until(deadline, |line| {
         is_response(line) && line.get("id").and_then(Value::as_str) == Some("loop-cancel-unknown")
     });
@@ -1035,6 +1057,16 @@ fn workflow_commands_wire_lifecycle_on_isolated_repo() {
     while created.is_none() || !saw_workflow_event {
         let value = session.read_json_deadline(deadline);
         if is_response(&value) && value.get("id").and_then(Value::as_str) == Some("wf-create") {
+            // A failed create never emits a workflow event; surface the
+            // already-redacted wire error immediately instead of stalling
+            // until the deadline waiting for an event that will never come.
+            if value.get("success") == Some(&Value::Bool(false)) {
+                let error = value
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("(no error field)");
+                panic!("workflow_create failed on the wire: {error}");
+            }
             created = Some(value.clone());
         }
         if matches!(
@@ -1051,10 +1083,7 @@ fn workflow_commands_wire_lifecycle_on_isolated_repo() {
         .expect("workflow id")
         .to_owned();
     assert_eq!(created["data"]["name"], "ship");
-    assert_eq!(
-        created["data"]["objective"],
-        "land the workflow foundation"
-    );
+    assert_eq!(created["data"]["objective"], "land the workflow foundation");
     assert!(
         created["data"]["worktree"]
             .as_str()
@@ -1072,8 +1101,7 @@ fn workflow_commands_wire_lifecycle_on_isolated_repo() {
     });
     assert_success(&listed, "workflow_list", "wf-list");
     assert_eq!(
-        listed["data"]["workflows"][0]["workflowId"],
-        workflow_id,
+        listed["data"]["workflows"][0]["workflowId"], workflow_id,
         "workflow_list must include the created workflow: {listed}"
     );
 
@@ -1085,8 +1113,7 @@ fn workflow_commands_wire_lifecycle_on_isolated_repo() {
     });
     assert_success(&by_id, "workflow_get", "wf-get-id");
     assert_eq!(
-        by_id["data"]["objective"],
-        "land the workflow foundation",
+        by_id["data"]["objective"], "land the workflow foundation",
         "workflow_get by id: {by_id}"
     );
 
@@ -1096,12 +1123,12 @@ fn workflow_commands_wire_lifecycle_on_isolated_repo() {
     });
     assert_success(&by_name, "workflow_get", "wf-get-name");
     assert_eq!(
-        by_name["data"]["workflowId"],
-        workflow_id,
+        by_name["data"]["workflowId"], workflow_id,
         "workflow_get by name: {by_name}"
     );
 
-    session.write_line(r#"{"type":"workflow_get","id":"wf-get-unknown","workflowId":"missing-wf"}"#);
+    session
+        .write_line(r#"{"type":"workflow_get","id":"wf-get-unknown","workflowId":"missing-wf"}"#);
     let (_events, unknown) = session.read_until(deadline, |line| {
         is_response(line) && line.get("id").and_then(Value::as_str) == Some("wf-get-unknown")
     });
@@ -1122,15 +1149,11 @@ fn workflow_commands_wire_lifecycle_on_isolated_repo() {
     });
     assert_success(&detail, "workflow_detail", "wf-detail");
     assert_eq!(
-        detail["data"]["id"],
-        workflow_id,
+        detail["data"]["id"], workflow_id,
         "workflow_detail must echo the workflow id: {detail}"
     );
     assert_eq!(detail["data"]["name"], "ship");
-    assert_eq!(
-        detail["data"]["objective"],
-        "land the workflow foundation"
-    );
+    assert_eq!(detail["data"]["objective"], "land the workflow foundation");
     let detail_status = detail["data"]["status"]
         .as_str()
         .expect("workflow_detail status");
@@ -1250,11 +1273,7 @@ export default function (pi) {
     .expect("extension entry");
 
     let extension_arg = extension.path().to_string_lossy().to_owned();
-    let mut session = RpcSession::spawn_with(
-        &["--extension", &extension_arg],
-        &[],
-        None,
-    );
+    let mut session = RpcSession::spawn_with(&["--extension", &extension_arg], &[], None);
     let deadline = Instant::now() + Duration::from_secs(60);
 
     // The process must reach the RPC loop with the extension loaded before the
@@ -1300,10 +1319,7 @@ export default function (pi) {
                 Some("input") if input_request.is_none() => {
                     let request = value.clone();
                     assert_eq!(request["title"], "Name");
-                    let request_id = request["id"]
-                        .as_str()
-                        .expect("input request id")
-                        .to_owned();
+                    let request_id = request["id"].as_str().expect("input request id").to_owned();
                     input_request = Some(request);
                     session.write_line(&format!(
                         r#"{{"type":"extension_ui_response","id":"{request_id}","value":"rpc-answer"}}"#
@@ -1336,12 +1352,7 @@ export default function (pi) {
     let (_events, unknown) = session.read_until(deadline, |line| {
         is_response(line) && line["command"] == "extension_ui_response" && line["success"] == false
     });
-    assert_failure(
-        &unknown,
-        "extension_ui_response",
-        None,
-        "no such request",
-    );
+    assert_failure(&unknown, "extension_ui_response", None, "no such request");
 
     // The connection stays usable.
     session.write_line(r#"{"type":"get_state","id":"ui-after"}"#);

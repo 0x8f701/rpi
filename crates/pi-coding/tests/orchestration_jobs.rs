@@ -3,32 +3,40 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use parking_lot::Mutex;
 use pi_agent::{AbortController, AgentTool, ThinkingLevel, ToolCallContext};
 use pi_ai::{ContentBlock, Model, StopReason, ToolCall, Usage};
 use pi_coding::{
     AgentCatalog, AgentDefinition, AgentDefinitionSource, ChildSessionFactory, JobSnapshot,
     JobStatus, OrchestrationConfig, OrchestrationRuntime, Session, SessionOptions, TaskSpawn,
 };
-use parking_lot::Mutex;
 use serde_json::{Value, json};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 fn definition() -> AgentDefinition {
-    AgentDefinition { name: "task".to_owned(),
-    description: "background task".to_owned(),
-    system_prompt: "complete the assignment".to_owned(),
-    tools: Some(Vec::new()),
-    autoload_skills: Vec::new(),
-    model: None,
-    thinking_level: Some(ThinkingLevel::Off),
-    max_turns: None,
-    max_tool_calls: None,
-    timeout_secs: None,
-    disallowed_tools: Vec::new(),
-    capability_ceiling: None,
-    source: AgentDefinitionSource::Bundled,
-    path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None }
+    AgentDefinition {
+        name: "task".to_owned(),
+        description: "background task".to_owned(),
+        system_prompt: "complete the assignment".to_owned(),
+        tools: Some(Vec::new()),
+        autoload_skills: Vec::new(),
+        model: None,
+        thinking_level: Some(ThinkingLevel::Off),
+        max_turns: None,
+        max_tool_calls: None,
+        timeout_secs: None,
+        disallowed_tools: Vec::new(),
+        capability_ceiling: None,
+        source: AgentDefinitionSource::Bundled,
+        path: None,
+        trusted: true,
+        kind: pi_coding::AgentDefinitionKind::Agent,
+        personality: None,
+        soft_budget: None,
+        knowledge_roots: Vec::new(),
+        user_proxy: false,
+    }
 }
 
 struct ControlledRuntime {
@@ -85,7 +93,9 @@ fn controlled_runtime(artifact_dir: &std::path::Path, max_concurrency: usize) ->
                             aborted.fetch_add(1, Ordering::SeqCst);
                             message.stop_reason = StopReason::Aborted;
                         } else {
-                            message.content.push(pi_ai::ContentBlock::text("retained result"));
+                            message
+                                .content
+                                .push(pi_ai::ContentBlock::text("retained result"));
                             message.stop_reason = StopReason::Stop;
                         }
                         producer.end(Some(message)).await;
@@ -106,13 +116,12 @@ fn controlled_runtime(artifact_dir: &std::path::Path, max_concurrency: usize) ->
                 after_tool_call: None,
                 stream_fn: Some(stream_fn),
                 auth_resolver: None,
+                auth_manager: None,
             })
         })
     });
-    let mut config = OrchestrationConfig::new(
-        AgentCatalog::from_agents(vec![definition()]),
-        artifact_dir,
-    );
+    let mut config =
+        OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition()]), artifact_dir);
     config.max_concurrency = max_concurrency;
     config.idle_ttl = None;
     config.parent_model = Model {
@@ -163,15 +172,11 @@ fn context(id: &str, arguments: Value) -> ToolCallContext {
         on_update: Arc::new(|_| {}),
         abort,
         model: None,
+        approval_token: None,
     }
 }
 
-async fn wait_for_count(
-    count: &AtomicUsize,
-    notify: &Notify,
-    expected: usize,
-    description: &str,
-) {
+async fn wait_for_count(count: &AtomicUsize, notify: &Notify, expected: usize, description: &str) {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let notified = notify.notified();
@@ -227,8 +232,18 @@ async fn task_returns_before_completion_and_hub_retains_job_results() {
         .expect("hub jobs");
     let jobs: Vec<JobSnapshot> =
         serde_json::from_value(jobs_result.details["jobs"].clone()).expect("job snapshots");
-    assert_eq!(jobs.iter().filter(|job| job.status == JobStatus::Running).count(), 1);
-    assert_eq!(jobs.iter().filter(|job| job.status == JobStatus::Queued).count(), 1);
+    assert_eq!(
+        jobs.iter()
+            .filter(|job| job.status == JobStatus::Running)
+            .count(),
+        1
+    );
+    assert_eq!(
+        jobs.iter()
+            .filter(|job| job.status == JobStatus::Queued)
+            .count(),
+        1
+    );
     assert_eq!(controlled.peak.load(Ordering::SeqCst), 1);
 
     let running = jobs
@@ -252,7 +267,10 @@ async fn task_returns_before_completion_and_hub_retains_job_results() {
         serde_json::from_value(timed_out.details["jobs"].clone()).expect("timed snapshots");
     assert_eq!(timed_jobs.len(), 1);
     assert_eq!(timed_jobs[0].status, JobStatus::Running);
-    assert_eq!(controlled.runtime.inbox("Main", true).len(), 1);
+    assert_eq!(
+        controlled.runtime.inbox("Main", true).expect("inbox").len(),
+        1
+    );
 
     let mut wait = Box::pin((hub.execute)(context(
         "wait-job",
@@ -272,7 +290,11 @@ async fn task_returns_before_completion_and_hub_retains_job_results() {
         .expect("hub wait result");
     let waited_jobs: Vec<JobSnapshot> =
         serde_json::from_value(waited.details["jobs"].clone()).expect("waited jobs");
-    assert!(waited_jobs.iter().any(|job| job.status == JobStatus::Completed));
+    assert!(
+        waited_jobs
+            .iter()
+            .any(|job| job.status == JobStatus::Completed)
+    );
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -287,16 +309,28 @@ async fn task_returns_before_completion_and_hub_retains_job_results() {
     let retained_result = (hub.execute)(context("jobs-retained", json!({ "op": "jobs" })))
         .await
         .expect("retained hub jobs");
-    let retained: Vec<JobSnapshot> = serde_json::from_value(retained_result.details["jobs"].clone())
-        .expect("retained snapshots");
+    let retained: Vec<JobSnapshot> =
+        serde_json::from_value(retained_result.details["jobs"].clone())
+            .expect("retained snapshots");
     assert_eq!(retained.len(), 2);
-    assert!(retained.iter().all(|job| job.status == JobStatus::Completed));
+    assert!(
+        retained
+            .iter()
+            .all(|job| job.status == JobStatus::Completed)
+    );
     assert!(retained.iter().all(|job| {
         job.result.as_ref().is_some_and(|result| {
             result.output == format!("retained result\n\n{}", pi_coding::MISSING_YIELD_WARNING)
         })
     }));
-    assert_eq!(controlled.runtime.inbox("Main", false).len(), 1);
+    assert_eq!(
+        controlled
+            .runtime
+            .inbox("Main", false)
+            .expect("inbox")
+            .len(),
+        1
+    );
     assert_eq!(controlled.peak.load(Ordering::SeqCst), 1);
 
     controlled.runtime.shutdown().await;
@@ -462,6 +496,7 @@ async fn cancellation_settles_when_child_stream_ignores_abort() {
                 after_tool_call: None,
                 stream_fn: Some(stream_fn),
                 auth_resolver: None,
+                auth_manager: None,
             })
         })
     });
@@ -488,7 +523,10 @@ async fn cancellation_settles_when_child_stream_ignores_abort() {
         .remove(0);
     wait_for_count(&started_count, &started, 1, "abort-ignoring child").await;
 
-    assert_eq!(runtime.cancel_jobs(std::slice::from_ref(&spawn.job_id)), vec![spawn.job_id.clone()]);
+    assert_eq!(
+        runtime.cancel_jobs(std::slice::from_ref(&spawn.job_id)),
+        vec![spawn.job_id.clone()]
+    );
     let jobs = tokio::time::timeout(
         Duration::from_secs(4),
         runtime.wait_jobs(std::slice::from_ref(&spawn.job_id), None, None),
@@ -499,9 +537,10 @@ async fn cancellation_settles_when_child_stream_ignores_abort() {
     assert_eq!(jobs[0].status, JobStatus::Cancelled);
     assert!(jobs[0].result.as_ref().is_some_and(|result| {
         result.status == pi_coding::AgentStatus::Aborted
-            && result.error.as_deref().is_some_and(|error| {
-                error.contains("cancellation timed out after 2s")
-            })
+            && result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("cancellation timed out after 2s"))
     }));
     assert_eq!(runtime.active_child_count(), 0);
 
@@ -555,7 +594,10 @@ async fn failed_artifact_write_does_not_publish_artifact_alias() {
         .expect("job wait");
     assert_eq!(jobs[0].status, JobStatus::Failed);
     assert!(jobs[0].result.as_ref().is_some_and(|result| {
-        result.error.as_deref().is_some_and(|error| error.contains("writing subagent artifact"))
+        result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("writing subagent artifact"))
     }));
     let snapshot = controlled
         .runtime
@@ -564,13 +606,23 @@ async fn failed_artifact_write_does_not_publish_artifact_alias() {
         .find(|agent| agent.id == "ArtifactFailure")
         .expect("agent snapshot");
     assert_eq!(snapshot.artifact_ref, None);
-    assert_eq!(snapshot.history_ref.as_deref(), Some("history://ArtifactFailure"));
-    assert!(controlled.runtime.resolve_agent_reference("ArtifactFailure").is_err());
-    assert!(controlled
-        .runtime
-        .resolve_history_reference("ArtifactFailure")
-        .expect("history alias")
-        .is_file());
+    assert_eq!(
+        snapshot.history_ref.as_deref(),
+        Some("history://ArtifactFailure")
+    );
+    assert!(
+        controlled
+            .runtime
+            .resolve_agent_reference("ArtifactFailure")
+            .is_err()
+    );
+    assert!(
+        controlled
+            .runtime
+            .resolve_history_reference("ArtifactFailure")
+            .expect("history alias")
+            .is_file()
+    );
 
     controlled.runtime.shutdown().await;
 }
@@ -602,7 +654,13 @@ async fn workflow_job_projection_tracks_running_and_terminal_status() {
         )
         .expect("spawn")
         .remove(0);
-    wait_for_count(&controlled.current, &controlled.started, 1, "scoped worker running").await;
+    wait_for_count(
+        &controlled.current,
+        &controlled.started,
+        1,
+        "scoped worker running",
+    )
+    .await;
     let running = controlled.runtime.workflow_jobs("alpha", 4);
     assert_eq!(running.len(), 1);
     assert_eq!(running[0].job.id, spawn.job_id);
@@ -637,7 +695,9 @@ async fn shared_workflow_gate_bounds_two_independent_runtimes() {
         .runtime
         .set_global_concurrency_gate(global.clone())
         .expect("alpha gate");
-    beta.runtime.set_global_concurrency_gate(global).expect("beta gate");
+    beta.runtime
+        .set_global_concurrency_gate(global)
+        .expect("beta gate");
     alpha
         .runtime
         .set_workflow_scope(pi_coding::WorkflowRuntimeScope {
@@ -685,10 +745,14 @@ async fn shared_workflow_gate_bounds_two_independent_runtimes() {
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let running = alpha.current.load(Ordering::SeqCst) + beta.current.load(Ordering::SeqCst);
-            let queued = alpha.runtime.jobs(None).iter().chain(beta.runtime.jobs(None).iter()).any(
-                |job| job.status == JobStatus::Queued,
-            );
+            let running =
+                alpha.current.load(Ordering::SeqCst) + beta.current.load(Ordering::SeqCst);
+            let queued = alpha
+                .runtime
+                .jobs(None)
+                .iter()
+                .chain(beta.runtime.jobs(None).iter())
+                .any(|job| job.status == JobStatus::Queued);
             if running == 1 && queued {
                 break;
             }
@@ -697,24 +761,39 @@ async fn shared_workflow_gate_bounds_two_independent_runtimes() {
     })
     .await
     .expect("one globally running worker and one queued worker");
-    assert_eq!(alpha.current.load(Ordering::SeqCst) + beta.current.load(Ordering::SeqCst), 1);
     assert_eq!(
-        alpha.runtime.workflow_jobs("alpha", 1)[0].todo_task_id.as_deref(),
+        alpha.current.load(Ordering::SeqCst) + beta.current.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        alpha.runtime.workflow_jobs("alpha", 1)[0]
+            .todo_task_id
+            .as_deref(),
         Some("alpha-root")
     );
     assert_eq!(
-        beta.runtime.workflow_jobs("beta", 1)[0].todo_task_id.as_deref(),
+        beta.runtime.workflow_jobs("beta", 1)[0]
+            .todo_task_id
+            .as_deref(),
         Some("beta-root")
     );
 
     release.cancel();
     alpha
         .runtime
-        .wait_jobs(&[alpha_spawn[0].job_id.clone()], Some(Duration::from_secs(2)), None)
+        .wait_jobs(
+            &[alpha_spawn[0].job_id.clone()],
+            Some(Duration::from_secs(2)),
+            None,
+        )
         .await
         .expect("alpha settled");
     beta.runtime
-        .wait_jobs(&[beta_spawn[0].job_id.clone()], Some(Duration::from_secs(2)), None)
+        .wait_jobs(
+            &[beta_spawn[0].job_id.clone()],
+            Some(Duration::from_secs(2)),
+            None,
+        )
         .await
         .expect("beta settled");
     alpha.runtime.shutdown().await;
@@ -781,8 +860,18 @@ async fn roster_keeps_waiting_child_queued_until_permit_acquired() {
             .map(|spawn| spawn.job_id.clone())
             .collect::<Vec<_>>(),
     ));
-    assert_eq!(jobs.iter().filter(|job| job.status == JobStatus::Running).count(), 1);
-    assert_eq!(jobs.iter().filter(|job| job.status == JobStatus::Queued).count(), 1);
+    assert_eq!(
+        jobs.iter()
+            .filter(|job| job.status == JobStatus::Running)
+            .count(),
+        1
+    );
+    assert_eq!(
+        jobs.iter()
+            .filter(|job| job.status == JobStatus::Queued)
+            .count(),
+        1
+    );
 
     controlled.release.cancel();
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -930,8 +1019,14 @@ async fn concurrent_duplicate_names_do_not_collide() {
     ids.sort();
     let mut unique = ids.clone();
     unique.dedup();
-    assert_eq!(ids, unique, "concurrent allocations must be unique: {ids:?}");
-    assert!(ids.contains(&"shared".to_owned()), "base name must be used once");
+    assert_eq!(
+        ids, unique,
+        "concurrent allocations must be unique: {ids:?}"
+    );
+    assert!(
+        ids.contains(&"shared".to_owned()),
+        "base name must be used once"
+    );
     assert!(
         ids.iter().any(|id| id.starts_with("shared_")),
         "collisions must receive _N suffixes: {ids:?}"
@@ -1070,9 +1165,7 @@ async fn hub_send_by_job_uuid_reaches_canonical_mailbox_once() {
     ))
     .await
     .expect("hub send by job uuid");
-    let receipts = send.details["receipts"]
-        .as_array()
-        .expect("receipts array");
+    let receipts = send.details["receipts"].as_array().expect("receipts array");
     assert_eq!(receipts.len(), 1);
     assert_eq!(receipts[0]["to"], agent_id);
     assert_eq!(receipts[0]["requested"], job_id);
@@ -1086,19 +1179,34 @@ async fn hub_send_by_job_uuid_reaches_canonical_mailbox_once() {
     // draining the canonical mailbox; poll until it does, matching the post-ack
     // inbox-empty check in `running_child_observes_mid_run_steering_exactly_once`.
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !controlled.runtime.inbox(&agent_id, true).is_empty() {
+        while !controlled
+            .runtime
+            .inbox(&agent_id, true)
+            .expect("inbox")
+            .is_empty()
+        {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("active delivery must drain the canonical mailbox after ack");
     assert!(
-        controlled.runtime.inbox(&agent_id, true).is_empty(),
+        controlled
+            .runtime
+            .inbox(&agent_id, true)
+            .expect("inbox")
+            .is_empty(),
         "active delivery must not leave a canonical mailbox duplicate"
     );
+    let job_inbox_error = controlled
+        .runtime
+        .inbox(&job_id, true)
+        .expect_err("job uuid is not an agent mailbox");
     assert!(
-        controlled.runtime.inbox(&job_id, true).is_empty(),
-        "job uuid must not be a separate mailbox"
+        job_inbox_error
+            .to_string()
+            .contains("unknown orchestration agent"),
+        "job uuid must not resolve as a separate mailbox: {job_inbox_error:#}"
     );
 
     // Settled retained job UUID still resolves to the retained agent.
@@ -1114,9 +1222,7 @@ async fn hub_send_by_job_uuid_reaches_canonical_mailbox_once() {
     .await
     .expect("child settled");
 
-    let retained_jobs = controlled
-        .runtime
-        .jobs(Some(std::slice::from_ref(&job_id)));
+    let retained_jobs = controlled.runtime.jobs(Some(std::slice::from_ref(&job_id)));
     assert_eq!(retained_jobs.len(), 1);
     assert!(retained_jobs[0].status.is_settled());
 
@@ -1137,13 +1243,16 @@ async fn hub_send_by_job_uuid_reaches_canonical_mailbox_once() {
     assert_eq!(retained_receipts[0]["to"], agent_id);
     assert_eq!(retained_receipts[0]["requested"], job_id);
     assert!(
-        retained_receipts[0]["error"].is_null()
-            || retained_receipts[0].get("error").is_none(),
+        retained_receipts[0]["error"].is_null() || retained_receipts[0].get("error").is_none(),
         "retained job uuid must still resolve: {}",
         retained_receipts[0]
     );
     assert_eq!(
-        controlled.runtime.inbox(&agent_id, true).len(),
+        controlled
+            .runtime
+            .inbox(&agent_id, true)
+            .expect("inbox")
+            .len(),
         1,
         "only the post-settlement delivery remains in the mailbox"
     );
@@ -1202,14 +1311,31 @@ async fn hub_await_reply_from_tracks_canonical_agent_after_job_uuid_send() {
     )
     .await;
 
-    // Child replies to Main; await-from must match canonical agent id even when
-    // the original send targeted the job UUID.
+    // Awaited replies must match both the canonical agent id and the exact
+    // outbound message id in replyTo. Uncorrelated chatter from the right
+    // sender must remain in Main's mailbox.
     let reply_body = "pong-from-child";
     let runtime = controlled.runtime.clone();
     let agent_for_reply = agent_id.clone();
     let reply_task = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(30)).await;
-        runtime.send(&agent_for_reply, "Main", reply_body, None)
+        let outbound_id = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(message) = runtime
+                    .delivered_messages()
+                    .into_iter()
+                    .find(|message| message.to == agent_for_reply && message.body == "ping")
+                {
+                    break message.id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("outbound request is durably logged before await");
+        let unrelated = runtime.send(&agent_for_reply, "Main", "uncorrelated chatter", None);
+        let correlated = runtime.send(&agent_for_reply, "Main", reply_body, Some(outbound_id));
+        (unrelated, correlated)
     });
 
     let awaited = (hub.execute)(context(
@@ -1225,7 +1351,8 @@ async fn hub_await_reply_from_tracks_canonical_agent_after_job_uuid_send() {
     .await
     .expect("await reply after job uuid send");
 
-    let reply_receipts = reply_task.await.expect("reply join");
+    let (unrelated_receipts, reply_receipts) = reply_task.await.expect("reply join");
+    assert!(unrelated_receipts[0].error.is_none());
     assert!(reply_receipts[0].error.is_none());
 
     let text = awaited
@@ -1243,6 +1370,16 @@ async fn hub_await_reply_from_tracks_canonical_agent_after_job_uuid_send() {
     assert!(
         !text.contains("No reply from"),
         "await must not time out when child replied as agent id: {text}"
+    );
+    let leftover = controlled
+        .runtime
+        .inbox("Main", true)
+        .expect("peek Main inbox");
+    assert!(
+        leftover
+            .iter()
+            .any(|message| message.body == "uncorrelated chatter"),
+        "right-sender mail without matching replyTo must remain queued: {leftover:?}"
     );
 
     controlled.release.cancel();
@@ -1339,13 +1476,12 @@ fn scripted_runtime(
                 after_tool_call: None,
                 stream_fn: Some(stream_fn),
                 auth_resolver: None,
+                auth_manager: None,
             })
         })
     });
-    let mut config = OrchestrationConfig::new(
-        AgentCatalog::from_agents(vec![definition()]),
-        artifact_dir,
-    );
+    let mut config =
+        OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition()]), artifact_dir);
     config.idle_ttl = None;
     config.soft_budget = budget;
     config.parent_model = Model {
@@ -1376,11 +1512,7 @@ async fn spawn_and_settle(runtime: &OrchestrationRuntime, name: &str) -> JobSnap
         .expect("spawn details")
         .remove(0);
     let jobs = runtime
-        .wait_jobs(
-            &[spawn.job_id],
-            Some(Duration::from_secs(5)),
-            None,
-        )
+        .wait_jobs(&[spawn.job_id], Some(Duration::from_secs(5)), None)
         .await
         .expect("child settlement");
     assert_eq!(jobs.len(), 1);
@@ -1405,12 +1537,29 @@ async fn soft_budget_yield_after_settles_with_marker_not_failed() {
     let job = spawn_and_settle(&runtime, "YieldChild").await;
 
     // The child yielded after its second request: partial output, not Failed.
-    assert_eq!(job.status, JobStatus::Completed, "yield must not fail the job");
-    assert!(job.soft_budget_exhausted, "job snapshot must carry the soft-limit marker");
+    assert_eq!(
+        job.status,
+        JobStatus::Completed,
+        "yield must not fail the job"
+    );
+    assert!(
+        job.soft_budget_exhausted,
+        "job snapshot must carry the soft-limit marker"
+    );
     let result = job.result.as_ref().expect("settled result");
-    assert!(result.soft_budget_exhausted, "task result must carry the soft-limit marker");
-    assert!(result.error.is_none(), "yield must not be an error: {:?}", result.error);
-    assert_eq!(result.output, "second", "partial output from the yield turn");
+    assert!(
+        result.soft_budget_exhausted,
+        "task result must carry the soft-limit marker"
+    );
+    assert!(
+        result.error.is_none(),
+        "yield must not be an error: {:?}",
+        result.error
+    );
+    assert_eq!(
+        result.output, "second",
+        "partial output from the yield turn"
+    );
 
     runtime.shutdown().await;
 }
@@ -1432,16 +1581,28 @@ async fn soft_budget_max_requests_caps_child_turns() {
     );
     let job = spawn_and_settle(&runtime, "CappedChild").await;
 
-    assert_eq!(job.status, JobStatus::Completed, "cap must not fail the job");
+    assert_eq!(
+        job.status,
+        JobStatus::Completed,
+        "cap must not fail the job"
+    );
     assert!(job.soft_budget_exhausted);
     let result = job.result.as_ref().expect("settled result");
     assert!(result.soft_budget_exhausted);
-    assert!(result.error.is_none(), "cap must not be an error: {:?}", result.error);
-    assert_eq!(result.output, "first", "child stopped after its single allowed request");
+    assert!(
+        result.error.is_none(),
+        "cap must not be an error: {:?}",
+        result.error
+    );
+    assert_eq!(
+        result.output, "first",
+        "child stopped after its single allowed request"
+    );
     // Only one assistant request was consumed: the remaining scripted turns
     // were never streamed.
     assert_eq!(
-        job.result.as_ref().expect("result").usage.total_tokens, 0,
+        job.result.as_ref().expect("result").usage.total_tokens,
+        0,
         "no further turns ran"
     );
 
@@ -1477,12 +1638,23 @@ async fn soft_budget_max_tokens_yields_on_usage_accumulation() {
     );
     let job = spawn_and_settle(&runtime, "TokenCappedChild").await;
 
-    assert_eq!(job.status, JobStatus::Completed, "token cap must not fail the job");
+    assert_eq!(
+        job.status,
+        JobStatus::Completed,
+        "token cap must not fail the job"
+    );
     assert!(job.soft_budget_exhausted);
     let result = job.result.as_ref().expect("settled result");
     assert!(result.soft_budget_exhausted);
-    assert!(result.error.is_none(), "token cap must not be an error: {:?}", result.error);
-    assert_eq!(result.output, "first", "child yielded once its first turn crossed the cap");
+    assert!(
+        result.error.is_none(),
+        "token cap must not be an error: {:?}",
+        result.error
+    );
+    assert_eq!(
+        result.output, "first",
+        "child yielded once its first turn crossed the cap"
+    );
     // Accumulated usage from the streamed turns is preserved in the result.
     assert_eq!(result.usage.total_tokens, 5_000);
 
@@ -1522,8 +1694,14 @@ async fn soft_budget_max_tokens_accumulates_across_turns_before_yielding() {
     assert!(job.soft_budget_exhausted);
     let result = job.result.as_ref().expect("settled result");
     assert!(result.soft_budget_exhausted);
-    assert_eq!(result.output, "second", "cap crossed only after the second turn");
-    assert_eq!(result.usage.total_tokens, 4_000, "both streamed turns reported usage");
+    assert_eq!(
+        result.output, "second",
+        "cap crossed only after the second turn"
+    );
+    assert_eq!(
+        result.usage.total_tokens, 4_000,
+        "both streamed turns reported usage"
+    );
 
     runtime.shutdown().await;
 }
@@ -1543,7 +1721,10 @@ async fn soft_budget_unlimited_default_runs_to_completion() {
     let job = spawn_and_settle(&runtime, "UnlimitedChild").await;
 
     assert_eq!(job.status, JobStatus::Completed);
-    assert!(!job.soft_budget_exhausted, "default budget must not mark the job");
+    assert!(
+        !job.soft_budget_exhausted,
+        "default budget must not mark the job"
+    );
     let result = job.result.as_ref().expect("settled result");
     assert!(!result.soft_budget_exhausted);
     assert!(result.error.is_none(), "{:?}", result.error);

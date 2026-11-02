@@ -15,9 +15,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::{
-    ApplicationEvent, JobStatus, OrchestrationConcurrencyGate, OrchestrationEvent,
-    TodoApplyResult, TodoDagExecutionOutcome, TodoDagExecutionStatus, TodoOp, TodoState,
-    WorkflowRuntimeScope,
+    ApplicationEvent, JobStatus, OrchestrationConcurrencyGate, OrchestrationEvent, TodoApplyResult,
+    TodoDagExecutionOutcome, TodoDagExecutionStatus, TodoOp, TodoState, WorkflowRuntimeScope,
 };
 
 use super::{WorkflowStatus, WorkflowTaskOwnership};
@@ -27,27 +26,34 @@ const SUPERVISOR_CHANNEL_CAPACITY: usize = 64;
 const SUPERVISOR_ACTIVITY_CAP: usize = 12;
 /// Bound on a single activity entry's display text.
 const SUPERVISOR_ACTIVITY_TEXT_CAP: usize = 240;
-/// Maximum assistant turns in one bounded planning prompt (P0-1). The inner
+/// Maximum assistant turns in one bounded planning prompt. The inner
 /// agent run is unbounded at the session layer, so the workflow imposes its
 /// own budget: a correcting model must never keep the workflow in Planning by
 /// looping forever. When the budget is reached the workflow settles from the
 /// canonical Todo state instead of waiting for the run to end.
 const PLANNING_MAX_TURNS: usize = 8;
-/// Maximum Todo/tool calls in one bounded planning prompt (P0-1).
+/// Maximum Todo/tool calls in one bounded planning prompt.
 const PLANNING_MAX_TOOL_CALLS: usize = 16;
-/// Default wall-clock budget for one planning prompt (P0-1). The actor aborts
+/// Default wall-clock budget for one planning prompt. The actor aborts
 /// the in-flight prompt when the budget expires and settles from the
 /// canonical Todo state.
 const PLANNING_DEFAULT_DEADLINE: Duration = Duration::from_secs(90);
 /// Identical failed Todo operations with no Todo-state change that terminate
-/// planning as non-converging (P1-2).
+/// planning as non-converging.
 const PLANNING_IDENTICAL_FAILED_OP_LIMIT: usize = 3;
-/// Total Todo corrections with no Todo-state change that terminate planning
-/// (P1-2). The counter tolerates varying IDs/error text that the session
+/// Total Todo corrections with no Todo-state change that terminate planning.
+/// The counter tolerates varying IDs/error text that the session
 /// doom-loop detector cannot see.
 const PLANNING_CORRECTIONS_WITHOUT_PROGRESS_LIMIT: usize = 6;
+/// Maximum planning prompts in one planning phase: the initial turn plus
+/// exactly one corrective feedback turn when that first turn produced no
+/// committed typed Todo plan.
+const PLANNING_MAX_PROMPTS: usize = 2;
+const _: () = assert!(PLANNING_MAX_PROMPTS == 2);
 
-/// Typed outcome of one bounded planning prompt (P0-1). Replaces the
+
+
+/// Typed outcome of one bounded planning prompt. Replaces the
 /// collapsed `Result<()>` so the supervisor can distinguish "the run ended
 /// naturally" from "a bound stopped it while a usable DAG was already
 /// committed" and act accordingly.
@@ -57,7 +63,7 @@ pub enum PlanningTurnOutcome {
     Completed,
     /// The run was terminated because a valid plan was committed — the first
     /// successful `todo init` — even though the model still had turns to
-    /// emit (P0-2). Planning ends on the committed plan, not on run end.
+    /// emit. Planning ends on the committed plan, not on run end.
     PlanCommitted,
     /// The run was stopped by the planning budget: assistant turns, tool
     /// calls, or semantic non-progress detection. `reason` names the bound.
@@ -66,9 +72,60 @@ pub enum PlanningTurnOutcome {
     TimedOut,
 }
 
+/// Stable planner identity stamped onto empty-plan failures. Names the
+/// model id and a coarse api/provider category so operators can tell which
+/// planner produced no typed Todo plan. Never includes prompt or user text.
+/// Each field is secret-redacted, control-stripped, and bounded before it
+/// can appear in a failure or event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannerIdentity {
+    /// Model id from the planning session (`gpt-4.1`, `workflow-…`, …).
+    pub model_id: String,
+    /// Coarse category: the model's `api` when set, otherwise its `provider`.
+    pub category: String,
+}
+
+/// Per-field bound on planner identity strings projected into failures.
+const PLANNER_IDENTITY_FIELD_CHARS: usize = 64;
+
+fn sanitize_planner_identity_field(value: &str) -> String {
+    let flattened: String = value.chars().filter(|ch| !ch.is_control()).collect();
+    crate::redact::redact_bounded(&flattened, PLANNER_IDENTITY_FIELD_CHARS)
+}
+
+impl PlannerIdentity {
+    /// Build a planner identity from raw model/api strings. Hostile,
+    /// secret-shaped, or unbounded values are redacted and truncated here
+    /// so they can never leak through a later `display()`.
+    #[must_use]
+    pub fn sanitized(model_id: impl Into<String>, category: impl Into<String>) -> Self {
+        Self {
+            model_id: sanitize_planner_identity_field(&model_id.into()),
+            category: sanitize_planner_identity_field(&category.into()),
+        }
+    }
+
+    /// Format as `model <id> (<category>)` when both fields are present,
+    /// falling back to whichever piece exists. Empty identity is `unknown`.
+    /// Display always re-sanitizes so a raw test/backend value cannot
+    /// inject controls, secrets, or unbounded text into a failure.
+    #[must_use]
+    pub fn display(&self) -> String {
+        let model_id = sanitize_planner_identity_field(&self.model_id);
+        let category = sanitize_planner_identity_field(&self.category);
+        match (model_id.is_empty(), category.is_empty()) {
+            (true, true) => "unknown".to_owned(),
+            (false, true) => format!("model {model_id}"),
+            (true, false) => format!("category {category}"),
+            (false, false) => format!("model {model_id} ({category})"),
+        }
+    }
+}
+
+
 /// Semantic fingerprint of one completed `todo` tool call during planning,
 /// forwarded alongside the display activity so the supervisor can detect
-/// non-progress loops that raw activity text cannot express (P1-2).
+/// non-progress loops that raw activity text cannot express.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkflowSupervisorTodoObservation {
     /// Normalized Todo operation name (`init`, `update_dependencies`, ...),
@@ -153,8 +210,10 @@ impl WorkflowSupervisorContract {
         format!(
             "You plan workflow {workflow_id}. Objective: {objective}\n\
              Work only in the current workflow Application cwd. During this planning phase, create the complete canonical Todo DAG \
-             exactly once with the todo tool, then stop. Do not delegate workers, modify files, wait on jobs, or keep refining \
-             after the plan is accepted. Use only task IDs returned by the todo tool (every task has a stable todoTaskId). \
+             exactly once with a typed todo init call (op=init with a non-empty list or items), then stop. \
+             Do not invent tasks in prose, parse the objective into tasks without the todo tool, delegate workers, modify files, \
+             wait on jobs, or keep refining after the plan is accepted. Use only task IDs returned by the todo tool \
+             (every task has a stable todoTaskId). \
              If the objective assigns work to a specific agent by name, PRESERVE that role as a typed routing contract: \
              pass an `agents` array in the matching todo init phase entry, parallel to `items` (agents[i] names the agent that \
              must execute items[i]), and also keep the agent's name in that task's content. Only use agents that are defined and \
@@ -172,16 +231,19 @@ impl WorkflowSupervisorContract {
         )
     }
 
-    /// Bounded continuation prompt for a planning turn that produced no Todo
-    /// tasks. Exactly one re-prompt is allowed before the workflow fails, so
-    /// a model that answered the first turn with plain text gets one chance
-    /// to build the plan instead of leaving the workflow stuck in Planning.
+    /// Bounded continuation prompt for a planning turn that produced no
+    /// committed typed Todo plan. Exactly one re-prompt is allowed before
+    /// the workflow fails, so a model that answered the first turn with
+    /// plain text gets one chance to call `todo init` instead of leaving
+    /// the workflow stuck in Planning. The prompt names the missing typed
+    /// plan and never restates the user objective.
     #[must_use]
     pub fn replan_prompt(&self) -> String {
         format!(
-            "The planning turn for workflow {workflow_id} produced no Todo tasks. \
-             This is the final attempt: call the todo tool now to create the complete canonical Todo DAG exactly once, then stop. \
-             Do not delegate workers, modify files, or keep refining after the plan is accepted. \
+            "The planning turn for workflow {workflow_id} produced no typed Todo plan. \
+             The missing artifact is a committed todo init (op=init with a non-empty list or items). \
+             This is the final attempt: call the todo tool now with op=init to create the complete canonical Todo DAG exactly once, then stop. \
+             Do not invent tasks in prose, parse the objective into tasks without the todo tool, delegate workers, modify files, or keep refining after the plan is accepted. \
              Use only task IDs returned by the todo tool. \
              Give every Todo task a single concise title of at most ~60 characters — a terse imperative phrase \
              (e.g. \"Bootstrap pi-zig sources\"), never a paragraph: the title is what the panel shows and \
@@ -194,9 +256,10 @@ impl WorkflowSupervisorContract {
             workflow_id = self.workflow_id,
         )
     }
+
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowSupervisorProjection {
     pub workflow_id: String,
@@ -216,7 +279,17 @@ pub struct WorkflowSupervisorProjection {
     /// Epoch millis when the current Planning phase started (None otherwise).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planning_started_at_ms: Option<u64>,
+    /// Planning prompts already consumed in this durable Planning phase.
+    /// Carried on the live projection so persist/restore can resume the 1+1
+    /// budget instead of resetting it. `0` is omitted on the wire.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub planning_prompts_consumed: usize,
 }
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -249,8 +322,40 @@ pub enum WorkflowSupervisorEvent {
 pub trait WorkflowSupervisorBackend: Send + Sync + 'static {
     fn todo_state(&self) -> TodoState;
     fn todo_dag_status(&self) -> TodoDagExecutionStatus;
+    fn todo_dag_failure_reason(&self) -> Option<crate::TodoDagFailureReason> {
+        None
+    }
+    /// Compose the workflow failure for a provider/run failure raised during
+    /// the planning turn. The production backend can stamp the planning
+    /// session's ground truth (provider id, endpoint, model id) onto the
+    /// failure so a generically-labeled provider error reaches the workflow
+    /// record and points users at the account/endpoint to fix directly
+    /// (e.g. a 402 Insufficient Balance reported as "OpenAI API error 402"
+    /// by an OpenAI-compatible endpoint such as deepseek). Default: relay
+    /// the message unchanged.
+    fn planning_failure_error(&self, message: &str) -> anyhow::Error {
+        anyhow!(message.to_owned())
+    }
+    /// Identity of the planner that will run (or just ran) a planning
+    /// prompt. Used to stamp empty-plan failures with model id and a coarse
+    /// api/provider category. Default: unknown, so lightweight test
+    /// backends keep working unless they opt in.
+    fn planner_identity(&self) -> PlannerIdentity {
+        PlannerIdentity::sanitized(String::new(), String::new())
+    }
+    /// Persist the spent planning-prompt count to the durable workflow
+    /// record and wait for acknowledgement before the next planner call.
+    /// Failure to persist fails planning without calling the model.
+    /// Production backends MUST override this; the default fails closed
+    /// so a missing implementation cannot silently skip durability.
+    async fn persist_planning_attempt(&self, _count: u8) -> Result<()> {
+        bail!("planning attempt persistence is not configured")
+    }
+
     fn workflow_jobs(&self, workflow_id: &str, generation: u64) -> Vec<crate::WorkflowJobSnapshot>;
-    fn inbox(&self, agent_id: &str, peek: bool) -> Vec<crate::MailboxMessage>;
+    fn inbox(&self, agent_id: &str, peek: bool) -> Result<Vec<crate::MailboxMessage>>;
+    /// Durable delivered-message history (newest-last), independent of mailbox consumption.
+    fn delivered_messages(&self) -> Result<Vec<crate::MailboxMessage>>;
     fn active_workflow_job_ids(&self, workflow_id: &str, generation: u64) -> Vec<String>;
     fn configure_workflow_runtime(
         &self,
@@ -260,14 +365,14 @@ pub trait WorkflowSupervisorBackend: Send + Sync + 'static {
     ) -> Result<()>;
     async fn prompt_supervisor(&self, prompt: String) -> Result<PlanningTurnOutcome>;
     async fn steer_supervisor(&self, message: String) -> Result<()>;
-    /// P0-C: validate the objective's explicit agent references against the
+    /// Validate the objective's explicit agent references against the
     /// workflow child catalog before any planning prompt runs. The default is
     /// a no-op so lightweight test backends keep working.
     fn validate_objective_agents(&self, _objective: &str) -> Result<()> {
         Ok(())
     }
     fn execute_todo_dag(&self) -> Result<TodoDagExecutionOutcome>;
-    /// Wall-clock budget for one planning prompt (P0-1). The actor aborts the
+    /// Wall-clock budget for one planning prompt. The actor aborts the
     /// in-flight prompt when the budget expires and settles from the
     /// canonical Todo state.
     fn planning_deadline(&self) -> Duration {
@@ -276,7 +381,7 @@ pub trait WorkflowSupervisorBackend: Send + Sync + 'static {
     /// Apply a canonical Todo operation through the workflow child. Used by
     /// the supervisor's execution-supervision to mark delegated tasks Done
     /// once their worker jobs complete (the DAG coordinator must never forge
-    /// workflow-owned completion, BUG-3).
+    /// workflow-owned completion).
     fn apply_todo(&self, op: TodoOp) -> Result<TodoApplyResult>;
     /// Re-evaluate an already armed Todo DAG (settle when every task is done,
     /// spawn newly ready dependents) without creating new execution intent.
@@ -308,6 +413,7 @@ impl WorkflowSupervisor {
             backend,
             global_concurrency,
             WorkflowStatus::Queued,
+            0,
         )
     }
 
@@ -316,6 +422,7 @@ impl WorkflowSupervisor {
         backend: Arc<B>,
         global_concurrency: OrchestrationConcurrencyGate,
         status: WorkflowStatus,
+        planning_prompts_consumed: u8,
     ) -> Result<Self>
     where
         B: WorkflowSupervisorBackend,
@@ -329,7 +436,13 @@ impl WorkflowSupervisor {
         ) {
             bail!("workflow supervisor cannot restore lifecycle status {status}");
         }
-        Self::spawn_with_status(contract, backend, global_concurrency, status)
+        Self::spawn_with_status(
+            contract,
+            backend,
+            global_concurrency,
+            status,
+            planning_prompts_consumed,
+        )
     }
 
     fn spawn_with_status<B>(
@@ -337,6 +450,7 @@ impl WorkflowSupervisor {
         backend: Arc<B>,
         global_concurrency: OrchestrationConcurrencyGate,
         status: WorkflowStatus,
+        planning_prompts_consumed: u8,
     ) -> Result<Self>
     where
         B: WorkflowSupervisorBackend,
@@ -350,6 +464,8 @@ impl WorkflowSupervisor {
             contract.max_concurrency,
             global_concurrency,
         )?;
+        let planning_prompts_consumed =
+            (planning_prompts_consumed as usize).min(PLANNING_MAX_PROMPTS);
         let projection = Arc::new(Mutex::new(project_backend(
             &contract,
             backend.as_ref(),
@@ -357,7 +473,8 @@ impl WorkflowSupervisor {
             None,
             &[],
             (status == WorkflowStatus::Planning).then(now_ms),
-        )));
+            planning_prompts_consumed,
+        )?));
         let (commands, receiver) = mpsc::channel(SUPERVISOR_CHANNEL_CAPACITY);
         let (events, _) = broadcast::channel(SUPERVISOR_CHANNEL_CAPACITY);
         let actor = SupervisorActor {
@@ -378,6 +495,7 @@ impl WorkflowSupervisor {
             corrections_without_progress: 0,
             activity: Vec::new(),
             planning_started_at_ms: (status == WorkflowStatus::Planning).then(now_ms),
+            planning_prompts_consumed,
         };
         tokio::spawn(actor.run(receiver));
         Ok(Self {
@@ -517,7 +635,7 @@ enum SupervisorRequest {
     },
     /// Semantic `todo` tool observation from the supervisor's own turn,
     /// delivered by the application forwarder for planning non-progress
-    /// detection (P1-2).
+    /// detection.
     TodoObservation {
         generation: u64,
         observation: WorkflowSupervisorTodoObservation,
@@ -537,7 +655,7 @@ struct SupervisorActor<B> {
     /// status at `Planning` until the turn completes.
     planning_in_flight: bool,
     /// True once the first successful `todo init` of the current planning
-    /// phase was observed (P0-2). A committed plan ends planning: the
+    /// phase was observed. A committed plan ends planning: the
     /// workflow moves to Running immediately while the model's run finishes
     /// its short grace.
     plan_committed: bool,
@@ -553,7 +671,7 @@ struct SupervisorActor<B> {
     planning_non_progress_reason: Option<String>,
     /// Hash of the canonical Todo state at the last observed Todo tool call
     /// (the "before" state of the next call). Todo-state change is the
-    /// decisive non-progress signal (P1-2).
+    /// decisive non-progress signal.
     last_todo_state_hash: Option<u64>,
     /// Fingerprint of the last failed Todo operation (op + target IDs +
     /// error prefix). Consecutive identical fingerprints with no Todo-state
@@ -568,7 +686,11 @@ struct SupervisorActor<B> {
     activity: Vec<WorkflowSupervisorActivity>,
     /// Epoch millis when the current Planning phase started (None otherwise).
     planning_started_at_ms: Option<u64>,
+    /// Restored `Planning` resumes from the durable count so a crash cannot
+    /// reset the 1+1 budget back to two full prompts.
+    planning_prompts_consumed: usize,
 }
+
 
 impl<B> SupervisorActor<B>
 where
@@ -670,8 +792,19 @@ where
                 match self.status {
                     WorkflowStatus::Paused => {
                         if self.todo_has_tasks() {
-                            if let Err(error) = self.backend.resume().await {
-                                return (Err(error), Vec::new());
+                            let outcome = match self.backend.resume().await {
+                                Ok(outcome) => outcome,
+                                Err(error) => return (Err(error), Vec::new()),
+                            };
+                            if outcome.status == TodoDagExecutionStatus::Failed {
+                                let message = outcome.failure_reason.map_or_else(
+                                    || {
+                                        "Todo executor failed without an actionable reason"
+                                            .to_owned()
+                                    },
+                                    |reason| reason.message().to_owned(),
+                                );
+                                return (self.fail(anyhow!(message)), Vec::new());
                             }
                             self.set_status(self.status_from_backend());
                             (Ok(Vec::new()), Vec::new())
@@ -710,10 +843,9 @@ where
                 if self.status == WorkflowStatus::Cancelled || is_terminal(self.status) {
                     return (Ok(Vec::new()), Vec::new());
                 }
-                let ids = self.backend.active_workflow_job_ids(
-                    &self.contract.workflow_id,
-                    self.contract.generation,
-                );
+                let ids = self
+                    .backend
+                    .active_workflow_job_ids(&self.contract.workflow_id, self.contract.generation);
                 let cancelled = match self.backend.cancel_jobs(&ids).await {
                     Ok(cancelled) => cancelled,
                     Err(error) => return (Err(error), Vec::new()),
@@ -774,11 +906,21 @@ where
                             self.suppress_abort_failure = false;
                             return (Ok(Vec::new()), Vec::new());
                         }
-                        return (self.fail(anyhow!(message.clone())), Vec::new());
+                        // A forwarded failure consumed while the planning
+                        // turn is in flight is the production path that
+                        // records a planning provider failure; it must carry
+                        // the backend's ground-truth context (provider id,
+                        // endpoint, model). Executor-phase failures keep
+                        // their exact reason.
+                        let error = if self.planning_in_flight {
+                            self.backend.planning_failure_error(message)
+                        } else {
+                            anyhow!(message.clone())
+                        };
+                        return (self.fail(error), Vec::new());
                     }
                     ApplicationEvent::Orchestration(OrchestrationEvent::JobUpdated {
-                        job,
-                        ..
+                        job, ..
                     }) if job
                         .workflow_id
                         .as_deref()
@@ -790,8 +932,7 @@ where
                         return (Ok(Vec::new()), Vec::new());
                     }
                     ApplicationEvent::Orchestration(OrchestrationEvent::JobUpdated {
-                        job,
-                        ..
+                        job, ..
                     }) => {
                         // Execution-supervision under the plan/execution phase
                         // split: planning ends when the plan is committed, so
@@ -799,30 +940,55 @@ where
                         // supervisor owns the canonical Todo DAG and marks
                         // each delegated task Done once its worker job
                         // completes (the DAG coordinator must never forge
-                        // workflow-owned completion — BUG-3). Reconcile so a
+                        // workflow-owned completion). Reconcile so a
                         // fully settled DAG transitions to Completed and
                         // newly ready dependents spawn.
                         if self.status == WorkflowStatus::Running
                             && !self.planning_in_flight
                             && job.status.is_settled()
                         {
-                            if job.status == JobStatus::Completed
-                                && !job.soft_budget_exhausted
-                                && let Some(task_id) = job.todo_task_id.clone()
-                            {
-                                let _ = self.backend.apply_todo(TodoOp::Done {
-                                    task: Some(task_id),
-                                    phase: None,
-                                });
-                            }
-                            // Soft-budget partial work stays open for the
-                            // parent's decision: the Todo task is never
-                            // marked Done and the DAG is not re-armed, so
-                            // dependents never advance on a partial result.
-                            if job.status != JobStatus::Completed
-                                || !job.soft_budget_exhausted
-                            {
-                                let _ = self.backend.reconcile_todo_dag();
+                            // Reject foreign/stale linkage: settle exactly
+                            // the authoritative workflow DAG node the job
+                            // owns. A mutation may have replaced the canonical
+                            // Todo DAG; a job whose `todo_task_id` is no longer
+                            // an open task in that DAG (or has none) must never
+                            // forge completion or rearm dependents — match by
+                            // the stable task id only, never by display name.
+                            let owned_open = job.todo_task_id.as_deref().is_some_and(|task_id| {
+                                self.backend
+                                    .todo_state()
+                                    .phases
+                                    .iter()
+                                    .flat_map(|phase| &phase.tasks)
+                                    .any(|task| {
+                                        task.id == task_id
+                                            && matches!(
+                                                task.status,
+                                                crate::TodoStatus::Pending
+                                                    | crate::TodoStatus::InProgress
+                                            )
+                                    })
+                            });
+                            if owned_open {
+                                if job.status == JobStatus::Completed
+                                    && !job.soft_budget_exhausted
+                                    && let Some(task_id) = job.todo_task_id.clone()
+                                {
+                                    let _ = self.backend.apply_todo(TodoOp::Done {
+                                        task: Some(task_id),
+                                        phase: None,
+                                    });
+                                }
+                                // Soft-budget partial work stays open for the
+                                // parent's decision: the Todo task is never
+                                // marked Done and the DAG is not re-armed, so
+                                // dependents never advance on a partial result.
+                                if job.status != JobStatus::Completed || !job.soft_budget_exhausted
+                                {
+                                    if let Err(error) = self.backend.reconcile_todo_dag() {
+                                        return (self.fail(error), Vec::new());
+                                    }
+                                }
                             }
                         }
                     }
@@ -859,139 +1025,177 @@ where
         }
     }
 
-    /// Runs the bounded planning flow: the initial planning prompt, then a
-    /// single re-prompt if it produced no Todo tasks. Every planning prompt
-    /// is itself bounded (assistant turns, tool calls, wall-clock deadline —
-    /// P0-1), and a committed plan ends planning immediately (P0-2). On any
-    /// bound with a valid canonical DAG the DAG is preserved and armed for
-    /// execution before the workflow moves to Running; with no committed
-    /// tasks the workflow fails naming the tripped bound. While a prompt is
-    /// awaited, `ApplicationEvent` commands are still drained so Todo
-    /// mutations made by the planning turn refresh the projection live
-    /// (BUG-2); other requests are deferred until the turn completes. The
-    /// caller processes the returned deferred requests after the workflow
-    /// status has settled, preserving serial-actor ordering.
+    /// Runs the bounded planning flow. A restored Planning workflow that
+    /// already has a persisted canonical Todo DAG arms that DAG and never
+    /// re-invokes the planner. Otherwise: the initial planning prompt, then
+    /// exactly one corrective feedback turn if that first pass produced no
+    /// committed typed Todo plan. Restored `Planning` (durable status) has
+    /// already consumed the initial pass, so only the corrective slot
+    /// remains — a crash cannot reset the 1+1 budget. Every planning prompt
+    /// is itself bounded (assistant turns, tool calls, wall-clock deadline),
+    /// and a committed typed plan ends planning immediately. Consumption is
+    /// recorded before the prompt is issued so a crash mid-turn cannot
+    /// restore a spent slot. On any bound with a valid canonical DAG the DAG
+    /// is preserved and armed for execution; with no committed typed plan
+    /// the workflow fails naming the planner model identity/category and
+    /// never invents tasks from prose.
+
     async fn run_planning_phase(
         &mut self,
         commands: &mut mpsc::Receiver<SupervisorCommand>,
     ) -> Result<Vec<SupervisorCommand>> {
-        // P0-C: fail actionably before spending a single planning turn when
-        // the objective explicitly delegates to an agent that is absent or
-        // disabled in the workflow child catalog (never a silent fallback to
-        // the bundled `task` agent).
         self.backend
             .validate_objective_agents(&self.contract.objective)?;
+        if self.has_committed_typed_plan() {
+            self.arm_plan_and_run()?;
+            return Ok(Vec::new());
+        }
         let mut deferred = Vec::new();
-        let (outcome, turn_deferred) =
-            self.await_planning_turn(self.contract.initial_prompt(), commands)
-                .await?;
-        deferred.extend(turn_deferred);
-        // A user cancel that interrupted the turn already won: never run the
-        // bounded re-prompt (or clobber the Cancelled status) on a cancelled
-        // workflow.
-        if is_terminal(self.status) {
-            return Ok(deferred);
-        }
-        match outcome {
-            PlanningTurnOutcome::Completed | PlanningTurnOutcome::PlanCommitted => {
-                if self.todo_has_tasks() {
-                    self.arm_plan_and_run()?;
-                    return Ok(deferred);
-                }
-            }
-            PlanningTurnOutcome::PlanBudgetReached { reason } => {
-                if self.todo_has_tasks() {
-                    self.preserve_plan_and_run(&reason)?;
-                    return Ok(deferred);
-                }
-                // Never strand deferred requests: process them (against a
-                // workflow that is about to fail, where Pause/Cancel/Steer
-                // are all no-ops or errors) before returning the failure.
-                self.flush_deferred(std::mem::take(&mut deferred), commands)
-                    .await;
-                bail!("planning stopped without a committed plan: {reason}; remove and re-create the workflow to retry");
-            }
-            PlanningTurnOutcome::TimedOut => {
-                if self.todo_has_tasks() {
-                    self.preserve_plan_and_run(
-                        "planning exceeded the wall-clock deadline; preserving the committed plan",
-                    )?;
-                    return Ok(deferred);
-                }
-                self.flush_deferred(std::mem::take(&mut deferred), commands)
-                    .await;
-                bail!("planning timed out before a plan was committed; remove and re-create the workflow to retry");
+        if self.planning_prompts_consumed == 0 {
+            deferred.extend(
+                self.run_one_planning_prompt(self.contract.initial_prompt(), commands)
+                    .await?,
+            );
+            if is_terminal(self.status) || self.has_committed_typed_plan() {
+                return Ok(deferred);
             }
         }
-        if is_terminal(self.status) {
-            return Ok(deferred);
-        }
-        if self.todo_has_tasks() {
-            return Ok(deferred);
-        }
-        let (outcome, turn_deferred) =
-            self.await_planning_turn(self.contract.replan_prompt(), commands)
-                .await?;
-        deferred.extend(turn_deferred);
-        if is_terminal(self.status) {
-            return Ok(deferred);
-        }
-        match outcome {
-            PlanningTurnOutcome::Completed | PlanningTurnOutcome::PlanCommitted => {
-                if self.todo_has_tasks() {
-                    self.arm_plan_and_run()?;
-                    return Ok(deferred);
-                }
-            }
-            PlanningTurnOutcome::PlanBudgetReached { reason } => {
-                if self.todo_has_tasks() {
-                    self.preserve_plan_and_run(&reason)?;
-                    return Ok(deferred);
-                }
-                self.flush_deferred(std::mem::take(&mut deferred), commands)
-                    .await;
-                bail!("planning stopped without a committed plan: {reason}; remove and re-create the workflow to retry");
-            }
-            PlanningTurnOutcome::TimedOut => {
-                if self.todo_has_tasks() {
-                    self.preserve_plan_and_run(
-                        "planning exceeded the wall-clock deadline; preserving the committed plan",
-                    )?;
-                    return Ok(deferred);
-                }
-                self.flush_deferred(std::mem::take(&mut deferred), commands)
-                    .await;
-                bail!("planning timed out before a plan was committed; remove and re-create the workflow to retry");
+        if self.planning_prompts_consumed < PLANNING_MAX_PROMPTS {
+            deferred.extend(
+                self.run_one_planning_prompt(self.contract.replan_prompt(), commands)
+                    .await?,
+            );
+            if is_terminal(self.status) || self.has_committed_typed_plan() {
+                return Ok(deferred);
             }
         }
-        if is_terminal(self.status) {
-            return Ok(deferred);
-        }
-        if self.todo_has_tasks() {
-            return Ok(deferred);
-        }
-        // The bounded re-prompt still produced no tasks. Never strand
-        // deferred requests: process them (against a workflow that is about
-        // to fail, where Pause/Cancel/Steer are all no-ops or errors) before
-        // returning the failure.
         self.flush_deferred(std::mem::take(&mut deferred), commands)
             .await;
-        bail!("planning produced no tasks; remove and re-create the workflow to retry")
+        bail!("{}", self.empty_plan_failure());
+    }
+
+    /// Issue one bounded planning prompt, recording consumption before the
+    /// call so a crash cannot restore the spent slot. Returns deferred
+    /// requests accumulated while the prompt was in flight.
+    async fn run_one_planning_prompt(
+        &mut self,
+        prompt: String,
+        commands: &mut mpsc::Receiver<SupervisorCommand>,
+    ) -> Result<Vec<SupervisorCommand>> {
+        let next = self
+            .planning_prompts_consumed
+            .saturating_add(1)
+            .min(PLANNING_MAX_PROMPTS);
+        let persisted = u8::try_from(next).unwrap_or(u8::MAX);
+        self.backend.persist_planning_attempt(persisted).await?;
+        self.planning_prompts_consumed = next;
+        self.refresh();
+        let (outcome, deferred) = self.await_planning_turn(prompt, commands).await?;
+
+        if is_terminal(self.status) {
+            return Ok(deferred);
+        }
+        if let Some(error) = self.settle_planning_turn(outcome)? {
+            self.flush_deferred(deferred, commands).await;
+            bail!(error);
+        }
+        Ok(deferred)
+    }
+
+
+    /// Settle one planning-prompt outcome. Returns `Ok(None)` when the
+    /// phase either armed a committed typed plan or should continue to the
+    /// (at most one) corrective re-prompt. Returns `Ok(Some(message))` when
+    /// the turn must fail the workflow now (budget/timeout with no typed
+    /// plan). Never invents tasks from prose: only a committed typed Todo
+    /// plan (`todo init` + at least one task) is a success.
+    fn settle_planning_turn(&mut self, outcome: PlanningTurnOutcome) -> Result<Option<String>> {
+        match outcome {
+            PlanningTurnOutcome::PlanCommitted => {
+                // The backend's stop hook fires only on a successful
+                // `todo init` — that is the typed-plan commit signal.
+                self.plan_committed = true;
+                if self.todo_has_tasks() {
+                    self.arm_plan_and_run()?;
+                }
+                Ok(None)
+            }
+            PlanningTurnOutcome::Completed => {
+                // A canonical Todo DAG in the backend is the committed typed
+                // plan: the planner used `todo init` (or a test backend
+                // injected the resulting DAG). Never invent tasks from prose.
+                if self.todo_has_tasks() {
+                    self.plan_committed = true;
+                    self.arm_plan_and_run()?;
+                }
+                Ok(None)
+            }
+            PlanningTurnOutcome::PlanBudgetReached { reason } => {
+                if self.todo_has_tasks() {
+                    self.plan_committed = true;
+                    self.preserve_plan_and_run(&reason)?;
+                    Ok(None)
+                } else {
+                    Ok(Some(format!(
+                        "planning stopped without a committed plan: {reason}; remove and re-create the workflow to retry"
+                    )))
+                }
+            }
+            PlanningTurnOutcome::TimedOut => {
+                if self.todo_has_tasks() {
+                    self.plan_committed = true;
+                    self.preserve_plan_and_run(
+                        "planning exceeded the wall-clock deadline; preserving the committed plan",
+                    )?;
+                    Ok(None)
+                } else {
+                    Ok(Some(
+                        "planning timed out before a plan was committed; remove and re-create the workflow to retry"
+                            .to_owned(),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Success predicate for the planning phase: the canonical Todo state
+    /// has at least one task, which is the committed typed plan. An empty
+    /// DAG after the bounded pass is never filled in from prose.
+    fn has_committed_typed_plan(&self) -> bool {
+        self.todo_has_tasks()
+    }
+
+
+    /// Stable empty-plan failure. Always the same shape for the same
+    /// planner: names the missing typed plan and the planner model
+    /// identity/category, never prompt or user text.
+    fn empty_plan_failure(&self) -> String {
+        format!(
+            "planning produced no tasks: no typed Todo plan was committed by {}; remove and re-create the workflow to retry",
+            self.backend.planner_identity().display()
+        )
     }
 
     /// Transition from Planning to Running over a committed plan: explicitly
-    /// arm Todo DAG execution (workflow Todo mutations never auto-arm, see
-    /// BUG-1) and set the status immediately instead of waiting for the
+    /// arm Todo DAG execution (workflow Todo mutations never auto-arm) and
+    /// set the status immediately instead of waiting for the
     /// planning run to end.
     fn arm_plan_and_run(&mut self) -> Result<()> {
-        self.backend.execute_todo_dag()?;
+        let outcome = self.backend.execute_todo_dag()?;
+        if outcome.status == TodoDagExecutionStatus::Failed {
+            let message = outcome.failure_reason.map_or_else(
+                || "Todo executor failed without an actionable reason".to_owned(),
+                |reason| reason.message().to_owned(),
+            );
+            bail!(message);
+        }
         self.set_status(WorkflowStatus::Running);
         Ok(())
     }
 
     /// Preserve a DAG that was committed before a planning bound tripped:
     /// surface the bound in the live activity feed, arm DAG execution and
-    /// move to Running (P0-1).
+    /// move to Running.
     fn preserve_plan_and_run(&mut self, reason: &str) -> Result<()> {
         let task_count = self
             .backend
@@ -1016,10 +1220,17 @@ where
         commands: &mut mpsc::Receiver<SupervisorCommand>,
     ) -> Result<Vec<SupervisorCommand>> {
         if self.todo_has_tasks() {
-            if self.status == WorkflowStatus::Paused {
-                self.backend.resume().await?;
+            let outcome = if self.status == WorkflowStatus::Paused {
+                self.backend.resume().await?
             } else {
-                self.backend.execute_todo_dag()?;
+                self.backend.execute_todo_dag()?
+            };
+            if outcome.status == TodoDagExecutionStatus::Failed {
+                let message = outcome.failure_reason.map_or_else(
+                    || "Todo executor failed without an actionable reason".to_owned(),
+                    |reason| reason.message().to_owned(),
+                );
+                bail!(message);
             }
             Ok(Vec::new())
         } else {
@@ -1041,10 +1252,10 @@ where
     }
 
     /// Awaits one planning turn while still processing `ApplicationEvent`
-    /// commands concurrently. The turn is bounded three ways (P0-1): the
+    /// commands concurrently. The turn is bounded three ways: the
     /// backend's per-turn stop hook caps assistant turns and tool calls, the
     /// wall-clock deadline here aborts the in-flight prompt, and semantic
-    /// Todo non-progress detection aborts it too (P1-2). Returns the typed
+    /// Todo non-progress detection aborts it too. Returns the typed
     /// outcome plus the requests deferred while the turn was in flight; the
     /// caller processes the deferred requests after the turn ends.
     async fn await_planning_turn(
@@ -1182,8 +1393,8 @@ where
             .any(|phase| !phase.tasks.is_empty())
     }
 
-    /// Semantic planning non-progress detection (P1-2) plus the plan-commit
-    /// signal (P0-2). The first successful `todo init` ends planning: the
+    /// Semantic planning non-progress detection plus the plan-commit
+    /// signal. The first successful `todo init` ends planning: the
     /// workflow moves to Running immediately while the model's run continues
     /// its short grace. Todo-state change is the decisive non-progress
     /// signal: a legitimate init + dependency sequence mutates the canonical
@@ -1250,7 +1461,7 @@ where
                     WorkflowStatus::Failed
                 }
             }
-            TodoDagExecutionStatus::Blocked => WorkflowStatus::Failed,
+            TodoDagExecutionStatus::Failed => WorkflowStatus::Failed,
             TodoDagExecutionStatus::Dormant => {
                 if todo_is_exactly_complete(&todo) {
                     WorkflowStatus::Completed
@@ -1267,6 +1478,12 @@ where
     }
 
     fn set_status(&mut self, status: WorkflowStatus) {
+        if status == WorkflowStatus::Failed && self.failure.is_none() {
+            self.failure = self
+                .backend
+                .todo_dag_failure_reason()
+                .map(|reason| reason.message().to_owned());
+        }
         let changed = self.status != status;
         self.status = status;
         match status {
@@ -1288,19 +1505,32 @@ where
     }
 
     fn refresh(&self) {
-        let projection = project_backend(
+        let projection = match project_backend(
             &self.contract,
             self.backend.as_ref(),
             self.status,
             self.failure.clone(),
             &self.activity,
             self.planning_started_at_ms,
-        );
+            self.planning_prompts_consumed,
+        ) {
+            Ok(projection) => projection,
+            Err(error) => {
+                let mut projection = self.projection.lock().clone();
+                projection.status = self.status;
+                projection.failure = self.failure.clone().or_else(|| Some(error.to_string()));
+                projection.activity = self.activity.clone();
+                projection.planning_started_at_ms = self.planning_started_at_ms;
+                projection.planning_prompts_consumed = self.planning_prompts_consumed;
+                projection
+            }
+        };
         *self.projection.lock() = projection.clone();
         let _ = self
             .events
             .send(WorkflowSupervisorEvent::ProjectionChanged { projection });
     }
+
 
     /// Append one bounded activity entry (newest-last) and refresh the
     /// projection so the workflow page sees the supervisor's live turn.
@@ -1308,7 +1538,10 @@ where
         let redacted = crate::redact_value(&serde_json::Value::String(text.clone()))
             .as_str()
             .map_or_else(|| text, str::to_owned);
-        let text: String = redacted.chars().take(SUPERVISOR_ACTIVITY_TEXT_CAP).collect();
+        let text: String = redacted
+            .chars()
+            .take(SUPERVISOR_ACTIVITY_TEXT_CAP)
+            .collect();
         self.activity.push(WorkflowSupervisorActivity {
             at_ms: now_ms(),
             kind,
@@ -1337,26 +1570,31 @@ fn project_backend<B: WorkflowSupervisorBackend + ?Sized>(
     failure: Option<String>,
     activity: &[WorkflowSupervisorActivity],
     planning_started_at_ms: Option<u64>,
-) -> WorkflowSupervisorProjection {
-    WorkflowSupervisorProjection {
+    planning_prompts_consumed: usize,
+) -> Result<WorkflowSupervisorProjection> {
+    Ok(WorkflowSupervisorProjection {
         workflow_id: contract.workflow_id.clone(),
         generation: contract.generation,
         status,
         supervisor_agent_id: contract.supervisor_agent_id.clone(),
         todo: backend.todo_state(),
         jobs: backend.workflow_jobs(&contract.workflow_id, contract.generation),
-        irc: backend.inbox(&contract.supervisor_agent_id, true),
+        irc: backend.delivered_messages()?,
         failure,
         activity: activity.to_vec(),
         planning_started_at_ms,
-    }
+        planning_prompts_consumed,
+    })
 }
 
 fn todo_is_exactly_complete(todo: &TodoState) -> bool {
     let mut saw_task = false;
     for task in todo.phases.iter().flat_map(|phase| &phase.tasks) {
         saw_task = true;
-        if !matches!(task.status, crate::TodoStatus::Completed | crate::TodoStatus::Abandoned) {
+        if !matches!(
+            task.status,
+            crate::TodoStatus::Completed | crate::TodoStatus::Abandoned
+        ) {
             return false;
         }
     }
@@ -1364,14 +1602,13 @@ fn todo_is_exactly_complete(todo: &TodoState) -> bool {
 }
 
 /// Whether a completed tool result is a successful `todo init` — the
-/// plan-commit signal (P0-2). Used by the backend's planning stop hook.
+/// plan-commit signal. Used by the backend's planning stop hook.
 pub(crate) fn workflow_supervisor_todo_init_succeeded(result: &pi_ai::ToolResultMessage) -> bool {
     result.tool_name == "todo"
         && !result.is_error
-        && result
-            .details
-            .as_ref()
-            .is_some_and(|details| details.get("op").and_then(serde_json::Value::as_str) == Some("init"))
+        && result.details.as_ref().is_some_and(|details| {
+            details.get("op").and_then(serde_json::Value::as_str) == Some("init")
+        })
 }
 
 fn todo_has_any_task(todo: &TodoState) -> bool {
@@ -1452,8 +1689,11 @@ mod tests {
     /// tically; the prompt string is the enforceable surface.
     #[test]
     fn initial_prompt_requires_concise_task_titles() {
+
         let prompt = contract("Ship the release").initial_prompt();
         for needle in [
+            "typed todo init",
+            "Do not invent tasks in prose",
             "single concise line",
             "~60 characters",
             "terse imperative title",
@@ -1467,12 +1707,16 @@ mod tests {
         }
     }
 
+
     /// The final-attempt re-prompt builds the same canonical DAG under the
     /// same display contract, so it carries the same title requirement.
     #[test]
     fn replan_prompt_requires_concise_task_titles() {
         let prompt = contract("Ship the release").replan_prompt();
         for needle in [
+            "produced no typed Todo plan",
+            "missing artifact is a committed todo init",
+            "Do not invent tasks in prose",
             "concise title",
             "~60 characters",
             "terse imperative phrase",
@@ -1484,7 +1728,12 @@ mod tests {
                 "replan prompt must require concise task titles: missing {needle:?}\n{prompt}"
             );
         }
+        assert!(
+            !prompt.contains("Ship the release"),
+            "replan prompt must not restate the user objective:\n{prompt}"
+        );
     }
+
 
     /// The planning prompts must steer the planner toward a WIDE DAG: the
     /// executor runs every ready task concurrently, so independent work must
@@ -1535,8 +1784,12 @@ mod tests {
     struct JobSettleBackend {
         task: Arc<Mutex<TodoItem>>,
         dag_status: Arc<Mutex<TodoDagExecutionStatus>>,
+        dag_failure_reason: Arc<Mutex<Option<crate::TodoDagFailureReason>>>,
         done_calls: Arc<AtomicUsize>,
         reconcile_calls: Arc<AtomicUsize>,
+        /// Optional ground-truth planning stamp (mirrors the application
+        /// backend's provider/endpoint context) for RunFailed routing tests.
+        planning_failure_context: Arc<Mutex<Option<String>>>,
     }
 
     impl JobSettleBackend {
@@ -1548,12 +1801,14 @@ mod tests {
                     status: TodoStatus::InProgress,
                     depends_on: Vec::new(),
                     ready: true,
-                    blocked_by: Vec::new(),
+                    waiting_on: Vec::new(),
                     agent: None,
                 })),
                 dag_status: Arc::new(Mutex::new(TodoDagExecutionStatus::Active)),
+                dag_failure_reason: Arc::new(Mutex::new(None)),
                 done_calls: Arc::new(AtomicUsize::new(0)),
                 reconcile_calls: Arc::new(AtomicUsize::new(0)),
+                planning_failure_context: Arc::new(Mutex::new(None)),
             }
         }
 
@@ -1564,10 +1819,7 @@ mod tests {
         fn task_open(&self, task_id: &str) -> bool {
             let task = self.task.lock();
             task.id == task_id
-                && matches!(
-                    task.status,
-                    TodoStatus::Pending | TodoStatus::InProgress
-                )
+                && matches!(task.status, TodoStatus::Pending | TodoStatus::InProgress)
         }
     }
 
@@ -1587,6 +1839,10 @@ mod tests {
             *self.dag_status.lock()
         }
 
+        fn todo_dag_failure_reason(&self) -> Option<crate::TodoDagFailureReason> {
+            self.dag_failure_reason.lock().clone()
+        }
+
         fn workflow_jobs(
             &self,
             _workflow_id: &str,
@@ -1595,15 +1851,15 @@ mod tests {
             Vec::new()
         }
 
-        fn inbox(&self, _agent_id: &str, _peek: bool) -> Vec<crate::MailboxMessage> {
-            Vec::new()
+        fn inbox(&self, _agent_id: &str, _peek: bool) -> Result<Vec<crate::MailboxMessage>> {
+            Ok(Vec::new())
         }
 
-        fn active_workflow_job_ids(
-            &self,
-            _workflow_id: &str,
-            _generation: u64,
-        ) -> Vec<String> {
+        fn delivered_messages(&self) -> Result<Vec<crate::MailboxMessage>> {
+            Ok(Vec::new())
+        }
+
+        fn active_workflow_job_ids(&self, _workflow_id: &str, _generation: u64) -> Vec<String> {
             Vec::new()
         }
 
@@ -1624,9 +1880,15 @@ mod tests {
             Ok(())
         }
 
+        async fn persist_planning_attempt(&self, _count: u8) -> Result<()> {
+            Ok(())
+        }
+
+
         fn execute_todo_dag(&self) -> Result<TodoDagExecutionOutcome> {
             Ok(TodoDagExecutionOutcome {
                 status: *self.dag_status.lock(),
+                failure_reason: None,
                 spawns: Vec::new(),
             })
         }
@@ -1654,6 +1916,7 @@ mod tests {
             self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
             Ok(TodoDagExecutionOutcome {
                 status: *self.dag_status.lock(),
+                failure_reason: None,
                 spawns: Vec::new(),
             })
         }
@@ -1665,12 +1928,21 @@ mod tests {
         async fn resume(&self) -> Result<TodoDagExecutionOutcome> {
             Ok(TodoDagExecutionOutcome {
                 status: *self.dag_status.lock(),
+                failure_reason: None,
                 spawns: Vec::new(),
             })
         }
 
         async fn cancel_jobs(&self, ids: &[String]) -> Result<Vec<String>> {
             Ok(ids.to_vec())
+        }
+        fn planning_failure_error(&self, message: &str) -> anyhow::Error {
+            match self.planning_failure_context.lock().as_ref() {
+                Some(context) => {
+                    anyhow!("workflow planning call failed {context}: {message}")
+                }
+                None => anyhow!(message.to_owned()),
+            }
         }
     }
 
@@ -1719,7 +1991,9 @@ mod tests {
             backend.clone(),
             OrchestrationConcurrencyGate::new(1).expect("gate"),
             WorkflowStatus::Running,
+            0,
         )
+
         .expect("spawn supervisor");
         observe_job(&supervisor, delegated_job(JobStatus::Failed))
             .await
@@ -1758,7 +2032,9 @@ mod tests {
             backend.clone(),
             OrchestrationConcurrencyGate::new(1).expect("gate"),
             WorkflowStatus::Running,
+            0,
         )
+
         .expect("spawn supervisor");
         observe_job(&supervisor, delegated_job(JobStatus::Completed))
             .await
@@ -1769,6 +2045,38 @@ mod tests {
             "a completed worker job marks the delegated task Done"
         );
         assert_eq!(backend.reconcile_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_supervisor_ignores_later_job_events() {
+        let backend = Arc::new(JobSettleBackend::with_open_task("task-1"));
+        let supervisor = WorkflowSupervisor::spawn_restored(
+            contract("Ship the release"),
+            backend.clone(),
+            OrchestrationConcurrencyGate::new(1).expect("gate"),
+            WorkflowStatus::Running,
+            0,
+        )
+        .expect("spawn supervisor");
+        supervisor
+            .observe_application_event(
+                1,
+                ApplicationEvent::RunFailed {
+                    message: "planning provider failed".to_owned(),
+                },
+            )
+            .await
+            .expect("fail the workflow");
+        assert_eq!(supervisor.projection().status, WorkflowStatus::Failed);
+        observe_job(&supervisor, delegated_job(JobStatus::Completed))
+            .await
+            .expect("later job event");
+        assert_eq!(
+            backend.done_calls.load(Ordering::SeqCst),
+            0,
+            "a terminal workflow must not apply a later worker completion"
+        );
+        assert_eq!(supervisor.projection().status, WorkflowStatus::Failed);
     }
 
     /// Status-mapping contract behind "no integrate": while a delegated task
@@ -1784,11 +2092,16 @@ mod tests {
             TodoDagExecutionStatus::Active,
             TodoDagExecutionStatus::Settled,
             TodoDagExecutionStatus::Dormant,
-            TodoDagExecutionStatus::Blocked,
+            TodoDagExecutionStatus::Failed,
         ] {
             *backend.dag_status.lock() = dag_status;
-            let actor = test_actor(&contract, backend.clone(), WorkflowStatus::Running);
+            *backend.dag_failure_reason.lock() = (dag_status == TodoDagExecutionStatus::Failed)
+                .then(|| crate::TodoDagFailureReason::NoProgress {
+                    message: "inspect waitingOn edges".to_owned(),
+                });
+            let mut actor = test_actor(&contract, backend.clone(), WorkflowStatus::Running);
             let status = actor.status_from_backend();
+            actor.set_status(status);
             assert_ne!(
                 status,
                 WorkflowStatus::Completed,
@@ -1802,8 +2115,12 @@ mod tests {
                 TodoDagExecutionStatus::Active | TodoDagExecutionStatus::Dormant => {
                     assert_eq!(status, WorkflowStatus::Running, "{dag_status:?}");
                 }
-                TodoDagExecutionStatus::Settled | TodoDagExecutionStatus::Blocked => {
+                TodoDagExecutionStatus::Settled => {
                     assert_eq!(status, WorkflowStatus::Failed, "{dag_status:?}");
+                }
+                TodoDagExecutionStatus::Failed => {
+                    assert_eq!(status, WorkflowStatus::Failed, "{dag_status:?}");
+                    assert_eq!(actor.failure.as_deref(), Some("inspect waitingOn edges"));
                 }
             }
         }
@@ -1817,14 +2134,10 @@ mod tests {
         let (events, _) = broadcast::channel(SUPERVISOR_CHANNEL_CAPACITY);
         SupervisorActor {
             contract: contract.clone(),
-            projection: Arc::new(Mutex::new(project_backend(
-                contract,
-                backend.as_ref(),
-                status,
-                None,
-                &[],
-                None,
-            ))),
+            projection: Arc::new(Mutex::new(
+                project_backend(contract, backend.as_ref(), status, None, &[], None, 0)
+                    .expect("test projection"),
+            )),
             events,
             backend,
             status,
@@ -1838,8 +2151,154 @@ mod tests {
             last_failed_todo_fingerprint: None,
             identical_failed_ops: 0,
             corrections_without_progress: 0,
+
             activity: Vec::new(),
             planning_started_at_ms: None,
+            planning_prompts_consumed: 0,
         }
+
+    }
+
+    fn run_failed_event(message: &str) -> SupervisorRequest {
+        SupervisorRequest::ApplicationEvent {
+            generation: 1,
+            event: ApplicationEvent::RunFailed {
+                message: message.to_owned(),
+            },
+        }
+    }
+
+    /// Forwarded `RunFailed` consumed while the planning turn is in flight is
+    /// the production path that records a planning provider failure: the
+    /// failure record must carry the backend's ground-truth context (provider
+    /// id, endpoint, model) on top of the raw message. Pre-fix, the handler
+    /// `self.fail`ed `anyhow!(message.clone())` directly, so no context could
+    /// ever appear in the record.
+    #[tokio::test]
+    async fn planning_in_flight_run_failed_stamps_backend_context() {
+        let backend = Arc::new(JobSettleBackend::with_open_task("task-1"));
+        *backend.planning_failure_context.lock() = Some(
+            "(provider settle-test, endpoint https://settle.test/v1, model settle-1)".to_owned(),
+        );
+        let mut actor = test_actor(&contract("Ship the release"), backend, WorkflowStatus::Planning);
+        actor.planning_in_flight = true;
+        let (_, mut commands) = tokio::sync::mpsc::channel::<SupervisorCommand>(8);
+        let (result, _) = actor
+            .handle(
+                run_failed_event("OpenAI API error 402: Insufficient Balance (invalid_request_error)"),
+                &mut commands,
+            )
+            .await;
+        result.expect("run-failed command handler");
+        let failure = actor.failure.expect("planning failure must be recorded");
+        assert!(failure.contains("workflow planning call failed"), "{failure}");
+        assert!(failure.contains("provider settle-test"), "{failure}");
+        assert!(failure.contains("https://settle.test/v1"), "{failure}");
+        assert!(failure.contains("settle-1"), "{failure}");
+        assert!(
+            failure.ends_with("OpenAI API error 402: Insufficient Balance (invalid_request_error)"),
+            "raw provider error and its status must be preserved: {failure}"
+        );
+        assert_eq!(actor.status, WorkflowStatus::Failed);
+    }
+
+    /// The same forwarded failure outside the planning window (e.g. a Todo
+    /// executor failure relayed while running) keeps its exact reason: the
+    /// planning-context stamp must never attach off-planning failures.
+    #[tokio::test]
+    async fn run_failed_outside_planning_is_relayed_unstamped() {
+        let backend = Arc::new(JobSettleBackend::with_open_task("task-1"));
+        *backend.planning_failure_context.lock() = Some(
+            "(provider settle-test, endpoint https://settle.test/v1, model settle-1)".to_owned(),
+        );
+        let mut actor = test_actor(&contract("Ship the release"), backend, WorkflowStatus::Running);
+        let (_, mut commands) = tokio::sync::mpsc::channel::<SupervisorCommand>(8);
+        let (result, _) = actor
+            .handle(
+                run_failed_event("Todo executor failed without an actionable reason"),
+                &mut commands,
+            )
+            .await;
+        result.expect("run-failed command handler");
+        assert_eq!(
+            actor.failure.as_deref(),
+            Some("Todo executor failed without an actionable reason"),
+            "off-planning failures must not gain the planning context"
+        );
+        assert_eq!(actor.status, WorkflowStatus::Failed);
+    }
+
+    #[test]
+    fn planner_identity_display_is_stable_and_omits_prompt_text() {
+        assert_eq!(
+            PlannerIdentity::sanitized(String::new(), String::new()).display(),
+            "unknown"
+        );
+        assert_eq!(
+            PlannerIdentity::sanitized("gpt-4.1", String::new()).display(),
+            "model gpt-4.1"
+        );
+        assert_eq!(
+            PlannerIdentity::sanitized(String::new(), "openai-completions").display(),
+            "category openai-completions"
+        );
+        let display = PlannerIdentity::sanitized("gpt-4.1", "openai-completions").display();
+        assert_eq!(display, "model gpt-4.1 (openai-completions)");
+        assert!(!display.contains("Objective"));
+        assert!(!display.contains("prompt"));
+
+        let identity = PlannerIdentity::sanitized(
+            format!("sk-abcdefghijklmnop1234\n\u{7f}{}", "x".repeat(80)),
+            "openai-completions\napi_key=hunter2",
+        );
+        assert!(
+            identity.model_id.chars().count() <= PLANNER_IDENTITY_FIELD_CHARS,
+            "{}",
+            identity.model_id
+        );
+        assert!(
+            identity.category.chars().count() <= PLANNER_IDENTITY_FIELD_CHARS,
+            "{}",
+            identity.category
+        );
+        assert!(
+            !identity.model_id.contains('\n') && !identity.category.contains('\n'),
+            "{identity:?}"
+        );
+        assert!(!identity.model_id.contains('\u{7f}'), "{identity:?}");
+        assert!(
+            !identity.model_id.contains("sk-abcdefghijklmnop1234"),
+            "{identity:?}"
+        );
+        assert!(!identity.category.contains("hunter2"), "{identity:?}");
+        assert!(
+            identity.model_id.contains("[REDACTED]"),
+            "redaction marker must be preserved when it fits: {identity:?}"
+        );
+
+        let hostile = identity.display();
+        assert!(!hostile.contains('\n'), "{hostile}");
+        assert!(!hostile.contains('\u{7f}'), "{hostile}");
+        assert!(!hostile.contains("sk-abcdefghijklmnop1234"), "{hostile}");
+        assert!(!hostile.contains("hunter2"), "{hostile}");
+        assert!(hostile.contains("[REDACTED]"), "{hostile}");
+        assert!(
+            hostile.chars().count() <= PLANNER_IDENTITY_FIELD_CHARS * 2 + 20,
+            "{hostile}"
+        );
+        assert!(!hostile.contains("Objective"), "{hostile}");
+
+        let raw_display = PlannerIdentity {
+            model_id: format!("sk-abcdefghijklmnop1234\n\u{7f}{}", "x".repeat(80)),
+            category: "openai-completions\napi_key=hunter2".to_owned(),
+        }
+        .display();
+        assert!(!raw_display.contains('\n'), "{raw_display}");
+        assert!(
+            !raw_display.contains("sk-abcdefghijklmnop1234"),
+            "{raw_display}"
+        );
+        assert!(!raw_display.contains("hunter2"), "{raw_display}");
+        assert!(raw_display.contains("[REDACTED]"), "{raw_display}");
     }
 }

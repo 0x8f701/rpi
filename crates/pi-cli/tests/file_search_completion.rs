@@ -220,7 +220,10 @@ async fn search_rejects_escapes_and_honors_cancellation() {
     )
     .await
     .expect_err("parent query must fail");
-    assert!(err.to_string().contains("within the working directory"), "{err}");
+    assert!(
+        err.to_string().contains("within the working directory"),
+        "{err}"
+    );
 
     // Absolute queries are refused.
     let err = search(
@@ -231,19 +234,17 @@ async fn search_rejects_escapes_and_honors_cancellation() {
     )
     .await
     .expect_err("absolute query must fail");
-    assert!(err.to_string().contains("within the working directory"), "{err}");
+    assert!(
+        err.to_string().contains("within the working directory"),
+        "{err}"
+    );
 
     // Pre-cancelled search returns an empty result set.
     let cancelled = CancellationToken::new();
     cancelled.cancel();
-    let matches = search(
-        dir.path().to_path_buf(),
-        "".to_owned(),
-        50,
-        cancelled,
-    )
-    .await
-    .expect("cancelled search");
+    let matches = search(dir.path().to_path_buf(), "".to_owned(), 50, cancelled)
+        .await
+        .expect("cancelled search");
     assert!(matches.is_empty());
 }
 

@@ -2,7 +2,7 @@
 //!
 //! Surfaces under test (Unix only, faux model, isolated HOME/cwd):
 //! 1. No-arg welcome "Recent sessions" lists cwd-scoped native Pi + Codex +
-//!    Claude rows with sanitized `[pi]` / `[codex]` / `[claude]` badges (and
+//!    Claude rows with sanitized `[rpi]` / `[codex]` / `[claude]` badges (and
 //!    not wrong-cwd / corrupt / symlink foreign noise).
 //! 2. `/resume` (and `/sessions`) selector shows the same unified catalog rows
 //!    with badges/status/summary corpus under title `Resume Session`.
@@ -38,8 +38,8 @@ use nix::pty::{Winsize, openpty};
 use nix::sys::termios::Termios;
 use pi_coding::session_catalog::{SESSION_CATALOG_CANDIDATE_LIMIT, SESSION_CATALOG_ROW_LIMIT};
 use serde_json::Value;
-use unicode_width::UnicodeWidthChar;
 use tempfile::TempDir;
+use unicode_width::UnicodeWidthChar;
 
 const SHOW_CURSOR: &str = "\x1b[?25h";
 const CTRL_D: u8 = 0x04;
@@ -139,7 +139,7 @@ fn rpi_bin() -> String {
     env!("CARGO_BIN_EXE_rpi").to_owned()
 }
 fn set_session_import_sources(home: &Path, sources: &[&str]) {
-    let agent_dir = home.join(".pi/agent");
+    let agent_dir = home.join(".rpi");
     fs::create_dir_all(&agent_dir).expect("agent settings directory");
     fs::write(
         agent_dir.join("settings.json"),
@@ -180,8 +180,8 @@ impl PtyProbe {
         cmd.env("SESSIONS_HOME", home.path());
         cmd.env("PATH", std::env::var("PATH").unwrap_or_default());
         cmd.env("TERM", "xterm-256color");
-        cmd.env("PI_OFFLINE", "1");
-        cmd.env("PI_SKIP_VERSION_CHECK", "1");
+        cmd.env("RPI_OFFLINE", "1");
+        cmd.env("RPI_SKIP_VERSION_CHECK", "1");
         // Default foreign/native roots under isolated HOME — no overrides.
         cmd.env_remove("PI_CODING_AGENT_DIR");
         cmd.env_remove("PI_CODING_AGENT_SESSION_DIR");
@@ -858,11 +858,16 @@ fn wait_for_exact_filtered_row(
     // races the last filter events.
     let select_at = probe.len();
     probe.send(b"\x1b[A");
-    probe.wait_for_live_after(select_at, Duration::from_secs(8), predicate)
+    probe
+        .wait_for_live_after(select_at, Duration::from_secs(8), predicate)
         .or(Some(live))
 }
 
-fn wait_for_unfiltered_selector(probe: &PtyProbe, marker: usize, timeout: Duration) -> Option<String> {
+fn wait_for_unfiltered_selector(
+    probe: &PtyProbe,
+    marker: usize,
+    timeout: Duration,
+) -> Option<String> {
     probe.wait_for_live_after(marker, timeout, |live| {
         live.contains("Resume Session")
             && live.lines().any(|line| {
@@ -901,7 +906,10 @@ fn assert_badge_label(plain: &str, badge: &str, labels: &[&str]) -> bool {
 }
 
 fn assert_source_badges(plain: &str, context: &str) {
-    assert!(plain.contains("[pi]"), "{context}: missing [pi] badge:\n{plain}");
+    assert!(
+        plain.contains("[rpi]"),
+        "{context}: missing [rpi] badge:\n{plain}"
+    );
     assert!(
         plain.contains("[codex]"),
         "{context}: missing [codex] badge:\n{plain}"
@@ -916,10 +924,15 @@ fn assert_source_badges(plain: &str, context: &str) {
     assert!(
         assert_badge_label(
             plain,
-            "pi",
-            &[PI_SUMMARY, CUSTOM_NATIVE_SUMMARY, "native-pi", "custom-root"],
+            "rpi",
+            &[
+                PI_SUMMARY,
+                CUSTOM_NATIVE_SUMMARY,
+                "native-pi",
+                "custom-root"
+            ],
         ),
-        "{context}: missing native `[pi] <summary>` row:\n{plain}"
+        "{context}: missing native `[rpi] <summary>` row:\n{plain}"
     );
     assert!(
         assert_badge_label(plain, "codex", &[CODEX_SUMMARY, CODEX_ID]),
@@ -1009,9 +1022,9 @@ fn assert_import_lineage(path: &Path, source: &str, source_session_id: &str) {
         .filter(|line| !line.trim().is_empty())
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect();
-    let has_lineage = records.iter().any(|record| {
-        record.get("customType").and_then(Value::as_str) == Some("import_lineage")
-    });
+    let has_lineage = records
+        .iter()
+        .any(|record| record.get("customType").and_then(Value::as_str) == Some("import_lineage"));
     assert!(
         has_lineage,
         "expected custom import_lineage record in {}",
@@ -1023,7 +1036,7 @@ fn plant_all_fixtures(home: &Path, cwd: &Path, session_dir: &Path) -> PathBuf {
     let other_cwd = home.join("other-project-cwd");
     fs::create_dir_all(&other_cwd).expect("other cwd");
 
-    // Default-home native (cwd-scoped) for [pi] badge coverage.
+    // Default-home native (cwd-scoped) for [rpi] badge coverage.
     let _ = plant_native_pi(home, cwd, "native-pi-default", PI_SUMMARY, 100);
     let codex = plant_codex(home, cwd, CODEX_ID, CODEX_SUMMARY, 300);
     let _ = plant_claude(home, cwd, CLAUDE_ID, CLAUDE_SUMMARY, 200);
@@ -1114,8 +1127,7 @@ fn plant_bounded_large_catalog(
         .join(".codex")
         .join("sessions")
         .join("rollout-bounded-corrupt.jsonl");
-    fs::write(&corrupt, format!("{{not json\n{BOUNDED_CORRUPT}\n"))
-        .expect("write bounded corrupt");
+    fs::write(&corrupt, format!("{{not json\n{BOUNDED_CORRUPT}\n")).expect("write bounded corrupt");
     set_modified(&corrupt, BOUNDED_MTIME_BASE + count as u64 + 2);
 
     // Symlink to the newest sentinel: discovery path safety must reject it
@@ -1190,7 +1202,7 @@ fn pty_cross_tool_welcome_resume_import_under_session_dir() {
             || probe.wait_for(CODEX_SUMMARY, Duration::from_secs(8))
             || probe.wait_for(PI_SUMMARY, Duration::from_secs(8))
             || probe.wait_for("[codex]", Duration::from_secs(8))
-            || probe.wait_for("[pi]", Duration::from_secs(8)),
+            || probe.wait_for("[rpi]", Duration::from_secs(8)),
         "welcome must surface Recent sessions / catalog rows: {}",
         strip_ansi(&probe.snapshot())
     );
@@ -1207,11 +1219,11 @@ fn pty_cross_tool_welcome_resume_import_under_session_dir() {
             || welcome_plain.contains(PI_SUMMARY)
             || welcome_plain.contains("custom-root")
             || welcome_plain.contains("native-pi"),
-        "welcome must include custom --session-dir native row with [pi] badge: {welcome_plain}"
+        "welcome must include custom --session-dir native row with [rpi] badge: {welcome_plain}"
     );
     // Up to 3 cwd-matching rows; require sanitized [source] badge form on bullets.
     assert!(
-        ["pi", "codex", "claude"]
+        ["rpi", "codex", "claude"]
             .iter()
             .any(|badge| welcome_plain.contains(&format!("[{badge}]"))),
         "welcome Recent sessions must show a source badge: {welcome_plain}"
@@ -1330,7 +1342,12 @@ fn pty_cross_tool_welcome_resume_import_under_session_dir() {
         CODEX_SUMMARY,
         Duration::from_secs(12),
     )
-    .unwrap_or_else(|| panic!("reopened selector must isolate codex row: {}", probe.live_screen()));
+    .unwrap_or_else(|| {
+        panic!(
+            "reopened selector must isolate codex row: {}",
+            probe.live_screen()
+        )
+    });
     assert!(
         row_shows_imported(&reopened, "codex", CODEX_SUMMARY),
         "reopened selector must show exact `{IMPORTED_MARKER}` on [codex] row (not import_* path alone): {reopened}"
@@ -1342,10 +1359,15 @@ fn pty_cross_tool_welcome_resume_import_under_session_dir() {
 
     let clear_at = clear_filter(&mut probe);
     let unfiltered = wait_for_unfiltered_selector(&probe, clear_at, Duration::from_secs(10))
-        .unwrap_or_else(|| panic!("reopened selector filter must clear: {}", probe.live_screen()));
+        .unwrap_or_else(|| {
+            panic!(
+                "reopened selector filter must clear: {}",
+                probe.live_screen()
+            )
+        });
     assert!(
         unfiltered.contains("[codex]")
-            && unfiltered.contains("[pi]")
+            && unfiltered.contains("[rpi]")
             && unfiltered.contains("[claude]"),
         "reopened unfiltered selector must retain all source badges: {unfiltered}"
     );
@@ -1445,9 +1467,14 @@ fn pty_sessions_slash_shows_cross_tool_badges() {
                 && live.contains("Filter:")
                 && live.contains("[codex]")
                 && live.contains("[claude]")
-                && live.contains("[pi]")
+                && live.contains("[rpi]")
         })
-        .unwrap_or_else(|| panic!("/sessions must open unified selector: {}", probe.live_screen()));
+        .unwrap_or_else(|| {
+            panic!(
+                "/sessions must open unified selector: {}",
+                probe.live_screen()
+            )
+        });
     assert_source_badges(&plain, "/sessions selector");
     assert_noise_absent(&plain, "/sessions selector");
     assert!(
@@ -1576,7 +1603,12 @@ fn pty_bounded_large_catalog_startup_resume_import() {
         BOUNDED_CLAUDE,
         Duration::from_secs(12),
     )
-    .unwrap_or_else(|| panic!("selector must isolate non-starved claude row: {}", probe.live_screen()));
+    .unwrap_or_else(|| {
+        panic!(
+            "selector must isolate non-starved claude row: {}",
+            probe.live_screen()
+        )
+    });
 
     let native_query = "bounded-custom-native SIGIL-cu5";
     let native_filter_at = replace_filter(&mut probe, native_query);
@@ -1584,11 +1616,16 @@ fn pty_bounded_large_catalog_startup_resume_import() {
         &mut probe,
         native_filter_at,
         native_query,
-        "pi",
+        "rpi",
         BOUNDED_CUSTOM_NATIVE,
         Duration::from_secs(12),
     )
-    .unwrap_or_else(|| panic!("selector must isolate custom-root native row: {}", probe.live_screen()));
+    .unwrap_or_else(|| {
+        panic!(
+            "selector must isolate custom-root native row: {}",
+            probe.live_screen()
+        )
+    });
 
     // ── Phase 3: select the newest sentinel → import under session-dir ────
     let newest_query = format!("{newest_id} SIGIL-n3w");
@@ -1601,7 +1638,12 @@ fn pty_bounded_large_catalog_startup_resume_import() {
         BOUNDED_NEWEST_SENTINEL,
         Duration::from_secs(12),
     )
-    .unwrap_or_else(|| panic!("filter must isolate exact newest sentinel row: {}", probe.live_screen()));
+    .unwrap_or_else(|| {
+        panic!(
+            "filter must isolate exact newest sentinel row: {}",
+            probe.live_screen()
+        )
+    });
     assert!(
         !import_filtered.contains(BOUNDED_OLDEST_SENTINEL)
             && !import_filtered.contains(BOUNDED_WRONG_CWD),
@@ -1686,7 +1728,12 @@ fn pty_bounded_large_catalog_startup_resume_import() {
         BOUNDED_NEWEST_SENTINEL,
         Duration::from_secs(12),
     )
-    .unwrap_or_else(|| panic!("reopened selector must isolate newest row: {}", probe.live_screen()));
+    .unwrap_or_else(|| {
+        panic!(
+            "reopened selector must isolate newest row: {}",
+            probe.live_screen()
+        )
+    });
     assert!(
         row_shows_imported(&reopened, "codex", BOUNDED_NEWEST_SENTINEL),
         "reopened selector must mark the imported newest sentinel with `{IMPORTED_MARKER}`: {reopened}"
@@ -1698,7 +1745,12 @@ fn pty_bounded_large_catalog_startup_resume_import() {
 
     let clear_at = clear_filter(&mut probe);
     let unfiltered = wait_for_unfiltered_selector(&probe, clear_at, Duration::from_secs(10))
-        .unwrap_or_else(|| panic!("reopened selector filter must clear: {}", probe.live_screen()));
+        .unwrap_or_else(|| {
+            panic!(
+                "reopened selector filter must clear: {}",
+                probe.live_screen()
+            )
+        });
     assert!(
         !unfiltered.contains(BOUNDED_OLDEST_SENTINEL),
         "oldest sentinel must remain truncated after reopen: {unfiltered}"

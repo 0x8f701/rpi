@@ -1,12 +1,16 @@
 /**
- * STT (hold-to-talk) pure helpers — the bounded WAV encode/resample and
- * size guard shared by App.tsx's transcribeAudio flow and the node-runnable
- * regression test (scripts/stt.test.ts). DELIBERATELY has no DOM/browser
- * dependency so `esbuild --platform=node` can bundle the test in isolation
- * (mirroring src/realtime.ts + scripts/realtime.test.ts).
+ * STT (hold-to-talk) pure helpers — the bounded WAV encode/resample, the
+ * decoded-size guard, and the captured-session owner check shared by
+ * App.tsx's transcribeAudio flow and the node-runnable regression test
+ * (scripts/stt.test.ts). DELIBERATELY has no DOM/browser dependency so
+ * `esbuild --platform=node` can bundle the test in isolation (mirroring
+ * src/realtime.ts + scripts/realtime.test.ts).
  *
  * The browser sends ONLY the bounded audio and a fixed MIME type over the
  * `stt_transcribe` RPC; the endpoint URL and API key never leave the backend.
+ * The RPC and any composer write stay bound to the session captured when
+ * transcription begins — a late result after an A→B switch is dropped
+ * instead of mutating B's composer.
  */
 
 /** Backend-side decoded-size cap for browser-recorded STT audio: a 44-byte
@@ -103,4 +107,152 @@ export function wavToBase64(bytes: Uint8Array): string | null {
     binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
   }
   return btoa(binary);
+}
+
+/** `stt_transcribe` RPC targeted at the session captured when transcription
+ *  began. Stamping `sessionId` here means a late result after an A→B switch
+ *  still routes to A's runtime instead of falling back to the active session. */
+export function sttTranscribeCommand(
+  owner: string,
+  audioBase64: string,
+  mimeType: string,
+): { type: 'stt_transcribe'; audioBase64: string; mimeType: string; sessionId: string } {
+  return { type: 'stt_transcribe', audioBase64, mimeType, sessionId: owner };
+}
+
+/** True when a captured STT owner may mutate the active composer. A late
+ *  transcript is dropped unless the owner is a non-empty string that still
+ *  matches the current session — switching A→B must never write A's result
+ *  into B's draft. */
+export function shouldCommitSttTranscript(owner: string | null | undefined, current: string | null | undefined): boolean {
+  return typeof owner === 'string' && owner !== '' && owner === current;
+}
+
+/** Submit kind for a committed STT transcript against the OWNER's state at
+ *  result time (owner running -> steer, else prompt). App.tsx consumes this;
+ *  the node test drives the same decision table through the seam. */
+export function planSttCommit(
+  owner: string | null | undefined,
+  current: string | null | undefined,
+  streaming: boolean,
+): 'steer' | 'prompt' | null {
+  if (!shouldCommitSttTranscript(owner, current)) return null;
+  return streaming ? 'steer' : 'prompt';
+}
+
+/** Hold-to-talk capture may begin only after the listener has bound a concrete
+ * session owner. Empty ownership must fail before getUserMedia; otherwise the
+ * later RPC routing fallback can retarget the recording to another session. */
+export function canStartSttRecording(owner: string | null | undefined): owner is string {
+  return typeof owner === 'string' && owner !== '';
+}
+
+export const STT_RECORDER_MIME_CANDIDATES = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'] as const;
+
+export const STT_UNCONFIGURED_MESSAGE =
+  'Live voice is not configured — set Settings.live.sttBaseUrl and sttApiKey (and sttModel) in the terminal';
+export const STT_HTTPS_MESSAGE =
+  'microphone requires HTTPS (or localhost). Use https:// or connect via 127.0.0.1.';
+export const STT_NO_SESSION_MESSAGE = 'voice recording requires an active session';
+export const STT_WAV_CONVERT_MESSAGE = 'transcription failed: recording could not be converted to WAV';
+export const STT_EMPTY_TRANSCRIPT_MESSAGE = 'transcription failed: no transcript returned';
+
+export function sttWavCapMessage(): string {
+  return `transcription failed: recording exceeds the ${STT_MAX_WAV_BYTES}-byte WAV cap`;
+}
+
+export function sttMicrophoneUnavailableMessage(err: unknown): string {
+  return `microphone unavailable: ${err instanceof Error ? err.message : String(err)}`;
+}
+
+export function sttTranscribeFailedMessage(err: unknown): string {
+  return `transcription failed: ${err instanceof Error ? err.message : String(err)}`;
+}
+
+export function selectSttRecorderMime(
+  isTypeSupported: ((mime: string) => boolean) | null | undefined,
+): string | undefined {
+  if (typeof isTypeSupported !== 'function') return undefined;
+  for (const mime of STT_RECORDER_MIME_CANDIDATES) {
+    if (isTypeSupported(mime)) return mime;
+  }
+  return undefined;
+}
+
+export type SttStartPlan =
+  | { ok: true; owner: string }
+  | { ok: false; message: string };
+
+export function planSttStart(args: {
+  owner: string | null | undefined;
+  live: { sttConfigured?: boolean } | null;
+  hasGetUserMedia: boolean;
+}): SttStartPlan {
+  if (args.live != null && args.live.sttConfigured !== true) {
+    return { ok: false, message: STT_UNCONFIGURED_MESSAGE };
+  }
+  if (!args.hasGetUserMedia) {
+    return { ok: false, message: STT_HTTPS_MESSAGE };
+  }
+  if (!canStartSttRecording(args.owner)) {
+    return { ok: false, message: STT_NO_SESSION_MESSAGE };
+  }
+  return { ok: true, owner: args.owner };
+}
+
+export function sttTranscriptText(raw: unknown): string {
+  if (raw && typeof raw === 'object' && typeof (raw as { text?: unknown }).text === 'string') {
+    return (raw as { text: string }).text;
+  }
+  return '';
+}
+
+export type SttTranscribeResult =
+  | { kind: 'drop' }
+  | { kind: 'error'; message: string }
+  | { kind: 'transcript'; text: string };
+
+export function planSttTranscribeResult(args: {
+  owner: string | null | undefined;
+  current: string | null | undefined;
+  wavOk: boolean;
+  audioBase64: string | null;
+  text: string;
+}): SttTranscribeResult {
+  if (!args.wavOk) {
+    return shouldCommitSttTranscript(args.owner, args.current)
+      ? { kind: 'error', message: STT_WAV_CONVERT_MESSAGE }
+      : { kind: 'drop' };
+  }
+  if (args.audioBase64 === null) {
+    return shouldCommitSttTranscript(args.owner, args.current)
+      ? { kind: 'error', message: sttWavCapMessage() }
+      : { kind: 'drop' };
+  }
+  if (!shouldCommitSttTranscript(args.owner, args.current)) return { kind: 'drop' };
+  if (!args.text) return { kind: 'error', message: STT_EMPTY_TRANSCRIPT_MESSAGE };
+  return { kind: 'transcript', text: args.text };
+}
+
+/** Convert a MediaRecorder blob to 16 kHz WAV; null on an undecodable container. */
+export async function blobToWav(blob: Blob): Promise<Blob | null> {
+  try {
+    const webkitWindow = globalThis as unknown as {
+      AudioContext?: typeof AudioContext;
+      webkitAudioContext?: typeof AudioContext;
+    };
+    const AudioCtor = webkitWindow.AudioContext ?? webkitWindow.webkitAudioContext;
+    if (!AudioCtor) return null;
+    const ctx = new AudioCtor();
+    try {
+      const audioBuffer = await ctx.decodeAudioData(await blob.arrayBuffer());
+      const channel = audioBuffer.numberOfChannels > 0 ? audioBuffer.getChannelData(0) : new Float32Array(0);
+      const resampled = resampleToSttRate(channel, Math.max(1, Math.round(audioBuffer.sampleRate)));
+      return new Blob([encodeWavPcm16(resampled, STT_SAMPLE_RATE)], { type: STT_WAV_MIME });
+    } finally {
+      void ctx.close();
+    }
+  } catch {
+    return null;
+  }
 }

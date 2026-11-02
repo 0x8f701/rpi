@@ -2,16 +2,25 @@
 
 use std::collections::HashMap;
 
+use crate::tool_card_adapter::{
+    TASK_TARGET_CHAR_LIMIT, TaskDelegationSections, task_delegation_sections,
+};
 use pi_coding::{
     AgentSnapshot, AgentStatus, ApplicationEvent, JobSnapshot, JobStatus, MailboxMessage,
     OrchestrationEvent, redact_value,
 };
 use serde::Serialize;
 
-const MAX_DESCRIPTION_CHARS: usize = 160;
+/// Task description row budget, aligned with the backend task description
+/// bound (`MAX_AGENT_DESCRIPTION_LENGTH`, 1024). Compact overview rows cap
+/// their own width and detail pages wrap at the panel width, so the raise
+/// keeps cards compact while details stay complete.
+const MAX_DESCRIPTION_CHARS: usize = 1024;
 const MAX_RESULT_CHARS: usize = 600;
 const MAX_ERROR_CHARS: usize = 300;
 const MAX_REFERENCE_CHARS: usize = 240;
+/// Character budget for the requested agent/persona overlay.
+const MAX_REQUESTED_AGENT_CHARS: usize = 64;
 /// Bound for the per-subagent live activity log kept for the detail panel.
 const MAX_JOB_EVENT_LOG: usize = 64;
 /// Bound for a single live activity line (a child IRC progress message body).
@@ -148,8 +157,13 @@ pub struct JobCardPresentationAdapter {
     agents: HashMap<String, AgentSnapshot>,
     next_ordinal: u64,
     group_id: Option<String>,
-    context: String,
+    task_context: TaskDelegationSections,
     requested_children: Vec<RequestedChild>,
+    /// Runtime group that owns the stored request after the first following
+    /// orchestration event. `None` while a just-observed Task call awaits its
+    /// group, so a clean group rollover does not discard the new request.
+    task_request_group_id: Option<String>,
+    task_request_pending: bool,
     /// Wall-clock epoch millis for live elapsed rendering. `0` (unset) means
     /// "unknown": active jobs then fall back to coarse stage-only text.
     now: u64,
@@ -173,12 +187,7 @@ impl JobCardPresentationAdapter {
             | OrchestrationEvent::AgentUpdated { group_id, .. }
             | OrchestrationEvent::MessageDelivered { group_id, .. } => group_id,
         };
-        if self.group_id.as_deref().is_some_and(|current| current != group_id) {
-            self.jobs.clear();
-            self.agents.clear();
-            self.next_ordinal = 0;
-        }
-        self.group_id = Some(group_id.clone());
+        self.prepare_group(group_id);
         match event {
             OrchestrationEvent::JobUpdated { job, .. } => self.upsert_job(job.clone()),
             OrchestrationEvent::AgentUpdated { agent, .. } => self.upsert_agent(agent.clone()),
@@ -213,10 +222,11 @@ impl JobCardPresentationAdapter {
         jobs: Vec<JobSnapshot>,
         agents: Vec<AgentSnapshot>,
     ) {
+        let group_id = group_id.into();
+        self.prepare_group(&group_id);
         self.jobs.clear();
         self.agents.clear();
         self.next_ordinal = 0;
-        self.group_id = Some(group_id.into());
         for agent in agents {
             self.upsert_agent(agent);
         }
@@ -232,39 +242,78 @@ impl JobCardPresentationAdapter {
         self.now = now;
     }
 
+    /// Store one safe detail authority for the Task delegation request.
+    /// Callers still parse the tool arguments during the TUI cutover; this
+    /// adapter owns the redacted/bounded request details exposed afterward.
     pub fn set_task_request(
         &mut self,
         context: String,
         children: impl IntoIterator<Item = (Option<String>, Option<String>, String)>,
     ) {
-        self.context = context;
+        self.task_context = task_delegation_sections(&redacted_text(&context));
         self.requested_children = children
             .into_iter()
-            .map(|(name, agent, task)| RequestedChild { name, agent, task })
+            .map(|(name, agent, task)| RequestedChild {
+                name,
+                agent: agent.and_then(|agent| {
+                    let agent = bounded_redacted(agent.trim(), MAX_REQUESTED_AGENT_CHARS);
+                    (!agent.is_empty()).then_some(agent)
+                }),
+                task: bounded_redacted(task.trim(), TASK_TARGET_CHAR_LIMIT),
+            })
             .collect();
+        self.task_request_group_id = None;
+        self.task_request_pending = true;
+    }
+
+    /// Bounded, credential-redacted shared Task context split for the explicit
+    /// Todo detail surface. This is the sole structured context authority;
+    /// legacy Task-card text is reconstructed from these sections.
+    #[must_use]
+    pub(crate) fn task_context_sections(&self) -> &TaskDelegationSections {
+        &self.task_context
+    }
+
+    fn prepare_group(&mut self, group_id: &str) {
+        if self
+            .group_id
+            .as_deref()
+            .is_some_and(|current| current != group_id)
+        {
+            self.jobs.clear();
+            self.agents.clear();
+            self.next_ordinal = 0;
+        }
+        if self.task_request_pending {
+            self.task_request_group_id = Some(group_id.to_owned());
+            self.task_request_pending = false;
+        } else if self
+            .task_request_group_id
+            .as_deref()
+            .is_some_and(|owner| owner != group_id)
+        {
+            self.clear_task_request();
+        }
+        self.group_id = Some(group_id.to_owned());
+    }
+
+    fn clear_task_request(&mut self) {
+        self.task_context = TaskDelegationSections::default();
+        self.requested_children.clear();
+        self.task_request_group_id = None;
+        self.task_request_pending = false;
     }
 
     #[must_use]
     pub fn task_card(&self) -> Option<TaskCardRows> {
         let group_id = self.group_id.clone()?;
-        let mut children = self.cards_in_source_order();
+        let children = self.cards_in_source_order();
         if children.is_empty() {
             return None;
         }
-        for (index, child) in children.iter_mut().enumerate() {
-            let requested = self.requested_children.iter().find(|requested| {
-                requested.name.as_deref() == Some(child.agent_id.as_str())
-            }).or_else(|| self.requested_children.get(index));
-            if let Some(requested) = requested {
-                child.summary = Some(requested.task.clone());
-                if let Some(agent) = &requested.agent {
-                    child.agent = agent.clone();
-                }
-            }
-        }
         Some(TaskCardRows {
             group_id,
-            context: self.context.clone(),
+            context: legacy_task_context(&self.task_context),
             aggregate: self.aggregate_row().expect("task card has children"),
             children,
         })
@@ -275,15 +324,61 @@ impl JobCardPresentationAdapter {
         self.agents.clear();
         self.next_ordinal = 0;
         self.group_id = None;
-        self.context.clear();
-        self.requested_children.clear();
+        self.clear_task_request();
     }
 
     #[must_use]
     pub fn cards_in_source_order(&self) -> Vec<JobCardRows> {
         let mut jobs = self.jobs.values().collect::<Vec<_>>();
         jobs.sort_by_key(|job| job.ordinal);
-        jobs.into_iter().map(|job| card_rows(job, self.now)).collect()
+        let mut cards = jobs
+            .into_iter()
+            .map(|job| card_rows(job, self.now))
+            .collect::<Vec<_>>();
+        let mut assignments = vec![None; cards.len()];
+        let mut consumed = vec![false; self.requested_children.len()];
+
+        // Exact requested names are authoritative even when runtime source
+        // order differs. Reserve those first so index fallback cannot reuse a
+        // named request that already belongs to another card.
+        for (card_index, card) in cards.iter().enumerate() {
+            if let Some(request_index) =
+                self.requested_children
+                    .iter()
+                    .enumerate()
+                    .position(|(request_index, requested)| {
+                        !consumed[request_index]
+                            && requested.name.as_deref() == Some(card.agent_id.as_str())
+                    })
+            {
+                assignments[card_index] = Some(request_index);
+                consumed[request_index] = true;
+            }
+        }
+        // Unnamed/unmatched runtime children consume only requests not already
+        // claimed above, preserving request order without duplicate overlays.
+        let mut remaining = consumed
+            .iter()
+            .enumerate()
+            .filter_map(|(index, used)| (!used).then_some(index));
+        for assignment in assignments
+            .iter_mut()
+            .filter(|assignment| assignment.is_none())
+        {
+            *assignment = remaining.next();
+        }
+        for (card, request_index) in cards.iter_mut().zip(assignments) {
+            let Some(requested) =
+                request_index.and_then(|index| self.requested_children.get(index))
+            else {
+                continue;
+            };
+            card.summary = Some(requested.task.clone());
+            if let Some(agent) = &requested.agent {
+                card.agent.clone_from(agent);
+            }
+        }
+        cards
     }
 
     #[must_use]
@@ -305,7 +400,11 @@ impl JobCardPresentationAdapter {
                 JobStatus::Failed => failed += 1,
                 JobStatus::Cancelled => cancelled += 1,
             }
-            if job.agent.as_ref().is_some_and(|agent| agent.status == AgentStatus::Parked) {
+            if job
+                .agent
+                .as_ref()
+                .is_some_and(|agent| agent.status == AgentStatus::Parked)
+            {
                 parked += 1;
             }
         }
@@ -391,10 +490,29 @@ impl JobCardPresentationAdapter {
 
     fn upsert_agent(&mut self, agent: AgentSnapshot) {
         self.agents.insert(agent.id.clone(), agent.clone());
-        for job in self.jobs.values_mut().filter(|job| job.snapshot.agent_id == agent.id) {
+        for job in self
+            .jobs
+            .values_mut()
+            .filter(|job| job.snapshot.agent_id == agent.id)
+        {
             job.agent = Some(agent.clone());
         }
     }
+}
+/// Temporary text compatibility for the legacy transcript Task card. The
+/// structured, safe sections above remain the only stored context authority.
+fn legacy_task_context(sections: &TaskDelegationSections) -> String {
+    [
+        ("Goal", sections.goal.as_str()),
+        ("Target", sections.target.as_str()),
+        ("Constraints", sections.constraints.as_str()),
+        ("Contract", sections.contract.as_str()),
+    ]
+    .into_iter()
+    .filter(|(_, body)| !body.is_empty())
+    .map(|(heading, body)| format!("# {heading}\n{body}"))
+    .collect::<Vec<_>>()
+    .join("\n\n")
 }
 
 fn card_rows(job: &ProjectedJob, now: u64) -> JobCardRows {
@@ -407,7 +525,10 @@ fn card_rows(job: &ProjectedJob, now: u64) -> JobCardRows {
     let mut rows = vec![row(
         snapshot,
         JobCardRowRole::Title,
-        format!("{} ({}) · {title_status}", snapshot.agent_id, snapshot.agent),
+        format!(
+            "{} ({}) · {title_status}",
+            snapshot.agent_id, snapshot.agent
+        ),
     )];
     let progress = JobCardProgress {
         stage: Some(job_status_label(snapshot.status).to_owned()),
@@ -415,10 +536,20 @@ fn card_rows(job: &ProjectedJob, now: u64) -> JobCardRows {
         activity_at: job.activity_at,
         elapsed_ms: elapsed_ms(snapshot, now),
         events: job.events.clone(),
-        history_ref: job.agent.as_ref().and_then(|agent| agent.history_ref.clone()),
-        artifact_ref: job.agent.as_ref().and_then(|agent| agent.artifact_ref.clone()),
+        history_ref: job
+            .agent
+            .as_ref()
+            .and_then(|agent| agent.history_ref.clone()),
+        artifact_ref: job
+            .agent
+            .as_ref()
+            .and_then(|agent| agent.artifact_ref.clone()),
     };
-    if let Some(description) = snapshot.description.as_deref().filter(|value| !value.is_empty()) {
+    if let Some(description) = snapshot
+        .description
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
         rows.push(row(
             snapshot,
             JobCardRowRole::Description,
@@ -451,14 +582,22 @@ fn card_rows(job: &ProjectedJob, now: u64) -> JobCardRows {
                 bounded_redacted(&result.output, MAX_RESULT_CHARS),
             ));
         }
-        if let Some(error) = result.error.as_deref().filter(|value| !value.trim().is_empty()) {
+        if let Some(error) = result
+            .error
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
             rows.push(row(
                 snapshot,
                 JobCardRowRole::Error,
                 bounded_redacted(error, MAX_ERROR_CHARS),
             ));
         }
-        for reference in [&result.artifact_ref, &result.history_ref, &result.artifact_uri] {
+        for reference in [
+            &result.artifact_ref,
+            &result.history_ref,
+            &result.artifact_uri,
+        ] {
             if !reference.is_empty() {
                 rows.push(row(
                     snapshot,
@@ -495,7 +634,7 @@ fn row(snapshot: &JobSnapshot, role: JobCardRowRole, text: String) -> JobCardRow
     }
 }
 
-fn job_status_label(status: JobStatus) -> &'static str {
+pub(crate) fn job_status_label(status: JobStatus) -> &'static str {
     match status {
         JobStatus::Queued => "queued",
         JobStatus::Running => "running",
@@ -510,9 +649,10 @@ fn timing_text(snapshot: &JobSnapshot) -> String {
         .started_at
         .unwrap_or(snapshot.created_at)
         .saturating_sub(snapshot.created_at);
-    let runtime = snapshot.finished_at.zip(snapshot.started_at).map(|(finished, started)| {
-        finished.saturating_sub(started)
-    });
+    let runtime = snapshot
+        .finished_at
+        .zip(snapshot.started_at)
+        .map(|(finished, started)| finished.saturating_sub(started));
     match (snapshot.started_at, runtime) {
         (None, _) => "request queued".to_owned(),
         (Some(_), None) if age == 0 => "running".to_owned(),
@@ -627,10 +767,15 @@ fn usage_text(usage: &pi_ai::Usage) -> String {
     let total = if usage.total_tokens > 0 {
         usage.total_tokens
     } else {
-        [usage.input, usage.output, usage.cache_read, usage.cache_write]
-            .into_iter()
-            .filter(|value| *value > 0)
-            .sum()
+        [
+            usage.input,
+            usage.output,
+            usage.cache_read,
+            usage.cache_write,
+        ]
+        .into_iter()
+        .filter(|value| *value > 0)
+        .sum()
     };
     let mut parts = Vec::new();
     if total > 0 {
@@ -651,10 +796,15 @@ fn usage_text(usage: &pi_ai::Usage) -> String {
     parts.join(" · ")
 }
 
+fn redacted_text(text: &str) -> String {
+    redact_value(&serde_json::Value::String(text.to_owned()))
+        .as_str()
+        .unwrap_or_default()
+        .to_owned()
+}
+
 fn bounded_redacted(text: &str, max_chars: usize) -> String {
-    let value = redact_value(&serde_json::Value::String(text.to_owned()));
-    let redacted = value.as_str().unwrap_or_default();
-    truncate_chars(redacted, max_chars)
+    truncate_chars(&redacted_text(text), max_chars)
 }
 
 fn truncate_chars(text: &str, max_chars: usize) -> String {
@@ -672,6 +822,7 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool_card_adapter::TASK_SECTION_CHAR_LIMIT;
     use pi_coding::{AgentStatus, TaskResult};
 
     fn job(id: &str, agent_id: &str, status: JobStatus) -> JobSnapshot {
@@ -713,7 +864,11 @@ mod tests {
             index: 0,
             id: id.to_owned(),
             agent: "task".to_owned(),
-            status: if error.is_some() { AgentStatus::Idle } else { AgentStatus::Idle },
+            status: if error.is_some() {
+                AgentStatus::Idle
+            } else {
+                AgentStatus::Idle
+            },
             output: output.to_owned(),
             usage: pi_ai::Usage {
                 input: 10,
@@ -734,19 +889,33 @@ mod tests {
     fn queued_running_completed_updates_one_card() {
         let mut adapter = JobCardPresentationAdapter::new();
         let mut snapshot = job("job-1", "Child", JobStatus::Queued);
-        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated { group_id: "group".to_owned(), job: snapshot.clone() });
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: snapshot.clone(),
+        });
         snapshot.status = JobStatus::Running;
         snapshot.started_at = Some(1_100);
-        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated { group_id: "group".to_owned(), job: snapshot.clone() });
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: snapshot.clone(),
+        });
         snapshot.status = JobStatus::Completed;
         snapshot.finished_at = Some(2_100);
         snapshot.result = Some(result("Child", "done", None));
-        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated { group_id: "group".to_owned(), job: snapshot });
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: snapshot,
+        });
         let cards = adapter.cards_in_source_order();
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].job_status, JobStatus::Completed);
         assert!(cards[0].rows.iter().any(|row| row.text == "done"));
-        assert!(cards[0].rows.iter().any(|row| row.text.contains("runtime 1s")));
+        assert!(
+            cards[0]
+                .rows
+                .iter()
+                .any(|row| row.text.contains("runtime 1s"))
+        );
     }
 
     #[test]
@@ -754,10 +923,19 @@ mod tests {
         let mut adapter = JobCardPresentationAdapter::new();
         let mut failed = job("failed", "Same", JobStatus::Failed);
         failed.result = Some(result("Same", "", Some("provider failed")));
-        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated { group_id: "group".to_owned(), job: failed });
-        adapter.apply_orchestration_event(&OrchestrationEvent::AgentUpdated { group_id: "group".to_owned(), agent: agent("Same", AgentStatus::Parked) });
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: failed,
+        });
+        adapter.apply_orchestration_event(&OrchestrationEvent::AgentUpdated {
+            group_id: "group".to_owned(),
+            agent: agent("Same", AgentStatus::Parked),
+        });
         let cancelled = job("cancelled", "Other", JobStatus::Cancelled);
-        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated { group_id: "group".to_owned(), job: cancelled });
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: cancelled,
+        });
         let cards = adapter.cards_in_source_order();
         assert_eq!(cards[0].job_status, JobStatus::Failed);
         assert_eq!(cards[0].agent_status, Some(AgentStatus::Parked));
@@ -768,13 +946,28 @@ mod tests {
     #[test]
     fn concurrent_same_agent_jobs_keep_job_identity_order() {
         let mut adapter = JobCardPresentationAdapter::new();
-        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated { group_id: "group".to_owned(), job: job("first", "Shared", JobStatus::Running) });
-        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated { group_id: "group".to_owned(), job: job("second", "Shared", JobStatus::Queued) });
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: job("first", "Shared", JobStatus::Running),
+        });
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: job("second", "Shared", JobStatus::Queued),
+        });
         let mut first = job("first", "Shared", JobStatus::Completed);
         first.result = Some(result("Shared", "first result", None));
-        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated { group_id: "group".to_owned(), job: first });
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: first,
+        });
         let cards = adapter.cards_in_source_order();
-        assert_eq!(cards.iter().map(|card| card.job_id.as_str()).collect::<Vec<_>>(), ["first", "second"]);
+        assert_eq!(
+            cards
+                .iter()
+                .map(|card| card.job_id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
         assert_eq!(cards[0].job_status, JobStatus::Completed);
         assert_eq!(cards[1].job_status, JobStatus::Queued);
     }
@@ -784,8 +977,15 @@ mod tests {
         let secret = "credential-redaction-fixture-value";
         let mut adapter = JobCardPresentationAdapter::new();
         let mut snapshot = job("terminal", "Child", JobStatus::Completed);
-        snapshot.result = Some(result("Child", &format!("token={secret} {}", "é".repeat(700)), None));
-        let event = OrchestrationEvent::JobUpdated { group_id: "group".to_owned(), job: snapshot };
+        snapshot.result = Some(result(
+            "Child",
+            &format!("token={secret} {}", "é".repeat(700)),
+            None,
+        ));
+        let event = OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: snapshot,
+        };
         adapter.apply_orchestration_event(&event);
         adapter.apply_orchestration_event(&event);
         let cards = adapter.cards_in_source_order();
@@ -793,7 +993,11 @@ mod tests {
         let encoded = serde_json::to_string(&cards).expect("serialize cards");
         assert!(!encoded.contains(secret));
         assert!(encoded.contains("[REDACTED]"));
-        let result_row = cards[0].rows.iter().find(|row| row.role == JobCardRowRole::Result).expect("result row");
+        let result_row = cards[0]
+            .rows
+            .iter()
+            .find(|row| row.role == JobCardRowRole::Result)
+            .expect("result row");
         assert!(result_row.text.chars().count() <= MAX_RESULT_CHARS);
         assert!(result_row.text.ends_with('…'));
     }
@@ -822,9 +1026,15 @@ mod tests {
             job("r", "R", JobStatus::Running),
             job("c", "C", JobStatus::Completed),
         ] {
-            adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated { group_id: "group".to_owned(), job: snapshot });
+            adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+                group_id: "group".to_owned(),
+                job: snapshot,
+            });
         }
-        adapter.apply_orchestration_event(&OrchestrationEvent::AgentUpdated { group_id: "group".to_owned(), agent: agent("C", AgentStatus::Parked) });
+        adapter.apply_orchestration_event(&OrchestrationEvent::AgentUpdated {
+            group_id: "group".to_owned(),
+            agent: agent("C", AgentStatus::Parked),
+        });
         assert_eq!(adapter.running_count(), 2);
         let aggregate = adapter.aggregate_row().expect("aggregate");
         assert!(aggregate.text.contains("1 running"));
@@ -833,28 +1043,197 @@ mod tests {
         assert!(aggregate.text.contains("1 completed"));
     }
     #[test]
-    fn task_card_groups_children_and_merges_by_stable_job_id() {
+    fn requested_details_overlay_cards_without_changing_source_identity_or_order() {
         let mut adapter = JobCardPresentationAdapter::new();
         adapter.set_task_request(
             "# Goal\nShip the Task card\n\n# Contract\nKeep stable ids".to_owned(),
             [
-                (Some("Alpha".to_owned()), Some("reviewer".to_owned()), "Review adapter".to_owned()),
+                (
+                    Some("Alpha".to_owned()),
+                    Some("reviewer".to_owned()),
+                    "Review adapter".to_owned(),
+                ),
                 (Some("Beta".to_owned()), None, "Render card".to_owned()),
             ],
         );
-        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated { group_id: "group".to_owned(), job: job("job-a", "Alpha", JobStatus::Running) });
-        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated { group_id: "group".to_owned(), job: job("job-b", "Beta", JobStatus::Queued) });
-        let mut updated = job("job-a", "Alpha", JobStatus::Completed);
-        updated.result = Some(result("Alpha", "done", None));
-        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated { group_id: "group".to_owned(), job: updated });
+        // Runtime source order differs from request order. Explicit names win,
+        // while the stable job/agent authority ids remain untouched.
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: job("job-b", "Beta", JobStatus::Queued),
+        });
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: job("job-a", "Alpha", JobStatus::Running),
+        });
+        let cards = adapter.cards_in_source_order();
+        assert_eq!(
+            cards
+                .iter()
+                .map(|child| child.job_id.as_str())
+                .collect::<Vec<_>>(),
+            ["job-b", "job-a"]
+        );
+        assert_eq!(cards[0].agent_id, "Beta");
+        assert_eq!(cards[0].summary.as_deref(), Some("Render card"));
+        assert_eq!(cards[0].agent, "task");
+        assert_eq!(cards[1].agent_id, "Alpha");
+        assert_eq!(cards[1].summary.as_deref(), Some("Review adapter"));
+        assert_eq!(cards[1].agent, "reviewer");
+
+        // Legacy Task-card callers consume the exact same enriched cards and
+        // the reconstructed safe context until the TUI cutover removes them.
         let card = adapter.task_card().expect("task card");
-        assert_eq!(card.children.len(), 2);
-        assert_eq!(card.children.iter().map(|child| child.job_id.as_str()).collect::<Vec<_>>(), ["job-a", "job-b"]);
-        assert_eq!(card.children[0].summary.as_deref(), Some("Review adapter"));
-        assert_eq!(card.children[0].agent, "reviewer");
-        assert_eq!(card.children[0].job_status, JobStatus::Completed);
-        assert_eq!(card.children[1].job_status, JobStatus::Queued);
-        assert!(card.context.contains("# Contract"));
+        assert_eq!(card.children, cards);
+        assert!(card.context.contains("# Contract\nKeep stable ids"));
+    }
+    #[test]
+    fn mixed_exact_and_fallback_requests_are_consumed_once() {
+        let mut adapter = JobCardPresentationAdapter::new();
+        adapter.set_task_request(
+            "shared".to_owned(),
+            [
+                (
+                    Some("Alpha".to_owned()),
+                    Some("researcher".to_owned()),
+                    "Alpha request".to_owned(),
+                ),
+                (
+                    Some("Beta".to_owned()),
+                    Some("reviewer".to_owned()),
+                    "Beta request".to_owned(),
+                ),
+            ],
+        );
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: job("job-beta", "Beta", JobStatus::Running),
+        });
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: job("job-unknown", "Generated", JobStatus::Queued),
+        });
+
+        let cards = adapter.cards_in_source_order();
+        assert_eq!(cards[0].summary.as_deref(), Some("Beta request"));
+        assert_eq!(cards[0].agent, "reviewer");
+        assert_eq!(cards[1].summary.as_deref(), Some("Alpha request"));
+        assert_eq!(cards[1].agent, "researcher");
+        assert_ne!(
+            cards[0].summary, cards[1].summary,
+            "one request must not overlay two cards"
+        );
+    }
+
+    #[test]
+    fn task_request_is_owned_by_one_runtime_group_without_losing_pending_rollover() {
+        let mut adapter = JobCardPresentationAdapter::new();
+        adapter.set_task_request(
+            "# Goal\nOld detail".to_owned(),
+            [(
+                Some("Old".to_owned()),
+                Some("reviewer".to_owned()),
+                "Old request".to_owned(),
+            )],
+        );
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+            group_id: "old-group".to_owned(),
+            job: job("old-job", "Old", JobStatus::Running),
+        });
+        assert_eq!(
+            adapter.cards_in_source_order()[0].summary.as_deref(),
+            Some("Old request")
+        );
+
+        // A group that arrives without a preceding Task request cannot inherit
+        // the old group's request context or source-index overlays.
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+            group_id: "unrelated-group".to_owned(),
+            job: job("unrelated-job", "Other", JobStatus::Queued),
+        });
+        let unrelated = adapter.cards_in_source_order();
+        assert_eq!(unrelated.len(), 1);
+        assert!(unrelated[0].summary.is_none());
+        assert_eq!(unrelated[0].agent, "task");
+        assert_eq!(
+            adapter.task_context_sections(),
+            &TaskDelegationSections::default()
+        );
+
+        // A fresh Task request is pending until its first orchestration event,
+        // so the normal Task-start → new-group ordering preserves the request.
+        adapter.set_task_request(
+            "# Contract\nNew detail".to_owned(),
+            [(
+                Some("Fresh".to_owned()),
+                Some("scout".to_owned()),
+                "Fresh request".to_owned(),
+            )],
+        );
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+            group_id: "fresh-group".to_owned(),
+            job: job("fresh-job", "Fresh", JobStatus::Running),
+        });
+        let fresh = adapter.cards_in_source_order();
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].summary.as_deref(), Some("Fresh request"));
+        assert_eq!(fresh[0].agent, "scout");
+        assert_eq!(adapter.task_context_sections().contract, "New detail");
+    }
+
+    #[test]
+    fn requested_task_persona_and_shared_context_are_redacted_and_bounded() {
+        let secret = "credential-redaction-fixture-value";
+        let long_task = format!(
+            "token={secret} {}",
+            "任".repeat(TASK_TARGET_CHAR_LIMIT + 80)
+        );
+        let long_goal = format!(
+            "password={secret} {}",
+            "界".repeat(TASK_SECTION_CHAR_LIMIT + 80)
+        );
+        let long_target = "標".repeat(TASK_SECTION_CHAR_LIMIT + 80);
+        let long_persona = format!(
+            "token={secret} {}",
+            "p".repeat(MAX_REQUESTED_AGENT_CHARS + 80)
+        );
+        let mut adapter = JobCardPresentationAdapter::new();
+        adapter.set_task_request(
+            format!(
+                "# Goal\n{long_goal}\n\n# Target\n{long_target}\n\n# Constraints\nNo leaks\n\n# Contract\nOne authority"
+            ),
+            [(Some("Alpha".to_owned()), Some(long_persona), long_task)],
+        );
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: job("job-a", "Alpha", JobStatus::Running),
+        });
+
+        let cards = adapter.cards_in_source_order();
+        let card = &cards[0];
+        let summary = card.summary.as_deref().expect("requested task summary");
+        assert!(!summary.contains(secret));
+        assert!(summary.contains("[REDACTED]"));
+        assert_eq!(summary.chars().count(), TASK_TARGET_CHAR_LIMIT);
+        assert!(summary.ends_with('…'));
+        assert!(!card.agent.contains(secret));
+        assert!(card.agent.contains("[REDACTED]"));
+        assert_eq!(card.agent.chars().count(), MAX_REQUESTED_AGENT_CHARS);
+        assert!(card.agent.ends_with('…'));
+
+        let sections = adapter.task_context_sections();
+        assert!(!sections.goal.contains(secret));
+        assert!(sections.goal.contains("[REDACTED]"));
+        assert_eq!(sections.goal.chars().count(), TASK_SECTION_CHAR_LIMIT);
+        assert!(sections.goal.ends_with('…'));
+        assert_eq!(sections.target.chars().count(), TASK_SECTION_CHAR_LIMIT);
+        assert!(sections.target.ends_with('…'));
+        assert_eq!(sections.constraints, "No leaks");
+        assert_eq!(sections.contract, "One authority");
+
+        let legacy = adapter.task_card().expect("legacy task card");
+        assert!(!legacy.context.contains(secret));
+        assert!(legacy.context.contains("[REDACTED]"));
     }
 
     #[test]
@@ -863,12 +1242,22 @@ mod tests {
         let mut snapshot = job("job-1", "Child", JobStatus::Running);
         snapshot.started_at = Some(500);
         adapter.set_now(12_500);
-        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated { group_id: "group".to_owned(), job: snapshot });
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: snapshot,
+        });
         // No detail yet: coarse stage + elapsed fallback.
         let cards = adapter.cards_in_source_order();
-        let progress_row = cards[0].rows.iter().find(|row| row.role == JobCardRowRole::Progress).expect("progress row");
+        let progress_row = cards[0]
+            .rows
+            .iter()
+            .find(|row| row.role == JobCardRowRole::Progress)
+            .expect("progress row");
         assert_eq!(progress_row.text, "running · 12s");
-        assert_eq!(cards[0].progress.as_ref().expect("progress").elapsed_ms, Some(12_000));
+        assert_eq!(
+            cards[0].progress.as_ref().expect("progress").elapsed_ms,
+            Some(12_000)
+        );
         // A child → Main IRC progress message becomes the live activity.
         adapter.apply_orchestration_event(&OrchestrationEvent::MessageDelivered {
             group_id: "group".to_owned(),
@@ -883,7 +1272,11 @@ mod tests {
             },
         });
         let cards = adapter.cards_in_source_order();
-        let progress_row = cards[0].rows.iter().find(|row| row.role == JobCardRowRole::Progress).expect("progress row");
+        let progress_row = cards[0]
+            .rows
+            .iter()
+            .find(|row| row.role == JobCardRowRole::Progress)
+            .expect("progress row");
         assert_eq!(progress_row.text, "read tools.rs · 12s");
         let progress = cards[0].progress.as_ref().expect("progress");
         assert_eq!(progress.activity.as_deref(), Some("read tools.rs"));
@@ -903,42 +1296,95 @@ mod tests {
         let mut snapshot = job("job-1", "Child", JobStatus::Running);
         snapshot.started_at = Some(1_000);
         adapter.set_now(1_500);
-        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated { group_id: "group".to_owned(), job: snapshot });
-        assert_eq!(adapter.cards_in_source_order()[0].progress.as_ref().expect("progress").elapsed_ms, Some(500));
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: snapshot,
+        });
+        assert_eq!(
+            adapter.cards_in_source_order()[0]
+                .progress
+                .as_ref()
+                .expect("progress")
+                .elapsed_ms,
+            Some(500)
+        );
         adapter.set_now(13_000);
         let cards = adapter.cards_in_source_order();
-        let progress_row = cards[0].rows.iter().find(|row| row.role == JobCardRowRole::Progress).expect("progress row");
+        let progress_row = cards[0]
+            .rows
+            .iter()
+            .find(|row| row.role == JobCardRowRole::Progress)
+            .expect("progress row");
         assert_eq!(progress_row.text, "running · 12s");
         // Settled: no Progress row; Timing + Usage rows and settled runtime return.
         let mut done = job("job-1", "Child", JobStatus::Completed);
         done.started_at = Some(1_000);
         done.finished_at = Some(4_000);
         done.result = Some(result("Child", "done", None));
-        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated { group_id: "group".to_owned(), job: done });
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: done,
+        });
         let cards = adapter.cards_in_source_order();
-        assert!(cards[0].rows.iter().all(|row| row.role != JobCardRowRole::Progress));
-        assert!(cards[0].rows.iter().any(|row| row.role == JobCardRowRole::Timing && row.text.contains("runtime 3s")));
-        assert!(cards[0].rows.iter().any(|row| row.role == JobCardRowRole::Usage && row.text.contains("15 tokens")));
-        assert_eq!(cards[0].progress.as_ref().expect("progress").elapsed_ms, Some(3_000));
+        assert!(
+            cards[0]
+                .rows
+                .iter()
+                .all(|row| row.role != JobCardRowRole::Progress)
+        );
+        assert!(
+            cards[0]
+                .rows
+                .iter()
+                .any(|row| row.role == JobCardRowRole::Timing && row.text.contains("runtime 3s"))
+        );
+        assert!(
+            cards[0]
+                .rows
+                .iter()
+                .any(|row| row.role == JobCardRowRole::Usage && row.text.contains("15 tokens"))
+        );
+        assert_eq!(
+            cards[0].progress.as_ref().expect("progress").elapsed_ms,
+            Some(3_000)
+        );
     }
 
     #[test]
     fn event_log_records_lifecycle_transitions_in_order() {
         let mut adapter = JobCardPresentationAdapter::new();
         let mut snapshot = job("job-1", "Child", JobStatus::Queued);
-        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated { group_id: "group".to_owned(), job: snapshot.clone() });
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: snapshot.clone(),
+        });
         snapshot.status = JobStatus::Running;
         snapshot.started_at = Some(1_100);
-        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated { group_id: "group".to_owned(), job: snapshot.clone() });
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: snapshot.clone(),
+        });
         snapshot.status = JobStatus::Failed;
         snapshot.finished_at = Some(2_000);
         snapshot.result = Some(result("Child", "", Some("provider failed")));
-        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated { group_id: "group".to_owned(), job: snapshot });
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: snapshot,
+        });
         let cards = adapter.cards_in_source_order();
         let progress = cards[0].progress.as_ref().expect("progress");
-        let texts = progress.events.iter().map(|entry| entry.text.as_str()).collect::<Vec<_>>();
+        let texts = progress
+            .events
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect::<Vec<_>>();
         assert_eq!(texts, ["queued", "started", "failed: provider failed"]);
-        assert!(progress.events.iter().all(|entry| entry.kind == JobEventKind::Job));
+        assert!(
+            progress
+                .events
+                .iter()
+                .all(|entry| entry.kind == JobEventKind::Job)
+        );
     }
 
     #[test]
@@ -948,7 +1394,10 @@ mod tests {
         let mut snapshot = job("job-1", "Child", JobStatus::Running);
         snapshot.started_at = Some(500);
         adapter.set_now(12_500);
-        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated { group_id: "group".to_owned(), job: snapshot });
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: snapshot,
+        });
         adapter.apply_orchestration_event(&OrchestrationEvent::MessageDelivered {
             group_id: "group".to_owned(),
             waiter_claimed: false,
@@ -965,7 +1414,13 @@ mod tests {
         let encoded = serde_json::to_string(&cards).expect("serialize cards");
         assert!(!encoded.contains(secret), "activity log must be redacted");
         assert!(encoded.contains("[REDACTED]"));
-        let activity = cards[0].progress.as_ref().expect("progress").activity.clone().expect("activity");
+        let activity = cards[0]
+            .progress
+            .as_ref()
+            .expect("progress")
+            .activity
+            .clone()
+            .expect("activity");
         assert!(activity.chars().count() <= MAX_ACTIVITY_CHARS);
     }
 }

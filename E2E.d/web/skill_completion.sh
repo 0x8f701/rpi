@@ -52,8 +52,8 @@ spawn_rpi() {
         exec env -i \
             HOME="$root/home" USERPROFILE="$root/home" \
             PATH="${PATH:-/usr/bin:/bin}" LANG="${LANG:-C.UTF-8}" LC_ALL="${LC_ALL:-C.UTF-8}" \
-            PI_CODING_AGENT_DIR="$root/home/.pi/agent" \
-            PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 \
+            RPI_HOME="$root/home/.rpi" \
+            RPI_OFFLINE=1 RPI_SKIP_VERSION_CHECK=1 \
             RPI_WEB_DEV_DIR="${RPI_WEB_DEV_DIR:-}" \
             "$RPI_BIN" --offline --approve \
             --listen 127.0.0.1:0 \
@@ -62,13 +62,14 @@ spawn_rpi() {
             --model user-steering/mock --api-key user-mock-key \
             <"$stdin_path" >"$evidence/rpi.stdout" 2>"$evidence/rpi.stderr"
     ) &
-    register_pid $!
+    RPI_PID=$!
+    register_pid "$RPI_PID"
 }
 
 seed_skill() {
     local root="$1" name="$2" desc="$3"
-    mkdir -p "$root/workspace/.pi/skills/$name"
-    cat >"$root/workspace/.pi/skills/$name/SKILL.md" <<EOF
+    mkdir -p "$root/workspace/.rpi/skills/$name"
+    cat >"$root/workspace/.rpi/skills/$name/SKILL.md" <<EOF
 ---
 name: $name
 description: $desc
@@ -96,6 +97,7 @@ run_phase() {
         "RPI_SKILL_DESC=$SKILL_DESC" \
         "RPI_SECOND_SKILL_NAME=$SECOND_SKILL_NAME" \
         "RPI_SECOND_SKILL_DESC=$SECOND_SKILL_DESC" || pw_status=$?
+    web_sanity_http "$url" >/dev/null
     web_kill_rpi
     web_kill_mock "$root"
     if [ "$pw_status" -eq 0 ]; then
@@ -105,7 +107,6 @@ run_phase() {
     else
         fail "$SCENARIO ($phase): playwright lane failed (exit $pw_status)"
     fi
-    web_sanity_http "$url" >/dev/null
 }
 
 main() {

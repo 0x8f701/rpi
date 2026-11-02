@@ -84,7 +84,7 @@ mod tests {
 
     #[test]
     fn html_adapter_preserves_shared_text_and_roles() {
-        let source = "# Heading\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\n```mermaid\nflowchart LR\nA --> B\n```\n\n```mermaid\npie\n\"Breakfast\" 5\n```";
+        let source = "# Heading\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\n```mermaid\nflowchart LR\nA --> B\n```\n\n```mermaid\nclassDiagram\nclass Animal {\n+name: String\n}\nclass Dog {\n+bark()\n}\nAnimal --> Dog\n```\n\n```mermaid\npie\n\"Breakfast\" 5\n```";
         let neutral = render_markdown(
             source,
             &MarkdownRenderOptions {
@@ -101,6 +101,9 @@ mod tests {
         assert!(html.contains("md-line--heading-1"));
         assert!(html.contains("md-line--table-header"));
         assert!(html.contains("md-line--mermaid-edge"));
+        assert!(
+            html.contains("<div class=\"md-line md-line--mermaid-edge\">│ Animal ───▶ Dog</div>")
+        );
         assert!(html.contains("md-line--diagnostic"));
         assert!(html.contains("source fallback"));
     }
@@ -116,9 +119,7 @@ mod tests {
     #[test]
     fn html_adapter_redacts_credential_shapes() {
         let ghp = ["gh", "p_", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"].concat();
-        let html = render_markdown_html(&format!(
-            "deploy with token=abc123 and {ghp}"
-        ));
+        let html = render_markdown_html(&format!("deploy with token=abc123 and {ghp}"));
         assert!(html.contains("[REDACTED]"));
         assert!(!html.contains("abc123"));
         assert!(!html.contains(ghp.as_str()));

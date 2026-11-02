@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 
-use pi_coding::{CatalogRowStatus, SessionSourceKind};
+use pi_coding::{CatalogRowStatus, SessionKind, SessionSourceKind};
 
 use crate::resume_catalog::{ResumeSelectionRequest, ResumeSelectorRow, ResumeSelectorTarget};
 
@@ -30,8 +30,10 @@ impl SessionManagementRejection {
     pub(crate) const fn status_message(self) -> &'static str {
         match self {
             Self::NoSelection => "No session selected",
-            Self::ForeignSource => "Foreign source sessions cannot be renamed or deleted",
-            Self::CurrentSession => "Cannot delete the currently active session",
+            Self::ForeignSource => {
+                "Foreign source sessions cannot be forked, cloned, renamed, or archived"
+            }
+            Self::CurrentSession => "Cannot archive the currently active session",
         }
     }
 }
@@ -51,7 +53,7 @@ impl SessionManagementResult {
     pub(crate) const fn status_message(self) -> Option<&'static str> {
         match self {
             Self::Started => None,
-            Self::QueryCleared => Some("Cleared session filter; press delete again to confirm"),
+            Self::QueryCleared => Some("Cleared session filter; press d again to confirm"),
             Self::Rejected(reason) => Some(reason.status_message()),
         }
     }
@@ -61,8 +63,17 @@ impl SessionManagementResult {
 pub(crate) enum SessionSelectorRequest {
     None,
     Resume(ResumeSelectionRequest),
+    ForkLatest(PathBuf),
+    Clone(PathBuf),
     Rename { path: PathBuf, name: String },
-    Delete(PathBuf),
+    Archive(PathBuf),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SessionSelectorInput {
+    Request(SessionSelectorRequest),
+    Status(SessionManagementResult),
+    Query,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -251,16 +262,17 @@ impl SavedSessionSelector {
     }
 
     pub(crate) fn begin_rename(&mut self) -> SessionManagementResult {
-        let Some(row) = self.selected_row() else {
-            return SessionManagementResult::Rejected(SessionManagementRejection::NoSelection);
-        };
-        let Some(path) = row.native_management_path() else {
-            return SessionManagementResult::Rejected(SessionManagementRejection::ForeignSource);
-        };
-        let path = path.to_path_buf();
-        let value = row.name.clone().unwrap_or_default();
-        self.mode = SessionSelectorMode::Rename { path, value };
-        SessionManagementResult::Started
+        match self.selected_native_path() {
+            Ok(path) => {
+                let value = self
+                    .selected_row()
+                    .and_then(|row| row.name.clone())
+                    .unwrap_or_default();
+                self.mode = SessionSelectorMode::Rename { path, value };
+                SessionManagementResult::Started
+            }
+            Err(reason) => SessionManagementResult::Rejected(reason),
+        }
     }
 
     pub(crate) fn rename_push(&mut self, character: char) {
@@ -275,7 +287,18 @@ impl SavedSessionSelector {
         }
     }
 
+    pub(crate) fn begin_fork_latest(&self) -> Result<PathBuf, SessionManagementRejection> {
+        self.selected_native_path()
+    }
+
+    pub(crate) fn begin_clone(&self) -> Result<PathBuf, SessionManagementRejection> {
+        self.selected_native_path()
+    }
+
     pub(crate) fn begin_delete(&mut self, noninvasive: bool) -> SessionManagementResult {
+        if matches!(self.mode, SessionSelectorMode::ConfirmDelete { .. }) {
+            return SessionManagementResult::Started;
+        }
         if noninvasive && !self.query.is_empty() {
             self.pop_query();
             return SessionManagementResult::QueryCleared;
@@ -291,6 +314,49 @@ impl SavedSessionSelector {
         }
         self.mode = SessionSelectorMode::ConfirmDelete { path };
         SessionManagementResult::Started
+    }
+
+    pub(crate) fn handle_char(&mut self, character: char) -> SessionSelectorInput {
+        match self.mode.clone() {
+            SessionSelectorMode::Rename { .. } => {
+                self.rename_push(character);
+                SessionSelectorInput::Query
+            }
+            SessionSelectorMode::ConfirmDelete { path } => {
+                if matches!(character, 'd' | 'D') {
+                    self.mode = SessionSelectorMode::List;
+                    SessionSelectorInput::Request(SessionSelectorRequest::Archive(path))
+                } else {
+                    SessionSelectorInput::Query
+                }
+            }
+            SessionSelectorMode::List => match character {
+                'f' | 'F' => match self.begin_fork_latest() {
+                    Ok(path) => {
+                        SessionSelectorInput::Request(SessionSelectorRequest::ForkLatest(path))
+                    }
+                    Err(reason) => {
+                        SessionSelectorInput::Status(SessionManagementResult::Rejected(reason))
+                    }
+                },
+                'c' | 'C' => match self.begin_clone() {
+                    Ok(path) => SessionSelectorInput::Request(SessionSelectorRequest::Clone(path)),
+                    Err(reason) => {
+                        SessionSelectorInput::Status(SessionManagementResult::Rejected(reason))
+                    }
+                },
+                'r' | 'R' => SessionSelectorInput::Status(self.begin_rename()),
+                'd' | 'D' => SessionSelectorInput::Status(self.begin_delete(false)),
+                _ => {
+                    self.push_query(character);
+                    SessionSelectorInput::Query
+                }
+            },
+        }
+    }
+
+    pub(crate) fn set_current_path(&mut self, path: Option<PathBuf>) {
+        self.current_path = path.map(normalized_path);
     }
 
     pub(crate) fn cancel_mode(&mut self) -> bool {
@@ -319,8 +385,20 @@ impl SavedSessionSelector {
                     SessionSelectorRequest::Rename { path, name }
                 }
             }
-            SessionSelectorMode::ConfirmDelete { path } => SessionSelectorRequest::Delete(path),
+            SessionSelectorMode::ConfirmDelete { path } => {
+                self.mode = SessionSelectorMode::ConfirmDelete { path };
+                SessionSelectorRequest::None
+            }
         }
+    }
+
+    fn selected_native_path(&self) -> Result<PathBuf, SessionManagementRejection> {
+        let Some(row) = self.selected_row() else {
+            return Err(SessionManagementRejection::NoSelection);
+        };
+        row.native_management_path()
+            .map(Path::to_path_buf)
+            .ok_or(SessionManagementRejection::ForeignSource)
     }
 
     fn rebuild_visible_indices(&mut self) {
@@ -485,6 +563,10 @@ mod tests {
             status,
             search_text: search_text.to_owned(),
             message_blob: message_blob.to_owned(),
+            has_parent_session: false,
+            session_kind: SessionKind::User,
+            agent_session: false,
+            bootstrap_only: false,
         }
     }
 
@@ -557,7 +639,7 @@ mod tests {
                 .map(|row| (row.source_badge, row.session_id.as_str()))
                 .collect::<Vec<_>>(),
             vec![
-                ("pi", "pi-id"),
+                ("rpi", "pi-id"),
                 ("codex", "codex-id"),
                 ("claude", "claude-id")
             ]
@@ -664,9 +746,7 @@ mod tests {
             })
             .collect();
         let mut selector = SavedSessionSelector::new(rows, None);
-        assert_eq!(
-            selector
-                .visible_count(), 32);
+        assert_eq!(selector.visible_count(), 32);
         assert_eq!(
             selector
                 .visible_window(3, 4)
@@ -680,15 +760,11 @@ mod tests {
             ]
         );
         selector.move_selection(isize::MAX);
-        assert_eq!(
-            selector
-                .selected(), 31);
+        assert_eq!(selector.selected(), 31);
         assert_eq!(selector.selected_row().unwrap().session_id, "session-00");
         // Wrapping down from the last row returns to the first.
         selector.move_selection(1);
-        assert_eq!(
-            selector
-                .selected(), 0);
+        assert_eq!(selector.selected(), 0);
         assert_eq!(selector.selected_row().unwrap().session_id, "session-31");
     }
 
@@ -756,17 +832,39 @@ mod tests {
     fn foreign_rows_reject_management_without_emitting_a_source_path_request() {
         let foreign = mixed_rows().remove(1);
         let mut selector = SavedSessionSelector::new(vec![foreign], None);
-        for result in [selector.begin_rename(), selector.begin_delete(false)] {
-            assert_eq!(
-                result,
-                SessionManagementResult::Rejected(SessionManagementRejection::ForeignSource)
-            );
-            assert_eq!(
-                result.status_message(),
-                Some("Foreign source sessions cannot be renamed or deleted")
-            );
-            assert_eq!(selector.mode(), &SessionSelectorMode::List);
-        }
+        let foreign_status =
+            SessionManagementResult::Rejected(SessionManagementRejection::ForeignSource);
+        assert_eq!(selector.begin_rename(), foreign_status);
+        assert_eq!(selector.begin_delete(false), foreign_status);
+        assert_eq!(
+            selector.begin_fork_latest(),
+            Err(SessionManagementRejection::ForeignSource)
+        );
+        assert_eq!(
+            selector.begin_clone(),
+            Err(SessionManagementRejection::ForeignSource)
+        );
+        assert_eq!(
+            foreign_status.status_message(),
+            Some("Foreign source sessions cannot be forked, cloned, renamed, or archived")
+        );
+        assert_eq!(selector.mode(), &SessionSelectorMode::List);
+        assert_eq!(
+            selector.handle_char('f'),
+            SessionSelectorInput::Status(foreign_status)
+        );
+        assert_eq!(
+            selector.handle_char('c'),
+            SessionSelectorInput::Status(foreign_status)
+        );
+        assert_eq!(
+            selector.handle_char('r'),
+            SessionSelectorInput::Status(foreign_status)
+        );
+        assert_eq!(
+            selector.handle_char('d'),
+            SessionSelectorInput::Status(foreign_status)
+        );
         assert!(matches!(
             selector.confirm(),
             SessionSelectorRequest::Resume(ResumeSelectionRequest::Target(_))
@@ -778,6 +876,14 @@ mod tests {
         let imported = mixed_rows().remove(2);
         let native_path = PathBuf::from("/sessions/imported-claude.jsonl");
         let mut selector = SavedSessionSelector::new(vec![imported.clone()], None);
+        assert_eq!(
+            selector.handle_char('f'),
+            SessionSelectorInput::Request(SessionSelectorRequest::ForkLatest(native_path.clone()))
+        );
+        assert_eq!(
+            selector.handle_char('c'),
+            SessionSelectorInput::Request(SessionSelectorRequest::Clone(native_path.clone()))
+        );
         assert_eq!(selector.begin_rename(), SessionManagementResult::Started);
         selector.rename_push('!');
         assert_eq!(
@@ -788,24 +894,37 @@ mod tests {
             }
         );
         assert_eq!(
-            selector.begin_delete(false),
-            SessionManagementResult::Started
+            selector.handle_char('d'),
+            SessionSelectorInput::Status(SessionManagementResult::Started)
         );
+        assert_eq!(selector.confirm(), SessionSelectorRequest::None);
+        assert!(matches!(
+            selector.mode(),
+            SessionSelectorMode::ConfirmDelete { .. }
+        ));
         assert_eq!(
-            selector.confirm(),
-            SessionSelectorRequest::Delete(native_path.clone())
+            selector.handle_char('d'),
+            SessionSelectorInput::Request(SessionSelectorRequest::Archive(native_path.clone()))
         );
+        assert_eq!(selector.mode(), &SessionSelectorMode::List);
 
         let mut current = SavedSessionSelector::new(vec![imported], Some(native_path));
         assert_eq!(
             current.begin_delete(false),
             SessionManagementResult::Rejected(SessionManagementRejection::CurrentSession)
         );
+        assert_eq!(
+            current.handle_char('d'),
+            SessionSelectorInput::Status(SessionManagementResult::Rejected(
+                SessionManagementRejection::CurrentSession
+            ))
+        );
     }
 
     #[test]
-    fn native_management_and_noninvasive_delete_use_native_path() {
+    fn native_direct_keys_fork_clone_rename_and_second_d_archives() {
         let native = mixed_rows().remove(0);
+        let path = PathBuf::from("/sessions/pi.jsonl");
         let mut selector = SavedSessionSelector::new(vec![native], None);
         selector.push_query('p');
         assert_eq!(
@@ -814,12 +933,51 @@ mod tests {
         );
         assert!(selector.query().is_empty());
         assert_eq!(
-            selector.begin_delete(false),
-            SessionManagementResult::Started
+            selector.handle_char('f'),
+            SessionSelectorInput::Request(SessionSelectorRequest::ForkLatest(path.clone()))
         );
         assert_eq!(
-            selector.confirm(),
-            SessionSelectorRequest::Delete(PathBuf::from("/sessions/pi.jsonl"))
+            selector.handle_char('c'),
+            SessionSelectorInput::Request(SessionSelectorRequest::Clone(path.clone()))
+        );
+        assert_eq!(
+            selector.handle_char('r'),
+            SessionSelectorInput::Status(SessionManagementResult::Started)
+        );
+        assert!(matches!(
+            selector.mode(),
+            SessionSelectorMode::Rename { .. }
+        ));
+        selector.cancel_mode();
+        assert_eq!(
+            selector.handle_char('d'),
+            SessionSelectorInput::Status(SessionManagementResult::Started)
+        );
+        assert_eq!(selector.confirm(), SessionSelectorRequest::None);
+        assert!(matches!(
+            selector.mode(),
+            SessionSelectorMode::ConfirmDelete { .. }
+        ));
+        selector.cancel_mode();
+        assert_eq!(selector.mode(), &SessionSelectorMode::List);
+        assert_eq!(
+            selector.handle_char('d'),
+            SessionSelectorInput::Status(SessionManagementResult::Started)
+        );
+        assert_eq!(selector.handle_char('x'), SessionSelectorInput::Query);
+        assert!(matches!(
+            selector.mode(),
+            SessionSelectorMode::ConfirmDelete { .. }
+        ));
+        selector.cancel_mode();
+        assert_eq!(selector.mode(), &SessionSelectorMode::List);
+        assert_eq!(
+            selector.handle_char('d'),
+            SessionSelectorInput::Status(SessionManagementResult::Started)
+        );
+        assert_eq!(
+            selector.handle_char('d'),
+            SessionSelectorInput::Request(SessionSelectorRequest::Archive(path))
         );
     }
 }

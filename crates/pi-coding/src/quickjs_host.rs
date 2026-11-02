@@ -178,13 +178,11 @@ use pi_agent::{ToolCapability, ToolExecutionMode};
 use pi_ai::{Model, Schema};
 use rquickjs::{
     Array, AsyncContext, AsyncRuntime, Ctx, Exception, Function, Module, Object,
-    Result as JsResult, String as JsString, Value as JsValue,
-    prelude::*,
-    promise::MaybePromise,
+    Result as JsResult, String as JsString, Value as JsValue, prelude::*, promise::MaybePromise,
 };
 use serde_json::Value as JsonValue;
 use serde_json::json;
-use tokio::sync::{mpsc, Mutex as AsyncMutex};
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use uuid::Uuid;
 
 /// serde_json object map with the standard key/value types.
@@ -193,12 +191,12 @@ type JsonMap = serde_json::Map<String, JsonValue>;
 use crate::extensions::{
     EXTENSION_PROTOCOL_VERSION, ExtensionCapability, ExtensionCapabilityManifest,
     ExtensionCommandDescriptor, ExtensionEvent, ExtensionEventHookDescriptor, ExtensionFrame,
-    ExtensionHost, ExtensionHostFrame, ExtensionHostRequest, ExtensionInvocation,
+    ExtensionFuture, ExtensionHost, ExtensionHostFrame, ExtensionHostRequest, ExtensionInvocation,
     ExtensionLaunch, ExtensionMode, ExtensionOverlayDescriptor, ExtensionProviderDescriptor,
     ExtensionRegistration, ExtensionRuntimeAction, ExtensionRuntimeOptions,
-    ExtensionRuntimeRequest, ExtensionSpecRuntime, ExtensionToolDescriptor,
-    ExtensionTransport, ProtocolResult, ExtensionFuture, ExtensionUiCapability,
-    ExtensionUiRequest, OverlayEvent, OverlayInputDeclaration, RuntimeUiRequest,
+    ExtensionRuntimeRequest, ExtensionSpecRuntime, ExtensionToolDescriptor, ExtensionTransport,
+    ExtensionUiCapability, ExtensionUiRequest, OverlayEvent, OverlayInputDeclaration,
+    ProtocolResult, RuntimeUiRequest,
 };
 
 /// The authoritative event allow-list. `pi.on` rejects any other name.
@@ -211,15 +209,38 @@ use crate::extensions::{
 /// `overlay_open`, `overlay_close`) are deliberately rejected so extensions
 /// fail fast at registration instead of silently never firing.
 const SUPPORTED_EVENTS: [&str; 32] = [
-    "trust_decision", "session_start",
+    "trust_decision",
+    "session_start",
     "session_info_changed",
-    "session_before_switch", "session_before_fork", "session_before_compact", "session_compact",
-    "session_shutdown", "session_before_tree", "session_tree", "context",
-    "before_provider_request", "before_provider_headers", "after_provider_response",
-    "before_agent_start", "agent_start", "agent_end", "agent_settled", "turn_start", "turn_end",
-    "message_start", "message_update", "message_end", "tool_execution_start",
-    "tool_execution_update", "tool_execution_end", "model_select", "thinking_level_select",
-    "tool_call", "tool_result", "user_bash", "input",
+    "session_before_switch",
+    "session_before_fork",
+    "session_before_compact",
+    "session_compact",
+    "session_shutdown",
+    "session_before_tree",
+    "session_tree",
+    "context",
+    "before_provider_request",
+    "before_provider_headers",
+    "after_provider_response",
+    "before_agent_start",
+    "agent_start",
+    "agent_end",
+    "agent_settled",
+    "turn_start",
+    "turn_end",
+    "message_start",
+    "message_update",
+    "message_end",
+    "tool_execution_start",
+    "tool_execution_update",
+    "tool_execution_end",
+    "model_select",
+    "thinking_level_select",
+    "tool_call",
+    "tool_result",
+    "user_bash",
+    "input",
 ];
 
 /// Memory ceiling for a single in-process QuickJS extension runtime.
@@ -637,27 +658,12 @@ impl ExtensionHost for QuickJsExtensionHost {
         Box::pin(async move {
             let spec = launch.spec;
             spec.validate_before_launch()?;
-            let entry = match &spec.runtime {
-                ExtensionSpecRuntime::QuickJs { entry } => entry.clone(),
+            match &spec.runtime {
+                ExtensionSpecRuntime::QuickJs { .. } => {}
                 runtime => bail!("QuickJsExtensionHost cannot launch {runtime:?} runtime"),
-            };
-            let working_directory = spec
-                .working_directory
-                .canonicalize()
-                .with_context(|| format!("resolving working directory for extension {}", spec.id))?;
-            let entry = entry
-                .canonicalize()
-                .with_context(|| format!("resolving QuickJS extension entry for {}", spec.id))?;
-            if !entry.starts_with(&working_directory) || !entry.is_file() {
-                bail!("QuickJS extension entry must remain inside its working directory");
             }
-            let source = std::fs::read_to_string(&entry)
-                .with_context(|| format!("reading QuickJS extension entry {}", entry.display()))?;
-            let entry_leaf = entry
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("extension")
-                .to_owned();
+            let (source, entry_leaf) = spec.staged_quickjs_source()?;
+            let working_directory = spec.working_directory.clone();
             let thread_name = format!("pi-quickjs-{}", spec.id);
             let diagnostic = format!("quickjs extension {} (entry: {entry_leaf})", spec.id);
 
@@ -807,7 +813,9 @@ fn run_extension_thread(
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            *last_error.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            *last_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                 Some(format!("building tokio runtime: {error}"));
             return;
         }
@@ -816,21 +824,22 @@ fn run_extension_thread(
     let outcome = tokio_runtime.block_on(async {
         let js_runtime =
             AsyncRuntime::new().map_err(|error| format!("creating QuickJS runtime: {error}"))?;
-        js_runtime.set_memory_limit(QUICKJS_MEMORY_LIMIT_BYTES).await;
+        js_runtime
+            .set_memory_limit(QUICKJS_MEMORY_LIMIT_BYTES)
+            .await;
         {
             let deadline = interrupt_deadline.clone();
             let shutdown = shutdown.clone();
             js_runtime
                 .set_interrupt_handler(Some(Box::new(move || {
-                    shutdown.load(Ordering::Relaxed)
-                        || {
-                            // Paired with the Release stores of
-                            // `interrupt_deadline` (set before invoking JS and
-                            // cleared after), so the deadline written by the
-                            // worker is visible to the interrupt handler.
-                            let deadline = deadline.load(Ordering::Acquire);
-                            deadline != 0 && now_millis() >= deadline
-                        }
+                    shutdown.load(Ordering::Relaxed) || {
+                        // Paired with the Release stores of
+                        // `interrupt_deadline` (set before invoking JS and
+                        // cleared after), so the deadline written by the
+                        // worker is visible to the interrupt handler.
+                        let deadline = deadline.load(Ordering::Acquire);
+                        deadline != 0 && now_millis() >= deadline
+                    }
                 })))
                 .await;
         }
@@ -859,7 +868,9 @@ fn run_extension_thread(
         .await
     });
     if let Err(error) = outcome {
-        *last_error.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
+        *last_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
     }
 }
 
@@ -910,7 +921,12 @@ async fn main_loop<'js>(
         .set(OVERLAYS_REGISTRY_GLOBAL, overlays_registry.clone())
         .map_err(|error| js_err_text(&error))?;
     ctx.eval::<(), _>(PROVIDER_STREAM_DRIVER_SOURCE)
-        .map_err(|error| format!("bootstrapping extension provider stream: {}", js_err_text(&error)))?;
+        .map_err(|error| {
+            format!(
+                "bootstrapping extension provider stream: {}",
+                js_err_text(&error)
+            )
+        })?;
     let in_load = Arc::new(AtomicBool::new(false));
     let pending_actions: PendingActions<'js> = Arc::new(Mutex::new(HashMap::new()));
 
@@ -988,7 +1004,12 @@ async fn main_loop<'js>(
         .map_err(|error| js_err_text(&error))?;
     let session_actions: Object = ctx
         .eval(SESSION_ACTIONS_BOOTSTRAP_SOURCE)
-        .map_err(|error| format!("bootstrapping extension session actions: {}", js_err_text(&error)))?;
+        .map_err(|error| {
+            format!(
+                "bootstrapping extension session actions: {}",
+                js_err_text(&error)
+            )
+        })?;
     ctx.globals()
         .set(SESSION_ACTIONS_GLOBAL, session_actions)
         .map_err(|error| js_err_text(&error))?;
@@ -1003,8 +1024,10 @@ async fn main_loop<'js>(
     )
     .map_err(|error| js_err_text(&error))?;
 
-    let mut active: Option<(String, std::pin::Pin<Box<dyn Future<Output = ProtocolResult> + 'js>>)> =
-        None;
+    let mut active: Option<(
+        String,
+        std::pin::Pin<Box<dyn Future<Output = ProtocolResult> + 'js>>,
+    )> = None;
     // Host frames received while an invocation is settling are buffered here
     // (arrival order) instead of being dropped; the idle branch drains the
     // buffer before blocking on the channel.
@@ -1087,7 +1110,10 @@ async fn main_loop<'js>(
             };
             let _ = send_frame(
                 &from_js_tx,
-                ExtensionFrame::Response { id, result: outcome },
+                ExtensionFrame::Response {
+                    id,
+                    result: outcome,
+                },
                 timeouts.max_frame_bytes,
             );
             continue;
@@ -1107,11 +1133,11 @@ async fn main_loop<'js>(
                 ..
             }) => {
                 if protocol_version != EXTENSION_PROTOCOL_VERSION {
-                    *last_error.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(
-                        format!(
-                            "unsupported extension protocol version {protocol_version}; host requires {EXTENSION_PROTOCOL_VERSION}"
-                        ),
-                    );
+                    *last_error
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(format!(
+                        "unsupported extension protocol version {protocol_version}; host requires {EXTENSION_PROTOCOL_VERSION}"
+                    ));
                     break;
                 }
                 hello = Some(HelloState {
@@ -1172,7 +1198,10 @@ async fn main_loop<'js>(
                         break;
                     }
                 }
-                ExtensionHostRequest::Invoke { invocation, context } => {
+                ExtensionHostRequest::Invoke {
+                    invocation,
+                    context,
+                } => {
                     let model = context.as_ref().and_then(|context| context.model.clone());
                     let hello = hello.clone().unwrap_or(HelloState {
                         mode: ExtensionMode::Tui,
@@ -1229,7 +1258,9 @@ async fn main_loop<'js>(
                     &pending_actions,
                     &format!("extension is shutting down: {reason}"),
                 );
-                *last_error.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(reason);
+                *last_error
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(reason);
                 break;
             }
             None => {
@@ -1296,7 +1327,10 @@ fn issue_runtime_request<'js>(
         .lock()
         .expect("quickjs action mutex poisoned")
         .insert(id.clone(), (resolve, reject));
-    let frame = ExtensionFrame::Request { id: id.clone(), request };
+    let frame = ExtensionFrame::Request {
+        id: id.clone(),
+        request,
+    };
     if send_frame(from_js_tx, frame, max_frame_bytes).is_err() {
         pending_actions
             .lock()
@@ -1369,46 +1403,46 @@ fn build_ui_request_fn<'js>(
     max_frame_bytes: usize,
     capabilities: &BTreeSet<ExtensionCapability>,
 ) -> JsResult<Function<'js>> {
-    Function::new(
-        ctx.clone(),
-        {
-            let pending_actions = pending_actions.clone();
-            let from_js_tx = from_js_tx.clone();
-            let capabilities = capabilities.clone();
-            move |ctx: Ctx<'js>, request: Object<'js>, timeout_ms: JsValue<'js>| -> JsResult<JsValue<'js>> {
-                // Mirror the process bridge's requireCapability("ui", "UI action")
-                // gate: the ui capability is required synchronously.
-                // Per-capability grants are enforced host-side and surface as
-                // a promise rejection ("permission_denied").
-                if !capabilities.contains(&ExtensionCapability::Ui) {
-                    return Err(Exception::throw_message(
-                        &ctx,
-                        "UI action requires the ui capability",
-                    ));
-                }
-                let request_json = js_to_json(&ctx, request.into_value(), 0).map_err(|error| {
+    Function::new(ctx.clone(), {
+        let pending_actions = pending_actions.clone();
+        let from_js_tx = from_js_tx.clone();
+        let capabilities = capabilities.clone();
+        move |ctx: Ctx<'js>,
+              request: Object<'js>,
+              timeout_ms: JsValue<'js>|
+              -> JsResult<JsValue<'js>> {
+            // Mirror the process bridge's requireCapability("ui", "UI action")
+            // gate: the ui capability is required synchronously.
+            // Per-capability grants are enforced host-side and surface as
+            // a promise rejection ("permission_denied").
+            if !capabilities.contains(&ExtensionCapability::Ui) {
+                return Err(Exception::throw_message(
+                    &ctx,
+                    "UI action requires the ui capability",
+                ));
+            }
+            let request_json = js_to_json(&ctx, request.into_value(), 0).map_err(|error| {
+                Exception::throw_message(&ctx, &format!("invalid ui request: {error}"))
+            })?;
+            let ui_request: ExtensionUiRequest =
+                serde_json::from_value(request_json).map_err(|error| {
                     Exception::throw_message(&ctx, &format!("invalid ui request: {error}"))
                 })?;
-                let ui_request: ExtensionUiRequest =
-                    serde_json::from_value(request_json).map_err(|error| {
-                        Exception::throw_message(&ctx, &format!("invalid ui request: {error}"))
-                    })?;
-                let timeout_ms = ui_timeout_ms(&ctx, timeout_ms)?;
-                issue_runtime_request(
-                    &ctx,
-                    &pending_actions,
-                    &from_js_tx,
-                    max_frame_bytes,
-                    ExtensionRuntimeRequest::Ui {
-                        ui: RuntimeUiRequest {
-                            request: ui_request,
-                            timeout_ms,
-                        },
+            let timeout_ms = ui_timeout_ms(&ctx, timeout_ms)?;
+            issue_runtime_request(
+                &ctx,
+                &pending_actions,
+                &from_js_tx,
+                max_frame_bytes,
+                ExtensionRuntimeRequest::Ui {
+                    ui: RuntimeUiRequest {
+                        request: ui_request,
+                        timeout_ms,
                     },
-                )
-            }
-        },
-    )
+                },
+            )
+        }
+    })
 }
 
 /// The low-level session-action bridge installed under [`ACTION_REQUEST_GLOBAL`].
@@ -1426,50 +1460,47 @@ fn build_action_request_fn<'js>(
     max_frame_bytes: usize,
     capabilities: &BTreeSet<ExtensionCapability>,
 ) -> JsResult<Function<'js>> {
-    Function::new(
-        ctx.clone(),
-        {
-            let pending_actions = pending_actions.clone();
-            let from_js_tx = from_js_tx.clone();
-            let capabilities = capabilities.clone();
-            move |ctx: Ctx<'js>, action: Object<'js>| -> JsResult<JsValue<'js>> {
-                // Mirror the process bridge's requireCapability("session_actions",
-                // "session action") gate. Per-capability grants are enforced
-                // host-side and surface as a promise rejection
-                // ("permission_denied").
-                if !capabilities.contains(&ExtensionCapability::SessionActions) {
-                    return Err(Exception::throw_message(
-                        &ctx,
-                        "session action requires the session_actions capability",
-                    ));
-                }
-                let action_json = js_to_json(&ctx, action.into_value(), 0).map_err(|error| {
-                    Exception::throw_message(&ctx, &format!("invalid session action: {error}"))
-                })?;
-                let action: ExtensionRuntimeAction = match serde_json::from_value(action_json) {
-                    Ok(action) => action,
-                    Err(error) => {
-                        // Async rejection (the process bridge's host-side action_failed)
-                        // instead of a synchronous throw: the method call
-                        // itself succeeded, the payload was malformed.
-                        let (promise, _resolve, reject) = ctx.promise()?;
-                        let _ = reject.call::<_, ()>((throw_value(
-                            &ctx,
-                            &format!("invalid session action: {error}"),
-                        ),));
-                        return Ok(promise.into_value());
-                    }
-                };
-                issue_runtime_request(
+    Function::new(ctx.clone(), {
+        let pending_actions = pending_actions.clone();
+        let from_js_tx = from_js_tx.clone();
+        let capabilities = capabilities.clone();
+        move |ctx: Ctx<'js>, action: Object<'js>| -> JsResult<JsValue<'js>> {
+            // Mirror the process bridge's requireCapability("session_actions",
+            // "session action") gate. Per-capability grants are enforced
+            // host-side and surface as a promise rejection
+            // ("permission_denied").
+            if !capabilities.contains(&ExtensionCapability::SessionActions) {
+                return Err(Exception::throw_message(
                     &ctx,
-                    &pending_actions,
-                    &from_js_tx,
-                    max_frame_bytes,
-                    ExtensionRuntimeRequest::Action { action },
-                )
+                    "session action requires the session_actions capability",
+                ));
             }
-        },
-    )
+            let action_json = js_to_json(&ctx, action.into_value(), 0).map_err(|error| {
+                Exception::throw_message(&ctx, &format!("invalid session action: {error}"))
+            })?;
+            let action: ExtensionRuntimeAction = match serde_json::from_value(action_json) {
+                Ok(action) => action,
+                Err(error) => {
+                    // Async rejection (the process bridge's host-side action_failed)
+                    // instead of a synchronous throw: the method call
+                    // itself succeeded, the payload was malformed.
+                    let (promise, _resolve, reject) = ctx.promise()?;
+                    let _ = reject.call::<_, ()>((throw_value(
+                        &ctx,
+                        &format!("invalid session action: {error}"),
+                    ),));
+                    return Ok(promise.into_value());
+                }
+            };
+            issue_runtime_request(
+                &ctx,
+                &pending_actions,
+                &from_js_tx,
+                max_frame_bytes,
+                ExtensionRuntimeRequest::Action { action },
+            )
+        }
+    })
 }
 
 /// Parse the JS `{ timeout }` option into the host-side `RuntimeUiRequest`
@@ -1504,9 +1535,12 @@ async fn load_extension<'js>(
 ) -> Result<(), String> {
     let module = Module::declare(ctx.clone(), entry_leaf, entry_source)
         .map_err(|error| format!("declaring quickjs extension entry: {}", js_err_text(&error)))?;
-    let (module, eval_promise) = module
-        .eval()
-        .map_err(|error| format!("evaluating quickjs extension entry: {}", js_err_text(&error)))?;
+    let (module, eval_promise) = module.eval().map_err(|error| {
+        format!(
+            "evaluating quickjs extension entry: {}",
+            js_err_text(&error)
+        )
+    })?;
     eval_promise.into_future::<()>().await.map_err(|error| {
         format!(
             "evaluating quickjs extension entry: {}",
@@ -1519,9 +1553,12 @@ async fn load_extension<'js>(
             js_err_text(&error)
         )
     })?;
-    factory
-        .call::<_, ()>((pi,))
-        .map_err(|error| format!("initializing quickjs extension: {}", exception_message(ctx, &error)))
+    factory.call::<_, ()>((pi,)).map_err(|error| {
+        format!(
+            "initializing quickjs extension: {}",
+            exception_message(ctx, &error)
+        )
+    })
 }
 
 async fn run_invoke<'js>(
@@ -1612,14 +1649,16 @@ async fn dispatch_invoke<'js>(
 ) -> Result<JsValue<'js>, String> {
     match invocation {
         ExtensionInvocation::Command { name, arguments } => {
-            let handler: Option<Function> = commands_registry.get(name.clone()).map_err(|error| js_err_text(&error))?;
+            let handler: Option<Function> = commands_registry
+                .get(name.clone())
+                .map_err(|error| js_err_text(&error))?;
             let Some(handler) = handler else {
                 return Err(format!("unknown command {name}"));
             };
             let args = json_to_js(ctx, &JsonValue::String(arguments.clone()), 0)
                 .map_err(|error| js_err_text(&error))?;
-            let context_object =
-                build_context_object(ctx, hello, signal.clone(), model.as_ref()).map_err(|error| js_err_text(&error))?;
+            let context_object = build_context_object(ctx, hello, signal.clone(), model.as_ref())
+                .map_err(|error| js_err_text(&error))?;
             let call = handler.call::<_, MaybePromise<'js>>((args, context_object));
             await_call(ctx, call).await
         }
@@ -1628,7 +1667,9 @@ async fn dispatch_invoke<'js>(
             call_id,
             arguments,
         } => {
-            let tool: Option<Object> = tools_registry.get(name.clone()).map_err(|error| js_err_text(&error))?;
+            let tool: Option<Object> = tools_registry
+                .get(name.clone())
+                .map_err(|error| js_err_text(&error))?;
             let Some(tool) = tool else {
                 return Err(format!("unknown tool {name}"));
             };
@@ -1637,10 +1678,15 @@ async fn dispatch_invoke<'js>(
             // The host routes Update frames by the *request* id (its pending
             // map is keyed by it), so the onUpdate callback must carry
             // `request_id` rather than the tool call id.
-            let on_update = build_on_update(ctx, from_js_tx.clone(), request_id.to_owned(), max_frame_bytes)
+            let on_update = build_on_update(
+                ctx,
+                from_js_tx.clone(),
+                request_id.to_owned(),
+                max_frame_bytes,
+            )
+            .map_err(|error| js_err_text(&error))?;
+            let context_object = build_context_object(ctx, hello, signal.clone(), model.as_ref())
                 .map_err(|error| js_err_text(&error))?;
-            let context_object =
-                build_context_object(ctx, hello, signal.clone(), model.as_ref()).map_err(|error| js_err_text(&error))?;
             let call = execute.call::<_, MaybePromise<'js>>((
                 call_id.clone(),
                 args,
@@ -1665,7 +1711,9 @@ async fn dispatch_invoke<'js>(
             let Some(provider) = provider else {
                 return Err(format!("unknown provider {provider_id}"));
             };
-            let stream_fn: Function = provider.get("stream").map_err(|error| js_err_text(&error))?;
+            let stream_fn: Function = provider
+                .get("stream")
+                .map_err(|error| js_err_text(&error))?;
             let session_id_value = match session_id {
                 Some(session_id) => JsString::from_str(ctx.clone(), session_id)
                     .map_err(|error| js_err_text(&error))?
@@ -1680,8 +1728,13 @@ async fn dispatch_invoke<'js>(
             // Each yielded event is forwarded to the host as an
             // `ExtensionFrame::Update` (same path as tool onUpdate), in order,
             // before the invocation's final response.
-            let on_event = build_on_update(ctx, from_js_tx.clone(), request_id.to_owned(), max_frame_bytes)
-                .map_err(|error| js_err_text(&error))?;
+            let on_event = build_on_update(
+                ctx,
+                from_js_tx.clone(),
+                request_id.to_owned(),
+                max_frame_bytes,
+            )
+            .map_err(|error| js_err_text(&error))?;
             let driver: Function = ctx
                 .globals()
                 .get("__piRunProviderStream")
@@ -1703,9 +1756,8 @@ async fn dispatch_invoke<'js>(
                 return Err(format!("unknown overlay {id}"));
             };
             let render: Function = overlay.get("render").map_err(|error| js_err_text(&error))?;
-            let context_object =
-                build_context_object(ctx, hello, signal.clone(), model.as_ref())
-                    .map_err(|error| js_err_text(&error))?;
+            let context_object = build_context_object(ctx, hello, signal.clone(), model.as_ref())
+                .map_err(|error| js_err_text(&error))?;
             let call = render.call::<_, MaybePromise<'js>>((context_object,));
             let value = await_call(ctx, call).await?;
             // The original contract let `render` return a bare rows array;
@@ -1730,8 +1782,9 @@ async fn dispatch_invoke<'js>(
             };
             let (callback, payload) = match event {
                 OverlayEvent::Submit { text } => {
-                    let callback: Option<Function> =
-                        overlay.get("onSubmit").map_err(|error| js_err_text(&error))?;
+                    let callback: Option<Function> = overlay
+                        .get("onSubmit")
+                        .map_err(|error| js_err_text(&error))?;
                     let callback = callback.ok_or_else(|| {
                         format!("overlay {id} has no onSubmit callback for a submit event")
                     })?;
@@ -1750,12 +1803,14 @@ async fn dispatch_invoke<'js>(
                     })?;
                     let serialized = serde_json::to_value(action)
                         .map_err(|error| format!("serializing overlay key action: {error}"))?;
-                    (callback, json_to_js(ctx, &serialized, 0).map_err(|e| e.to_string())?)
+                    (
+                        callback,
+                        json_to_js(ctx, &serialized, 0).map_err(|e| e.to_string())?,
+                    )
                 }
             };
-            let context_object =
-                build_context_object(ctx, hello, signal.clone(), model.as_ref())
-                    .map_err(|error| js_err_text(&error))?;
+            let context_object = build_context_object(ctx, hello, signal.clone(), model.as_ref())
+                .map_err(|error| js_err_text(&error))?;
             let call = callback.call::<_, MaybePromise<'js>>((payload, context_object));
             await_call(ctx, call).await
         }
@@ -1826,18 +1881,15 @@ async fn dispatch_event<'js>(
             .map_err(|error| js_err_text(&error))?;
         let context_object = build_context_object(ctx, hello, signal.clone(), model.as_ref())
             .map_err(|error| js_err_text(&error))?;
-        let call = handler.call::<_, MaybePromise<'js>>((
-            JsValue::from(event_object.clone()),
-            context_object,
-        ));
+        let call = handler
+            .call::<_, MaybePromise<'js>>((JsValue::from(event_object.clone()), context_object));
         let next = await_call(ctx, call).await?;
         sync_event_data(ctx, &event_object, &mut event_data, needs_signal)
             .map_err(|error| js_err_text(&error))?;
         if next.is_undefined() {
             continue;
         }
-        let next: JsonValue =
-            js_to_json(ctx, next, 0).map_err(|error| js_err_text(&error))?;
+        let next: JsonValue = js_to_json(ctx, next, 0).map_err(|error| js_err_text(&error))?;
 
         // Per-event merge branches.
         if name == "context"
@@ -1845,10 +1897,7 @@ async fn dispatch_event<'js>(
                 .as_object()
                 .is_some_and(|fields| fields.contains_key("messages"))
         {
-            let messages = next
-                .get("messages")
-                .cloned()
-                .unwrap_or(JsonValue::Null);
+            let messages = next.get("messages").cloned().unwrap_or(JsonValue::Null);
             event_data.insert("messages".to_owned(), messages.clone());
             value = json!({ "messages": messages });
         } else if name == "before_provider_request" {
@@ -1889,7 +1938,10 @@ async fn dispatch_event<'js>(
             value = merge_into_object(&value, &next);
         } else if name == "tool_result" && next.is_object() {
             for field in ["content", "details", "isError", "usage"] {
-                if next.as_object().is_some_and(|fields| fields.contains_key(field)) {
+                if next
+                    .as_object()
+                    .is_some_and(|fields| fields.contains_key(field))
+                {
                     if let Some(item) = next.get(field) {
                         event_data.insert(field.to_owned(), item.clone());
                     }
@@ -2103,13 +2155,11 @@ const PI_SESSION_METHODS: [&str; 7] = [
     "setModel",
 ];
 /// Session actions exposed on `ctx`.
-const CTX_SESSION_METHODS: [&str; 5] =
-    ["abort", "compact", "shutdown", "waitForIdle", "reload"];
+const CTX_SESSION_METHODS: [&str; 5] = ["abort", "compact", "shutdown", "waitForIdle", "reload"];
 
 /// A pending JS -> host action: resolve/reject pair stored Rust-side and
 /// settled by the main loop when the host's response frame arrives.
-type PendingActions<'js> =
-    Arc<Mutex<HashMap<String, (Function<'js>, Function<'js>)>>>;
+type PendingActions<'js> = Arc<Mutex<HashMap<String, (Function<'js>, Function<'js>)>>>;
 
 fn build_pi<'js>(
     ctx: &Ctx<'js>,
@@ -2119,430 +2169,412 @@ fn build_pi<'js>(
     max_frame_bytes: usize,
     capabilities: &BTreeSet<ExtensionCapability>,
 ) -> JsResult<Object<'js>> {
-    let register_command = Function::new(
-        ctx.clone(),
-        {
-            let in_load = in_load.clone();
-            let from_js_tx = from_js_tx.clone();
-            move |ctx: Ctx<'js>, name: String, options: Object<'js>| -> JsResult<()> {
-                if !in_load.load(Ordering::Acquire) {
-                    return Err(Exception::throw_message(
-                        &ctx,
-                        "command registration is only allowed during the load phase",
-                    ));
-                }
-                if options.get::<_, Option<Function>>("handler")?.is_none() {
-                    return Err(Exception::throw_message(
-                        &ctx,
-                        "registerCommand requires a handler function",
-                    ));
-                }
-                let registry: Object = ctx.globals().get(COMMANDS_REGISTRY_GLOBAL)?;
-                if registry.contains_key(&name)? {
-                    return Err(Exception::throw_message(
-                        &ctx,
-                        &format!("duplicate command {name}"),
-                    ));
-                }
-                let handler: Function = options.get("handler")?;
-                registry.set(name.clone(), handler)?;
-                let description: Option<String> = options.get("description")?;
-                let frame = ExtensionFrame::Register {
-                    registration: ExtensionRegistration::Command {
-                        command: ExtensionCommandDescriptor { name, description },
-                    },
-                };
-                send_frame(&from_js_tx, frame, max_frame_bytes)
-                    .map_err(|message| Exception::throw_message(&ctx, &message))
+    let register_command = Function::new(ctx.clone(), {
+        let in_load = in_load.clone();
+        let from_js_tx = from_js_tx.clone();
+        move |ctx: Ctx<'js>, name: String, options: Object<'js>| -> JsResult<()> {
+            if !in_load.load(Ordering::Acquire) {
+                return Err(Exception::throw_message(
+                    &ctx,
+                    "command registration is only allowed during the load phase",
+                ));
             }
-        },
-    )?;
+            if options.get::<_, Option<Function>>("handler")?.is_none() {
+                return Err(Exception::throw_message(
+                    &ctx,
+                    "registerCommand requires a handler function",
+                ));
+            }
+            let registry: Object = ctx.globals().get(COMMANDS_REGISTRY_GLOBAL)?;
+            if registry.contains_key(&name)? {
+                return Err(Exception::throw_message(
+                    &ctx,
+                    &format!("duplicate command {name}"),
+                ));
+            }
+            let handler: Function = options.get("handler")?;
+            registry.set(name.clone(), handler)?;
+            let description: Option<String> = options.get("description")?;
+            let frame = ExtensionFrame::Register {
+                registration: ExtensionRegistration::Command {
+                    command: ExtensionCommandDescriptor { name, description },
+                },
+            };
+            send_frame(&from_js_tx, frame, max_frame_bytes)
+                .map_err(|message| Exception::throw_message(&ctx, &message))
+        }
+    })?;
 
-    let register_tool = Function::new(
-        ctx.clone(),
-        {
-            let in_load = in_load.clone();
-            let from_js_tx = from_js_tx.clone();
-            move |ctx: Ctx<'js>, tool: Object<'js>| -> JsResult<()> {
-                if !in_load.load(Ordering::Acquire) {
+    let register_tool = Function::new(ctx.clone(), {
+        let in_load = in_load.clone();
+        let from_js_tx = from_js_tx.clone();
+        move |ctx: Ctx<'js>, tool: Object<'js>| -> JsResult<()> {
+            if !in_load.load(Ordering::Acquire) {
+                return Err(Exception::throw_message(
+                    &ctx,
+                    "tool registration is only allowed during the load phase",
+                ));
+            }
+            for field in [
+                "constrainedSampling",
+                "renderShell",
+                "prepareArguments",
+                "renderCall",
+                "renderResult",
+            ] {
+                if tool.get::<_, Option<JsValue>>(field)?.is_some() {
                     return Err(Exception::throw_message(
                         &ctx,
-                        "tool registration is only allowed during the load phase",
+                        &format!("registerTool.{field} is unavailable in the quickjs runtime"),
                     ));
                 }
-                for field in [
-                    "constrainedSampling",
-                    "renderShell",
-                    "prepareArguments",
-                    "renderCall",
-                    "renderResult",
-                ] {
-                    if tool.get::<_, Option<JsValue>>(field)?.is_some() {
-                        return Err(Exception::throw_message(
-                            &ctx,
-                            &format!("registerTool.{field} is unavailable in the quickjs runtime"),
-                        ));
-                    }
-                }
-                let name: String = tool.get("name")?;
-                if tool.get::<_, Option<Function>>("execute")?.is_none() {
+            }
+            let name: String = tool.get("name")?;
+            if tool.get::<_, Option<Function>>("execute")?.is_none() {
+                return Err(Exception::throw_message(
+                    &ctx,
+                    "registerTool requires an execute function",
+                ));
+            }
+            let registry: Object = ctx.globals().get(TOOLS_REGISTRY_GLOBAL)?;
+            if registry.contains_key(&name)? {
+                return Err(Exception::throw_message(
+                    &ctx,
+                    &format!("duplicate tool {name}"),
+                ));
+            }
+            registry.set(name.clone(), tool.clone())?;
+            let label: String = tool
+                .get::<_, Option<String>>("label")?
+                .unwrap_or_else(|| name.clone());
+            let description: String = tool
+                .get::<_, Option<String>>("description")?
+                .unwrap_or_else(|| "Extension tool".to_owned());
+            let capability = match tool.get::<_, Option<String>>("capability")?.as_deref() {
+                Some("read") => ToolCapability::Read,
+                Some("write") => ToolCapability::Write,
+                Some("exec") | None => ToolCapability::Exec,
+                Some(other) => {
                     return Err(Exception::throw_message(
                         &ctx,
-                        "registerTool requires an execute function",
+                        &format!(
+                            "registerTool capability must be read, write, or exec, got {other}"
+                        ),
                     ));
                 }
-                let registry: Object = ctx.globals().get(TOOLS_REGISTRY_GLOBAL)?;
-                if registry.contains_key(&name)? {
+            };
+            let execution_mode = match tool.get::<_, Option<String>>("executionMode")?.as_deref() {
+                None | Some("default") => ToolExecutionMode::Default,
+                Some(other) => {
                     return Err(Exception::throw_message(
                         &ctx,
-                        &format!("duplicate tool {name}"),
+                        &format!("registerTool executionMode must be \"default\", got {other:?}"),
                     ));
                 }
-                registry.set(name.clone(), tool.clone())?;
-                let label: String = tool
-                    .get::<_, Option<String>>("label")?
-                    .unwrap_or_else(|| name.clone());
-                let description: String = tool
-                    .get::<_, Option<String>>("description")?
-                    .unwrap_or_else(|| "Extension tool".to_owned());
-                let capability = match tool.get::<_, Option<String>>("capability")?.as_deref() {
-                    Some("read") => ToolCapability::Read,
-                    Some("write") => ToolCapability::Write,
-                    Some("exec") | None => ToolCapability::Exec,
-                    Some(other) => {
-                        return Err(Exception::throw_message(
-                            &ctx,
-                            &format!(
-                                "registerTool capability must be read, write, or exec, got {other}"
-                            ),
-                        ));
-                    }
-                };
-                let execution_mode =
-                    match tool.get::<_, Option<String>>("executionMode")?.as_deref() {
-                        None | Some("default") => ToolExecutionMode::Default,
-                        Some(other) => {
-                            return Err(Exception::throw_message(
-                                &ctx,
-                                &format!("registerTool executionMode must be \"default\", got {other:?}"),
-                            ));
-                        }
-                    };
-                let prompt_guidelines: Vec<String> = tool
-                    .get::<_, Option<Vec<String>>>("promptGuidelines")?
-                    .unwrap_or_default();
-                let parameters = match tool.get::<_, Option<JsValue>>("parameters")? {
-                    Some(value) => js_to_json(&ctx, value, 0).map_err(|error| {
-                        Exception::throw_message(
-                            &ctx,
-                            &format!("invalid registerTool parameters: {error}"),
-                        )
-                    })?,
-                    None => json!({ "type": "object", "properties": {} }),
-                };
-                let parameters: Schema = serde_json::from_value(parameters).map_err(|error| {
+            };
+            let prompt_guidelines: Vec<String> = tool
+                .get::<_, Option<Vec<String>>>("promptGuidelines")?
+                .unwrap_or_default();
+            let parameters = match tool.get::<_, Option<JsValue>>("parameters")? {
+                Some(value) => js_to_json(&ctx, value, 0).map_err(|error| {
                     Exception::throw_message(
                         &ctx,
-                        &format!("invalid registerTool parameters schema: {error}"),
+                        &format!("invalid registerTool parameters: {error}"),
                     )
-                })?;
-                let frame = ExtensionFrame::Register {
-                    registration: ExtensionRegistration::Tool {
-                        tool: ExtensionToolDescriptor {
-                            name,
-                            label,
-                            description,
-                            parameters,
-                            capability,
-                            execution_mode,
-                            prompt_guidelines,
-                        },
+                })?,
+                None => json!({ "type": "object", "properties": {} }),
+            };
+            let parameters: Schema = serde_json::from_value(parameters).map_err(|error| {
+                Exception::throw_message(
+                    &ctx,
+                    &format!("invalid registerTool parameters schema: {error}"),
+                )
+            })?;
+            let frame = ExtensionFrame::Register {
+                registration: ExtensionRegistration::Tool {
+                    tool: ExtensionToolDescriptor {
+                        name,
+                        label,
+                        description,
+                        parameters,
+                        capability,
+                        execution_mode,
+                        prompt_guidelines,
                     },
-                };
-                send_frame(&from_js_tx, frame, max_frame_bytes)
-                    .map_err(|message| Exception::throw_message(&ctx, &message))
-            }
-        },
-    )?;
+                },
+            };
+            send_frame(&from_js_tx, frame, max_frame_bytes)
+                .map_err(|message| Exception::throw_message(&ctx, &message))
+        }
+    })?;
 
     // `pi.registerProvider({ id, label?, api?, capabilities?, stream })`:
     // load-phase-only, `provider` capability-gated, like registerTool. The
     // options object (holding the JS stream function) is stored in the shared
     // providers registry so provider invocations can reach it without any
     // closure capture; the host receives the descriptor frame for resolution.
-    let register_provider = Function::new(
-        ctx.clone(),
-        {
-            let in_load = in_load.clone();
-            let from_js_tx = from_js_tx.clone();
-            let capabilities = capabilities.clone();
-            move |ctx: Ctx<'js>, options: Object<'js>| -> JsResult<()> {
-                if !in_load.load(Ordering::Acquire) {
-                    return Err(Exception::throw_message(
-                        &ctx,
-                        "provider registration is only allowed during the load phase",
-                    ));
-                }
-                if !capabilities.contains(&ExtensionCapability::Provider) {
-                    return Err(Exception::throw_message(
-                        &ctx,
-                        "provider registration requires the provider capability",
-                    ));
-                }
-                let id: String = options.get("id")?;
-                if let Err(message) = validate_js_identifier(&id, "provider id") {
-                    return Err(Exception::throw_message(&ctx, &message));
-                }
-                if options.get::<_, Option<Function>>("stream")?.is_none() {
-                    return Err(Exception::throw_message(
-                        &ctx,
-                        "registerProvider requires a stream function",
-                    ));
-                }
-                let api: String = match options.get::<_, Option<String>>("api")? {
-                    Some(api) => api,
-                    None => id.clone(),
-                };
-                if let Err(message) = validate_js_identifier(&api, "provider api") {
-                    return Err(Exception::throw_message(&ctx, &message));
-                }
-                let label: Option<String> = options.get("label")?;
-                if let Some(label) = &label {
-                    if label.is_empty() || label.len() > 256 || label.chars().any(char::is_control)
-                    {
-                        return Err(Exception::throw_message(
-                            &ctx,
-                            "provider label must be 1-256 printable characters",
-                        ));
-                    }
-                }
-                let provider_capabilities: Vec<String> =
-                    options.get::<_, Option<Vec<String>>>("capabilities")?.unwrap_or_default();
-                for capability in &provider_capabilities {
-                    if let Err(message) =
-                        validate_js_identifier(capability, "provider capability")
-                    {
-                        return Err(Exception::throw_message(&ctx, &message));
-                    }
-                }
-                let registry: Object = ctx.globals().get(PROVIDERS_REGISTRY_GLOBAL)?;
-                if registry.contains_key(&id)? {
-                    return Err(Exception::throw_message(
-                        &ctx,
-                        &format!("duplicate provider {id}"),
-                    ));
-                }
-                registry.set(id.clone(), options)?;
-                let frame = ExtensionFrame::Register {
-                    registration: ExtensionRegistration::Provider {
-                        provider: ExtensionProviderDescriptor {
-                            id,
-                            label,
-                            api,
-                            capabilities: provider_capabilities,
-                        },
-                    },
-                };
-                send_frame(&from_js_tx, frame, max_frame_bytes)
-                    .map_err(|message| Exception::throw_message(&ctx, &message))
+    let register_provider = Function::new(ctx.clone(), {
+        let in_load = in_load.clone();
+        let from_js_tx = from_js_tx.clone();
+        let capabilities = capabilities.clone();
+        move |ctx: Ctx<'js>, options: Object<'js>| -> JsResult<()> {
+            if !in_load.load(Ordering::Acquire) {
+                return Err(Exception::throw_message(
+                    &ctx,
+                    "provider registration is only allowed during the load phase",
+                ));
             }
-        },
-    )?;
+            if !capabilities.contains(&ExtensionCapability::Provider) {
+                return Err(Exception::throw_message(
+                    &ctx,
+                    "provider registration requires the provider capability",
+                ));
+            }
+            let id: String = options.get("id")?;
+            if let Err(message) = validate_js_identifier(&id, "provider id") {
+                return Err(Exception::throw_message(&ctx, &message));
+            }
+            if options.get::<_, Option<Function>>("stream")?.is_none() {
+                return Err(Exception::throw_message(
+                    &ctx,
+                    "registerProvider requires a stream function",
+                ));
+            }
+            let api: String = match options.get::<_, Option<String>>("api")? {
+                Some(api) => api,
+                None => id.clone(),
+            };
+            if let Err(message) = validate_js_identifier(&api, "provider api") {
+                return Err(Exception::throw_message(&ctx, &message));
+            }
+            let label: Option<String> = options.get("label")?;
+            if let Some(label) = &label {
+                if label.is_empty() || label.len() > 256 || label.chars().any(char::is_control) {
+                    return Err(Exception::throw_message(
+                        &ctx,
+                        "provider label must be 1-256 printable characters",
+                    ));
+                }
+            }
+            let provider_capabilities: Vec<String> = options
+                .get::<_, Option<Vec<String>>>("capabilities")?
+                .unwrap_or_default();
+            for capability in &provider_capabilities {
+                if let Err(message) = validate_js_identifier(capability, "provider capability") {
+                    return Err(Exception::throw_message(&ctx, &message));
+                }
+            }
+            let registry: Object = ctx.globals().get(PROVIDERS_REGISTRY_GLOBAL)?;
+            if registry.contains_key(&id)? {
+                return Err(Exception::throw_message(
+                    &ctx,
+                    &format!("duplicate provider {id}"),
+                ));
+            }
+            registry.set(id.clone(), options)?;
+            let frame = ExtensionFrame::Register {
+                registration: ExtensionRegistration::Provider {
+                    provider: ExtensionProviderDescriptor {
+                        id,
+                        label,
+                        api,
+                        capabilities: provider_capabilities,
+                    },
+                },
+            };
+            send_frame(&from_js_tx, frame, max_frame_bytes)
+                .map_err(|message| Exception::throw_message(&ctx, &message))
+        }
+    })?;
 
     // `pi.unregisterProvider(id)`: load-phase-only; drops the JS-side
     // callable and tells the host to drop the descriptor so resolution fails
     // actionably. Re-registering the same id afterwards replaces it.
-    let unregister_provider = Function::new(
-        ctx.clone(),
-        {
-            let in_load = in_load.clone();
-            let from_js_tx = from_js_tx.clone();
-            move |ctx: Ctx<'js>, id: String| -> JsResult<()> {
-                if !in_load.load(Ordering::Acquire) {
-                    return Err(Exception::throw_message(
-                        &ctx,
-                        "provider unregistration is only allowed during the load phase",
-                    ));
-                }
-                let registry: Object = ctx.globals().get(PROVIDERS_REGISTRY_GLOBAL)?;
-                if !registry.contains_key(&id)? {
-                    return Err(Exception::throw_message(
-                        &ctx,
-                        &format!("cannot unregister unknown provider {id}"),
-                    ));
-                }
-                registry.remove(&id)?;
-                send_frame(
-                    &from_js_tx,
-                    ExtensionFrame::UnregisterProvider { id },
-                    max_frame_bytes,
-                )
-                .map_err(|message| Exception::throw_message(&ctx, &message))
+    let unregister_provider = Function::new(ctx.clone(), {
+        let in_load = in_load.clone();
+        let from_js_tx = from_js_tx.clone();
+        move |ctx: Ctx<'js>, id: String| -> JsResult<()> {
+            if !in_load.load(Ordering::Acquire) {
+                return Err(Exception::throw_message(
+                    &ctx,
+                    "provider unregistration is only allowed during the load phase",
+                ));
             }
-        },
-    )?;
+            let registry: Object = ctx.globals().get(PROVIDERS_REGISTRY_GLOBAL)?;
+            if !registry.contains_key(&id)? {
+                return Err(Exception::throw_message(
+                    &ctx,
+                    &format!("cannot unregister unknown provider {id}"),
+                ));
+            }
+            registry.remove(&id)?;
+            send_frame(
+                &from_js_tx,
+                ExtensionFrame::UnregisterProvider { id },
+                max_frame_bytes,
+            )
+            .map_err(|message| Exception::throw_message(&ctx, &message))
+        }
+    })?;
 
     // `pi.registerOverlay({ id, title, render })`: load-phase-only,
     // `overlays` capability-gated. The options object (holding the JS render
     // function) is stored in the shared overlays registry so render
     // invocations can reach it without any closure capture; the host receives
     // the descriptor frame for `/overlay <id>` resolution.
-    let register_overlay = Function::new(
-        ctx.clone(),
-        {
-            let in_load = in_load.clone();
-            let from_js_tx = from_js_tx.clone();
-            let capabilities = capabilities.clone();
-            move |ctx: Ctx<'js>, options: Object<'js>| -> JsResult<()> {
-                if !in_load.load(Ordering::Acquire) {
-                    return Err(Exception::throw_message(
-                        &ctx,
-                        "overlay registration is only allowed during the load phase",
-                    ));
+    let register_overlay = Function::new(ctx.clone(), {
+        let in_load = in_load.clone();
+        let from_js_tx = from_js_tx.clone();
+        let capabilities = capabilities.clone();
+        move |ctx: Ctx<'js>, options: Object<'js>| -> JsResult<()> {
+            if !in_load.load(Ordering::Acquire) {
+                return Err(Exception::throw_message(
+                    &ctx,
+                    "overlay registration is only allowed during the load phase",
+                ));
+            }
+            if !capabilities.contains(&ExtensionCapability::Overlays) {
+                return Err(Exception::throw_message(
+                    &ctx,
+                    "overlay registration requires the overlays capability",
+                ));
+            }
+            let id: String = options.get("id")?;
+            if let Err(message) = validate_js_identifier(&id, "overlay id") {
+                return Err(Exception::throw_message(&ctx, &message));
+            }
+            let title: String = options
+                .get::<_, Option<String>>("title")?
+                .unwrap_or_else(|| id.clone());
+            if title.is_empty() || title.len() > 256 || title.chars().any(char::is_control) {
+                return Err(Exception::throw_message(
+                    &ctx,
+                    "overlay title must be 1-256 printable characters",
+                ));
+            }
+            if options.get::<_, Option<Function>>("render")?.is_none() {
+                return Err(Exception::throw_message(
+                    &ctx,
+                    "registerOverlay requires a render function",
+                ));
+            }
+            // Interactive overlays may declare `onSubmit(text, ctx)` and
+            // `onKey(action, ctx)` callbacks; the host owns the editor, so
+            // only sanitized text and the limited action ids reach them.
+            for field in ["onSubmit", "onKey"] {
+                if let Some(value) = options.get::<_, Option<JsValue>>(field)? {
+                    if !value.is_function() {
+                        return Err(Exception::throw_message(
+                            &ctx,
+                            &format!("registerOverlay {field} must be a function"),
+                        ));
+                    }
                 }
-                if !capabilities.contains(&ExtensionCapability::Overlays) {
-                    return Err(Exception::throw_message(
-                        &ctx,
-                        "overlay registration requires the overlays capability",
-                    ));
-                }
-                let id: String = options.get("id")?;
-                if let Err(message) = validate_js_identifier(&id, "overlay id") {
-                    return Err(Exception::throw_message(&ctx, &message));
-                }
-                let title: String = options
-                    .get::<_, Option<String>>("title")?
-                    .unwrap_or_else(|| id.clone());
-                if title.is_empty() || title.len() > 256 || title.chars().any(char::is_control) {
-                    return Err(Exception::throw_message(
-                        &ctx,
-                        "overlay title must be 1-256 printable characters",
-                    ));
-                }
-                if options.get::<_, Option<Function>>("render")?.is_none() {
-                    return Err(Exception::throw_message(
-                        &ctx,
-                        "registerOverlay requires a render function",
-                    ));
-                }
-                // Interactive overlays may declare `onSubmit(text, ctx)` and
-                // `onKey(action, ctx)` callbacks; the host owns the editor, so
-                // only sanitized text and the limited action ids reach them.
-                for field in ["onSubmit", "onKey"] {
-                    if let Some(value) = options.get::<_, Option<JsValue>>(field)? {
-                        if !value.is_function() {
+            }
+            // Optional static editor declaration (`input: { placeholder?,
+            // multiline? }`). Validated host-side; the host owns the
+            // editor, so the declaration carries no mutable state.
+            let input = match options.get::<_, Option<Object>>("input")? {
+                None => None,
+                Some(declaration) => {
+                    let placeholder: Option<String> = declaration.get("placeholder")?;
+                    if let Some(placeholder) = &placeholder {
+                        if placeholder.is_empty()
+                            || placeholder.len() > 256
+                            || placeholder.chars().any(char::is_control)
+                        {
                             return Err(Exception::throw_message(
                                 &ctx,
-                                &format!("registerOverlay {field} must be a function"),
+                                "overlay input placeholder must be 1-256 printable characters",
                             ));
                         }
                     }
+                    let multiline: bool = declaration
+                        .get::<_, Option<bool>>("multiline")?
+                        .unwrap_or(false);
+                    Some(OverlayInputDeclaration {
+                        placeholder,
+                        multiline,
+                    })
                 }
-                // Optional static editor declaration (`input: { placeholder?,
-                // multiline? }`). Validated host-side; the host owns the
-                // editor, so the declaration carries no mutable state.
-                let input = match options.get::<_, Option<Object>>("input")? {
-                    None => None,
-                    Some(declaration) => {
-                        let placeholder: Option<String> = declaration.get("placeholder")?;
-                        if let Some(placeholder) = &placeholder {
-                            if placeholder.is_empty()
-                                || placeholder.len() > 256
-                                || placeholder.chars().any(char::is_control)
-                            {
-                                return Err(Exception::throw_message(
-                                    &ctx,
-                                    "overlay input placeholder must be 1-256 printable characters",
-                                ));
-                            }
-                        }
-                        let multiline: bool = declaration
-                            .get::<_, Option<bool>>("multiline")?
-                            .unwrap_or(false);
-                        Some(OverlayInputDeclaration { placeholder, multiline })
-                    }
-                };
-                let registry: Object = ctx.globals().get(OVERLAYS_REGISTRY_GLOBAL)?;
-                if registry.contains_key(&id)? {
-                    return Err(Exception::throw_message(
-                        &ctx,
-                        &format!("duplicate overlay {id}"),
-                    ));
-                }
-                registry.set(id.clone(), options)?;
-                let frame = ExtensionFrame::Register {
-                    registration: ExtensionRegistration::Overlay {
-                        overlay: ExtensionOverlayDescriptor { id, title, input },
-                    },
-                };
-                send_frame(&from_js_tx, frame, max_frame_bytes)
-                    .map_err(|message| Exception::throw_message(&ctx, &message))
+            };
+            let registry: Object = ctx.globals().get(OVERLAYS_REGISTRY_GLOBAL)?;
+            if registry.contains_key(&id)? {
+                return Err(Exception::throw_message(
+                    &ctx,
+                    &format!("duplicate overlay {id}"),
+                ));
             }
-        },
-    )?;
+            registry.set(id.clone(), options)?;
+            let frame = ExtensionFrame::Register {
+                registration: ExtensionRegistration::Overlay {
+                    overlay: ExtensionOverlayDescriptor { id, title, input },
+                },
+            };
+            send_frame(&from_js_tx, frame, max_frame_bytes)
+                .map_err(|message| Exception::throw_message(&ctx, &message))
+        }
+    })?;
 
     // Synchronous bridge that returns a Promise: the resolve/reject pair is
     // stored Rust-side and settled by the main loop when the host answers the
     // action. Keeping the JS handles in Rust-owned state (never captured by a
     // closure stored on a JS function) avoids the JS_FreeRuntime teardown leak.
-    let set_session_name = Function::new(
-        ctx.clone(),
-        {
-            let pending_actions = pending_actions.clone();
-            let from_js_tx = from_js_tx.clone();
-            move |ctx: Ctx<'js>, name: String| -> JsResult<JsValue<'js>> {
-                issue_runtime_request(
-                    &ctx,
-                    &pending_actions,
-                    &from_js_tx,
-                    max_frame_bytes,
-                    ExtensionRuntimeRequest::Action {
-                        action: ExtensionRuntimeAction::SetSessionName { name },
-                    },
-                )
-            }
-        },
-    )?;
+    let set_session_name = Function::new(ctx.clone(), {
+        let pending_actions = pending_actions.clone();
+        let from_js_tx = from_js_tx.clone();
+        move |ctx: Ctx<'js>, name: String| -> JsResult<JsValue<'js>> {
+            issue_runtime_request(
+                &ctx,
+                &pending_actions,
+                &from_js_tx,
+                max_frame_bytes,
+                ExtensionRuntimeRequest::Action {
+                    action: ExtensionRuntimeAction::SetSessionName { name },
+                },
+            )
+        }
+    })?;
 
-    let pi_on = Function::new(
-        ctx.clone(),
-        {
-            let capabilities = capabilities.clone();
-            let from_js_tx = from_js_tx.clone();
-            move |ctx: Ctx<'js>, event: String, handler: Function<'js>| -> JsResult<()> {
-                // Mirror the process bridge's pi.on:
-                // capability gate, authoritative allow-list, one event_hook
-                // Register frame per event on first registration, then record
-                // the handler for dispatch.
-                if !capabilities.contains(&ExtensionCapability::EventHooks) {
-                    return Err(Exception::throw_message(
-                        &ctx,
-                        "event registration requires the event_hooks capability",
-                    ));
-                }
-                if !SUPPORTED_EVENTS.contains(&event.as_str()) {
-                    return Err(Exception::throw_message(
-                        &ctx,
-                        &format!("unsupported extension event {event}"),
-                    ));
-                }
-                let hooks: Object = ctx.globals().get(HOOKS_REGISTRY_GLOBAL)?;
-                let mut handlers: Vec<Function> =
-                    hooks.get::<_, Option<Vec<Function>>>(&event)?.unwrap_or_default();
-                if handlers.is_empty() {
-                    let frame = ExtensionFrame::Register {
-                        registration: ExtensionRegistration::EventHook {
-                            hook: ExtensionEventHookDescriptor { event: event.clone() },
-                        },
-                    };
-                    send_frame(&from_js_tx, frame, max_frame_bytes)
-                        .map_err(|message| Exception::throw_message(&ctx, &message))?;
-                }
-                handlers.push(handler);
-                hooks.set(event, handlers)
+    let pi_on = Function::new(ctx.clone(), {
+        let capabilities = capabilities.clone();
+        let from_js_tx = from_js_tx.clone();
+        move |ctx: Ctx<'js>, event: String, handler: Function<'js>| -> JsResult<()> {
+            // Mirror the process bridge's pi.on:
+            // capability gate, authoritative allow-list, one event_hook
+            // Register frame per event on first registration, then record
+            // the handler for dispatch.
+            if !capabilities.contains(&ExtensionCapability::EventHooks) {
+                return Err(Exception::throw_message(
+                    &ctx,
+                    "event registration requires the event_hooks capability",
+                ));
             }
-        },
-    )?;
+            if !SUPPORTED_EVENTS.contains(&event.as_str()) {
+                return Err(Exception::throw_message(
+                    &ctx,
+                    &format!("unsupported extension event {event}"),
+                ));
+            }
+            let hooks: Object = ctx.globals().get(HOOKS_REGISTRY_GLOBAL)?;
+            let mut handlers: Vec<Function> = hooks
+                .get::<_, Option<Vec<Function>>>(&event)?
+                .unwrap_or_default();
+            if handlers.is_empty() {
+                let frame = ExtensionFrame::Register {
+                    registration: ExtensionRegistration::EventHook {
+                        hook: ExtensionEventHookDescriptor {
+                            event: event.clone(),
+                        },
+                    },
+                };
+                send_frame(&from_js_tx, frame, max_frame_bytes)
+                    .map_err(|message| Exception::throw_message(&ctx, &message))?;
+            }
+            handlers.push(handler);
+            hooks.set(event, handlers)
+        }
+    })?;
 
     let pi = Object::new(ctx.clone())?;
     pi.set("registerCommand", register_command)?;
@@ -2563,15 +2595,12 @@ fn build_pi<'js>(
     }
     for method in UNAVAILABLE_PI_METHODS {
         let name = (*method).to_owned();
-        let unavailable = Function::new(
-            ctx.clone(),
-            move |ctx: Ctx<'js>| -> JsResult<()> {
-                Err(Exception::throw_message(
-                    &ctx,
-                    &format!("{name} is unavailable in the quickjs runtime"),
-                ))
-            },
-        )?;
+        let unavailable = Function::new(ctx.clone(), move |ctx: Ctx<'js>| -> JsResult<()> {
+            Err(Exception::throw_message(
+                &ctx,
+                &format!("{name} is unavailable in the quickjs runtime"),
+            ))
+        })?;
         pi.set(*method, unavailable)?;
     }
     Ok(pi)
@@ -2600,10 +2629,7 @@ fn build_on_update<'js>(
                 JsonValue::Object(JsonMap::new())
             } else {
                 js_to_json(&ctx, value, 0).map_err(|error| {
-                    Exception::throw_message(
-                        &ctx,
-                        &format!("invalid tool update value: {error}"),
-                    )
+                    Exception::throw_message(&ctx, &format!("invalid tool update value: {error}"))
                 })?
             };
             send_frame(
@@ -2631,7 +2657,9 @@ fn build_context_object<'js>(
     object.set("cwd", &hello.cwd)?;
     let model_value = match model {
         Some(model) => match serde_json::to_value(model) {
-            Ok(value) => json_to_js(ctx, &value, 0).unwrap_or_else(|_| JsValue::new_null(ctx.clone())),
+            Ok(value) => {
+                json_to_js(ctx, &value, 0).unwrap_or_else(|_| JsValue::new_null(ctx.clone()))
+            }
             Err(_) => JsValue::new_null(ctx.clone()),
         },
         None => JsValue::new_null(ctx.clone()),
@@ -2670,10 +2698,9 @@ fn validate_js_identifier(value: &str, field: &str) -> Result<(), String> {
     if value.len() > 128 {
         return Err(format!("{field} exceeds 128 bytes"));
     }
-    if value
-        .chars()
-        .any(|character| !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')))
-    {
+    if value.chars().any(|character| {
+        !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+    }) {
         return Err(format!("{field} {value:?} contains unsupported characters"));
     }
     Ok(())
@@ -2688,7 +2715,9 @@ fn json_to_js<'js>(ctx: &Ctx<'js>, value: &JsonValue, depth: usize) -> JsResult<
         return Err(rquickjs::Error::FromJs {
             from: "json value",
             to: "javascript value",
-            message: Some(format!("maximum nesting depth {VALUE_BRIDGE_MAX_DEPTH} exceeded")),
+            message: Some(format!(
+                "maximum nesting depth {VALUE_BRIDGE_MAX_DEPTH} exceeded"
+            )),
         });
     }
     Ok(match value {
@@ -2735,7 +2764,9 @@ fn js_to_json<'js>(ctx: &Ctx<'js>, value: JsValue<'js>, depth: usize) -> JsResul
         return Err(rquickjs::Error::FromJs {
             from: "javascript value",
             to: "json value",
-            message: Some(format!("maximum nesting depth {VALUE_BRIDGE_MAX_DEPTH} exceeded")),
+            message: Some(format!(
+                "maximum nesting depth {VALUE_BRIDGE_MAX_DEPTH} exceeded"
+            )),
         });
     }
     if value.is_null() || value.is_undefined() {
@@ -2754,7 +2785,9 @@ fn js_to_json<'js>(ctx: &Ctx<'js>, value: JsValue<'js>, depth: usize) -> JsResul
         return Err(rquickjs::Error::FromJs {
             from: "javascript number",
             to: "json value",
-            message: Some(format!("non-finite number {float} is not representable in JSON")),
+            message: Some(format!(
+                "non-finite number {float} is not representable in JSON"
+            )),
         });
     }
     if let Some(string) = value.as_string() {
@@ -2804,7 +2837,9 @@ fn send_frame(
     max_frame_bytes: usize,
 ) -> Result<(), String> {
     if frame_bytes(&frame) > max_frame_bytes {
-        return Err(format!("extension protocol frame exceeds {max_frame_bytes} bytes"));
+        return Err(format!(
+            "extension protocol frame exceeds {max_frame_bytes} bytes"
+        ));
     }
     from_js_tx
         .send(frame)

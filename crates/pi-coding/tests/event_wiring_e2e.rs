@@ -17,49 +17,66 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
-use pi_ai::providers::{
-    FauxProviderOptions, FauxResponse, register_faux_provider,
-};
+use anyhow::{Context, Result, anyhow};
 use pi_ai::Model;
+use pi_ai::providers::{
+    FauxProviderOptions, FauxProviderRegistration, FauxResponse, register_faux_provider,
+};
 use pi_coding::{
-    Application, ApplicationEvent, ExtensionCapability, ExtensionMode, ExtensionOrigin,
+    Application, ApplicationEvent, ApplicationRuntimeCandidate, ExtensionCapability, ExtensionMode,
     ExtensionPermissionSet, ExtensionRuntime, ExtensionRuntimeEvent, ExtensionRuntimeOptions,
-    ExtensionSpec, ExtensionSpecRuntime, Session, SessionEvent, SessionOptions,
+    ResourceManager, ResourceManagerOptions, Session, SessionEvent, SessionOptions,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
 /// Session model that does not claim any thinking-level support, so the
 /// recorded level after `set_thinking_level` is whatever the session clamps
-/// to — the event must carry that effective level.
-fn lifecycle_model() -> Model {
+/// to — the event must carry that effective level. The registration makes the
+/// model resolvable during Application HTTP-authority staging without network.
+fn lifecycle_model() -> (Model, FauxProviderRegistration) {
+    faux_model("lifecycle", Vec::new())
+}
+
+fn faux_model(prefix: &str, responses: Vec<FauxResponse>) -> (Model, FauxProviderRegistration) {
     let suffix = uuid::Uuid::now_v7().to_string();
-    Model {
-        id: format!("lifecycle-model-{suffix}"),
-        name: "Lifecycle Test Model".to_owned(),
-        api: format!("lifecycle-api-{suffix}"),
-        provider: format!("lifecycle-provider-{suffix}"),
+    let model = Model {
+        id: format!("{prefix}-model-{suffix}"),
+        name: format!("{prefix} Test Model"),
+        api: format!("{prefix}-api-{suffix}"),
+        provider: format!("{prefix}-provider-{suffix}"),
+        base_url: "http://localhost:0".to_owned(),
         ..Model::default()
-    }
-}
-
-/// Per-process isolated native session root so `start_new_recording()` never
-/// writes into the real `~/.pi/agent/sessions` tree (Web sidebar source).
-fn test_sessions_root() -> std::path::PathBuf {
-    static ROOT: std::sync::LazyLock<tempfile::TempDir> = std::sync::LazyLock::new(|| {
-        tempfile::tempdir().expect("test sessions root")
+    };
+    let registration = register_faux_provider(FauxProviderOptions {
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+        models: vec![model.clone()],
+        chunk_size: 1,
     });
-    ROOT.path().to_path_buf()
+    registration.set_responses(responses);
+    (model, registration)
 }
 
-fn session_with(model: Model) -> Session {
+fn workspace_root(root: &Path) -> PathBuf {
+    root.join("workspace")
+}
+
+fn session_root(root: &Path) -> PathBuf {
+    root.join("sessions")
+}
+
+fn session_with(model: Model, root: &Path) -> Session {
+    let workspace = workspace_root(root);
+    let sessions = session_root(root);
+    fs::create_dir_all(&workspace).expect("test workspace");
+    fs::create_dir_all(&sessions).expect("test sessions root");
     let session = Session::new(SessionOptions {
         model,
-        cwd: std::env::current_dir().expect("current directory"),
+        cwd: workspace,
         system_prompt: String::new(),
         thinking_level: pi_agent::ThinkingLevel::Off,
         api_key: String::new(),
@@ -70,28 +87,37 @@ fn session_with(model: Model) -> Session {
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: None,
+        auth_manager: None,
     })
-.expect("build session");
-    session.set_session_dir(test_sessions_root());
+    .expect("build session");
+    session.set_session_dir(sessions);
     session
 }
 
-/// Write the extension entry and load it into a fresh in-process runtime.
-async fn load_runtime(dir: &Path, id: &str, source: &str) -> Result<(ExtensionRuntime, ExtensionPermissionSet)> {
+/// Write the extension package and stage it through the application's explicit-resource path.
+async fn application_with_runtime(
+    session: Session,
+    dir: &Path,
+    id: &str,
+    source: &str,
+) -> Result<(Application, ExtensionRuntime)> {
     let entry = dir.join(format!("{id}.mjs"));
     fs::write(&entry, source).context("writing extension entry")?;
+    let manifest = dir.join("pi-extension.json");
+    fs::write(
+        &manifest,
+        serde_json::to_vec_pretty(&json!({
+            "schemaVersion": 1,
+            "id": id,
+            "runtime": "quickjs",
+            "entry": entry.file_name().expect("extension entry file name").to_string_lossy(),
+            "capabilities": ["event_hooks"],
+        }))?,
+    )?;
     let permissions = ExtensionPermissionSet {
         capabilities: BTreeSet::from([ExtensionCapability::EventHooks]),
         ui_capabilities: BTreeSet::new(),
     };
-    let spec = ExtensionSpec::new_runtime(
-        id,
-        ExtensionSpecRuntime::QuickJs { entry: entry.clone() },
-        dir.to_path_buf(),
-        ExtensionOrigin::Project,
-        true,
-        permissions.clone(),
-    );
     let runtime = ExtensionRuntime::process(
         None,
         ExtensionRuntimeOptions {
@@ -100,18 +126,29 @@ async fn load_runtime(dir: &Path, id: &str, source: &str) -> Result<(ExtensionRu
             ..ExtensionRuntimeOptions::default()
         },
     );
-    let report = runtime.load(vec![spec]).await;
-    anyhow::ensure!(report.failures.is_empty(), "{:?}", report.failures);
-    Ok((runtime, permissions))
-}
-
-/// Build an Application bound to the loaded extension runtime.
-async fn application_with_runtime(
-    session: Session,
-    runtime: ExtensionRuntime,
-    permissions: ExtensionPermissionSet,
-) -> Application {
-    Application::new_with_extensions(session, runtime, permissions).await
+    let agent_dir = dir.join("agent");
+    fs::create_dir_all(&agent_dir).context("creating test agent directory")?;
+    fs::write(
+        agent_dir.join("settings.json"),
+        r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+    )
+    .context("writing test agent settings")?;
+    let mut options = ResourceManagerOptions::new(session.cwd());
+    options.agent_dir = agent_dir;
+    options.project_trust_override = Some(true);
+    options.disable_skills = true;
+    options.disable_prompt_templates = true;
+    options.disable_themes = true;
+    options.disable_context_files = true;
+    options.explicit_extension_paths = vec![manifest];
+    session
+        .attach_resources(ResourceManager::new(options)?)
+        .await?;
+    let application = Application::from_runtime_candidate(
+        ApplicationRuntimeCandidate::new(session).with_extensions(runtime.clone(), permissions),
+    )
+    .await?;
+    Ok((application, runtime))
 }
 
 /// The fixture throws `received:<json>` from the event handler; this drains
@@ -127,9 +164,9 @@ async fn received_event_payload(
     loop {
         let received = tokio::time::timeout(Duration::from_millis(500), events.recv()).await;
         match received {
-            Ok(Ok(ExtensionRuntimeEvent::InvocationFailed { operation, message, .. }))
-                if operation == format!("event:{event}") =>
-            {
+            Ok(Ok(ExtensionRuntimeEvent::InvocationFailed {
+                operation, message, ..
+            })) if operation == format!("event:{event}") => {
                 // The failure message is the JS error, possibly followed by
                 // an `; child stderr: ...` suffix from the invocation bridge.
                 let payload = message
@@ -193,7 +230,9 @@ async fn assert_forwarded_session_event(
 #[tokio::test]
 async fn session_info_changed_reaches_extension_on_rename() -> Result<()> {
     let dir = TempDir::new()?;
-    let (runtime, permissions) = load_runtime(
+    let (model, _registration) = lifecycle_model();
+    let (application, runtime) = application_with_runtime(
+        session_with(model, dir.path()),
         dir.path(),
         "session-info",
         r#"export default function (pi) {
@@ -206,7 +245,6 @@ async fn session_info_changed_reaches_extension_on_rename() -> Result<()> {
     )
     .await?;
     let mut runtime_events = runtime.subscribe();
-    let application = application_with_runtime(session_with(lifecycle_model()), runtime.clone(), permissions).await;
 
     let payload = assert_forwarded_session_event(
         &application,
@@ -230,7 +268,9 @@ async fn session_info_changed_reaches_extension_on_rename() -> Result<()> {
 #[tokio::test]
 async fn model_select_reaches_extension_on_model_change() -> Result<()> {
     let dir = TempDir::new()?;
-    let (runtime, permissions) = load_runtime(
+    let (model, _registration) = lifecycle_model();
+    let (application, runtime) = application_with_runtime(
+        session_with(model.clone(), dir.path()),
         dir.path(),
         "model-select",
         r#"export default function (pi) {
@@ -242,9 +282,7 @@ async fn model_select_reaches_extension_on_model_change() -> Result<()> {
 "#,
     )
     .await?;
-    let model = lifecycle_model();
     let mut runtime_events = runtime.subscribe();
-    let application = application_with_runtime(session_with(model.clone()), runtime.clone(), permissions).await;
 
     let payload = assert_forwarded_session_event(
         &application,
@@ -267,7 +305,17 @@ async fn model_select_reaches_extension_on_model_change() -> Result<()> {
 #[tokio::test]
 async fn model_select_extension_event_strips_credential_headers() -> Result<()> {
     let dir = TempDir::new()?;
-    let (runtime, permissions) = load_runtime(
+    // Headers are assembled at runtime so no credential-shaped literal ever
+    // appears in source; they must never cross the EventHooks boundary.
+    let auth = format!("Bearer {}", uuid::Uuid::now_v7());
+    let api_key = format!("api-key-{}", uuid::Uuid::now_v7());
+    let (mut model, _registration) = faux_model("sanitized", Vec::new());
+    model.headers = Some(HashMap::from([
+        ("Authorization".to_owned(), auth.clone()),
+        ("X-Api-Key".to_owned(), api_key.clone()),
+    ]));
+    let (application, runtime) = application_with_runtime(
+        session_with(model.clone(), dir.path()),
         dir.path(),
         "model-select-sanitized",
         r#"export default function (pi) {
@@ -279,24 +327,7 @@ async fn model_select_extension_event_strips_credential_headers() -> Result<()> 
 "#,
     )
     .await?;
-    // Headers are assembled at runtime so no credential-shaped literal ever
-    // appears in source; they must never cross the EventHooks boundary.
-    let auth = format!("Bearer {}", uuid::Uuid::now_v7());
-    let api_key = format!("api-key-{}", uuid::Uuid::now_v7());
-    let suffix = uuid::Uuid::now_v7().to_string();
-    let model = Model {
-        id: format!("sanitized-model-{suffix}"),
-        name: "Sanitized Model".to_owned(),
-        api: format!("sanitized-api-{suffix}"),
-        provider: format!("sanitized-provider-{suffix}"),
-        headers: Some(HashMap::from([
-            ("Authorization".to_owned(), auth.clone()),
-            ("X-Api-Key".to_owned(), api_key.clone()),
-        ])),
-        ..Model::default()
-    };
     let mut runtime_events = runtime.subscribe();
-    let application = application_with_runtime(session_with(model.clone()), runtime.clone(), permissions).await;
 
     // Ordinary in-process model selection is unchanged: the ApplicationEvent
     // still carries the credential-bearing model.
@@ -346,7 +377,9 @@ async fn model_select_extension_event_strips_credential_headers() -> Result<()> 
 #[tokio::test]
 async fn thinking_level_select_reaches_extension_on_level_change() -> Result<()> {
     let dir = TempDir::new()?;
-    let (runtime, permissions) = load_runtime(
+    let (model, _registration) = lifecycle_model();
+    let (application, runtime) = application_with_runtime(
+        session_with(model, dir.path()),
         dir.path(),
         "thinking-level-select",
         r#"export default function (pi) {
@@ -359,7 +392,6 @@ async fn thinking_level_select_reaches_extension_on_level_change() -> Result<()>
     )
     .await?;
     let mut runtime_events = runtime.subscribe();
-    let application = application_with_runtime(session_with(lifecycle_model()), runtime.clone(), permissions).await;
 
     let payload = assert_forwarded_session_event(
         &application,
@@ -384,7 +416,18 @@ async fn thinking_level_select_reaches_extension_on_level_change() -> Result<()>
 #[tokio::test]
 async fn session_tree_reaches_extension_after_navigation() -> Result<()> {
     let dir = TempDir::new()?;
-    let (runtime, permissions) = load_runtime(
+    // A recorded session with one turn so navigate_tree has an entry to jump
+    // to (mirrors tests/application_runtime.rs navigation tests).
+    let (model, registration) = faux_model("session-tree", vec![FauxResponse::text("answer")]);
+    let session = session_with(model, dir.path());
+    session.start_new_recording().expect("start recorder");
+    session
+        .run("question", Vec::new())
+        .await
+        .expect("record turn");
+
+    let (application, runtime) = application_with_runtime(
+        session,
         dir.path(),
         "session-tree",
         r#"export default function (pi) {
@@ -396,35 +439,7 @@ async fn session_tree_reaches_extension_after_navigation() -> Result<()> {
 "#,
     )
     .await?;
-
-    // A recorded session with one turn so navigate_tree has an entry to jump
-    // to (mirrors tests/application_runtime.rs navigation tests).
-    let suffix = uuid::Uuid::now_v7().to_string();
-    let api = format!("session-tree-api-{suffix}");
-    let provider = format!("session-tree-provider-{suffix}");
-    let model = Model {
-        id: "session-tree-model".to_owned(),
-        name: "Session Tree Model".to_owned(),
-        api: api.clone(),
-        provider: provider.clone(),
-        ..Model::default()
-    };
-    let registration = register_faux_provider(FauxProviderOptions {
-        api,
-        provider,
-        models: vec![model.clone()],
-        chunk_size: 1,
-    });
-    registration.set_responses(vec![FauxResponse::text("answer")]);
-    let session = session_with(model);
-    session.start_new_recording().expect("start recorder");
-    session
-        .run("question", Vec::new())
-        .await
-        .expect("record turn");
-
     let mut runtime_events = runtime.subscribe();
-    let application = application_with_runtime(session, runtime.clone(), permissions).await;
     let user_id = application
         .session_entries(None)
         .expect("entries")
@@ -455,7 +470,10 @@ async fn session_tree_reaches_extension_after_navigation() -> Result<()> {
             Err(_) => continue,
         }
     }
-    assert!(saw_session_tree, "session_tree must be published after navigation");
+    assert!(
+        saw_session_tree,
+        "session_tree must be published after navigation"
+    );
 
     let payload = received_event_payload(&mut runtime_events, "session_tree").await?;
     assert_eq!(payload["targetId"], json!(user_id));
@@ -480,7 +498,9 @@ async fn session_tree_reaches_extension_after_navigation() -> Result<()> {
 #[tokio::test]
 async fn agent_settled_reaches_extension_after_turn() -> Result<()> {
     let dir = TempDir::new()?;
-    let (runtime, permissions) = load_runtime(
+    let (model, registration) = faux_model("agent-settled", vec![FauxResponse::text("hello")]);
+    let (application, runtime) = application_with_runtime(
+        session_with(model, dir.path()),
         dir.path(),
         "agent-settled",
         r#"export default function (pi) {
@@ -492,26 +512,7 @@ async fn agent_settled_reaches_extension_after_turn() -> Result<()> {
 "#,
     )
     .await?;
-
-    let suffix = uuid::Uuid::now_v7().to_string();
-    let api = format!("agent-settled-api-{suffix}");
-    let provider = format!("agent-settled-provider-{suffix}");
-    let model = Model {
-        id: "agent-settled-model".to_owned(),
-        name: "Agent Settled Model".to_owned(),
-        api: api.clone(),
-        provider: provider.clone(),
-        ..Model::default()
-    };
-    let registration = register_faux_provider(FauxProviderOptions {
-        api,
-        provider,
-        models: vec![model.clone()],
-        chunk_size: 1,
-    });
-    registration.set_responses(vec![FauxResponse::text("hello")]);
     let mut runtime_events = runtime.subscribe();
-    let application = application_with_runtime(session_with(model), runtime.clone(), permissions).await;
 
     let mut app_events = application.subscribe();
     application
@@ -538,7 +539,11 @@ async fn agent_settled_reaches_extension_after_turn() -> Result<()> {
     let payload = received_event_payload(&mut runtime_events, "agent_settled").await?;
     // The host injects `type` into the event object; the event carries no
     // other state.
-    assert_eq!(payload, json!({ "type": "agent_settled" }), "agent_settled carries no state");
+    assert_eq!(
+        payload,
+        json!({ "type": "agent_settled" }),
+        "agent_settled carries no state"
+    );
 
     application.cleanup().await;
     runtime.shutdown().await;

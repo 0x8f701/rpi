@@ -16,12 +16,21 @@ pub(crate) struct EditDiffDetails {
     pub first_changed_line: Option<usize>,
 }
 
-pub(crate) fn generate_edit_details(path: &str, old_content: &str, new_content: &str) -> EditDiffDetails {
+pub(crate) fn generate_edit_details(
+    path: &str,
+    old_content: &str,
+    new_content: &str,
+) -> EditDiffDetails {
     let text_diff = TextDiff::from_lines(old_content, new_content);
     let first_changed_line = text_diff
         .iter_all_changes()
         .find(|change| change.tag() != ChangeTag::Equal)
-        .map(|change| change.new_index().map_or_else(|| change.old_index().unwrap_or(0), |index| index) + 1);
+        .map(|change| {
+            change
+                .new_index()
+                .map_or_else(|| change.old_index().unwrap_or(0), |index| index)
+                + 1
+        });
     let diff = bounded_detail(generate_diff_string(&text_diff, old_content, new_content));
     let patch = bounded_detail(generate_unified_patch(&text_diff, path));
     EditDiffDetails {
@@ -31,8 +40,15 @@ pub(crate) fn generate_edit_details(path: &str, old_content: &str, new_content: 
     }
 }
 
-fn generate_diff_string(text_diff: &TextDiff<'_, '_, str>, old_content: &str, new_content: &str) -> String {
-    let max_line_num = old_content.split('\n').count().max(new_content.split('\n').count());
+fn generate_diff_string(
+    text_diff: &TextDiff<'_, '_, str>,
+    old_content: &str,
+    new_content: &str,
+) -> String {
+    let max_line_num = old_content
+        .split('\n')
+        .count()
+        .max(new_content.split('\n').count());
     let width = max_line_num.to_string().len();
     let groups = text_diff.grouped_ops(DIFF_CONTEXT_LINES);
     let mut output = Vec::new();
@@ -62,7 +78,9 @@ fn generate_diff_string(text_diff: &TextDiff<'_, '_, str>, old_content: &str, ne
             }
         }
         if group_index + 1 == groups.len()
-            && group.last().is_some_and(|op| op.old_range().end < text_diff.old_len())
+            && group
+                .last()
+                .is_some_and(|op| op.old_range().end < text_diff.old_len())
         {
             output.push(format!(" {:width$}...", ""));
         }
@@ -102,14 +120,22 @@ mod tests {
         assert_eq!(details.first_changed_line, Some(2));
         assert!(details.diff.contains("-2 two"), "{}", details.diff);
         assert!(details.diff.contains("+2 TWO"), "{}", details.diff);
-        assert!(details.patch.starts_with("--- a.txt\n+++ a.txt\n@@"), "{}", details.patch);
+        assert!(
+            details.patch.starts_with("--- a.txt\n+++ a.txt\n@@"),
+            "{}",
+            details.patch
+        );
         assert!(details.patch.contains("-two\n+TWO"), "{}", details.patch);
     }
 
     #[test]
     fn detail_strings_are_bounded() {
-        let old = (0..40_000).map(|i| format!("old-{i}\n")).collect::<String>();
-        let new = (0..40_000).map(|i| format!("new-{i}\n")).collect::<String>();
+        let old = (0..40_000)
+            .map(|i| format!("old-{i}\n"))
+            .collect::<String>();
+        let new = (0..40_000)
+            .map(|i| format!("new-{i}\n"))
+            .collect::<String>();
         let details = generate_edit_details("large.txt", &old, &new);
         assert!(details.diff.len() <= MAX_DETAIL_BYTES);
         assert!(details.patch.len() <= MAX_DETAIL_BYTES);

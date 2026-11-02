@@ -9,30 +9,43 @@
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/master/install.sh | sh
-#   sh install.sh --version v0.2.11      # pin a specific release
+#   sh install.sh --version v1.0.0      # pin a specific release
 #
 # Environment:
-#   PI_HOME                install root (default: ~/.rpi)
-#   PI_UPDATE_BASE_URL     GitHub-Releases-shaped API base (default:
+#   RPI_HOME                install root (default: ~/.rpi)
+#   RPI_UPDATE_BASE_URL     GitHub-Releases-shaped API base (default:
 #                          https://api.github.com/repos/0x8f701/rpi/releases)
 #   GITHUB_TOKEN           authenticate the fixed GitHub API endpoint (default:
 #                          none; never sent to release-asset hosts)
+#   RPI_ALLOW_LOOPBACK_HTTP set to 1 to allow http:// on 127.0.0.1, localhost,
+#                          or [::1] for a local release fixture. Never the
+#                          default; every other host must be HTTPS.
 #
 # Fails fast on any error; never leaves a partial binary as the active rpi.
 
 set -eu
 
 REPO="0x8f701/rpi"
-API_BASE="${PI_UPDATE_BASE_URL:-https://api.github.com/repos/${REPO}/releases}"
-PI_HOME="${PI_HOME:-$HOME/.rpi}"
+API_BASE="${RPI_UPDATE_BASE_URL:-https://api.github.com/repos/${REPO}/releases}"
+RPI_HOME="${RPI_HOME:-$HOME/.rpi}"
 
 err() {
     printf 'install.sh: error: %s\n' "$*" >&2
     exit 1
 }
 
+# Legacy names are intentionally not aliased. Reject them with an actionable
+# message before any network request or filesystem change so users do not
+# silently install into the wrong root or leak credentials to the wrong endpoint.
+if [ -n "${PI_HOME:-}" ]; then
+    err "legacy PI_HOME is no longer supported; set RPI_HOME instead (current PI_HOME=$PI_HOME)"
+fi
+if [ -n "${PI_UPDATE_BASE_URL:-}" ]; then
+    err "legacy PI_UPDATE_BASE_URL is no longer supported; set RPI_UPDATE_BASE_URL instead"
+fi
+
 usage() {
-    sed -n '2,21p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
+    sed -n '2,25p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
 }
 
 is_semver() {
@@ -130,41 +143,280 @@ is_fixed_github_api_url() {
     esac
 }
 
+url_scheme() {
+    printf '%s' "$1" | sed -n 's/^\([A-Za-z][A-Za-z0-9+.-]*\):\/\/.*/\1/p' | tr 'A-Z' 'a-z'
+}
+
+url_authority() {
+    printf '%s' "$1" | sed -n 's/^[A-Za-z][A-Za-z0-9+.-]*:\/\/\([^/?#]*\).*/\1/p'
+}
+
+url_host() {
+    auth="$(url_authority "$1")"
+    [ -n "$auth" ] || return 0
+    case "$auth" in
+        \[*\])
+            printf '%s' "$auth" | sed 's/^\(\[[^]]*\]\).*/\1/'
+            ;;
+        *)
+            printf '%s' "$auth" | sed 's/:.*//'
+            ;;
+    esac
+}
+
+is_loopback_host() {
+    case "$1" in
+        127.0.0.1|localhost|\[::1\])
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+is_loopback_http_url() {
+    [ "$(url_scheme "$1")" = "http" ] || return 1
+    is_loopback_host "$(url_host "$1")"
+}
+
+is_github_asset_host() {
+    case "$1" in
+        github.com|objects.githubusercontent.com|github-releases.githubusercontent.com|release-assets.githubusercontent.com)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+require_allowed_url() {
+    candidate="$1"
+    scheme="$(url_scheme "$candidate")"
+    host="$(url_host "$candidate")"
+    auth="$(url_authority "$candidate")"
+    [ -n "$scheme" ] && [ -n "$host" ] && [ -n "$auth" ] \
+        || err "refusing URL with a missing scheme or host: $candidate"
+    case "$auth" in
+        *@*)
+            err "refusing URL with userinfo: $candidate"
+            ;;
+    esac
+    case "$scheme" in
+        https)
+            return 0
+            ;;
+        http)
+            if [ "${RPI_ALLOW_LOOPBACK_HTTP:-}" = "1" ] && is_loopback_host "$host"; then
+                return 0
+            fi
+            err "refusing non-HTTPS URL (loopback http requires RPI_ALLOW_LOOPBACK_HTTP=1): $candidate"
+            ;;
+        *)
+            err "refusing URL with scheme '$scheme' (HTTPS required): $candidate"
+            ;;
+    esac
+}
+
+require_effective_url() {
+    requested="$1"
+    effective="$2"
+    [ -n "$effective" ] || err "refusing download with empty effective URL"
+    require_allowed_url "$effective"
+    req_host="$(url_host "$requested")"
+    eff_host="$(url_host "$effective")"
+    if is_fixed_github_api_url "$requested" || [ "$req_host" = "api.github.com" ]; then
+        [ "$eff_host" = "api.github.com" ] \
+            || err "release metadata redirected to an unexpected host: $effective"
+        return 0
+    fi
+    if is_github_asset_host "$req_host"; then
+        is_github_asset_host "$eff_host" \
+            || err "download redirected to an unexpected host: $effective"
+        return 0
+    fi
+    [ "$eff_host" = "$req_host" ] \
+        || err "download redirected off the metadata host ($req_host): $effective"
+}
+
+allows_github_cdn_redirects() {
+    is_fixed_github_api_url "$1" && return 0
+    is_github_asset_host "$(url_host "$1")"
+}
+
+http_redirect_location() {
+    hdr="$1"
+    [ -f "$hdr" ] || return 1
+    status="$(awk '$1 ~ /HTTP\// { code=$2 } END { print code }' "$hdr" | tr -d '\r')"
+    case "$status" in
+        301|302|303|307|308) ;;
+        *)
+            return 1
+            ;;
+    esac
+    loc="$(awk 'tolower($1) == "location:" { loc=$2 } END { print loc }' "$hdr" | tr -d '\r')"
+    [ -n "$loc" ] || return 1
+    printf '%s' "$loc"
+}
+
+curl_fetch_pinned_redirects() {
+    pinned_origin="$1"
+    dest="$2"
+    current="$pinned_origin"
+    hop=0
+    while [ "$hop" -le 5 ]; do
+        require_allowed_url "$current"
+        require_effective_url "$pinned_origin" "$current"
+        hdr="$TMP_DIR/curl-headers.$$"
+        code_file="$TMP_DIR/curl-http-code.$$"
+        rm -f "$dest" "$hdr" "$code_file"
+        if [ -n "$AUTH_HDR" ] && is_fixed_github_api_url "$current"; then
+            if ! curl -fsS --proto '=https' --proto-redir '=https' --max-redirs 0 \
+                -H "$AUTH_HDR" -D "$hdr" -o "$dest" -w '%{http_code}' "$current" \
+                > "$code_file"; then
+                rm -f "$dest" "$hdr" "$code_file"
+                return 1
+            fi
+        else
+            if ! curl -fsS --proto '=https' --proto-redir '=https' --max-redirs 0 \
+                -D "$hdr" -o "$dest" -w '%{http_code}' "$current" \
+                > "$code_file"; then
+                rm -f "$dest" "$hdr" "$code_file"
+                return 1
+            fi
+        fi
+        http_code="$(tr -d '\r\n' < "$code_file")"
+        rm -f "$code_file"
+        [ -n "$http_code" ] || {
+            rm -f "$dest" "$hdr"
+            err "refusing download with empty HTTP status"
+        }
+        case "$http_code" in
+            200)
+                rm -f "$hdr"
+                return 0
+                ;;
+            301|302|303|307|308)
+                loc="$(http_redirect_location "$hdr")" || loc=""
+                rm -f "$hdr" "$dest"
+                [ -n "$loc" ] || return 1
+                current="$loc"
+                hop=$((hop + 1))
+                ;;
+            *)
+                rm -f "$dest" "$hdr"
+                return 1
+                ;;
+        esac
+    done
+    return 1
+}
+
+safe_asset_name() {
+    name="$1"
+    case "$name" in
+        ""|*/*|*\\*|*" "*)
+            err "refusing asset name with unexpected characters: $name"
+            ;;
+    esac
+    case "$name" in
+        *[!A-Za-z0-9._-]*)
+            err "refusing asset name with unexpected characters: $name"
+            ;;
+    esac
+    printf '%s' "$name"
+}
+
+asset_url_for_name() {
+    name="$(safe_asset_name "$1")"
+    if is_fixed_github_api_url "$API_BASE"; then
+        printf 'https://github.com/%s/releases/download/%s/%s' "$REPO" "$TAG" "$name"
+        return 0
+    fi
+    origin_scheme="$(url_scheme "$API_BASE")"
+    origin_auth="$(url_authority "$API_BASE")"
+    printf '%s://%s/%s' "$origin_scheme" "$origin_auth" "$name"
+}
+
 if command -v curl >/dev/null 2>&1; then
     fetch_once() {
-        if [ -n "$AUTH_HDR" ] && is_fixed_github_api_url "$1"; then
-            curl -fsSL -H "$AUTH_HDR" -o "$2" "$1"
-        else
-            curl -fsSL -o "$2" "$1"
+        url="$1"
+        dest="$2"
+        require_allowed_url "$url"
+        if is_loopback_http_url "$url"; then
+            if [ -n "$AUTH_HDR" ] && is_fixed_github_api_url "$url"; then
+                if ! curl -fsS --max-redirs 0 -H "$AUTH_HDR" -o "$dest" "$url"; then
+                    return 1
+                fi
+            else
+                if ! curl -fsS --max-redirs 0 -o "$dest" "$url"; then
+                    return 1
+                fi
+            fi
+            return 0
         fi
-    }
-    fetch_stdout_once() {
-        if [ -n "$AUTH_HDR" ] && is_fixed_github_api_url "$1"; then
-            curl -fsSL -H "$AUTH_HDR" "$1"
-        else
-            curl -fsSL "$1"
+        if allows_github_cdn_redirects "$url"; then
+            if curl_fetch_pinned_redirects "$url" "$dest"; then
+                return 0
+            fi
+            return 1
         fi
+        if ! curl -fsSL --proto '=https' --proto-redir '=https' --max-redirs 0 \
+            -o "$dest" "$url"; then
+            rm -f "$dest"
+            return 1
+        fi
+        return 0
     }
 elif command -v wget >/dev/null 2>&1; then
     fetch_once() {
-        if [ -n "$AUTH_HDR" ] && is_fixed_github_api_url "$1"; then
-            wget -q --header="$AUTH_HDR" -O "$2" "$1"
-        else
-            wget -q -O "$2" "$1"
+        url="$1"
+        dest="$2"
+        require_allowed_url "$url"
+        if is_loopback_http_url "$url"; then
+            if [ -n "$AUTH_HDR" ] && is_fixed_github_api_url "$url"; then
+                wget -q --max-redirect=0 --header="$AUTH_HDR" -O "$dest" "$url"
+            else
+                wget -q --max-redirect=0 -O "$dest" "$url"
+            fi
+            return $?
         fi
-    }
-    fetch_stdout_once() {
-        if [ -n "$AUTH_HDR" ] && is_fixed_github_api_url "$1"; then
-            wget -q --header="$AUTH_HDR" -O - "$1"
-        else
-            wget -q -O - "$1"
-        fi
+        pinned_origin="$url"
+        current="$url"
+        hop=0
+        while [ "$hop" -le 5 ]; do
+            require_allowed_url "$current"
+            require_effective_url "$pinned_origin" "$current"
+            hdr="$TMP_DIR/wget-headers.$$"
+            rm -f "$dest"
+            if [ -n "$AUTH_HDR" ] && is_fixed_github_api_url "$current"; then
+                if wget --https-only --max-redirect=0 --server-response \
+                    --header="$AUTH_HDR" -O "$dest" "$current" 2>"$hdr"; then
+                    rm -f "$hdr"
+                    return 0
+                fi
+            else
+                if wget --https-only --max-redirect=0 --server-response \
+                    -O "$dest" "$current" 2>"$hdr"; then
+                    rm -f "$hdr"
+                    return 0
+                fi
+            fi
+            loc="$(http_redirect_location "$hdr")" || loc=""
+            rm -f "$hdr" "$dest"
+            [ -n "$loc" ] || return 1
+            current="$loc"
+            hop=$((hop + 1))
+        done
+        return 1
     }
 else
     err "neither curl nor wget found"
 fi
 
 fetch() {
+    require_allowed_url "$1"
     attempt=1
     while ! fetch_once "$1" "$2"; do
         [ "$attempt" -lt 3 ] || return 1
@@ -175,14 +427,17 @@ fetch() {
 }
 
 fetch_stdout() {
+    require_allowed_url "$1"
+    meta="$TMP_DIR/release-meta.$$"
     attempt=1
-    while ! response="$(fetch_stdout_once "$1")"; do
+    while ! fetch_once "$1" "$meta"; do
         [ "$attempt" -lt 3 ] || return 1
         attempt=$((attempt + 1))
         printf 'Request attempt failed; retrying (%s/3)...\n' "$attempt" >&2
         sleep 1 || return 1
     done
-    printf '%s' "$response"
+    cat "$meta"
+    rm -f "$meta"
 }
 
 # ── SHA-256 tool ─────────────────────────────────────────────────────────────
@@ -232,11 +487,13 @@ trap cleanup EXIT
 trap 'cleanup; exit 1' HUP INT TERM
 
 # ── Resolve the release ──────────────────────────────────────────────────────
+require_allowed_url "$API_BASE"
 if [ -n "$VERSION" ]; then
     RELEASE_URL="$API_BASE/tags/v$VERSION"
 else
     RELEASE_URL="$API_BASE/latest"
 fi
+require_allowed_url "$RELEASE_URL"
 printf 'Resolving release from %s\n' "$RELEASE_URL"
 RELEASE_JSON="$(fetch_stdout "$RELEASE_URL")" \
     || err "could not fetch release metadata from $RELEASE_URL
@@ -267,9 +524,8 @@ URLS="$(printf '%s' "$RELEASE_JSON" \
 "browser_download_url"/g' \
     | sed -n 's/^[[:space:]]*"browser_download_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
 
-find_asset_url() {
+release_lists_asset() {
     suffix="$1"
-    found=""
     count=0
     for u in $URLS; do
         case "$u" in
@@ -277,25 +533,24 @@ find_asset_url() {
                 if [ "$count" -ne 0 ]; then
                     err "release $TAG contains duplicate $suffix assets"
                 fi
-                found="$u"
                 count=1
                 ;;
         esac
     done
-    if [ "$count" -ne 1 ]; then
-        return 1
-    fi
-    printf '%s\n' "$found"
+    [ "$count" -eq 1 ]
 }
 
-if ! SUMS_URL="$(find_asset_url "SHA256SUMS")"; then
+if ! release_lists_asset "SHA256SUMS"; then
     err "release $TAG must contain exactly one SHA256SUMS asset"
 fi
 
 ASSET="rpi-${RESOLVED_VERSION}-${TRIPLE}.tar.gz"
-if ! ARCHIVE_URL="$(find_asset_url "$ASSET")"; then
+if ! release_lists_asset "$ASSET"; then
     err "release $TAG does not contain asset $ASSET"
 fi
+
+SUMS_URL="$(asset_url_for_name "SHA256SUMS")"
+ARCHIVE_URL="$(asset_url_for_name "$ASSET")"
 
 # ── Download + verify ────────────────────────────────────────────────────────
 printf 'Downloading rpi v%s (%s)...\n' "$RESOLVED_VERSION" "$TRIPLE"
@@ -376,20 +631,20 @@ ensure_directory() {
     chmod 0700 "$path" || err "could not secure $label permissions: $path"
 }
 
-DOWNLOADS_DIR="$PI_HOME/downloads"
-BIN_DIR="$PI_HOME/bin"
-STATE_FILE="$PI_HOME/update-state.json"
-ensure_directory "$PI_HOME" "rpi install root"
+DOWNLOADS_DIR="$RPI_HOME/downloads"
+BIN_DIR="$RPI_HOME/bin"
+STATE_FILE="$RPI_HOME/update-state.json"
+ensure_directory "$RPI_HOME" "rpi install root"
 ensure_directory "$DOWNLOADS_DIR" "rpi downloads directory"
 ensure_directory "$BIN_DIR" "rpi bin directory"
 
 # ── Serialize concurrent installs ─────────────────────────────────────────────
 # The content-addressed versioned path is shared by every install of the same
 # release, so two concurrent installs of the same release would race on DEST
-# and the active symlink. Hold an exclusive lock over PI_HOME for the whole
+# and the active symlink. Hold an exclusive lock over RPI_HOME for the whole
 # transaction. The portable PID lock reaps dead/corrupt owners, but never waits
 # more than 30 seconds for a live owner, matching the self-updater deadline.
-LOCKFILE="$PI_HOME/.install.lock"
+LOCKFILE="$RPI_HOME/.install.lock"
 LOCK_WAIT_SECONDS=30
 [ ! -L "$LOCKFILE" ] || err "refusing to use a symlinked install lock: $LOCKFILE"
 LOCK_HELD=0
@@ -471,22 +726,23 @@ fi
 
 # The archive digest is part of the deployment identity. A deliberately
 # republished tag therefore gets a new path and cannot overwrite the active
-# same-semver binary before its smoke test succeeds.
+# same-semver binary before its identity check succeeds.
 VERSIONED="rpi-${RESOLVED_VERSION}-${PLATFORM_OS}-${PLATFORM_ARCH}-sha256-${EXPECTED}"
 DEST="$DOWNLOADS_DIR/$VERSIONED"
 STAGED="$(mktemp "$DOWNLOADS_DIR/.rpi-stage.XXXXXX")" \
     || err "could not create a staged binary under $DOWNLOADS_DIR"
 cp "$TMP_DIR/rpi" "$STAGED" || err "could not stage downloaded rpi"
 chmod 0755 "$STAGED"
-# Capture and verify the candidate identity before touching the active binary
-# or updater state. A checksum-valid archive with the wrong executable must
-# fail closed even when its `--version` command exits successfully.
-if ! CANDIDATE_VERSION_OUTPUT="$("$STAGED" --version 2>/dev/null)"; then
-    err "downloaded binary failed smoke test; existing install left untouched"
-fi
+# Identity is read from already-checksummed bytes; the candidate is never executed.
+# Release-dist LTO does not store clap's runtime "rpi $VERSION" line as one C string.
 EXPECTED_VERSION_OUTPUT="rpi $RESOLVED_VERSION"
-[ "$CANDIDATE_VERSION_OUTPUT" = "$EXPECTED_VERSION_OUTPUT" ] \
-    || err "downloaded binary reported unexpected identity/version (expected '$EXPECTED_VERSION_OUTPUT'); existing install left untouched"
+if tr '\000' '\n' < "$STAGED" | grep -F -q -- "$EXPECTED_VERSION_OUTPUT"; then
+    :
+elif tr '\000' '\n' < "$STAGED" | grep -F -q -- "rpi$RESOLVED_VERSION"; then
+    :
+else
+    err "downloaded binary reported unexpected identity/version (expected '$EXPECTED_VERSION_OUTPUT'); existing install left untouched"
+fi
 
 TMP_LINK="$BIN_DIR/rpi.install.$$"
 [ ! -e "$TMP_LINK" ] && [ ! -L "$TMP_LINK" ] \
@@ -647,9 +903,9 @@ if [ -d "$STATE_FILE" ]; then
     fail_after_rollback "update-state path is a directory: $STATE_FILE"
 fi
 
-if ! STATE_TMP="$(mktemp "$PI_HOME/.update-state.XXXXXX")"; then
+if ! STATE_TMP="$(mktemp "$RPI_HOME/.update-state.XXXXXX")"; then
     STATE_TMP=""
-    fail_after_rollback "could not create temporary update state under $PI_HOME"
+    fail_after_rollback "could not create temporary update state under $RPI_HOME"
 fi
 
 if ! CHECKED_AT="$(date -u +%s)"; then

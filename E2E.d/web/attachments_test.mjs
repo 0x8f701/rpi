@@ -50,6 +50,12 @@
 //     provider turn), and the user bubble renders a bounded/collapsed
 //     preview — no full 1 MiB user content ever reaches the DOM, including
 //     after the backend's user message_start reconciles the bubble.
+//   - A <=2 MiB wide JPEG succeeds through the real browser decode/canvas
+//     path and is resized to a <=2000px longest edge before sending.
+//   - Truncated or MIME/signature-mismatched large photos, a 0-byte/headerless
+//     PNG, a tiny IHDR >16 Mi-pixel PNG, large GIF/WebP, and >20 MiB raw input
+//     fail visibly without chips; the existing >2 MiB code rejection remains unchanged.
+
 
 import { chromium } from 'playwright';
 
@@ -119,6 +125,17 @@ async function readChips(page) {
   );
 }
 
+// Host composer (App.tsx onPaste / Ctrl+V) arms COMPOSER_PASTE_ENTER_GUARD_MS
+// (250) so Chromium-synthesized Enters cannot submit. Intentional test sends
+// after a clipboard paste wait past that window; the CRLF synthesized-Enter
+// regression stays in the same evaluate so it remains inside the guard.
+const PASTE_ENTER_GUARD_MS = 250;
+const PASTE_ENTER_GUARD_WAIT_MS = PASTE_ENTER_GUARD_MS + 50;
+
+async function waitPastPasteEnterGuard(page) {
+  await page.waitForTimeout(PASTE_ENTER_GUARD_WAIT_MS);
+}
+
 async function main() {
   if (!url) fail('RPI_URL is required');
   const launchOptions = chromePath ? { executablePath: chromePath } : {};
@@ -144,18 +161,27 @@ async function main() {
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await waitFor(page, () => document.title === 'rpi web', 'page title missing');
-    await waitFor(page, () => document.getElementById('conn-state') !== null, 'conn-state missing');
     await waitFor(
       page,
-      () => document.getElementById('conn-state').dataset.state === 'on',
+      () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true,
       'WS did not reach "connected"'
     );
 
     // The composer surface must exist: #prompt-input textarea, #attach-btn,
-    // and the hidden file input.
+    // and the hidden file input. Glyph-only attach/mic buttons must expose
+    // a stable accessible name (emoji textContent is not a name).
     if (!await page.locator('#prompt-input').count()) fail('#prompt-input not found');
     if (!await page.locator('#attach-btn').count()) fail('#attach-btn not found');
+    if (!await page.locator('#mic-btn').count()) fail('#mic-btn not found');
     if (!await page.locator('input[type=file]').count()) fail('hidden input[type=file] not found');
+    const attachName = await page.getAttribute('#attach-btn', 'aria-label');
+    if (attachName !== 'Attach files') {
+      fail(`#attach-btn aria-label must be "Attach files" (got "${attachName}")`);
+    }
+    const micName = await page.getAttribute('#mic-btn', 'aria-label');
+    if (micName !== 'Microphone') {
+      fail(`#mic-btn aria-label must be "Microphone" (got "${micName}")`);
+    }
 
     // ------------------------------------------------------------------
     // Paste image via real ClipboardEvent/DataTransfer with a valid tiny
@@ -212,9 +238,12 @@ async function main() {
     }
     await page.screenshot({ path: `${evidence}/paste.png`, fullPage: true });
 
-    // Small text remains a native textarea paste. Large text is intercepted
-    // before the browser inserts/layouts it and becomes a bounded text chip.
+    // Small single-line text remains a native textarea paste. A small
+    // two-line paste is intercepted as a text attachment, and a synthesized
+    // Enter in the same paste window must not submit a prompt.
     const textPasteResult = await page.evaluate(() => {
+      const input = document.getElementById('prompt-input');
+      const before = input.value;
       const dt = new DataTransfer();
       dt.setData('text/plain', 'hello plain text');
       const event = new ClipboardEvent('paste', {
@@ -222,16 +251,68 @@ async function main() {
         bubbles: true,
         cancelable: true,
       });
-      document.getElementById('prompt-input').dispatchEvent(event);
-      return { defaultPrevented: event.defaultPrevented };
+      input.dispatchEvent(event);
+      return { defaultPrevented: event.defaultPrevented, valueUnchanged: input.value === before };
     });
     if (textPasteResult.defaultPrevented) {
-      fail('small text paste was canceled — native textarea paste must remain available');
+      fail('small single-line text paste was canceled — native textarea paste must remain available');
     }
-    if ((await readChips(page)).length !== 1) {
-      fail('small text paste changed the attachment list');
+    if (!textPasteResult.valueUnchanged || (await readChips(page)).length !== 1) {
+      fail('small single-line text paste changed the attachment list or synthetic textarea value');
     }
 
+    const multilineFramesBefore = sentFrames.length;
+    const multilinePasteResult = await page.evaluate(() => {
+      const input = document.getElementById('prompt-input');
+      const text = Array.from({ length: 32 }, (_, index) => `pasted line ${index}`).join('\r\n');
+      const dt = new DataTransfer();
+      dt.setData('text/plain', text);
+      const paste = new ClipboardEvent('paste', {
+        clipboardData: dt,
+        bubbles: true,
+        cancelable: true,
+      });
+      input.dispatchEvent(paste);
+      const enter = new KeyboardEvent('keydown', {
+        key: 'Enter',
+        code: 'Enter',
+        bubbles: true,
+        cancelable: true,
+      });
+      input.dispatchEvent(enter);
+      return {
+        defaultPrevented: paste.defaultPrevented,
+        enterPrevented: enter.defaultPrevented,
+        valueLength: input.value.length,
+      };
+    });
+    if (!multilinePasteResult.defaultPrevented || !multilinePasteResult.enterPrevented) {
+      fail(`multiline paste/Enter guard did not cancel both events: ${JSON.stringify(multilinePasteResult)}`);
+    }
+    if (multilinePasteResult.valueLength !== 0) {
+      fail(`multiline paste reached textarea value (${multilinePasteResult.valueLength} chars)`);
+    }
+    await waitFor(
+      page,
+      () => document.querySelectorAll('.composer-attachment').length === 2,
+      '32-line paste did not create a text attachment chip'
+    );
+    await waitPastPasteEnterGuard(page);
+    if (sentFrames.slice(multilineFramesBefore).some((raw) => {
+      try { return JSON.parse(raw)?.type === 'prompt'; } catch { return false; }
+    })) {
+      fail('synthesized Enter during paste guard submitted a prompt');
+    }
+    const multilineChip = (await readChips(page))[1];
+    if (!multilineChip || multilineChip.name !== 'pasted-text.txt' || multilineChip.isImage) {
+      fail(`32-line paste chip wrong: ${JSON.stringify(multilineChip)}`);
+    }
+    await page.click('.composer-attachment[title="pasted-text.txt"] .composer-attachment__remove');
+    await waitFor(
+      page,
+      () => document.querySelectorAll('.composer-attachment').length === 1,
+      '32-line paste chip did not remove after guard proof'
+    );
     // The 1 MiB large-text paste journey (dispatch latency, full wire
     // payload, bounded DOM, ACK chip cleanup) runs as its own self-contained
     // section AFTER the multi-image + markdown sends, so the queue-state and
@@ -340,37 +421,36 @@ async function main() {
     }
 
     // ------------------------------------------------------------------
-    // PDF picker yields a visible error toast and NO chip. PDFs are
-    // unsupported (no content wire, no Web-side text extraction) and are
-    // rejected at intake with a specific toast summary.
+    // Malformed PDFs reach authenticated extraction and remain as error chips.
     // ------------------------------------------------------------------
     const chipCountBeforePdf = await page.evaluate(() => document.querySelectorAll('.composer-attachment').length);
     await page.setInputFiles('input[type=file]', [
       { name: PDF_NAME, mimeType: 'application/pdf', buffer: Buffer.from('%PDF-1.4\n%not a real pdf\n') },
     ]);
-    // The error toast must appear with the PDF name and "unsupported".
+    // Extraction failure must remain visible until explicitly removed.
     await waitFor(
       page,
       (pdf) => {
-        const toasts = Array.from(document.querySelectorAll('.toast--error'));
-        return toasts.some((t) => t.textContent.includes(pdf) && t.textContent.includes('unsupported'));
+        return [...document.querySelectorAll('.composer-attachment--error')].some((chip) =>
+          chip.getAttribute('title') === pdf && chip.querySelector('[data-state="error"]') !== null);
       },
-      `PDF picker: error toast with "${PDF_NAME}" and "unsupported" did not appear`,
+      `PDF picker: failed extraction chip for "${PDF_NAME}" did not appear`,
       15000,
       PDF_NAME
     );
     await page.screenshot({ path: `${evidence}/reject.png`, fullPage: true });
-    // No new chip should have appeared (PDF was rejected).
     const chipCountAfterPdf = await page.evaluate(() => document.querySelectorAll('.composer-attachment').length);
-    if (chipCountAfterPdf !== chipCountBeforePdf) {
-      fail(`PDF picker: chip count changed from ${chipCountBeforePdf} to ${chipCountAfterPdf} — rejected PDF should not create a chip`);
+    if (chipCountAfterPdf !== chipCountBeforePdf + 1) {
+      fail('PDF picker: failed extraction did not retain exactly one error chip');
     }
+    await page.click(`.composer-attachment[title="${PDF_NAME}"] .composer-attachment__remove`);
 
     // ------------------------------------------------------------------
     // Send dispatches a prompt RPC — observe the outgoing WS frame.
     // Provider success is NOT required; only that the composer dispatch
     // sends the prompt with the right images + message (deterministic).
-    // ------------------------------------------------------------------
+    // Last clipboard paste was the CRLF guard proof above; the post-guard wait
+    // plus picker/drop/PDF work already put this Enter outside the window.
     await page.fill('#prompt-input', USER_MESSAGE);
     const sendBefore = sentFrames.length;
     await page.press('#prompt-input', 'Enter');
@@ -568,6 +648,15 @@ async function main() {
       fail(`count cap: 9th file should be rejected (chips ${chipsAfterTooMany}, expected 8)`);
     }
     // Remove one chip (the budget-a.rs chip) via its Remove button.
+    await page.setViewportSize({ width: 320, height: 844 });
+    const removeTarget = await page.locator('.composer-attachment .composer-attachment__remove').first().boundingBox();
+    if (!removeTarget || removeTarget.width < 44 || removeTarget.height < 44) {
+      fail(`remove chip: mobile touch target is ${removeTarget?.width ?? -1}x${removeTarget?.height ?? -1}px`);
+    }
+    await page.setViewportSize({ width: 1280, height: 800 });
+    if (await page.locator('.app-layout.app-layout--drawer-open').count()) {
+      await page.click('#sidebar-toggle-btn');
+    }
     await page.click('.composer-attachment .composer-attachment__remove');
     await waitFor(
       page,
@@ -762,6 +851,7 @@ async function main() {
       () => document.querySelectorAll('.composer-attachment').length === 2,
       'image-only send: 2 image chips did not appear after multi-image paste'
     );
+    await waitPastPasteEnterGuard(page);
     await page.press('#prompt-input', 'Enter');
 
     // Both thumbnails render in the new (image-only) bubble; total user
@@ -832,7 +922,7 @@ async function main() {
     await waitFor(page, () => document.title === 'rpi web', 'page title missing after reload');
     await waitFor(
       page,
-      () => document.getElementById('conn-state')?.dataset.state === 'on',
+      () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true,
       'WS did not reconnect after reload'
     );
     await waitFor(
@@ -936,6 +1026,7 @@ async function main() {
       }
     };
 
+    // Reload reconstructed the page (guard ref is 0); fill is not a paste.
     await page.fill('#prompt-input', USER_MARKDOWN);
     await page.press('#prompt-input', 'Enter');
     await waitFor(
@@ -978,7 +1069,7 @@ async function main() {
     await waitFor(page, () => document.title === 'rpi web', 'page title missing after markdown reload');
     await waitFor(
       page,
-      () => document.getElementById('conn-state')?.dataset.state === 'on',
+      () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true,
       'WS did not reconnect after markdown reload'
     );
     await waitFor(
@@ -1060,6 +1151,7 @@ async function main() {
     // fenced text attachment shape), the textarea stays empty, and the chip
     // clears on the ACK — not after the provider turn.
     const largeSendBefore = sentFrames.length;
+    await waitPastPasteEnterGuard(page);
     await page.press('#prompt-input', 'Enter');
     let largeFrame = null;
     const largeDeadline = Date.now() + 15000;
@@ -1253,6 +1345,7 @@ async function main() {
       },
       'sanitize: control-char-named file never queued as a chip'
     );
+    // Picker intake is not a paste; this Enter is outside the guard window.
     await page.fill('#prompt-input', 'final branch send');
     const sendBeforeFinal = sentFrames.length;
     await page.press('#prompt-input', 'Enter');
@@ -1299,16 +1392,26 @@ async function main() {
     );
     await page.screenshot({ path: `${evidence}/sanitize-wire.png`, fullPage: true });
 
+    // ACK cleanup can clear the chips before request 5 emits turn_started.
+    // Wait for its actual slow completion marker, not a transient idle gate,
+    // before the edge batch; otherwise Enter can correctly route as `steer`.
+    await waitFor(
+      page,
+      () => document.body.textContent.includes('steer-5-ing stream chunk-four-done')
+        && document.getElementById('send-btn')?.getAttribute('aria-label') === 'Send message',
+      'sanitize: final prompt did not complete before the edge matrix',
+      30000
+    );
+
     // ------------------------------------------------------------------
-    // Edge-case intake matrix (coverage journeys, disjoint block): empty
-    // 0-byte image (base64Length zero branch), type-less .jpg extension-MIME
-    // fallback, empty-type text file (mimeType 'text/plain' fallback), a
-    // 200-char filename (sanitize truncation to 128 in the File: header), an
-    // EMPTY filename (sanitize 'file' fallback), and an extension-less
-    // basename (extOf no-dot branch + language-less fence). All queue in ONE
-    // batch (6 chips: 2 images + 4 code), then a single send proves the wire
-    // (2 image blocks in paste order incl. the empty data + the jpeg MIME
-    // fallback; every code File: header incl. truncation/fallback shapes).
+    // Edge-case intake matrix (coverage journeys, disjoint block): type-less
+    // .jpg extension-MIME fallback, empty-type text file (mimeType
+    // 'text/plain' fallback), a 200-char filename (sanitize truncation to 128
+    // in the File: header), an EMPTY filename (sanitize 'file' fallback), and
+    // an extension-less basename (extOf no-dot branch + language-less fence).
+    // All queue in ONE batch (5 chips: 1 image + 4 code), then a single send
+    // proves the wire (1 JPEG image block plus every code File: header incl.
+    // truncation/fallback shapes).
     // The block starts by clearing any leftover chips and waits for the
     // previous stream before dispatching, so it never assumes mid-flow chip
     // counts from earlier sections.
@@ -1328,9 +1431,7 @@ async function main() {
     const LONG_NAME = `${'x'.repeat(200)}.rs`;
     await page.evaluate((longName) => {
       const dt = new DataTransfer();
-      // 1. Empty 0-byte PNG (base64Length(0) classify branch).
-      dt.items.add(new File([], 'empty.png', { type: 'image/png' }));
-      // 2. Type-less .jpg (extension-based imageMimeType jpeg branch).
+      // 1. Type-less .jpg (extension-based imageMimeType jpeg branch).
       const canvas = document.createElement('canvas');
       canvas.width = 1;
       canvas.height = 1;
@@ -1342,13 +1443,13 @@ async function main() {
       const jpegBytes = new Uint8Array(jpegBin.length);
       for (let i = 0; i < jpegBin.length; i++) jpegBytes[i] = jpegBin.charCodeAt(i);
       dt.items.add(new File([jpegBytes], 'shot.jpg', { type: '' }));
-      // 3. Empty-type text file (code mimeType 'text/plain' fallback).
+      // 2. Empty-type text file (code mimeType 'text/plain' fallback).
       dt.items.add(new File(['plain content'], 'note.txt', { type: '' }));
-      // 4. Over-long filename (sanitize truncation to MAX_FILENAME_LEN).
+      // 3. Over-long filename (sanitize truncation to MAX_FILENAME_LEN).
       dt.items.add(new File(['long name body'], longName, { type: 'text/plain' }));
-      // 5. Empty filename (sanitize 'file' fallback).
+      // 4. Empty filename (sanitize 'file' fallback).
       dt.items.add(new File(['nameless body'], '', { type: 'text/plain' }));
-      // 6. Extension-less basename (extOf no-dot + language-less fence).
+      // 5. Extension-less basename (extOf no-dot + language-less fence).
       dt.items.add(new File(['LICENSE body'], 'LICENSE', { type: 'text/plain' }));
       document.getElementById('prompt-input').dispatchEvent(
         new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true })
@@ -1356,17 +1457,13 @@ async function main() {
     }, LONG_NAME);
     await waitFor(
       page,
-      () => document.querySelectorAll('.composer-attachment').length === 6,
-      'edge matrix: 6-chip edge batch never fully queued (2 images + 4 code)'
+      () => document.querySelectorAll('.composer-attachment').length === 5,
+      'edge matrix: 5-chip edge batch never fully queued (1 image + 4 code)'
     );
     const edgeChips = await readChips(page);
     const edgeNames = edgeChips.map((c) => c.name);
-    if (!edgeNames.includes('empty.png') || !edgeNames.includes('shot.jpg')) {
-      fail(`edge matrix: image chips missing (got ${JSON.stringify(edgeNames)})`);
-    }
-    const emptyPngChip = edgeChips.find((c) => c.name === 'empty.png');
-    if (!emptyPngChip || !emptyPngChip.isImage) {
-      fail('edge matrix: the 0-byte empty.png must queue as an image chip');
+    if (!edgeNames.includes('shot.jpg')) {
+      fail(`edge matrix: image chip missing (got ${JSON.stringify(edgeNames)})`);
     }
     const jpgChip = edgeChips.find((c) => c.name === 'shot.jpg');
     if (!jpgChip || !jpgChip.isImage) {
@@ -1396,15 +1493,15 @@ async function main() {
     // so Enter dispatches a NEW prompt (never a steer).
     await waitFor(
       page,
-      () => {
-        const badge = document.getElementById('stream-badge');
-        return !badge || badge.hidden === true;
-      },
+      // Production idle gate (App.tsx): the unified action reads Send only
+      // when no run is in flight; a missing element fails the gate.
+      () => document.getElementById('send-btn')?.getAttribute('aria-label') === 'Send message',
       'edge matrix: previous stream never cleared before the batch send',
       30000
     );
     await page.fill('#prompt-input', 'edge cases batch');
     const edgeSendBefore = sentFrames.length;
+    await waitPastPasteEnterGuard(page);
     await page.press('#prompt-input', 'Enter');
     let edgeFrame = null;
     const edgeDeadline = Date.now() + 15000;
@@ -1427,16 +1524,12 @@ async function main() {
     if (!edgeFrame) {
       fail(`edge matrix: batch prompt RPC not observed (sent ${sentFrames.length - edgeSendBefore} frames after submit; last=${sentFrames.slice(-3).join(' | ') || 'none'})`);
     }
-    if (!Array.isArray(edgeFrame.images) || edgeFrame.images.length !== 2) {
-      fail(`edge matrix: batch must carry exactly 2 image blocks (got ${JSON.stringify(edgeFrame.images)})`);
+    if (!Array.isArray(edgeFrame.images) || edgeFrame.images.length !== 1) {
+      fail(`edge matrix: batch must carry exactly 1 image block (got ${JSON.stringify(edgeFrame.images)})`);
     }
     const edgeImg0 = edgeFrame.images[0];
-    if (edgeImg0.mimeType !== 'image/png' || edgeImg0.data !== '') {
-      fail(`edge matrix: empty.png must ride as an image/png block with EMPTY data (got ${JSON.stringify(edgeImg0)})`);
-    }
-    const edgeImg1 = edgeFrame.images[1];
-    if (edgeImg1.mimeType !== 'image/jpeg' || typeof edgeImg1.data !== 'string' || edgeImg1.data.length === 0) {
-      fail(`edge matrix: type-less shot.jpg must ride as image/jpeg via the extension fallback (got ${JSON.stringify({ mime: edgeImg1.mimeType, len: edgeImg1.data?.length })})`);
+    if (edgeImg0.mimeType !== 'image/jpeg' || typeof edgeImg0.data !== 'string' || edgeImg0.data.length === 0) {
+      fail(`edge matrix: type-less shot.jpg must ride as image/jpeg via the extension fallback (got ${JSON.stringify({ mime: edgeImg0.mimeType, len: edgeImg0.data?.length })})`);
     }
     const edgeMsg = typeof edgeFrame.message === 'string' ? edgeFrame.message : '';
     if (!edgeMsg.includes('File: note.txt\n```text\nplain content')) {
@@ -1462,13 +1555,11 @@ async function main() {
     );
     await page.screenshot({ path: `${evidence}/edge-matrix-wire.png`, fullPage: true });
 
-    // Three PDFs in ONE batch: every rejection shares the 'unsupported'
-    // reason, so the grouped skip summary must use the 3+ sample form
-    // ("a.pdf, b.pdf +1 more") — never two separate toasts.
+    // Unsupported binaries share one grouped rejection summary.
     await page.setInputFiles('input[type=file]', [
-      { name: 'a.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-1.4 a\n') },
-      { name: 'b.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-1.4 b\n') },
-      { name: 'c.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-1.4 c\n') },
+      { name: 'a.bin', mimeType: 'application/octet-stream', buffer: Buffer.from([0, 1, 2]) },
+      { name: 'b.bin', mimeType: 'application/octet-stream', buffer: Buffer.from([0, 1, 2]) },
+      { name: 'c.bin', mimeType: 'application/octet-stream', buffer: Buffer.from([0, 1, 2]) },
     ]);
     await waitFor(
       page,
@@ -1478,19 +1569,329 @@ async function main() {
           (t) =>
             (t.textContent || '').includes('Skipped 3 file(s)') &&
             (t.textContent || '').includes('3 unsupported') &&
-            (t.textContent || '').includes('a.pdf, b.pdf +1 more')
+            (t.textContent || '').includes('a.bin, b.bin +1 more')
         );
       },
-      'edge matrix: 3-PDF batch never produced the grouped "+1 more" skip toast',
+      'edge matrix: binary batch never produced the grouped "+1 more" skip toast',
       15000
     );
-    const chipsAfterPdfs = await page.evaluate(() => document.querySelectorAll('.composer-attachment').length);
-    if (chipsAfterPdfs !== 0) {
-      fail(`edge matrix: 3-PDF batch created ${chipsAfterPdfs} chips (expected 0)`);
+    const chipsAfterBinaries = await page.evaluate(() => document.querySelectorAll('.composer-attachment').length);
+    if (chipsAfterBinaries !== 0) {
+      fail(`edge matrix: binary batch created ${chipsAfterBinaries} chips (expected 0)`);
     }
-    await page.screenshot({ path: `${evidence}/edge-matrix-pdf-group.png`, fullPage: true });
+    await page.screenshot({ path: `${evidence}/edge-matrix-binary-group.png`, fullPage: true });
 
-    console.log('web-attachments: PASSED (paste image canceled + chip; text-only paste not canceled; picker 2 code files RS/TS; drop 2 code files + drop-active highlight; chips preserve global intake order; PDF rejection toast + no chip; outgoing prompt frame: 1 image block + code files in order + no PDF; attachments cleared after dispatch; user bubble renders the image thumbnail inline with text — no "(image attached)"; image-only multi-image send renders 2 distinct thumbnails with no text; mobile viewport has no horizontal overflow with the multi-image grid; reload restores both user bubbles with their thumbnails; user-caption Markdown (heading/list/bold/inline code/fence/hostile) renders structurally with no pre wrapper and hostile HTML inert — images stay before the caption and reload still renders Markdown; rejection matrix (oversize/over-budget/too-many/invalid-UTF-8/remove/extension-fallback); codeLanguage switch matrix + basenames/app-type fallbacks; sanitizeFileName + safeFence wire contract)');
+    // Bounded photo pipeline. Late failures are visible and queue no chips;
+    // valid JPEGs preprocess when their raw bytes exceed 2 MiB OR their parsed
+    // longest edge exceeds 2000px, while following code retains intake order.
+    // ------------------------------------------------------------------
+    const pasteSyntheticImage = async ({ name, mimeType, prefix, size }) => page.evaluate(
+      ({ fileName, type, start, totalSize }) => {
+        const dt = new DataTransfer();
+        dt.items.add(new File(
+          [new Uint8Array(start), new ArrayBuffer(totalSize - start.length)],
+          fileName,
+          { type },
+        ));
+        document.getElementById('prompt-input').dispatchEvent(
+          new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true })
+        );
+      },
+      { fileName: name, type: mimeType, start: prefix, totalSize: size }
+    );
+    const waitForImageFailure = async (name, label) => {
+      await waitFor(
+        page,
+        (fileName) => Array.from(document.querySelectorAll('.toast--error')).some(
+          (toast) => (toast.textContent || '').includes(fileName) &&
+            (toast.textContent || '').includes('image could not be decoded or resized safely')
+        ),
+        label,
+        20000,
+        name,
+      );
+      if (await page.locator('.composer-attachment').count()) {
+        fail(`${label}: rejected image created an attachment chip`);
+      }
+    };
+
+    const LARGE_INVALID_BYTES = 2 * 1024 * 1024 + 1;
+    await pasteSyntheticImage({
+      name: 'truncated-camera.jpg',
+      mimeType: 'image/jpeg',
+      prefix: [0xff, 0xd8, 0xff, 0xe1, 0xff, 0xff],
+      size: LARGE_INVALID_BYTES,
+    });
+    await waitForImageFailure('truncated-camera.jpg', 'large photo: truncated JPEG rejection not surfaced');
+
+    await pasteSyntheticImage({
+      name: 'jpeg-mime-png-signature.jpg',
+      mimeType: 'image/jpeg',
+      prefix: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a],
+      size: LARGE_INVALID_BYTES,
+    });
+    await waitForImageFailure('jpeg-mime-png-signature.jpg', 'large photo: MIME/signature mismatch not surfaced');
+
+    await pasteSyntheticImage({
+      name: 'headerless-empty.png',
+      mimeType: 'image/png',
+      prefix: [],
+      size: 0,
+    });
+    await waitForImageFailure('headerless-empty.png', 'all-size header: 0-byte headerless PNG rejection not surfaced');
+
+    await pasteSyntheticImage({
+      name: 'tiny-pixel-bomb.png',
+      mimeType: 'image/png',
+      prefix: [
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+        0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+        0x00, 0x00, 0x13, 0x88, // width 5000
+        0x00, 0x00, 0x13, 0x88, // height 5000 (>16 Mi pixels)
+      ],
+      size: 100 * 1024,
+    });
+    await waitForImageFailure('tiny-pixel-bomb.png', 'all-size header: tiny IHDR pixel bomb rejection not surfaced');
+
+    await pasteSyntheticImage({
+      name: 'large-animation.gif',
+      mimeType: 'image/gif',
+      prefix: [0x47, 0x49, 0x46, 0x38, 0x39, 0x61],
+      size: LARGE_INVALID_BYTES,
+    });
+    await waitForImageFailure('large-animation.gif', 'large photo: GIF rejection not surfaced');
+
+    await pasteSyntheticImage({
+      name: 'large-animation.webp',
+      mimeType: 'image/webp',
+      prefix: [0x52, 0x49, 0x46, 0x46, 0x00, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50],
+      size: LARGE_INVALID_BYTES,
+    });
+    await waitForImageFailure('large-animation.webp', 'large photo: WebP rejection not surfaced');
+
+    await pasteSyntheticImage({
+      name: 'raw-over-ceiling.jpg',
+      mimeType: 'image/jpeg',
+      prefix: [0xff, 0xd8],
+      size: 20 * 1024 * 1024 + 1,
+    });
+    await waitFor(
+      page,
+      () => Array.from(document.querySelectorAll('.toast--error')).some(
+        (toast) => (toast.textContent || '').includes('raw-over-ceiling.jpg') &&
+          (toast.textContent || '').includes('image over 20 MiB input limit')
+      ),
+      'large photo: 20 MiB raw ceiling rejection not surfaced',
+      15000
+    );
+    if (await page.locator('.composer-attachment').count()) {
+      fail('large photo: raw-over-ceiling.jpg created an attachment chip');
+    }
+
+    const wideFixture = await page.evaluate(async () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = 2400;
+      canvas.height = 600;
+      const context = canvas.getContext('2d');
+      const gradient = context.createLinearGradient(0, 0, canvas.width, canvas.height);
+      gradient.addColorStop(0, '#123456');
+      gradient.addColorStop(1, '#abcdef');
+      context.fillStyle = gradient;
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.9));
+      if (!blob) return { size: 0, error: 'canvas JPEG encoding returned null' };
+      if (blob.size > 2 * 1024 * 1024) return { size: blob.size, error: 'fixture exceeded 2 MiB' };
+      const dt = new DataTransfer();
+      dt.items.add(new File([blob], 'wide-under-2mib.jpg', { type: 'image/jpeg' }));
+      document.getElementById('prompt-input').dispatchEvent(
+        new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true })
+      );
+      return { size: blob.size, error: '' };
+    });
+    if (wideFixture.error) {
+      fail(`all-size header fixture: ${wideFixture.error} (size=${wideFixture.size})`);
+    }
+    await waitFor(
+      page,
+      () => document.querySelectorAll('.composer-attachment').length === 1,
+      'all-size header: <=2 MiB wide JPEG did not preprocess into a chip',
+      30000
+    );
+    await waitFor(
+      page,
+      // Production idle gate (App.tsx): the unified action reads Send only
+      // when no run is in flight; a missing element fails the gate.
+      () => document.getElementById('send-btn')?.getAttribute('aria-label') === 'Send message',
+      'all-size header: previous stream never cleared before wide JPEG send',
+      30000
+    );
+    await page.fill('#prompt-input', 'wide image preprocessing');
+    const wideSendBefore = sentFrames.length;
+    await waitPastPasteEnterGuard(page);
+    await page.press('#prompt-input', 'Enter');
+    let wideFrame = null;
+    const wideDeadline = Date.now() + 15000;
+    while (Date.now() < wideDeadline) {
+      for (let i = wideSendBefore; i < sentFrames.length; i++) {
+        try {
+          const candidate = JSON.parse(sentFrames[i]);
+          if (candidate && candidate.type === 'prompt') {
+            wideFrame = candidate;
+            break;
+          }
+        } catch {
+          // Ignore non-JSON WebSocket frames.
+        }
+      }
+      if (wideFrame) break;
+      await page.waitForTimeout(100);
+    }
+    if (!wideFrame || !Array.isArray(wideFrame.images) || wideFrame.images.length !== 1) {
+      fail(`all-size header: wide JPEG prompt image missing (${JSON.stringify(wideFrame?.images)})`);
+    } else {
+      const wideDimensions = await page.evaluate(async ({ data, mimeType }) => {
+        const image = new Image();
+        image.src = `data:${mimeType};base64,${data}`;
+        await image.decode();
+        return { width: image.naturalWidth, height: image.naturalHeight };
+      }, wideFrame.images[0]);
+      if (Math.max(wideDimensions.width, wideDimensions.height) > 2000) {
+        fail(`all-size header: <=2 MiB wide JPEG was not resized to <=2000px (${JSON.stringify(wideDimensions)})`);
+      }
+    }
+    await waitFor(
+      page,
+      () => document.getElementById('composer-attachments') === null,
+      'all-size header: wide JPEG chip did not clear after send'
+    );
+
+    const cameraFixture = await page.evaluate(async () => {
+      const width = 3000;
+      const height = 3000;
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext('2d');
+      const image = context.createImageData(width, height);
+      let seed = 0x12345678;
+      for (let i = 0; i < image.data.length; i += 4) {
+        seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+        image.data[i] = seed & 0xff;
+        image.data[i + 1] = (seed >>> 8) & 0xff;
+        image.data[i + 2] = (seed >>> 16) & 0xff;
+        image.data[i + 3] = 0xff;
+      }
+      context.putImageData(image, 0, 0);
+      const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.95));
+      if (!blob) return { size: 0, error: 'canvas JPEG encoding returned null' };
+      if (blob.size <= 2 * 1024 * 1024) return { size: blob.size, error: 'fixture did not exceed 2 MiB' };
+      if (blob.size > 20 * 1024 * 1024) return { size: blob.size, error: 'fixture exceeded 20 MiB raw ceiling' };
+      const dt = new DataTransfer();
+      dt.items.add(new File([blob], 'camera-noise.jpg', { type: 'image/jpeg' }));
+      dt.items.add(new File(['export const afterCamera = true;'], 'after-camera.ts', { type: 'text/plain' }));
+      document.getElementById('prompt-input').dispatchEvent(
+        new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true })
+      );
+      return { size: blob.size, error: '' };
+    });
+    if (cameraFixture.error) {
+      fail(`large photo fixture: ${cameraFixture.error} (size=${cameraFixture.size})`);
+    }
+    await waitFor(
+      page,
+      () => document.querySelectorAll('.composer-attachment').length === 2,
+      'large photo: processed camera JPEG + following code chips did not settle',
+      30000
+    );
+    const cameraChips = await readChips(page);
+    if (cameraChips.map((chip) => chip.name).join(',') !== 'camera-noise.jpg,after-camera.ts') {
+      fail(`large photo: intake order changed while decode was in flight (${JSON.stringify(cameraChips)})`);
+    }
+    if (!cameraChips[0].isImage || cameraChips[1].badge !== 'TS') {
+      fail(`large photo: settled chip kinds are wrong (${JSON.stringify(cameraChips)})`);
+    }
+
+    await waitFor(
+      page,
+      // Production idle gate (App.tsx): the unified action reads Send only
+      // when no run is in flight; a missing element fails the gate.
+      () => document.getElementById('send-btn')?.getAttribute('aria-label') === 'Send message',
+      'large photo: previous stream never cleared before send',
+      30000
+    );
+    await page.fill('#prompt-input', 'camera preprocessing bounds');
+    const cameraSendBefore = sentFrames.length;
+    await waitPastPasteEnterGuard(page);
+    await page.press('#prompt-input', 'Enter');
+    let cameraFrame = null;
+    const cameraDeadline = Date.now() + 15000;
+    while (Date.now() < cameraDeadline) {
+      for (let i = cameraSendBefore; i < sentFrames.length; i++) {
+        try {
+          const candidate = JSON.parse(sentFrames[i]);
+          if (candidate && candidate.type === 'prompt') {
+            cameraFrame = candidate;
+            break;
+          }
+        } catch {
+          // Ignore non-JSON WebSocket frames.
+        }
+      }
+      if (cameraFrame) break;
+      await page.waitForTimeout(100);
+    }
+    if (!cameraFrame) fail('large photo: prompt RPC not observed');
+    if (!Array.isArray(cameraFrame.images) || cameraFrame.images.length !== 1) {
+      fail(`large photo: expected exactly one processed image block (${JSON.stringify(cameraFrame.images)})`);
+    }
+    const processed = cameraFrame.images[0];
+    if (processed.mimeType !== 'image/jpeg') {
+      fail(`large photo: output MIME must be image/jpeg (got ${processed.mimeType})`);
+    }
+    if (typeof processed.data !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(processed.data)) {
+      fail('large photo: output is not canonical non-empty base64');
+    }
+    const processedBytes = Buffer.from(processed.data, 'base64');
+    if (processedBytes.length === 0 || processedBytes.length > 2 * 1024 * 1024) {
+      fail(`large photo: processed JPEG raw size out of bounds (${processedBytes.length} bytes)`);
+    }
+    if (processed.data.length > Math.ceil((2 * 1024 * 1024) / 3) * 4) {
+      fail(`large photo: processed JPEG base64 exceeds 2 MiB bound (${processed.data.length} chars)`);
+    }
+    if (processedBytes[0] !== 0xff || processedBytes[1] !== 0xd8) {
+      fail('large photo: processed payload lacks JPEG signature');
+    }
+    if (processed.data.length >= Math.ceil(cameraFixture.size / 3) * 4) {
+      fail('large photo: raw camera bytes appear to have entered the prompt frame');
+    }
+    const cameraFrameBytes = Buffer.byteLength(JSON.stringify(cameraFrame));
+    if (cameraFrameBytes >= 4 * 1024 * 1024) {
+      fail(`large photo: serialized prompt frame exceeds 4 MiB (${cameraFrameBytes} bytes)`);
+    }
+    const processedDimensions = await page.evaluate(async ({ data, mimeType }) => {
+      const image = new Image();
+      image.src = `data:${mimeType};base64,${data}`;
+      await image.decode();
+      return { width: image.naturalWidth, height: image.naturalHeight };
+    }, processed);
+    if (Math.max(processedDimensions.width, processedDimensions.height) > 2000) {
+      fail(`large photo: processed longest edge exceeds 2000 (${JSON.stringify(processedDimensions)})`);
+    }
+    const cameraMessage = typeof cameraFrame.message === 'string' ? cameraFrame.message : '';
+    if (!cameraMessage.includes('File: after-camera.ts') || !cameraMessage.includes('export const afterCamera = true;')) {
+      fail('large photo: following code file was lost from the prompt message');
+    }
+    if (cameraMessage.indexOf('File: after-camera.ts') > cameraMessage.indexOf('camera preprocessing bounds')) {
+      fail('large photo: code/user message ordering changed');
+    }
+    await waitFor(
+      page,
+      () => document.getElementById('composer-attachments') === null,
+      'large photo: chips did not clear after send'
+    );
+    await page.screenshot({ path: `${evidence}/large-camera-photo.png`, fullPage: true });
+
+    console.log('web-attachments: PASSED (all-size JPEG/PNG header validation incl. 0-byte/headerless PNG rejection; <=2 MiB wide JPEG preprocessing to <=2000px; tiny IHDR pixel-bomb rejection; bounded >2 MiB camera JPEG preprocessing to <=2 MiB JPEG/2000px under 4 MiB frame; small image/code/video behavior; intake order; truncated and large GIF/WebP image-processing failures; 20 MiB raw image ceiling; >2 MiB code rejection; attachment wire/render/reload regressions)');
   } finally {
     await browser.close().catch(() => {});
   }

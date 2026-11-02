@@ -25,8 +25,8 @@
 //!   through) and observes the goal auto-pause on budget exhaustion, resume
 //!   rejection, and drop from the exhausted state — exactly the T06 Phase-2
 //!   flow.
-//! * **Persistence** — stop the listener (SIGTERM) and restart the binary in
-//!   the same temp HOME/cwd with `--continue`; the goal journal is replayed
+//! * **Persistence** — stop the listener through its SIGTERM restart authority
+//!   and restart the binary in the same temp HOME/cwd with `--continue`; the goal journal is replayed
 //!   from the session tree, so the goal survives with its budget and charged
 //!   usage exactly.
 //! * **PTY harness** — a real pseudoterminal drives the TUI: bare `/goal`
@@ -122,8 +122,8 @@ impl ReplProbe {
         cmd.env("HOME", home);
         cmd.env("PATH", std::env::var("PATH").unwrap_or_default());
         cmd.env("TERM", "xterm-256color");
-        cmd.env("PI_OFFLINE", "1");
-        cmd.env("PI_SKIP_VERSION_CHECK", "1");
+        cmd.env("RPI_OFFLINE", "1");
+        cmd.env("RPI_SKIP_VERSION_CHECK", "1");
         cmd.env("PI_FAUX_RESPONSE", FAUX_RESPONSE);
         cmd.args(args);
         cmd.current_dir(cwd);
@@ -294,8 +294,8 @@ impl TuiProbe {
         cmd.env("HOME", home.path());
         cmd.env("PATH", std::env::var("PATH").unwrap_or_default());
         cmd.env("TERM", "xterm-256color");
-        cmd.env("PI_OFFLINE", "1");
-        cmd.env("PI_SKIP_VERSION_CHECK", "1");
+        cmd.env("RPI_OFFLINE", "1");
+        cmd.env("RPI_SKIP_VERSION_CHECK", "1");
         cmd.env("PI_FAUX_RESPONSE", FAUX_RESPONSE);
         cmd.args(["--model", "faux/faux-1"]);
         cmd.current_dir(cwd.path());
@@ -448,10 +448,12 @@ impl Screen {
                                 self.row = self.row.saturating_sub(csi_param_int(&params, 1));
                             }
                             'B' => {
-                                self.row = (self.row + csi_param_int(&params, 1)).min(self.rows - 1);
+                                self.row =
+                                    (self.row + csi_param_int(&params, 1)).min(self.rows - 1);
                             }
                             'C' => {
-                                self.col = (self.col + csi_param_int(&params, 1)).min(self.cols - 1);
+                                self.col =
+                                    (self.col + csi_param_int(&params, 1)).min(self.cols - 1);
                             }
                             'D' => {
                                 self.col = self.col.saturating_sub(csi_param_int(&params, 1));
@@ -557,7 +559,13 @@ impl Screen {
     fn text(&self) -> String {
         self.grid
             .iter()
-            .map(|row| row.iter().collect::<String>().split_whitespace().collect::<Vec<_>>().join(" "))
+            .map(|row| {
+                row.iter()
+                    .collect::<String>()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -629,10 +637,7 @@ fn http_rpc(addr: &str, body: &Value) -> Value {
 /// banner the listener prints to stderr.
 fn control_plane_addr(stderr: &str) -> String {
     const MARKER: &str = "Control plane listening on http://";
-    let start = stderr
-        .find(MARKER)
-        .expect("control plane banner on stderr")
-        + MARKER.len();
+    let start = stderr.find(MARKER).expect("control plane banner on stderr") + MARKER.len();
     let end = stderr[start..]
         .find(' ')
         .expect("control plane address terminator")
@@ -647,8 +652,8 @@ fn control_plane_addr(stderr: &str) -> String {
 /// waits for the `Control plane listening on http://…` banner on stderr and
 /// parses the bound address. All goal mutations run through the JSON-RPC
 /// control plane ([`ListenerProbe::rpc`]). `stop()` SIGTERMs the process —
-/// listener mode shuts down gracefully on SIGTERM and exits 0 after
-/// `application.cleanup()` — and the Drop impl kills as a backstop.
+/// listener mode checkpoints restart state on SIGTERM and exits 0 without
+/// terminal `application.cleanup()` — and the Drop impl kills as a backstop.
 struct ListenerProbe {
     child: Child,
     stderr_buffer: Arc<Mutex<String>>,
@@ -665,8 +670,8 @@ impl ListenerProbe {
         cmd.env("HOME", home);
         cmd.env("PATH", std::env::var("PATH").unwrap_or_default());
         cmd.env("TERM", "xterm-256color");
-        cmd.env("PI_OFFLINE", "1");
-        cmd.env("PI_SKIP_VERSION_CHECK", "1");
+        cmd.env("RPI_OFFLINE", "1");
+        cmd.env("RPI_SKIP_VERSION_CHECK", "1");
         cmd.env("PI_FAUX_RESPONSE", FAUX_RESPONSE);
         cmd.args([
             "--listen",
@@ -734,8 +739,8 @@ impl ListenerProbe {
         http_rpc(&self.addr, body)
     }
 
-    /// SIGTERM the listener (its shutdown path runs `application.cleanup`)
-    /// and require a clean exit.
+    /// SIGTERM the listener through its restart-checkpoint path and require a
+    /// clean exit without terminal application cleanup.
     fn stop(mut self) {
         kill(Pid::from_raw(self.child.id() as i32), Signal::SIGTERM)
             .expect("send SIGTERM to listener");
@@ -777,8 +782,11 @@ fn rfc3339_millis(value: &str) -> i64 {
     assert!(value.len() >= 20, "malformed rfc3339: {value:?}");
     let bytes = value.as_bytes();
     assert!(
-        bytes[4] == b'-' && bytes[7] == b'-' && bytes[10] == b'T'
-            && bytes[13] == b':' && bytes[16] == b':',
+        bytes[4] == b'-'
+            && bytes[7] == b'-'
+            && bytes[10] == b'T'
+            && bytes[13] == b':'
+            && bytes[16] == b':',
         "malformed rfc3339: {value:?}"
     );
     let year: i64 = value[0..4].parse().expect("rfc3339 year");
@@ -810,12 +818,12 @@ fn rfc3339_millis(value: &str) -> i64 {
     // Offset: only same-offset values are ever compared (chrono UTC emits
     // "+00:00"; accept "Z" defensively). Validate the shape, ignore magnitude.
     assert!(
-        rest.starts_with('Z') || (rest.len() == 6 && (rest.starts_with('+') || rest.starts_with('-'))),
+        rest.starts_with('Z')
+            || (rest.len() == 6 && (rest.starts_with('+') || rest.starts_with('-'))),
         "unexpected rfc3339 offset in {value:?}"
     );
     let days = days_from_civil(year, month, day);
-    (days * 86_400 + i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second))
-        * 1_000
+    (days * 86_400 + i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second)) * 1_000
         + fraction_millis
 }
 
@@ -868,12 +876,19 @@ fn loop_next_millis(list_output: &str, id: &str) -> i64 {
 fn repl_goal_lifecycle_create_pause_resume_complete_and_invalid_transitions() {
     let home = TempDir::new().expect("temp HOME");
     let cwd = TempDir::new().expect("temp cwd");
-    let mut repl =
-        ReplProbe::spawn(home.path(), cwd.path(), &["--mode", "text", "--model", "faux/faux-1"]);
+    let mut repl = ReplProbe::spawn(
+        home.path(),
+        cwd.path(),
+        &["--mode", "text", "--model", "faux/faux-1"],
+    );
     repl.ready();
 
     let bare = repl.command("/goal");
-    assert_eq!(bare.trim(), "no goal", "bare /goal without a goal: {bare:?}");
+    assert_eq!(
+        bare.trim(),
+        "no goal",
+        "bare /goal without a goal: {bare:?}"
+    );
 
     let created = repl.command("/goal create --tokens 100 ship the widget");
     assert!(
@@ -916,7 +931,10 @@ fn repl_goal_lifecycle_create_pause_resume_complete_and_invalid_transitions() {
     thread::sleep(Duration::from_secs(1));
 
     let completed = repl.command("/goal complete");
-    assert_eq!(completed.trim(), "completed · 0/100 tokens · ship the widget");
+    assert_eq!(
+        completed.trim(),
+        "completed · 0/100 tokens · ship the widget"
+    );
 
     // Terminal lifecycle rejects every further mutation.
     repl.command("/goal pause");
@@ -956,7 +974,10 @@ fn repl_goal_lifecycle_create_pause_resume_complete_and_invalid_transitions() {
     );
     repl.command("/goal create --tokens 0 x");
     assert!(
-        repl.wait_stderr("--tokens requires a positive integer", Duration::from_secs(5)),
+        repl.wait_stderr(
+            "--tokens requires a positive integer",
+            Duration::from_secs(5)
+        ),
         "zero budget must fail, stderr: {:?}",
         repl.stderr_snapshot()
     );
@@ -971,7 +992,10 @@ fn repl_goal_lifecycle_create_pause_resume_complete_and_invalid_transitions() {
     );
 
     let final_state = repl.command("/goal");
-    assert_eq!(final_state.trim(), "completed · 0/100 tokens · ship the widget");
+    assert_eq!(
+        final_state.trim(),
+        "completed · 0/100 tokens · ship the widget"
+    );
 
     repl.quit();
 }
@@ -983,8 +1007,11 @@ fn repl_goal_lifecycle_create_pause_resume_complete_and_invalid_transitions() {
 fn repl_goal_drop_terminates_goal_and_slot_stays_permanent() {
     let home = TempDir::new().expect("temp HOME");
     let cwd = TempDir::new().expect("temp cwd");
-    let mut repl =
-        ReplProbe::spawn(home.path(), cwd.path(), &["--mode", "text", "--model", "faux/faux-1"]);
+    let mut repl = ReplProbe::spawn(
+        home.path(),
+        cwd.path(),
+        &["--mode", "text", "--model", "faux/faux-1"],
+    );
     repl.ready();
 
     let created = repl.command("/goal create --tokens 5 fix the lights");
@@ -1140,20 +1167,17 @@ fn repl_goal_state_survives_restart_through_journal_replay() {
         // Let the goal-work turn settle before exiting so the journal is idle.
         thread::sleep(Duration::from_secs(2));
         let completed = repl.command("/goal complete");
-        assert_eq!(completed.trim(), "completed · 0/100 tokens · persist the goal");
+        assert_eq!(
+            completed.trim(),
+            "completed · 0/100 tokens · persist the goal"
+        );
         repl.quit();
     }
 
     let mut resumed = ReplProbe::spawn(
         home.path(),
         cwd.path(),
-        &[
-            "--mode",
-            "text",
-            "--model",
-            "faux/faux-1",
-            "--continue",
-        ],
+        &["--mode", "text", "--model", "faux/faux-1", "--continue"],
     );
     resumed.ready();
     assert!(
@@ -1239,7 +1263,10 @@ fn goal_active_restart_resumes_session_restores_usage_budget_and_lifecycle() {
     // Lifecycle still works on the restored goal: resume re-activates it and
     // complete terminates it, preserving the charged usage.
     let resumed_work = resumed.rpc(&json!({"type": "goal_resume", "id": "restart-resume"}));
-    assert_eq!(resumed_work["success"], true, "resume response: {resumed_work}");
+    assert_eq!(
+        resumed_work["success"], true,
+        "resume response: {resumed_work}"
+    );
     assert_eq!(resumed_work["data"]["lifecycle"], "active");
     assert_eq!(resumed_work["data"]["objective"], "deliver the release");
     assert_eq!(resumed_work["data"]["tokenBudget"], 100);
@@ -1267,8 +1294,11 @@ fn repl_goal_restart_without_resume_isolates_goal_per_session() {
     let cwd = TempDir::new().expect("temp cwd");
 
     {
-        let mut repl =
-            ReplProbe::spawn(home.path(), cwd.path(), &["--mode", "text", "--model", "faux/faux-1"]);
+        let mut repl = ReplProbe::spawn(
+            home.path(),
+            cwd.path(),
+            &["--mode", "text", "--model", "faux/faux-1"],
+        );
         repl.ready();
         let created = repl.command("/goal create --tokens 100 private session goal");
         assert!(
@@ -1282,8 +1312,11 @@ fn repl_goal_restart_without_resume_isolates_goal_per_session() {
 
     // A fresh spawn in the same temp HOME/cwd starts a DIFFERENT session:
     // the per-session goal must not leak into it.
-    let mut fresh =
-        ReplProbe::spawn(home.path(), cwd.path(), &["--mode", "text", "--model", "faux/faux-1"]);
+    let mut fresh = ReplProbe::spawn(
+        home.path(),
+        cwd.path(),
+        &["--mode", "text", "--model", "faux/faux-1"],
+    );
     fresh.ready();
     let shown = fresh.command("/goal show");
     assert_eq!(shown.trim(), "no goal");
@@ -1302,12 +1335,18 @@ fn repl_goal_restart_without_resume_isolates_goal_per_session() {
 fn repl_loop_create_list_fire_cancel_delete_and_error_paths() {
     let home = TempDir::new().expect("temp HOME");
     let cwd = TempDir::new().expect("temp cwd");
-    let mut repl =
-        ReplProbe::spawn(home.path(), cwd.path(), &["--mode", "text", "--model", "faux/faux-1"]);
+    let mut repl = ReplProbe::spawn(
+        home.path(),
+        cwd.path(),
+        &["--mode", "text", "--model", "faux/faux-1"],
+    );
     repl.ready();
 
     let created = repl.command("/loop 5s ping the satellite");
-    assert!(created.starts_with("scheduled "), "loop create: {created:?}");
+    assert!(
+        created.starts_with("scheduled "),
+        "loop create: {created:?}"
+    );
     let loop_id = loop_id_from_create(&created);
     assert!(!loop_id.is_empty(), "loop id missing: {created:?}");
     assert!(
@@ -1317,7 +1356,10 @@ fn repl_loop_create_list_fire_cancel_delete_and_error_paths() {
     assert!(created.contains("expires "), "loop expiry: {created:?}");
 
     let loops = repl.command("/loops");
-    assert!(loops.contains(&loop_id), "/loops must list the loop: {loops:?}");
+    assert!(
+        loops.contains(&loop_id),
+        "/loops must list the loop: {loops:?}"
+    );
     assert!(
         loops.contains("every 5 seconds"),
         "/loops schedule: {loops:?}"
@@ -1482,7 +1524,11 @@ fn pty_tui_goal_panel_and_footer_chip_lifecycle() {
     probe.send(b"\r");
     assert!(
         wait_for_screen(&probe, "/goal create", Duration::from_secs(10))
-            && wait_for_screen(&probe, "Enter the goal objective, then press Enter", Duration::from_secs(10)),
+            && wait_for_screen(
+                &probe,
+                "Enter the goal objective, then press Enter",
+                Duration::from_secs(10)
+            ),
         "create hint must render:\n{}",
         visible(&probe)
     );
@@ -1491,7 +1537,11 @@ fn pty_tui_goal_panel_and_footer_chip_lifecycle() {
     // objective, then submit.
     probe.send(b"--tokens 100 ship the widget\r");
     assert!(
-        wait_for_screen(&probe, "Objective: ship the widget", Duration::from_secs(20)),
+        wait_for_screen(
+            &probe,
+            "Objective: ship the widget",
+            Duration::from_secs(20)
+        ),
         "goal details block must render:\n{}",
         visible(&probe)
     );
@@ -1519,7 +1569,10 @@ fn pty_tui_goal_panel_and_footer_chip_lifecycle() {
     // pass/fail signal — then wait for the footer chip as
     // the authoritative paused-status + `0/100` budget check: one snapshot
     // showing ⏸ without the active 🎯 chip.
-    let _ = probe.wait_for("paused (manually paused) · 0/100 tokens · ship the widget", Duration::from_secs(8));
+    let _ = probe.wait_for(
+        "paused (manually paused) · 0/100 tokens · ship the widget",
+        Duration::from_secs(8),
+    );
     assert!(
         wait_for_screen_transition(
             &probe,
@@ -1556,7 +1609,10 @@ fn pty_tui_goal_panel_and_footer_chip_lifecycle() {
     // (`completed · 0/100 tokens · …`); the footer `✓ Goal 0/100` chip is the
     // authoritative completed-status + budget check: one snapshot showing ✓
     // without the active 🎯 chip.
-    let _ = probe.wait_for("completed · 0/100 tokens · ship the widget", Duration::from_secs(8));
+    let _ = probe.wait_for(
+        "completed · 0/100 tokens · ship the widget",
+        Duration::from_secs(8),
+    );
     assert!(
         wait_for_screen_transition(
             &probe,
@@ -1571,7 +1627,11 @@ fn pty_tui_goal_panel_and_footer_chip_lifecycle() {
     // Terminal goals reject drop through the TUI dispatch error surface.
     probe.send(b"/goal drop\r");
     assert!(
-        wait_for_screen(&probe, "cannot drop a goal in the Completed lifecycle", Duration::from_secs(10)),
+        wait_for_screen(
+            &probe,
+            "cannot drop a goal in the Completed lifecycle",
+            Duration::from_secs(10)
+        ),
         "drop rejection must render:\n{}",
         visible(&probe)
     );
@@ -1588,7 +1648,11 @@ fn pty_tui_goal_panel_and_footer_chip_lifecycle() {
             break;
         }
     }
-    assert!(cleared, "composer must clear before quit:\n{}", visible(&probe));
+    assert!(
+        cleared,
+        "composer must clear before quit:\n{}",
+        visible(&probe)
+    );
     // Let the 500ms double-press quit window lapse, then quit cleanly.
     thread::sleep(Duration::from_millis(700));
     probe.send(&[CTRL_D]);

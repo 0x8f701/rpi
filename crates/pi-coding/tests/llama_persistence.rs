@@ -13,12 +13,11 @@ use std::path::Path;
 
 use pi_ai::Model;
 use pi_coding::llama::{
-    InstalledGgufCatalog, InstalledGgufFile, InstalledGgufModel, LlamaCatalogSnapshot,
-    LlamaManager,
+    InstalledGgufCatalog, InstalledGgufFile, InstalledGgufModel, LlamaCatalogSnapshot, LlamaManager,
 };
 
 fn manager(root: &Path) -> LlamaManager {
-    LlamaManager::new(root.to_path_buf())
+    LlamaManager::new(root.to_path_buf()).expect("llama manager")
 }
 
 #[test]
@@ -49,19 +48,18 @@ fn settings_round_trip_and_secret_permission_gate() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&settings_path, fs::Permissions::from_mode(0o644))
-            .expect("set 0644");
+        fs::set_permissions(&settings_path, fs::Permissions::from_mode(0o644)).expect("set 0644");
         let err = manager
             .effective_settings()
             .expect_err("0644 settings must be refused");
         assert!(
-            err.to_string().contains("must not be accessible by group or other"),
+            err.to_string()
+                .contains("must not be accessible by group or other"),
             "{err}"
         );
 
         // 0600 passes the gate and round-trips.
-        fs::set_permissions(&settings_path, fs::Permissions::from_mode(0o600))
-            .expect("set 0600");
+        fs::set_permissions(&settings_path, fs::Permissions::from_mode(0o600)).expect("set 0600");
         let effective = manager
             .effective_settings()
             .expect("0600 settings accepted")

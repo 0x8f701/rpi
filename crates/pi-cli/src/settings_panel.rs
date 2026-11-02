@@ -29,16 +29,45 @@ const CATEGORIES: &[SettingCategory] = &[
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum SettingsControl {
-    Boolean { value: Option<bool> },
-    Enum { value: Option<String>, options: Vec<String> },
-    String { value: Option<String>, non_empty: bool },
-    Integer { value: Option<i64>, min: i64, max: i64 },
-    UnsignedInteger { value: Option<u64>, min: u64, max: u64 },
-    Number { value: Option<f64>, min: f64, max: f64 },
-    StringList { value: Vec<String>, non_empty_items: bool },
-    List { value: Vec<Value> },
-    Object { value: Map<String, Value> },
-    Secret { is_set: bool },
+    Boolean {
+        value: Option<bool>,
+    },
+    Enum {
+        value: Option<String>,
+        options: Vec<String>,
+    },
+    String {
+        value: Option<String>,
+        non_empty: bool,
+    },
+    Integer {
+        value: Option<i64>,
+        min: i64,
+        max: i64,
+    },
+    UnsignedInteger {
+        value: Option<u64>,
+        min: u64,
+        max: u64,
+    },
+    Number {
+        value: Option<f64>,
+        min: f64,
+        max: f64,
+    },
+    StringList {
+        value: Vec<String>,
+        non_empty_items: bool,
+    },
+    List {
+        value: Vec<Value>,
+    },
+    Object {
+        value: Map<String, Value>,
+    },
+    Secret {
+        is_set: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -99,7 +128,6 @@ const SECTION_OVERRIDES: &[(&str, &str)] = &[
     ("transport", "Transport"),
     ("timeoutMs", "Transport"),
     ("httpIdleTimeoutMs", "Transport"),
-    ("websocketConnectTimeoutMs", "Transport"),
     ("maxRetryDelayMs", "Transport"),
     // Resources: one named section per resource kind.
     ("packages", "Packages"),
@@ -115,6 +143,7 @@ const SECTION_OVERRIDES: &[(&str, &str)] = &[
     ("defaultProjectTrust", "Trust policy"),
     ("approvalMode", "Trust policy"),
     ("apiKey", "Secrets"),
+    ("sandbox", "Sandbox policy"),
     // Session.
     ("steeringMode", "Steering"),
     ("followUpMode", "Steering"),
@@ -137,7 +166,11 @@ static LEGACY_ALIAS_CANONICALS: LazyLock<HashMap<&'static str, &'static str>> =
             let canonical = definition
                 .description
                 .strip_prefix("Legacy alias for ")
-                .or_else(|| definition.description.strip_prefix("Legacy inverse alias for "))
+                .or_else(|| {
+                    definition
+                        .description
+                        .strip_prefix("Legacy inverse alias for ")
+                })
                 .and_then(|rest| rest.strip_suffix('.'));
             if let Some(canonical) = canonical {
                 map.insert(definition.key, canonical);
@@ -163,7 +196,10 @@ fn settings_key_section(key: &str) -> String {
     if let Some(canonical) = LEGACY_ALIAS_CANONICALS.get(key) {
         return settings_key_section(canonical);
     }
-    if let Some((_, section)) = SECTION_OVERRIDES.iter().find(|(candidate, _)| *candidate == key) {
+    if let Some((_, section)) = SECTION_OVERRIDES
+        .iter()
+        .find(|(candidate, _)| *candidate == key)
+    {
         return (*section).to_owned();
     }
     // Two-segment prefix groups: the provider-level retry knobs are distinct
@@ -329,7 +365,10 @@ impl SettingsPanel {
         let query = self.search.trim().to_ascii_lowercase();
         let mut rows = SettingsCatalog::definitions()
             .iter()
-            .filter(|definition| self.category.is_none_or(|category| definition.category == category))
+            .filter(|definition| {
+                self.category
+                    .is_none_or(|category| definition.category == category)
+            })
             .filter(|definition| {
                 query.is_empty()
                     || definition.key.to_ascii_lowercase().contains(&query)
@@ -350,7 +389,10 @@ impl SettingsPanel {
                     SettingsScope::Project => view.editable_project,
                 };
                 let blocked_reason = if definition.secret {
-                    Some("secret settings are managed through auth storage or environment variables".to_owned())
+                    Some(
+                        "secret settings are managed through auth storage or environment variables"
+                            .to_owned(),
+                    )
                 } else if !definition.scopes.allows(self.scope) {
                     Some(format!("setting is unavailable in {:?} scope", self.scope))
                 } else if self.scope == SettingsScope::Project && !self.project_trusted {
@@ -485,29 +527,39 @@ impl SettingsPanel {
         };
         let value = scope_value.unwrap_or(&view.effective_value);
         match definition.value_type {
-            SettingValueType::Boolean => Ok(value.as_bool().map(|value| value.to_string()).unwrap_or_default()),
+            SettingValueType::Boolean => Ok(value
+                .as_bool()
+                .map(|value| value.to_string())
+                .unwrap_or_default()),
             SettingValueType::Enum | SettingValueType::String { .. } => {
                 Ok(value.as_str().unwrap_or_default().to_owned())
             }
             SettingValueType::Integer { .. }
             | SettingValueType::UnsignedInteger { .. }
-            | SettingValueType::Number { .. } => {
-                Ok(value.is_number().then(|| value.to_string()).unwrap_or_default())
-            }
-            SettingValueType::StringList { .. } => Ok(if value
-                .as_array()
-                .is_some_and(|values| values.iter().all(Value::is_string))
-            {
+            | SettingValueType::Number { .. } => Ok(value
+                .is_number()
+                .then(|| value.to_string())
+                .unwrap_or_default()),
+            SettingValueType::StringList { .. } => Ok(
+                if value
+                    .as_array()
+                    .is_some_and(|values| values.iter().all(Value::is_string))
+                {
+                    value.to_string()
+                } else {
+                    "[]".to_owned()
+                },
+            ),
+            SettingValueType::Array => Ok(if value.is_array() {
                 value.to_string()
             } else {
                 "[]".to_owned()
             }),
-            SettingValueType::Array => {
-                Ok(if value.is_array() { value.to_string() } else { "[]".to_owned() })
-            }
-            SettingValueType::Object => {
-                Ok(if value.is_object() { value.to_string() } else { "{}".to_owned() })
-            }
+            SettingValueType::Object => Ok(if value.is_object() {
+                value.to_string()
+            } else {
+                "{}".to_owned()
+            }),
             SettingValueType::Secret => {
                 bail!("{key} is secret material and cannot be edited here")
             }
@@ -589,10 +641,8 @@ pub fn parse_setting_input(key: &str, input: &str) -> Result<Value> {
             }
             value
         }
-        SettingValueType::Array | SettingValueType::Object => {
-            serde_json::from_str(input)
-                .map_err(|error| anyhow::anyhow!("{key} must be valid JSON: {error}"))?
-        }
+        SettingValueType::Array | SettingValueType::Object => serde_json::from_str(input)
+            .map_err(|error| anyhow::anyhow!("{key} must be valid JSON: {error}"))?,
         SettingValueType::Secret => {
             bail!("{key} is secret material and cannot be edited here")
         }
@@ -610,10 +660,15 @@ fn control_for(
         return SettingsControl::Secret { is_set: redacted };
     }
     match value_type {
-        SettingValueType::Boolean => SettingsControl::Boolean { value: value.as_bool() },
+        SettingValueType::Boolean => SettingsControl::Boolean {
+            value: value.as_bool(),
+        },
         SettingValueType::Enum => SettingsControl::Enum {
             value: value.as_str().map(str::to_owned),
-            options: enum_values.iter().map(|value| (*value).to_owned()).collect(),
+            options: enum_values
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
         },
         SettingValueType::String { non_empty } => SettingsControl::String {
             value: value.as_str().map(str::to_owned),
@@ -669,7 +724,9 @@ mod tests {
         let agent = tempfile::tempdir().expect("agent dir");
         let cwd = tempfile::tempdir().expect("cwd");
         let manager = SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("manager");
-        manager.load_project(project_trusted).expect("project trust");
+        manager
+            .load_project(project_trusted)
+            .expect("project trust");
         (agent, cwd, manager)
     }
 
@@ -678,13 +735,31 @@ mod tests {
         let (_agent, _cwd, manager) = manager(true);
         let panel = SettingsPanel::new(manager, SettingsScope::Global).expect("panel");
         let rows = panel.rows().expect("rows");
-        assert!(rows.iter().any(|row| matches!(row.control, SettingsControl::Boolean { .. })));
+        assert!(
+            rows.iter()
+                .any(|row| matches!(row.control, SettingsControl::Boolean { .. }))
+        );
         assert!(rows.iter().any(|row| matches!(row.control, SettingsControl::Enum { ref options, .. } if !options.is_empty())));
-        assert!(rows.iter().any(|row| matches!(row.control, SettingsControl::String { .. })));
-        assert!(rows.iter().any(|row| matches!(row.control, SettingsControl::Integer { .. } | SettingsControl::UnsignedInteger { .. })));
-        assert!(rows.iter().any(|row| matches!(row.control, SettingsControl::StringList { .. } | SettingsControl::List { .. })));
-        assert!(rows.iter().any(|row| matches!(row.control, SettingsControl::Object { .. })));
-        assert!(rows.iter().any(|row| matches!(row.control, SettingsControl::Secret { .. })));
+        assert!(
+            rows.iter()
+                .any(|row| matches!(row.control, SettingsControl::String { .. }))
+        );
+        assert!(rows.iter().any(|row| matches!(
+            row.control,
+            SettingsControl::Integer { .. } | SettingsControl::UnsignedInteger { .. }
+        )));
+        assert!(rows.iter().any(|row| matches!(
+            row.control,
+            SettingsControl::StringList { .. } | SettingsControl::List { .. }
+        )));
+        assert!(
+            rows.iter()
+                .any(|row| matches!(row.control, SettingsControl::Object { .. }))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| matches!(row.control, SettingsControl::Secret { .. }))
+        );
     }
 
     #[test]
@@ -704,7 +779,10 @@ mod tests {
             .iter()
             .position(|row| row.key == "retry.enabled")
             .expect("retry.enabled position");
-        assert_eq!(panel.selected().expect("selected").expect("row").key, "retry.enabled");
+        assert_eq!(
+            panel.selected().expect("selected").expect("row").key,
+            "retry.enabled"
+        );
     }
 
     #[test]
@@ -716,9 +794,15 @@ mod tests {
         assert_eq!(row.key, "thinkingBudgets.medium");
         assert_eq!(row.section(), "Thinking");
         assert_eq!(row.display_key(), "medium token budget");
-        assert_eq!(panel.input_hint(&row.key).expect("hint"), "integer token override; inherited when unset");
+        assert_eq!(
+            panel.input_hint(&row.key).expect("hint"),
+            "integer token override; inherited when unset"
+        );
         assert!(row.inherited);
-        assert!(!panel.is_dirty(), "selecting the override row must not stage a value");
+        assert!(
+            !panel.is_dirty(),
+            "selecting the override row must not stage a value"
+        );
     }
 
     #[test]
@@ -727,9 +811,9 @@ mod tests {
         manager
             .update_global(|settings| settings.theme = Some("global-theme".to_owned()))
             .expect("global theme");
-        fs::create_dir_all(cwd.path().join(".pi")).expect("project dir");
+        fs::create_dir_all(cwd.path().join(".rpi")).expect("project dir");
         fs::write(
-            cwd.path().join(".pi/settings.json"),
+            cwd.path().join(".rpi/settings.json"),
             r#"{"theme":"project-theme"}"#,
         )
         .expect("project settings");
@@ -767,7 +851,10 @@ mod tests {
             .filter(|row| row.section() == "Thinking")
             .collect::<Vec<_>>();
         assert_eq!(
-            thinking.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(),
+            thinking
+                .iter()
+                .map(|row| row.key.as_str())
+                .collect::<Vec<_>>(),
             vec![
                 "defaultThinkingLevel",
                 "thinkingBudgets.minimal",
@@ -811,7 +898,9 @@ mod tests {
         assert!(
             !rows.iter().any(|row| row.section() == "General"),
             "RetryTransport general bucket must be fully split: {:?}",
-            rows.iter().map(|row| (row.key.as_str(), row.section())).collect::<Vec<_>>()
+            rows.iter()
+                .map(|row| (row.key.as_str(), row.section()))
+                .collect::<Vec<_>>()
         );
 
         // S3-S7: Resources / TrustSecurity / Session named buckets.
@@ -833,8 +922,8 @@ mod tests {
         assert_eq!(section("themes"), "Themes");
         assert_eq!(section("mcpServers"), "MCP servers");
 
-        let mut trust = SettingsPanel::new(panel.manager.clone(), SettingsScope::Global)
-            .expect("trust panel");
+        let mut trust =
+            SettingsPanel::new(panel.manager.clone(), SettingsScope::Global).expect("trust panel");
         trust.set_category(Some(SettingCategory::TrustSecurity));
         let rows = trust.rows().expect("trust rows");
         let section = |key: &str| {
@@ -848,6 +937,9 @@ mod tests {
         assert_eq!(section("hooks"), "Hooks");
         assert_eq!(section("permissionRules"), "Permission rules");
         assert_eq!(section("apiKey"), "Secrets");
+        assert_eq!(section("sandbox.mode"), "Sandbox");
+        assert_eq!(section("sandbox.hostHttp"), "Sandbox");
+        assert!(rows.iter().all(|row| row.key != "sandbox.enabled"));
 
         let mut session = SettingsPanel::new(panel.manager.clone(), SettingsScope::Global)
             .expect("session panel");
@@ -915,7 +1007,11 @@ mod tests {
             .expect("secret row");
         assert!(secret.redacted);
         assert!(!secret.writable);
-        assert!(!serde_json::to_string(&secret).expect("serialize").contains("never-print-this"));
+        assert!(
+            !serde_json::to_string(&secret)
+                .expect("serialize")
+                .contains("never-print-this")
+        );
         panel.cancel().expect("cancel");
         assert!(!panel.is_dirty());
         assert_eq!(manager.global_settings().compaction, None);
@@ -948,7 +1044,9 @@ mod tests {
         panel
             .set_input("terminal.imageWidthCells", "80")
             .expect("unsigned input");
-        panel.set_input("temperature", "0.75").expect("number input");
+        panel
+            .set_input("temperature", "0.75")
+            .expect("number input");
         panel
             .set_input("enabledModels", r#"["first, model","  padded  "]"#)
             .expect("string list input");
@@ -977,8 +1075,14 @@ mod tests {
         assert!(panel.set_input("packages", "{}").is_err());
         assert!(panel.set_input("apiKey", "secret").is_err());
 
-        assert_eq!(panel.input_hint("enabledModels").expect("list hint"), "JSON array of strings");
-        assert_eq!(panel.input_hint("keybindings").expect("object hint"), "JSON object");
+        assert_eq!(
+            panel.input_hint("enabledModels").expect("list hint"),
+            "JSON array of strings"
+        );
+        assert_eq!(
+            panel.input_hint("keybindings").expect("object hint"),
+            "JSON object"
+        );
     }
 
     #[test]
@@ -989,7 +1093,11 @@ mod tests {
         manager
             .update_global(|settings| settings.quiet_startup = Some(true))
             .expect("concurrent write");
-        let error = panel.draft.clone().apply(&manager).expect_err("stale draft");
+        let error = panel
+            .draft
+            .clone()
+            .apply(&manager)
+            .expect_err("stale draft");
         assert!(error.to_string().contains("settings changed"));
         assert_eq!(manager.global_settings().theme, None);
     }

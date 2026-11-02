@@ -138,20 +138,22 @@ impl StreamingMarkdownRenderer {
     }
 
     pub fn push_str(&mut self, chunk: &str) {
-        let remaining = self.options.max_input_bytes.saturating_sub(self.source.len());
+        let remaining = self
+            .options
+            .max_input_bytes
+            .saturating_sub(self.source.len());
         let (chunk, truncated) = safe_prefix(chunk, remaining);
         self.source.push_str(chunk);
         self.input_truncated |= truncated;
 
         let boundary = streaming_tail_start(&self.source);
         if boundary > self.frozen_source_bytes {
-            let line_offset = self.source[..self.frozen_source_bytes].matches('\n').count();
+            let line_offset = self.source[..self.frozen_source_bytes]
+                .matches('\n')
+                .count();
             let newly_frozen = &self.source[self.frozen_source_bytes..boundary];
-            let mut rendered = render_with_mode(
-                newly_frozen,
-                &self.options,
-                AnalysisMode::Streaming,
-            );
+            let mut rendered =
+                render_with_mode(newly_frozen, &self.options, AnalysisMode::Streaming);
             offset_source_lines(&mut rendered.diagnostics, line_offset);
             self.frozen.lines.append(&mut rendered.lines);
             self.frozen.diagnostics.append(&mut rendered.diagnostics);
@@ -161,7 +163,9 @@ impl StreamingMarkdownRenderer {
         let tail_source = &self.source[self.frozen_source_bytes..];
         self.parsed_bytes = self.parsed_bytes.saturating_add(tail_source.len());
         self.tail = render_with_mode(tail_source, &self.options, AnalysisMode::Streaming);
-        let line_offset = self.source[..self.frozen_source_bytes].matches('\n').count();
+        let line_offset = self.source[..self.frozen_source_bytes]
+            .matches('\n')
+            .count();
         offset_source_lines(&mut self.tail.diagnostics, line_offset);
     }
 
@@ -169,7 +173,9 @@ impl StreamingMarkdownRenderer {
     pub fn output(&self) -> MarkdownRenderOutput {
         let mut output = self.frozen.clone();
         output.lines.extend(self.tail.lines.iter().cloned());
-        output.diagnostics.extend(self.tail.diagnostics.iter().cloned());
+        output
+            .diagnostics
+            .extend(self.tail.diagnostics.iter().cloned());
         if self.input_truncated {
             output.diagnostics.push(RenderDiagnostic::InputTruncated {
                 limit: self.options.max_input_bytes,
@@ -218,19 +224,22 @@ fn offset_source_lines(diagnostics: &mut [RenderDiagnostic], line_offset: usize)
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RenderDiagnostic {
-    InputTruncated { limit: usize },
+    InputTruncated {
+        limit: usize,
+    },
     Mermaid {
         source_line: usize,
         diagnostic: MermaidDiagnostic,
     },
-    UnclosedFence { source_line: usize },
-    TableTooNarrow { source_line: usize },
+    UnclosedFence {
+        source_line: usize,
+    },
+    TableTooNarrow {
+        source_line: usize,
+    },
 }
 
-pub fn render_markdown(
-    source: &str,
-    options: &MarkdownRenderOptions,
-) -> MarkdownRenderOutput {
+pub fn render_markdown(source: &str, options: &MarkdownRenderOptions) -> MarkdownRenderOutput {
     render_with_mode(source, options, AnalysisMode::Complete)
 }
 
@@ -253,18 +262,23 @@ fn render_with_mode(
         ..MarkdownRenderOutput::default()
     };
     if document.truncated {
-        output
-            .diagnostics
-            .push(RenderDiagnostic::InputTruncated {
-                limit: options.max_input_bytes,
-            });
+        output.diagnostics.push(RenderDiagnostic::InputTruncated {
+            limit: options.max_input_bytes,
+        });
     }
 
     for block in document.blocks {
         match block {
             MarkdownBlock::Blank => output.lines.push(NeutralLine::default()),
             MarkdownBlock::Heading { level, text, .. } => {
-                append_wrapped(&mut output.lines, &text, width, LineRole::Heading(level), "", None);
+                append_wrapped(
+                    &mut output.lines,
+                    &text,
+                    width,
+                    LineRole::Heading(level),
+                    "",
+                    None,
+                );
             }
             MarkdownBlock::List { items, .. } => {
                 for item in items {
@@ -326,13 +340,14 @@ fn render_with_mode(
                         .zip(layout.inline_styles)
                         .enumerate()
                     {
-                        let role = if index == 0 || index == header_rows + 1 || index + 1 == line_count {
-                            LineRole::TableBorder
-                        } else if index <= header_rows {
-                            LineRole::TableHeader
-                        } else {
-                            LineRole::TableBody
-                        };
+                        let role =
+                            if index == 0 || index == header_rows + 1 || index + 1 == line_count {
+                                LineRole::TableBorder
+                            } else if index <= header_rows {
+                                LineRole::TableHeader
+                            } else {
+                                LineRole::TableBody
+                            };
                         output.lines.push(NeutralLine {
                             text: line,
                             role,
@@ -341,11 +356,9 @@ fn render_with_mode(
                         });
                     }
                 } else {
-                    output
-                        .diagnostics
-                        .push(RenderDiagnostic::TableTooNarrow {
-                            source_line: table.line,
-                        });
+                    output.diagnostics.push(RenderDiagnostic::TableTooNarrow {
+                        source_line: table.line,
+                    });
                     append_verbatim_source_lines(
                         &mut output.lines,
                         table.source_lines.iter().map(String::as_str),
@@ -359,10 +372,9 @@ fn render_with_mode(
                 }
             }
             MarkdownBlock::ThematicBreak { .. } => {
-                output.lines.push(NeutralLine::new(
-                    "─".repeat(width),
-                    LineRole::ThematicBreak,
-                ));
+                output
+                    .lines
+                    .push(NeutralLine::new("─".repeat(width), LineRole::ThematicBreak));
             }
             MarkdownBlock::Paragraph { lines, .. } => {
                 append_source_lines(
@@ -398,6 +410,8 @@ fn append_mermaid(
                 MermaidDiagramKind::Flowchart => "flowchart",
                 MermaidDiagramKind::ClassDiagram => "classDiagram",
                 MermaidDiagramKind::Sequence => "sequenceDiagram",
+                MermaidDiagramKind::StateDiagram => "stateDiagram",
+                MermaidDiagramKind::ErDiagram => "erDiagram",
             };
             // Over-budget flowcharts/class diagrams arrive as multiple
             // chunks: render each as its own bordered frame, numbered so the
@@ -420,7 +434,11 @@ fn append_mermaid(
                     }
                     output.lines.push(NeutralLine::new(
                         fit_text(&format!("│ {line}"), width),
-                        if in_edges { LineRole::MermaidEdge } else { LineRole::MermaidNode },
+                        if in_edges {
+                            LineRole::MermaidEdge
+                        } else {
+                            LineRole::MermaidNode
+                        },
                     ));
                 }
                 output.lines.push(NeutralLine::new(
@@ -432,30 +450,23 @@ fn append_mermaid(
         Err(diagnostic) => {
             let message = format!("! mermaid: {}", diagnostic.message);
             output.lines.push(NeutralLine::new(
-                fit_text("┌─ mermaid · source fallback", width),
+                fit_text("mermaid · source fallback", width),
                 LineRole::MermaidBorder,
             ));
             for line in source.lines() {
-                for wrapped in wrap_verbatim(line, width.saturating_sub(2).max(1)) {
-                    output.lines.push(NeutralLine::new(
-                        format!("│ {wrapped}"),
-                        LineRole::Code,
-                    ));
+                for wrapped in wrap_verbatim(line, width.max(1)) {
+                    output.lines.push(NeutralLine::new(wrapped, LineRole::Code));
                 }
             }
             if source.is_empty() {
-                output.lines.push(NeutralLine::new("│", LineRole::Code));
+                output.lines.push(NeutralLine::new("", LineRole::Code));
             }
-            for line in wrap_text(&message, width.saturating_sub(2).max(1)) {
+            for line in wrap_text(&message, width.max(1)) {
                 output.lines.push(NeutralLine::new(
-                    fit_text(&format!("│ {line}"), width),
+                    fit_text(&line, width),
                     LineRole::Diagnostic,
                 ));
             }
-            output.lines.push(NeutralLine::new(
-                fit_text("└─", width),
-                LineRole::MermaidBorder,
-            ));
             output.diagnostics.push(RenderDiagnostic::Mermaid {
                 source_line,
                 diagnostic,
@@ -585,7 +596,11 @@ fn append_verbatim_wrapped_lines<'a>(
     role: LineRole,
 ) {
     for line in lines {
-        output.extend(wrap_verbatim(line, width).into_iter().map(|text| NeutralLine::new(text, role)));
+        output.extend(
+            wrap_verbatim(line, width)
+                .into_iter()
+                .map(|text| NeutralLine::new(text, role)),
+        );
     }
 }
 
@@ -593,14 +608,24 @@ fn table_row_height(cells: &[String], widths: &[usize]) -> usize {
     widths
         .iter()
         .enumerate()
-        .map(|(column, width)| wrap_inline(cells.get(column).map(String::as_str).unwrap_or_default(), *width).len())
+        .map(|(column, width)| {
+            wrap_inline(
+                cells.get(column).map(String::as_str).unwrap_or_default(),
+                *width,
+            )
+            .len()
+        })
         .max()
         .unwrap_or(1)
 }
 
 fn layout_line_count(table: &super::table::TableBlock, widths: &[usize]) -> usize {
     3 + table_row_height(&table.headers, widths)
-        + table.rows.iter().map(|row| table_row_height(row, widths)).sum::<usize>()
+        + table
+            .rows
+            .iter()
+            .map(|row| table_row_height(row, widths))
+            .sum::<usize>()
 }
 
 fn append_verbatim_source_lines<'a>(
@@ -608,7 +633,11 @@ fn append_verbatim_source_lines<'a>(
     lines: impl IntoIterator<Item = &'a str>,
     role: LineRole,
 ) {
-    output.extend(lines.into_iter().map(|line| NeutralLine::new(sanitize_inline(line), role)));
+    output.extend(
+        lines
+            .into_iter()
+            .map(|line| NeutralLine::new(sanitize_inline(line), role)),
+    );
 }
 
 /// Append `text` wrapped at `width`, prefixed by `prefix` on the first line
@@ -765,7 +794,9 @@ mod tests {
             );
             if let Some(lang) = expected {
                 assert!(
-                    output.lines[0].text.starts_with(&format!("╭── code · {lang}")),
+                    output.lines[0]
+                        .text
+                        .starts_with(&format!("╭── code · {lang}")),
                     "top border must carry the language: {:?}",
                     output.lines[0].text
                 );
@@ -883,8 +914,7 @@ mod tests {
         // Indented code (Makefile/trace style) keeps its leading whitespace
         // and every frame row stays exactly `width` cells.
         for width in [20, 30, 40, 76] {
-            let source =
-                "```\n  two\n    four\n        eight\nbusy + Steer --> session.steer\n```";
+            let source = "```\n  two\n    four\n        eight\nbusy + Steer --> session.steer\n```";
             let output = render(source, width);
             assert!(
                 output.plain_text().contains("  two"),
@@ -988,7 +1018,10 @@ mod tests {
             "─".repeat(18),
         );
         assert_eq!(blank_body.plain_text(), blank_expected);
-        assert_eq!(code_body_lines(&blank_body)[0].language.as_deref(), Some("sh"));
+        assert_eq!(
+            code_body_lines(&blank_body)[0].language.as_deref(),
+            Some("sh")
+        );
 
         let unclosed = render_markdown_streaming(
             "```json\n{\"a\":1}",
@@ -1014,9 +1047,11 @@ mod tests {
             unclosed.diagnostics.as_slice(),
             [RenderDiagnostic::UnclosedFence { source_line: 1 }]
         ));
-        assert!(code_body_lines(&unclosed)
-            .iter()
-            .all(|line| line.language.as_deref() == Some("json")));
+        assert!(
+            code_body_lines(&unclosed)
+                .iter()
+                .all(|line| line.language.as_deref() == Some("json"))
+        );
         // The marker bottom is fence chrome, so it stays language-neutral.
         assert!(
             unclosed
@@ -1096,15 +1131,20 @@ mod tests {
         assert_eq!(output.lines[1].text, "│ code · … │");
         assert_eq!(output.lines[0].role, LineRole::CodeFence);
         assert_eq!(output.lines[1].role, LineRole::CodeFence);
-        assert_eq!(output.lines.last().map(|line| line.role), Some(LineRole::CodeFence));
-        assert!(code_body_lines(&output)
-            .iter()
-            .all(|line| line.language.as_deref() == Some(long_lang.as_str())));
+        assert_eq!(
+            output.lines.last().map(|line| line.role),
+            Some(LineRole::CodeFence)
+        );
+        assert!(
+            code_body_lines(&output)
+                .iter()
+                .all(|line| line.language.as_deref() == Some(long_lang.as_str()))
+        );
     }
 
     fn mermaid_card_count(text: &str) -> usize {
         text.lines()
-            .filter(|line| line.contains("┌─ mermaid ·"))
+            .filter(|line| line.contains("mermaid ·"))
             .count()
     }
 
@@ -1161,8 +1201,10 @@ Agent ..> AgentTool : via context\n\
     }
 
     #[test]
-    fn successful_labeled_subgraph_flowchart_card_is_single() {
+    fn labeled_subgraph_flowchart_card_splits_into_connected_frames() {
         // Exact user-reported flowchart LR with subgraph records["SessionRecord types"].
+        // At width 48 the four-node LR rank cannot fit one panel, so the
+        // canvas splits into two numbered cards connected by boundary rows.
         let source = "```mermaid\n\
 flowchart LR\n\
 subgraph records[\"SessionRecord types\"]\n\
@@ -1173,23 +1215,33 @@ X[User] --> A\n\
 ```";
         let output = render(source, 48);
         let text = output.plain_text();
-        assert_eq!(mermaid_card_count(&text), 1, "{text}");
-        assert!(text.contains("┌─ mermaid · flowchart"), "{text}");
+        assert_eq!(mermaid_card_count(&text), 2, "{text}");
+        assert!(text.contains("┌─ mermaid · flowchart [part 1/2]"), "{text}");
+        assert!(
+            text.lines()
+                .filter(|line| line.starts_with("┌─ mermaid · flowchart"))
+                .all(|line| line.contains("[part")),
+            "split cards must never use the unnumbered title: {text}"
+        );
         assert!(!text.contains("source fallback"), "{text}");
         assert!(!text.contains("! mermaid:"), "{text}");
         assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
-        assert!(text.contains("subgraph records · SessionRecord types"), "{text}");
+        assert!(
+            text.contains("subgraph records · SessionRecord types"),
+            "{text}"
+        );
         assert!(text.contains("end subgraph records"), "{text}");
         assert!(text.contains("A · Session"), "{text}");
-        assert!(text.contains("X ───▶ A"), "{text}");
-        assert_eq!(mermaid_footer_count(&output), 1, "{text}");
+        assert!(text.contains("C · ToolCall"), "{text}");
+        assert!(text.contains("X · User"), "{text}");
+        assert!(text.contains("▶B"), "{text}");
+        assert!(text.contains("boundary: B"), "{text}");
+        assert!(text.contains("boundary: X"), "{text}");
+        assert_eq!(mermaid_footer_count(&output), 2, "{text}");
     }
 
     #[test]
-    fn over_budget_flowchart_card_splits_into_numbered_frames() {
-        // A 112-node chain needs ~5k cells (per-chunk budget 3_200, 4x total
-        // ceiling): the card must render as two numbered frames with stub
-        // notes on the crossing edge instead of falling back to the source.
+    fn over_budget_flowchart_card_splits_into_numbered_connected_frames() {
         let mut diagram = String::from("flowchart TD\n");
         for i in 1..112 {
             diagram.push_str(&format!("A{i} --> A{}\n", i + 1));
@@ -1208,9 +1260,8 @@ X[User] --> A\n\
             },
         );
         let text = output.plain_text();
-        assert_eq!(mermaid_card_count(&text), 2, "{text}");
-        assert!(text.contains("┌─ mermaid · flowchart [part 1/2]"), "{text}");
-        assert!(text.contains("┌─ mermaid · flowchart [part 2/2]"), "{text}");
+        assert!(mermaid_card_count(&text) >= 2, "{text}");
+        assert!(text.contains("┌─ mermaid · flowchart [part 1/"), "{text}");
         assert!(
             text.lines()
                 .filter(|line| line.starts_with("┌─ mermaid · flowchart"))
@@ -1220,11 +1271,22 @@ X[User] --> A\n\
         assert!(!text.contains("source fallback"), "{text}");
         assert!(!text.contains("! mermaid:"), "{text}");
         assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
-        // The single crossing edge appears once as a source stub and once as
-        // a target stub (in the exact same order they read in the panels).
-        assert!(text.contains("│ A72 → …"), "{text}");
-        assert!(text.contains("│ … → A73"), "{text}");
-        assert_eq!(mermaid_footer_count(&output), 2, "{text}");
+        let vertical_glyphs = text.matches('▼').count();
+        let boundary_rows = text
+            .lines()
+            .filter(|line| line.contains("boundary:"))
+            .count();
+        assert_eq!(
+            vertical_glyphs + boundary_rows,
+            111,
+            "every edge must remain attached via vertical glyphs plus boundary rows: {text}"
+        );
+        assert!(!text.lines().any(|line| line.trim() == "│ edges"), "{text}");
+        assert_eq!(
+            mermaid_footer_count(&output),
+            mermaid_card_count(&text),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1235,15 +1297,25 @@ X[User] --> A\n\
         // back to the raw source; it must render as one or more numbered
         // diagram frames at every width, with no source fallback and no
         // diagnostic.
-        let source = format!("```mermaid\n{}\n```", super::super::mermaid::reported_subgraph_flowchart_source());
+        let source = format!(
+            "```mermaid\n{}\n```",
+            super::super::mermaid::reported_subgraph_flowchart_source()
+        );
         for width in [48usize, 60, 80, 100, 120, 160, 200] {
             let output = render(&source, width);
             let text = output.plain_text();
             assert!(mermaid_card_count(&text) >= 1, "width {width}: {text}");
-            assert!(text.contains("┌─ mermaid · flowchart"), "width {width}: {text}");
+            assert!(
+                text.contains("┌─ mermaid · flowchart"),
+                "width {width}: {text}"
+            );
             assert!(!text.contains("source fallback"), "width {width}: {text}");
             assert!(!text.contains("! mermaid:"), "width {width}: {text}");
-            assert!(output.diagnostics.is_empty(), "width {width}: {:?}", output.diagnostics);
+            assert!(
+                output.diagnostics.is_empty(),
+                "width {width}: {:?}",
+                output.diagnostics
+            );
             assert_eq!(
                 output
                     .lines
@@ -1253,12 +1325,118 @@ X[User] --> A\n\
                 0,
                 "width {width}"
             );
-            for id in ["CWD", "TR", "RM", "AD", "PJ", "SNAP", "SESS", "EXT", "ORCH", "SBX"] {
-                assert!(text.contains(&format!("subgraph {id} ·")), "width {width}: {text}");
+            for id in [
+                "CWD", "TR", "RM", "AD", "PJ", "SNAP", "SESS", "EXT", "ORCH", "SBX",
+            ] {
+                assert!(
+                    text.contains(&format!("subgraph {id} ·")),
+                    "width {width}: {text}"
+                );
             }
         }
     }
 
+    #[test]
+    fn architecture_multiline_flowchart_card_is_framed_and_bounded() {
+        let source = format!(
+            "```mermaid\n{}\n```",
+            super::super::mermaid::arch_flow_source()
+        );
+        for width in [32usize, 96] {
+            let output = render(&source, width);
+            let text = output.plain_text();
+
+            // The connected canvas now fits this four-node TD graph in one
+            // bounded card at both widths instead of splitting by declaration
+            // order.
+            let expected_cards = 1;
+            assert_eq!(
+                mermaid_card_count(&text),
+                expected_cards,
+                "width {width}: {text}"
+            );
+            assert_eq!(
+                mermaid_footer_count(&output),
+                expected_cards,
+                "width {width}: {text}"
+            );
+            assert!(
+                text.contains("┌─ mermaid · flowchart"),
+                "width {width}: {text}"
+            );
+            assert!(!text.contains("source fallback"), "width {width}: {text}");
+            assert!(!text.contains("! mermaid:"), "width {width}: {text}");
+            assert!(
+                !text.to_ascii_lowercase().contains("<br"),
+                "width {width}: literal break markup leaked from successful render: {text}"
+            );
+            assert!(
+                output.diagnostics.is_empty(),
+                "width {width}: {:?}",
+                output.diagnostics
+            );
+            assert!(
+                output
+                    .lines
+                    .iter()
+                    .all(|line| UnicodeWidthStr::width(line.text.as_str()) <= width),
+                "width {width}: card line exceeded width: {text}"
+            );
+
+            let node_rows = output
+                .lines
+                .iter()
+                .filter(|line| line.role == LineRole::MermaidNode)
+                .collect::<Vec<_>>();
+            // Truncation-safe stable prefixes: at narrow widths fit_text may
+            // truncate node content rows, so each assertion uses a prefix that
+            // survives truncation at both 32 and 96 columns.
+            for expected in [
+                "SESS ·",
+                "session.rs:3685",
+                "AGENT ·",
+                "agent.rs /",
+                "run_agent_loop",
+                "TOOL ·",
+                "tools.rs · execute()",
+                "PROV ·",
+                "stream · 流式请求",
+            ] {
+                assert!(
+                    node_rows.iter().any(|line| line.text.contains(expected)),
+                    "width {width}: framed node row {expected:?} missing: {text}"
+                );
+            }
+            assert_eq!(
+                node_rows
+                    .iter()
+                    .filter(|line| {
+                        line.text.contains("AGENT ·")
+                            || line.text.contains("agent.rs /")
+                            || line.text.contains("run_agent_loop")
+                    })
+                    .count(),
+                3,
+                "width {width}: AGENT break segments must occupy three framed rows: {text}"
+            );
+
+            // Attached canvas edge labels appear as glyphs; vertical arrow
+            // glyphs (▼) mark target borders. Labels and arrows occupy
+            // separate canvas rows, so each is asserted independently. At
+            // narrow widths the longer label may be truncated in a boundary
+            // row, so a truncation-safe prefix is used.
+            for expected_label in ["[run]", "[执行"] {
+                assert!(
+                    text.contains(expected_label),
+                    "width {width}: attached edge label {expected_label:?} missing: {text}"
+                );
+            }
+            assert!(
+                text.contains('▼'),
+                "width {width}: vertical arrow glyph missing: {text}"
+            );
+        }
+    }
     #[test]
     fn successful_sequence_diagram_card_is_single_and_truthful() {
         // Sequence participants, aliases, arrows, note, and an unknown-arrow
@@ -1280,11 +1458,17 @@ A => B: hmm\n\
         assert!(!text.contains("source fallback"), "{text}");
         assert!(!text.contains("! mermaid:"), "{text}");
         assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
-        assert!(text.contains("Alice ── Bob"), "{text}");
-        assert!(text.contains("│ │ Alice │──▶│ Bob : hello │"), "{text}");
-        assert!(text.contains("│ │ Bob   │···▶│ Alice : ack │"), "{text}");
-        assert!(text.contains("│ │ [note over A, B: working] │"), "{text}");
-        assert!(text.contains("│ │ A => B: hmm │"), "{text}");
+        assert!(text.contains("Alice"), "{text}");
+        assert!(text.contains("Bob"), "{text}");
+        assert!(text.contains("hello"), "{text}");
+        assert!(text.contains("ack"), "{text}");
+        assert!(text.contains("[note over A, B: working]"), "{text}");
+        assert!(text.contains("A => B: hmm"), "{text}");
+        assert!(text.contains('▶') && text.contains('◀'), "{text}");
+        assert!(
+            !text.contains("│ Alice │──▶│"),
+            "legacy sequence projection leaked: {text}"
+        );
         assert_eq!(mermaid_footer_count(&output), 1, "{text}");
     }
 
@@ -1300,11 +1484,11 @@ pie\n\
         let output = render(source, 48);
         let text = output.plain_text();
         assert_eq!(mermaid_card_count(&text), 1, "{text}");
-        assert!(text.contains("┌─ mermaid · source fallback"), "{text}");
+        assert!(text.contains("mermaid · source fallback"), "{text}");
         assert!(text.contains("\"Breakfast\" 5"), "{text}");
         assert!(text.contains("! mermaid:"), "{text}");
         assert!(!output.diagnostics.is_empty(), "{text}");
-        assert_eq!(mermaid_footer_count(&output), 1, "{text}");
+        assert_eq!(mermaid_footer_count(&output), 0, "{text}");
     }
 
     #[test]
@@ -1335,13 +1519,13 @@ X[User] --> A\n\
 ```";
         let output = render(source, 48);
         let text = output.plain_text();
-        assert_eq!(mermaid_card_count(&text), 2, "{text}");
+        assert_eq!(mermaid_card_count(&text), 3, "{text}");
         assert!(text.contains("┌─ mermaid · classDiagram"), "{text}");
         assert!(text.contains("┌─ mermaid · flowchart"), "{text}");
         assert!(!text.contains("source fallback"), "{text}");
         assert!(!text.contains("! mermaid:"), "{text}");
         assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
-        assert_eq!(mermaid_footer_count(&output), 2, "{text}");
+        assert_eq!(mermaid_footer_count(&output), 3, "{text}");
         assert_eq!(
             output
                 .lines
@@ -1363,25 +1547,54 @@ X[User] --> A\n\
 | Shared renderer | One wrapping implementation serves print and live terminal views | Adapters consume explicit semantic ranges |\n\
 | TUI reparsing | Quick to prototype | Duplicates parsing and can recolor ordinary content |";
         let output = render(source, 78);
-        assert!(output.lines.iter().all(|line| UnicodeWidthStr::width(line.text.as_str()) <= 78));
-        assert_eq!(output.lines.iter().filter(|line| line.role == LineRole::TableBorder).count(), 6);
+        assert!(
+            output
+                .lines
+                .iter()
+                .all(|line| UnicodeWidthStr::width(line.text.as_str()) <= 78)
+        );
+        assert_eq!(
+            output
+                .lines
+                .iter()
+                .filter(|line| line.role == LineRole::TableBorder)
+                .count(),
+            6
+        );
         assert!(output.lines.iter().any(|line| {
             line.role == LineRole::TableHeader
-                && line.inline_styles.iter().any(|styled| styled.style == super::super::inline::InlineStyle::Bold)
+                && line
+                    .inline_styles
+                    .iter()
+                    .any(|styled| styled.style == super::super::inline::InlineStyle::Bold)
         }));
         assert!(output.lines.iter().any(|line| {
             line.role == LineRole::TableBody
-                && line.inline_styles.iter().any(|styled| styled.style == super::super::inline::InlineStyle::Code)
+                && line
+                    .inline_styles
+                    .iter()
+                    .any(|styled| styled.style == super::super::inline::InlineStyle::Code)
         }));
         for line in output.lines.iter().filter(|line| {
-            matches!(line.role, LineRole::TableBorder | LineRole::TableHeader | LineRole::TableBody)
+            matches!(
+                line.role,
+                LineRole::TableBorder | LineRole::TableHeader | LineRole::TableBody
+            )
         }) {
-            for (offset, character) in line.text.char_indices().filter(|(_, character)| "┌┬┐├┼┤│└┴┘─".contains(*character)) {
-                assert!(line.inline_styles.iter().any(|styled| {
-                    styled.style == super::super::inline::InlineStyle::TableBorder
-                        && styled.range.start <= offset
-                        && styled.range.end >= offset + character.len_utf8()
-                }), "unmarked border {character:?} in {:?}", line.text);
+            for (offset, character) in line
+                .text
+                .char_indices()
+                .filter(|(_, character)| "┌┬┐├┼┤│└┴┘─".contains(*character))
+            {
+                assert!(
+                    line.inline_styles.iter().any(|styled| {
+                        styled.style == super::super::inline::InlineStyle::TableBorder
+                            && styled.range.start <= offset
+                            && styled.range.end >= offset + character.len_utf8()
+                    }),
+                    "unmarked border {character:?} in {:?}",
+                    line.text
+                );
             }
         }
     }
@@ -1402,17 +1615,30 @@ X[User] --> A\n\
         let lines = &output.lines;
         assert_eq!(lines.len(), 3, "one row per item: {lines:?}");
         for line in lines {
-            assert_eq!(line.role, LineRole::Text, "list lines are base text: {line:?}");
+            assert_eq!(
+                line.role,
+                LineRole::Text,
+                "list lines are base text: {line:?}"
+            );
         }
         assert_eq!(lines[0].text, "• 第一条要点");
         // "•" is 3 UTF-8 bytes + trailing space = 4 bytes.
-        assert_eq!(list_marker_range(&lines[0]).expect("bullet marker").range, (0..4));
+        assert_eq!(
+            list_marker_range(&lines[0]).expect("bullet marker").range,
+            (0..4)
+        );
         assert_eq!(lines[1].text, "1. 编号步骤");
-        assert_eq!(list_marker_range(&lines[1]).expect("ordered marker").range, (0..3));
+        assert_eq!(
+            list_marker_range(&lines[1]).expect("ordered marker").range,
+            (0..3)
+        );
         // Nested item: the 2-space indent is outside the marker range so the
         // indent renders in the base color, not the marker color.
         assert_eq!(lines[2].text, "  2. 嵌套项");
-        assert_eq!(list_marker_range(&lines[2]).expect("nested marker").range, (2..5));
+        assert_eq!(
+            list_marker_range(&lines[2]).expect("nested marker").range,
+            (2..5)
+        );
     }
 
     #[test]
@@ -1426,10 +1652,20 @@ X[User] --> A\n\
         // "•" is 3 UTF-8 bytes + trailing space = 4 bytes; the marker range
         // covers exactly the visible prefix even with an empty body.
         assert_eq!(lines[0].text, "• ");
-        assert_eq!(list_marker_range(&lines[0]).expect("empty bullet marker").range, (0..4));
+        assert_eq!(
+            list_marker_range(&lines[0])
+                .expect("empty bullet marker")
+                .range,
+            (0..4)
+        );
         assert_eq!(lines[1].text, "• 第二条");
         assert_eq!(lines[2].text, "1. ");
-        assert_eq!(list_marker_range(&lines[2]).expect("empty ordered marker").range, (0..3));
+        assert_eq!(
+            list_marker_range(&lines[2])
+                .expect("empty ordered marker")
+                .range,
+            (0..3)
+        );
     }
 
     #[test]
@@ -1440,15 +1676,27 @@ X[User] --> A\n\
         let lines = &output.lines;
         assert_eq!(lines.len(), 3, "one row per item: {lines:?}");
         for line in lines {
-            assert_eq!(line.role, LineRole::Text, "list lines are base text: {line:?}");
+            assert_eq!(
+                line.role,
+                LineRole::Text,
+                "list lines are base text: {line:?}"
+            );
         }
         assert_eq!(lines[0].text, "• ☐ open");
         assert_eq!(lines[1].text, "• ☑ done");
         assert_eq!(lines[2].text, "• ☑ DONE");
         // The checkbox is chrome like the bullet: the whole `• ☐ ` prefix
         // (8 UTF-8 bytes) carries the ListMarker style; the body is unstyled.
-        assert_eq!(list_marker_range(&lines[0]).expect("unchecked marker").range, (0..8));
-        assert_eq!(list_marker_range(&lines[1]).expect("checked marker").range, (0..8));
+        assert_eq!(
+            list_marker_range(&lines[0])
+                .expect("unchecked marker")
+                .range,
+            (0..8)
+        );
+        assert_eq!(
+            list_marker_range(&lines[1]).expect("checked marker").range,
+            (0..8)
+        );
         assert_eq!(
             lines[0].inline_styles.len(),
             1,
@@ -1465,7 +1713,10 @@ X[User] --> A\n\
         let lines = &output.lines;
         assert_eq!(lines.len(), 3, "every item renders a row: {lines:?}");
         assert_eq!(lines[0].text, "• ☐ ");
-        assert_eq!(list_marker_range(&lines[0]).expect("empty unchecked").range, (0..8));
+        assert_eq!(
+            list_marker_range(&lines[0]).expect("empty unchecked").range,
+            (0..8)
+        );
         assert_eq!(lines[1].text, "• ☑ ");
         assert_eq!(lines[2].text, "• 第二条");
     }
@@ -1505,7 +1756,10 @@ X[User] --> A\n\
         assert_eq!(lines[1].text, "• [ ]no-space");
         // The literal brackets are body text: the marker range still covers
         // only the bullet prefix.
-        assert_eq!(list_marker_range(&lines[0]).expect("bullet marker").range, (0..4));
+        assert_eq!(
+            list_marker_range(&lines[0]).expect("bullet marker").range,
+            (0..4)
+        );
     }
 
     #[test]
@@ -1581,7 +1835,11 @@ X[User] --> A\n\
         // `keyword_tail` used to slice `statement[..10]` at a non-char
         // boundary and panicked mid-mermaid-stream (exit 101). The full
         // block must stream (unclosed fence → code frame) and settle (closed
-        // fence → rendered sequence card) without panicking.
+        // fence → source fallback) without panicking. The over-budget
+        // sequence (6 participants, ~20 rows at width 96) exceeds the default
+        // output cell ceiling, so it falls back to one bordered source
+        // fallback carrying an OutputLimit diagnostic — not a successful
+        // sequenceDiagram card.
         let diagram = "\
 sequenceDiagram
     autonumber
@@ -1642,71 +1900,610 @@ sequenceDiagram
             renderer.push_str(&source[previous..]);
         }
         let streamed = renderer.output();
+        let stext = streamed.plain_text();
+        // The over-budget sequence settles as one unframed source fallback
+        // carrying an OutputLimit diagnostic — not a successful card.
+        assert!(
+            stext.contains("mermaid · source fallback"),
+            "closed fence must fall back for the over-budget sequence: {stext}"
+        );
+        assert!(
+            stext.contains("! mermaid:"),
+            "streamed fallback missing diagnostic: {stext}"
+        );
+        assert!(
+            !streamed.diagnostics.is_empty(),
+            "streamed fallback missing RenderDiagnostic"
+        );
+        assert_eq!(mermaid_card_count(&stext), 1, "streamed: {stext}");
+        assert_eq!(mermaid_footer_count(&streamed), 0, "streamed: {stext}");
         assert!(
             streamed
                 .lines
                 .iter()
-                .any(|line| line.text.contains("┌─ mermaid · sequenceDiagram")),
-            "closed fence must render the sequence card: {}",
-            streamed.plain_text()
+                .all(|line| UnicodeWidthStr::width(line.text.as_str()) <= 96),
+            "streamed fallback exceeded width: {stext}"
         );
 
-        // The settled (complete) render must also succeed — this is the
+        // The settled (complete) render must also fall back — this is the
         // transcript re-render path after the stream settles.
         let complete = render_markdown(&source, &options);
         let text = complete.plain_text();
-        assert!(text.contains("┌─ mermaid · sequenceDiagram"), "{text}");
-        assert!(!text.contains("source fallback"), "{text}");
+        assert!(text.contains("mermaid · source fallback"), "{text}");
+        assert!(
+            text.contains("! mermaid:"),
+            "complete fallback missing diagnostic: {text}"
+        );
+        assert!(
+            !complete.diagnostics.is_empty(),
+            "complete fallback missing RenderDiagnostic"
+        );
+        assert_eq!(mermaid_card_count(&text), 1, "{text}");
+        assert_eq!(mermaid_footer_count(&complete), 0, "{text}");
+        assert!(
+            complete
+                .lines
+                .iter()
+                .all(|line| UnicodeWidthStr::width(line.text.as_str()) <= 96),
+            "complete fallback exceeded width: {text}"
+        );
+        // The source CJK block keywords are preserved in the fallback body.
         assert!(text.contains("loop 每个模型回合"), "{text}");
         assert!(text.contains("alt 有工具调用"), "{text}");
         assert!(text.contains("else 无工具调用"), "{text}");
-        assert!(complete.diagnostics.is_empty(), "{:?}", complete.diagnostics);
     }
 
     #[test]
     fn streaming_and_complete_render_survive_hostile_mermaid_content() {
-        // D78's fallback content shapes (CJK labels, `<br/>`, quoted
-        // subgraph titles, classDef lines, stateDiagram-v2, pie, multi-node
-        // edges) must never panic the mermaid path: every statement either
-        // parses, falls back to source, or produces a diagnostic — none may
-        // unwind, in complete mode or in the streaming tail at ANY valid
-        // prefix length.
+        // D78's hostile shapes must do more than avoid panics: supported
+        // diagrams settle as bounded, diagnostic-free Mermaid cards, while
+        // unsupported syntax visibly preserves the source with a diagnostic.
+        // Successful cards must never leak raw break markup, in complete mode,
+        // streaming mode, or at any valid streaming prefix.
         let hostile = [
             // Run-1 fallback shapes: CJK/`<br/>` node labels + classDef line.
-            "flowchart LR\nMEMTOOL[\"memory · recall · retain · reflect\"]\nMCPTOOL[\"mcp_tool（McpRegistry）<br/>mcp.rs:554\"]\nMEMTOOL --> MCPTOOL\nclassDef lay fill:#eef7ff,stroke:#1565c0\nclass L0,L1 lay\n",
+            (
+                "flowchart LR\nMEMTOOL[\"memory · recall · retain · reflect\"]\nMCPTOOL[\"mcp_tool（McpRegistry）<br/>mcp.rs:554\"]\nMEMTOOL --> MCPTOOL\nclassDef lay fill:#eef7ff,stroke:#1565c0\nclass L0,L1 lay\n",
+                None,
+            ),
             // Quoted subgraph title without an id (run-2 diagram 2 shape).
-            "graph TD\nsubgraph \"会话核心\"\nS[\"Session<br/>session.rs\"]\nend\n",
-            // stateDiagram-v2 (run-2 diagrams 7-8): always fallback.
-            "stateDiagram-v2\n[*] --> Idle: new Session\nIdle --> Running: run / continue_run<br/>begin_run 声明回合\nParked --> Running: hub 消息唤醒/revival\n",
+            (
+                "graph TD\nsubgraph \"会话核心\"\nS[\"Session<br/>session.rs\"]\nend\n",
+                None,
+            ),
+            // stateDiagram-v2 (run-2 diagrams 7-8): successful bounded card.
+            (
+                "stateDiagram-v2\n[*] --> Idle\nIdle --> Running: 状态 空闲\nRunning --> [*]\n",
+                Some("stateDiagram"),
+            ),
+            // erDiagram: solid six-char cardinality + CJK relation/attribute text.
+            (
+                "erDiagram\nUSER ||--o{ SESSION : 拥有\nUSER {\nstring 名称\n}\nSESSION {\nstring 标识\n}\n",
+                Some("erDiagram"),
+            ),
             // Unsupported diagram kind.
-            "pie\n\"Breakfast\" 5\n\"Lunch\" 3\n",
+            ("pie\n\"Breakfast\" 5\n\"Lunch\" 3\n", None),
+            // Supported break forms, including case-insensitive markup and CJK.
+            (
+                "flowchart TD\nA[\"alpha<br>beta<br/>gamma<br />delta<BR>终\"] --> B[\"done\"]\n",
+                Some("flowchart"),
+            ),
+            // Multiline diamond semantics cannot be represented as box rows.
+            ("flowchart TD\nD{\"one<br/>two\"}\n", None),
             // CJK sequence block keywords.
-            "sequenceDiagram\nparticipant U as 用户\nloop 每个模型回合\nU->>S: run(prompt)\nalt 有工具调用\nS->>T: 执行工具\nelse 无工具调用\nend\nend\n",
+            (
+                "sequenceDiagram\nparticipant U as 用户\nloop 每个模型回合\nU->>S: run(prompt)\nalt 有工具调用\nS->>T: 执行工具\nelse 无工具调用\nend\nend\n",
+                Some("sequenceDiagram"),
+            ),
             // Multi-node edges with quoted labels.
-            "flowchart LR\nA[\"x\"] -->|\"y\"| B\nB --> C & D\nA & E --> F\n",
+            (
+                "flowchart LR\nA[\"x\"] -->|\"y\"| B\nB --> C & D\nA & E --> F\n",
+                Some("flowchart"),
+            ),
             // classDiagram members + relations.
-            "classDiagram\nclass Application {\n+run()\n}\nApplication --> Session\nAgent ..> AgentTool : via context\n",
+            (
+                "classDiagram\nclass Application {\n+run()\n}\nApplication --> Session\nAgent ..> AgentTool : via context\n",
+                Some("classDiagram"),
+            ),
             // Unterminated bracket mid-statement (partial stream artifact).
-            "flowchart LR\nA[\"x\" --> B\n",
+            ("flowchart LR\nA[\"x\" --> B\n", None),
         ];
         let options = MarkdownRenderOptions {
             width: 48,
             ..MarkdownRenderOptions::default()
         };
-        for block in hostile {
+        for (block, expected_kind) in hostile {
             let source = format!("```mermaid\n{block}\n```");
-            let _ = render_markdown(&source, &options);
+            let assert_settled = |output: &MarkdownRenderOutput, mode: &str| {
+                let text = output.plain_text();
+                assert!(
+                    output
+                        .lines
+                        .iter()
+                        .all(|line| UnicodeWidthStr::width(line.text.as_str()) <= options.width),
+                    "{mode} emitted an unbounded line for {block:?}: {text}"
+                );
+                match expected_kind {
+                    Some(kind) => {
+                        // Successful renders may split into numbered panels when
+                        // over budget; every panel still closes its own frame.
+                        assert!(
+                            mermaid_card_count(&text) >= 1,
+                            "{mode} must settle as at least one Mermaid card for {block:?}: {text}"
+                        );
+                        assert_eq!(
+                            mermaid_footer_count(output),
+                            mermaid_card_count(&text),
+                            "{mode} split panels must close one frame per card for {block:?}: {text}"
+                        );
+                        assert!(
+                            text.contains(&format!("┌─ mermaid · {kind}")),
+                            "{mode} expected successful {kind} card for {block:?}: {text}"
+                        );
+                        assert!(
+                            !text.contains("source fallback") && !text.contains("! mermaid:"),
+                            "{mode} unexpectedly fell back for {block:?}: {text}"
+                        );
+                        assert!(
+                            output.diagnostics.is_empty(),
+                            "{mode} successful card emitted diagnostics for {block:?}: {:?}",
+                            output.diagnostics
+                        );
+                        assert!(
+                            !text.to_ascii_lowercase().contains("<br"),
+                            "{mode} successful card leaked literal break markup for {block:?}: {text}"
+                        );
+                    }
+                    None => {
+                        // Unsupported input collapses to exactly one unframed
+                        // source fallback with a diagnostic — never a split panel.
+                        assert_eq!(
+                            mermaid_card_count(&text),
+                            1,
+                            "{mode} must settle as exactly one fallback card for {block:?}: {text}"
+                        );
+                        assert_eq!(
+                            mermaid_footer_count(output),
+                            0,
+                            "{mode} fallback must remain unframed for {block:?}: {text}"
+                        );
+                        let header = block.lines().next().unwrap_or_default();
+                        assert!(
+                            text.contains("mermaid · source fallback"),
+                            "{mode} unsupported input did not visibly fall back for {block:?}: {text}"
+                        );
+                        assert!(
+                            text.contains(header),
+                            "{mode} fallback did not preserve source header {header:?}: {text}"
+                        );
+                        assert!(
+                            text.contains("! mermaid:") && !output.diagnostics.is_empty(),
+                            "{mode} fallback lacked a diagnostic for {block:?}: {text}"
+                        );
+                    }
+                }
+            };
+
+            let complete = render_markdown(&source, &options);
+            assert_settled(&complete, "complete");
+
             let mut renderer = StreamingMarkdownRenderer::new(options.clone());
             renderer.push_str(&source);
-            let _ = renderer.output();
-            // Every valid prefix length (worst-case partial content).
-            let mut boundaries = source.char_indices().map(|(index, _)| index).collect::<Vec<_>>();
+            let streamed = renderer.output();
+            assert_settled(&streamed, "streaming");
+
+            // Every valid prefix length is a worst-case partial provider
+            // delta. It may still be a code frame, but any Mermaid card it
+            // produces must be bounded and truthful.
+            let mut boundaries = source
+                .char_indices()
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
             boundaries.push(source.len());
             for end in boundaries {
                 let mut renderer = StreamingMarkdownRenderer::new(options.clone());
                 renderer.push_str(&source[..end]);
-                let _ = renderer.output();
+                let output = renderer.output();
+                let text = output.plain_text();
+                assert!(
+                    output
+                        .lines
+                        .iter()
+                        .all(|line| UnicodeWidthStr::width(line.text.as_str()) <= options.width),
+                    "prefix {end} emitted an unbounded line for {block:?}: {text}"
+                );
+                let successful_card = text
+                    .lines()
+                    .any(|line| line.contains("┌─ mermaid ·") && !line.contains("source fallback"));
+                if successful_card {
+                    assert!(
+                        !text.to_ascii_lowercase().contains("<br"),
+                        "prefix {end} successful card leaked literal break markup for {block:?}: {text}"
+                    );
+                    assert!(
+                        output.diagnostics.is_empty(),
+                        "prefix {end} successful card emitted diagnostics for {block:?}: {:?}",
+                        output.diagnostics
+                    );
+                }
+                if text.contains("mermaid · source fallback") {
+                    assert!(
+                        text.contains("! mermaid:") && !output.diagnostics.is_empty(),
+                        "prefix {end} fallback lacked a diagnostic for {block:?}: {text}"
+                    );
+                }
             }
+        }
+    }
+
+    // ---- stateDiagram / erDiagram Markdown-layer presentation parity ----
+
+    fn fenced_mermaid(block: &str) -> String {
+        format!("```mermaid\n{block}\n```")
+    }
+
+    fn state_block() -> &'static str {
+        "stateDiagram-v2\n[*] --> Idle\nIdle --> Running: 状态 空闲\nRunning --> [*]\n"
+    }
+
+    fn er_block() -> &'static str {
+        "erDiagram\nUSER ||--o{ SESSION : 拥有\nUSER {\nstring 名称\n}\nSESSION {\nstring 标识\n}\n"
+    }
+
+    fn assert_bounded(output: &MarkdownRenderOutput, width: usize, ctx: &str) {
+        for line in &output.lines {
+            assert!(
+                UnicodeWidthStr::width(line.text.as_str()) <= width,
+                "{ctx}: line exceeded width {width}: {:?}",
+                line.text
+            );
+        }
+    }
+
+    #[test]
+    fn successful_state_and_er_cards_are_bounded_and_truthful() {
+        // Valid CJK state/ER diagrams settle as exactly one diagnostic-free
+        // Mermaid card carrying the exact production title. No literal break
+        // markup ever appears in a successful card; node-label `<br/>` is
+        // exercised by `state_node_label_break_renders_without_leak`.
+        for (block, kind) in [(state_block(), "stateDiagram"), (er_block(), "erDiagram")] {
+            let source = fenced_mermaid(block);
+            let width = 48;
+            let title = format!("┌─ mermaid · {kind}");
+
+            let complete = render(&source, width);
+            let text = complete.plain_text();
+            assert_eq!(mermaid_card_count(&text), 1, "{kind}: {text}");
+            assert_eq!(mermaid_footer_count(&complete), 1, "{kind}: {text}");
+            assert!(text.contains(&title), "{kind}: exact title missing: {text}");
+            // Titles are exclusive: neither kind reuses another kind's title.
+            for other in [
+                "┌─ mermaid · flowchart",
+                "┌─ mermaid · classDiagram",
+                "┌─ mermaid · sequenceDiagram",
+            ] {
+                assert!(!text.contains(other), "{kind}: stray title {other}: {text}");
+            }
+            assert!(
+                !text.to_ascii_lowercase().contains("<br"),
+                "{kind}: literal break markup leaked from successful render: {text}"
+            );
+            assert!(!text.contains("source fallback"), "{kind}: {text}");
+            assert!(!text.contains("! mermaid:"), "{kind}: {text}");
+            assert!(
+                complete.diagnostics.is_empty(),
+                "{kind}: {:?}",
+                complete.diagnostics
+            );
+            assert_bounded(&complete, width, kind);
+
+            // Streaming the whole block in one push settles identically.
+            let mut renderer = StreamingMarkdownRenderer::new(MarkdownRenderOptions {
+                width,
+                ..MarkdownRenderOptions::default()
+            });
+            renderer.push_str(&source);
+            let streamed = renderer.output();
+            let stext = streamed.plain_text();
+            assert_eq!(mermaid_card_count(&stext), 1, "{kind} stream: {stext}");
+            assert_eq!(mermaid_footer_count(&streamed), 1, "{kind} stream: {stext}");
+            assert!(
+                stext.contains(&title),
+                "{kind} stream: title missing: {stext}"
+            );
+            assert!(
+                !stext.to_ascii_lowercase().contains("<br"),
+                "{kind} stream: leaked markup: {stext}"
+            );
+            assert!(
+                streamed.diagnostics.is_empty(),
+                "{kind} stream: {:?}",
+                streamed.diagnostics
+            );
+            assert_bounded(&streamed, width, kind);
+        }
+    }
+
+    #[test]
+    fn state_and_er_open_prefixes_stay_bounded_until_settled() {
+        // Every char-boundary open prefix is a worst-case partial delta. It
+        // may be a code frame, but any Mermaid card it produces must be
+        // bounded and truthful: a successful card never leaks `<br` and never
+        // emits diagnostics; a fallback always carries a diagnostic. A prefix
+        // that ends mid-statement falls back rather than rendering a partial
+        // card.
+        for (block, kind) in [(state_block(), "stateDiagram"), (er_block(), "erDiagram")] {
+            let source = fenced_mermaid(block);
+            let options = MarkdownRenderOptions {
+                width: 48,
+                ..MarkdownRenderOptions::default()
+            };
+            let mut boundaries = source.char_indices().map(|(i, _)| i).collect::<Vec<_>>();
+            boundaries.push(source.len());
+            let mut settled_success = false;
+            for &end in &boundaries {
+                let mut renderer = StreamingMarkdownRenderer::new(options.clone());
+                renderer.push_str(&source[..end]);
+                let output = renderer.output();
+                let text = output.plain_text();
+                assert_bounded(&output, options.width, &format!("{kind} prefix {end}"));
+                // An open (unclosed-fence) prefix must stay a bounded code
+                // frame, never a Mermaid card; the card appears only once the
+                // fence closes (the fully-streamed source).
+                if end < source.len() {
+                    assert_eq!(
+                        mermaid_card_count(&text),
+                        0,
+                        "{kind} prefix {end}: open prefix rendered a Mermaid card instead of a code frame: {text}"
+                    );
+                }
+                let successful_card = text
+                    .lines()
+                    .any(|line| line.contains("┌─ mermaid ·") && !line.contains("source fallback"));
+                if successful_card {
+                    assert!(
+                        !text.to_ascii_lowercase().contains("<br"),
+                        "{kind} prefix {end}: successful card leaked markup: {text}"
+                    );
+                    assert!(
+                        output.diagnostics.is_empty(),
+                        "{kind} prefix {end}: successful card emitted diagnostics: {:?}",
+                        output.diagnostics
+                    );
+                    assert!(
+                        text.contains(&format!("┌─ mermaid · {kind}")),
+                        "{kind} prefix {end}: wrong successful title: {text}"
+                    );
+                    settled_success = true;
+                }
+                if text.contains("mermaid · source fallback") {
+                    assert!(
+                        text.contains("! mermaid:") && !output.diagnostics.is_empty(),
+                        "{kind} prefix {end}: fallback lacked a diagnostic: {text}"
+                    );
+                }
+            }
+            // The fully-streamed source settles as a successful card.
+            assert!(
+                settled_success,
+                "{kind}: no prefix produced a successful card"
+            );
+        }
+    }
+
+    #[test]
+    fn state_and_er_cards_survive_width_sweep() {
+        for (block, kind) in [(state_block(), "stateDiagram"), (er_block(), "erDiagram")] {
+            let source = fenced_mermaid(block);
+            for width in [28usize, 40, 56, 72, 96, 120] {
+                let output = render(&source, width);
+                let text = output.plain_text();
+                assert_eq!(mermaid_card_count(&text), 1, "{kind} width {width}: {text}");
+                assert_eq!(
+                    mermaid_footer_count(&output),
+                    1,
+                    "{kind} width {width}: {text}"
+                );
+                assert!(
+                    text.contains(&format!("┌─ mermaid · {kind}")),
+                    "{kind} width {width}: exact title missing: {text}"
+                );
+                assert!(
+                    !text.contains("source fallback"),
+                    "{kind} width {width}: {text}"
+                );
+                assert!(!text.contains("! mermaid:"), "{kind} width {width}: {text}");
+                assert!(
+                    !text.to_ascii_lowercase().contains("<br"),
+                    "{kind} width {width}: leaked markup: {text}"
+                );
+                assert!(
+                    output.diagnostics.is_empty(),
+                    "{kind} width {width}: {:?}",
+                    output.diagnostics
+                );
+                assert_bounded(&output, width, &format!("{kind} width {width}"));
+            }
+        }
+    }
+
+    #[test]
+    fn state_and_er_failures_are_one_unframed_source_fallback() {
+        // Invalid/unsupported input and every budget overrun (source, node,
+        // edge, output) collapse to exactly one unframed nonblank source
+        // fallback carrying a diagnostic — never a split panel or a blank
+        // card. State/ER/sequence over budget returns OutputLimit (no split panels).
+        let width = 48usize;
+        let mut node_chain = String::from("stateDiagram-v2\n");
+        for i in 0..70 {
+            node_chain.push_str(&format!("S{i} --> S{}\n", i + 1));
+        }
+        let mut edge_chain = String::from("stateDiagram-v2\n");
+        for i in 0..20 {
+            edge_chain.push_str(&format!("S{i} --> S{}\n", i + 1));
+        }
+        // 22 000 CJK chars × 3 bytes ≈ 66 KiB > 64 KiB source ceiling.
+        let oversize = format!("stateDiagram-v2\nA --> B: {}\n", "字".repeat(22000));
+        let cases: Vec<(&str, &str, &str, MermaidLimits)> = vec![
+            // Invalid statement: ER relation missing the cardinality operator.
+            (
+                "erDiagram\nUSER SESSION : 拥有\n",
+                "erDiagram",
+                "invalid ER",
+                MermaidLimits::default(),
+            ),
+            // Transition label containing `<brx>`: split_label_rows rejects the
+            // unrecognized <br...> form, so the whole state diagram falls back
+            // (InvalidSyntax "transition"). A valid `<br/>` no longer falls
+            // back — it renders as multiple rows via state_edge_lines.
+            (
+                "stateDiagram-v2\n[*] --> Idle\nIdle --> Running: 状态 空闲<brx>开始\nRunning --> [*]\n",
+                "stateDiagram-v2",
+                "transition <brx>",
+                MermaidLimits::default(),
+            ),
+            // Unsupported diagram kind.
+            (
+                "journey\ntitle Day\nsection Work\nGo home : 5\n",
+                "journey",
+                "unsupported",
+                MermaidLimits::default(),
+            ),
+            // Source over the 64 KiB ceiling (fires before parsing).
+            (
+                oversize.as_str(),
+                "stateDiagram-v2",
+                ">64KiB",
+                MermaidLimits::default(),
+            ),
+            // Node budget (default max_nodes 64): 71 states overruns it.
+            (
+                node_chain.as_str(),
+                "stateDiagram-v2",
+                "node budget",
+                MermaidLimits {
+                    max_edges: 256,
+                    ..MermaidLimits::default()
+                },
+            ),
+            // Edge budget (max_edges 10): a 20-edge chain overruns it.
+            (
+                edge_chain.as_str(),
+                "stateDiagram-v2",
+                "edge budget",
+                MermaidLimits {
+                    max_nodes: 256,
+                    max_edges: 10,
+                    ..MermaidLimits::default()
+                },
+            ),
+            // Output budget: a normal ER diagram over a tiny cell ceiling.
+            (
+                er_block(),
+                "erDiagram",
+                "output budget",
+                MermaidLimits {
+                    max_output_cells: 10,
+                    ..MermaidLimits::default()
+                },
+            ),
+            // Over-budget sequence: OutputLimit source fallback (no split panels).
+            (
+                "sequenceDiagram\nparticipant A as Alice\nA->>B: hello\nB-->>A: ack\n",
+                "sequenceDiagram",
+                "sequence output budget",
+                MermaidLimits {
+                    max_output_cells: 5,
+                    ..MermaidLimits::default()
+                },
+            ),
+        ];
+        for &(block, header, label, limits) in &cases {
+            let source = fenced_mermaid(block);
+            let options = MarkdownRenderOptions {
+                width,
+                mermaid: limits,
+                ..MarkdownRenderOptions::default()
+            };
+            let output = render_markdown(&source, &options);
+            let text = output.plain_text();
+            assert_eq!(
+                mermaid_card_count(&text),
+                1,
+                "{label}: expected one card: {text}"
+            );
+            assert_eq!(
+                mermaid_footer_count(&output),
+                0,
+                "{label}: fallback must be unframed: {text}"
+            );
+            assert!(
+                text.contains("mermaid · source fallback"),
+                "{label}: no fallback chrome: {text}"
+            );
+            assert!(
+                text.contains(header),
+                "{label}: source header {header:?} not preserved: {text}"
+            );
+            assert!(
+                text.contains("! mermaid:"),
+                "{label}: no diagnostic line: {text}"
+            );
+            assert!(
+                !output.diagnostics.is_empty(),
+                "{label}: no RenderDiagnostic: {:?}",
+                output.diagnostics
+            );
+            // No split panels: exactly one card title and one footer.
+            assert_bounded(&output, width, label);
+            // Fallback body is nonblank: at least one source row besides chrome.
+            let body = output
+                .lines
+                .iter()
+                .filter(|line| line.role == LineRole::Code)
+                .count();
+            assert!(body >= 1, "{label}: fallback body was blank: {text}");
+        }
+    }
+
+    #[test]
+    fn state_node_label_break_renders_without_leak() {
+        // A `<br/>` inside a state NODE label (alias) is rendered as a line
+        // break by append_node: the diagram succeeds and the successful card
+        // never leaks literal `<br` markup — the label splits into `状态` and
+        // `空闲` rows. (An invalid `<brx>` in a transition label falls back;
+        // that path is covered by `state_and_er_failures_are_one_unframed_source_fallback`.)
+        let block = "stateDiagram-v2\n[*] --> Idle\nstate \"状态<br/>空闲\" as Running\nIdle --> Running\nRunning --> [*]\n";
+        let source = fenced_mermaid(block);
+        for width in [40usize, 64, 96] {
+            let output = render(&source, width);
+            let text = output.plain_text();
+            assert_eq!(mermaid_card_count(&text), 1, "width {width}: {text}");
+            assert_eq!(mermaid_footer_count(&output), 1, "width {width}: {text}");
+            assert!(
+                text.contains("┌─ mermaid · stateDiagram"),
+                "width {width}: {text}"
+            );
+            assert!(!text.contains("source fallback"), "width {width}: {text}");
+            assert!(!text.contains("! mermaid:"), "width {width}: {text}");
+            assert!(
+                output.diagnostics.is_empty(),
+                "width {width}: {:?}",
+                output.diagnostics
+            );
+            assert!(
+                !text.to_ascii_lowercase().contains("<br"),
+                "width {width}: node-label <br/> leaked: {text}"
+            );
+            assert!(
+                text.contains("状态"),
+                "width {width}: first split row missing: {text}"
+            );
+            assert!(
+                text.contains("空闲"),
+                "width {width}: second split row missing: {text}"
+            );
+            assert_bounded(&output, width, &format!("node-br width {width}"));
         }
     }
 }

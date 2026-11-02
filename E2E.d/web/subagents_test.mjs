@@ -13,8 +13,7 @@ const evidence = process.env.RPI_EVIDENCE || '.';
 const chromePath = process.env.RPI_CHROME || '';
 
 function fail(message) {
-  console.error(`d93: FAIL: ${message}`);
-  process.exit(2);
+  throw new Error(`d93: FAIL: ${message}`);
 }
 
 async function waitFor(page, fn, label, timeoutMs = 30000, arg) {
@@ -29,14 +28,14 @@ async function main() {
   if (!url) fail('RPI_URL is required');
   const launchOptions = chromePath ? { executablePath: chromePath } : {};
   const browser = await chromium.launch(launchOptions);
+  let page;
   try {
-    const page = await browser.newPage();
+    page = await browser.newPage({ viewport: { width: 1360, height: 900 } });
     if (token) {
       await page.addInitScript((t) => { window.localStorage.setItem('rpi-web-token', t); }, token);
     }
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
-    await waitFor(page, () => document.getElementById('conn-state') !== null, 'conn-state missing');
-        await waitFor(page, () => document.getElementById('conn-state').dataset.state === 'on', 'WS never connected');
+    await waitFor(page, () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true, 'WS never connected');
 
     // --- Subagents panel ---
     await page.click('#subagents-toggle-btn');
@@ -98,9 +97,16 @@ async function main() {
       'Running tab never reactivated after arrow-key navigation'
     );
 
-    // Spawn a faux subagent via the panel (task_spawn; agent auto/writer).
+    const detailsTask = [
+      'web-e2e-subagent-details: audit the release notes and report findings.',
+      'Keep every acceptance sentence in the task body so the description stays',
+      'longer than two hundred characters and still ends on DETAILSTAIL',
+    ].join(' ');
+    if (detailsTask.length <= 200 || !detailsTask.endsWith('DETAILSTAIL')) {
+      fail(`details task fixture is not >200 chars ending DETAILSTAIL (${detailsTask.length})`);
+    }
     await page.selectOption('#subagents-agent-select', 'writer');
-    await page.fill('#subagents-task-input', 'web-e2e-subagent: audit the release notes and report findings');
+    await page.fill('#subagents-task-input', detailsTask);
     await page.click('#subagents-spawn-btn');
 
     // Job card appears with the task summary (description).
@@ -108,14 +114,14 @@ async function main() {
       page,
       () => {
         const cards = [...document.querySelectorAll('.subagent-job')];
-        return cards.some((c) => (c.textContent || '').includes('audit the release notes'));
+        return cards.some((c) => (c.textContent || '').includes('web-e2e-subagent-details'));
       },
       'spawned subagent job never appeared in the panel'
     );
     const status = () =>
       page.evaluate(() => {
         const cards = [...document.querySelectorAll('.subagent-job')];
-        const card = cards.find((c) => (c.textContent || '').includes('audit the release notes'));
+        const card = cards.find((c) => (c.textContent || '').includes('web-e2e-subagent-details'));
         return card ? card.getAttribute('data-status') || '' : '';
       });
     const live = await status();
@@ -125,7 +131,7 @@ async function main() {
     // Live activity/elapsed one-liner rendered.
     const progress = await page.evaluate(() => {
       const cards = [...document.querySelectorAll('.subagent-job')];
-      const card = cards.find((c) => (c.textContent || '').includes('audit the release notes'));
+      const card = cards.find((c) => (c.textContent || '').includes('web-e2e-subagent-details'));
       const line = card ? card.querySelector('[data-progress-line]') : null;
       return line ? line.textContent || '' : '';
     });
@@ -140,7 +146,7 @@ async function main() {
       page,
       () => {
         const cards = [...document.querySelectorAll('.subagent-job')];
-        return !cards.some((c) => (c.textContent || '').includes('audit the release notes'));
+        return !cards.some((c) => (c.textContent || '').includes('web-e2e-subagent-details'));
       },
       'live job still visible under the Completed filter'
     );
@@ -156,7 +162,7 @@ async function main() {
       page,
       () => {
         const cards = [...document.querySelectorAll('.subagent-job')];
-        return cards.some((c) => (c.textContent || '').includes('audit the release notes'));
+        return cards.some((c) => (c.textContent || '').includes('web-e2e-subagent-details'));
       },
       'live job never reappeared after switching back to Running'
     );
@@ -166,7 +172,7 @@ async function main() {
     // toggle button reads "Hide output" while the pane is open.
     await page.evaluate(() => {
       const cards = [...document.querySelectorAll('.subagent-job')];
-      const card = cards.find((c) => (c.textContent || '').includes('audit the release notes'));
+      const card = cards.find((c) => (c.textContent || '').includes('web-e2e-subagent-details'));
       [...card.querySelectorAll('.subagent-job__action')]
         .find((b) => /output/i.test(b.textContent || ''))
         .click();
@@ -175,7 +181,7 @@ async function main() {
       page,
       () => {
         const cards = [...document.querySelectorAll('.subagent-job')];
-        const card = cards.find((c) => (c.textContent || '').includes('audit the release notes'));
+        const card = cards.find((c) => (c.textContent || '').includes('web-e2e-subagent-details'));
         return !!card && card.querySelector('[data-output-view]') !== null;
       },
       'job output pane never opened (filter-survival precondition)'
@@ -186,7 +192,7 @@ async function main() {
       page,
       () => {
         const cards = [...document.querySelectorAll('.subagent-job')];
-        const card = cards.find((c) => (c.textContent || '').includes('audit the release notes'));
+        const card = cards.find((c) => (c.textContent || '').includes('web-e2e-subagent-details'));
         return !!card && card.querySelector('[data-output-view]') !== null;
       },
       'output pane did not survive the filter round trip'
@@ -194,7 +200,7 @@ async function main() {
     // Close it again so the later dedicated output section starts clean.
     await page.evaluate(() => {
       const cards = [...document.querySelectorAll('.subagent-job')];
-      const card = cards.find((c) => (c.textContent || '').includes('audit the release notes'));
+      const card = cards.find((c) => (c.textContent || '').includes('web-e2e-subagent-details'));
       [...card.querySelectorAll('.subagent-job__action')]
         .find((b) => /output/i.test(b.textContent || ''))
         .click();
@@ -203,7 +209,7 @@ async function main() {
       page,
       () => {
         const cards = [...document.querySelectorAll('.subagent-job')];
-        const card = cards.find((c) => (c.textContent || '').includes('audit the release notes'));
+        const card = cards.find((c) => (c.textContent || '').includes('web-e2e-subagent-details'));
         return !card || card.querySelector('[data-output-view]') === null;
       },
       'output pane never closed after the filter round trip'
@@ -219,7 +225,7 @@ async function main() {
     // via the Close button, before continuing the hub/output/cancel flow.
     await page.evaluate(() => {
       const cards = [...document.querySelectorAll('.subagent-job')];
-      const card = cards.find((c) => (c.textContent || '').includes('audit the release notes'));
+      const card = cards.find((c) => (c.textContent || '').includes('web-e2e-subagent-details'));
       card.querySelector('[data-details-trigger]').click();
     });
     await waitFor(
@@ -232,7 +238,7 @@ async function main() {
       const dlg = document.querySelector('[data-details-dialog]');
       const close = document.querySelector('[data-details-close]');
       const card = [...document.querySelectorAll('.subagent-job')]
-        .find((c) => (c.textContent || '').includes('audit the release notes'));
+        .find((c) => (c.textContent || '').includes('web-e2e-subagent-details'));
       return {
         role: dlg?.getAttribute('role') || '',
         ariaModal: dlg?.getAttribute('aria-modal') || '',
@@ -260,7 +266,7 @@ async function main() {
     const modalAfterFilter = await page.evaluate(() => {
       const dlg = document.querySelector('[data-details-dialog]');
       const card = [...document.querySelectorAll('.subagent-job')]
-        .find((c) => (c.textContent || '').includes('audit the release notes'));
+        .find((c) => (c.textContent || '').includes('web-e2e-subagent-details'));
       return {
         open: !!dlg,
         jobId: dlg?.getAttribute('data-job-id') || '',
@@ -271,48 +277,84 @@ async function main() {
     if (modalAfterFilter.jobId !== modalAfterFilter.cardJobId) {
       fail('detail modal rebound to a different job after filter change');
     }
-    // Content while the job is still running: task description, status,
-    // elapsed, latest activity, and the live badge.
+    // Running job: task tail, typed status, elapsed. No live-word badge and
+    // no Latest activity until a hub message exists.
     const detailsContent = await page.evaluate(() => {
       const txt = (sel) => (document.querySelector(sel)?.textContent || '').trim();
+      const status = document.querySelector('[data-details-status] [role="status"]');
       return {
         description: txt('[data-details-description]'),
-        status: txt('[data-details-status] .subagent-job__status'),
+        status: status?.textContent.trim() || '',
+        statusRole: status?.getAttribute('role') || '',
         elapsed: txt('[data-details-elapsed]'),
-        activity: txt('[data-details-activity]'),
-        live: document.querySelector('[data-details-live]') !== null,
+        activity: document.querySelector('[data-details-activity]') !== null,
+        liveWord: document.querySelector('[data-details-live]') !== null
+          || /\blive\b/i.test(document.querySelector('[data-details-dialog]')?.textContent || ''),
       };
     });
-    if (!detailsContent.description.includes('audit the release notes')) {
-      fail(`detail modal description missing the task text: "${detailsContent.description}"`);
+    if (!detailsContent.description.endsWith('DETAILSTAIL')) {
+      fail(`task description cropped before DETAILSTAIL: "${detailsContent.description}"`);
     }
-    if (!['queued', 'running'].includes(detailsContent.status)) {
-      fail(`detail modal status must be live (queued/running), got "${detailsContent.status}"`);
+    if (detailsContent.statusRole !== 'status' || !['queued', 'running'].includes(detailsContent.status.toLowerCase())) {
+      fail(`detail status must be a typed live status, got "${detailsContent.status}"`);
     }
     if (!detailsContent.elapsed) fail('detail modal elapsed never rendered while running');
-    if (!detailsContent.activity) fail('detail modal latest activity never rendered');
-    if (!detailsContent.live) fail('detail modal live badge missing while the job is running');
-    // Recent history MUST be non-empty while the job is still running and must
-    // carry the CONCRETE tool action the child took — the history projection
-    // renders the read call as `assistant · read seed.txt`, never a history
-    // that reduces the child's work to generic `[tool: read]`/`[bash]` tags.
+    if (detailsContent.activity) fail('Latest activity rendered without a hub message');
+    if (detailsContent.liveWord) fail('detail modal still shows a live-word badge');
+    const readPath = 'fixtures/subagent-details/workspace-relative/long-read-target-for-subagent-details-readability/long-relative-read-target.txt';
+    await page.screenshot({ path: `${evidence}/details-desktop-1360.png`, fullPage: true });
     await waitFor(
       page,
-      () => {
-        const pre = document.querySelector('[data-details-history]');
-        const text = pre ? pre.textContent.trim() : '';
-        return text.includes('read seed.txt');
-      },
-      'detail modal recent history never showed the concrete read seed.txt action',
-      15000
+      (want) => (document.querySelector('[data-details-history]')?.textContent || '').includes(want),
+      'detail history never showed the full relative read path',
+      20000,
+      readPath
     );
-    const historyErrorShown = await page.evaluate(
-      () => document.querySelector('[data-details-error]') !== null
-    );
-    if (historyErrorShown) {
-      fail('detail modal reported an agent_history error while the job was running');
+    const historyProbe = await page.evaluate((path) => {
+      const root = document.querySelector('[data-details-history]');
+      const prose = [...(root?.querySelectorAll('[data-history-kind="text"]') || [])];
+      const assistant = prose.find((row) => (row.textContent || '').startsWith('The first assistant paragraph'));
+      const call = [...(root?.querySelectorAll('[data-history-kind="call"]') || [])]
+        .find((row) => (row.textContent || '').includes(path));
+      const summary = call?.querySelector('.subagent-details__history-text');
+      const summaryStyle = summary ? getComputedStyle(summary) : null;
+      const outcome = call?.querySelector('[data-history-status]');
+      return {
+        assistantTag: assistant?.querySelector('.subagent-details__history-tag')?.textContent || '',
+        assistantText: assistant?.textContent || '',
+        summary: summary?.textContent || '',
+        summaryEllipsis: summaryStyle?.textOverflow === 'ellipsis' || summaryStyle?.webkitLineClamp === '2',
+        summaryClipped: !!summary && summary.scrollHeight > summary.clientHeight + 1,
+        outcome: outcome?.getAttribute('aria-label') || '',
+        outcomeKind: outcome?.getAttribute('data-history-status') || '',
+        toggle: call?.querySelector('[data-history-output-toggle]')?.getAttribute('aria-label') || '',
+      };
+    }, readPath);
+    if (historyProbe.assistantTag) fail(`assistant prose still has a tag: "${historyProbe.assistantTag}"`);
+    if (!historyProbe.assistantText.includes('DETAILSTAIL')) fail('assistant prose does not show DETAILSTAIL');
+    if (!historyProbe.summary.includes(readPath)) fail('tool summary is not the full relative read path');
+    if (historyProbe.summaryEllipsis || historyProbe.summaryClipped) fail('tool summary is ellipsized');
+    if (historyProbe.outcome !== 'succeeded' || historyProbe.outcomeKind !== 'ok') {
+      fail(`successful outcome is not an accessible succeeded glyph: ${historyProbe.outcome}/${historyProbe.outcomeKind}`);
     }
-    await page.screenshot({ path: `${evidence}/modal-running.png`, fullPage: true });
+    if (historyProbe.toggle !== 'Show tool output') fail(`output toggle missing or already open: "${historyProbe.toggle}"`);
+    await page.screenshot({ path: `${evidence}/details-desktop-1360-after.png`, fullPage: true });
+    const readRow = page.locator('[data-history-kind="call"]').filter({ hasText: readPath }).first();
+    await readRow.locator('[data-history-output-toggle]').click();
+    await readRow.locator('[data-history-output]').waitFor({ state: 'visible' });
+    const outputToggle = await page.evaluate((path) => {
+      const row = [...document.querySelectorAll('[data-history-kind="call"]')]
+        .find((node) => (node.textContent || '').includes(path));
+      const button = row?.querySelector('[data-history-output-toggle]');
+      const output = row?.querySelector('[data-history-output]');
+      return {
+        label: button?.getAttribute('aria-label') || '',
+        tail: output?.textContent.includes('DETAILSOUTTAIL') || false,
+      };
+    }, readPath);
+    if (outputToggle.label !== 'Hide tool output' || !outputToggle.tail) {
+      fail(`output toggle did not reveal DETAILSOUTTAIL: ${JSON.stringify(outputToggle)}`);
+    }
     // Refresh re-fetches the child transcript: the dialog stays open, history
     // keeps the concrete read action, and no error appears.
     await page.evaluate(() => document.querySelector('[data-details-refresh]').click());
@@ -322,7 +364,7 @@ async function main() {
         const pre = document.querySelector('[data-details-history]');
         return (
           !!pre &&
-          pre.textContent.includes('read seed.txt') &&
+          pre.textContent.includes('fixtures/subagent-details/workspace-relative/long-read-target-for-subagent-details-readability/long-relative-read-target.txt') &&
           document.querySelector('[data-details-error]') === null
         );
       },
@@ -340,7 +382,7 @@ async function main() {
     // and close via the Close button — proving both dismissal paths.
     await page.evaluate(() => {
       const cards = [...document.querySelectorAll('.subagent-job')];
-      const card = cards.find((c) => (c.textContent || '').includes('audit the release notes'));
+      const card = cards.find((c) => (c.textContent || '').includes('web-e2e-subagent-details'));
       // Click the description (no stopPropagation) so the section onClick opens
       // the modal rather than landing on the message input or action buttons.
       card.querySelector('.subagent-job__description').click();
@@ -361,7 +403,7 @@ async function main() {
     // `input.value=`; use the native setter so onChange fires.
     await page.evaluate(() => {
       const cards = [...document.querySelectorAll('.subagent-job')];
-      const card = cards.find((c) => (c.textContent || '').includes('audit the release notes'));
+      const card = cards.find((c) => (c.textContent || '').includes('web-e2e-subagent-details'));
       const input = card.querySelector('.subagent-job__message-input');
       const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
       setter.call(input, 'status report?');
@@ -371,7 +413,7 @@ async function main() {
       page,
       () => {
         const cards = [...document.querySelectorAll('.subagent-job')];
-        const card = cards.find((c) => (c.textContent || '').includes('audit the release notes'));
+        const card = cards.find((c) => (c.textContent || '').includes('web-e2e-subagent-details'));
         const btn = card ? card.querySelector('.subagent-job__message .subagent-job__action') : null;
         return !!btn && !btn.disabled;
       },
@@ -379,7 +421,7 @@ async function main() {
     );
     await page.evaluate(() => {
       const cards = [...document.querySelectorAll('.subagent-job')];
-      const card = cards.find((c) => (c.textContent || '').includes('audit the release notes'));
+      const card = cards.find((c) => (c.textContent || '').includes('web-e2e-subagent-details'));
       card.querySelector('.subagent-job__message .subagent-job__action').click();
     });
     await waitFor(
@@ -391,7 +433,7 @@ async function main() {
     // View the job's delivered output (job_output -> output pane).
     await page.evaluate(() => {
       const cards = [...document.querySelectorAll('.subagent-job')];
-      const card = cards.find((c) => (c.textContent || '').includes('audit the release notes'));
+      const card = cards.find((c) => (c.textContent || '').includes('web-e2e-subagent-details'));
       [...card.querySelectorAll('.subagent-job__action')]
         .find((b) => (b.textContent || '').includes('Output'))
         .click();
@@ -400,7 +442,7 @@ async function main() {
       page,
       () => {
         const cards = [...document.querySelectorAll('.subagent-job')];
-        const card = cards.find((c) => (c.textContent || '').includes('audit the release notes'));
+        const card = cards.find((c) => (c.textContent || '').includes('web-e2e-subagent-details'));
         return !!card && card.querySelector('[data-output-view]') !== null;
       },
       'job output pane never opened'
@@ -411,7 +453,7 @@ async function main() {
     // card must disappear from Running and reappear under Completed.
     await page.evaluate(() => {
       const cards = [...document.querySelectorAll('.subagent-job')];
-      const card = cards.find((c) => (c.textContent || '').includes('audit the release notes'));
+      const card = cards.find((c) => (c.textContent || '').includes('web-e2e-subagent-details'));
       [...card.querySelectorAll('.subagent-job__action')]
         .find((b) => (b.textContent || '').includes('Cancel'))
         .click();
@@ -420,7 +462,7 @@ async function main() {
       page,
       () => {
         const cards = [...document.querySelectorAll('.subagent-job')];
-        return !cards.some((c) => (c.textContent || '').includes('audit the release notes'));
+        return !cards.some((c) => (c.textContent || '').includes('web-e2e-subagent-details'));
       },
       'settled job never disappeared from the Running filter'
     );
@@ -447,7 +489,7 @@ async function main() {
       page,
       () => {
         const cards = [...document.querySelectorAll('.subagent-job')];
-        const card = cards.find((c) => (c.textContent || '').includes('audit the release notes'));
+        const card = cards.find((c) => (c.textContent || '').includes('web-e2e-subagent-details'));
         return !!card && card.getAttribute('data-status') === 'cancelled';
       },
       'settled job never appeared under the Completed filter'
@@ -476,24 +518,53 @@ async function main() {
     // Mobile: no horizontal overflow — page, panel, and the filter bar all
     // fit a 390px phone viewport.
     await page.setViewportSize({ width: 390, height: 844 });
-    await page.waitForTimeout(150);
-    const overflow = await page.evaluate(() => {
+    await page.evaluate(() => {
+      const card = [...document.querySelectorAll('.subagent-job')]
+        .find((node) => (node.textContent || '').includes('web-e2e-subagent-details'));
+      card?.querySelector('[data-details-trigger]')?.click();
+    });
+    await waitFor(
+      page,
+      () => (document.querySelector('[data-details-history]')?.textContent || '').includes('long-relative-read-target.txt'),
+      'mobile detail history never showed the read path',
+      10000
+    );
+    const mobile = await page.evaluate(() => {
       const panel = document.getElementById('subagents-panel');
       const filter = document.querySelector('.subagents-panel__filter');
+      const dialog = document.querySelector('[data-details-dialog]');
+      const history = document.querySelector('[data-details-history]');
+      const text = history?.textContent || '';
       return {
         pageOverflow: document.documentElement.scrollWidth > window.innerWidth,
         panelOverflow: !!panel && panel.scrollWidth > panel.clientWidth,
         filterOverflow: !!filter && filter.scrollWidth > filter.clientWidth,
+        dialogOverflow: !!dialog && dialog.scrollWidth > window.innerWidth,
+        tail: text.includes('DETAILSTAIL') && text.includes('long-relative-read-target.txt'),
+        liveWord: document.querySelector('[data-details-live]') !== null,
+        ellipsis: text.includes('\u2026') || text.includes('...'),
       };
     });
-    if (overflow.pageOverflow) fail('mobile: page scrolls horizontally');
-    if (overflow.panelOverflow) fail('mobile: subagents panel overflows horizontally');
-    if (overflow.filterOverflow) fail('mobile: filter bar overflows horizontally');
-    await page.screenshot({ path: `${evidence}/mobile-filter.png`, fullPage: true });
+    if (mobile.pageOverflow) fail('mobile: page scrolls horizontally');
+    if (mobile.panelOverflow) fail('mobile: subagents panel overflows horizontally');
+    if (mobile.filterOverflow) fail('mobile: filter bar overflows horizontally');
+    if (mobile.dialogOverflow) fail('mobile: details dialog overflows horizontally');
+    if (!mobile.tail || mobile.ellipsis || mobile.liveWord) fail('mobile: details text is cropped, ellipsized, or badged live');
+    await page.screenshot({ path: `${evidence}/details-mobile-390.png`, fullPage: true });
     console.log('d93: PASSED (subagents spawn/live-activity/filter/detail-modal/hub-send/output-view/cancel/mobile)');
+  } catch (err) {
+    try {
+      await page.screenshot({ path: `${evidence}/details-desktop-1360.png`, fullPage: true });
+      await page.setViewportSize({ width: 390, height: 844 });
+      await page.screenshot({ path: `${evidence}/details-mobile-390.png`, fullPage: true });
+    } catch (shot) {
+      console.error(`d93: screenshot failed: ${shot.stack || shot}`);
+    }
+    throw err;
   } finally {
     await browser.close();
   }
+
 }
 
 main().catch((err) => {

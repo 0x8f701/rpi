@@ -10,6 +10,13 @@ use pi_ai::Model;
 use pi_ai::providers::{FauxProviderOptions, FauxResponse, register_faux_provider};
 use pi_coding::{Application, Session, SessionOptions};
 
+/// Hermetic session-store fixture (see approvals `prepare_session_store`).
+fn prepare_session_store(session: &Session, cwd: &std::path::Path) {
+    let session_dir = cwd.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session directory");
+    session.set_session_dir(session_dir);
+}
+
 /// A completed run streams the assistant text to the writer and appends a
 /// trailing newline, returning `Ok` — proving `run_turn_to` awaits the run
 /// future instead of detaching it on the non-cancel branch.
@@ -44,8 +51,10 @@ async fn run_turn_to_completed_run_writes_stream_and_trailing_newline() {
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: None,
+        auth_manager: None,
     })
     .expect("build session");
+    prepare_session_store(&session, cwd.path());
     let application = Application::new(session).await;
 
     let mut out = Vec::new();

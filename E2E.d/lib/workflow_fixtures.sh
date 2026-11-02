@@ -22,11 +22,14 @@ WORKFLOW_PAGE_TITLE=' Workflows '
 WORKFLOW_DETAIL_LABELS=(
     'Objective'
     'Status'
-    'Todo'
     'Supervisor'
-    'Agents'
-    'Recent IRC'
     'Worktree'
+    'Overview'
+    'Todo'
+    'Agents'
+    'Jobs'
+    'Activity'
+    'IRC'
     'Integration'
 )
 
@@ -261,8 +264,8 @@ env = {
     "LANG": os.environ.get("LANG", "C.UTF-8"),
     "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
     "PI_CODING_AGENT_DIR": str(Path(home) / ".pi" / "agent"),
-    "PI_OFFLINE": "1",
-    "PI_SKIP_VERSION_CHECK": "1",
+    "RPI_OFFLINE": "1",
+    "RPI_SKIP_VERSION_CHECK": "1",
     "PI_FAUX_RESPONSE": "deterministic-workflow-probe",
     "TERM": "xterm-256color",
 }

@@ -134,7 +134,7 @@ def main() -> None:
         "LANG": os.environ.get("LANG", "C.UTF-8"),
         "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
         "PI_CODING_AGENT_DIR": str(agent_dir),
-        "PI_SKIP_VERSION_CHECK": "1",
+        "RPI_SKIP_VERSION_CHECK": "1",
     }
     command = [
         args.rpi,

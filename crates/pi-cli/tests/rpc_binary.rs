@@ -66,8 +66,8 @@ impl RpcSession {
         let mut child = rpc_cmd()
             .args(["--offline", "--model", "faux/faux-1"])
             .env("HOME", home.path())
-            .env("PI_OFFLINE", "1")
-            .env("PI_SKIP_VERSION_CHECK", "1")
+            .env("RPI_OFFLINE", "1")
+            .env("RPI_SKIP_VERSION_CHECK", "1")
             // Deterministic offline assistant text for prompt-driven contracts.
             .env("PI_FAUX_RESPONSE", "rpc-binary-faux-reply")
             .stdin(Stdio::piped())
@@ -87,9 +87,7 @@ impl RpcSession {
 
     fn write_line(&mut self, line: &str) {
         let stdin = self.child.stdin.as_mut().expect("stdin pipe");
-        stdin
-            .write_all(line.as_bytes())
-            .expect("write rpc stdin");
+        stdin.write_all(line.as_bytes()).expect("write rpc stdin");
         if !line.ends_with('\n') {
             stdin.write_all(b"\n").expect("write rpc LF");
         }
@@ -138,9 +136,7 @@ impl RpcSession {
                 Ok(RpcLine::Eof) => {
                     // EOF — collect status for diagnostics.
                     let status = self.child.try_wait().ok().flatten();
-                    panic!(
-                        "rpi rpc stdout closed before next JSONL record (status={status:?})"
-                    );
+                    panic!("rpi rpc stdout closed before next JSONL record (status={status:?})");
                 }
                 Ok(RpcLine::Error(error)) => panic!("reading rpi rpc stdout: {error}"),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -242,9 +238,8 @@ fn run_rpc(stdin: &[u8]) -> (Vec<Value>, Output) {
                     !trimmed.to_ascii_lowercase().starts_with("warning:"),
                     "stdout must not contain plain-text warnings: {trimmed:?}"
                 );
-                let value = serde_json::from_str::<Value>(trimmed).unwrap_or_else(|error| {
-                    panic!("stdout line is not JSON ({error}): {trimmed}")
-                });
+                let value = serde_json::from_str::<Value>(trimmed)
+                    .unwrap_or_else(|error| panic!("stdout line is not JSON ({error}): {trimmed}"));
                 assert!(
                     value.is_object(),
                     "stdout line must be a JSON object: {value}"
@@ -332,14 +327,9 @@ fn assert_success(line: &Value, command: &str, id: &str) {
 
 #[test]
 fn help_and_version_use_standalone_name() {
-    let help = rpc_cmd()
-        .arg("--help")
-        .output()
-        .expect("rpi rpc --help");
+    let help = rpc_cmd().arg("--help").output().expect("rpi rpc --help");
     assert!(help.status.success());
-    assert!(
-        String::from_utf8_lossy(&help.stdout).contains("rpi headless RPC server")
-    );
+    assert!(String::from_utf8_lossy(&help.stdout).contains("rpi headless RPC server"));
 
     let version = rpc_cmd()
         .arg("--version")
@@ -371,10 +361,7 @@ fn lf_delimited_framing_accepts_crlf_and_emits_json_objects() {
         raw.ends_with('\n'),
         "protocol writer must terminate the final record with LF: {raw:?}"
     );
-    assert!(
-        !raw.contains('\r'),
-        "host stdout must not emit CR: {raw:?}"
-    );
+    assert!(!raw.contains('\r'), "host stdout must not emit CR: {raw:?}");
     assert!(
         !raw.contains('\u{1b}'),
         "stdout must not contain ANSI escapes: {raw:?}"
@@ -385,7 +372,10 @@ fn lf_delimited_framing_accepts_crlf_and_emits_json_objects() {
         "expected at least one JSONL record on stdout"
     );
     for line in &lines {
-        assert!(line.get("type").is_some(), "every record needs type: {line}");
+        assert!(
+            line.get("type").is_some(),
+            "every record needs type: {line}"
+        );
     }
 
     let first = find_response(&lines, "crlf-1");
@@ -406,8 +396,7 @@ fn lf_delimited_framing_accepts_crlf_and_emits_json_objects() {
 /// LF-delimited valid command still succeeds — framing recovery is per-line.
 #[test]
 fn malformed_then_valid_frames_keep_stdout_jsonl() {
-    let (lines, output) =
-        run_rpc(b"{bad json}\n{\"type\":\"get_state\",\"id\":\"state-1\"}\n");
+    let (lines, output) = run_rpc(b"{bad json}\n{\"type\":\"get_state\",\"id\":\"state-1\"}\n");
     assert!(
         output.status.success(),
         "status: {:?}\nstderr: {}",
@@ -592,7 +581,8 @@ fn unterminated_final_frame_emits_parse_failure() {
 #[test]
 fn prompt_emits_response_events_and_agent_settled() {
     let mut session = RpcSession::spawn();
-    session.write_line(r#"{"type":"prompt","id":"prompt-1","message":"ping from rpc binary test"}"#);
+    session
+        .write_line(r#"{"type":"prompt","id":"prompt-1","message":"ping from rpc binary test"}"#);
 
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut lines = Vec::new();
@@ -895,9 +885,7 @@ fn loop_crud_events_and_malformed_recovery_share_one_rpc_connection() {
     let mut created_event = None;
     while created.is_none() || created_event.is_none() {
         let line = session.read_json_deadline(deadline);
-        if is_response(&line)
-            && line.get("id").and_then(Value::as_str) == Some("loop-create")
-        {
+        if is_response(&line) && line.get("id").and_then(Value::as_str) == Some("loop-create") {
             created = Some(line);
             continue;
         }
@@ -916,18 +904,27 @@ fn loop_crud_events_and_malformed_recovery_share_one_rpc_connection() {
     assert_eq!(created_event["task"]["id"], task_id);
     let mut loop_turn_events = vec![created_event];
     if !loop_turn_events.iter().any(|line| {
-        matches!(line.get("type").and_then(Value::as_str), Some("loop_finished" | "loop_failed"))
+        matches!(
+            line.get("type").and_then(Value::as_str),
+            Some("loop_finished" | "loop_failed")
+        )
     }) {
         let (events, terminal) = session.read_until(deadline, |line| {
-            matches!(line.get("type").and_then(Value::as_str), Some("loop_finished" | "loop_failed"))
+            matches!(
+                line.get("type").and_then(Value::as_str),
+                Some("loop_finished" | "loop_failed")
+            )
         });
         loop_turn_events.extend(events);
         loop_turn_events.push(terminal);
     }
-    let scheduled_message = loop_turn_events.iter().find(|line| {
-        line.get("type").and_then(Value::as_str) == Some("message_end")
-            && line["message"]["role"] == "custom"
-    }).expect("public loop message event");
+    let scheduled_message = loop_turn_events
+        .iter()
+        .find(|line| {
+            line.get("type").and_then(Value::as_str) == Some("message_end")
+                && line["message"]["role"] == "custom"
+        })
+        .expect("public loop message event");
     let serialized = scheduled_message.to_string();
     assert!(serialized.contains("Loop "));
     assert!(serialized.contains("every 3 seconds"));
@@ -956,9 +953,7 @@ fn loop_crud_events_and_malformed_recovery_share_one_rpc_connection() {
     let mut updated_event = None;
     while updated.is_none() || updated_event.is_none() {
         let line = session.read_json_deadline(update_deadline);
-        if is_response(&line)
-            && line.get("id").and_then(Value::as_str) == Some("loop-update")
-        {
+        if is_response(&line) && line.get("id").and_then(Value::as_str) == Some("loop-update") {
             updated = Some(line);
             continue;
         }
@@ -1011,7 +1006,12 @@ fn loop_crud_events_and_malformed_recovery_share_one_rpc_connection() {
         is_response(line) && line.get("id").and_then(Value::as_str) == Some("after-loop-delete")
     });
     assert_success(&empty, "loop_list", "after-loop-delete");
-    assert!(empty["data"].as_array().expect("empty loop list").is_empty());
+    assert!(
+        empty["data"]
+            .as_array()
+            .expect("empty loop list")
+            .is_empty()
+    );
 
     let output = session.finish();
     assert!(
@@ -1024,12 +1024,15 @@ fn loop_crud_events_and_malformed_recovery_share_one_rpc_connection() {
 
 const FAUX_REPLY: &str = "rpc-binary-faux-reply";
 
-/// Contract: `get_available_models` returns the offline faux catalog entry so
-/// CI can discover models without credentials or network.
+/// Contract: `get_available_models` is the public catalog behind the Web
+/// model/provider selectors — the test-only faux backend must never appear in
+/// it, even when the session itself runs offline on faux/faux-1.
 #[test]
-fn get_available_models_includes_offline_faux() {
-    let (lines, output) = run_rpc(br#"{"type":"get_available_models","id":"models-1"}
-"#);
+fn get_available_models_excludes_faux() {
+    let (lines, output) = run_rpc(
+        br#"{"type":"get_available_models","id":"models-1"}
+"#,
+    );
     assert!(
         output.status.success(),
         "status: {:?}\nstderr: {}",
@@ -1042,11 +1045,10 @@ fn get_available_models_includes_offline_faux() {
         .as_array()
         .unwrap_or_else(|| panic!("models array missing: {response}"));
     assert!(
-        models.iter().any(|model| {
-            model.get("provider").and_then(Value::as_str) == Some("faux")
-                && model.get("id").and_then(Value::as_str) == Some("faux-1")
-        }),
-        "available models must include faux/faux-1: {response}"
+        !models
+            .iter()
+            .any(|model| model.get("provider").and_then(Value::as_str) == Some("faux")),
+        "available models must not contain faux provider rows: {response}"
     );
     assert!(
         !String::from_utf8_lossy(&output.stdout).contains('\u{1b}'),
@@ -1132,8 +1134,7 @@ fn session_stats_and_last_assistant_text_after_prompt() {
     let mut saw_prompt_ok = false;
     loop {
         let value = session.read_json_deadline(deadline);
-        if is_response(&value) && value.get("id").and_then(Value::as_str) == Some("stats-prompt")
-        {
+        if is_response(&value) && value.get("id").and_then(Value::as_str) == Some("stats-prompt") {
             assert_success(&value, "prompt", "stats-prompt");
             saw_prompt_ok = true;
         }

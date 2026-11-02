@@ -14,11 +14,11 @@ pub const DEFAULT_MAX_BYTES: usize = 50 * 1024;
 /// Maximum line length (in UTF-16 code units) for grep output lines.
 pub const GREP_MAX_LINE_LENGTH: usize = 500;
 /// Default entry limit for the `ls` tool.
-pub const LS_DEFAULT_LIMIT: usize = 500;
+pub const LS_DEFAULT_LIMIT: usize = 5_000;
 /// Default result limit for the `find` tool.
-pub const FIND_DEFAULT_LIMIT: usize = 1000;
+pub const FIND_DEFAULT_LIMIT: usize = 5_000;
 /// Default match limit for the `grep` tool.
-pub const GREP_DEFAULT_LIMIT: usize = 100;
+pub const GREP_DEFAULT_LIMIT: usize = 1_000;
 /// Default / hard-max result limit for the `glob` tool (OMP child-agent parity).
 pub const GLOB_DEFAULT_LIMIT: usize = 200;
 /// Hard maximum for the `glob` tool `limit` parameter (clamped, never exceeded).
@@ -110,8 +110,16 @@ fn split_lines_for_counting(content: &str) -> Vec<&str> {
 /// [`usize::MAX`] disables the line limit (byte cap only), matching pi's
 /// `truncateHead({ maxLines: Number.MAX_SAFE_INTEGER })` for ls/find/grep.
 pub fn truncate_head(content: &str, max_lines: usize, max_bytes: usize) -> TruncationResult {
-    let max_lines = if max_lines == 0 { DEFAULT_MAX_LINES } else { max_lines };
-    let max_bytes = if max_bytes == 0 { DEFAULT_MAX_BYTES } else { max_bytes };
+    let max_lines = if max_lines == 0 {
+        DEFAULT_MAX_LINES
+    } else {
+        max_lines
+    };
+    let max_bytes = if max_bytes == 0 {
+        DEFAULT_MAX_BYTES
+    } else {
+        max_bytes
+    };
     let total_bytes = content.len();
     let lines = split_lines_for_counting(content);
     let total_lines = lines.len();
@@ -181,8 +189,16 @@ pub fn truncate_head(content: &str, max_lines: usize, max_bytes: usize) -> Trunc
 /// Keeps the last N lines/bytes (for command output). Port of pi's
 /// `truncateTail`.
 pub fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -> TruncationResult {
-    let max_lines = if max_lines == 0 { DEFAULT_MAX_LINES } else { max_lines };
-    let max_bytes = if max_bytes == 0 { DEFAULT_MAX_BYTES } else { max_bytes };
+    let max_lines = if max_lines == 0 {
+        DEFAULT_MAX_LINES
+    } else {
+        max_lines
+    };
+    let max_bytes = if max_bytes == 0 {
+        DEFAULT_MAX_BYTES
+    } else {
+        max_bytes
+    };
     let total_bytes = content.len();
     let lines = split_lines_for_counting(content);
     let total_lines = lines.len();
@@ -264,7 +280,11 @@ fn truncate_string_to_bytes_from_end(s: &str, max_bytes: usize) -> String {
 ///
 /// `max_chars` of `0` falls back to [`GREP_MAX_LINE_LENGTH`].
 pub fn truncate_line(line: &str, max_chars: usize) -> (String, bool) {
-    let max_chars = if max_chars == 0 { GREP_MAX_LINE_LENGTH } else { max_chars };
+    let max_chars = if max_chars == 0 {
+        GREP_MAX_LINE_LENGTH
+    } else {
+        max_chars
+    };
     if utf16_len(line) <= max_chars {
         return (line.to_string(), false);
     }
@@ -320,7 +340,10 @@ mod tests {
 
     #[test]
     fn truncate_head_by_lines() {
-        let content = (0..10).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        let content = (0..10)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let tr = truncate_head(&content, 3, 0);
         assert!(tr.truncated);
         assert_eq!(tr.truncated_by, "lines");
@@ -331,7 +354,10 @@ mod tests {
 
     #[test]
     fn truncate_head_by_bytes() {
-        let content = (0..5).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        let content = (0..5)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let tr = truncate_head(&content, 0, 20);
         assert!(tr.truncated);
         assert_eq!(tr.truncated_by, "bytes");
@@ -351,7 +377,10 @@ mod tests {
 
     #[test]
     fn truncate_tail_keeps_last_lines() {
-        let content = (0..10).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        let content = (0..10)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let tr = truncate_tail(&content, 3, 0);
         assert!(tr.truncated);
         assert_eq!(tr.truncated_by, "lines");

@@ -40,6 +40,8 @@ export interface StaticMetrics {
 export interface AutoResizeElement {
   style: { height: string };
   scrollHeight: number;
+  /** Empty/absent value must not size from a wrapped placeholder. */
+  value?: string;
 }
 
 /** Frame scheduler seam; the real browser adapter uses requestAnimationFrame. */
@@ -115,6 +117,12 @@ export function createAutoResizeController<E extends AutoResizeElement>(
   };
 
   const apply = (input: E): void => {
+    if (!input.value) {
+      // Empty composer: the placeholder may wrap, so clear the inline height
+      // and let CSS `min-height: 44px` own the idle size.
+      input.style.height = '';
+      return;
+    }
     if (metrics === null) metrics = measure(input);
     const cap = capFor(metrics);
     // Reset to `auto` so scrollHeight reports the natural content height, then

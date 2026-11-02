@@ -43,28 +43,39 @@
 //! - `threads` — list adapter threads.
 //! - `terminate` — DAP `disconnect` (terminateDebuggee) then kill the group.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use parking_lot::Mutex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::sync::{oneshot, Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, Notify};
+#[cfg(test)]
+use tokio::process::Command;
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, Notify, oneshot};
 use tokio::time::Instant;
 
 use pi_agent::{AbortSignal, AgentTool, AgentToolResult, ToolCallContext, ToolCapability};
+use pi_sandbox::{SpawnFamily, StdioMode};
 
+use crate::application::generation::ApplicationGeneration;
+use crate::process::{
+    GovernedChild, ProcessSignal, TrustedToolProbe, authorize_spawn, launch_authorized_pipe,
+    run_trusted_tool_probe,
+};
 use crate::redact::redact_secrets;
+use crate::sandbox::{CredentialAudience, RawSpawnRequest, SpawnAuthorization};
 use crate::truncate::truncate_tail;
 
 use super::framing::{encode_message, read_message};
-use super::{arg_int, arg_str, check_aborted, s_array, s_number, s_object, s_string, text_result};
+use super::{
+    GenerationCaptureFn, arg_int, arg_str, check_aborted, s_array, s_number, s_object, s_string,
+    text_result,
+};
 
 /// Implemented actions, listed in the schema and in validation errors.
 const ACTIONS: &str = "launch, set_breakpoint, continue_, pause, step_over, step_in, step_out, stack_trace, variables, evaluate, threads, terminate";
@@ -143,9 +154,7 @@ fn find_in_path(path: &str, binary: &str) -> Option<PathBuf> {
 /// `(resolved binary, remaining argv)`.
 fn resolve_adapter_command(adapter: &str, path: &str) -> Result<(String, Vec<String>)> {
     let spec = adapter_spec(adapter).ok_or_else(|| {
-        anyhow!(
-            "unsupported debug adapter `{adapter}` (supported: gdb, lldb-dap, debugpy)"
-        )
+        anyhow!("unsupported debug adapter `{adapter}` (supported: gdb, lldb-dap, debugpy)")
     })?;
     let binary = spec.command[0];
     let executables: &[&str] = if binary == "python3" {
@@ -216,8 +225,11 @@ struct SessionState {
 /// queueing events, bounded stderr/output capture. Drop kills the whole
 /// process group (adapter + debuggee).
 pub(crate) struct DebugSession {
-    child: Child,
-    stdin: Arc<AsyncMutex<ChildStdin>>,
+    _generation: Option<Arc<ApplicationGeneration>>,
+    child: Option<GovernedChild>,
+    #[cfg(test)]
+    raw_child: Option<tokio::process::Child>,
+    stdin: Arc<AsyncMutex<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>>,
     next_seq: Arc<AtomicI64>,
     pending: Arc<Mutex<HashMap<i64, oneshot::Sender<anyhow::Result<Value>>>>>,
     events: Arc<Mutex<VecDeque<Value>>>,
@@ -227,40 +239,30 @@ pub(crate) struct DebugSession {
     dead: Arc<AtomicBool>,
     death_error: Arc<Mutex<Option<String>>>,
     state: Mutex<SessionState>,
-    /// DAP launch `type` (gdb | lldb-dap | debugpy).
     adapter: String,
 }
 
 impl DebugSession {
-    /// Spawns an already-configured command as a DAP adapter and starts the
-    /// stdout reader / stderr capture tasks. The child leads its own process
-    /// group so a kill reaps the adapter *and* its debuggee.
-    pub(crate) async fn spawn_command(
-        mut command: Command,
+    pub(crate) fn from_governed(
+        generation: Arc<ApplicationGeneration>,
+        mut child: GovernedChild,
         adapter: &str,
     ) -> Result<Self> {
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.as_std_mut().process_group(0);
-        }
-        // Route through the crate's ETXTBSY-retrying spawn: re-executing a
-        // just-touched binary (e.g. a test binary under parallel load) can
-        // transiently fail with "Text file busy"; the retry resolves it.
-        let mut child = super::spawn_with_etxtbsy_retry(&mut command, adapter)
-            .await
-            .context("spawning DAP adapter process")?;
-        let stdin = child.stdin.take().context("DAP adapter stdin unavailable")?;
-        let stdout = child.stdout.take().context("DAP adapter stdout unavailable")?;
-        let stderr = child.stderr.take().context("DAP adapter stderr unavailable")?;
+        let stdin = child
+            .take_stdin()
+            .context("DAP adapter stdin unavailable")?;
+        let stdout = child
+            .take_stdout()
+            .context("DAP adapter stdout unavailable")?;
+        let stderr = child
+            .take_stderr()
+            .context("DAP adapter stderr unavailable")?;
         let session = Self {
-            child,
-            stdin: Arc::new(AsyncMutex::new(stdin)),
+            _generation: Some(generation),
+            child: Some(child),
+            #[cfg(test)]
+            raw_child: None,
+            stdin: Arc::new(AsyncMutex::new(Box::new(stdin))),
             next_seq: Arc::new(AtomicI64::new(0)),
             pending: Arc::new(Mutex::new(HashMap::new())),
             events: Arc::new(Mutex::new(VecDeque::new())),
@@ -272,12 +274,60 @@ impl DebugSession {
             state: Mutex::new(SessionState::default()),
             adapter: adapter.to_owned(),
         };
-        session.start_readers(stdout, stderr);
+        session.start_readers(Box::new(stdout), Box::new(stderr));
         Ok(session)
     }
 
-    /// Spawns the bounded stderr-tail capture and the stdout reader task.
-    fn start_readers(&self, stdout: ChildStdout, stderr: ChildStderr) {
+    #[cfg(test)]
+    pub(crate) async fn spawn_command(
+        mut command: tokio::process::Command,
+        adapter: &str,
+    ) -> Result<Self> {
+        use std::process::Stdio;
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .context("spawning test DAP adapter process")?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("DAP adapter stdin unavailable")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("DAP adapter stdout unavailable")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("DAP adapter stderr unavailable")?;
+        let session = Self {
+            _generation: None,
+            child: None,
+            raw_child: Some(child),
+            stdin: Arc::new(AsyncMutex::new(Box::new(stdin))),
+            next_seq: Arc::new(AtomicI64::new(0)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            events: Arc::new(Mutex::new(VecDeque::new())),
+            output: Arc::new(Mutex::new(String::new())),
+            stderr_tail: Arc::new(Mutex::new(String::new())),
+            notify: Arc::new(Notify::new()),
+            dead: Arc::new(AtomicBool::new(false)),
+            death_error: Arc::new(Mutex::new(None)),
+            state: Mutex::new(SessionState::default()),
+            adapter: adapter.to_owned(),
+        };
+        session.start_readers(Box::new(stdout), Box::new(stderr));
+        Ok(session)
+    }
+
+    fn start_readers(
+        &self,
+        stdout: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+        stderr: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+    ) {
         let tail = self.stderr_tail.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 8192];
@@ -308,8 +358,12 @@ impl DebugSession {
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
             loop {
-                match read_message("DAP", &mut reader, super::framing::DEFAULT_MAX_MESSAGE_BYTES)
-                    .await
+                match read_message(
+                    "DAP",
+                    &mut reader,
+                    super::framing::DEFAULT_MAX_MESSAGE_BYTES,
+                )
+                .await
                 {
                     Ok(message) => match message.get("type").and_then(Value::as_str) {
                         Some("response") => {
@@ -333,9 +387,8 @@ impl DebugSession {
                             if message.get("event").and_then(Value::as_str) == Some("output") {
                                 // Debuggee output: accumulate into the bounded
                                 // buffer instead of the event queue.
-                                if let Some(text) = message
-                                    .pointer("/body/output")
-                                    .and_then(Value::as_str)
+                                if let Some(text) =
+                                    message.pointer("/body/output").and_then(Value::as_str)
                                 {
                                     let mut guard = output.lock();
                                     guard.push_str(text);
@@ -357,9 +410,12 @@ impl DebugSession {
                             // Adapter→client request (e.g. runInTerminal): we
                             // cannot honor it, so answer a failure response to
                             // keep the adapter's protocol loop moving.
-                            let request_seq = message.get("seq").and_then(Value::as_i64).unwrap_or(0);
-                            let command =
-                                message.get("command").and_then(Value::as_str).unwrap_or("unknown");
+                            let request_seq =
+                                message.get("seq").and_then(Value::as_i64).unwrap_or(0);
+                            let command = message
+                                .get("command")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown");
                             let seq = next_seq.fetch_add(1, Ordering::SeqCst) + 1;
                             let response = json!({
                                 "seq": seq,
@@ -413,7 +469,8 @@ impl DebugSession {
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst) + 1;
         let (tx, rx) = oneshot::channel();
         self.pending.lock().insert(seq, tx);
-        let message = json!({ "seq": seq, "type": "request", "command": command, "arguments": args });
+        let message =
+            json!({ "seq": seq, "type": "request", "command": command, "arguments": args });
         let bytes = match encode_message(&message) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -440,7 +497,10 @@ impl DebugSession {
             }
             Err(_elapsed) => {
                 self.pending.lock().remove(&seq);
-                bail!("DAP request `{command}` timed out after {}s", timeout.as_secs());
+                bail!(
+                    "DAP request `{command}` timed out after {}s",
+                    timeout.as_secs()
+                );
             }
         }
     }
@@ -620,8 +680,6 @@ impl DebugSession {
         std::mem::take(&mut *guard)
     }
 
-    /// Best-effort DAP `disconnect` (terminating the debuggee), then kills
-    /// the whole process group and reaps the child. Never fails the caller.
     pub(crate) async fn terminate(mut self) -> String {
         let _ = tokio::time::timeout(
             SHUTDOWN_TIMEOUT,
@@ -631,50 +689,57 @@ impl DebugSession {
             ),
         )
         .await;
-        kill_adapter(&self.child);
-        match tokio::time::timeout(EXIT_TIMEOUT, self.child.wait()).await {
-            Ok(Ok(status)) => format!("DAP adapter terminated ({status})."),
-            _ => "DAP adapter terminated (killed).".to_owned(),
+        if let Some(mut child) = self.child.take() {
+            let _ = child.signal(ProcessSignal::Sigterm);
+            return match tokio::time::timeout(EXIT_TIMEOUT, child.wait()).await {
+                Ok(Ok(status)) => format!("DAP adapter terminated (exit code {status})."),
+                _ => {
+                    let _ = child.signal(ProcessSignal::Sigkill);
+                    let _ = child.wait().await;
+                    "DAP adapter terminated (killed).".to_owned()
+                }
+            };
         }
+        #[cfg(test)]
+        if let Some(mut child) = self.raw_child.take() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+        "DAP adapter terminated.".to_owned()
     }
 }
 
 impl Drop for DebugSession {
     fn drop(&mut self) {
-        // Never leak the adapter (or its debuggee), even on panic paths.
-        if self.child.try_wait().ok().flatten().is_none() {
-            kill_adapter(&self.child);
-            let _ = self.child.start_kill();
+        if let Some(child) = self.child.as_ref()
+            && child.exit_status().is_none()
+        {
+            let _ = child.signal(ProcessSignal::Sigkill);
+        }
+        #[cfg(test)]
+        if let Some(child) = self.raw_child.as_mut()
+            && child.try_wait().ok().flatten().is_none()
+        {
+            let _ = child.start_kill();
         }
     }
-}
-
-/// SIGKILLs the adapter's process group (spawned with `process_group(0)`, so
-/// this also reaps the debuggee). Mirrors the hooks.rs kill_process_group
-/// pattern.
-fn kill_adapter(child: &Child) {
-    #[cfg(unix)]
-    {
-        use nix::sys::signal::{killpg, Signal};
-        use nix::unistd::Pid;
-        if let Some(pid) = child.id() {
-            let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = child;
 }
 
 /// Formats a DAP error response (`success: false`) into an actionable
 /// message.
 fn dap_error_message(message: &Value) -> String {
-    let command = message.get("command").and_then(Value::as_str).unwrap_or("?");
+    let command = message
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
     let detail = message
         .get("message")
         .and_then(Value::as_str)
         .unwrap_or("DAP error response");
     let mut text = format!("DAP request `{command}` failed: {detail}");
-    if let Some(body_error) = message.pointer("/body/error/message").and_then(Value::as_str)
+    if let Some(body_error) = message
+        .pointer("/body/error/message")
+        .and_then(Value::as_str)
         && body_error != detail
     {
         text.push_str(&format!(" — {body_error}"));
@@ -747,6 +812,12 @@ impl DebugRegistry {
 /// Builds the `debug` tool: session-scoped DAP debugging (gdb, lldb-dap,
 /// debugpy) with one live adapter per session.
 pub(crate) fn debug_tool(cwd: &str) -> AgentTool {
+    let capture: GenerationCaptureFn =
+        Arc::new(|| bail!("debug requires an application generation"));
+    debug_tool_with_generation(cwd, capture)
+}
+
+pub(crate) fn debug_tool_with_generation(cwd: &str, capture: GenerationCaptureFn) -> AgentTool {
     let description = format!(
         "Drive a Debug Adapter Protocol (DAP) adapter over stdio for a session-scoped debugging \
          session. Actions: {ACTIONS}. `launch` resolves the adapter binary on PATH, spawns it \
@@ -772,11 +843,16 @@ pub(crate) fn debug_tool(cwd: &str) -> AgentTool {
             ),
             (
                 "program",
-                s_string("Debuggee program path (required for launch; resolved against the session cwd)"),
+                s_string(
+                    "Debuggee program path (required for launch; resolved against the session cwd)",
+                ),
             ),
             (
                 "args",
-                s_array(s_string("Program argument"), "Array of program arguments for the debuggee (launch)"),
+                s_array(
+                    s_string("Program argument"),
+                    "Array of program arguments for the debuggee (launch)",
+                ),
             ),
             (
                 "cwd",
@@ -784,11 +860,16 @@ pub(crate) fn debug_tool(cwd: &str) -> AgentTool {
             ),
             (
                 "launch_args",
-                s_string("Optional JSON object merged into the DAP launch request (e.g. env, stopOnEntry); overrides defaults"),
+                s_string(
+                    "Optional JSON object merged into the DAP launch request (e.g. env, stopOnEntry); overrides defaults",
+                ),
             ),
             (
                 "adapter_args",
-                s_array(s_string("Adapter argument"), "Optional extra arguments appended to the adapter command line (launch)"),
+                s_array(
+                    s_string("Adapter argument"),
+                    "Optional extra arguments appended to the adapter command line (launch)",
+                ),
             ),
             (
                 "file",
@@ -800,7 +881,9 @@ pub(crate) fn debug_tool(cwd: &str) -> AgentTool {
             ),
             (
                 "thread",
-                s_number("Thread id for stack_trace/continue_/pause/step actions; defaults to the last stopped thread"),
+                s_number(
+                    "Thread id for stack_trace/continue_/pause/step actions; defaults to the last stopped thread",
+                ),
             ),
             (
                 "variables_reference",
@@ -816,7 +899,9 @@ pub(crate) fn debug_tool(cwd: &str) -> AgentTool {
             ),
             (
                 "wait_ms",
-                s_number("How long continue_/pause wait for the next stop event (0 returns immediately); default 30000"),
+                s_number(
+                    "How long continue_/pause wait for the next stop event (0 returns immediately); default 30000",
+                ),
             ),
             (
                 "levels",
@@ -830,7 +915,8 @@ pub(crate) fn debug_tool(cwd: &str) -> AgentTool {
     AgentTool::new("debug", description, params, move |ctx: ToolCallContext| {
         let registry = registry.clone();
         let cwd = cwd.clone();
-        async move { run_debug(&registry, &cwd, ctx.arguments, ctx.abort).await }
+        let capture = capture.clone();
+        async move { run_debug_with_generation(&registry, &cwd, &capture, ctx.arguments, ctx.abort).await }
     })
     .with_capability(ToolCapability::Write)
     .with_prompt_guidelines(vec![
@@ -847,6 +933,18 @@ pub(crate) async fn run_debug(
     args: Value,
     abort: AbortSignal,
 ) -> Result<AgentToolResult> {
+    let capture: GenerationCaptureFn =
+        Arc::new(|| bail!("debug requires an application generation"));
+    run_debug_with_generation(registry, cwd, &capture, args, abort).await
+}
+
+async fn run_debug_with_generation(
+    registry: &DebugRegistry,
+    cwd: &str,
+    capture: &GenerationCaptureFn,
+    args: Value,
+    abort: AbortSignal,
+) -> Result<AgentToolResult> {
     check_aborted(&abort)?;
     let action = arg_str(&args, "action");
     let action = action.trim();
@@ -855,7 +953,7 @@ pub(crate) async fn run_debug(
     }
     let mut slot = registry.lock().await;
     match action {
-        "launch" => run_launch(&mut slot, cwd, &args, &abort).await,
+        "launch" => run_launch(capture()?, &mut slot, cwd, &args, &abort).await,
         "terminate" => {
             let session = slot
                 .take()
@@ -882,15 +980,14 @@ pub(crate) async fn run_debug(
 /// local session drops (killing the spawned process); the slot is only
 /// populated on success.
 async fn run_launch(
+    generation: Arc<ApplicationGeneration>,
     slot: &mut AsyncMutexGuard<'_, Option<DebugSession>>,
     cwd: &str,
     args: &Value,
     abort: &AbortSignal,
 ) -> Result<AgentToolResult> {
     if slot.is_some() {
-        bail!(
-            "a DAP adapter is already running for this session; `debug terminate` it first"
-        );
+        bail!("a DAP adapter is already running for this session; `debug terminate` it first");
     }
     let adapter = arg_str(args, "adapter");
     let adapter = adapter.trim();
@@ -902,22 +999,53 @@ async fn run_launch(
     if program.is_empty() {
         bail!("debug launch requires a `program` path (the debuggee)");
     }
-    let path = std::env::var_os("PATH")
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let (binary, base_args) = resolve_adapter_command(adapter, &path)?;
-    let mut command = Command::new(&binary);
-    command.args(&base_args);
+    let spec =
+        adapter_spec(adapter).ok_or_else(|| anyhow!("unsupported debug adapter `{adapter}`"))?;
+    let executable = run_trusted_tool_probe(
+        &generation,
+        TrustedToolProbe::DebugAdapter {
+            executable: spec.command[0].into(),
+        },
+    )?;
+    let mut argv = Vec::with_capacity(spec.command.len() + 4);
+    argv.push(OsString::from(executable.as_path()));
+    argv.extend(spec.command.iter().skip(1).map(OsString::from));
     if let Some(extra) = args.get("adapter_args").and_then(Value::as_array) {
         let extra = extra
             .iter()
             .map(Value::as_str)
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| anyhow!("debug launch `adapter_args` must be an array of strings"))?;
-        command.args(extra);
+        argv.extend(extra.into_iter().map(OsString::from));
     }
-    command.current_dir(cwd);
-    let session = DebugSession::spawn_command(command, adapter).await?;
+    let family = SpawnFamily::DebugAdapter;
+    let authorized = authorize_spawn(
+        generation.clone(),
+        RawSpawnRequest {
+            authorization: SpawnAuthorization::Captured(generation.sandbox().clone()),
+            family,
+            audience: CredentialAudience::new_spawn_family(family)?,
+            argv,
+            cwd: PathBuf::from(cwd),
+            requested_env: BTreeMap::new(),
+            requested_grants: BTreeSet::new(),
+            stdio: StdioMode::Piped,
+            terminal_size: None,
+            timeout_ms: None,
+            target_fd_mappings: Vec::new(),
+            #[cfg(unix)]
+            owned_target_fd_mappings: Vec::new(),
+            #[cfg(unix)]
+            mount_sources: Vec::new(),
+            #[cfg(unix)]
+            retained_executable: None,
+            #[cfg(unix)]
+            retained_working_directory: None,
+        },
+    )
+    .await?;
+    let session =
+        DebugSession::from_governed(generation, launch_authorized_pipe(authorized)?, adapter)?;
     session.launch(args, abort).await?;
     let program_abs = resolve_path(cwd, program);
     **slot = Some(session);
@@ -1013,7 +1141,10 @@ async fn render_stopped(
         .unwrap_or("unknown");
     let description = event.pointer("/body/description").and_then(Value::as_str);
     let text = event.pointer("/body/text").and_then(Value::as_str);
-    let thread_id = event.pointer("/body/threadId").and_then(Value::as_i64).unwrap_or(-1);
+    let thread_id = event
+        .pointer("/body/threadId")
+        .and_then(Value::as_i64)
+        .unwrap_or(-1);
     let mut out = format!("{prefix} (reason: {reason}, thread {thread_id})");
     // Probe the top frame for the stop location; failures are non-fatal.
     if let Ok(body) = session
@@ -1042,7 +1173,10 @@ async fn render_stopped(
     }
     let output = session.drain_output();
     if !output.trim().is_empty() {
-        out.push_str(&format!("\n--- debuggee output ---\n{}", tail_output(&output)));
+        out.push_str(&format!(
+            "\n--- debuggee output ---\n{}",
+            tail_output(&output)
+        ));
     }
     Ok(text_result(bounded(&out)))
 }
@@ -1058,7 +1192,10 @@ fn render_exited(event: &Value, output: &str) -> Result<AgentToolResult> {
         _ => "Program terminated.".to_owned(),
     };
     if !output.trim().is_empty() {
-        out.push_str(&format!("\n--- debuggee output ---\n{}", tail_output(output)));
+        out.push_str(&format!(
+            "\n--- debuggee output ---\n{}",
+            tail_output(output)
+        ));
     }
     Ok(text_result(out))
 }
@@ -1081,7 +1218,11 @@ fn bounded(text: &str) -> String {
 /// `set_breakpoint`: adds a 1-based file:line breakpoint (per-source lists
 /// are replaced wholesale on the adapter, so earlier breakpoints in the same
 /// file survive). Allowed while the program is paused or before it starts.
-async fn run_set_breakpoint(session: &DebugSession, cwd: &str, args: &Value) -> Result<AgentToolResult> {
+async fn run_set_breakpoint(
+    session: &DebugSession,
+    cwd: &str,
+    args: &Value,
+) -> Result<AgentToolResult> {
     let file = arg_str(args, "file");
     let file = file.trim();
     if file.is_empty() {
@@ -1103,12 +1244,20 @@ async fn run_set_breakpoint(session: &DebugSession, cwd: &str, args: &Value) -> 
         }
         let lines = state.breakpoints.entry(abs.clone()).or_default();
         if lines.contains(&line) {
-            return Ok(text_result(format!("Breakpoint already set at {abs}:{line}")));
+            return Ok(text_result(format!(
+                "Breakpoint already set at {abs}:{line}"
+            )));
         }
         lines.push(line);
         lines.sort_unstable();
     }
-    let lines = session.state.lock().breakpoints.get(&abs).cloned().unwrap_or_default();
+    let lines = session
+        .state
+        .lock()
+        .breakpoints
+        .get(&abs)
+        .cloned()
+        .unwrap_or_default();
     let source_name = Path::new(&abs)
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -1227,7 +1376,9 @@ async fn run_pause(
         .pointer("/threads/0/id")
         .and_then(Value::as_i64)
         .ok_or_else(|| anyhow!("adapter reported no threads; cannot pause"))?;
-    session.request("pause", json!({ "threadId": thread_id })).await?;
+    session
+        .request("pause", json!({ "threadId": thread_id }))
+        .await?;
     let wait = wait_duration(args)?;
     if wait.is_zero() {
         return Ok(text_result("Pause requested (wait_ms=0, not waiting)."));
@@ -1308,7 +1459,10 @@ async fn run_stack_trace(session: &DebugSession, args: &Value) -> Result<AgentTo
         .get("totalFrames")
         .and_then(Value::as_i64)
         .unwrap_or(frames.len() as i64);
-    let mut out = format!("Stack (thread {thread_id}, {} of {total} frames):", frames.len());
+    let mut out = format!(
+        "Stack (thread {thread_id}, {} of {total} frames):",
+        frames.len()
+    );
     let scope_frames = frames.len().min(MAX_SCOPES_FRAMES);
     for (index, frame) in frames.iter().enumerate() {
         let id = frame.get("id").and_then(Value::as_i64).unwrap_or(-1);
@@ -1320,7 +1474,9 @@ async fn run_stack_trace(session: &DebugSession, args: &Value) -> Result<AgentTo
             .and_then(Value::as_str)
             .or_else(|| frame.pointer("/source/name").and_then(Value::as_str))
             .unwrap_or("?");
-        out.push_str(&format!("\n#{index} {name} at {source}:{line}:{column} (frame {id})"));
+        out.push_str(&format!(
+            "\n#{index} {name} at {source}:{line}:{column} (frame {id})"
+        ));
         if index < scope_frames {
             match session
                 .request_timeout("scopes", json!({ "frameId": id }), REQUEST_TIMEOUT)
@@ -1356,10 +1512,15 @@ async fn run_variables(session: &DebugSession, args: &Value) -> Result<AgentTool
         anyhow!("debug variables requires `variables_reference` (a scope reference from `debug stack_trace`)")
     })?;
     if reference <= 0 {
-        bail!("debug variables `variables_reference` must be a positive scope reference (0 means no children)");
+        bail!(
+            "debug variables `variables_reference` must be a positive scope reference (0 means no children)"
+        );
     }
     let body = session
-        .request("variables", json!({ "variablesReference": reference, "filter": "named" }))
+        .request(
+            "variables",
+            json!({ "variablesReference": reference, "filter": "named" }),
+        )
         .await?;
     let variables = body
         .get("variables")
@@ -1375,14 +1536,20 @@ async fn run_variables(session: &DebugSession, args: &Value) -> Result<AgentTool
         if let Some(vtype) = variable.get("type").and_then(Value::as_str) {
             line.push_str(&format!(" ({vtype})"));
         }
-        let nested = variable.get("variablesReference").and_then(Value::as_i64).unwrap_or(0);
+        let nested = variable
+            .get("variablesReference")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
         if nested > 0 {
             line.push_str(&format!(" [nested reference {nested}]"));
         }
         out.push_str(&format!("\n{line}"));
     }
     if variables.len() > MAX_VARIABLES {
-        out.push_str(&format!("\n[{} more variables omitted]", variables.len() - MAX_VARIABLES));
+        out.push_str(&format!(
+            "\n[{} more variables omitted]",
+            variables.len() - MAX_VARIABLES
+        ));
     }
     Ok(text_result(bounded(&out)))
 }
@@ -1447,6 +1614,98 @@ mod tests {
 
     use serde_json::json;
 
+    struct DebugFixture {
+        _agent: tempfile::TempDir,
+        _sessions: tempfile::TempDir,
+        _resources: crate::ResourceManager,
+        _session: crate::Session,
+        _application: crate::Application,
+        _faux: pi_ai::providers::FauxProviderRegistration,
+        generation: Arc<ApplicationGeneration>,
+        cwd: PathBuf,
+    }
+
+    async fn debug_fixture(cwd: &Path) -> DebugFixture {
+        let agent = tempfile::tempdir().expect("agent dir");
+        let sessions = tempfile::tempdir().expect("session dir");
+        std::fs::write(
+            agent.path().join("settings.json"),
+            r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+        )
+        .expect("sandbox settings");
+        let mut resource_options = crate::ResourceManagerOptions::new(cwd);
+        resource_options.agent_dir = agent.path().to_path_buf();
+        resource_options.project_trust_override = Some(true);
+        resource_options.disable_extensions = true;
+        resource_options.disable_skills = true;
+        resource_options.disable_prompt_templates = true;
+        resource_options.disable_themes = true;
+        resource_options.disable_context_files = true;
+        let resources = crate::ResourceManager::new(resource_options).expect("resources");
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let api = format!("debug-{suffix}");
+        let provider = format!("debug-{suffix}");
+        let model = pi_ai::Model {
+            id: format!("debug-{suffix}"),
+            api: api.clone(),
+            provider: provider.clone(),
+            ..pi_ai::Model::default()
+        };
+        let faux =
+            pi_ai::providers::register_faux_provider(pi_ai::providers::FauxProviderOptions {
+                api,
+                provider,
+                models: vec![model.clone()],
+                chunk_size: 1,
+            });
+        let workspace = crate::WorkspaceRoots::new(cwd, Vec::<PathBuf>::new()).expect("workspace");
+        let session =
+            crate::Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
+                crate::SessionOptions {
+                    model,
+                    cwd: cwd.to_path_buf(),
+                    system_prompt: String::new(),
+                    thinking_level: pi_agent::ThinkingLevel::Off,
+                    api_key: String::new(),
+                    compaction: None,
+                    stream_options: Default::default(),
+                    tools: Some(Vec::new()),
+                    before_tool_call: None,
+                    after_tool_call: None,
+                    stream_fn: None,
+                    auth_resolver: None,
+                    auth_manager: None,
+                },
+                Vec::new(),
+                crate::ToolSelection::default(),
+                crate::ResourceDiscovery::Disabled,
+                workspace,
+                None,
+            )
+            .expect("session");
+        session.set_session_dir(sessions.path().to_path_buf());
+        session
+            .attach_resources(resources.clone())
+            .await
+            .expect("attach resources");
+        let application = crate::Application::from_runtime_candidate(
+            crate::ApplicationRuntimeCandidate::new(session.clone()),
+        )
+        .await
+        .expect("publish debug application");
+        let generation = application.capture_generation();
+        DebugFixture {
+            _agent: agent,
+            _sessions: sessions,
+            _resources: resources,
+            _session: session,
+            _application: application,
+            _faux: faux,
+            generation,
+            cwd: cwd.to_path_buf(),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Fake DAP adapter
     // -----------------------------------------------------------------------
@@ -1488,7 +1747,11 @@ mod tests {
         let mut writer = std::io::BufWriter::new(stdout.lock());
         let mut seq = 0i64;
 
-        fn send(writer: &mut std::io::BufWriter<std::io::StdoutLock<'_>>, seq: &mut i64, body: &Value) {
+        fn send(
+            writer: &mut std::io::BufWriter<std::io::StdoutLock<'_>>,
+            seq: &mut i64,
+            body: &Value,
+        ) {
             *seq += 1;
             let mut message = body.clone();
             message["seq"] = json!(*seq);
@@ -1521,7 +1784,13 @@ mod tests {
                 send(writer, seq, &response);
             };
             match command {
-                Some("initialize") if boom => respond(&mut writer, &mut seq, json!(null), false, Some("initialize refused by fake adapter")),
+                Some("initialize") if boom => respond(
+                    &mut writer,
+                    &mut seq,
+                    json!(null),
+                    false,
+                    Some("initialize refused by fake adapter"),
+                ),
                 Some("initialize") => respond(
                     &mut writer,
                     &mut seq,
@@ -1556,7 +1825,13 @@ mod tests {
                             json!({ "id": 1000 + index as i64, "verified": true, "line": line })
                         })
                         .collect();
-                    respond(&mut writer, &mut seq, json!({ "breakpoints": bps }), true, None);
+                    respond(
+                        &mut writer,
+                        &mut seq,
+                        json!({ "breakpoints": bps }),
+                        true,
+                        None,
+                    );
                 }
                 Some("configurationDone") => {
                     respond(&mut writer, &mut seq, json!(null), true, None);
@@ -1605,7 +1880,13 @@ mod tests {
                 }
                 Some("continue") => {
                     // Resuming from a stop runs the program to completion.
-                    respond(&mut writer, &mut seq, json!({ "allThreadsContinued": true }), true, None);
+                    respond(
+                        &mut writer,
+                        &mut seq,
+                        json!({ "allThreadsContinued": true }),
+                        true,
+                        None,
+                    );
                     send(
                         &mut writer,
                         &mut seq,
@@ -1655,7 +1936,10 @@ mod tests {
                     None,
                 ),
                 Some("scopes") => {
-                    let frame_id = message.pointer("/arguments/frameId").and_then(Value::as_i64).unwrap_or(0);
+                    let frame_id = message
+                        .pointer("/arguments/frameId")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
                     let reference = if frame_id == 1 { 10 } else { 20 };
                     respond(
                         &mut writer,
@@ -1666,7 +1950,10 @@ mod tests {
                     );
                 }
                 Some("variables") => {
-                    let reference = message.pointer("/arguments/variablesReference").and_then(Value::as_i64).unwrap_or(0);
+                    let reference = message
+                        .pointer("/arguments/variablesReference")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
                     match reference {
                         10 => respond(
                             &mut writer,
@@ -1694,11 +1981,20 @@ mod tests {
                             true,
                             None,
                         ),
-                        _ => respond(&mut writer, &mut seq, json!(null), false, Some("unknown variablesReference")),
+                        _ => respond(
+                            &mut writer,
+                            &mut seq,
+                            json!(null),
+                            false,
+                            Some("unknown variablesReference"),
+                        ),
                     }
                 }
                 Some("evaluate") => {
-                    let expression = message.pointer("/arguments/expression").and_then(Value::as_str).unwrap_or("");
+                    let expression = message
+                        .pointer("/arguments/expression")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
                     let (result, vtype) = match expression {
                         "x" => ("42", "int"),
                         "x + 1" => ("43", "int"),
@@ -1723,7 +2019,13 @@ mod tests {
                     respond(&mut writer, &mut seq, json!(null), true, None);
                     return; // adapter exits
                 }
-                _ => respond(&mut writer, &mut seq, json!(null), false, Some("unknown command")),
+                _ => respond(
+                    &mut writer,
+                    &mut seq,
+                    json!(null),
+                    false,
+                    Some("unknown command"),
+                ),
             }
         }
     }
@@ -1755,9 +2057,10 @@ mod tests {
             }
             if let Some((name, value)) = header.trim_end().split_once(':') {
                 if name.trim().eq_ignore_ascii_case("Content-Length") {
-                    content_length = Some(value.trim().parse().map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-                    })?);
+                    content_length =
+                        Some(value.trim().parse().map_err(|e| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                        })?);
                 }
             }
         }
@@ -1770,97 +2073,147 @@ mod tests {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
-    /// Spawns the fake adapter (this test binary in fake-adapter mode).
-    /// `runs_forever` puts the fake in runs-forever mode (see
-    /// [`fake_dap_adapter_process`]).
-    async fn spawn_fake_session_with(boom: bool, runs_forever: bool) -> DebugSession {
+    /// Spawns the fake adapter under a published danger generation. The
+    /// fixture is returned with the session so Application, ResourceManager,
+    /// Session, faux-provider, and sandbox owners remain live for the entire
+    /// governed child lifetime.
+    async fn spawn_fake_session_with(
+        boom: bool,
+        runs_forever: bool,
+    ) -> (DebugFixture, DebugSession) {
+        let cwd = tempfile::tempdir().expect("debug cwd").keep();
+        let fixture = debug_fixture(&cwd).await;
         let exe = std::env::current_exe().expect("test binary path");
-        let mut command = Command::new(exe);
-        command
-            .arg("tools::debug::tests::fake_dap_adapter_process")
-            .arg("--nocapture")
-            .env("PI_FAKE_DAP_ADAPTER", "1");
+        let mut requested_env = BTreeMap::new();
+        requested_env.insert(
+            OsString::from("PI_FAKE_DAP_ADAPTER"),
+            Some(OsString::from("1")),
+        );
         if boom {
-            command.env("PI_FAKE_DAP_BOOM", "1");
+            requested_env.insert(
+                OsString::from("PI_FAKE_DAP_BOOM"),
+                Some(OsString::from("1")),
+            );
         }
         if runs_forever {
-            command.env("PI_FAKE_DAP_RUNS_FOREVER", "1");
+            requested_env.insert(
+                OsString::from("PI_FAKE_DAP_RUNS_FOREVER"),
+                Some(OsString::from("1")),
+            );
         }
-        DebugSession::spawn_command(command, "gdb")
-            .await
-            .expect("fake adapter spawn")
+        let family = SpawnFamily::DebugAdapter;
+        let authorized = authorize_spawn(
+            fixture.generation.clone(),
+            RawSpawnRequest {
+                authorization: SpawnAuthorization::Captured(fixture.generation.sandbox().clone()),
+                family,
+                audience: CredentialAudience::new_spawn_family(family).expect("debug audience"),
+                argv: vec![
+                    exe.into_os_string(),
+                    OsString::from("tools::debug::tests::fake_dap_adapter_process"),
+                    OsString::from("--nocapture"),
+                ],
+                cwd: fixture.cwd.clone(),
+                requested_env,
+                requested_grants: BTreeSet::new(),
+                stdio: StdioMode::Piped,
+                terminal_size: None,
+                timeout_ms: None,
+                target_fd_mappings: Vec::new(),
+                #[cfg(unix)]
+                owned_target_fd_mappings: Vec::new(),
+                #[cfg(unix)]
+                mount_sources: Vec::new(),
+                #[cfg(unix)]
+                retained_executable: None,
+                #[cfg(unix)]
+                retained_working_directory: None,
+            },
+        )
+        .await
+        .expect("authorize fake adapter");
+        let session = DebugSession::from_governed(
+            fixture.generation.clone(),
+            launch_authorized_pipe(authorized).expect("launch fake adapter"),
+            "gdb",
+        )
+        .expect("fake adapter session");
+        (fixture, session)
     }
 
     /// Spawns the fake adapter in normal mode.
-    async fn spawn_fake_session(boom: bool) -> DebugSession {
+    async fn spawn_fake_session(boom: bool) -> (DebugFixture, DebugSession) {
         spawn_fake_session_with(boom, false).await
     }
 
     /// Launches a fake session into a fresh registry slot.
-    async fn registry_with_launched_fake() -> DebugRegistry {
+    async fn registry_with_launched_fake() -> (DebugFixture, DebugRegistry) {
         let registry = DebugRegistry::new();
-        let session = spawn_fake_session(false).await;
+        let (fixture, session) = spawn_fake_session(false).await;
         session
-            .launch(&json!({ "program": "/fake/main.py", "args": ["--flag"] }), &AbortSignal::none())
+            .launch(
+                &json!({ "program": "/fake/main.py", "args": ["--flag"] }),
+                &AbortSignal::none(),
+            )
             .await
             .expect("fake adapter launches");
         *registry.lock().await = Some(session);
-        registry
+        (fixture, registry)
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn spawn_command_recovers_from_transient_etxtbsy() {
-        // execve of an executable that is open for writing returns ETXTBSY
-        // ("Text file busy") — the exact condition that flakes DAP adapter
-        // spawns under parallel load (the test binary is re-exec'd as the
-        // fake adapter). The session spawn must retry until the transient
-        // condition clears instead of failing on the first attempt. The
-        // running test binary itself cannot be opened for writing (open(2)
-        // already fails with ETXTBSY), so a copy is used.
+    async fn governed_spawn_classifies_transient_etxtbsy() {
+        // Keep the transient kernel contract at the governed boundary: an
+        // executable open for writing must surface the OS ETXTBSY class, not
+        // be reclassified as an authorization or policy failure.
+        let cwd = tempfile::tempdir().expect("debug cwd").keep();
+        let fixture = debug_fixture(&cwd).await;
         let exe = std::env::current_exe().expect("test binary path");
-        let dir = tempfile::tempdir().expect("tmp dir");
-        let copy = dir.path().join("fake-adapter-copy");
+        let copy = cwd.join("fake-adapter-copy");
         std::fs::copy(&exe, &copy).expect("copy test binary");
         let write_handle = std::fs::OpenOptions::new()
             .write(true)
             .open(&copy)
             .expect("open copied binary for writing");
-        // Probe: while the handle is open, a bare spawn must hit ETXTBSY.
-        let mut probe = std::process::Command::new(&copy);
-        let probe_error = probe
-            .arg("--version")
-            .spawn()
-            .expect_err("bare spawn of a write-open executable must fail with ETXTBSY");
-        assert_eq!(
-            probe_error.raw_os_error(),
-            Some(nix::errno::Errno::ETXTBSY as i32),
-            "{probe_error}"
+        let family = SpawnFamily::DebugAdapter;
+        let mut requested_env = BTreeMap::new();
+        requested_env.insert(
+            OsString::from("PI_FAKE_DAP_ADAPTER"),
+            Some(OsString::from("1")),
         );
-        drop(probe_error);
-        // Release the handle shortly after the first retry attempt, so the
-        // retry loop (not the first attempt) succeeds — the recovery path.
-        let closer = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(5));
-            drop(write_handle);
-        });
-        let mut command = Command::new(&copy);
-        command
-            .arg("tools::debug::tests::fake_dap_adapter_process")
-            .arg("--nocapture")
-            .env("PI_FAKE_DAP_ADAPTER", "1");
-        let session = DebugSession::spawn_command(command, "gdb")
-            .await
-            .expect("spawn must recover from transient ETXTBSY");
-        closer.join().expect("closer thread");
-        // The recovered session is live: a launch round trip works.
-        session
-            .launch(
-                &json!({ "program": "/fake/main.py" }),
-                &AbortSignal::none(),
-            )
-            .await
-            .expect("launch over recovered session");
+        let authorized = authorize_spawn(
+            fixture.generation.clone(),
+            RawSpawnRequest {
+                authorization: SpawnAuthorization::Captured(fixture.generation.sandbox().clone()),
+                family,
+                audience: CredentialAudience::new_spawn_family(family).expect("debug audience"),
+                argv: vec![
+                    copy.into_os_string(),
+                    OsString::from("tools::debug::tests::fake_dap_adapter_process"),
+                    OsString::from("--nocapture"),
+                ],
+                cwd: fixture.cwd.clone(),
+                requested_env,
+                requested_grants: BTreeSet::new(),
+                stdio: StdioMode::Piped,
+                terminal_size: None,
+                timeout_ms: None,
+                target_fd_mappings: Vec::new(),
+                owned_target_fd_mappings: Vec::new(),
+                mount_sources: Vec::new(),
+                retained_executable: None,
+                retained_working_directory: None,
+            },
+        )
+        .await
+        .expect("authorize busy fake adapter");
+        let error = match launch_authorized_pipe(authorized) {
+            Ok(_) => panic!("write-open executable must not launch"),
+            Err(error) => error,
+        };
+        assert!(crate::hooks::retryable_etxtbsy(&error), "{error}");
+        drop(write_handle);
     }
 
     // -----------------------------------------------------------------------
@@ -1880,7 +2233,9 @@ mod tests {
 
     #[test]
     fn resolve_adapter_command_missing_binary_is_actionable() {
-        let err = resolve_adapter_command("gdb", "/nonexistent").unwrap_err().to_string();
+        let err = resolve_adapter_command("gdb", "/nonexistent")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("gdb"), "{err}");
         assert!(err.contains("PATH"), "{err}");
         let err = resolve_adapter_command("debugpy", "/nonexistent")
@@ -1898,7 +2253,10 @@ mod tests {
         let path = dir.path().to_string_lossy().into_owned();
         let (binary, argv) = resolve_adapter_command("gdb", &path).expect("resolves");
         assert_eq!(binary, gdb.to_string_lossy());
-        assert_eq!(argv, vec!["-q".to_owned(), "-i".to_owned(), "dap".to_owned()]);
+        assert_eq!(
+            argv,
+            vec!["-q".to_owned(), "-i".to_owned(), "dap".to_owned()]
+        );
     }
 
     #[test]
@@ -1935,7 +2293,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_launch_breakpoint_continue_stack_round_trip() {
-        let session = spawn_fake_session(false).await;
+        let (_fixture, session) = spawn_fake_session(false).await;
         let abort = AbortSignal::none();
         session
             .launch(&json!({ "program": "/fake/main.py" }), &abort)
@@ -1959,7 +2317,10 @@ mod tests {
         // Capture the watermark before the request so the stop events it
         // triggers are observed by the wait below.
         let from = session.event_watermark();
-        session.request("configurationDone", json!({})).await.expect("configurationDone");
+        session
+            .request("configurationDone", json!({}))
+            .await
+            .expect("configurationDone");
         let event = session
             .wait_for_event(is_stop_event, from, REQUEST_TIMEOUT, &abort)
             .await
@@ -1969,7 +2330,10 @@ mod tests {
         assert_eq!(event["body"]["threadId"], 1);
 
         let body = session
-            .request("stackTrace", json!({ "threadId": 1, "startFrame": 0, "levels": 50 }))
+            .request(
+                "stackTrace",
+                json!({ "threadId": 1, "startFrame": 0, "levels": 50 }),
+            )
             .await
             .expect("stackTrace");
         let frames = body["stackFrames"].as_array().expect("frames");
@@ -1977,7 +2341,10 @@ mod tests {
         assert_eq!(frames[0]["name"], "main");
         assert_eq!(frames[0]["line"], 42);
 
-        let body = session.request("scopes", json!({ "frameId": 1 })).await.expect("scopes");
+        let body = session
+            .request("scopes", json!({ "frameId": 1 }))
+            .await
+            .expect("scopes");
         assert_eq!(body["scopes"][0]["variablesReference"], 10);
 
         let body = session
@@ -1994,7 +2361,10 @@ mod tests {
             .expect("evaluate");
         assert_eq!(body["result"], "43");
 
-        let body = session.request("threads", json!({})).await.expect("threads");
+        let body = session
+            .request("threads", json!({}))
+            .await
+            .expect("threads");
         assert_eq!(body["threads"][0]["id"], 1);
 
         // The watermark is taken BEFORE the continue request so the
@@ -2023,7 +2393,7 @@ mod tests {
         // A fake adapter that logs credential-shaped text to stderr and then
         // refuses initialize: the launch error must embed the stderr tail
         // but never the secret values.
-        let session = spawn_fake_session(true).await;
+        let (_fixture, session) = spawn_fake_session(true).await;
         let err = session
             .launch(&json!({ "program": "/fake/main.py" }), &AbortSignal::none())
             .await
@@ -2036,7 +2406,10 @@ mod tests {
         for secret in [ghp.as_str(), sk.as_str()] {
             assert!(!text.contains(secret), "{secret} leaked: {text}");
         }
-        assert!(text.contains("[REDACTED]"), "redaction marker missing: {text}");
+        assert!(
+            text.contains("[REDACTED]"),
+            "redaction marker missing: {text}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2062,6 +2435,7 @@ mod tests {
             on_update: Arc::new(|_| {}),
             abort: AbortSignal::none(),
             model: None,
+            approval_token: None,
         }
     }
 
@@ -2087,45 +2461,82 @@ mod tests {
 
     #[tokio::test]
     async fn debug_tool_launch_validation_errors() {
+        let cwd_store = tempfile::tempdir().expect("debug cwd");
+        let fixture = debug_fixture(cwd_store.path()).await;
+        let generation = fixture.generation.clone();
+        let capture: GenerationCaptureFn = Arc::new(move || Ok(generation.clone()));
         let registry = DebugRegistry::new();
-        let cwd = "/tmp";
+        let cwd = fixture.cwd.to_string_lossy().into_owned();
 
-        let err = run_text(&registry, cwd, json!({})).await.expect_err("missing action");
+        let err =
+            run_debug_with_generation(&registry, &cwd, &capture, json!({}), AbortSignal::none())
+                .await
+                .expect_err("missing action");
         assert!(err.to_string().contains("action is required"), "{err}");
 
-        let err = run_text(
+        let err = run_debug_with_generation(
             &registry,
-            cwd,
+            &cwd,
+            &capture,
             json!({ "action": "launch", "adapter": "frobnicator", "program": "app.py" }),
+            AbortSignal::none(),
         )
         .await
         .expect_err("unknown adapter");
-        assert!(err.to_string().contains("unsupported debug adapter"), "{err}");
+        assert!(
+            err.to_string().contains("unsupported debug adapter"),
+            "{err}"
+        );
 
-        let err = run_text(&registry, cwd, json!({ "action": "launch", "adapter": "gdb" }))
-            .await
-            .expect_err("missing program");
+        let err = run_debug_with_generation(
+            &registry,
+            &cwd,
+            &capture,
+            json!({ "action": "launch", "adapter": "gdb" }),
+            AbortSignal::none(),
+        )
+        .await
+        .expect_err("missing program");
         assert!(err.to_string().contains("program"), "{err}");
 
-        let err = run_text(&registry, cwd, json!({ "action": "launch", "program": "app.py" }))
-            .await
-            .expect_err("missing adapter");
+        let err = run_debug_with_generation(
+            &registry,
+            &cwd,
+            &capture,
+            json!({ "action": "launch", "program": "app.py" }),
+            AbortSignal::none(),
+        )
+        .await
+        .expect_err("missing adapter");
         assert!(err.to_string().contains("adapter"), "{err}");
 
-        let err = run_text(&registry, cwd, json!({ "action": "fly" }))
-            .await
-            .expect_err("unknown action");
-        assert!(err.to_string().contains("unknown debug action `fly`"), "{err}");
+        let err = run_debug_with_generation(
+            &registry,
+            &cwd,
+            &capture,
+            json!({ "action": "fly" }),
+            AbortSignal::none(),
+        )
+        .await
+        .expect_err("unknown action");
+        assert!(
+            err.to_string().contains("unknown debug action `fly`"),
+            "{err}"
+        );
         assert!(err.to_string().contains("launch"), "{err}");
     }
 
     #[tokio::test]
     async fn debug_tool_rejects_second_launch_while_running() {
-        let registry = registry_with_launched_fake().await;
-        let err = run_text(
+        let (fixture, registry) = registry_with_launched_fake().await;
+        let generation = fixture.generation.clone();
+        let capture: GenerationCaptureFn = Arc::new(move || Ok(generation.clone()));
+        let err = run_debug_with_generation(
             &registry,
-            "/tmp",
+            &fixture.cwd.to_string_lossy(),
+            &capture,
             json!({ "action": "launch", "adapter": "gdb", "program": "app.py" }),
+            AbortSignal::none(),
         )
         .await
         .expect_err("second launch must fail");
@@ -2135,7 +2546,7 @@ mod tests {
 
     #[tokio::test]
     async fn debug_tool_actions_round_trip() {
-        let registry = registry_with_launched_fake().await;
+        let (_fixture, registry) = registry_with_launched_fake().await;
         let cwd = "/tmp";
 
         // set_breakpoint while the program is paused before start.
@@ -2162,8 +2573,14 @@ mod tests {
             .await
             .expect("stack_trace");
         assert!(text.contains("Stack (thread 1, 2 of 2 frames)"), "{text}");
-        assert!(text.contains("#0 main at /fake/main.py:42:1 (frame 1)"), "{text}");
-        assert!(text.contains("scope Local (variables_reference 10)"), "{text}");
+        assert!(
+            text.contains("#0 main at /fake/main.py:42:1 (frame 1)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("scope Local (variables_reference 10)"),
+            "{text}"
+        );
 
         // variables: expand a scope reference.
         let text = run_text(
@@ -2228,15 +2645,23 @@ mod tests {
 
     #[tokio::test]
     async fn debug_tool_set_breakpoint_validation_errors() {
-        let registry = registry_with_launched_fake().await;
+        let (_fixture, registry) = registry_with_launched_fake().await;
         let cwd = "/tmp";
-        let err = run_text(&registry, cwd, json!({ "action": "set_breakpoint", "line": 42 }))
-            .await
-            .expect_err("missing file");
+        let err = run_text(
+            &registry,
+            cwd,
+            json!({ "action": "set_breakpoint", "line": 42 }),
+        )
+        .await
+        .expect_err("missing file");
         assert!(err.to_string().contains("`file`"), "{err}");
-        let err = run_text(&registry, cwd, json!({ "action": "set_breakpoint", "file": "a.py" }))
-            .await
-            .expect_err("missing line");
+        let err = run_text(
+            &registry,
+            cwd,
+            json!({ "action": "set_breakpoint", "file": "a.py" }),
+        )
+        .await
+        .expect_err("missing line");
         assert!(err.to_string().contains("`line`"), "{err}");
         let err = run_text(
             &registry,
@@ -2250,7 +2675,7 @@ mod tests {
 
     #[tokio::test]
     async fn debug_tool_variables_requires_reference() {
-        let registry = registry_with_launched_fake().await;
+        let (_fixture, registry) = registry_with_launched_fake().await;
         let err = run_text(&registry, "/tmp", json!({ "action": "variables" }))
             .await
             .expect_err("missing reference");
@@ -2262,7 +2687,7 @@ mod tests {
         // Runs-forever mode: the program does not exit after configurationDone,
         // so it is genuinely running after a no-wait continue.
         let registry = DebugRegistry::new();
-        let session = spawn_fake_session_with(false, true).await;
+        let (_fixture, session) = spawn_fake_session_with(false, true).await;
         session
             .launch(&json!({ "program": "/fake/main.py" }), &AbortSignal::none())
             .await

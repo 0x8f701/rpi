@@ -19,10 +19,19 @@
 //!   `history://<agentId>` falls back to the persona archive.
 //! - **Ordinary agent regression**: an ordinary agent (kind `Agent`) still
 //!   spawns and settles alongside a persona in the same runtime.
+//! - **Learned skills**: `learn_skill` persists under the persona root and is
+//!   autoloaded beginning with the next spawn; it stays inside that persona
+//!   and shadows a same-named shared skill only there.
+//! - **Memory across rebuild**: a persona-rooted `memory` entry survives a
+//!   new `Application` on the same disk state.
+//! - **Workspace inheritance**: a parent `WorkspaceRoots` additional root
+//!   reaches the built child's `Session::workspace_roots()`.
 //!
 //! The production child factory (`child_factory_from_snapshot`) is used so the
 //! persona coding tools — including the persona-rooted `memory` tool — are
-//! injected exactly as in live runs; no tool construction is mocked.
+//! injected exactly as in live runs; no tool construction is mocked. Child
+//! tool names and prompts are captured from the built `Session` after the
+//! inner factory returns `Ok`.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -31,14 +40,17 @@ use std::time::Duration;
 use futures_util::FutureExt;
 use parking_lot::Mutex;
 use pi_agent::{AbortController, StreamFn, ThinkingLevel, ToolCallContext};
+use pi_ai::providers::{FauxProviderOptions, FauxProviderRegistration, register_faux_provider};
 use pi_ai::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, Context, Model, SimpleStreamOptions,
     StopReason, ToolCall, new_assistant_message_event_stream,
 };
 use pi_coding::{
-    AgentCatalog, AgentDefinition, AgentDefinitionKind, AgentDefinitionSource, JobStatus,
-    OrchestrationConfig, OrchestrationRuntime, ResourceManager, ResourceManagerOptions, Session,
-    SessionOptions, TaskItem, TaskSpawn, session_store,
+    AgentCatalog, AgentDefinition, AgentDefinitionKind, AgentDefinitionSource, Application,
+    ApplicationRuntimeCandidate, ChildSessionFactory, JobStatus, OrchestrationConfig,
+    OrchestrationRuntime, OrchestrationSkill, ResourceDiscovery, ResourceManager,
+    ResourceManagerOptions, Session, SessionOptions, SkillSource, TaskItem, TaskSpawn,
+    WorkspaceRoots, session_store,
 };
 use serde_json::{Value, json};
 
@@ -88,6 +100,58 @@ fn persona_definition(persona_root: &std::path::Path, name: &str) -> AgentDefini
         kind: AgentDefinitionKind::Persona,
         personality: None,
         soft_budget: None,
+        knowledge_roots: Vec::new(),
+        user_proxy: false,
+    }
+}
+
+fn persona_definition_with_tools(
+    persona_root: &std::path::Path,
+    name: &str,
+    tools: &[&str],
+) -> AgentDefinition {
+    let mut definition = persona_definition(persona_root, name);
+    definition.tools = Some(tools.iter().map(|tool| (*tool).to_owned()).collect());
+    definition
+}
+
+fn seed_persona_skill(persona_root: &std::path::Path, name: &str, description: &str, body: &str) {
+    let skill = persona_root.join("skills").join(name);
+    std::fs::create_dir_all(&skill).expect("persona skill dir");
+    std::fs::write(
+        skill.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: {description}\n---\n\n{body}\n"),
+    )
+    .expect("persona SKILL.md");
+}
+
+fn shared_skill(
+    root: &std::path::Path,
+    name: &str,
+    description: &str,
+    body: &str,
+) -> OrchestrationSkill {
+    let skill_dir = root.join("shared-skills").join(name);
+    std::fs::create_dir_all(&skill_dir).expect("shared skill dir");
+    let file_path = skill_dir.join("SKILL.md");
+    std::fs::write(
+        &file_path,
+        format!("---\nname: {name}\ndescription: {description}\n---\n\n{body}\n"),
+    )
+    .expect("shared SKILL.md");
+    OrchestrationSkill {
+        name: name.to_owned(),
+        description: description.to_owned(),
+        file_path,
+        base_dir: skill_dir,
+        globs: Vec::new(),
+        always_apply: false,
+        hidden: false,
+        disable_model_invocation: false,
+        source: SkillSource::Project,
+        managed_project_boundary: None,
+        managed_root: None,
+        trusted: true,
     }
 }
 
@@ -113,6 +177,8 @@ fn ordinary_definition(name: &str) -> AgentDefinition {
         kind: AgentDefinitionKind::Agent,
         personality: None,
         soft_budget: None,
+        knowledge_roots: Vec::new(),
+        user_proxy: false,
     }
 }
 
@@ -144,73 +210,133 @@ fn capturing_scripted(
     captured: Arc<Mutex<Vec<Vec<pi_ai::Message>>>>,
 ) -> StreamFn {
     let queue = Arc::new(Mutex::new(VecDeque::from(messages)));
-    Arc::new(move |model: Model, context: Context, _options: SimpleStreamOptions| {
-        let queue = queue.clone();
-        let captured = captured.clone();
-        async move {
-            captured.lock().push(context.messages.clone());
-            let message = queue.lock().pop_front().unwrap_or_else(|| {
-                let mut fallback = AssistantMessage::pending(&model);
-                fallback.content = vec![ContentBlock::text("done")];
-                fallback.stop_reason = StopReason::Stop;
-                fallback
-            });
-            let stream = new_assistant_message_event_stream();
-            let producer = stream.clone();
-            let model = model.clone();
-            tokio::spawn(async move {
-                producer
-                    .push(AssistantMessageEvent::Start {
-                        partial: AssistantMessage::pending(&model),
-                    })
-                    .await;
-                let terminal = if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
-                    AssistantMessageEvent::Error {
-                        reason: message.stop_reason,
-                        error: message.clone(),
-                    }
-                } else {
-                    AssistantMessageEvent::Done {
-                        reason: message.stop_reason,
-                        message: message.clone(),
-                    }
-                };
-                producer.push(terminal).await;
-                producer.end(Some(message)).await;
-            });
-            stream
-        }
-        .boxed()
-    })
+    Arc::new(
+        move |model: Model, context: Context, _options: SimpleStreamOptions| {
+            let queue = queue.clone();
+            let captured = captured.clone();
+            async move {
+                captured.lock().push(context.messages.clone());
+                let message = queue.lock().pop_front().unwrap_or_else(|| {
+                    let mut fallback = AssistantMessage::pending(&model);
+                    fallback.content = vec![ContentBlock::text("done")];
+                    fallback.stop_reason = StopReason::Stop;
+                    fallback
+                });
+                let stream = new_assistant_message_event_stream();
+                let producer = stream.clone();
+                let model = model.clone();
+                tokio::spawn(async move {
+                    producer
+                        .push(AssistantMessageEvent::Start {
+                            partial: AssistantMessage::pending(&model),
+                        })
+                        .await;
+                    let terminal =
+                        if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
+                            AssistantMessageEvent::Error {
+                                reason: message.stop_reason,
+                                error: message.clone(),
+                            }
+                        } else {
+                            AssistantMessageEvent::Done {
+                                reason: message.stop_reason,
+                                message: message.clone(),
+                            }
+                        };
+                    producer.push(terminal).await;
+                    producer.end(Some(message)).await;
+                });
+                stream
+            }
+            .boxed()
+        },
+    )
+}
+
+struct CapturedChild {
+    agent: String,
+    tool_names: Vec<String>,
+    system_prompt: String,
+    session: Session,
+}
+
+#[derive(Default)]
+struct PersonaRuntimeConfig {
+    extra_catalog: Vec<AgentDefinition>,
+    extra_skills: Vec<OrchestrationSkill>,
+    workspace: Option<WorkspaceRoots>,
+    persona_tools: Option<Vec<String>>,
 }
 
 struct PersonaRuntime {
     runtime: OrchestrationRuntime,
+    application: Application,
+    model_registration: FauxProviderRegistration,
     persona_root: std::path::PathBuf,
     persona_name: String,
     captured: Arc<Mutex<Vec<Vec<pi_ai::Message>>>>,
+    children: tokio::sync::mpsc::UnboundedReceiver<CapturedChild>,
 }
 
-/// Builds a durably-bound runtime whose production child factory injects the
-/// persona-rooted `memory` tool, with a capturing scripted stream. The parent
-/// session is recorded so `bind_and_recover` establishes the durable child
-/// root. `max_retained_jobs` controls job retention for the history-fallback
-/// test.
-fn persona_runtime(
+/// Builds a durably-bound application whose production child factory injects
+/// the persona-rooted `memory` tool, with a capturing scripted stream. The
+/// parent session is recorded before publication so the application installs
+/// one authoritative generation and binds the durable child root against it.
+/// `max_retained_jobs` controls job retention for the history-fallback test.
+async fn persona_runtime(
     root: &std::path::Path,
     persona_name: &str,
     messages: Vec<AssistantMessage>,
     max_retained_jobs: usize,
 ) -> PersonaRuntime {
+    persona_runtime_configured(
+        root,
+        persona_name,
+        messages,
+        max_retained_jobs,
+        PersonaRuntimeConfig::default(),
+    )
+    .await
+}
+
+async fn persona_runtime_configured(
+    root: &std::path::Path,
+    persona_name: &str,
+    messages: Vec<AssistantMessage>,
+    max_retained_jobs: usize,
+    config_ext: PersonaRuntimeConfig,
+) -> PersonaRuntime {
     let persona_root = root.join("personas").join(persona_name);
     write_persona_md(&persona_root, persona_name);
-    let definition = persona_definition(&persona_root, persona_name);
+    let definition = match config_ext.persona_tools.as_deref() {
+        Some(tools) => persona_definition_with_tools(
+            &persona_root,
+            persona_name,
+            &tools.iter().map(String::as_str).collect::<Vec<_>>(),
+        ),
+        None => persona_definition(&persona_root, persona_name),
+    };
     let model = test_model();
+    let model_registration = register_faux_provider(FauxProviderOptions {
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+        models: vec![model.clone()],
+        chunk_size: 1,
+    });
     let captured: Arc<Mutex<Vec<Vec<pi_ai::Message>>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let parent = Session::new(SessionOptions {
+    let cwd = config_ext
+        .workspace
+        .as_ref()
+        .map(|workspace| workspace.cwd().to_path_buf())
+        .unwrap_or_else(|| {
+            let cwd = root.join("project");
+            std::fs::create_dir_all(&cwd).expect("project cwd");
+            cwd
+        });
+    let options = SessionOptions {
         model: model.clone(),
-        cwd: root.to_path_buf(),
+        cwd: cwd.clone(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
         api_key: "persona-e2e".to_owned(),
@@ -221,43 +347,129 @@ fn persona_runtime(
         after_tool_call: None,
         stream_fn: Some(capturing_scripted(messages, captured.clone())),
         auth_resolver: None,
-    })
+        auth_manager: None,
+    };
+    let parent = if let Some(workspace) = config_ext.workspace.clone() {
+        Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
+            options,
+            Vec::new(),
+            Default::default(),
+            ResourceDiscovery::Disabled,
+            workspace,
+            None,
+        )
+    } else {
+        Session::new_with_additional_tools_filtered_and_discovery(
+            options,
+            Vec::new(),
+            Default::default(),
+            ResourceDiscovery::Disabled,
+        )
+    }
     .expect("parent session");
 
     let session_dir = root.join("parent-sessions");
-    let recorder = session_store::start_session_in(
-        root,
-        Some(&model),
-        None,
-        Some(&session_dir),
-        None,
-        None,
-    )
-    .expect("parent recorder");
+    let recorder =
+        session_store::start_session_in(root, Some(&model), None, Some(&session_dir), None, None)
+            .expect("parent recorder");
     parent.record(recorder).expect("record parent");
 
+    let mut agents = vec![definition.clone(), ordinary_definition("worker")];
+    agents.extend(config_ext.extra_catalog);
     let mut config = OrchestrationConfig::new(
-        AgentCatalog::from_agents(vec![definition.clone(), ordinary_definition("worker")]),
+        AgentCatalog::from_agents(agents),
         root.join("artifacts"),
     );
+    config.skills = config_ext.extra_skills;
     config.default_agent = "worker".to_owned();
     config.parent_model = model;
     config.idle_ttl = None;
     config.max_retained_jobs = max_retained_jobs;
     config.retained_job_ttl = Duration::from_secs(24 * 60 * 60);
 
+    let agent_dir = root.join("agent-home");
+    std::fs::create_dir_all(&agent_dir).expect("agent home");
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        r#"{"sandbox":{"mode":"danger-full-access"},"orchestration":{"isolation":"none"}}"#,
+    )
+    .expect("persona settings");
+    let mut resource_options = ResourceManagerOptions::new(&cwd);
+    resource_options.agent_dir = agent_dir;
+    resource_options.disable_extensions = true;
+    resource_options.disable_skills = true;
+    resource_options.disable_prompt_templates = true;
+    resource_options.disable_themes = true;
+    resource_options.disable_context_files = true;
+    let resources = ResourceManager::new(resource_options).expect("persona resources");
+    parent
+        .attach_resources(resources)
+        .await
+        .expect("attach persona resources");
     let snapshot = parent.child_session_options_snapshot();
-    let runtime =
-        OrchestrationRuntime::new(config, OrchestrationRuntime::child_factory_from_snapshot(snapshot))
-            .expect("runtime");
-    runtime.bind_and_recover(&parent).expect("bind durable");
-    assert!(runtime.is_durable(), "persona runtime must be durable-bound");
+    let inner = OrchestrationRuntime::child_factory_from_snapshot(snapshot);
+    let (sender, children) = tokio::sync::mpsc::unbounded_channel();
+    let factory: ChildSessionFactory = std::sync::Arc::new(move |request| {
+        let inner = inner.clone();
+        let sender = sender.clone();
+        Box::pin(async move {
+            let agent = request.definition.name.clone();
+            let child = inner(request).await?;
+            let captured = CapturedChild {
+                agent,
+                tool_names: child.get_active_tool_names(),
+                system_prompt: child.system_prompt().await,
+                session: child.clone(),
+            };
+            let _ = sender.send(captured);
+            Ok(child)
+        })
+    });
+    let runtime = OrchestrationRuntime::new(config, factory).expect("runtime");
+    let application = Application::from_runtime_candidate(
+        ApplicationRuntimeCandidate::new(parent).with_orchestration(runtime.clone()),
+    )
+    .await
+    .expect("publish persona application");
+    assert!(
+        runtime.is_durable(),
+        "persona runtime must be durable-bound"
+    );
     PersonaRuntime {
         runtime,
+        model_registration,
+        application,
         persona_root,
         persona_name: persona_name.to_owned(),
         captured,
+        children,
     }
+}
+
+async fn captured_child(
+    children: &mut tokio::sync::mpsc::UnboundedReceiver<CapturedChild>,
+    agent: &str,
+) -> CapturedChild {
+    loop {
+        let child = tokio::time::timeout(std::time::Duration::from_secs(30), children.recv())
+            .await
+            .expect("the spawned child factory must build a session")
+            .expect("captured child channel");
+        if child.agent == agent {
+            return child;
+        }
+    }
+}
+
+fn tool_text(result: &pi_agent::AgentToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            pi_ai::ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn tool_context(id: &str, arguments: Value) -> ToolCallContext {
@@ -268,6 +480,7 @@ fn tool_context(id: &str, arguments: Value) -> ToolCallContext {
         on_update: Arc::new(|_| {}),
         abort,
         model: None,
+        approval_token: None,
     }
 }
 
@@ -352,12 +565,7 @@ async fn preferred_agent_wins_unnamed_task_spawn() {
     // The preferred persona never actually runs a turn here — the task tool
     // only resolves the agent and returns spawn ids — so a single terminal
     // message keeps the stream non-empty for any incidental child start.
-    let env = persona_runtime(
-        root.path(),
-        "mentor",
-        vec![text_message("done")],
-        256,
-    );
+    let env = persona_runtime(root.path(), "mentor", vec![text_message("done")], 256).await;
     let runtime = &env.runtime;
     runtime.set_preferred_agent(Some("mentor"));
     assert_eq!(runtime.preferred_agent().as_deref(), Some("mentor"));
@@ -373,8 +581,7 @@ async fn preferred_agent_wins_unnamed_task_spawn() {
     ))
     .await
     .expect("task tool spawn");
-    let spawns: Vec<TaskSpawn> =
-        serde_json::from_value(result.details).expect("spawns decoded");
+    let spawns: Vec<TaskSpawn> = serde_json::from_value(result.details).expect("spawns decoded");
     let spawn = spawns.first().expect("one spawn");
     assert_eq!(
         spawn.agent, "mentor",
@@ -401,10 +608,15 @@ async fn persona_fresh_run_archives_transcript_and_persists_memory() {
             text_message("learned"),
         ],
         256,
-    );
+    )
+    .await;
     let spawn = spawn_persona(&env.runtime, "mentor", "Mentor", "first-run-marker-AAAA");
     let snapshot = wait_settled(&env.runtime, &spawn.job_id).await;
-    assert_eq!(snapshot.status, JobStatus::Completed, "job should settle completed");
+    assert_eq!(
+        snapshot.status,
+        JobStatus::Completed,
+        "job should settle completed"
+    );
     let result = snapshot.result.expect("result");
     assert!(result.error.is_none(), "no error: {:?}", result.error);
     assert!(!result.output.is_empty(), "run must produce output");
@@ -417,7 +629,11 @@ async fn persona_fresh_run_archives_transcript_and_persists_memory() {
     );
 
     let archive = env.persona_root.join("sessions").join("Mentor.jsonl");
-    assert!(archive.exists(), "transcript archive must be written: {}", archive.display());
+    assert!(
+        archive.exists(),
+        "transcript archive must be written: {}",
+        archive.display()
+    );
     let archive_text = std::fs::read_to_string(&archive).expect("archive");
     assert!(
         archive_text.contains("first-run-marker-AAAA"),
@@ -437,14 +653,12 @@ async fn persona_continuity_loaded_on_second_run() {
         root.path(),
         "mentor",
         vec![
-            // Run 1: learn a durable note, then settle.
             tool_call_message(
                 "learn-1",
                 "memory",
                 json!({ "op": "learn", "content": "durable-persona-note-AAAA" }),
             ),
             text_message("learned"),
-            // Run 2: recall (reads the same persona-rooted store), then settle.
             tool_call_message(
                 "recall-2",
                 "memory",
@@ -453,7 +667,8 @@ async fn persona_continuity_loaded_on_second_run() {
             text_message("recalled"),
         ],
         256,
-    );
+    )
+    .await;
 
     let first = spawn_persona(&env.runtime, "mentor", "Mentor", "first-run-marker-AAAA");
     wait_settled(&env.runtime, &first.job_id).await;
@@ -469,8 +684,13 @@ async fn persona_continuity_loaded_on_second_run() {
 
     // Run 2's stream calls happen after run 1's; their context must include run
     // 1's archived transcript (loaded as continuity before the child runs).
-    let second_contexts: Vec<Vec<pi_ai::Message>> =
-        env.captured.lock().iter().skip(first_captured).cloned().collect();
+    let second_contexts: Vec<Vec<pi_ai::Message>> = env
+        .captured
+        .lock()
+        .iter()
+        .skip(first_captured)
+        .cloned()
+        .collect();
     assert!(
         !second_contexts.is_empty(),
         "run 2 must make at least one stream call"
@@ -481,14 +701,21 @@ async fn persona_continuity_loaded_on_second_run() {
         "run 2 must load run 1's archived transcript as continuity: {serialized}"
     );
     assert!(
-        !serialized.contains("second-run-marker-BBBB") || serialized.contains("first-run-marker-AAAA"),
+        !serialized.contains("second-run-marker-BBBB")
+            || serialized.contains("first-run-marker-AAAA"),
         "continuity marker present"
     );
 
     // Two archives now exist; memory entry persists unchanged across both runs.
     let sessions = env.persona_root.join("sessions");
-    assert!(sessions.join("Mentor.jsonl").exists(), "first archive present");
-    assert!(sessions.join("Mentor_2.jsonl").exists(), "second archive present");
+    assert!(
+        sessions.join("Mentor.jsonl").exists(),
+        "first archive present"
+    );
+    assert!(
+        sessions.join("Mentor_2.jsonl").exists(),
+        "second archive present"
+    );
     let entries = std::fs::read_to_string(env.persona_root.join("memory").join("entries.jsonl"))
         .expect("entries");
     assert!(
@@ -509,26 +736,25 @@ async fn persona_history_falls_back_to_archive_after_retention() {
         root.path(),
         "mentor",
         vec![
-            // Run 1 (persona): learn a durable note, then settle.
             tool_call_message(
                 "learn-1",
                 "memory",
                 json!({ "op": "learn", "content": "durable-persona-note-AAAA" }),
             ),
             text_message("learned"),
-            // Evictor run (ordinary worker): settles on a single text turn.
             text_message("worker-done"),
         ],
-        // Retain only one settled job: a second settled job evicts the oldest
-        // (the persona run) on the next jobs() prune, dropping its REGISTRY
-        // entry and artifact history file while leaving the persona archive.
         1,
-    );
+    )
+    .await;
     let persona_spawn = spawn_persona(&env.runtime, "mentor", "Mentor", "first-run-marker-AAAA");
     wait_settled(&env.runtime, &persona_spawn.job_id).await;
 
     let archive = env.persona_root.join("sessions").join("Mentor.jsonl");
-    assert!(archive.exists(), "persona archive must exist before retention");
+    assert!(
+        archive.exists(),
+        "persona archive must exist before retention"
+    );
 
     // Before eviction the live REGISTRY entry resolves to the artifact history.
     let before = env
@@ -567,7 +793,8 @@ async fn ordinary_agent_spawns_and_settles_alongside_persona() {
         // The ordinary worker settles on the first scripted message.
         vec![text_message("worker-done")],
         256,
-    );
+    )
+    .await;
     // The worker is an ordinary agent, not a persona.
     let worker = env
         .runtime
@@ -578,12 +805,21 @@ async fn ordinary_agent_spawns_and_settles_alongside_persona() {
     assert!(!worker.is_persona(), "worker must not be a persona");
     assert_eq!(worker.kind, AgentDefinitionKind::Agent);
 
-    let spawn = spawn_persona(&env.runtime, "worker", "Worker", "ordinary-agent-marker-CCCC");
+    let spawn = spawn_persona(
+        &env.runtime,
+        "worker",
+        "Worker",
+        "ordinary-agent-marker-CCCC",
+    );
     assert_eq!(spawn.agent, "worker");
     let snapshot = wait_settled(&env.runtime, &spawn.job_id).await;
     assert_eq!(snapshot.status, JobStatus::Completed);
     let result = snapshot.result.expect("result");
-    assert!(result.error.is_none(), "ordinary agent must not error: {:?}", result.error);
+    assert!(
+        result.error.is_none(),
+        "ordinary agent must not error: {:?}",
+        result.error
+    );
     assert!(
         result.output.contains("worker-done"),
         "ordinary agent output must reflect the settled turn: {}",
@@ -612,8 +848,12 @@ async fn persona_spawn_requires_durable_binding() {
         tools: Some(Vec::new()),
         before_tool_call: None,
         after_tool_call: None,
-        stream_fn: Some(capturing_scripted(vec![text_message("done")], Arc::new(Mutex::new(Vec::new())))),
+        stream_fn: Some(capturing_scripted(
+            vec![text_message("done")],
+            Arc::new(Mutex::new(Vec::new())),
+        )),
         auth_resolver: None,
+        auth_manager: None,
     })
     .expect("parent session");
     let mut config = OrchestrationConfig::new(
@@ -624,9 +864,11 @@ async fn persona_spawn_requires_durable_binding() {
     config.parent_model = model;
     config.idle_ttl = None;
     let snapshot = parent.child_session_options_snapshot();
-    let runtime =
-        OrchestrationRuntime::new(config, OrchestrationRuntime::child_factory_from_snapshot(snapshot))
-            .expect("runtime");
+    let runtime = OrchestrationRuntime::new(
+        config,
+        OrchestrationRuntime::child_factory_from_snapshot(snapshot),
+    )
+    .expect("runtime");
     assert!(!runtime.is_durable(), "runtime is not bound yet");
     let error = runtime
         .spawn_tasks(
@@ -647,4 +889,389 @@ async fn persona_spawn_requires_durable_binding() {
         "expected durable-binding requirement, got: {error}"
     );
     runtime.shutdown().await;
+}
+
+
+#[tokio::test]
+async fn persona_learn_skill_persists_and_loads_on_next_spawn() {
+    let root = tempfile::tempdir().expect("root");
+    let mut env = persona_runtime_configured(
+        root.path(),
+        "mentor",
+        vec![text_message("first-spawn-done"), text_message("second-spawn-done")],
+        256,
+        PersonaRuntimeConfig {
+            persona_tools: Some(vec!["memory".to_owned(), "learn_skill".to_owned()]),
+            ..PersonaRuntimeConfig::default()
+        },
+    )
+    .await;
+
+    let first = spawn_persona(&env.runtime, "mentor", "Mentor", "draft the first report");
+    let first_child = captured_child(&mut env.children, "mentor").await;
+    assert!(
+        first_child.tool_names.iter().any(|name| name == "learn_skill"),
+        "learn_skill must reach the first child: {:?}",
+        first_child.tool_names
+    );
+    assert!(
+        !first_child.system_prompt.contains("release-audit"),
+        "the current prompt stays immutable after learn_skill: {}",
+        first_child.system_prompt
+    );
+    let learn = first_child
+        .session
+        .active_tools()
+        .into_iter()
+        .find(|tool| tool.name == "learn_skill")
+        .expect("the child holds learn_skill");
+    let learned = (learn.execute)(tool_context(
+        "learn-skill-1",
+        json!({
+            "name": "release-audit",
+            "description": "persona-local release audit",
+            "instructions": "persona-only-skill-body-YYYY"
+        }),
+    ))
+    .await
+    .expect("learn_skill execute");
+    assert!(
+        tool_text(&learned).contains("Learned persona skill `release-audit`"),
+        "learn_skill must persist through the real tool: {}",
+        tool_text(&learned)
+    );
+    let snapshot = wait_settled(&env.runtime, &first.job_id).await;
+    assert_eq!(snapshot.status, JobStatus::Completed);
+    let result = snapshot.result.expect("result");
+    assert!(result.error.is_none(), "no error: {:?}", result.error);
+    let skill_md = env
+        .persona_root
+        .join("skills")
+        .join("release-audit")
+        .join("SKILL.md");
+    let skill_text = std::fs::read_to_string(&skill_md).expect("learned SKILL.md");
+    assert!(
+        skill_text.contains("persona-only-skill-body-YYYY"),
+        "learned skill bytes must land under the persona root: {skill_text}"
+    );
+
+    let second = spawn_persona(&env.runtime, "mentor", "Mentor", "draft the follow-up report");
+    let second_child = captured_child(&mut env.children, "mentor").await;
+    wait_settled(&env.runtime, &second.job_id).await;
+    assert!(
+        second_child.system_prompt.contains("skill://release-audit"),
+        "the next spawn must autoload the learned skill: {}",
+        second_child.system_prompt
+    );
+    assert!(
+        second_child
+            .system_prompt
+            .contains("persona-only-skill-body-YYYY"),
+        "the next spawn must include the learned skill body: {}",
+        second_child.system_prompt
+    );
+    env.runtime.shutdown().await;
+    env.application.cleanup().await;
+}
+
+#[tokio::test]
+async fn persona_learn_skill_stays_inside_its_own_persona() {
+    let root = tempfile::tempdir().expect("root");
+    let archivist_root = root.path().join("personas").join("archivist");
+    write_persona_md(&archivist_root, "archivist");
+    let mut env = persona_runtime_configured(
+        root.path(),
+        "mentor",
+        vec![
+            tool_call_message(
+                "learn-skill-1",
+                "learn_skill",
+                json!({
+                    "name": "release-audit",
+                    "description": "persona-local release audit",
+                    "instructions": "persona-only-skill-body-YYYY"
+                }),
+            ),
+            text_message("learned-skill"),
+            text_message("archivist-done"),
+            text_message("worker-done"),
+        ],
+        256,
+        PersonaRuntimeConfig {
+            persona_tools: Some(vec!["memory".to_owned(), "learn_skill".to_owned()]),
+            extra_catalog: vec![persona_definition(&archivist_root, "archivist")],
+            ..PersonaRuntimeConfig::default()
+        },
+    )
+    .await;
+
+    let learned = spawn_persona(&env.runtime, "mentor", "Mentor", "draft the first report");
+    captured_child(&mut env.children, "mentor").await;
+    wait_settled(&env.runtime, &learned.job_id).await;
+
+    let skill_md = env
+        .persona_root
+        .join("skills")
+        .join("release-audit")
+        .join("SKILL.md");
+    assert!(skill_md.is_file(), "mentor learned the skill");
+    assert!(
+        !archivist_root.join("skills").exists(),
+        "the sibling persona must not receive the learned skill directory"
+    );
+
+    let other = spawn_persona(
+        &env.runtime,
+        "archivist",
+        "Archivist",
+        "review the archive labels",
+    );
+    let other_child = captured_child(&mut env.children, "archivist").await;
+    wait_settled(&env.runtime, &other.job_id).await;
+    assert!(
+        !other_child.system_prompt.contains("release-audit"),
+        "a sibling persona must not see another persona's learned skill: {}",
+        other_child.system_prompt
+    );
+    assert!(
+        !other_child
+            .tool_names
+            .iter()
+            .any(|name| name == "learn_skill"),
+        "learn_skill stays on the persona that declared it: {:?}",
+        other_child.tool_names
+    );
+
+    let ordinary = spawn_persona(
+        &env.runtime,
+        "worker",
+        "Worker",
+        "review the ordinary notes",
+    );
+    let ordinary_child = captured_child(&mut env.children, "worker").await;
+    wait_settled(&env.runtime, &ordinary.job_id).await;
+    assert!(
+        !ordinary_child.system_prompt.contains("release-audit"),
+        "an ordinary child must not see a persona-local skill: {}",
+        ordinary_child.system_prompt
+    );
+    let snapshot = env
+        .application
+        .resource_snapshot()
+        .expect("resource snapshot");
+    assert!(
+        snapshot
+            .skills
+            .iter()
+            .all(|skill| skill.name != "release-audit"),
+        "learn_skill must not pollute the shared skill catalog: {:?}",
+        snapshot.skills.iter().map(|skill| &skill.name).collect::<Vec<_>>()
+    );
+    env.runtime.shutdown().await;
+    env.application.cleanup().await;
+}
+
+#[tokio::test]
+async fn persona_memory_recall_survives_application_rebuild() {
+    let root = tempfile::tempdir().expect("root");
+    let env = persona_runtime(
+        root.path(),
+        "mentor",
+        vec![
+            tool_call_message(
+                "learn-1",
+                "memory",
+                json!({ "op": "learn", "content": "durable-rebuild-note-ZZZZ" }),
+            ),
+            text_message("learned"),
+        ],
+        256,
+    )
+    .await;
+    let first = spawn_persona(&env.runtime, "mentor", "Mentor", "store the rebuild note");
+    wait_settled(&env.runtime, &first.job_id).await;
+    let entries = env.persona_root.join("memory").join("entries.jsonl");
+    let entries_text = std::fs::read_to_string(&entries).expect("persona memory entries");
+    assert!(
+        entries_text.contains("durable-rebuild-note-ZZZZ"),
+        "first application must persist the persona memory entry: {entries_text}"
+    );
+    env.runtime.shutdown().await;
+    env.application.cleanup().await;
+
+    let mut rebuilt = persona_runtime(
+        root.path(),
+        "mentor",
+        vec![
+            tool_call_message(
+                "list-1",
+                "memory",
+                json!({ "op": "list" }),
+            ),
+            text_message("listed"),
+        ],
+        256,
+    )
+    .await;
+    let second = spawn_persona(
+        &rebuilt.runtime,
+        "mentor",
+        "Mentor",
+        "recall the rebuild note",
+    );
+    let child = captured_child(&mut rebuilt.children, "mentor").await;
+    wait_settled(&rebuilt.runtime, &second.job_id).await;
+    let memory = child
+        .session
+        .active_tools()
+        .into_iter()
+        .find(|tool| tool.name == "memory")
+        .expect("rebuilt child holds the persona memory tool");
+    let listed = (memory.execute)(tool_context("rebuild-list", json!({ "op": "list" })))
+        .await
+        .expect("persona memory list after rebuild");
+    assert!(
+        tool_text(&listed).contains("durable-rebuild-note-ZZZZ"),
+        "persona memory must survive application rebuild: {}",
+        tool_text(&listed)
+    );
+    rebuilt.runtime.shutdown().await;
+    rebuilt.application.cleanup().await;
+}
+
+#[tokio::test]
+async fn persona_skill_shadows_shared_skill_only_inside_persona() {
+    let root = tempfile::tempdir().expect("root");
+    let persona_root = root.path().join("personas").join("mentor");
+    write_persona_md(&persona_root, "mentor");
+    seed_persona_skill(
+        &persona_root,
+        "release-audit",
+        "persona-local release audit",
+        "persona-only-skill-body-YYYY",
+    );
+    let shared = shared_skill(
+        root.path(),
+        "release-audit",
+        "shared release audit",
+        "shared-skill-body-XXXX",
+    );
+    let mut env = persona_runtime_configured(
+        root.path(),
+        "mentor",
+        vec![text_message("persona-done"), text_message("worker-done")],
+        256,
+        PersonaRuntimeConfig {
+            extra_skills: vec![shared],
+            ..PersonaRuntimeConfig::default()
+        },
+    )
+    .await;
+
+    let persona_spawn = spawn_persona(&env.runtime, "mentor", "Mentor", "draft the first report");
+    let persona_child = captured_child(&mut env.children, "mentor").await;
+    wait_settled(&env.runtime, &persona_spawn.job_id).await;
+    assert!(
+        persona_child
+            .system_prompt
+            .contains("persona-only-skill-body-YYYY"),
+        "the persona child must autoload its own skill body: {}",
+        persona_child.system_prompt
+    );
+    assert!(
+        !persona_child
+            .system_prompt
+            .contains("shared-skill-body-XXXX"),
+        "the persona-local skill must shadow the shared skill: {}",
+        persona_child.system_prompt
+    );
+
+    let ordinary = spawn_persona(
+        &env.runtime,
+        "worker",
+        "Worker",
+        "review the ordinary notes",
+    );
+    let ordinary_child = captured_child(&mut env.children, "worker").await;
+    wait_settled(&env.runtime, &ordinary.job_id).await;
+    assert!(
+        ordinary_child.system_prompt.contains("skill://release-audit"),
+        "an ordinary child still sees the shared skill catalog entry: {}",
+        ordinary_child.system_prompt
+    );
+    assert!(
+        ordinary_child
+            .system_prompt
+            .contains("shared release audit"),
+        "an ordinary child still sees the shared skill description: {}",
+        ordinary_child.system_prompt
+    );
+    assert!(
+        !ordinary_child
+            .system_prompt
+            .contains("shared-skill-body-XXXX"),
+        "shared skill bodies autoload only when selected; catalog listing is the ordinary view: {}",
+        ordinary_child.system_prompt
+    );
+    assert!(
+        !ordinary_child
+            .system_prompt
+            .contains("persona-only-skill-body-YYYY"),
+        "an ordinary child must not see the persona-local skill body: {}",
+        ordinary_child.system_prompt
+    );
+    env.runtime.shutdown().await;
+    env.application.cleanup().await;
+}
+
+#[tokio::test]
+async fn persona_child_inherits_parent_additional_workspace_roots() {
+    let root = tempfile::tempdir().expect("root");
+    let project = root.path().join("project");
+    let extra = root.path().join("extra-root");
+    std::fs::create_dir_all(&project).expect("project cwd");
+    std::fs::create_dir_all(&extra).expect("additional root");
+    let workspace = WorkspaceRoots::new(&project, [extra.clone()]).expect("workspace");
+    assert_eq!(workspace.cwd(), project.as_path());
+    assert_eq!(
+        workspace.additional_roots(),
+        std::slice::from_ref(&extra.canonicalize().unwrap_or(extra.clone())),
+        "fixture must carry exactly one additional root"
+    );
+    let expected_cwd = workspace.cwd().to_path_buf();
+    let expected_additional = workspace.additional_roots().to_vec();
+    assert_eq!(expected_additional.len(), 1);
+
+    let mut env = persona_runtime_configured(
+        root.path(),
+        "mentor",
+        vec![text_message("done")],
+        256,
+        PersonaRuntimeConfig {
+            workspace: Some(workspace),
+            ..PersonaRuntimeConfig::default()
+        },
+    )
+    .await;
+
+    let parent = env.application.session();
+    let snapshot = parent.child_session_options_snapshot();
+    assert_eq!(snapshot.workspace.cwd(), expected_cwd.as_path());
+    assert_eq!(
+        snapshot.workspace.additional_roots(),
+        expected_additional.as_slice(),
+        "the parent snapshot must preserve the additional root"
+    );
+
+    let spawn = spawn_persona(&env.runtime, "mentor", "Mentor", "inspect the extra root");
+    let child = captured_child(&mut env.children, "mentor").await;
+    wait_settled(&env.runtime, &spawn.job_id).await;
+    assert_eq!(child.session.workspace_roots().cwd(), expected_cwd.as_path());
+    assert_eq!(
+        child.session.workspace_roots().additional_roots(),
+        expected_additional.as_slice(),
+        "the built child must inherit the parent's additional workspace roots"
+    );
+    env.runtime.shutdown().await;
+    env.application.cleanup().await;
 }

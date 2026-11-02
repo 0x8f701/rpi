@@ -25,7 +25,6 @@ pub const MAX_GOAL_PINS: usize = 8;
 /// example/instruction strings shown verbatim in the goal turn's context.
 pub const MAX_GOAL_PIN_CHARS: usize = 200;
 
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GoalLifecycle {
@@ -128,14 +127,22 @@ pub struct GoalState {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GoalEventKind {
     Created,
-    ForkCloned { source: Goal },
-    Paused { reason: GoalPauseReason },
+    ForkCloned {
+        source: Goal,
+    },
+    Paused {
+        reason: GoalPauseReason,
+    },
     Resumed,
     Completed,
     Dropped,
-    UsageUpdated { delta: GoalUsageDelta },
+    UsageUpdated {
+        delta: GoalUsageDelta,
+    },
     /// A pin was appended or removed; `pins` is the resulting list.
-    PinsUpdated { pins: Vec<String> },
+    PinsUpdated {
+        pins: Vec<String>,
+    },
 }
 
 /// A typed, revisioned goal journal event. `goal` is the resulting snapshot.
@@ -398,7 +405,11 @@ impl GoalRuntime {
     pub fn fork_clone(&self, source: &Goal) -> Result<Goal, GoalError> {
         validate_goal(source, 0)?;
         let mut state = self.state.lock();
-        if state.current.as_ref().is_some_and(|current| current != source) {
+        if state
+            .current
+            .as_ref()
+            .is_some_and(|current| current != source)
+        {
             return Err(GoalError::GoalAlreadyExists);
         }
         let timestamp = (self.clock)();
@@ -604,11 +615,7 @@ impl GoalRuntime {
             goal.pause_reason = Some(GoalPauseReason::BudgetExhausted);
         }
         goal.updated_at = self.next_timestamp(goal.updated_at);
-        self.commit(
-            &mut state,
-            GoalEventKind::UsageUpdated { delta },
-            goal,
-        )
+        self.commit(&mut state, GoalEventKind::UsageUpdated { delta }, goal)
     }
 
     /// Appends a role-model pin shown verbatim in the goal turn's system
@@ -780,7 +787,6 @@ pub fn goal_events_from_session_tree(tree: &SessionTree) -> Result<Vec<GoalEvent
         .collect()
 }
 
-
 fn current_goal(state: &GoalState) -> Result<&Goal, GoalError> {
     state.current.as_ref().ok_or(GoalError::NoCurrentGoal)
 }
@@ -822,12 +828,18 @@ fn replay_event(state: &mut GoalState, event: &GoalEvent) -> Result<(), GoalErro
         (None, _) => return Err(invalid_event(event, "first event is not created")),
         (Some(previous), GoalEventKind::ForkCloned { source }) => {
             if previous != source {
-                return Err(invalid_event(event, "fork clone source does not match current goal"));
+                return Err(invalid_event(
+                    event,
+                    "fork clone source does not match current goal",
+                ));
             }
             validate_fork_cloned(source, event)?;
         }
         (Some(_), GoalEventKind::Created) => {
-            return Err(invalid_event(event, "created event replaces an existing goal"));
+            return Err(invalid_event(
+                event,
+                "created event replaces an existing goal",
+            ));
         }
         (Some(previous), kind) => validate_replayed_transition(previous, event, kind)?,
     }
@@ -846,7 +858,11 @@ fn validate_goal(goal: &Goal, revision: u64) -> Result<(), GoalError> {
             "revision {revision} has an empty goal id"
         )));
     }
-    if goal.origin_goal_id.as_deref().is_some_and(|origin| origin.is_empty() || origin == goal.id) {
+    if goal
+        .origin_goal_id
+        .as_deref()
+        .is_some_and(|origin| origin.is_empty() || origin == goal.id)
+    {
         return Err(GoalError::InvalidJournal(format!(
             "revision {revision} has an invalid origin goal id"
         )));
@@ -930,16 +946,12 @@ fn validate_goal(goal: &Goal, revision: u64) -> Result<(), GoalError> {
 fn validate_fork_cloned(source: &Goal, event: &GoalEvent) -> Result<(), GoalError> {
     validate_goal(source, event.revision)?;
     let goal = &event.goal;
-    let expected_origin = source
-        .origin_goal_id
-        .as_ref()
-        .unwrap_or(&source.id);
-    let (expected_lifecycle, expected_pause_reason) =
-        if source.lifecycle == GoalLifecycle::Active {
-            (GoalLifecycle::Paused, Some(GoalPauseReason::ResumeSafety))
-        } else {
-            (source.lifecycle, source.pause_reason)
-        };
+    let expected_origin = source.origin_goal_id.as_ref().unwrap_or(&source.id);
+    let (expected_lifecycle, expected_pause_reason) = if source.lifecycle == GoalLifecycle::Active {
+        (GoalLifecycle::Paused, Some(GoalPauseReason::ResumeSafety))
+    } else {
+        (source.lifecycle, source.pause_reason)
+    };
     if goal.id == source.id
         || goal.origin_goal_id.as_ref() != Some(expected_origin)
         || goal.objective != source.objective
@@ -1088,9 +1100,9 @@ fn event_changes_lifecycle_or_identity(
 ) -> bool {
     match kind {
         GoalEventKind::PinsUpdated { .. } => false,
-        GoalEventKind::UsageUpdated { .. } => previous.is_none_or(|prev| {
-            prev.id != goal.id || prev.lifecycle != goal.lifecycle
-        }),
+        GoalEventKind::UsageUpdated { .. } => {
+            previous.is_none_or(|prev| prev.id != goal.id || prev.lifecycle != goal.lifecycle)
+        }
         GoalEventKind::Created
         | GoalEventKind::ForkCloned { .. }
         | GoalEventKind::Paused { .. }

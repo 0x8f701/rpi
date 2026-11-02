@@ -120,12 +120,16 @@ fn event_serialization_includes_workflow_id_generation_and_redacts_path() {
             phases: Vec::new(),
             storage: pi_coding::TodoStorage::Memory,
         },
+        durable_policy: crate::test_support::test_durable_policy_state(),
         worktree_label: Some(absolute.to_string_lossy().into_owned()),
         branch: Some("workflow/wf-event-1".into()),
         supervisor_agent_id: Some("sup-1".into()),
         supervisor_job_id: None,
         failure: None,
         integration: pi_coding::WorkflowIntegration::None,
+        planning_prompts_consumed: 0,
+
+
     };
     let event = project_workflow_event(&WorkflowEvent::Updated {
         snapshot: host_snap,
@@ -176,7 +180,7 @@ fn snapshot_projects_exact_composite_todo_ownership_without_content() {
                             status: pi_coding::TodoStatus::Pending,
                             depends_on: Vec::new(),
                             ready: false,
-                            blocked_by: Vec::new(),
+                            waiting_on: Vec::new(),
                             agent: None,
                         },
                         pi_coding::TodoItem {
@@ -185,7 +189,7 @@ fn snapshot_projects_exact_composite_todo_ownership_without_content() {
                             status: pi_coding::TodoStatus::InProgress,
                             depends_on: Vec::new(),
                             ready: true,
-                            blocked_by: Vec::new(),
+                            waiting_on: Vec::new(),
                             agent: None,
                         },
                     ],
@@ -198,19 +202,22 @@ fn snapshot_projects_exact_composite_todo_ownership_without_content() {
                         status: pi_coding::TodoStatus::Completed,
                         depends_on: Vec::new(),
                         ready: true,
-                        blocked_by: Vec::new(),
+                        waiting_on: Vec::new(),
                         agent: None,
                     }],
                 },
             ],
             storage: pi_coding::TodoStorage::Memory,
         },
+        durable_policy: crate::test_support::test_durable_policy_state(),
         worktree_label: Some("wf-own-1".into()),
         branch: None,
         supervisor_agent_id: None,
         supervisor_job_id: None,
         failure: None,
         integration: pi_coding::WorkflowIntegration::None,
+        planning_prompts_consumed: 0,
+
     };
 
     let projected = project_workflow_snapshot(&host_snap);
@@ -278,12 +285,15 @@ fn empty_todo_skips_ownership_on_the_wire() {
             phases: Vec::new(),
             storage: pi_coding::TodoStorage::Memory,
         },
+        durable_policy: crate::test_support::test_durable_policy_state(),
         worktree_label: None,
         branch: None,
         supervisor_agent_id: None,
         supervisor_job_id: None,
         failure: None,
         integration: pi_coding::WorkflowIntegration::None,
+        planning_prompts_consumed: 0,
+
     };
     let value = serde_json::to_value(project_workflow_snapshot(&host_snap)).unwrap();
     assert!(
@@ -323,13 +333,36 @@ async fn workflow_detail_returns_panel_snapshot_with_redacted_worktree() {
     assert_eq!(detail["objective"], "land detail");
     assert_eq!(detail["status"], "queued");
     assert_eq!(detail["generation"], 1);
-    // Empty live sections project as defaults, not errors.
+    // Empty live sections project as defaults, not errors. The durable
+    // fallback carries no live jobs/irc, and the supervisor actor has no
+    // authoritative role (role omitted), so the Web reads them as unavailable
+    // live-only data rather than fabricated entries.
     assert_eq!(detail["activeTasks"], json!([]));
     assert_eq!(detail["subagents"], json!([]));
+    assert_eq!(detail["jobs"], json!([]), "fallback jobs is an empty array");
+    assert_eq!(
+        detail["recentIrc"],
+        json!([]),
+        "fallback irc is an empty array"
+    );
+    assert_eq!(
+        detail["supervisor"]["role"],
+        json!(null),
+        "fallback supervisor has no authoritative role"
+    );
+    assert!(
+        detail["supervisor"].get("role").is_none() || detail["supervisor"]["role"].is_null(),
+        "role omitted or null on durable fallback"
+    );
     // The memory host stores an absolute worktree path; the wire label must
     // be redacted to a display-safe basename.
-    let worktree = detail["worktree"]["label"].as_str().expect("worktree label");
-    assert!(!Path::new(worktree).is_absolute(), "worktree must not be absolute: {worktree}");
+    let worktree = detail["worktree"]["label"]
+        .as_str()
+        .expect("worktree label");
+    assert!(
+        !Path::new(worktree).is_absolute(),
+        "worktree must not be absolute: {worktree}"
+    );
     let encoded = serde_json::to_string(&detail).unwrap();
     assert!(
         !wire_json_leaks_absolute_path(&encoded),
@@ -360,10 +393,7 @@ async fn workflow_detail_returns_panel_snapshot_with_redacted_worktree() {
     )
     .await
     .expect_err("selector required");
-    assert!(
-        err.to_string().contains("workflowId or name"),
-        "{err}"
-    );
+    assert!(err.to_string().contains("workflowId or name"), "{err}");
     // An unknown workflow fails too.
     let err = dispatch_workflow_command(
         &host,
@@ -485,4 +515,144 @@ fn status_wire_values_match_canonical_contract() {
         assert_eq!(serde_json::to_value(status).unwrap(), json!(expected));
         assert_eq!(status.as_str(), expected);
     }
+}
+
+#[test]
+fn workflow_detail_wire_exposes_authoritative_jobs_irc_and_actor_roles() {
+    // The RPC workflow-detail payload (a WorkflowPanelSnapshot projected from
+    // the core WorkflowRuntimeDetail) must expose the full authoritative job
+    // shape, actor role/definition separate from the display name, and IRC
+    // correlation fields — all in stable camelCase, with no path leakage.
+    let snapshot = WorkflowSnapshot {
+        workflow_id: WorkflowId::new("wf-detail-wire"),
+        name: "Detail wire".into(),
+        objective: "project the detail".into(),
+        status: WorkflowStatus::Running,
+        created_at_ms: 1,
+        updated_at_ms: 2,
+        generation: 7,
+        todo: pi_coding::TodoState {
+            phases: Vec::new(),
+            storage: pi_coding::TodoStorage::Memory,
+        },
+        durable_policy: crate::test_support::test_durable_policy_state(),
+        worktree_label: Some("wf-detail-wire".into()),
+        branch: Some("rpi/workflow/detail-wire".into()),
+        supervisor_agent_id: None,
+        supervisor_job_id: None,
+        failure: None,
+        integration: pi_coding::WorkflowIntegration::None,
+        planning_prompts_consumed: 0,
+
+    };
+    let detail = pi_coding::WorkflowRuntimeDetail {
+        workflow_id: snapshot.workflow_id.clone(),
+        generation: 7,
+        name: "Detail wire".into(),
+        objective: "project the detail".into(),
+        status: WorkflowStatus::Running,
+        failure: None,
+        todo: snapshot.todo.clone(),
+        supervisor: Some(pi_coding::WorkflowSupervisorDetail {
+            display_name: "Supervisor".into(),
+            role: "supervisor".into(),
+            status: pi_coding::AgentStatus::Running,
+            task_summary: Some("Direct workers".into()),
+            todo_task_id: None,
+            activity: Vec::new(),
+        }),
+        subagents: vec![pi_coding::WorkflowSubagentDetail {
+            display_name: "Code Review".into(),
+            role: "reviewer".into(),
+            status: pi_coding::AgentStatus::Idle,
+            task_summary: Some("Review changes".into()),
+            todo_task_id: Some("render-id".into()),
+            activity: Vec::new(),
+        }],
+        jobs: vec![pi_coding::WorkflowRuntimeJobDetail {
+            display_name: "Code Review".into(),
+            job_id: "job-1".into(),
+            role: "reviewer".into(),
+            status: pi_coding::JobStatus::Running,
+            task_summary: Some("Run integration".into()),
+            todo_task_id: Some("render-id".into()),
+            created_at_ms: 3,
+            started_at_ms: Some(4),
+            finished_at_ms: None,
+            soft_budget_exhausted: true,
+        }],
+        irc: vec![pi_coding::WorkflowIrcMessage {
+            message_id: "msg-1".into(),
+            from: "Code Review".into(),
+            to: "Supervisor".into(),
+            body: "Live update".into(),
+            timestamp_ms: 5,
+            reply_to: Some("msg-0".into()),
+        }],
+        supervisor_activity: Vec::new(),
+        planning_started_at_ms: None,
+    };
+    let panel =
+        crate::workflow_panel::WorkflowPanelSnapshot::from_runtime_detail(&detail, &snapshot);
+    let data = serde_json::to_value(&panel).expect("serialize panel");
+
+    // workflowId + generation are preserved strictly.
+    assert_eq!(data["id"], "wf-detail-wire");
+    assert_eq!(data["generation"], 7);
+
+    // Jobs array: full authoritative shape in camelCase.
+    let job = &data["jobs"][0];
+    assert_eq!(job["jobId"], "job-1", "jobId exposed: {data}");
+    assert_eq!(job["displayName"], "Code Review");
+    assert_eq!(
+        job["role"], "reviewer",
+        "job role separate from display name"
+    );
+    assert_eq!(job["status"], "running");
+    assert_eq!(job["taskSummary"], "Run integration");
+    assert_eq!(job["todoTaskId"], "render-id");
+    assert_eq!(job["createdAtMs"], 3);
+    assert_eq!(job["startedAtMs"], 4);
+    assert!(
+        job.get("finishedAtMs").is_none(),
+        "absent finishedAtMs must be omitted"
+    );
+    assert_eq!(
+        job["softBudgetExhausted"], true,
+        "softBudgetExhausted emitted when true"
+    );
+    // No model field is invented (no authoritative runtime source for it).
+    assert!(job.get("model").is_none(), "no model field is fabricated");
+
+    // Actors: display name (`name`) and role are separate keys.
+    assert_eq!(data["supervisor"]["name"], "Supervisor");
+    assert_eq!(
+        data["supervisor"]["role"], "supervisor",
+        "supervisor role separate from name"
+    );
+    assert_eq!(data["subagents"][0]["name"], "Code Review");
+    assert_eq!(
+        data["subagents"][0]["role"], "reviewer",
+        "subagent role separate from name"
+    );
+
+    // IRC: from (sender), to, body (text), timestamp, messageId, replyTo.
+    let irc = &data["recentIrc"][0];
+    assert_eq!(irc["sender"], "Code Review");
+    assert_eq!(irc["to"], "Supervisor");
+    assert_eq!(irc["text"], "Live update");
+    assert_eq!(irc["atMs"], 5);
+    assert_eq!(irc["messageId"], "msg-1", "messageId exposed for threading");
+    assert_eq!(irc["replyTo"], "msg-0", "replyTo exposed when present");
+
+    // The opaque correlation ids are on the wire by design; no path leaks.
+    let encoded = serde_json::to_string(&panel).expect("encode");
+    assert!(
+        !wire_json_leaks_absolute_path(&encoded),
+        "absolute path leaked: {encoded}"
+    );
+    assert!(encoded.contains("\"jobId\":\"job-1\""));
+    assert!(encoded.contains("\"messageId\":\"msg-1\""));
+    assert!(encoded.contains("\"replyTo\":\"msg-0\""));
+    assert!(encoded.contains("\"softBudgetExhausted\":true"));
 }

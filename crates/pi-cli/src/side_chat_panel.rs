@@ -8,19 +8,22 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
+use pi_coding::redact::redact_secrets;
+
+use crate::markdown::ratatui::{render_ratatui_markdown, render_ratatui_markdown_streaming};
 use crate::side_chat::{SideChatController, SideChatEntry, SideChatRole, SideChatTabs};
 use crate::theme::Theme;
-use crate::tui::clean_terminal_text;
+use crate::tui::{clean_terminal_text, markdown_ratatui_styles};
 
 /// Render the side-chat overlay into `frame`: a tab bar row over the active
 /// tab's transcript and editor.
-pub fn render_side_chat_panel(
-    frame: &mut ratatui::Frame<'_>,
-    tabs: &SideChatTabs,
-    theme: Theme,
-) {
+pub fn render_side_chat_panel(frame: &mut ratatui::Frame<'_>, tabs: &SideChatTabs, theme: Theme) {
     let controller: &SideChatController = tabs;
-    let area = centered_rect(frame.area().width.saturating_mul(9) / 10, frame.area().height.saturating_mul(4) / 5, frame.area());
+    let area = centered_rect(
+        frame.area().width.saturating_mul(9) / 10,
+        frame.area().height.saturating_mul(4) / 5,
+        frame.area(),
+    );
     frame.render_widget(Clear, area);
 
     let mode = controller.tool_mode().label();
@@ -178,7 +181,10 @@ fn tab_bar_line(tabs: &SideChatTabs, theme: Theme, width: usize) -> Line<'static
                     .add_modifier(Modifier::BOLD),
             ));
         } else {
-            spans.push(Span::styled(name.to_owned(), Style::default().fg(theme.muted)));
+            spans.push(Span::styled(
+                name.to_owned(),
+                Style::default().fg(theme.muted),
+            ));
         }
     }
     truncate_line(Line::from(spans), width)
@@ -223,7 +229,6 @@ fn build_transcript_lines(
     for entry in controller.entries() {
         lines.extend(entry_lines(entry, theme, width));
     }
-    append_streaming_lines(&mut lines, controller.streaming_text(), theme, width);
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
             "  Forked side chat. Messages stay here and never merge into main.",
@@ -237,42 +242,52 @@ fn build_transcript_lines(
     lines
 }
 
-fn append_streaming_lines(
-    lines: &mut Vec<Line<'static>>,
-    text: &str,
-    theme: Theme,
-    width: usize,
-) {
-    if text.is_empty() {
-        return;
-    }
-    lines.push(role_line("side", theme.accent, theme));
-    let streaming = clean_terminal_text(text);
-    for row in wrap_text(&streaming, width.saturating_sub(2)) {
-        lines.push(Line::from(Span::styled(
-            format!("  {row}"),
-            Style::default().fg(theme.text),
-        )));
-    }
-}
-
 fn entry_lines(entry: &SideChatEntry, theme: Theme, width: usize) -> Vec<Line<'static>> {
     let (label, color) = match entry.role {
         SideChatRole::User => ("you", theme.accent),
         SideChatRole::Assistant => ("side", theme.accent),
         SideChatRole::Tool => ("tool", theme.muted),
-        SideChatRole::System => ("sys", if entry.is_error { theme.error } else { theme.muted }),
+        SideChatRole::System => (
+            "sys",
+            if entry.is_error {
+                theme.error
+            } else {
+                theme.muted
+            },
+        ),
     };
     let mut lines = vec![role_line(label, color, theme)];
-    let style = Style::default().fg(if entry.is_error {
-        theme.error
-    } else {
-        theme.text
-    });
-    for row in wrap_text(&clean_terminal_text(&entry.text), width.saturating_sub(2)) {
-        lines.push(Line::from(Span::styled(format!("  {row}"), style)));
+    let inner_width = width.saturating_sub(2).clamp(1, usize::from(u16::MAX)) as u16;
+    if entry.is_error || matches!(entry.role, SideChatRole::Tool | SideChatRole::System) {
+        let style = Style::default().fg(if entry.is_error {
+            theme.error
+        } else {
+            theme.text
+        });
+        for row in wrap_text(
+            &redact_secrets(&clean_terminal_text(&entry.text)),
+            width.saturating_sub(2),
+        ) {
+            lines.push(Line::from(Span::styled(format!("  {row}"), style)));
+        }
+        return lines;
     }
+    let styles = markdown_ratatui_styles(theme, theme.text);
+    let cleaned = redact_secrets(&clean_terminal_text(&entry.text));
+    let rendered = if entry.is_partial {
+        render_ratatui_markdown_streaming(&cleaned, inner_width, styles)
+    } else {
+        render_ratatui_markdown(&cleaned, inner_width, styles)
+    };
+    lines.extend(rendered.lines.into_iter().map(indent_line));
     lines
+}
+
+fn indent_line(line: Line<'static>) -> Line<'static> {
+    let mut spans = Vec::with_capacity(line.spans.len() + 1);
+    spans.push(Span::raw("  "));
+    spans.extend(line.spans);
+    Line::from(spans)
 }
 
 fn role_line(label: &str, color: ratatui::style::Color, theme: Theme) -> Line<'static> {
@@ -333,27 +348,105 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi_ai::Model;
-    use pi_coding::{Application, create_coding_tools};
-    use pi_agent::ThinkingLevel;
+    use pi_agent::{AgentEvent, ThinkingLevel};
+    use pi_ai::{AssistantMessageEvent, ContentBlock, Message, Model};
+    use pi_ai::providers::{FauxProviderOptions, FauxProviderRegistration, register_faux_provider};
+    use pi_coding::Application;
     use ratatui::{Terminal, backend::TestBackend};
 
-    fn test_session(cwd: &std::path::Path) -> pi_coding::Session {
-        pi_coding::Session::new(pi_coding::SessionOptions {
-            model: Model::default(),
-            cwd: cwd.to_path_buf(),
-            system_prompt: "main system".to_owned(),
-            thinking_level: ThinkingLevel::Off,
-            api_key: "test-key".to_owned(),
-            compaction: None,
-            stream_options: Default::default(),
-            tools: Some(create_coding_tools(&cwd.to_string_lossy())),
-            before_tool_call: None,
-            after_tool_call: None,
-            stream_fn: None,
-            auth_resolver: None,
-        })
-        .expect("session")
+    struct PanelTestApplication {
+        application: Application,
+        _agent: tempfile::TempDir,
+        _session: tempfile::TempDir,
+        _resources: pi_coding::ResourceManager,
+        _faux: FauxProviderRegistration,
+    }
+
+    impl std::ops::Deref for PanelTestApplication {
+        type Target = Application;
+
+        fn deref(&self) -> &Self::Target {
+            &self.application
+        }
+    }
+
+    async fn test_application(cwd: &std::path::Path) -> PanelTestApplication {
+        let suffix = uuid::Uuid::now_v7().simple().to_string();
+        let model = Model {
+            id: format!("side-chat-panel-{suffix}"),
+            name: "Side chat panel fixture".to_owned(),
+            api: format!("side-chat-panel-api-{suffix}"),
+            provider: format!("side-chat-panel-provider-{suffix}"),
+            base_url: "http://localhost:0".to_owned(),
+            ..Model::default()
+        };
+        let faux = register_faux_provider(FauxProviderOptions {
+            api: model.api.clone(),
+            provider: model.provider.clone(),
+            models: vec![model.clone()],
+            chunk_size: 4,
+        });
+        let workspace = pi_coding::WorkspaceRoots::new(cwd, Vec::<std::path::PathBuf>::new())
+            .expect("workspace");
+        let session =
+            pi_coding::Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
+                pi_coding::SessionOptions {
+                    model,
+                    cwd: cwd.to_path_buf(),
+                    system_prompt: "main system".to_owned(),
+                    thinking_level: ThinkingLevel::Off,
+                    api_key: "faux".to_owned(),
+                    compaction: None,
+                    stream_options: Default::default(),
+                    tools: Some(Vec::new()),
+                    before_tool_call: None,
+                    after_tool_call: None,
+                    stream_fn: Some(std::sync::Arc::new(|_, _, _| {
+                        Box::pin(async { pi_ai::new_assistant_message_event_stream() })
+                    })),
+                    auth_resolver: None,
+                    auth_manager: None,
+                },
+                Vec::new(),
+                Default::default(),
+                pi_coding::ResourceDiscovery::Disabled,
+                workspace,
+                None,
+            )
+            .expect("session");
+        let agent = tempfile::tempdir().expect("agent dir");
+        std::fs::write(
+            agent.path().join("settings.json"),
+            r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+        )
+        .expect("sandbox settings");
+        let session_dir = tempfile::tempdir().expect("session dir");
+        session.set_session_dir(session_dir.path().to_path_buf());
+        let mut options = pi_coding::ResourceManagerOptions::new(cwd);
+        options.agent_dir = agent.path().to_path_buf();
+        options.project_trust_override = Some(true);
+        options.disable_extensions = true;
+        options.disable_skills = true;
+        options.disable_prompt_templates = true;
+        options.disable_themes = true;
+        options.disable_context_files = true;
+        let resources = pi_coding::ResourceManager::new(options).expect("resources");
+        session
+            .attach_resources(resources.clone())
+            .await
+            .expect("attach resources");
+        let application = Application::from_runtime_candidate(
+            pi_coding::ApplicationRuntimeCandidate::new(session),
+        )
+        .await
+        .expect("publish application");
+        PanelTestApplication {
+            application,
+            _agent: agent,
+            _session: session_dir,
+            _resources: resources,
+            _faux: faux,
+        }
     }
 
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
@@ -408,10 +501,7 @@ mod tests {
             "golinkend"
         );
         // Tabs expand; newlines and visible Unicode remain
-        assert_eq!(
-            clean_terminal_text("a\tb\n你好\u{1b}[1mc"),
-            "a    b\n你好c"
-        );
+        assert_eq!(clean_terminal_text("a\tb\n你好\u{1b}[1mc"), "a    b\n你好c");
         // Bare ESC and other unsafe controls disappear (not replaced with glyphs)
         assert_eq!(clean_terminal_text("x\u{1b}y\u{7}z\u{8}w"), "xyzw");
     }
@@ -435,11 +525,7 @@ mod tests {
                 "[read] \u{1b}]8;;https://y.test\u{1b}\\path\u{1b}]8;;\u{1b}\\ done",
                 "[read] path done",
             ),
-            (
-                SideChatRole::System,
-                "err\u{1b}[2J\u{7}or",
-                "error",
-            ),
+            (SideChatRole::System, "err\u{1b}[2J\u{7}or", "error"),
         ];
         for (role, raw, expected) in samples {
             let text = lines_text(&entry_lines(
@@ -448,6 +534,7 @@ mod tests {
                     text: raw.to_owned(),
                     is_error: matches!(role, SideChatRole::System),
                     is_partial: false,
+                    ..SideChatEntry::default()
                 },
                 theme,
                 80,
@@ -463,15 +550,21 @@ mod tests {
     #[test]
     fn streaming_lines_sanitize_before_wrapping() {
         let theme = crate::theme::DARK;
-        let mut lines = Vec::new();
-        append_streaming_lines(
-            &mut lines,
-            "live \u{1b}[31mstream\u{1b}[0m \u{1b}[2;5H\u{1b}]8;;https://stream.test\u{7}label\u{1b}]8;;\u{7} \u{1b}]8;;https://stream.test\u{1b}\\st\u{1b}]8;;\u{1b}\\",
+        let text = lines_text(&entry_lines(
+            &SideChatEntry {
+                role: SideChatRole::Assistant,
+                text: "live \u{1b}[31mstream\u{1b}[0m \u{1b}[2;5H\u{1b}]8;;https://stream.test\u{7}label\u{1b}]8;;\u{7} \u{1b}]8;;https://stream.test\u{1b}\\st\u{1b}]8;;\u{1b}\\".to_owned(),
+                is_error: false,
+                is_partial: true,
+                ..SideChatEntry::default()
+            },
             theme,
             80,
+        ));
+        assert!(
+            text.contains("live stream label st"),
+            "visible streaming payload missing: {text:?}"
         );
-        let text = lines_text(&lines);
-        assert!(text.contains("live stream label st"), "visible streaming payload missing: {text:?}");
         assert!(
             !text.contains("https://stream.test"),
             "hyperlink target must not render: {text:?}"
@@ -483,11 +576,243 @@ mod tests {
         );
     }
 
+    fn side_role_count(lines: &[Line<'static>]) -> usize {
+        lines
+            .iter()
+            .filter(|line| {
+                line.spans
+                    .first()
+                    .is_some_and(|span| span.content.trim() == "side")
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn live_assistant_paints_once_while_streaming_text_is_set() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = test_application(cwd.path()).await;
+        let mut side = crate::side_chat::SideChatController::fork_from(&session)
+            .await
+            .expect("fork");
+        side.apply_agent_event(AgentEvent::AgentStart);
+        side.apply_agent_event(AgentEvent::TurnStart);
+        let mut partial = pi_ai::AssistantMessage::pending(side.model());
+        side.apply_agent_event(AgentEvent::MessageUpdate {
+            message: Message::Assistant(partial.clone()),
+            assistant_message_event: AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: "LIVEANSWERZX".into(),
+                partial: partial.clone(),
+            },
+        });
+        assert_eq!(side.streaming_text(), "LIVEANSWERZX");
+        let theme = crate::theme::DARK;
+        let live = build_transcript_lines(&side, theme, 80);
+        let live_text = lines_text(&live);
+        assert_eq!(live_text.matches("LIVEANSWERZX").count(), 1);
+        assert_eq!(side_role_count(&live), 1);
+
+        partial.content.push(ContentBlock::text("LIVEANSWERZX"));
+        side.apply_agent_event(AgentEvent::MessageEnd {
+            message: Message::Assistant(partial),
+        });
+        assert!(side.streaming_text().is_empty());
+        let settled = build_transcript_lines(&side, theme, 80);
+        let settled_text = lines_text(&settled);
+        assert_eq!(settled_text.matches("LIVEANSWERZX").count(), 1);
+        assert_eq!(side_role_count(&settled), 1);
+    }
+
+    #[tokio::test]
+    async fn thinking_then_live_text_then_message_end_paints_one_block_each() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = test_application(cwd.path()).await;
+        let mut side = crate::side_chat::SideChatController::fork_from(&session)
+            .await
+            .expect("fork");
+        side.apply_agent_event(AgentEvent::AgentStart);
+        side.apply_agent_event(AgentEvent::TurnStart);
+        let mut partial = pi_ai::AssistantMessage::pending(side.model());
+        side.apply_agent_event(AgentEvent::MessageUpdate {
+            message: Message::Assistant(partial.clone()),
+            assistant_message_event: AssistantMessageEvent::ThinkingStart {
+                content_index: 0,
+                partial: partial.clone(),
+            },
+        });
+        side.apply_agent_event(AgentEvent::MessageUpdate {
+            message: Message::Assistant(partial.clone()),
+            assistant_message_event: AssistantMessageEvent::ThinkingDelta {
+                content_index: 0,
+                delta: "REASONBLOCKQ".into(),
+                partial: partial.clone(),
+            },
+        });
+        side.apply_agent_event(AgentEvent::MessageUpdate {
+            message: Message::Assistant(partial.clone()),
+            assistant_message_event: AssistantMessageEvent::ThinkingEnd {
+                content_index: 0,
+                content: "REASONBLOCKQ".into(),
+                partial: partial.clone(),
+            },
+        });
+        side.apply_agent_event(AgentEvent::MessageUpdate {
+            message: Message::Assistant(partial.clone()),
+            assistant_message_event: AssistantMessageEvent::TextDelta {
+                content_index: 1,
+                delta: "LIVEANSWERZX".into(),
+                partial: partial.clone(),
+            },
+        });
+        assert_eq!(side.streaming_text(), "LIVEANSWERZX");
+        let theme = crate::theme::DARK;
+        let live = build_transcript_lines(&side, theme, 80);
+        let live_text = lines_text(&live);
+        assert_eq!(live_text.matches("REASONBLOCKQ").count(), 1);
+        assert_eq!(live_text.matches("LIVEANSWERZX").count(), 1);
+        assert_eq!(side_role_count(&live), 2);
+
+        partial.content.push(ContentBlock::thinking("REASONBLOCKQ"));
+        partial.content.push(ContentBlock::text("LIVEANSWERZX"));
+        side.apply_agent_event(AgentEvent::MessageEnd {
+            message: Message::Assistant(partial),
+        });
+        assert!(side.streaming_text().is_empty());
+        let settled = build_transcript_lines(&side, theme, 80);
+        let settled_text = lines_text(&settled);
+        assert_eq!(settled_text.matches("REASONBLOCKQ").count(), 1);
+        assert_eq!(settled_text.matches("LIVEANSWERZX").count(), 1);
+        assert_eq!(side_role_count(&settled), 2);
+    }
+
+    #[test]
+    fn assistant_entry_renders_markdown_not_literal_markers() {
+        let theme = crate::theme::DARK;
+        let text = lines_text(&entry_lines(
+            &SideChatEntry {
+                role: SideChatRole::Assistant,
+                text: "plan **bold** step".to_owned(),
+                is_error: false,
+                is_partial: false,
+                ..SideChatEntry::default()
+            },
+            theme,
+            80,
+        ));
+        assert!(
+            !text.contains("**"),
+            "assistant markdown markers must not leak as literals: {text:?}"
+        );
+        assert!(text.contains("plan bold step"), "rendered body: {text:?}");
+        let decorated = entry_lines(
+            &SideChatEntry {
+                role: SideChatRole::Assistant,
+                text: "**bold**".to_owned(),
+                is_error: false,
+                is_partial: false,
+                ..SideChatEntry::default()
+            },
+            theme,
+            80,
+        );
+        assert!(
+            decorated[1..].iter().any(|line| line
+                .spans
+                .iter()
+                .any(|span| span.content.as_ref() == "bold"
+                    && span.style.add_modifier.contains(Modifier::BOLD))),
+            "assistant bold must be a styled span"
+        );
+    }
+
+    #[test]
+    fn tool_entry_keeps_markdown_literals_and_redacts_secrets() {
+        let theme = crate::theme::DARK;
+        let secret = ["sk-", "abcdefghijklmnop1"].concat();
+        let text = lines_text(&entry_lines(
+            &SideChatEntry {
+                role: SideChatRole::Tool,
+                text: format!("**not markdown** key {secret}"),
+                is_error: false,
+                is_partial: false,
+                ..SideChatEntry::default()
+            },
+            theme,
+            80,
+        ));
+        assert!(
+            text.contains("**not markdown**"),
+            "tool rows must stay plain, no markdown rendering: {text:?}"
+        );
+        assert!(
+            !text.contains(&secret),
+            "tool rows must redact credentials: {text:?}"
+        );
+        assert!(text.contains("[REDACTED]"), "redaction marker: {text:?}");
+    }
+
+    #[test]
+    fn assistant_markdown_path_redacts_credentials() {
+        let theme = crate::theme::DARK;
+        let secret = ["ghp_", "abcdefghijklmnopqrst"].concat();
+        let text = lines_text(&entry_lines(
+            &SideChatEntry {
+                role: SideChatRole::Assistant,
+                text: format!("token **is** {secret}"),
+                is_error: false,
+                is_partial: false,
+                ..SideChatEntry::default()
+            },
+            theme,
+            80,
+        ));
+        assert!(
+            !text.contains(&secret),
+            "assistant markdown path must redact: {text:?}"
+        );
+        assert!(text.contains("[REDACTED]"), "redaction marker: {text:?}");
+    }
+
+    #[test]
+    fn markdown_lines_keep_two_space_indent_within_width() {
+        let theme = crate::theme::DARK;
+        let width = 30usize;
+        let raw = "a **bold** b `code` c *it* done".to_owned();
+        let lines = entry_lines(
+            &SideChatEntry {
+                role: SideChatRole::Assistant,
+                text: raw,
+                is_error: false,
+                is_partial: false,
+                ..SideChatEntry::default()
+            },
+            theme,
+            width,
+        );
+        assert!(lines.len() > 1, "expected body lines beyond the role line");
+        for line in &lines[1..] {
+            assert_eq!(
+                line.spans.first().map(|span| span.content.as_ref()),
+                Some("  "),
+                "body line must keep the two-column indent: {line:?}"
+            );
+            let visual: usize = line
+                .spans
+                .iter()
+                .map(|span| span.content.chars().count())
+                .sum();
+            assert!(
+                visual <= width,
+                "indented line overflows transcript width {width}: {line:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn render_side_chat_shows_readonly_chrome() {
         let cwd = tempfile::tempdir().expect("cwd");
-        let session = test_session(cwd.path());
-        let application = Application::new(session).await;
+        let session = test_application(cwd.path()).await;
+        let application = session;
         let side = crate::side_chat::SideChatController::fork_from(&application)
             .await
             .expect("fork");
@@ -504,8 +829,8 @@ mod tests {
     #[tokio::test]
     async fn side_chat_top_and_editor_borders_remain_continuous_without_titles() {
         let cwd = tempfile::tempdir().expect("cwd");
-        let session = test_session(cwd.path());
-        let application = Application::new(session).await;
+        let session = test_application(cwd.path()).await;
+        let application = session;
         let side = crate::side_chat::SideChatController::fork_from(&application)
             .await
             .expect("fork");
@@ -521,7 +846,10 @@ mod tests {
         let top = (area.left()..area.right())
             .map(|x| buffer[(x, area.top())].symbol())
             .collect::<String>();
-        assert_eq!(top, format!("╭{}╮", "─".repeat(usize::from(area.width - 2))));
+        assert_eq!(
+            top,
+            format!("╭{}╮", "─".repeat(usize::from(area.width - 2)))
+        );
 
         let inner = Rect::new(area.x + 1, area.y + 1, area.width - 2, area.height - 2);
         let chunks = Layout::default()
@@ -544,14 +872,14 @@ mod tests {
     #[tokio::test]
     async fn render_side_chat_strips_csi_and_osc_from_buffer() {
         let cwd = tempfile::tempdir().expect("cwd");
-        let session = test_session(cwd.path());
-        let application = Application::new(session).await;
+        let session = test_application(cwd.path()).await;
+        let application = session;
         let mut side = crate::side_chat::SideChatController::fork_from(&application)
             .await
             .expect("fork");
 
         // Transcript (user entry) carries CSI color + cursor controls.
-        side.submit_prompt("hello \u{1b}[31mworld\u{1b}[0m\u{1b}[2;5H!");
+        side.submit_prompt("hello \u{1b}[31mworld\u{1b}[0m\u{1b}[2;5H!", Vec::new());
         // Editor carries OSC 8 hyperlinks (BEL and ST forms) plus a bare control.
         side.handle_paste(
             "edit \u{1b}]8;;https://example.com\u{7}label\u{1b}]8;;\u{7} \u{1b}]8;;https://example.com\u{1b}\\st\u{1b}]8;;\u{1b}\\\u{7}",
@@ -565,8 +893,14 @@ mod tests {
             .expect("draw");
         let text = buffer_text(&terminal);
 
-        assert!(text.contains("hello"), "visible user payload missing: {text:?}");
-        assert!(text.contains("world"), "CSI-wrapped label missing: {text:?}");
+        assert!(
+            text.contains("hello"),
+            "visible user payload missing: {text:?}"
+        );
+        assert!(
+            text.contains("world"),
+            "CSI-wrapped label missing: {text:?}"
+        );
         assert!(text.contains("label"), "OSC8 BEL label missing: {text:?}");
         assert!(text.contains("st"), "OSC8 ST label missing: {text:?}");
         assert!(text.contains("edit"), "editor payload missing: {text:?}");
@@ -584,8 +918,8 @@ mod tests {
     #[tokio::test]
     async fn render_side_chat_shows_tab_bar_with_active_marker() {
         let cwd = tempfile::tempdir().expect("cwd");
-        let session = test_session(cwd.path());
-        let application = Application::new(session).await;
+        let session = test_application(cwd.path()).await;
+        let application = session;
         let mut tabs = crate::side_chat::SideChatTabs::new_default(&application)
             .await
             .expect("default");
@@ -597,9 +931,18 @@ mod tests {
             .draw(|frame| render_side_chat_panel(frame, &tabs, crate::theme::DARK))
             .expect("draw");
         let text = buffer_text(&terminal);
-        assert!(text.contains("default"), "tab bar must list every tab: {text:?}");
-        assert!(text.contains("alpha"), "tab bar must list every tab: {text:?}");
-        assert!(text.contains("beta"), "tab bar must list every tab: {text:?}");
+        assert!(
+            text.contains("default"),
+            "tab bar must list every tab: {text:?}"
+        );
+        assert!(
+            text.contains("alpha"),
+            "tab bar must list every tab: {text:?}"
+        );
+        assert!(
+            text.contains("beta"),
+            "tab bar must list every tab: {text:?}"
+        );
         assert!(
             text.contains("▸beta"),
             "active tab must carry the ▸ marker: {text:?}"
@@ -611,7 +954,10 @@ mod tests {
             .draw(|frame| render_side_chat_panel(frame, &tabs, crate::theme::DARK))
             .expect("draw");
         let text = buffer_text(&terminal);
-        assert!(text.contains("▸alpha"), "marker must follow the active tab: {text:?}");
+        assert!(
+            text.contains("▸alpha"),
+            "marker must follow the active tab: {text:?}"
+        );
         assert!(
             !text.contains("▸beta"),
             "inactive tabs must not carry the marker: {text:?}"

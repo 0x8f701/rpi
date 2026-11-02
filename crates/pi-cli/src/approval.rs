@@ -5,13 +5,12 @@ pub use pi_agent::compose_before_tool_call;
 use pi_agent::{
     ApprovalMode, BeforeToolCallContext, BeforeToolCallFn, BeforeToolCallResult, ToolCapability,
 };
-use pi_coding::{permission_verdict, ExtensionMode, PermissionRule, PermissionVerdict};
+use pi_coding::{ExtensionMode, PermissionRule, PermissionVerdict, permission_verdict};
 
 use crate::extension_ui::ExtensionUiAdapter;
 
 const DENIED_REASON: &str = "Tool execution denied by host approval policy";
-const UNAVAILABLE_REASON: &str =
-    "Tool execution blocked: host approval is required but no interactive confirmation adapter is available";
+const UNAVAILABLE_REASON: &str = "Tool execution blocked: host approval is required but no interactive confirmation adapter is available";
 
 /// Live source of path-level permission rules.
 ///
@@ -24,6 +23,63 @@ pub type PermissionRulesSource = Arc<dyn Fn() -> Vec<PermissionRule> + Send + Sy
 #[must_use]
 pub fn empty_permission_rules() -> PermissionRulesSource {
     Arc::new(Vec::new)
+}
+/// Compose host/final approval reducers, then issue the sandbox token only
+/// after the composed decision is allowed.
+///
+/// Final approval has a distinct boundary: policy and downstream hooks run
+/// first, downstream hooks cannot consume the prepared request, and that
+/// request is consumed exactly once only when the aggregate outcome proceeds.
+pub(crate) fn compose_final_approval(
+    approval: BeforeToolCallFn,
+    existing: Option<BeforeToolCallFn>,
+) -> BeforeToolCallFn {
+    Arc::new(move |context| {
+        let approval = approval.clone();
+        let existing = existing.clone();
+        Box::pin(async move {
+            let approval_request = context.approval_request.clone();
+            let first_outcome = approval(context.clone()).await?;
+            let outcome = if first_outcome.block {
+                first_outcome
+            } else if let Some(existing) = existing {
+                let mut next_context = context;
+                next_context.approval_request = None;
+                if let Some(arguments) = first_outcome.arguments.clone() {
+                    next_context.arguments = arguments;
+                }
+                let second_outcome = existing(next_context).await?;
+                BeforeToolCallResult {
+                    block: second_outcome.block,
+                    reason: second_outcome.reason.or(first_outcome.reason),
+                    arguments: second_outcome.arguments.or(first_outcome.arguments),
+                    approval_token: None,
+                }
+            } else {
+                first_outcome
+            };
+            issue_final_approval(approval_request.as_ref(), outcome).await
+        })
+    })
+}
+
+/// Single issuance authority for prepared sandbox approval requests.
+pub(crate) async fn issue_final_approval(
+    approval_request: Option<&pi_agent::ToolApprovalRequest>,
+    mut outcome: BeforeToolCallResult,
+) -> anyhow::Result<BeforeToolCallResult> {
+    outcome.approval_token = None;
+    if outcome.block {
+        return Ok(outcome);
+    }
+    let Some(request) = approval_request else {
+        return Ok(outcome);
+    };
+    if outcome.arguments.is_some() {
+        anyhow::bail!("final approval hook cannot rewrite tool arguments");
+    }
+    outcome.approval_token = Some(request.issue().await?);
+    Ok(outcome)
 }
 
 #[must_use]
@@ -45,8 +101,12 @@ pub fn host_approval_before_tool_call(
             // forces interactive confirmation even when the mode would allow.
             // Bash and other exec tools are not rule-addressable (no reliable
             // target path) and fall through to the capability decision.
-            let verdict =
-                permission_verdict(&context.tool_call.name, &context.arguments, &cwd, &permission_rules());
+            let verdict = permission_verdict(
+                &context.tool_call.name,
+                &context.arguments,
+                &cwd,
+                &permission_rules(),
+            );
             let forced_ask = matches!(&verdict, PermissionVerdict::Ask);
             match verdict {
                 PermissionVerdict::Deny(reason) => return Ok(blocked(reason)),
@@ -61,23 +121,31 @@ pub fn host_approval_before_tool_call(
                 return Ok(blocked(UNAVAILABLE_REASON));
             };
             match adapter
-                .confirm_host_tool(extension_mode, &context.tool_call.name, capability)
+                .confirm_host_tool(
+                    extension_mode,
+                    &context.tool_call.name,
+                    capability,
+                    context
+                        .approval_request
+                        .as_ref()
+                        .map(|request| &request.summary),
+                )
                 .await
             {
                 Ok(crate::extension_ui::HostToolConfirmation::Approved) => {
                     Ok(BeforeToolCallResult::default())
                 }
                 Ok(crate::extension_ui::HostToolConfirmation::Denied) => Ok(blocked(DENIED_REASON)),
-                Ok(crate::extension_ui::HostToolConfirmation::Cancelled) => Ok(blocked(
-                    "Tool execution cancelled by host approval policy",
-                )),
+                Ok(crate::extension_ui::HostToolConfirmation::Cancelled) => {
+                    Ok(blocked("Tool execution cancelled by host approval policy"))
+                }
                 Err(error) => Ok(blocked(format!(
                     "Tool execution blocked: host approval failed: {error}"
                 ))),
             }
         })
     });
-    compose_before_tool_call(Some(approval), existing).expect("approval hook is always present")
+    compose_final_approval(approval, existing)
 }
 
 fn tool_capability(context: &BeforeToolCallContext) -> ToolCapability {
@@ -94,6 +162,7 @@ fn blocked(reason: impl Into<String>) -> BeforeToolCallResult {
         block: true,
         reason: Some(reason.into()),
         arguments: None,
+        approval_token: None,
     }
 }
 
@@ -102,7 +171,10 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use pi_agent::{AgentContext, AgentTool, AgentToolResult};
+    use pi_agent::{
+        AgentContext, AgentTool, AgentToolResult, ToolApprovalDigest, ToolApprovalId,
+        ToolApprovalRequest, ToolApprovalSummary, ToolCallApprovalToken,
+    };
     use pi_ai::{AssistantMessage, Model, Schema, ToolCall};
     use pi_coding::PermissionRule;
     use serde_json::json;
@@ -128,6 +200,7 @@ mod tests {
                 messages: Vec::new(),
                 tools: vec![tool],
             },
+            approval_request: None,
         }
     }
 
@@ -177,7 +250,12 @@ mod tests {
             responder.await.unwrap();
             assert_eq!(result.block, blocked);
             if let Some(fragment) = reason_fragment {
-                assert!(result.reason.as_deref().is_some_and(|reason| reason.contains(fragment)));
+                assert!(
+                    result
+                        .reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains(fragment))
+                );
             }
         }
     }
@@ -198,7 +276,12 @@ mod tests {
             );
             let result = hook(context("tool", capability)).await.unwrap();
             assert!(result.block);
-            assert!(result.reason.unwrap().contains("no interactive confirmation adapter"));
+            assert!(
+                result
+                    .reason
+                    .unwrap()
+                    .contains("no interactive confirmation adapter")
+            );
         }
     }
 
@@ -213,6 +296,7 @@ mod tests {
                     block: false,
                     reason: None,
                     arguments: Some(json!({"rewritten": true})),
+                    approval_token: None,
                 })
             })
         });
@@ -244,7 +328,12 @@ mod tests {
             Box::pin(async { Ok(BeforeToolCallResult::default()) })
         });
         let composed = compose_before_tool_call(Some(first), Some(second)).expect("composed");
-        assert!(!composed(context("read", ToolCapability::Read)).await.unwrap().block);
+        assert!(
+            !composed(context("read", ToolCapability::Read))
+                .await
+                .unwrap()
+                .block
+        );
         assert_eq!(&*order.lock(), &["host", "extension"]);
     }
 
@@ -258,7 +347,11 @@ mod tests {
         });
         let adapter = ExtensionUiAdapter::new();
         let events = adapter.subscribe();
-        let responder = tokio::spawn(answer_confirmation(events, adapter.clone(), HostResponse::Deny));
+        let responder = tokio::spawn(answer_confirmation(
+            events,
+            adapter.clone(),
+            HostResponse::Deny,
+        ));
         let hook = host_approval_before_tool_call(
             ApprovalMode::Write,
             ExtensionMode::Rpc,
@@ -287,7 +380,12 @@ mod tests {
         context.context.tools.clear();
         let result = hook(context).await.unwrap();
         assert!(result.block);
-        assert!(result.reason.unwrap().contains("no interactive confirmation adapter"));
+        assert!(
+            result
+                .reason
+                .unwrap()
+                .contains("no interactive confirmation adapter")
+        );
     }
 
     #[tokio::test]
@@ -355,7 +453,10 @@ mod tests {
         .unwrap();
         assert!(result.block);
         let reason = result.reason.expect("denial reason");
-        assert!(reason.contains("denied by path permission rule"), "{reason}");
+        assert!(
+            reason.contains("denied by path permission rule"),
+            "{reason}"
+        );
         assert!(reason.contains("/secret"), "{reason}");
     }
 
@@ -389,7 +490,11 @@ mod tests {
         // the forced confirmation on another path.
         let adapter = ExtensionUiAdapter::new();
         let events = adapter.subscribe();
-        let responder = tokio::spawn(answer_confirmation(events, adapter.clone(), HostResponse::Deny));
+        let responder = tokio::spawn(answer_confirmation(
+            events,
+            adapter.clone(),
+            HostResponse::Deny,
+        ));
         let hook = host_approval_before_tool_call(
             ApprovalMode::Write,
             ExtensionMode::Tui,
@@ -409,7 +514,10 @@ mod tests {
         ))
         .await
         .unwrap();
-        assert!(!allowed.block, "allow rule must bypass the capability decision");
+        assert!(
+            !allowed.block,
+            "allow rule must bypass the capability decision"
+        );
 
         let forced_ask = hook(context_with_args(
             "write",
@@ -419,9 +527,15 @@ mod tests {
         .await
         .unwrap();
         responder.await.unwrap();
-        assert!(forced_ask.block, "ask rule must force confirmation in write mode");
         assert!(
-            forced_ask.reason.as_deref().is_some_and(|reason| reason.contains("denied")),
+            forced_ask.block,
+            "ask rule must force confirmation in write mode"
+        );
+        assert!(
+            forced_ask
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("denied")),
             "{:?}",
             forced_ask.reason
         );
@@ -431,7 +545,11 @@ mod tests {
     async fn ask_rule_forces_prompt_in_yolo_mode() {
         let adapter = ExtensionUiAdapter::new();
         let events = adapter.subscribe();
-        let responder = tokio::spawn(answer_confirmation(events, adapter.clone(), HostResponse::Allow));
+        let responder = tokio::spawn(answer_confirmation(
+            events,
+            adapter.clone(),
+            HostResponse::Allow,
+        ));
         let hook = host_approval_before_tool_call(
             ApprovalMode::Yolo,
             ExtensionMode::Tui,
@@ -452,7 +570,11 @@ mod tests {
 
         let adapter = ExtensionUiAdapter::new();
         let events = adapter.subscribe();
-        let responder = tokio::spawn(answer_confirmation(events, adapter.clone(), HostResponse::Deny));
+        let responder = tokio::spawn(answer_confirmation(
+            events,
+            adapter.clone(),
+            HostResponse::Deny,
+        ));
         let hook = host_approval_before_tool_call(
             ApprovalMode::Yolo,
             ExtensionMode::Tui,
@@ -490,7 +612,10 @@ mod tests {
         ))
         .await
         .unwrap();
-        assert!(unmatched.block, "unmatched path must fall through to the capability decision");
+        assert!(
+            unmatched.block,
+            "unmatched path must fall through to the capability decision"
+        );
         assert!(
             unmatched
                 .reason
@@ -527,7 +652,10 @@ mod tests {
         ))
         .await
         .unwrap();
-        assert!(result.block, "relative rule must resolve against the session cwd");
+        assert!(
+            result.block,
+            "relative rule must resolve against the session cwd"
+        );
     }
 
     #[tokio::test]
@@ -584,5 +712,342 @@ mod tests {
         shared.lock().expect("rules lock").clear();
         let allowed = hook(context()).await.unwrap();
         assert!(!allowed.block, "rules must be re-read on every call");
+    }
+
+    // ---- Approval-token issuance matrix ----
+    //
+    // `issue_final_approval` is the single authority that mints the final
+    // sandbox authorization token. Allow/Yolo automatic decisions issue the
+    // token when a request is present; Ask issues it only after explicit
+    // confirmation; deny/cancel/unavailable issue none and leave the request
+    // unissued.
+
+    fn matrix_token() -> ToolCallApprovalToken {
+        let mut bytes = [0_u8; 16];
+        bytes[6] = 0x70;
+        bytes[8] = 0x80;
+        ToolCallApprovalToken::new(
+            ToolApprovalId::from_uuid_v7_bytes(bytes).expect("uuid v7"),
+            ToolApprovalDigest::from_sha256([7_u8; 32]),
+        )
+    }
+
+    fn matrix_request() -> ToolApprovalRequest {
+        let expected = matrix_token();
+        ToolApprovalRequest::new(
+            ToolApprovalSummary {
+                family: "browser".to_owned(),
+                executable: "governed browser executable".to_owned(),
+                argument_count: 0,
+                working_directory: "captured workspace".to_owned(),
+                credential_audience: Some("browser".to_owned()),
+                requested_credential_count: 0,
+                target_fds: Vec::new(),
+            },
+            Box::new(move || Box::pin(async move { Ok(expected) })),
+        )
+    }
+
+    #[tokio::test]
+    async fn allow_rule_issues_final_token_when_request_present() {
+        let request = matrix_request();
+        let hook = host_approval_before_tool_call(
+            ApprovalMode::Yolo,
+            ExtensionMode::Print,
+            None,
+            None,
+            PathBuf::from("/"),
+            rules_source(vec![rule(pi_coding::PermissionRuleAction::Allow, "/safe")]),
+        );
+        let context =
+            context_with_args("read", ToolCapability::Read, json!({"path": "/safe/a.txt"}));
+        let mut context = context;
+        context.approval_request = Some(request.clone());
+        let outcome = hook(context).await.unwrap();
+        assert!(!outcome.block, "allow rule must not block");
+        let token = outcome
+            .approval_token
+            .expect("automatic allow must issue the final sandbox token");
+        assert_eq!(token, matrix_token());
+        // The request was consumed by the single issue path.
+        assert!(
+            request.issue().await.is_err(),
+            "token must be minted exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn allow_rule_issues_no_token_without_request() {
+        // When consulted as a general before-tool-call hook (approval_request
+        // is None there), the automatic-allow path must not issue a token —
+        // general hooks forbid tokens (loop_runtime.rs).
+        let hook = host_approval_before_tool_call(
+            ApprovalMode::Yolo,
+            ExtensionMode::Print,
+            None,
+            None,
+            PathBuf::from("/"),
+            rules_source(vec![rule(pi_coding::PermissionRuleAction::Allow, "/safe")]),
+        );
+        let outcome = hook(context_with_args(
+            "read",
+            ToolCapability::Read,
+            json!({"path": "/safe/a.txt"}),
+        ))
+        .await
+        .unwrap();
+        assert!(!outcome.block);
+        assert!(outcome.approval_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn composed_allow_issues_token_after_downstream_allow() {
+        let downstream: BeforeToolCallFn = Arc::new(|context| {
+            assert!(
+                context.approval_request.is_none(),
+                "only the final issuance boundary may receive the prepared request"
+            );
+            Box::pin(async { Ok(BeforeToolCallResult::default()) })
+        });
+        let request = matrix_request();
+        let hook = host_approval_before_tool_call(
+            ApprovalMode::Yolo,
+            ExtensionMode::Print,
+            None,
+            Some(downstream),
+            PathBuf::from("/"),
+            rules_source(vec![rule(pi_coding::PermissionRuleAction::Allow, "/safe")]),
+        );
+        let mut approval_context =
+            context_with_args("read", ToolCapability::Read, json!({"path": "/safe/a.txt"}));
+        approval_context.approval_request = Some(request.clone());
+
+        let outcome = hook(approval_context).await.unwrap();
+
+        assert!(!outcome.block);
+        assert_eq!(
+            outcome
+                .approval_token
+                .expect("final allow must retain issued token"),
+            matrix_token()
+        );
+        assert!(
+            request.issue().await.is_err(),
+            "token must be issued exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn composed_downstream_denial_leaves_request_unissued() {
+        let downstream: BeforeToolCallFn = Arc::new(|context| {
+            assert!(
+                context.approval_request.is_none(),
+                "only the final issuance boundary may receive the prepared request"
+            );
+            Box::pin(async {
+                Ok(BeforeToolCallResult {
+                    block: true,
+                    reason: Some("downstream denied".to_owned()),
+                    ..BeforeToolCallResult::default()
+                })
+            })
+        });
+        let request = matrix_request();
+        let hook = host_approval_before_tool_call(
+            ApprovalMode::Yolo,
+            ExtensionMode::Print,
+            None,
+            Some(downstream),
+            PathBuf::new(),
+            empty_permission_rules(),
+        );
+        let mut approval_context = context("read", ToolCapability::Read);
+        approval_context.approval_request = Some(request.clone());
+
+        let outcome = hook(approval_context).await.unwrap();
+
+        assert!(outcome.block);
+        assert_eq!(outcome.reason.as_deref(), Some("downstream denied"));
+        assert!(outcome.approval_token.is_none());
+        assert_eq!(
+            request.issue().await.unwrap(),
+            matrix_token(),
+            "downstream denial must not consume the prepared request"
+        );
+    }
+
+    #[tokio::test]
+    async fn yolo_capability_allow_issues_final_token_when_request_present() {
+        // Yolo never requires approval for a Read-capability tool, so this is
+        // the capability-allow automatic path (not a path rule).
+        let request = matrix_request();
+        let hook = host_approval_before_tool_call(
+            ApprovalMode::Yolo,
+            ExtensionMode::Print,
+            None,
+            None,
+            PathBuf::new(),
+            empty_permission_rules(),
+        );
+        let mut context = context("read", ToolCapability::Read);
+        context.approval_request = Some(request.clone());
+        let outcome = hook(context).await.unwrap();
+        assert!(!outcome.block);
+        assert_eq!(
+            outcome.approval_token.expect("yolo allow mints token"),
+            matrix_token()
+        );
+        assert!(request.issue().await.is_err(), "minted exactly once");
+    }
+
+    #[tokio::test]
+    async fn yolo_capability_allow_issues_no_token_without_request() {
+        let hook = host_approval_before_tool_call(
+            ApprovalMode::Yolo,
+            ExtensionMode::Print,
+            None,
+            None,
+            PathBuf::new(),
+            empty_permission_rules(),
+        );
+        let outcome = hook(context("read", ToolCapability::Read)).await.unwrap();
+        assert!(!outcome.block);
+        assert!(outcome.approval_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn ask_confirmed_issues_final_token() {
+        let adapter = ExtensionUiAdapter::new();
+        let events = adapter.subscribe();
+        let responder = tokio::spawn(answer_confirmation(
+            events,
+            adapter.clone(),
+            HostResponse::Allow,
+        ));
+        let request = matrix_request();
+        let hook = host_approval_before_tool_call(
+            ApprovalMode::Ask,
+            ExtensionMode::Tui,
+            Some(adapter),
+            None,
+            PathBuf::new(),
+            empty_permission_rules(),
+        );
+        let mut context = context("read", ToolCapability::Read);
+        context.approval_request = Some(request.clone());
+        let outcome = hook(context).await.unwrap();
+        responder.await.unwrap();
+        assert!(!outcome.block);
+        assert_eq!(
+            outcome.approval_token.expect("confirmed ask mints token"),
+            matrix_token()
+        );
+        assert!(request.issue().await.is_err(), "minted exactly once");
+    }
+
+    #[tokio::test]
+    async fn ask_denied_blocks_and_issues_no_token() {
+        let adapter = ExtensionUiAdapter::new();
+        let events = adapter.subscribe();
+        let responder = tokio::spawn(answer_confirmation(
+            events,
+            adapter.clone(),
+            HostResponse::Deny,
+        ));
+        let request = matrix_request();
+        let hook = host_approval_before_tool_call(
+            ApprovalMode::Ask,
+            ExtensionMode::Tui,
+            Some(adapter),
+            None,
+            PathBuf::new(),
+            empty_permission_rules(),
+        );
+        let mut context = context("read", ToolCapability::Read);
+        context.approval_request = Some(request.clone());
+        let outcome = hook(context).await.unwrap();
+        responder.await.unwrap();
+        assert!(outcome.block, "denied ask must block");
+        assert!(
+            outcome.approval_token.is_none(),
+            "denied ask must not mint a token"
+        );
+        // The request was never consumed: the sandbox stays fail-closed and
+        // the token may still be minted later (e.g. by a re-issued call).
+        assert_eq!(
+            request.issue().await.unwrap(),
+            matrix_token(),
+            "denied ask must leave the approval request unissued"
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_cancelled_blocks_and_issues_no_token() {
+        let adapter = ExtensionUiAdapter::new();
+        let events = adapter.subscribe();
+        let responder = tokio::spawn(answer_confirmation(
+            events,
+            adapter.clone(),
+            HostResponse::Cancel,
+        ));
+        let request = matrix_request();
+        let hook = host_approval_before_tool_call(
+            ApprovalMode::Ask,
+            ExtensionMode::Tui,
+            Some(adapter),
+            None,
+            PathBuf::new(),
+            empty_permission_rules(),
+        );
+        let mut context = context("read", ToolCapability::Read);
+        context.approval_request = Some(request.clone());
+        let outcome = hook(context).await.unwrap();
+        responder.await.unwrap();
+        assert!(outcome.block, "cancelled ask must block");
+        assert!(
+            outcome.approval_token.is_none(),
+            "cancelled ask mints no token"
+        );
+        assert_eq!(
+            request.issue().await.unwrap(),
+            matrix_token(),
+            "cancelled ask must leave the approval request unissued"
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_unavailable_blocks_and_issues_no_token() {
+        // No interactive adapter: host approval is required but unavailable.
+        // The call fails closed and the sandbox token is never minted.
+        let request = matrix_request();
+        let hook = host_approval_before_tool_call(
+            ApprovalMode::Ask,
+            ExtensionMode::Print,
+            None,
+            None,
+            PathBuf::new(),
+            empty_permission_rules(),
+        );
+        let mut context = context("read", ToolCapability::Read);
+        context.approval_request = Some(request.clone());
+        let outcome = hook(context).await.unwrap();
+        assert!(outcome.block, "unavailable adapter must block");
+        assert!(
+            outcome
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("no interactive confirmation adapter")),
+            "{:?}",
+            outcome.reason
+        );
+        assert!(
+            outcome.approval_token.is_none(),
+            "unavailable mints no token"
+        );
+        assert_eq!(
+            request.issue().await.unwrap(),
+            matrix_token(),
+            "unavailable must leave the approval request unissued"
+        );
     }
 }

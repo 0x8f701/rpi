@@ -12,11 +12,9 @@
 //!
 //! To generate the assets: `cd crates/pi-cli/web && npm ci && npm run build`.
 
+use std::fmt::Write as _;
 use std::{
-    env,
-    fmt,
-    fs,
-    io,
+    env, fmt, fs, io,
     path::{Path, PathBuf},
 };
 
@@ -47,15 +45,21 @@ fn main() {
         let bytes = fs::read(abs).unwrap_or_else(|err| {
             panic!("failed to read web client asset {}: {err}", abs.display())
         });
-        generated.push_str(&format!(
-            "    ({:?}, {:?}, include_bytes!({:?})), // bytes={} fingerprint={:016x}\n",
-            rel,
+        let abs = abs.to_str().unwrap_or_else(|| {
+            panic!(
+                "web client asset path is not valid UTF-8: {}",
+                abs.display()
+            )
+        });
+        writeln!(
+            generated,
+            "    ({rel:?}, {:?}, include_bytes!({abs:?})), // bytes={} fingerprint={:016x}",
             mime_for(rel),
-            abs,
             bytes.len(),
             content_fingerprint(&bytes)
-        ));
-        println!("cargo:rerun-if-changed={}", abs.display());
+        )
+        .expect("write generated asset entry");
+        println!("cargo:rerun-if-changed={abs}");
     }
     generated.push_str("];\n");
 
@@ -67,10 +71,10 @@ fn main() {
 /// Stable, dependency-free asset fingerprint used only to make the generated
 /// module change when an asset's bytes change without changing its path.
 fn content_fingerprint(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf29ce484222325_u64;
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in bytes {
         hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
     hash
 }
@@ -157,11 +161,7 @@ impl CollectError {
 fn rel_path(root: &Path, path: &Path) -> String {
     let rel = path.strip_prefix(root).unwrap_or(path);
     let rel = rel.to_string_lossy().replace('\\', "/");
-    if rel.is_empty() {
-        ".".to_owned()
-    } else {
-        rel
-    }
+    if rel.is_empty() { ".".to_owned() } else { rel }
 }
 
 impl fmt::Display for CollectError {
@@ -176,7 +176,11 @@ impl fmt::Display for CollectError {
                 rel = self.rel
             ),
             CollectErrorDetail::FileType(err) => {
-                write!(f, "cannot determine the type of {rel:?}: {err}", rel = self.rel)
+                write!(
+                    f,
+                    "cannot determine the type of {rel:?}: {err}",
+                    rel = self.rel
+                )
             }
             CollectErrorDetail::Unsupported(kind) => {
                 write!(f, "unsupported entry {rel:?}: {kind}", rel = self.rel)
@@ -186,28 +190,22 @@ impl fmt::Display for CollectError {
 }
 
 fn mime_for(path: &str) -> &'static str {
-    if path.ends_with(".html") {
-        "text/html; charset=utf-8"
-    } else if path.ends_with(".js") || path.ends_with(".mjs") {
-        "text/javascript"
-    } else if path.ends_with(".css") {
-        "text/css"
-    } else if path.ends_with(".svg") {
-        "image/svg+xml"
-    } else if path.ends_with(".png") {
-        "image/png"
-    } else if path.ends_with(".jpg") || path.ends_with(".jpeg") {
-        "image/jpeg"
-    } else if path.ends_with(".gif") {
-        "image/gif"
-    } else if path.ends_with(".webp") {
-        "image/webp"
-    } else if path.ends_with(".woff2") {
-        "font/woff2"
-    } else if path.ends_with(".map") {
-        "application/json"
-    } else {
-        "application/octet-stream"
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    match extension.as_deref() {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js" | "mjs") => "text/javascript",
+        Some("css") => "text/css",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("woff2") => "font/woff2",
+        Some("map") => "application/json",
+        _ => "application/octet-stream",
     }
 }
 
@@ -215,6 +213,15 @@ fn mime_for(path: &str) -> &'static str {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn mime_types_are_case_insensitive_and_unknown_types_fall_back() {
+        assert_eq!(mime_for("index.HTML"), "text/html; charset=utf-8");
+        assert_eq!(mime_for("assets/client.MJS"), "text/javascript");
+        assert_eq!(mime_for("assets/logo.PNG"), "image/png");
+        assert_eq!(mime_for("assets/unknown.bin"), "application/octet-stream");
+        assert_eq!(mime_for("LICENSE"), "application/octet-stream");
+    }
 
     /// Creates a unique scratch directory for one test.
     fn scratch(name: &str) -> PathBuf {
@@ -265,7 +272,6 @@ mod tests {
                 "assets/app.js",
                 "assets/img/logo.svg",
                 "assets/img/nested/deep.bin",
-
                 "assets/styles.css",
                 "index.html",
             ]
@@ -286,8 +292,14 @@ mod tests {
 
     #[test]
     fn asset_fingerprint_changes_with_contents() {
-        assert_ne!(content_fingerprint(b"first"), content_fingerprint(b"second"));
-        assert_eq!(content_fingerprint(b"stable"), content_fingerprint(b"stable"));
+        assert_ne!(
+            content_fingerprint(b"first"),
+            content_fingerprint(b"second")
+        );
+        assert_eq!(
+            content_fingerprint(b"stable"),
+            content_fingerprint(b"stable")
+        );
     }
 
     #[test]
@@ -328,7 +340,9 @@ mod tests {
                 // Permissions are not enforced (e.g. running as root or a
                 // filesystem that ignores mode bits) — the platform cannot
                 // exercise this case, so record and skip.
-                eprintln!("note: unreadable-directory assertion skipped (permissions not enforced)");
+                eprintln!(
+                    "note: unreadable-directory assertion skipped (permissions not enforced)"
+                );
             }
         }
         cleanup(&root);
@@ -340,18 +354,27 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let root = scratch("symlink");
-        write_tree(&root, &[("index.html", "<!doctype html>"), ("assets/app.js", "js")]);
+        write_tree(
+            &root,
+            &[("index.html", "<!doctype html>"), ("assets/app.js", "js")],
+        );
         // Symlink to a regular file.
         symlink(root.join("index.html"), root.join("link.html")).expect("create file symlink");
         let err = collect_files(&root, &root).expect_err("file symlink must be rejected");
         assert_eq!(err.rel, "link.html");
-        assert!(matches!(err.detail, CollectErrorDetail::Unsupported("symbolic link")));
+        assert!(matches!(
+            err.detail,
+            CollectErrorDetail::Unsupported("symbolic link")
+        ));
         // Symlink to a directory must not be followed into.
         fs::remove_file(root.join("link.html")).expect("remove file symlink");
         symlink(root.join("assets"), root.join("link-dir")).expect("create dir symlink");
         let err = collect_files(&root, &root).expect_err("dir symlink must be rejected");
         assert_eq!(err.rel, "link-dir");
-        assert!(matches!(err.detail, CollectErrorDetail::Unsupported("symbolic link")));
+        assert!(matches!(
+            err.detail,
+            CollectErrorDetail::Unsupported("symbolic link")
+        ));
         cleanup(&root);
     }
 

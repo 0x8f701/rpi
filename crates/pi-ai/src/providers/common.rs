@@ -1,16 +1,14 @@
 use crate::{
-    AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream, Model, ProviderHeaders,
-    ProviderResponse, StopReason, StreamOptions,
+    AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream, HttpMethod, HttpRequest,
+    HttpResponse, MAX_HTTP_STREAM_RESPONSE_BYTES, Model, ProviderHeaders, ProviderResponse,
+    StopReason, StreamOptions, request_from_url,
 };
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use futures_util::StreamExt;
-use reqwest::{
-    Client, Response, StatusCode,
-    header::{HeaderMap, HeaderName, HeaderValue},
-};
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{collections::HashMap, time::Duration};
 
 // Retry/timeout defaults, mirroring pi's provider retry helpers
@@ -19,7 +17,6 @@ use std::{collections::HashMap, time::Duration};
 // matching the OpenAI/Anthropic SDK default; it caps time-to-headers only so a
 // long SSE body is never severed.
 const DEFAULT_MAX_RETRY_DELAY_MS: u64 = 60_000;
-const DEFAULT_TIMEOUT_MS: u64 = 600_000;
 const RETRY_BASE_DELAY_MS: f64 = 500.0;
 const RETRY_BACKOFF_CAP_MS: f64 = 8_000.0;
 const MAX_PROVIDER_ERROR_BODY_CHARS: usize = 4_000;
@@ -29,12 +26,32 @@ const MAX_PROVIDER_ERROR_BODY_CHARS: usize = 4_000;
 // Duration.
 const MAX_SERVER_DELAY_MS: f64 = (i64::MAX as f64) / 1_000_000.0;
 
-pub fn client(_options: &StreamOptions) -> Result<Client> {
-    // No client-level total timeout: a total cap would sever a long SSE body.
-    // The time-to-headers cap is applied per-send in send_cancellable, mirroring
-    // pi's ResponseHeaderTimeout; the body stream stays uncapped and is only
-    // aborted by the cancellation token.
-    Ok(Client::builder().build()?)
+/// Deserialize an OPTIONAL streaming-sequence field leniently for
+/// OpenAI-compatible providers that emit an explicit `null` for a field they
+/// always carry on the wire (e.g. `delta.tool_calls: null` on a text-only
+/// chunk). `#[serde(default)]` alone only covers an ABSENT key — a present
+/// `null` would otherwise trip serde's `Vec` deserializer with
+/// `invalid type: null, expected a sequence` and abort the whole stream.
+/// `null` and absence both map to the empty `Vec`; a real array decodes
+/// normally; any non-array scalar/object is still rejected so a truly
+/// required/typed sequence is never silently widened. Apply ONLY to
+/// semantically optional sequence fields whose provider wire legitimately
+/// emits `null`.
+pub(crate) fn null_default_vec<'de, D, T>(deserializer: D) -> std::result::Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+pub fn client(options: &StreamOptions) -> Result<crate::SharedHttpExecutor> {
+    // An injected executor wins; without one, the request goes through the
+    // production default so provider streams work with no external transport.
+    Ok(options
+        .http_executor
+        .clone()
+        .unwrap_or_else(crate::http::default_http_executor))
 }
 
 pub fn is_aborted(options: &StreamOptions) -> bool {
@@ -155,33 +172,25 @@ pub async fn notify_response_headers(
 
 pub async fn notify_response(
     options: &StreamOptions,
-    response: &Response,
+    status: http::StatusCode,
+    headers: HeaderMap,
     model: &Model,
 ) -> Result<()> {
-    notify_response_headers(
-        options,
-        response.status().as_u16(),
-        response.headers(),
-        model,
-    )
-    .await
+    notify_response_headers(options, status.as_u16(), &headers, model).await
 }
 
 pub async fn error_body(
     label: &str,
-    response: Response,
-    options: &StreamOptions,
+    response: HttpResponse,
+    _options: &StreamOptions,
 ) -> Result<String> {
     let status = response.status();
-    let body = match &options.abort_signal {
-        Some(token) => tokio::select! {
-            biased;
-            _ = token.clone().cancelled_owned() => return Err(anyhow!("Request was aborted")),
-            body = response.text() => body.unwrap_or_default(),
-        },
-        None => response.text().await.unwrap_or_default(),
-    };
-    Ok(format_provider_error(label, status.as_u16(), &body))
+    let body = crate::collect_response_body(response).await?;
+    Ok(format_provider_error(
+        label,
+        status.as_u16(),
+        &String::from_utf8_lossy(&body),
+    ))
 }
 
 // format_provider_error mirrors pi's formatProviderError (error-body.ts): the
@@ -467,30 +476,8 @@ fn retry_delay(headers: &HeaderMap, attempt: usize, options: &StreamOptions) -> 
     }
 }
 
-async fn send_cancellable(
-    options: &StreamOptions,
-    request: reqwest::RequestBuilder,
-) -> Result<Response> {
-    // Cap time-to-headers only (mirrors pi's ResponseHeaderTimeout): the send()
-    // future resolves once response headers arrive, so a timeout here never
-    // touches the streaming body, which is read later in consume_sse without a
-    // deadline. The body is aborted only by the cancellation token.
-    let timeout = match options.timeout_ms {
-        Some(0) | None => Duration::from_millis(DEFAULT_TIMEOUT_MS),
-        Some(ms) => Duration::from_millis(ms),
-    };
-    match &options.abort_signal {
-        Some(token) => tokio::select! {
-            biased;
-            _ = token.clone().cancelled_owned() => Err(anyhow!("Request was aborted")),
-            response = request.send() => Ok(response?),
-            _ = tokio::time::sleep(timeout) => Err(anyhow!("request timed out after {}ms", timeout.as_millis())),
-        },
-        None => match tokio::time::timeout(timeout, request.send()).await {
-            Ok(response) => Ok(response?),
-            Err(_) => Err(anyhow!("request timed out after {}ms", timeout.as_millis())),
-        },
-    }
+async fn send_cancellable(options: &StreamOptions, request: HttpRequest) -> Result<HttpResponse> {
+    client(options)?.execute(request).await
 }
 
 async fn abortable_sleep(options: &StreamOptions, delay: Duration) -> Result<()> {
@@ -507,15 +494,15 @@ async fn abortable_sleep(options: &StreamOptions, delay: Duration) -> Result<()>
     }
 }
 
-pub async fn send_with_retry<F>(options: &StreamOptions, mut build: F) -> Result<Response>
+pub async fn send_with_retry<F>(options: &StreamOptions, mut build: F) -> Result<HttpResponse>
 where
-    F: FnMut() -> reqwest::RequestBuilder,
+    F: FnMut() -> Result<HttpRequest>,
 {
     for attempt in 0..=options.max_retries {
         if is_aborted(options) {
             return Err(anyhow!("Request was aborted"));
         }
-        match send_cancellable(options, build()).await {
+        match send_cancellable(options, build()?).await {
             Ok(response)
                 if retryable(response.status(), response.headers())
                     && attempt < options.max_retries =>
@@ -533,15 +520,32 @@ where
     Err(anyhow!("request retry loop ended unexpectedly"))
 }
 
+pub fn build_request(
+    options: &StreamOptions,
+    method: HttpMethod,
+    url: &str,
+    headers: &HeaderMap,
+    body: Vec<u8>,
+) -> Result<HttpRequest> {
+    request_from_url(
+        method,
+        url,
+        headers,
+        body,
+        options,
+        MAX_HTTP_STREAM_RESPONSE_BYTES,
+    )
+}
+
 pub async fn consume_sse<F>(
-    response: Response,
+    response: HttpResponse,
     options: &StreamOptions,
     mut handle: F,
 ) -> Result<()>
 where
     F: FnMut(Option<&str>, &str) -> Result<()>,
 {
-    let mut bytes = response.bytes_stream();
+    let mut bytes = response.into_body();
     let mut pending = String::new();
     loop {
         let chunk = match &options.abort_signal {
@@ -706,8 +710,204 @@ pub async fn apply_provider_request(
     }
 }
 
+/// Convert JSON Schema into the OpenAI strict-tool dialect without changing
+/// the shared source schema used by other providers. OpenAI requires every
+/// object property to appear in `required`; source-optional properties become
+/// required-but-nullable only in this payload. A `type: [T, "null"]` union
+/// becomes `anyOf`, keeping that existing non-null schema's constraints.
+pub fn openai_strict_schema_dialect(value: &mut Value) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                openai_strict_schema_dialect(item);
+            }
+        }
+        Value::Object(_) => {
+            rewrite_nullable_type_union(value);
+            if let Value::Object(map) = value {
+                for child in map.values_mut() {
+                    openai_strict_schema_dialect(child);
+                }
+                normalize_openai_strict_object(map);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_openai_strict_object(map: &mut serde_json::Map<String, Value>) {
+    if map.get("type").and_then(Value::as_str) != Some("object") {
+        return;
+    }
+    let mut required = map
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let mut required_names = required
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let Some(properties) = map.get_mut("properties").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let mut optional_names = properties
+        .keys()
+        .filter(|name| !required_names.contains(*name))
+        .cloned()
+        .collect::<Vec<_>>();
+    optional_names.sort();
+    for name in optional_names {
+        if let Some(property) = properties.get_mut(&name) {
+            if !schema_accepts_null(property) {
+                let non_null = std::mem::take(property);
+                *property = json!({
+                    "anyOf": [non_null, { "type": "null" }]
+                });
+            }
+            required_names.insert(name.clone());
+            required.push(name);
+        }
+    }
+    map.insert(
+        "required".to_owned(),
+        Value::Array(required.into_iter().map(Value::String).collect()),
+    );
+}
+
+fn schema_accepts_null(value: &Value) -> bool {
+    value
+        .get("type")
+        .and_then(Value::as_array)
+        .is_some_and(|types| types.iter().any(|entry| entry.as_str() == Some("null")))
+        || value
+            .get("anyOf")
+            .and_then(Value::as_array)
+            .is_some_and(|branches| {
+                branches
+                    .iter()
+                    .any(|branch| branch.get("type").and_then(Value::as_str) == Some("null"))
+            })
+}
+
+fn rewrite_nullable_type_union(value: &mut Value) {
+    let Value::Object(map) = value else {
+        return;
+    };
+    let Some(types) = map.get("type").and_then(Value::as_array).cloned() else {
+        return;
+    };
+    if !types.iter().any(|entry| entry.as_str() == Some("null")) {
+        return;
+    }
+    let mut non_null_schema = map.clone();
+    non_null_schema.remove("type");
+    let branches = types
+        .into_iter()
+        .map(|entry| {
+            if entry.as_str() == Some("null") {
+                json!({ "type": "null" })
+            } else {
+                let mut branch = non_null_schema.clone();
+                branch.insert("type".to_owned(), entry);
+                Value::Object(branch)
+            }
+        })
+        .collect::<Vec<_>>();
+    *value = json!({ "anyOf": branches });
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn openai_strict_dialect_normalizes_nested_optional_object_properties() {
+        use serde_json::json;
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "list": {
+                    "type": ["array", "null"],
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "phase": { "type": "string" },
+                            "items": { "type": "array", "items": { "type": "string" } },
+                            "agents": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+                        },
+                        "required": ["phase", "items"],
+                        "additionalProperties": false
+                    },
+                    "minItems": 1
+                },
+                "cascade": { "type": ["boolean", "null"] },
+                "op": { "type": "string" }
+            },
+            "required": ["op", "list", "cascade"],
+            "additionalProperties": false
+        });
+        openai_strict_schema_dialect(&mut schema);
+        let list = &schema["properties"]["list"];
+        assert_eq!(list["anyOf"][0]["type"], json!("array"));
+        assert_eq!(list["anyOf"][0]["minItems"], json!(1));
+        assert_eq!(list["anyOf"][0]["items"]["type"], json!("object"));
+        assert_eq!(list["anyOf"][1]["type"], json!("null"));
+        let phase = &list["anyOf"][0]["items"];
+        let required = phase["required"].as_array().expect("nested required");
+        assert!(required.iter().any(|name| name == "phase"));
+        assert!(required.iter().any(|name| name == "items"));
+        assert!(required.iter().any(|name| name == "agents"));
+        let agents = &phase["properties"]["agents"];
+        assert_eq!(agents["anyOf"][0]["type"], json!("array"));
+        assert_eq!(agents["anyOf"][0]["minItems"], json!(1));
+        assert_eq!(agents["anyOf"][0]["items"]["type"], json!("string"));
+        assert_eq!(agents["anyOf"][1]["type"], json!("null"));
+        assert_eq!(phase["additionalProperties"], json!(false));
+        assert_eq!(schema["properties"]["op"]["type"], json!("string"));
+        assert_eq!(
+            schema["properties"]["cascade"]["anyOf"][0]["type"],
+            json!("boolean")
+        );
+        assert_eq!(
+            schema["properties"]["cascade"]["anyOf"][1]["type"],
+            json!("null")
+        );
+    }
+
+    #[test]
+    fn openai_strict_dialect_requires_optional_properties_on_nullable_object() {
+        use serde_json::json;
+        let mut schema = json!({
+            "type": ["object", "null"],
+            "properties": {
+                "phase": { "type": "string" },
+                "items": { "type": "array", "items": { "type": "string" } },
+                "agents": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+            },
+            "required": ["phase", "items"],
+            "additionalProperties": false
+        });
+        openai_strict_schema_dialect(&mut schema);
+        assert_eq!(schema["anyOf"][0]["type"], json!("object"));
+        assert_eq!(schema["anyOf"][1]["type"], json!("null"));
+        let object = &schema["anyOf"][0];
+        let required = object["required"]
+            .as_array()
+            .expect("nullable object required");
+        assert!(required.iter().any(|name| name == "phase"));
+        assert!(required.iter().any(|name| name == "items"));
+        assert!(required.iter().any(|name| name == "agents"));
+        let agents = &object["properties"]["agents"];
+        assert_eq!(agents["anyOf"][0]["type"], json!("array"));
+        assert_eq!(agents["anyOf"][0]["minItems"], json!(1));
+        assert_eq!(agents["anyOf"][0]["items"]["type"], json!("string"));
+        assert_eq!(agents["anyOf"][1]["type"], json!("null"));
+        assert_eq!(object["additionalProperties"], json!(false));
+    }
+
     use super::*;
     use reqwest::header::HeaderValue;
     use std::io::{Read, Write};
@@ -715,6 +915,24 @@ mod tests {
     use std::thread;
     use tokio::sync::oneshot;
     use tokio_util::sync::CancellationToken;
+
+    fn test_options() -> StreamOptions {
+        StreamOptions {
+            http_executor: Some(crate::http::test_http_executor()),
+            ..StreamOptions::default()
+        }
+    }
+
+    fn test_get(url: &str, options: &StreamOptions) -> Result<HttpRequest> {
+        request_from_url(
+            HttpMethod::Get,
+            url,
+            &HeaderMap::new(),
+            Vec::new(),
+            options,
+            MAX_HTTP_STREAM_RESPONSE_BYTES,
+        )
+    }
 
     #[test]
     fn parses_crlf_and_final_unterminated_events() {
@@ -755,10 +973,10 @@ mod tests {
     }
 
     // Accepts one HTTP/1.1 connection, reads the request headers, then either
-    // writes `response` and holds the connection open (so a body never arrives)
-    // or stays silent, so the client's send/SSE wait can never complete on its
-    // own. `request_seen` fires once the request is in flight; `responded` fires
-    // after `response` bytes (if any) are written.
+    // writes `response` and holds the connection open or stays silent. These
+    // socket fixtures cover send/retry behavior; stream cancellation below
+    // uses current `HttpResponse` fixtures so it does not depend on HTTP
+    // framing or socket EOF timing.
     fn spawn_stalled_server(
         response: Option<&'static [u8]>,
     ) -> (String, oneshot::Receiver<()>, oneshot::Receiver<()>) {
@@ -795,48 +1013,17 @@ mod tests {
         (format!("http://{addr}"), request_seen_rx, responded_rx)
     }
 
-    // Like `spawn_stalled_server`, but after writing `response` it holds the
-    // connection until `close` is signaled, then drops the stream so the client
-    // observes EOF at a controlled moment. Used to drive the SSE EOF race: the
-    // server has already sent a complete event, and EOF is armed together with
-    // cancellation so both are ready when `consume_sse` next polls.
-    fn spawn_eof_server(
-        response: &'static [u8],
-    ) -> (String, oneshot::Receiver<()>, oneshot::Sender<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let (responded_tx, responded_rx) = oneshot::channel();
-        let (close_tx, close_rx) = oneshot::channel();
-        thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
-            let mut request = Vec::new();
-            let mut tmp = [0u8; 1024];
-            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                let n = stream.read(&mut tmp).expect("read request headers");
-                if n == 0 {
-                    break;
-                }
-                request.extend_from_slice(&tmp[..n]);
-            }
-            stream.write_all(response).expect("write response");
-            let _ = stream.flush();
-            let _ = responded_tx.send(());
-            // Hold until told to close, then drop so the client sees EOF.
-            let _ = close_rx.blocking_recv();
-            drop(stream);
-        });
-        (format!("http://{addr}"), responded_rx, close_tx)
-    }
-
     #[tokio::test]
     async fn request_send_is_interrupted_by_cancellation() {
         let (url, request_seen, _responded) = spawn_stalled_server(None);
         let token = CancellationToken::new();
-        let mut options = StreamOptions::default();
+        let mut options = test_options();
         options.max_retries = 0;
         options.abort_signal = Some(token.clone());
-        let http = client(&options).expect("client");
-        let task = tokio::spawn(async move { send_with_retry(&options, || http.get(&url)).await });
+        let task =
+            tokio::spawn(
+                async move { send_with_retry(&options, || test_get(&url, &options)).await },
+            );
         // The server only fires `request_seen` once it has read the request
         // headers, i.e. the client's `request.send()` future has been polled
         // and is now pending on the response that never arrives.
@@ -864,11 +1051,13 @@ mod tests {
             b"HTTP/1.1 429 Too Many Requests\r\nretry-after-ms: 60000\r\ncontent-length: 0\r\n\r\n";
         let (url, _request_seen, responded) = spawn_stalled_server(Some(TOO_MANY));
         let token = CancellationToken::new();
-        let mut options = StreamOptions::default();
+        let mut options = test_options();
         options.max_retries = 1;
         options.abort_signal = Some(token.clone());
-        let http = client(&options).expect("client");
-        let task = tokio::spawn(async move { send_with_retry(&options, || http.get(&url)).await });
+        let task =
+            tokio::spawn(
+                async move { send_with_retry(&options, || test_get(&url, &options)).await },
+            );
         responded.await.expect("retryable response delivered");
         // Let the retry loop receive the response, drop it, and enter the 60s
         // backoff. A pre-cancelled token would have returned instantly; the
@@ -920,29 +1109,28 @@ mod tests {
 
     #[tokio::test]
     async fn sse_body_wait_is_interrupted_by_cancellation() {
-        const SSE_HEADERS: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n";
-        let (url, _request_seen, responded) = spawn_stalled_server(Some(SSE_HEADERS));
         let token = CancellationToken::new();
-        let mut options = StreamOptions::default();
+        let mut options = test_options();
         options.abort_signal = Some(token.clone());
-        let http = client(&options).expect("client");
-        let response_task = tokio::spawn(async move { http.get(&url).send().await });
-        responded.await.expect("SSE headers delivered");
-        let response = response_task
-            .await
-            .expect("response task joins")
-            .expect("headers resolve the response");
+        let (body_waiting_tx, body_waiting_rx) = oneshot::channel();
+        let body = futures_util::stream::once(async move {
+            let _ = body_waiting_tx.send(());
+            std::future::pending::<Result<Vec<u8>>>().await
+        });
+        let response = HttpResponse::new(StatusCode::OK, HeaderMap::new(), Box::pin(body));
         let task =
             tokio::spawn(async move { consume_sse(response, &options, |_, _| Ok(())).await });
-        // Let consume_sse enter the body wait (server holds the stream open),
-        // then prove it is genuinely pending rather than pre-cancelled.
-        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        tokio::time::timeout(Duration::from_secs(2), body_waiting_rx)
+            .await
+            .expect("SSE body must be polled promptly")
+            .expect("SSE body poll started");
         assert!(
             !task.is_finished(),
             "SSE task should be waiting on the body, not finished"
         );
         token.cancel();
-        let result = tokio::time::timeout(Duration::from_secs(10), task)
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
             .await
             .expect("SSE body wait must return promptly after cancellation");
         assert_eq!(
@@ -956,26 +1144,36 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn sse_eof_race_does_not_become_success() {
-        // The server sends a complete event then holds the connection. We wait
-        // until the event has been dispatched (so consume_sse is parked on the
-        // next bytes_stream poll), then arm EOF and cancellation together. On
-        // the current_thread runtime the spawned task is not polled until the
-        // final await, so both the EOF (None) and the cancellation are ready at
-        // the next select poll; biased cancellation priority must make the
-        // abort win — EOF cannot become success.
-        const SSE: &[u8] =
-            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\ndata: hello\n\n";
-        let (url, responded, close_tx) = spawn_eof_server(SSE);
+        // Yield one complete event, then park at a controlled EOF. Once the
+        // second body poll is known to be pending, arm EOF and cancellation
+        // without yielding. Both select branches are ready on the next poll,
+        // so biased cancellation priority must win deterministically.
         let token = CancellationToken::new();
-        let mut options = StreamOptions::default();
+        let mut options = test_options();
         options.abort_signal = Some(token.clone());
-        let http = client(&options).expect("client");
-        let response_task = tokio::spawn(async move { http.get(&url).send().await });
-        responded.await.expect("SSE event delivered");
-        let response = response_task
-            .await
-            .expect("response task joins")
-            .expect("headers resolve the response");
+        let (eof_waiting_tx, eof_waiting_rx) = oneshot::channel();
+        let (release_eof_tx, release_eof_rx) = oneshot::channel();
+        let body = futures_util::stream::unfold(
+            (
+                Some(b"data: hello\n\n".to_vec()),
+                Some(eof_waiting_tx),
+                release_eof_rx,
+            ),
+            |(chunk, waiting, release)| async move {
+                if let Some(chunk) = chunk {
+                    return Some((
+                        Ok::<Vec<u8>, anyhow::Error>(chunk),
+                        (None, waiting, release),
+                    ));
+                }
+                if let Some(waiting) = waiting {
+                    let _ = waiting.send(());
+                }
+                let _ = release.await;
+                None
+            },
+        );
+        let response = HttpResponse::new(StatusCode::OK, HeaderMap::new(), Box::pin(body));
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         let task = tokio::spawn(async move {
             consume_sse(response, &options, |_, _| {
@@ -984,18 +1182,22 @@ mod tests {
             })
             .await
         });
-        // The handler firing proves consume_sse is past the first chunk and
-        // parked on the next bytes_stream poll (server still holds).
-        event_rx.recv().await.expect("event dispatched");
+
+        tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("SSE event must be dispatched promptly")
+            .expect("event dispatched");
+        tokio::time::timeout(Duration::from_secs(2), eof_waiting_rx)
+            .await
+            .expect("SSE EOF must be polled promptly")
+            .expect("SSE EOF poll started");
         assert!(
             !task.is_finished(),
-            "SSE task should be parked awaiting the next chunk, not finished"
+            "SSE task should be parked awaiting EOF, not finished"
         );
-        // Arm EOF and cancellation without yielding in between, so both are
-        // ready when the spawned task is next polled.
-        let _ = close_tx.send(());
+        let _ = release_eof_tx.send(());
         token.cancel();
-        let result = tokio::time::timeout(Duration::from_secs(10), task)
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
             .await
             .expect("SSE EOF race must resolve promptly");
         assert_eq!(
@@ -1009,31 +1211,32 @@ mod tests {
 
     #[tokio::test]
     async fn error_body_read_is_interrupted_by_cancellation() {
-        // A non-retryable error response whose body never arrives: error_body's
-        // text() read must abort promptly on cancellation, not hang on the
-        // stalled body.
-        const BAD: &[u8] = b"HTTP/1.1 400 Bad Request\r\ncontent-length: 100\r\n\r\n";
-        let (url, _request_seen, responded) = spawn_stalled_server(Some(BAD));
+        // The injected transport owns response-body cancellation. Model its
+        // delayed-body contract directly: signal when the body is first polled,
+        // remain pending, then surface the executor's cancellation error.
         let token = CancellationToken::new();
-        let mut options = StreamOptions::default();
+        let mut options = test_options();
         options.abort_signal = Some(token.clone());
-        let http = client(&options).expect("client");
-        let response_task = tokio::spawn(async move { http.get(&url).send().await });
-        responded.await.expect("error headers delivered");
-        let response = response_task
-            .await
-            .expect("response task joins")
-            .expect("headers resolve the response");
+        let body_token = token.clone();
+        let (body_waiting_tx, body_waiting_rx) = oneshot::channel();
+        let body = futures_util::stream::once(async move {
+            let _ = body_waiting_tx.send(());
+            body_token.cancelled_owned().await;
+            Err(anyhow!("Request was aborted"))
+        });
+        let response = HttpResponse::new(StatusCode::BAD_REQUEST, HeaderMap::new(), Box::pin(body));
         let task = tokio::spawn(async move { error_body("Test", response, &options).await });
-        // Let the task enter the stalled body read, then prove it is genuinely
-        // pending (a pre-cancelled token would have returned instantly).
-        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        tokio::time::timeout(Duration::from_secs(2), body_waiting_rx)
+            .await
+            .expect("error body must be polled promptly")
+            .expect("error body poll started");
         assert!(
             !task.is_finished(),
-            "error_body should be waiting on the stalled body, not finished"
+            "error_body should be waiting on the delayed body, not finished"
         );
         token.cancel();
-        let result = tokio::time::timeout(Duration::from_secs(10), task)
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
             .await
             .expect("error_body read must return promptly after cancellation");
         assert_eq!(
@@ -1047,19 +1250,13 @@ mod tests {
 
     #[tokio::test]
     async fn error_body_without_token_keeps_message_format() {
-        // No abort_signal: error_body must read the full body and produce the
-        // same formatted message as before (JSON error/message extraction).
-        const BAD: &[u8] =
-            b"HTTP/1.1 400 Bad Request\r\ncontent-length: 28\r\n\r\n{\"error\":{\"message\":\"boom\"}}";
-        let (url, _request_seen, responded) = spawn_stalled_server(Some(BAD));
-        let options = StreamOptions::default();
-        let http = client(&options).expect("client");
-        let response_task = tokio::spawn(async move { http.get(&url).send().await });
-        responded.await.expect("error headers delivered");
-        let response = response_task
-            .await
-            .expect("response task joins")
-            .expect("headers resolve the response");
+        // No abort_signal: error_body must read the full current response body
+        // and produce the same structured message as before.
+        let options = test_options();
+        let body = futures_util::stream::iter([Ok::<Vec<u8>, anyhow::Error>(
+            br#"{"error":{"message":"boom"}}"#.to_vec(),
+        )]);
+        let response = HttpResponse::new(StatusCode::BAD_REQUEST, HeaderMap::new(), Box::pin(body));
         let message = error_body("Acme", response, &options)
             .await
             .expect("no-token reads the body");
@@ -1331,10 +1528,12 @@ mod tests {
         const TOO_MANY: &[u8] =
             b"HTTP/1.1 429 Too Many Requests\r\nretry-after-ms: 1\r\ncontent-length: 0\r\n\r\n";
         let (url, _request_seen, responded) = spawn_stalled_server(Some(TOO_MANY));
-        let mut options = StreamOptions::default();
+        let mut options = test_options();
         options.max_retries = 0;
-        let http = client(&options).expect("client");
-        let task = tokio::spawn(async move { send_with_retry(&options, || http.get(&url)).await });
+        let task =
+            tokio::spawn(
+                async move { send_with_retry(&options, || test_get(&url, &options)).await },
+            );
         responded.await.expect("retryable response delivered");
         let response = task
             .await
@@ -1354,13 +1553,12 @@ mod tests {
             l.local_addr().expect("addr").port()
         };
         let url = format!("http://127.0.0.1:{closed_port}");
-        let mut options = StreamOptions::default();
+        let mut options = test_options();
         options.max_retries = 1;
-        let http = client(&options).expect("client");
         let mut builds = 0usize;
         let result = send_with_retry(&options, || {
             builds += 1;
-            http.get(&url)
+            test_get(&url, &options)
         })
         .await;
         assert!(result.is_err(), "network errors must surface as an error");
@@ -1379,16 +1577,102 @@ mod tests {
         // response. The body is never reached, so a long SSE stream is not what
         // trips this.
         let (url, _request_seen, _responded) = spawn_stalled_server(None);
-        let mut options = StreamOptions::default();
+        let mut options = test_options();
         options.max_retries = 0;
         options.timeout_ms = Some(200);
-        let http = client(&options).expect("client");
-        let err = send_with_retry(&options, || http.get(&url))
+        let err = send_with_retry(&options, || test_get(&url, &options))
             .await
             .expect_err("header timeout must fire");
         assert!(
             err.to_string().contains("timed out"),
             "expected timeout error, got {err}"
         );
+    }
+
+    // ---- client(): default fallback + injected precedence ----
+
+    #[tokio::test]
+    async fn client_falls_back_to_default_and_streams_live() {
+        // No injected executor: client() must realize the production default
+        // (no MissingHttpExecutor) and stream a live response end to end.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = [0u8; 1024];
+            let _ = stream.read(&mut buffer).expect("read request");
+            let body = "data: {\"id\":\"live-1\"}\n\ndata: [DONE]\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+        let options = StreamOptions::default(); // no executor injected
+        let executor = client(&options).expect("default executor realized");
+        let request = test_get(&format!("http://{address}/v1"), &options).expect("request");
+        let response = executor
+            .execute(request)
+            .await
+            .expect("executed through the default transport");
+        let body = crate::collect_response_body(response).await.expect("body");
+        let text = String::from_utf8(body).expect("utf8 body");
+        assert!(
+            text.contains("live-1") && text.contains("[DONE]"),
+            "live stream must arrive intact: {text}"
+        );
+        server.join().expect("server thread");
+    }
+
+    #[tokio::test]
+    async fn injected_executor_wins_over_default() {
+        // A supplied executor must take precedence over the process-wide
+        // default: the request is routed through the injected transport (with
+        // its observable behavior), never the default client.
+        struct SentinelExecutor(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl crate::HttpExecutor for SentinelExecutor {
+            fn execute<'a>(
+                &'a self,
+                _request: crate::HttpRequest,
+            ) -> futures_util::future::BoxFuture<'a, Result<crate::HttpResponse>> {
+                use futures_util::FutureExt as _;
+                let fired = self.0.clone();
+                async move {
+                    fired.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let body = futures_util::stream::iter([Ok::<Vec<u8>, anyhow::Error>(
+                        b"injected".to_vec(),
+                    )]);
+                    Ok(crate::HttpResponse::new(
+                        http::StatusCode::CREATED,
+                        http::HeaderMap::new(),
+                        Box::pin(body),
+                    ))
+                }
+                .boxed()
+            }
+        }
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let injected: crate::SharedHttpExecutor =
+            std::sync::Arc::new(SentinelExecutor(fired.clone()));
+        let options = StreamOptions {
+            http_executor: Some(injected),
+            ..StreamOptions::default()
+        };
+        let executor = client(&options).expect("injected executor");
+        let request = test_get("http://127.0.0.1:1/v1", &options).expect("request");
+        let response = executor
+            .execute(request)
+            .await
+            .expect("executed through the injected transport");
+        assert_eq!(response.status(), http::StatusCode::CREATED);
+        assert!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            "injected executor must handle the request instead of the default"
+        );
+        let body = crate::collect_response_body(response).await.expect("body");
+        assert_eq!(String::from_utf8(body).expect("utf8 body"), "injected");
     }
 }

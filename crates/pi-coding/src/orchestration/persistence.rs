@@ -4,36 +4,44 @@
 //! request / model / session path), retained job snapshots, and mailbox messages
 //! in an atomic versioned sidecar beneath the child session root.
 //!
-//! Recovery is fail-closed and truthful: a process crash interrupts a turn, so
-//! recovery parks interrupted agents and cancels interrupted jobs rather than
-//! claiming exactly-once execution. Corruption, wrong-parent, path traversal,
-//! and oversize inputs fail closed without mutating the in-memory registry or
-//! jobs table, and the sidecar is never deleted on failure.
+//! Recovery is fail-closed and truthful: unsettled Running/Queued jobs keep
+//! their identities for revival from the durable child JSONL. Corruption,
+//! wrong-parent, path traversal, and oversize inputs fail closed without
+//! mutating the in-memory registry or jobs table, and the sidecar is never
+//! deleted on failure.
 
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::runtime::{AgentSnapshot, AgentStatus, ChildSessionRequest, MailboxMessage};
+use crate::fs::{
+    CapabilityAccess, CapabilityRootLease, CapabilityRootPurpose, EntryKind, FileMode, FsError,
+    Replacement, RootCreation,
+};
+
+use super::runtime::{
+    AgentSnapshot, AgentStatus, ChildSessionRequest, DELIVERED_MESSAGE_LOG_CAP,
+    MAX_MESSAGE_BODY_BYTES, MailboxMessage,
+};
 use super::{JobSnapshot, JobStatus, TaskResult};
+use crate::sandbox::DurablePolicyState;
 
 /// Sidecar schema version. Bumped on incompatible changes; recovery rejects
 /// unknown future versions rather than guessing.
-pub const DURABLE_STATE_VERSION: u32 = 1;
+pub const DURABLE_STATE_VERSION: u32 = 3;
+const LEGACY_DURABLE_STATE_VERSION: u32 = 2;
 const SIDECAR_FILENAME: &str = "orchestration-state.json";
 const MAX_SIDECAR_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_AGENTS: usize = 1024;
 const MAX_JOBS: usize = 4096;
 const MAX_MAILBOX_PER_AGENT: usize = 1024;
 const MAX_AGENT_ID_LEN: usize = 80;
-const MAX_BODY_LEN: usize = 64 * 1024;
 
 /// Atomic versioned sidecar storing the full durable orchestration state.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -42,12 +50,17 @@ pub struct DurableState {
     pub version: u32,
     pub parent_session_id: String,
     pub parent_session_path: String,
+    pub group_id: String,
+    pub durable_policy: DurablePolicyState,
     pub agents: Vec<PersistedAgent>,
     /// Mailbox for the configured orchestration root agent. The root is not a
     /// child and therefore is not represented in `agents`, but child replies
     /// committed before the parent session can consume them must survive restart.
     #[serde(default)]
     pub main_mailbox: Vec<MailboxMessage>,
+    /// Bounded, newest-last history of accepted deliveries, independent of mailbox consumption.
+    #[serde(default)]
+    pub delivered_messages: Vec<MailboxMessage>,
     #[serde(default)]
     pub jobs: Vec<JobSnapshot>,
 }
@@ -102,6 +115,10 @@ pub struct PersistedDefinition {
     pub personality: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub soft_budget: Option<super::JobSoftBudget>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub knowledge_roots: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub user_proxy: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,9 +155,8 @@ pub struct PersistedRequest {
     pub schema_mode: Option<String>,
 }
 
-/// Durable runtime binding: holds the canonical parent session path, canonical
-/// child root, and one ordering lock spanning state capture plus atomic write.
-/// Stores only paths, never the live `Session`, to avoid an `Arc` cycle.
+/// Durable runtime binding: retains the parent session directory and the exact
+/// per-session child directory leases for the full runtime lifetime.
 #[derive(Clone)]
 pub struct DurableRuntime {
     inner: Arc<DurableRuntimeInner>,
@@ -150,111 +166,50 @@ struct DurableRuntimeInner {
     parent_session_id: String,
     main_agent_id: String,
     parent_session_path: PathBuf,
-    child_root: PathBuf,
-    sidecar_path: PathBuf,
+    parent_directory: CapabilityRootLease,
+    parent_relative: PathBuf,
+    child_root: CapabilityRootLease,
     ordering_lock: Mutex<()>,
 }
 
 impl DurableRuntime {
-    /// Bind to a canonical parent JSONL and its exact durable child root,
-    /// `<resolved-session-root>/children/<parent-id>/`.
-    pub fn new(
-        parent_session_id: String,
-        parent_session_path: PathBuf,
-        child_root: PathBuf,
-    ) -> Result<Self> {
-        Self::new_with_main_agent_id(
-            parent_session_id,
-            parent_session_path,
-            child_root,
-            "Main".to_owned(),
-        )
-    }
-
     pub fn new_with_main_agent_id(
         parent_session_id: String,
         parent_session_path: PathBuf,
-        child_root: PathBuf,
+        parent_directory: CapabilityRootLease,
+        parent_relative: PathBuf,
         main_agent_id: String,
     ) -> Result<Self> {
         crate::session_store::validate_session_id(&parent_session_id)
             .context("invalid parent session id")?;
         validate_agent_id(&main_agent_id).context("invalid orchestration main agent id")?;
-        let requested_parent = absolute_lexical(&parent_session_path)?;
-        let requested_parent_dir = requested_parent
-            .parent()
-            .ok_or_else(|| anyhow!("parent session path has no parent"))?;
-        // The parent session directory may not exist yet on first launch: the
-        // recorder defers materializing its file, and startup TTL pruning can
-        // remove the empty per-cwd directory before this binding runs. Create
-        // it (with ancestors) so canonicalizing the binding target never fails
-        // merely because the directory has not been materialized. Other
-        // failures (permissions, a non-directory path) still fail closed.
-        fs::create_dir_all(requested_parent_dir).with_context(|| {
-            format!(
-                "creating parent session directory {}",
-                requested_parent_dir.display()
+        if parent_directory.purpose() != CapabilityRootPurpose::SessionStore
+            || parent_directory.access() != CapabilityAccess::PrivateReadWrite
+        {
+            bail!("durable orchestration requires a private session-store capability");
+        }
+        validate_direct_file_relative(&parent_relative)?;
+        let expected_parent_path = parent_directory.display_root().join(&parent_relative);
+        if absolute_lexical(&parent_session_path)? != expected_parent_path {
+            bail!("parent session display path does not match retained authority");
+        }
+        validate_parent_file_authority(&parent_directory, &parent_relative)?;
+        let child_relative = Path::new("children").join(&parent_session_id);
+        let child_root = parent_directory
+            .lease_directory(
+                &child_relative,
+                CapabilityAccess::PrivateReadWrite,
+                RootCreation::CreateDirectory,
             )
-        })?;
-        let session_root = fs::canonicalize(requested_parent_dir).with_context(|| {
-            format!(
-                "canonicalizing parent session directory {}",
-                requested_parent_dir.display()
-            )
-        })?;
-        let session_root_metadata = fs::metadata(&session_root).with_context(|| {
-            format!("reading parent session directory {}", session_root.display())
-        })?;
-        if !session_root_metadata.is_dir() {
-            bail!("parent session directory is not a directory: {}", session_root.display());
-        }
-        let file_name = requested_parent
-            .file_name()
-            .ok_or_else(|| anyhow!("parent session path has no file name"))?;
-        let parent_session_path = session_root.join(file_name);
-        validate_parent_path_identity(&parent_session_path)?;
-        let children_root = session_root.join("children");
-        if children_root.exists() {
-            let metadata = fs::symlink_metadata(&children_root).with_context(|| {
-                format!("reading durable children root {}", children_root.display())
-            })?;
-            if !metadata.file_type().is_dir() {
-                bail!("durable children root is not a non-symlink directory");
-            }
-        }
-        let expected_root = children_root.join(&parent_session_id);
-        let requested_root = absolute_lexical(&child_root)?;
-        if requested_root != expected_root {
-            bail!(
-                "durable child root must be {} (got {})",
-                expected_root.display(),
-                requested_root.display()
-            );
-        }
-        ensure_existing_ancestor_contained(&session_root, &requested_root)?;
-        fs::create_dir_all(&requested_root).with_context(|| {
-            format!("creating durable child root {}", requested_root.display())
-        })?;
-        let child_root = fs::canonicalize(&requested_root).with_context(|| {
-            format!("canonicalizing durable child root {}", requested_root.display())
-        })?;
-        if child_root != requested_root {
-            bail!("durable child root contains a symlink or canonical alias");
-        }
-        let metadata = fs::metadata(&child_root).with_context(|| {
-            format!("reading durable child root {}", child_root.display())
-        })?;
-        if !metadata.is_dir() {
-            bail!("durable child root is not a directory: {}", child_root.display());
-        }
-        let sidecar_path = child_root.join(SIDECAR_FILENAME);
+            .context("opening durable child-session capability")?;
         Ok(Self {
             inner: Arc::new(DurableRuntimeInner {
                 parent_session_id,
                 main_agent_id,
-                parent_session_path,
+                parent_session_path: expected_parent_path,
+                parent_directory,
+                parent_relative,
                 child_root,
-                sidecar_path,
                 ordering_lock: Mutex::new(()),
             }),
         })
@@ -272,17 +227,14 @@ impl DurableRuntime {
 
     #[must_use]
     pub fn child_root(&self) -> &Path {
-        &self.inner.child_root
+        self.inner.child_root.display_root()
     }
 
     #[must_use]
-    pub fn sidecar_path(&self) -> &Path {
-        &self.inner.sidecar_path
+    pub fn sidecar_path(&self) -> PathBuf {
+        self.inner.child_root.display_root().join(SIDECAR_FILENAME)
     }
 
-    /// Capture and atomically write one state while holding the same ordering
-    /// primitive. This prevents an older pre-lock snapshot from overwriting a
-    /// newer state written by a concurrent mutation.
     pub fn persist_with<F>(&self, capture: F) -> Result<()>
     where
         F: FnOnce() -> Result<DurableState>,
@@ -295,13 +247,7 @@ impl DurableRuntime {
         F: FnOnce() -> Result<(T, DurableState)>,
     {
         let _guard = self.inner.ordering_lock.lock();
-        validate_parent_path_identity(&self.inner.parent_session_path)?;
-        let current_root = fs::canonicalize(&self.inner.child_root).with_context(|| {
-            format!("canonicalizing durable child root {}", self.inner.child_root.display())
-        })?;
-        if current_root != self.inner.child_root {
-            bail!("durable child root changed or escaped after binding");
-        }
+        validate_parent_file_authority(&self.inner.parent_directory, &self.inner.parent_relative)?;
         let (result, state) = capture()?;
         validate_state(
             &state,
@@ -310,7 +256,7 @@ impl DurableRuntime {
             &self.inner.child_root,
             &self.inner.main_agent_id,
         )?;
-        write_state_atomic(&self.inner.sidecar_path, &state)?;
+        write_state_atomic(&self.inner.child_root, &state)?;
         Ok(result)
     }
 
@@ -318,24 +264,21 @@ impl DurableRuntime {
         self.persist_with(|| Ok(state.clone()))
     }
 
-    /// Load a sidecar when present. Missing state is represented explicitly;
-    /// corruption, containment failures, and all other I/O errors fail closed.
     pub fn load_optional(&self) -> Result<Option<DurableState>> {
         let _guard = self.inner.ordering_lock.lock();
-        validate_parent_path_identity(&self.inner.parent_session_path)?;
-        if !self.inner.sidecar_path.try_exists().with_context(|| {
-            format!("checking durable state sidecar {}", self.inner.sidecar_path.display())
-        })? {
-            return Ok(None);
+        validate_parent_file_authority(&self.inner.parent_directory, &self.inner.parent_relative)?;
+        match self.inner.child_root.metadata(Path::new(SIDECAR_FILENAME)) {
+            Ok(metadata) if metadata.identity.kind() == EntryKind::RegularFile => {}
+            Ok(_) => bail!("durable state sidecar is not a regular file"),
+            Err(error) if is_missing(&error) => return Ok(None),
+            Err(error) => return Err(error).context("checking durable state sidecar"),
         }
         load_and_validate_state(
-            &self.inner.sidecar_path,
+            &self.inner.child_root,
             &self.inner.parent_session_id,
             &self.inner.parent_session_path,
-            &self.inner.child_root,
             &self.inner.main_agent_id,
         )
-        .map(Some)
     }
 
     pub fn load(&self) -> Result<DurableState> {
@@ -343,12 +286,32 @@ impl DurableRuntime {
             .ok_or_else(|| anyhow!("durable state sidecar not found"))
     }
 
-    pub fn canonicalize_child_session_path(&self, path: &Path) -> Result<PathBuf> {
-        canonicalize_child_path(&self.inner.child_root, path)
+    pub(crate) fn parent_file(&self) -> Result<crate::fs::CapabilityFile> {
+        validate_direct_file_relative(&self.inner.parent_relative)?;
+        self.inner
+            .parent_directory
+            .open_file(&self.inner.parent_relative)
+            .context("opening parent session through retained authority")
     }
 
-    pub fn canonicalize_artifact_path(&self, path: &Path) -> Result<PathBuf> {
-        canonicalize_child_path(&self.inner.child_root, path)
+    pub(crate) fn child_file(&self, path: &Path) -> Result<crate::fs::CapabilityFile> {
+        let relative = child_relative(&self.inner.child_root, path)?;
+        self.inner
+            .child_root
+            .open_file(&relative)
+            .context("opening child session through retained authority")
+    }
+
+    pub(crate) fn child_file_authority(
+        &self,
+        path: &Path,
+    ) -> Result<(CapabilityRootLease, PathBuf)> {
+        let file = self.child_file(path)?;
+        Ok(file.authority())
+    }
+
+    pub(crate) fn child_root_authority(&self) -> CapabilityRootLease {
+        self.inner.child_root.clone()
     }
 }
 
@@ -371,86 +334,86 @@ fn absolute_lexical(path: &Path) -> Result<PathBuf> {
     Ok(normalized)
 }
 
-fn validate_parent_path_identity(path: &Path) -> Result<()> {
-    let parent = path
+fn validate_direct_file_relative(relative: &Path) -> Result<()> {
+    if relative
         .parent()
-        .ok_or_else(|| anyhow!("parent session path has no parent"))?;
-    let canonical_parent = fs::canonicalize(parent)
-        .with_context(|| format!("canonicalizing parent session directory {}", parent.display()))?;
-    if canonical_parent != parent {
-        bail!("parent session path contains a symlink or canonical alias");
-    }
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => {
-            let canonical = fs::canonicalize(path)
-                .with_context(|| format!("canonicalizing parent session path {}", path.display()))?;
-            if canonical != path {
-                bail!("parent session path contains a symlink or canonical alias");
-            }
-            Ok(())
-        }
-        Ok(_) => bail!("parent session path is not a regular file: {}", path.display()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error)
-            .with_context(|| format!("reading parent session path {}", path.display())),
-    }
-}
-
-fn ensure_existing_ancestor_contained(root: &Path, target: &Path) -> Result<()> {
-    if !target.starts_with(root) {
-        bail!("durable child root escapes resolved session root");
-    }
-    let mut current = root.to_path_buf();
-    for component in target
-        .strip_prefix(root)
-        .map_err(|_| anyhow!("durable child root escapes resolved session root"))?
-        .components()
+        .is_some_and(|parent| !parent.as_os_str().is_empty())
+        || relative.file_name().is_none()
     {
-        current.push(component.as_os_str());
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                bail!("durable child root contains a symlink ancestor: {}", current.display());
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("reading durable child ancestor {}", current.display()));
-            }
-        }
+        bail!("durable session file must be directly under its retained directory");
     }
     Ok(())
 }
 
-/// Canonicalize `path` and prove it is a non-symlink regular file directly
-/// inside the already-canonical durable child root.
-fn canonicalize_child_path(root: &Path, path: &Path) -> Result<PathBuf> {
-    let resolved = if path.is_absolute() {
-        absolute_lexical(path)?
+fn validate_parent_file_authority(lease: &CapabilityRootLease, relative: &Path) -> Result<()> {
+    validate_direct_file_relative(relative)?;
+    match lease.metadata(relative) {
+        Ok(metadata) if metadata.identity.kind() == EntryKind::RegularFile => Ok(()),
+        Ok(_) => bail!("parent session path is not a regular file"),
+        Err(error) if is_missing(&error) => Ok(()),
+        Err(error) => Err(error).context("reading parent session through retained authority"),
+    }
+}
+
+fn child_relative(root: &CapabilityRootLease, path: &Path) -> Result<PathBuf> {
+    let relative = if path.is_absolute() {
+        path.strip_prefix(root.display_root())
+            .map_err(|_| anyhow!("child path escapes durable child root"))?
+            .to_path_buf()
     } else {
-        absolute_lexical(&root.join(path))?
+        path.to_path_buf()
     };
-    let metadata = fs::symlink_metadata(&resolved)
-        .with_context(|| format!("reading child path {}", resolved.display()))?;
-    if !metadata.file_type().is_file() {
-        bail!("child path is not a non-symlink regular file: {}", resolved.display());
+    validate_direct_file_relative(&relative)?;
+    Ok(relative)
+}
+
+fn validate_child_file(root: &CapabilityRootLease, path: &Path) -> Result<PathBuf> {
+    let relative = child_relative(root, path)?;
+    let metadata = root
+        .metadata(&relative)
+        .context("reading child path through retained authority")?;
+    if metadata.identity.kind() != EntryKind::RegularFile {
+        bail!("child path is not a regular file");
     }
-    let canonical = fs::canonicalize(&resolved)
-        .with_context(|| format!("canonicalizing child path {}", resolved.display()))?;
-    if !canonical.starts_with(root) {
-        bail!("child path escapes durable child root");
+    Ok(root.display_root().join(relative))
+}
+
+fn is_missing(error: &FsError) -> bool {
+    matches!(
+        error,
+        FsError::System {
+            kind: std::io::ErrorKind::NotFound,
+            ..
+        }
+    )
+}
+
+fn validate_group_id(group_id: &str) -> Result<()> {
+    let parsed =
+        Uuid::parse_str(group_id).map_err(|_| anyhow!("durable state group id is invalid"))?;
+    if parsed.is_nil() {
+        bail!("durable state group id is invalid");
     }
-    if canonical.parent() != Some(root) {
-        bail!("child path must be directly inside the durable child root");
-    }
-    Ok(canonical)
+    Ok(())
+}
+
+fn legacy_group_id(parent_session_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"pi-orchestration-group\0");
+    digest.update(parent_session_id.as_bytes());
+    let hash = digest.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&hash[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes).to_string()
 }
 
 fn validate_state(
     state: &DurableState,
     expected_parent_id: &str,
     expected_parent_path: &Path,
-    child_root: &Path,
+    child_root: &CapabilityRootLease,
     main_agent_id: &str,
 ) -> Result<()> {
     if state.version != DURABLE_STATE_VERSION {
@@ -460,6 +423,7 @@ fn validate_state(
             DURABLE_STATE_VERSION
         );
     }
+    validate_group_id(&state.group_id)?;
     if state.parent_session_id != expected_parent_id {
         bail!("durable state parent session id mismatch");
     }
@@ -470,7 +434,6 @@ fn validate_state(
     if state_parent != expected_parent_path {
         bail!("durable state parent session path mismatch");
     }
-    validate_parent_path_identity(expected_parent_path)?;
     if state.agents.len() > MAX_AGENTS {
         bail!("durable state agents exceed maximum of {MAX_AGENTS}");
     }
@@ -483,6 +446,9 @@ fn validate_state(
             main_agent_id
         );
     }
+    if state.delivered_messages.len() > DELIVERED_MESSAGE_LOG_CAP {
+        bail!("durable delivered-message log exceeds maximum of {DELIVERED_MESSAGE_LOG_CAP}");
+    }
     let mut seen_ids = BTreeSet::new();
     let mut agent_relationships = std::collections::BTreeMap::new();
     let mut seen_message_ids = BTreeSet::new();
@@ -494,35 +460,49 @@ fn validate_state(
             bail!("durable main mailbox message recipient does not match main agent");
         }
         if !seen_message_ids.insert(message.id.as_str()) {
-            bail!("durable mailbox message id {:?} appears more than once", message.id);
+            bail!(
+                "durable mailbox message id {:?} appears more than once",
+                message.id
+            );
         }
-        if message.body.len() > MAX_BODY_LEN {
+        if message.body.len() > MAX_MESSAGE_BODY_BYTES {
             bail!("durable main mailbox message body exceeds maximum length");
         }
     }
     for agent in &state.agents {
         validate_agent_id(&agent.snapshot.id)?;
         if !seen_ids.insert(agent.snapshot.id.as_str()) {
-            bail!("durable state agent id {:?} appears more than once", agent.snapshot.id);
+            bail!(
+                "durable state agent id {:?} appears more than once",
+                agent.snapshot.id
+            );
         }
         if agent.snapshot.id == main_agent_id {
             bail!("durable state cannot contain the orchestration main agent");
         }
         if agent.request.child_id != agent.snapshot.id {
-            bail!("durable state request child id does not match agent {:?}", agent.snapshot.id);
+            bail!(
+                "durable state request child id does not match agent {:?}",
+                agent.snapshot.id
+            );
         }
         if agent.definition.name != agent.snapshot.agent {
-            bail!("durable state definition does not match agent {:?}", agent.snapshot.id);
+            bail!(
+                "durable state definition does not match agent {:?}",
+                agent.snapshot.id
+            );
         }
-        let parent_id = agent
-            .snapshot
-            .parent_id
-            .as_deref()
-            .ok_or_else(|| anyhow!("durable child agent {:?} has no parent", agent.snapshot.id))?;
+        let parent_id =
+            agent.snapshot.parent_id.as_deref().ok_or_else(|| {
+                anyhow!("durable child agent {:?} has no parent", agent.snapshot.id)
+            })?;
         validate_agent_id(parent_id)
             .with_context(|| format!("invalid parent agent id {parent_id:?}"))?;
         if agent.request.parent_id != parent_id {
-            bail!("durable state request parent does not match agent {:?}", agent.snapshot.id);
+            bail!(
+                "durable state request parent does not match agent {:?}",
+                agent.snapshot.id
+            );
         }
         agent_relationships.insert(
             agent.snapshot.id.as_str(),
@@ -539,18 +519,39 @@ fn validate_state(
             validate_agent_id(&message.from)?;
             validate_agent_id(&message.to)?;
             if message.to != agent.snapshot.id {
-                bail!("durable mailbox message recipient does not match agent {:?}", agent.snapshot.id);
+                bail!(
+                    "durable mailbox message recipient does not match agent {:?}",
+                    agent.snapshot.id
+                );
             }
             if !seen_message_ids.insert(message.id.as_str()) {
-                bail!("durable mailbox message id {:?} appears more than once", message.id);
+                bail!(
+                    "durable mailbox message id {:?} appears more than once",
+                    message.id
+                );
             }
-            if message.body.len() > MAX_BODY_LEN {
+            if message.body.len() > MAX_MESSAGE_BODY_BYTES {
                 bail!("durable state mailbox message body exceeds maximum length");
             }
         }
         if let Some(session_path) = agent.session_path.as_deref() {
-            canonicalize_child_path(child_root, Path::new(session_path))
+            validate_child_file(child_root, Path::new(session_path))
                 .with_context(|| format!("agent {:?} session path", agent.snapshot.id))?;
+        }
+    }
+    let mut seen_delivered_ids = BTreeSet::new();
+    for message in &state.delivered_messages {
+        validate_agent_id(&message.id)?;
+        validate_agent_id(&message.from)?;
+        validate_agent_id(&message.to)?;
+        if !seen_delivered_ids.insert(message.id.as_str()) {
+            bail!(
+                "durable delivered-message id {:?} appears more than once",
+                message.id
+            );
+        }
+        if message.body.len() > MAX_MESSAGE_BODY_BYTES {
+            bail!("durable delivered-message body exceeds maximum length");
         }
     }
     for (agent_id, (_, parent_id)) in &agent_relationships {
@@ -569,40 +570,182 @@ fn validate_state(
             bail!("durable state job id {:?} appears more than once", job.id);
         }
         if seen_ids.contains(job.id.as_str()) {
-            bail!("durable state job id {:?} conflicts with an agent id", job.id);
+            bail!(
+                "durable state job id {:?} conflicts with an agent id",
+                job.id
+            );
         }
         let Some((agent_name, parent_id)) = agent_relationships.get(job.agent_id.as_str()) else {
-            bail!("durable state job {:?} references unknown agent {:?}", job.id, job.agent_id);
+            bail!(
+                "durable state job {:?} references unknown agent {:?}",
+                job.id,
+                job.agent_id
+            );
         };
         if job.agent != *agent_name || job.parent_id != *parent_id {
-            bail!("durable state job {:?} conflicts with its agent relationship", job.id);
+            bail!(
+                "durable state job {:?} conflicts with its agent relationship",
+                job.id
+            );
         }
         if let Some(result) = &job.result
             && (result.id != job.agent_id || result.agent != job.agent)
         {
-            bail!("durable state job {:?} result conflicts with its agent", job.id);
+            bail!(
+                "durable state job {:?} result conflicts with its agent",
+                job.id
+            );
         }
     }
     Ok(())
 }
-fn load_and_validate_state(
-    sidecar_path: &Path,
+/// Minimal envelope read before strict deserialization so the version can be
+/// probed from sidecars whose remaining shape is unknown (e.g. future versions).
+/// Unknown fields are intentionally ignored here: the probe must tolerate fields
+/// the envelope does not declare.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StateEnvelope {
+    version: u32,
+}
+
+/// Exact historical v1 sidecar schema. It lacks `durablePolicy`, so it can be
+/// ownership-validated but never restored as authority.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LegacyDurableStateV1 {
+    version: u32,
+    parent_session_id: String,
+    parent_session_path: String,
+    agents: Vec<PersistedAgent>,
+    #[serde(default)]
+    main_mailbox: Vec<MailboxMessage>,
+    #[serde(default)]
+    delivered_messages: Vec<MailboxMessage>,
+    #[serde(default)]
+    jobs: Vec<JobSnapshot>,
+}
+
+/// Exact historical v2 sidecar schema. The execution state is authoritative,
+/// but `groupId` did not exist; migration derives it once from parent identity.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LegacyDurableStateV2 {
+    version: u32,
+    parent_session_id: String,
+    parent_session_path: String,
+    durable_policy: DurablePolicyState,
+    agents: Vec<PersistedAgent>,
+    #[serde(default)]
+    main_mailbox: Vec<MailboxMessage>,
+    #[serde(default)]
+    delivered_messages: Vec<MailboxMessage>,
+    #[serde(default)]
+    jobs: Vec<JobSnapshot>,
+}
+
+impl LegacyDurableStateV2 {
+    fn migrate(self) -> DurableState {
+        DurableState {
+            version: DURABLE_STATE_VERSION,
+            group_id: legacy_group_id(&self.parent_session_id),
+            parent_session_id: self.parent_session_id,
+            parent_session_path: self.parent_session_path,
+            durable_policy: self.durable_policy,
+            agents: self.agents,
+            main_mailbox: self.main_mailbox,
+            delivered_messages: self.delivered_messages,
+            jobs: self.jobs,
+        }
+    }
+}
+
+/// Validate a legacy v1 sidecar's ownership and structural bounds before it is
+/// discarded. The v1 payload is never reconstructed (so its agents/jobs/mailbox
+/// are non-authoritative), but a sidecar belonging to a different session must
+/// fail closed rather than being treated as absent and overwritten, and the
+/// same structural bounds as [`validate_state`] apply to anything we accept as
+/// "legacy and discardable".
+fn validate_legacy_v1(
+    state: &LegacyDurableStateV1,
     expected_parent_id: &str,
     expected_parent_path: &Path,
-    child_root: &Path,
     main_agent_id: &str,
-) -> Result<DurableState> {
-    let sidecar_path = canonicalize_child_path(child_root, sidecar_path)
-        .context("validating durable state sidecar containment")?;
-    let metadata = fs::metadata(&sidecar_path)
-        .with_context(|| format!("reading durable state sidecar {}", sidecar_path.display()))?;
-    if metadata.len() > MAX_SIDECAR_BYTES {
-        bail!("durable state sidecar exceeds maximum size of {} bytes", MAX_SIDECAR_BYTES);
+) -> Result<()> {
+    if state.version != 1 {
+        bail!(
+            "durable state version {} is unsupported (expected {})",
+            state.version,
+            DURABLE_STATE_VERSION
+        );
     }
-    let bytes = fs::read(&sidecar_path)
-        .with_context(|| format!("reading durable state sidecar {}", sidecar_path.display()))?;
-    let state: DurableState = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parsing durable state sidecar {}", sidecar_path.display()))?;
+    if state.parent_session_id != expected_parent_id {
+        bail!("durable state parent session id mismatch");
+    }
+    if state.parent_session_path.trim().is_empty() {
+        bail!("durable state parent session path is empty");
+    }
+    let state_parent = absolute_lexical(Path::new(&state.parent_session_path))?;
+    if state_parent != expected_parent_path {
+        bail!("durable state parent session path mismatch");
+    }
+    if state.agents.len() > MAX_AGENTS {
+        bail!("durable state agents exceed maximum of {MAX_AGENTS}");
+    }
+    if state.jobs.len() > MAX_JOBS {
+        bail!("durable state jobs exceed maximum of {MAX_JOBS}");
+    }
+    if state.main_mailbox.len() > MAX_MAILBOX_PER_AGENT {
+        bail!(
+            "durable state mailbox for main agent {:?} exceeds maximum of {MAX_MAILBOX_PER_AGENT}",
+            main_agent_id
+        );
+    }
+    for agent in &state.agents {
+        validate_agent_id(&agent.snapshot.id)?;
+    }
+    Ok(())
+}
+
+fn load_and_validate_state(
+    child_root: &CapabilityRootLease,
+    expected_parent_id: &str,
+    expected_parent_path: &Path,
+    main_agent_id: &str,
+) -> Result<Option<DurableState>> {
+    let bytes = child_root
+        .read_bounded(Path::new(SIDECAR_FILENAME), MAX_SIDECAR_BYTES)
+        .context("reading durable state sidecar")?;
+    // Probe the version before strict deserialization so historical schemas
+    // can be migrated without accepting fields outside their exact shape.
+    let envelope: StateEnvelope =
+        serde_json::from_slice(&bytes).context("parsing durable state sidecar")?;
+    let state = match envelope.version {
+        1 => {
+            let legacy: LegacyDurableStateV1 =
+                serde_json::from_slice(&bytes).context("parsing durable state sidecar")?;
+            validate_legacy_v1(
+                &legacy,
+                expected_parent_id,
+                expected_parent_path,
+                main_agent_id,
+            )?;
+            return Ok(None);
+        }
+        LEGACY_DURABLE_STATE_VERSION => {
+            let legacy: LegacyDurableStateV2 =
+                serde_json::from_slice(&bytes).context("parsing durable state sidecar")?;
+            legacy.migrate()
+        }
+        DURABLE_STATE_VERSION => {
+            serde_json::from_slice(&bytes).context("parsing durable state sidecar")?
+        }
+        unsupported => {
+            bail!(
+                "durable state version {unsupported} is unsupported (expected {DURABLE_STATE_VERSION})"
+            );
+        }
+    };
     validate_state(
         &state,
         expected_parent_id,
@@ -610,61 +753,35 @@ fn load_and_validate_state(
         child_root,
         main_agent_id,
     )?;
-    Ok(state)
+    Ok(Some(state))
 }
 
-fn write_state_atomic(path: &Path, state: &DurableState) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(state).context("serializing durable state")?;
-    let serialized_len = bytes
-        .len()
-        .checked_add(1)
-        .ok_or_else(|| anyhow!("durable state serialized size overflow"))?;
-    if serialized_len as u64 > MAX_SIDECAR_BYTES {
-        bail!("durable state sidecar exceeds maximum size of {} bytes", MAX_SIDECAR_BYTES);
+fn write_state_atomic(root: &CapabilityRootLease, state: &DurableState) -> Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(state).context("serializing durable state")?;
+    bytes.push(b'\n');
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_SIDECAR_BYTES {
+        bail!(
+            "durable state sidecar exceeds maximum size of {} bytes",
+            MAX_SIDECAR_BYTES
+        );
     }
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("durable state sidecar path has no parent"))?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("creating durable state directory {}", parent.display()))?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(SIDECAR_FILENAME);
-    let temporary = parent.join(format!(".{file_name}.{}.tmp", Uuid::now_v7()));
-    let result = (|| -> Result<()> {
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .with_context(|| format!("creating durable state temporary {}", temporary.display()))?;
-        let mut writer = BufWriter::new(file);
-        writer.write_all(&bytes).context("writing durable state")?;
-        writer.write_all(b"\n").context("writing durable state newline")?;
-        writer.flush().context("flushing durable state temporary")?;
-        writer
-            .get_ref()
-            .sync_all()
-            .context("syncing durable state temporary")?;
-        drop(writer);
-        fs::rename(&temporary, path).with_context(|| {
-            format!(
-                "atomically replacing durable state {} from {}",
-                path.display(),
-                temporary.display()
-            )
-        })?;
-        if let Ok(directory) = File::open(parent) {
-            directory
-                .sync_all()
-                .with_context(|| format!("syncing durable state directory {}", parent.display()))?;
+    let relative = PathBuf::from(SIDECAR_FILENAME);
+    let expected = match root.metadata(&relative) {
+        Ok(metadata) if metadata.identity.kind() == EntryKind::RegularFile => {
+            Some(metadata.identity)
         }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+        Ok(_) => bail!("durable state sidecar is not a regular file"),
+        Err(error) if is_missing(&error) => None,
+        Err(error) => return Err(error).context("reading durable state sidecar identity"),
+    };
+    root.replace_file(Replacement {
+        relative,
+        expected,
+        bytes,
+        mode: FileMode::Private,
+    })
+    .context("atomically replacing durable state sidecar")?;
+    Ok(())
 }
 
 fn validate_agent_id(id: &str) -> Result<()> {
@@ -685,53 +802,41 @@ fn validate_agent_id(id: &str) -> Result<()> {
 
 /// Transform a live agent status into its recovery truth.
 ///
-/// Running/Queued/Idle agents recover as `Parked` (the process is gone so they
-/// cannot be active). Aborted stays Aborted. Parked stays Parked.
+/// Running/Queued agents recover as `Queued` — the process is gone so they
+/// cannot be actively running, but they are pending revival from their durable
+/// child JSONL and must NOT be parked or cancelled. Idle agents recover as
+/// `Parked` (they had completed their work). Aborted stays Aborted. Parked
+/// stays Parked.
 pub fn recovery_status(status: AgentStatus) -> AgentStatus {
     match status {
-        AgentStatus::Running | AgentStatus::Queued | AgentStatus::Idle => AgentStatus::Parked,
+        AgentStatus::Running | AgentStatus::Queued => AgentStatus::Queued,
+        AgentStatus::Idle => AgentStatus::Parked,
         AgentStatus::Aborted => AgentStatus::Aborted,
         AgentStatus::Parked => AgentStatus::Parked,
     }
 }
 
 /// Transform a job snapshot for recovery. Settled jobs (Completed/Failed/
-/// Cancelled) are kept as-is. Unsettled jobs (Queued/Running) become Cancelled
-/// with a contextual result and finished timestamp, truthfully recording that
-/// the process interrupted them.
-pub fn recovery_job(job: JobSnapshot, finished_at: u64) -> JobSnapshot {
-    recovery_job_with_persona(job, finished_at, None)
+/// Cancelled) are kept as-is. Unsettled jobs (Queued/Running) are kept in
+/// their current status — they are pending revival from their durable child
+/// JSONL and must NOT be cancelled. The runtime spawns revival tasks after
+/// installing the recovered state.
+pub fn recovery_job(job: JobSnapshot, _finished_at: u64) -> JobSnapshot {
+    recovery_job_with_persona(job, _finished_at, None)
 }
 
 pub(crate) fn recovery_job_with_persona(
     mut job: JobSnapshot,
-    finished_at: u64,
-    persona: Option<&str>,
+    _finished_at: u64,
+    _persona: Option<&str>,
 ) -> JobSnapshot {
     if job.status.is_settled() {
         return job;
     }
-    job.status = JobStatus::Cancelled;
-    job.finished_at = Some(finished_at);
-    if job.result.is_none() {
-        job.result = Some(TaskResult {
-            index: 0,
-            id: job.agent_id.clone(),
-            agent: job.agent.clone(),
-            status: AgentStatus::Aborted,
-            output: String::new(),
-            usage: pi_ai::Usage::default(),
-            soft_budget_exhausted: false,
-            error: Some("orchestration job interrupted by process restart".to_owned()),
-            structured_output: None,
-            artifact_ref: format!("agent://{}", job.agent_id),
-            history_ref: persona.map_or_else(
-                || format!("history://{}", job.agent_id),
-                |persona| format!("history://persona/{persona}/{}", job.agent_id),
-            ),
-            artifact_uri: format!("artifact://{}", job.agent_id),
-        });
-    }
+    // Unsettled jobs keep their status (Running/Queued) for revival.
+    // Do NOT cancel, do NOT set finished_at, do NOT synthesize an error result.
+    // The revival task reopens the child JSONL and continues the turn.
+    job.started_at = Some(job.started_at.unwrap_or(_finished_at));
     job
 }
 
@@ -741,11 +846,16 @@ pub(crate) fn recovery_job_with_persona(
 pub fn reconstruct_request(
     agent: &PersistedAgent,
     resolved_model: pi_ai::Model,
+    resolved_model_sequence: Vec<super::ResolvedAgentModelCandidate>,
+    resolved_model_selected_index: usize,
     definition: &super::AgentDefinition,
     system_prompt: String,
     requested_tool_names: Option<Vec<String>>,
     orchestration_tools: Vec<pi_agent::AgentTool>,
     max_tools_per_agent: usize,
+    persona_skill_store: Option<crate::PersonaSkillStore>,
+    persona_skills: std::sync::Arc<Vec<crate::PersonaSkill>>,
+    shared_skills: std::sync::Arc<Vec<crate::Skill>>,
 ) -> Option<ChildSessionRequest> {
     if !definition.trusted || persist_definition(definition) != agent.definition {
         return None;
@@ -760,8 +870,13 @@ pub fn reconstruct_request(
         system_prompt,
         requested_tool_names,
         orchestration_tools,
+        persona_skill_store,
+        persona_skills,
+        shared_skills,
         thinking_level: agent.request.thinking_level,
         model: resolved_model,
+        resolved_model_sequence,
+        resolved_model_selected_index,
         output_schema: agent.request.output_schema.clone(),
         schema_mode: agent.request.schema_mode.clone(),
         yield_state: std::sync::Arc::new(super::YieldState::default()),
@@ -793,6 +908,8 @@ pub fn persist_definition(definition: &super::AgentDefinition) -> PersistedDefin
         kind: definition.kind,
         personality: definition.personality.clone(),
         soft_budget: definition.soft_budget,
+        knowledge_roots: definition.knowledge_roots.clone(),
+        user_proxy: definition.user_proxy,
     }
 }
 
@@ -816,17 +933,23 @@ pub fn persist_request(request: &ChildSessionRequest) -> PersistedRequest {
 
 /// Build a `DurableState` snapshot from the live runtime state.
 pub fn build_state(
+    group_id: &str,
     parent_session_id: &str,
     parent_session_path: &Path,
+    durable_policy: DurablePolicyState,
     main_mailbox: Vec<MailboxMessage>,
+    delivered_messages: Vec<MailboxMessage>,
     agents: Vec<PersistedAgent>,
     jobs: Vec<JobSnapshot>,
 ) -> DurableState {
     DurableState {
         version: DURABLE_STATE_VERSION,
+        group_id: group_id.to_owned(),
         parent_session_id: parent_session_id.to_owned(),
         parent_session_path: parent_session_path.to_string_lossy().into_owned(),
+        durable_policy,
         main_mailbox,
+        delivered_messages,
         agents,
         jobs,
     }
@@ -834,19 +957,53 @@ pub fn build_state(
 
 #[cfg(test)]
 mod tests {
+    fn durable_policy() -> DurablePolicyState {
+        crate::sandbox::generation::test_durable_policy_state()
+    }
     use super::*;
+    use std::fs;
     use tempfile::tempdir;
 
     fn parent_id() -> String {
         "parent-session-id".to_owned()
     }
 
+    fn runtime_with_main(root: &Path, main_agent_id: &str) -> (DurableRuntime, PathBuf) {
+        let parent_path = root.join("parent.jsonl");
+        fs::write(&parent_path, b"{}\n").expect("parent");
+        let capabilities = crate::fs::CapabilityFs::new().expect("capability filesystem");
+        let lease = capabilities
+            .open_root(
+                CapabilityRootPurpose::SessionStore,
+                pi_sandbox::AbsolutePath::parse(root.to_path_buf()).expect("absolute session root"),
+                CapabilityAccess::PrivateReadWrite,
+                RootCreation::Existing,
+            )
+            .expect("session lease");
+        let runtime = DurableRuntime::new_with_main_agent_id(
+            parent_id(),
+            parent_path.clone(),
+            lease,
+            PathBuf::from("parent.jsonl"),
+            main_agent_id.to_owned(),
+        )
+        .expect("durable runtime");
+        (runtime, parent_path)
+    }
+
+    fn runtime(root: &Path) -> (DurableRuntime, PathBuf) {
+        runtime_with_main(root, "Main")
+    }
+
     fn state_with_agents(parent_path: &Path, agents: Vec<PersistedAgent>) -> DurableState {
         DurableState {
             version: DURABLE_STATE_VERSION,
             parent_session_id: parent_id(),
+            group_id: Uuid::now_v7().to_string(),
+            durable_policy: durable_policy(),
             parent_session_path: parent_path.to_string_lossy().into_owned(),
             main_mailbox: Vec::new(),
+            delivered_messages: Vec::new(),
             agents,
             jobs: Vec::new(),
         }
@@ -885,6 +1042,8 @@ mod tests {
                 kind: super::super::AgentDefinitionKind::Agent,
                 personality: None,
                 soft_budget: None,
+                knowledge_roots: Vec::new(),
+                user_proxy: false,
             },
             request: PersistedRequest {
                 child_id: id.to_owned(),
@@ -908,15 +1067,7 @@ mod tests {
     #[test]
     fn configured_main_identity_round_trips_root_relationships_and_mailbox() {
         let root = tempdir().expect("root");
-        let parent_path = root.path().join("parent.jsonl");
-        fs::write(&parent_path, b"{}\n").expect("parent");
-        let runtime = DurableRuntime::new_with_main_agent_id(
-            parent_id(),
-            parent_path.clone(),
-            root.path().join("children").join(parent_id()),
-            "Coordinator".to_owned(),
-        )
-        .expect("configured-main durable runtime");
+        let (runtime, parent_path) = runtime_with_main(root.path(), "Coordinator");
         let mut agent = persisted_agent("Alpha");
         agent.snapshot.parent_id = Some("Coordinator".to_owned());
         agent.request.parent_id = "Coordinator".to_owned();
@@ -930,22 +1081,16 @@ mod tests {
             reply_to: None,
         });
 
-        runtime.persist(&state).expect("persist configured-main state");
+        runtime
+            .persist(&state)
+            .expect("persist configured-main state");
         assert_eq!(runtime.load().expect("load configured-main state"), state);
     }
 
     #[test]
     fn configured_main_identity_rejects_wrong_mailbox_recipient() {
         let root = tempdir().expect("root");
-        let parent_path = root.path().join("parent.jsonl");
-        fs::write(&parent_path, b"{}\n").expect("parent");
-        let runtime = DurableRuntime::new_with_main_agent_id(
-            parent_id(),
-            parent_path.clone(),
-            root.path().join("children").join(parent_id()),
-            "Coordinator".to_owned(),
-        )
-        .expect("configured-main durable runtime");
+        let (runtime, parent_path) = runtime_with_main(root.path(), "Coordinator");
         let mut state = state_with_agents(&parent_path, Vec::new());
         state.main_mailbox.push(MailboxMessage {
             id: "message-1".to_owned(),
@@ -965,15 +1110,7 @@ mod tests {
     #[test]
     fn configured_main_identity_rejects_root_as_child() {
         let root = tempdir().expect("root");
-        let parent_path = root.path().join("parent.jsonl");
-        fs::write(&parent_path, b"{}\n").expect("parent");
-        let runtime = DurableRuntime::new_with_main_agent_id(
-            parent_id(),
-            parent_path.clone(),
-            root.path().join("children").join(parent_id()),
-            "Coordinator".to_owned(),
-        )
-        .expect("configured-main durable runtime");
+        let (runtime, parent_path) = runtime_with_main(root.path(), "Coordinator");
         let mut root_agent = persisted_agent("Coordinator");
         root_agent.snapshot.parent_id = Some("Coordinator".to_owned());
         root_agent.request.parent_id = "Coordinator".to_owned();
@@ -988,15 +1125,7 @@ mod tests {
     #[test]
     fn configured_main_identity_rejects_unknown_parent() {
         let root = tempdir().expect("root");
-        let parent_path = root.path().join("parent.jsonl");
-        fs::write(&parent_path, b"{}\n").expect("parent");
-        let runtime = DurableRuntime::new_with_main_agent_id(
-            parent_id(),
-            parent_path.clone(),
-            root.path().join("children").join(parent_id()),
-            "Coordinator".to_owned(),
-        )
-        .expect("configured-main durable runtime");
+        let (runtime, parent_path) = runtime_with_main(root.path(), "Coordinator");
         let mut orphan = persisted_agent("Alpha");
         orphan.snapshot.parent_id = Some("Missing".to_owned());
         orphan.request.parent_id = "Missing".to_owned();
@@ -1008,26 +1137,416 @@ mod tests {
         assert!(error.to_string().contains("unknown parent"), "{error:#}");
     }
 
-    fn runtime(root: &Path) -> (DurableRuntime, PathBuf) {
-        let parent_path = root.join("parent.jsonl");
-        fs::write(&parent_path, b"{}\n").expect("parent");
-        let rt = DurableRuntime::new(
-            parent_id(),
-            parent_path.clone(),
-            root.join("children").join(parent_id()),
-        )
-        .expect("durable runtime");
-        (rt, parent_path)
-    }
-
     #[test]
-    fn state_round_trips_through_atomic_persist_and_load() {
+    fn durable_policy_round_trips_through_atomic_persist_and_load() {
         let root = tempdir().expect("root");
         let (rt, parent_path) = runtime(root.path());
         let state = state_with_agents(&parent_path, vec![persisted_agent("Alpha")]);
         rt.persist(&state).expect("persist");
         let loaded = rt.load().expect("load");
         assert_eq!(loaded, state);
+        assert_eq!(loaded.durable_policy, durable_policy());
+    }
+
+    #[test]
+    fn previous_durable_state_version_is_rejected_before_recovery() {
+        let root = tempdir().expect("root");
+        let (rt, parent_path) = runtime(root.path());
+        let state = state_with_agents(&parent_path, vec![persisted_agent("Alpha")]);
+        rt.persist(&state).expect("persist current schema");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(rt.sidecar_path()).expect("read sidecar"))
+                .expect("decode sidecar");
+        value["version"] = serde_json::json!(DURABLE_STATE_VERSION + 1);
+        fs::write(
+            rt.sidecar_path(),
+            serde_json::to_vec_pretty(&value).expect("encode future schema"),
+        )
+        .expect("write future schema");
+        let error = rt
+            .load()
+            .expect_err("future schema rejected on recovery load");
+        assert!(error.to_string().contains("unsupported"));
+    }
+
+    // Real historical v1 sidecar shapes. v1 predates `durablePolicy` and cannot
+    // deserialize into `DurableState`, so recovery must probe the version field
+    // and treat valid v1 as unavailable orchestration state (Ok(None)) rather
+    // than failing to parse. The `__PARENT_PATH__` placeholder is replaced with
+    // the actual parent path at test time; v1 never reaches `validate_state`, so
+    // the path is present for realism but not validated.
+    const V1_SIDECAR_WITHOUT_MAIN_MAILBOX_TEMPLATE: &str = r#"{
+      "version": 1,
+      "parentSessionId": "parent-session-id",
+      "parentSessionPath": "__PARENT_PATH__",
+      "agents": []
+    }"#;
+    const V1_SIDECAR_WITH_MAIN_MAILBOX_TEMPLATE: &str = r#"{
+      "version": 1,
+      "parentSessionId": "parent-session-id",
+      "parentSessionPath": "__PARENT_PATH__",
+      "mainMailbox": [
+        {
+          "id": "message-1",
+          "from": "Alpha",
+          "to": "Main",
+          "body": "late durable reply",
+          "timestamp": 1,
+          "replyTo": null
+        }
+      ],
+      "agents": []
+    }"#;
+    const MALFORMED_JSON: &str = "{not valid json";
+    // A v2-versioned sidecar missing the required `durablePolicy` field: the
+    // version probe succeeds, but strict v2 deserialization must fail closed
+    // with the parse context preserved.
+    const MALFORMED_V2_TEMPLATE: &str = r#"{
+      "version": 2,
+      "parentSessionId": "parent-session-id",
+      "parentSessionPath": "__PARENT_PATH__",
+      "agents": []
+    }"#;
+    const FUTURE_VERSION_SIDECAR: &str = r#"{
+      "version": 4,
+      "parentSessionId": "parent-session-id",
+      "parentSessionPath": "__PARENT_PATH__",
+      "groupId": "018f5a8c-1234-7000-8000-000000000001",
+      "durablePolicy": {},
+      "agents": []
+    }"#;
+    const ZERO_VERSION_SIDECAR: &str = r#"{
+      "version": 0,
+      "parentSessionId": "parent-session-id",
+      "parentSessionPath": "__PARENT_PATH__",
+      "agents": []
+    }"#;
+
+    fn write_fixture(rt: &DurableRuntime, template: &str, parent_path: &Path) {
+        let rendered = template.replace("__PARENT_PATH__", &parent_path.to_string_lossy());
+        fs::write(rt.sidecar_path(), rendered.as_bytes()).expect("write fixture sidecar");
+    }
+
+    #[test]
+    fn legacy_v1_without_main_mailbox_loads_as_none_then_persists_fresh_v3() {
+        let root = tempdir().expect("root");
+        let (rt, parent_path) = runtime(root.path());
+        write_fixture(&rt, V1_SIDECAR_WITHOUT_MAIN_MAILBOX_TEMPLATE, &parent_path);
+
+        assert_eq!(
+            rt.load_optional()
+                .expect("legacy v1 is available-but-unusable state"),
+            None
+        );
+        // Optional load must not mutate or delete the v1 sidecar.
+        assert!(rt.sidecar_path().exists(), "v1 sidecar not deleted");
+        // The strict load path still refuses to fabricate/migrate v1 authority.
+        let error = rt
+            .load()
+            .expect_err("strict load of legacy v1 must not fabricate v3");
+        assert!(error.to_string().contains("sidecar not found"), "{error:#}");
+        // The existing `None => persist_state()` path writes fresh v3 state.
+        let state = state_with_agents(&parent_path, vec![persisted_agent("Alpha")]);
+        rt.persist(&state).expect("fresh v3 persist over legacy v1");
+        assert_eq!(rt.load().expect("load fresh v3"), state);
+    }
+
+    #[test]
+    fn legacy_v1_with_main_mailbox_loads_as_none() {
+        let root = tempdir().expect("root");
+        let (rt, parent_path) = runtime(root.path());
+        write_fixture(&rt, V1_SIDECAR_WITH_MAIN_MAILBOX_TEMPLATE, &parent_path);
+
+        assert_eq!(
+            rt.load_optional()
+                .expect("legacy v1 with main mailbox is unavailable state"),
+            None
+        );
+        assert!(rt.sidecar_path().exists(), "v1 sidecar not deleted");
+    }
+
+    #[test]
+    fn malformed_json_fails_closed_parsing_without_deleting() {
+        let root = tempdir().expect("root");
+        let (rt, parent_path) = runtime(root.path());
+        fs::write(rt.sidecar_path(), MALFORMED_JSON).expect("write malformed json");
+        let error = rt
+            .load_optional()
+            .expect_err("malformed json must fail closed");
+        assert!(
+            error.to_string().contains("parsing durable state"),
+            "{error:#}"
+        );
+        assert!(rt.sidecar_path().exists(), "sidecar not deleted");
+    }
+
+    #[test]
+    fn malformed_v2_fails_closed_parsing_without_deleting() {
+        let root = tempdir().expect("root");
+        let (rt, parent_path) = runtime(root.path());
+        write_fixture(&rt, MALFORMED_V2_TEMPLATE, &parent_path);
+        let error = rt
+            .load_optional()
+            .expect_err("v2 missing durablePolicy must fail closed");
+        assert!(
+            error.to_string().contains("parsing durable state"),
+            "{error:#}"
+        );
+        assert!(rt.sidecar_path().exists(), "sidecar not deleted");
+    }
+
+    // Malformed v1 must fail closed: the version probe alone is not enough, the
+    // legacy v1 shape must deserialize strictly (required parentSessionId /
+    // parentSessionPath / agents, deny_unknown_fields) before returning None.
+    const MALFORMED_V1_TRUNCATED: &str = r#"{ "version": 1 }"#;
+    const MALFORMED_V1_UNKNOWN_FIELD: &str = r#"{
+      "version": 1,
+      "parentSessionId": "parent-session-id",
+      "parentSessionPath": "__PARENT_PATH__",
+      "durablePolicy": {},
+      "agents": []
+    }"#;
+    const MALFORMED_V1_BAD_AGENT: &str = r#"{
+      "version": 1,
+      "parentSessionId": "parent-session-id",
+      "parentSessionPath": "__PARENT_PATH__",
+      "agents": [{"snapshot": {"totally": "wrong"}}]
+    }"#;
+
+    #[test]
+    fn malformed_v1_that_only_says_version_fails_closed() {
+        let root = tempdir().expect("root");
+        let (rt, _parent_path) = runtime(root.path());
+        fs::write(rt.sidecar_path(), MALFORMED_V1_TRUNCATED).expect("write truncated v1");
+        let error = rt
+            .load_optional()
+            .expect_err("truncated v1 must fail closed");
+        assert!(
+            error.to_string().contains("parsing durable state"),
+            "{error:#}"
+        );
+        assert!(rt.sidecar_path().exists(), "sidecar not deleted");
+    }
+
+    #[test]
+    fn malformed_v1_with_unknown_field_fails_closed() {
+        let root = tempdir().expect("root");
+        let (rt, parent_path) = runtime(root.path());
+        write_fixture(&rt, MALFORMED_V1_UNKNOWN_FIELD, &parent_path);
+        let error = rt
+            .load_optional()
+            .expect_err("v1 must not accept fields from a newer schema");
+        assert!(
+            error.to_string().contains("parsing durable state"),
+            "{error:#}"
+        );
+        assert!(rt.sidecar_path().exists(), "sidecar not deleted");
+    }
+
+    #[test]
+    fn malformed_v1_with_bad_agent_fails_closed() {
+        let root = tempdir().expect("root");
+        let (rt, parent_path) = runtime(root.path());
+        write_fixture(&rt, MALFORMED_V1_BAD_AGENT, &parent_path);
+        let error = rt
+            .load_optional()
+            .expect_err("v1 with malformed agents must fail closed");
+        assert!(
+            error.to_string().contains("parsing durable state"),
+            "{error:#}"
+        );
+        assert!(rt.sidecar_path().exists(), "sidecar not deleted");
+    }
+
+    // A well-formed v1 sidecar belonging to a different session must fail closed
+    // rather than being treated as absent (which the caller would then
+    // overwrite), matching the v2 wrong-parent guarantees.
+    #[test]
+    fn legacy_v1_wrong_parent_id_fails_closed() {
+        let root = tempdir().expect("root");
+        let (rt, parent_path) = runtime(root.path());
+        let rendered = V1_SIDECAR_WITHOUT_MAIN_MAILBOX_TEMPLATE
+            .replace("__PARENT_PATH__", &parent_path.to_string_lossy())
+            .replace("\"parent-session-id\"", "\"foreign-parent\"");
+        fs::write(rt.sidecar_path(), rendered.as_bytes()).expect("write foreign v1 sidecar");
+
+        let error = rt
+            .load_optional()
+            .expect_err("foreign v1 parent id must fail closed");
+        assert!(
+            error.to_string().contains("parent session id mismatch"),
+            "{error:#}"
+        );
+        assert!(rt.sidecar_path().exists(), "sidecar not deleted");
+    }
+
+    #[test]
+    fn legacy_v1_wrong_parent_path_fails_closed() {
+        let root = tempdir().expect("root");
+        let (rt, _parent_path) = runtime(root.path());
+        let other_root = tempdir().expect("other root");
+        let other_parent = other_root.path().join("parent.jsonl");
+        fs::write(&other_parent, b"{}\n").expect("other parent");
+        write_fixture(&rt, V1_SIDECAR_WITHOUT_MAIN_MAILBOX_TEMPLATE, &other_parent);
+
+        let error = rt
+            .load_optional()
+            .expect_err("foreign v1 parent path must fail closed");
+        assert!(
+            error.to_string().contains("parent session path mismatch"),
+            "{error:#}"
+        );
+        assert!(rt.sidecar_path().exists(), "sidecar not deleted");
+    }
+
+    #[test]
+    fn future_version_fails_closed() {
+        let root = tempdir().expect("root");
+        let (rt, parent_path) = runtime(root.path());
+        write_fixture(&rt, FUTURE_VERSION_SIDECAR, &parent_path);
+        let error = rt
+            .load_optional()
+            .expect_err("future version must fail closed");
+        assert!(error.to_string().contains("unsupported"), "{error:#}");
+        assert!(rt.sidecar_path().exists(), "sidecar not deleted");
+    }
+
+    #[test]
+    fn zero_version_fails_closed() {
+        let root = tempdir().expect("root");
+        let (rt, parent_path) = runtime(root.path());
+        write_fixture(&rt, ZERO_VERSION_SIDECAR, &parent_path);
+        let error = rt
+            .load_optional()
+            .expect_err("zero version must fail closed");
+        assert!(error.to_string().contains("unsupported"), "{error:#}");
+        assert!(rt.sidecar_path().exists(), "sidecar not deleted");
+    }
+
+    #[test]
+    fn current_state_without_delivered_messages_defaults_empty() {
+        let root = tempdir().expect("root");
+        let (rt, parent_path) = runtime(root.path());
+        let state = state_with_agents(&parent_path, vec![persisted_agent("Alpha")]);
+        rt.persist(&state).expect("persist current state");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(rt.sidecar_path()).expect("read current sidecar"))
+                .expect("decode current sidecar");
+        value
+            .as_object_mut()
+            .expect("state object")
+            .remove("deliveredMessages");
+        fs::write(
+            rt.sidecar_path(),
+            serde_json::to_vec_pretty(&value).expect("encode legacy current state"),
+        )
+        .expect("write legacy current state");
+
+        let loaded = rt.load().expect("missing delivered history defaults empty");
+        assert!(loaded.delivered_messages.is_empty());
+    }
+
+    #[test]
+    fn delivered_message_log_rejects_duplicate_ids_and_oversize_state() {
+        let root = tempdir().expect("root");
+        let (rt, parent_path) = runtime(root.path());
+        let delivered = MailboxMessage {
+            id: "message-1".to_owned(),
+            from: "Main".to_owned(),
+            to: "Alpha".to_owned(),
+            body: "accepted".to_owned(),
+            timestamp: 1,
+            reply_to: None,
+        };
+        let mut duplicate = state_with_agents(&parent_path, vec![persisted_agent("Alpha")]);
+        duplicate.delivered_messages = vec![delivered.clone(), delivered];
+        let error = rt
+            .persist(&duplicate)
+            .expect_err("duplicate delivered ids must fail closed");
+        assert!(
+            error.to_string().contains("appears more than once"),
+            "{error:#}"
+        );
+
+        let mut oversized = state_with_agents(&parent_path, vec![persisted_agent("Alpha")]);
+        oversized.delivered_messages = (0..=DELIVERED_MESSAGE_LOG_CAP)
+            .map(|index| MailboxMessage {
+                id: format!("message-{index}"),
+                from: "Main".to_owned(),
+                to: "Alpha".to_owned(),
+                body: "accepted".to_owned(),
+                timestamp: index as u64,
+                reply_to: None,
+            })
+            .collect();
+        let error = rt
+            .persist(&oversized)
+            .expect_err("oversized delivered history must fail closed");
+        assert!(error.to_string().contains("exceeds maximum"), "{error:#}");
+    }
+
+    #[test]
+    fn valid_strict_v3_round_trips_through_optional_load() {
+        let root = tempdir().expect("root");
+        let (rt, parent_path) = runtime(root.path());
+        let state = state_with_agents(&parent_path, vec![persisted_agent("Alpha")]);
+        rt.persist(&state).expect("persist strict v3");
+        assert_eq!(
+            rt.load_optional()
+                .expect("load strict v3 through optional path"),
+            Some(state)
+        );
+    }
+
+    #[test]
+    fn invalid_current_group_id_fails_closed_without_rewriting_sidecar() {
+        let root = tempdir().expect("root");
+        let (rt, parent_path) = runtime(root.path());
+        let mut state = state_with_agents(&parent_path, Vec::new());
+        state.group_id = "not-a-group-id".to_owned();
+        let bytes = serde_json::to_vec_pretty(&state).expect("serialize invalid group fixture");
+        fs::write(rt.sidecar_path(), &bytes).expect("write invalid group fixture");
+
+        let error = rt
+            .load()
+            .expect_err("invalid group identity must fail closed");
+        assert!(
+            error.to_string().contains("group id is invalid"),
+            "{error:#}"
+        );
+        assert_eq!(
+            fs::read(rt.sidecar_path()).expect("read unchanged fixture"),
+            bytes
+        );
+    }
+
+    #[test]
+    fn legacy_v2_group_migration_is_deterministic_and_persists_once() {
+        let root = tempdir().expect("root");
+        let (rt, parent_path) = runtime(root.path());
+        let state = state_with_agents(&parent_path, vec![persisted_agent("Alpha")]);
+        let mut legacy = serde_json::to_value(&state).expect("encode legacy v2 fixture");
+        legacy["version"] = serde_json::json!(LEGACY_DURABLE_STATE_VERSION);
+        legacy
+            .as_object_mut()
+            .expect("state object")
+            .remove("groupId");
+        let legacy_bytes = serde_json::to_vec_pretty(&legacy).expect("serialize legacy v2 fixture");
+        fs::write(rt.sidecar_path(), &legacy_bytes).expect("write legacy v2 fixture");
+
+        let first = rt.load().expect("migrate legacy v2");
+        let second = rt.load().expect("repeat legacy v2 migration");
+        assert_eq!(first.group_id, legacy_group_id(&parent_id()));
+        assert_eq!(second.group_id, first.group_id);
+        assert_eq!(
+            fs::read(rt.sidecar_path()).expect("legacy source remains unchanged"),
+            legacy_bytes
+        );
+
+        rt.persist(&first).expect("persist migrated v3 state");
+        let persisted = rt.load().expect("load persisted migrated state");
+        assert_eq!(persisted.version, DURABLE_STATE_VERSION);
+        assert_eq!(persisted.group_id, first.group_id);
     }
 
     #[test]
@@ -1051,17 +1570,14 @@ mod tests {
         let (rt, parent_path) = runtime(root.path());
         let state = state_with_agents(&parent_path, vec![persisted_agent("Alpha")]);
         rt.persist(&state).expect("persist");
-
         let other_root = tempdir().expect("other root");
-        let different_parent = other_root.path().join("different-parent.jsonl");
-        fs::write(&different_parent, b"{}\n").expect("different parent");
-        let rt_other = DurableRuntime::new(
-            parent_id(),
-            different_parent,
-            other_root.path().join("children").join(parent_id()),
+
+        let (rt_other, _) = runtime_with_main(other_root.path(), "Main");
+        fs::write(
+            rt_other.sidecar_path(),
+            fs::read(rt.sidecar_path()).expect("read sidecar"),
         )
-        .expect("runtime");
-        fs::copy(rt.sidecar_path(), rt_other.sidecar_path()).expect("copy sidecar");
+        .expect("copy sidecar");
         let error = rt_other.load().expect_err("wrong parent path rejected");
         assert!(error.to_string().contains("parent session path mismatch"));
     }
@@ -1127,7 +1643,20 @@ mod tests {
         let path = rt.sidecar_path();
         fs::write(&path, &vec![b' '; MAX_SIDECAR_BYTES as usize + 1]).expect("oversize");
         let error = rt.load().expect_err("oversize rejected");
-        assert!(error.to_string().contains("exceeds maximum size"));
+        assert!(
+            error.chain().any(|source| {
+                source
+                    .downcast_ref::<crate::fs::FsError>()
+                    .is_some_and(|error| {
+                        matches!(
+                            error,
+                            crate::fs::FsError::ReadLimitExceeded { limit }
+                                if *limit == MAX_SIDECAR_BYTES
+                        )
+                    })
+            }),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -1143,16 +1672,16 @@ mod tests {
     }
 
     #[test]
-    fn recovery_status_parks_active_agents() {
-        assert_eq!(recovery_status(AgentStatus::Running), AgentStatus::Parked);
-        assert_eq!(recovery_status(AgentStatus::Queued), AgentStatus::Parked);
+    fn recovery_status_queues_active_agents() {
+        assert_eq!(recovery_status(AgentStatus::Running), AgentStatus::Queued);
+        assert_eq!(recovery_status(AgentStatus::Queued), AgentStatus::Queued);
         assert_eq!(recovery_status(AgentStatus::Idle), AgentStatus::Parked);
         assert_eq!(recovery_status(AgentStatus::Aborted), AgentStatus::Aborted);
         assert_eq!(recovery_status(AgentStatus::Parked), AgentStatus::Parked);
     }
 
     #[test]
-    fn recovery_job_cancels_unsettled_and_keeps_settled() {
+    fn recovery_job_preserves_unsettled_and_keeps_settled() {
         let mut running = JobSnapshot {
             id: "job-1".to_owned(),
             agent_id: "Alpha".to_owned(),
@@ -1170,9 +1699,19 @@ mod tests {
             soft_budget_exhausted: false,
         };
         let recovered = recovery_job(running.clone(), 100);
-        assert_eq!(recovered.status, JobStatus::Cancelled);
-        assert_eq!(recovered.finished_at, Some(100));
-        assert!(recovered.result.as_ref().is_some_and(|r| r.error.is_some()));
+        assert_eq!(
+            recovered.status,
+            JobStatus::Running,
+            "unsettled jobs keep their status for revival"
+        );
+        assert_eq!(
+            recovered.finished_at, None,
+            "unsettled jobs are not finished"
+        );
+        assert!(
+            recovered.result.is_none(),
+            "unsettled jobs get no synthetic error result"
+        );
         running.status = JobStatus::Completed;
         running.finished_at = Some(50);
         let settled = recovery_job(running, 100);
@@ -1181,8 +1720,8 @@ mod tests {
     }
 
     #[test]
-    fn recovery_job_preserves_qualified_persona_history() {
-        let job = JobSnapshot {
+    fn recovery_job_preserves_qualified_persona_history_on_settled() {
+        let mut job = JobSnapshot {
             id: "job-persona".to_owned(),
             agent_id: "MentorRun".to_owned(),
             agent: "mentor".to_owned(),
@@ -1199,56 +1738,61 @@ mod tests {
             soft_budget_exhausted: false,
         };
 
-        let recovered = recovery_job_with_persona(job, 100, Some("mentor"));
+        // Unsettled: status preserved, no synthetic result.
+        let recovered = recovery_job_with_persona(job.clone(), 100, Some("mentor"));
+        assert_eq!(recovered.status, JobStatus::Running);
+        assert!(recovered.result.is_none());
+
+        // Settled: result preserved as-is.
+        job.status = JobStatus::Completed;
+        job.finished_at = Some(50);
+        job.result = Some(TaskResult {
+            index: 0,
+            id: "MentorRun".to_owned(),
+            agent: "mentor".to_owned(),
+            status: AgentStatus::Parked,
+            output: String::new(),
+            usage: pi_ai::Usage::default(),
+            soft_budget_exhausted: false,
+            error: None,
+            structured_output: None,
+            artifact_ref: "agent://MentorRun".to_owned(),
+            history_ref: "history://persona/mentor/MentorRun".to_owned(),
+            artifact_uri: "artifact://MentorRun".to_owned(),
+        });
+        let settled = recovery_job_with_persona(job, 100, Some("mentor"));
+        assert_eq!(settled.status, JobStatus::Completed);
         assert_eq!(
-            recovered.result.expect("recovery result").history_ref,
+            settled.result.expect("settled result").history_ref,
             "history://persona/mentor/MentorRun"
         );
     }
 
     #[test]
-    fn binding_creates_missing_parent_session_directory() {
+    fn binding_uses_retained_parent_directory_authority() {
         let root = tempdir().expect("root");
-        // First-launch shape: the per-cwd session directory (and its
-        // ancestors) does not exist yet — e.g. startup TTL pruning removed the
-        // empty directory before the orchestration binding ran.
-        let parent_path = root
-            .path()
-            .join("sessions")
-            .join("--missing--")
-            .join("parent.jsonl");
-        assert!(!parent_path.parent().expect("parent").exists());
-        let rt = DurableRuntime::new(
-            parent_id(),
-            parent_path.clone(),
-            root.path()
-                .join("sessions")
-                .join("--missing--")
-                .join("children")
-                .join(parent_id()),
-        )
-        .expect("binding must create the missing parent session directory");
-        assert!(parent_path.parent().expect("parent").is_dir());
+        let (rt, parent_path) = runtime(root.path());
         assert_eq!(rt.parent_session_path(), &parent_path);
-        assert!(rt.child_root().is_dir());
+        assert_eq!(
+            rt.child_root(),
+            root.path().join("children").join(parent_id())
+        );
     }
 
     #[test]
-    fn canonicalize_child_path_rejects_traversal_and_symlink() {
+    fn child_file_authority_rejects_paths_outside_retained_root() {
         let root = tempdir().expect("root");
         let (rt, _) = runtime(root.path());
         let legit = rt.child_root().join("child.jsonl");
         fs::write(&legit, b"{}").expect("write");
-        let canonical = rt
-            .canonicalize_child_session_path(&legit)
-            .expect("legit path");
-        assert_eq!(canonical, legit);
+        let (lease, relative) = rt.child_file_authority(&legit).expect("legit authority");
+        assert_eq!(lease.display_root().join(relative), legit);
 
         let outside = tempdir().expect("outside");
         let escaped = outside.path().join("escaped.jsonl");
         fs::write(&escaped, b"{}").expect("write outside");
         let error = rt
-            .canonicalize_child_session_path(&escaped)
+            .child_file_authority(&escaped)
             .expect_err("outside rejected");
         assert!(error.to_string().contains("escapes durable child root"));
     }
@@ -1275,29 +1819,45 @@ mod tests {
             kind: super::super::AgentDefinitionKind::Agent,
             personality: None,
             soft_budget: None,
+            knowledge_roots: Vec::new(),
+            user_proxy: false,
         };
         let model = pi_ai::Model::default();
-        assert!(reconstruct_request(
-            &agent,
-            model.clone(),
-            &definition,
-            "prompt".to_owned(),
-            None,
-            Vec::new(),
-            16,
-        )
-        .is_some());
+        assert!(
+            reconstruct_request(
+                &agent,
+                model.clone(),
+                Vec::new(),
+                0,
+                &definition,
+                "prompt".to_owned(),
+                None,
+                Vec::new(),
+                16,
+                None,
+                std::sync::Arc::new(Vec::new()),
+                std::sync::Arc::new(Vec::new()),
+            )
+            .is_some()
+        );
         definition.name = "other".to_owned();
-        assert!(reconstruct_request(
-            &agent,
-            model,
-            &definition,
-            "prompt".to_owned(),
-            None,
-            Vec::new(),
-            16,
-        )
-        .is_none());
+        assert!(
+            reconstruct_request(
+                &agent,
+                model,
+                Vec::new(),
+                0,
+                &definition,
+                "prompt".to_owned(),
+                None,
+                Vec::new(),
+                16,
+                None,
+                std::sync::Arc::new(Vec::new()),
+                std::sync::Arc::new(Vec::new()),
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1322,18 +1882,27 @@ mod tests {
             kind: super::super::AgentDefinitionKind::Agent,
             personality: None,
             soft_budget: None,
+            knowledge_roots: Vec::new(),
+            user_proxy: false,
         };
         definition.tools = Some(vec!["read".to_owned()]);
-        assert!(reconstruct_request(
-            &agent,
-            pi_ai::Model::default(),
-            &definition,
-            "current prompt".to_owned(),
-            Some(vec!["read".to_owned()]),
-            Vec::new(),
-            16,
-        )
-        .is_none());
+        assert!(
+            reconstruct_request(
+                &agent,
+                pi_ai::Model::default(),
+                Vec::new(),
+                0,
+                &definition,
+                "current prompt".to_owned(),
+                Some(vec!["read".to_owned()]),
+                Vec::new(),
+                16,
+                None,
+                std::sync::Arc::new(Vec::new()),
+                std::sync::Arc::new(Vec::new()),
+            )
+            .is_none()
+        );
     }
 
     #[test]

@@ -24,7 +24,11 @@ it. Scenarios:
               Any other request gets plain text.
 - sessions:  replies route by exact current prompt. `sessions-slow-b3` emits
               its first delta, then waits for POST /__release-session so the
-              Web lane owns the busy-close/release order.
+              Web lane owns the busy-close/release order. Supervisor planning
+              builds a two-task DAG (compile widget -> ship widget) and
+              delegated workers stay held until POST /__release-session-workers
+              so T5.3 can observe ready/running dependency state before
+              completion.
 - xss:       every request streams assistant text containing raw HTML that
               must never execute (<img onerror>, <script> setting a global)
               plus a credential-shaped token the web client must redact to
@@ -36,10 +40,14 @@ it. Scenarios:
 - slowclient: replies route by exact current prompt (slow-client web lane):
               `slowclient-burst-<N>-<bytes>` streams N text deltas back-to-
               back (one HTTP body, no sleeps — an event burst; tail marker
-              "slowclient-done-<N>", chunk prefix "s<N>:" — unique per
-              burst); `slowclient-burstslow-<N>-<bytes>-<delay>` writes the
+              "slowclient-done-<N>", chunk prefix "s<N>:");
+              `slowclient-burstslow-<N>-<bytes>-<delay>` writes the
               same N deltas at a <delay>s cadence so a browser-side
-              main-thread stall overlaps a sustained flood;
+              main-thread stall overlaps a sustained flood; an optional
+              trailing `-<salt>` scopes the chunk prefix to `s<N>:<salt>:`
+              and the done marker to `slowclient-done-<N>-<salt>` so
+              repeated same-size floods stay distinguishable in one
+              transcript;
               `slowclient-heavy-<count>` returns ONE final message with
               <count> KaTeX blocks, a <count>-node mermaid diagram and a
               table (heavy synchronous finalize + async mermaid hydration).
@@ -59,21 +67,41 @@ import threading
 import time
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, cast
 
 SUPERVISOR_RE = re.compile(r"You (?:supervise|plan) workflow\s+([^\s.]+)\.\s*Objective:\s*([^\n<]+)")
 DELEGATED_RE = re.compile(r"<delegated_assignment>\s*(.*?)\s*</delegated_assignment>", re.DOTALL)
 
-# Deterministic control seams: a selected completion stream sends SSE headers
-# and its first delta, then waits for its scenario-specific release POST.
-# Workflow and Web sessions deliberately use separate events/endpoints so one
-# protocol cannot release the other's held streams.
 HOLD_WORKERS = False
 HELD_STREAMS: list[Any] = []
 WORKER_RELEASE = threading.Event()
 SESSION_RELEASE = threading.Event()
+# Never signaled. A runtime-matrix parked todo must stay in progress for the
+# whole lane; releasing it would mark the task completed and drop LRU protection.
+TODO_TASK_HOLD = threading.Event()
+SESSION_WORKER_RELEASE = threading.Semaphore(0)
+SESSION_WORKER_LOCK = threading.Condition()
+SESSION_WORKER_HELD_COUNT = 0
+SESSION_WORKER_STATS: dict[str, Any] = {
+    "planning": 0,
+    "workers": 0,
+    "held": 0,
+    "completed": 0,
+    "assignments": {},
+}
+STEERING_RELEASE = threading.Event()
+STT_RELEASE = threading.Event()
+MIDSTREAM_RELEASE = threading.Event()
 WORKER_RELEASE_PATH = "/__release"
 SESSION_RELEASE_PATH = "/__release-session"
+SESSION_WORKER_RELEASE_PATH = "/__release-session-workers"
+SESSION_WORKER_HELD_PATH = "/__session-workers-held"
+SESSION_WORKER_STATS_PATH = "/__session-workflow-stats"
+STEERING_RELEASE_PATH = "/__release-steering"
+STT_RELEASE_PATH = "/__release-stt"
+MIDSTREAM_RELEASE_PATH = "/__release-midstream"
+REALTIME_RELEASE = threading.Event()
+REALTIME_RELEASE_PATH = "/__release-realtime"
 
 
 class HeldStream:
@@ -83,7 +111,7 @@ class HeldStream:
         request_number: int,
         first_text: str,
         final_text: str,
-        release: threading.Event,
+        release: threading.Event | threading.Semaphore,
     ) -> None:
         self.wfile = wfile
         self.request_number = request_number
@@ -338,28 +366,42 @@ def stream_response(payloads: list[dict[str, Any]]) -> bytes:
 
 
 def stream_held_response(wfile: Any, held: HeldStream) -> None:
-    """Serve one control-gated SSE stream.
-
-    HTTP/1.0 close-delimits the body (no content-length). The initial delta
-    proves the provider entered the turn; no terminal delta can be emitted
-    until the owning release event fires. Periodic comments keep the pipe
-    exercised so an abort or process exit surfaces as a broken pipe.
-    """
+    """Serve one control-gated SSE stream."""
     first = text_payload(f"user-mock-held-{held.request_number}", held.first_text)
     first["choices"][0]["finish_reason"] = None
+    session_worker = held.release is SESSION_WORKER_RELEASE
+    global SESSION_WORKER_HELD_COUNT
+    if session_worker:
+        with SESSION_WORKER_LOCK:
+            SESSION_WORKER_HELD_COUNT += 1
+            SESSION_WORKER_STATS["held"] = SESSION_WORKER_HELD_COUNT
+            SESSION_WORKER_LOCK.notify_all()
     try:
         wfile.write(f"data: {json.dumps(first, separators=(',', ':'))}\n\n".encode())
         wfile.flush()
-        while not held.release.wait(0.25):
+        while not (
+            cast(threading.Semaphore, held.release).acquire(timeout=0.25)
+            if session_worker
+            else cast(threading.Event, held.release).wait(0.25)
+        ):
             wfile.write(b": keepalive\n\n")
             wfile.flush()
         final = text_payload(f"user-mock-held-{held.request_number}", held.final_text)
         wfile.write(f"data: {json.dumps(final, separators=(',', ':'))}\n\n".encode())
         wfile.write(b"data: [DONE]\n\n")
         wfile.flush()
+        if session_worker:
+            with SESSION_WORKER_LOCK:
+                SESSION_WORKER_STATS["completed"] += 1
+                SESSION_WORKER_LOCK.notify_all()
     except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
-        # The client aborted the turn (pause/cancel/exit); nothing to deliver.
         return
+    finally:
+        if session_worker:
+            with SESSION_WORKER_LOCK:
+                SESSION_WORKER_HELD_COUNT -= 1
+                SESSION_WORKER_STATS["held"] = SESSION_WORKER_HELD_COUNT
+                SESSION_WORKER_LOCK.notify_all()
 
 
 def burst_stream_response(wfile: Any, payloads: list[dict[str, Any]]) -> None:
@@ -439,18 +481,50 @@ def todo_init(phases: list[tuple[str, list[str]]]) -> dict[str, Any]:
     }
 
 
+def todo_task_ids(summary: str, contents: tuple[str, ...]) -> dict[str, str]:
+    """Map exact task content to the stable ``task-*`` id the runtime assigned.
+
+    The first completed ``todo`` tool result (the runtime's summary text)
+    embeds each task's stable id twice: in the remaining-items projection
+    (``id=task-...``) and in the per-phase task list (``[task-...; ...]``).
+    Dependency ops must target IDs only. Fails closed unless every exact
+    content maps to exactly one distinct ``task-*`` id, so parsing drift can
+    never silently fall back to content-keyed dependency edges.
+    """
+    ids: dict[str, str] = {}
+    for content in contents:
+        found: set[str] = set()
+        for line in summary.splitlines():
+            if content not in line:
+                continue
+            found.update(re.findall(r"task-[0-9a-f]+", line))
+        if len(found) != 1:
+            raise ValueError(
+                "sessions workflow todo result did not yield exactly one stable "
+                f"task id for {content!r}: {sorted(found)!r}"
+            )
+        ids[content] = found.pop()
+    if len(set(ids.values())) != len(ids):
+        raise ValueError(f"sessions workflow todo result mapped distinct tasks onto shared ids: {ids!r}")
+    return ids
+
+
+def is_internal_user_context(text: str) -> bool:
+    stripped = text.lstrip()
+    return stripped.startswith("<system-reminder>") or (
+        stripped.startswith("<orchestration-message")
+        and stripped.rstrip().endswith("</orchestration-message>")
+    )
+
+
 def last_user_text(body: dict[str, Any]) -> str:
-    """Text of the last REAL user input. Provider bodies inject goal/loop
-    reminders as user-role messages (`<system-reminder>…</system-reminder>`);
-    those are model context, not input, so they are skipped when locating the
-    user's latest prompt — routing and queue-ordering assertions need the
-    actual typed text."""
+    """Text of the last real user input, excluding injected context messages."""
     for message in reversed(body.get("messages") or []):
         if message.get("role") != "user":
             continue
         content = message.get("content")
         if isinstance(content, str):
-            if content.lstrip().startswith("<system-reminder>"):
+            if is_internal_user_context(content):
                 continue
             return content
         if isinstance(content, list):
@@ -459,7 +533,7 @@ def last_user_text(body: dict[str, Any]) -> str:
                 for block in content
                 if isinstance(block, dict) and block.get("type") == "text"
             )
-            if text.lstrip().startswith("<system-reminder>"):
+            if is_internal_user_context(text):
                 continue
             return text
     return ""
@@ -506,6 +580,20 @@ def completed_tool_results(body: dict[str, Any], tool_name: str) -> list[str]:
             results[str(message["tool_call_id"])] = str(message.get("content") or "")
     return [results[call_id] for call_id in calls if call_id in results]
 
+def completed_tool_result_entries(body: dict[str, Any], tool_name: str) -> list[tuple[str, str]]:
+    calls: list[str] = []
+    results: dict[str, str] = {}
+    for message in body.get("messages") or []:
+        if message.get("role") == "assistant":
+            for call in message.get("tool_calls") or []:
+                function = call.get("function") or {}
+                call_id = call.get("id")
+                if function.get("name") == tool_name and call_id:
+                    calls.append(str(call_id))
+        elif message.get("role") == "tool" and message.get("tool_call_id"):
+            results[str(message["tool_call_id"])] = str(message.get("content") or "")
+    return [(call_id, results[call_id]) for call_id in calls if call_id in results]
+
 def last_real_message_is_tool_result(body: dict[str, Any]) -> bool:
     """True when the most recent real (non-system-reminder) message in the
     request body is a tool result — i.e. the agent already ran the tool and
@@ -540,16 +628,80 @@ def last_real_message_is_tool_result(body: dict[str, Any]) -> bool:
     return False
 
 
+
+def realtime_input_evidence(session: Any) -> dict[str, Any]:
+    """Safe evidence that create-call omitted the AVAS-rejected audio.input."""
+    audio = session.get("audio") if isinstance(session, dict) else None
+    return {"sessionInputOmitted": isinstance(audio, dict) and "input" not in audio}
+
+
+def realtime_session_frameless_v3_ok(session: dict[str, Any]) -> bool:
+    """Current create-call session: output voice + client delegation only."""
+    audio = session.get("audio")
+    audio_output = audio.get("output") if isinstance(audio, dict) else None
+    delegation = session.get("delegation")
+    return (
+        session.get("instructions") == ""
+        and "model" not in session
+        and "type" not in session
+        and isinstance(audio, dict)
+        and "input" not in audio
+        and isinstance(audio_output, dict)
+        and isinstance(audio_output.get("voice"), str)
+        and bool(audio_output["voice"].strip())
+        and isinstance(delegation, dict)
+        and delegation.get("type") == "client"
+    )
+
+
 class UserMockServer(BaseHTTPRequestHandler):
     scenario: str = ""
     serial = 0
 
     def do_POST(self) -> None:
         release = None
+        if self.path == REALTIME_RELEASE_PATH:
+            REALTIME_RELEASE.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+        if self.path in (SESSION_WORKER_HELD_PATH, SESSION_WORKER_STATS_PATH) and self.scenario == "sessions":
+            with SESSION_WORKER_LOCK:
+                snapshot = dict(SESSION_WORKER_STATS)
+                snapshot["held"] = SESSION_WORKER_HELD_COUNT
+                snapshot["assignments"] = {
+                    workflow_id: {
+                        "name": record["name"],
+                        "tasks": dict(record["tasks"]),
+                    }
+                    for workflow_id, record in SESSION_WORKER_STATS["assignments"].items()
+                }
+            body = (json.dumps(snapshot, separators=(",", ":")) + "\n").encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path == SESSION_WORKER_RELEASE_PATH and self.scenario == "sessions":
+            SESSION_WORKER_RELEASE.release()
+            body = b'{"released":true}\n'
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path == WORKER_RELEASE_PATH and self.scenario == "workflow" and HOLD_WORKERS:
             release = WORKER_RELEASE
         elif self.path == SESSION_RELEASE_PATH and self.scenario == "sessions":
             release = SESSION_RELEASE
+        elif self.path == STT_RELEASE_PATH and self.scenario == "sessions":
+            release = STT_RELEASE
+        elif self.path == STEERING_RELEASE_PATH and self.scenario in ("sessions", "steering"):
+            release = STEERING_RELEASE
+        elif self.path == MIDSTREAM_RELEASE_PATH and self.scenario == "steering":
+            release = MIDSTREAM_RELEASE
         if release is not None:
             release.set()
             body = b'{"released": true}\n'
@@ -558,59 +710,26 @@ class UserMockServer(BaseHTTPRequestHandler):
             self.send_header("content-length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-            return
-        # Codex Live realtime create-call proxy endpoint (web realtime
-        # coverage driver). The Rust realtime_create_call proxy (rpc.rs)
-        # POSTs a JSON body exactly {sdp, session} (Content-Type:
-        # application/json) with `OpenAI-Alpha: quicksilver=v2` and a Bearer
-        # token to `{realtimeBaseUrl}/v1/realtime/calls`. Reply with a
-        # Location header carrying an `rtc_` call id plus a bare SDP answer
-        # body; the E2E driver stubs the browser RTCPeerConnection, so the
-        # answer only needs to be a non-empty SDP-looking string.
+        # Codex Live realtime create-call proxy endpoint. The Rust proxy sends
+        # a JSON object containing SDP plus the AVAS-compatible session object:
+        # empty instructions, output voice, and client delegation. `audio.input`
+        # is rejected upstream and must remain absent. Never echo request values.
         if self.path == "/v1/realtime/calls":
             length = int(self.headers.get("content-length", "0"))
             raw_body = self.rfile.read(length)
-            # The create-call contract is a JSON body exactly {sdp, session};
-            # validate it before answering so a contract drift (multipart,
-            # missing fields, non-object session) fails loudly as a 400 rather
-            # than being silently consumed. Never echo the body or auth values.
             try:
                 payload = json.loads(raw_body)
-                sdp_value = payload.get("sdp") if isinstance(payload, dict) else None
-                session_value = payload.get("session") if isinstance(payload, dict) else None
-                if not isinstance(sdp_value, str) or not sdp_value.strip():
-                    raise ValueError("sdp must be a non-empty string")
-                if not isinstance(session_value, dict):
-                    raise ValueError("session must be an object")
-            except (ValueError, json.JSONDecodeError):
-                bad = b"mock realtime create-call requires a JSON body {sdp: string, session: object}\n"
-                self.send_response(400)
-                self.send_header("content-type", "text/plain")
-                self.send_header("content-length", str(len(bad)))
-                self.end_headers()
-                self.wfile.write(bad)
-                return
-            # Regression guard (web realtime_rpc lane R2): Codex Live
-            # create-call sessions must NOT carry a model — the proxy selects
-            # the model server-side, and a stale client that still sends
-            # session.model is exactly the regression this lane exists to
-            # catch. Reject such requests with the exact reported 400 body so
-            # the lane fails on the wire. Evidence records ONLY the
-            # sessionHasModel boolean — never the model value or the auth key.
-            # This contract check deliberately precedes the
-            # MOCK_REALTIME_ERROR knob below, whose 500 behavior is unchanged
-            # for the model-free sessions every lane sends.
-            session_has_model = session_value.get("model") is not None
-            if session_has_model:
+            except json.JSONDecodeError:
+                payload = None
+            session = payload.get("session") if isinstance(payload, dict) else None
+            sdp_value = payload.get("sdp") if isinstance(payload, dict) else None
+            keys_ok = isinstance(payload, dict) and sorted(payload.keys()) == ["sdp", "session"]
+            sdp_ok = isinstance(sdp_value, str) and bool(sdp_value.strip())
+            session_ok = isinstance(session, dict) and realtime_session_frameless_v3_ok(session)
+            if not keys_ok or not sdp_ok or not session_ok:
                 alpha = self.headers.get("OpenAI-Alpha", "")
                 auth = self.headers.get("Authorization", "")
                 content_type = self.headers.get("Content-Type", "")
-                print(
-                    f"user-mock scenario={type(self).scenario} "
-                    f"realtime_create_call_rejected session.model present",
-                    file=sys.stderr,
-                    flush=True,
-                )
                 evidence_file = os.environ.get("MOCK_REALTIME_EVIDENCE", "")
                 if evidence_file:
                     try:
@@ -621,7 +740,9 @@ class UserMockServer(BaseHTTPRequestHandler):
                                     "openaiAlpha": alpha,
                                     "authPresent": bool(auth),
                                     "contentType": content_type,
-                                    "sessionHasModel": True,
+                                    "sessionPresent": isinstance(session, dict),
+                                    "sessionValid": session_ok,
+                                    **realtime_input_evidence(session),
                                 },
                                 handle,
                             )
@@ -632,7 +753,7 @@ class UserMockServer(BaseHTTPRequestHandler):
                             file=sys.stderr,
                             flush=True,
                         )
-                bad = b"Field session.model is not allowed for this Codex realtime session"
+                bad = b"mock realtime create-call requires sdp and a complete session object\n"
                 self.send_response(400)
                 self.send_header("content-type", "text/plain")
                 self.send_header("content-length", str(len(bad)))
@@ -654,23 +775,21 @@ class UserMockServer(BaseHTTPRequestHandler):
                 return
             type(self).serial += 1
             call_id = f"rtc_e2e-{type(self).serial}"
-            # Record the proxy's required request headers for the E2E
-            # assertion (the web realtime coverage driver asserts
-            # OpenAI-Alpha: quicksilver=v2, the Bearer token, and the JSON
-            # Content-Type reached the backend) plus the sessionHasModel
-            # guard boolean (always false here — the guard above already
-            # rejected model-carrying sessions with a 400). Persisted when
-            # MOCK_REALTIME_EVIDENCE is set.
+            # Record only bounded contract metadata for E2E assertions. Never
+            # persist SDP, voice, token, or authorization values; the
+            # transcription-present/model classification is bounded and safe.
             alpha = self.headers.get("OpenAI-Alpha", "")
             auth = self.headers.get("Authorization", "")
             content_type = self.headers.get("Content-Type", "")
             print(
                 f"user-mock scenario={type(self).scenario} realtime_create_call "
                 f"call={call_id} alpha={alpha!r} auth_present={bool(auth)} "
-                f"content_type={content_type!r}",
+                f"content_type={content_type!r} session_present=true session_valid=true",
                 file=sys.stderr,
                 flush=True,
             )
+            if os.environ.get("MOCK_REALTIME_DELAY") == "1":
+                REALTIME_RELEASE.clear()
             evidence_file = os.environ.get("MOCK_REALTIME_EVIDENCE", "")
             if evidence_file:
                 try:
@@ -681,7 +800,9 @@ class UserMockServer(BaseHTTPRequestHandler):
                                 "openaiAlpha": alpha,
                                 "authPresent": bool(auth),
                                 "contentType": content_type,
-                                "sessionHasModel": session_has_model,
+                                "sessionPresent": True,
+                                "sessionValid": True,
+                                **realtime_input_evidence(session),
                             },
                             handle,
                         )
@@ -692,6 +813,8 @@ class UserMockServer(BaseHTTPRequestHandler):
                         file=sys.stderr,
                         flush=True,
                     )
+            if os.environ.get("MOCK_REALTIME_DELAY") == "1":
+                REALTIME_RELEASE.wait(30)
             body = b"v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=web-e2e-realtime-answer\r\n"
             self.send_response(200)
             self.send_header("location", f"/v1/realtime/calls/{call_id}")
@@ -711,9 +834,11 @@ class UserMockServer(BaseHTTPRequestHandler):
             raw = self.rfile.read(length)
             auth = self.headers.get("Authorization", "")
             content_type = self.headers.get("Content-Type", "")
-            # Evidence is written BEFORE the error knob so the error phase
-            # also proves the Rust proxy reached the mock with the server-held
+            # Evidence is written BEFORE the error/delay knobs so those paths
+            # also prove the Rust proxy reached the mock with the server-held
             # key. Metadata only — never the auth value or the audio body.
+            if os.environ.get("MOCK_STT_DELAY") == "1":
+                STT_RELEASE.clear()
             evidence_file = os.environ.get("MOCK_STT_EVIDENCE", "")
             if evidence_file:
                 try:
@@ -735,6 +860,8 @@ class UserMockServer(BaseHTTPRequestHandler):
                         file=sys.stderr,
                         flush=True,
                     )
+            if os.environ.get("MOCK_STT_DELAY") == "1":
+                STT_RELEASE.wait(30)
             # Error-path knob (web stt_rpc lane): MOCK_STT_ERROR=1 makes the
             # endpoint reject with 500 so the page surfaces the bounded
             # "transcription failed" toast.
@@ -815,6 +942,45 @@ class UserMockServer(BaseHTTPRequestHandler):
 
     def route(self, request_number: int, body: dict[str, Any]) -> bytes:
         scenario = type(self).scenario
+        if "restart-held task spawn" in last_user_text(body):
+            if completed_tool_results(body, "task"):
+                return stream_response([
+                    text_payload(f"user-mock-{request_number}", "restart-held task parent settled")
+                ])
+            return stream_response(
+                [
+                    tool_call_payload(
+                        f"user-mock-{request_number}",
+                        "call-restart-held-task",
+                        "task",
+                        {
+                            "name": "RestartWorker",
+                            "agent": "writer",
+                            "task": "restart-held-subagent: preserve exact identity across process restart",
+                        },
+                    )
+                ]
+            )
+        if scenario == "sessions" and "restart-held-subagent" in message_text(body):
+            held = HeldStream(
+                self.wfile,
+                request_number,
+                "restart-held-",
+                "subagent identity survived exactly-once",
+                SESSION_RELEASE,
+            )
+            HELD_STREAMS.append(held)
+            return held
+        if "restart-held-subagent" in message_text(body):
+            held = HeldStream(
+                self.wfile,
+                request_number,
+                "restart-held-",
+                "subagent identity survived exactly-once",
+                STEERING_RELEASE,
+            )
+            HELD_STREAMS.append(held)
+            return held
         if scenario == "xss":
             # The full hostile payload in one assistant text block; the web
             # client must escape it (inert text) and redact the credential-shaped secret.
@@ -829,6 +995,61 @@ class UserMockServer(BaseHTTPRequestHandler):
             # NOT contain "render rich content" (substring routing).
             if "render markdown extra branches" in last_user_text(body):
                 return stream_response([text_payload(f"user-mock-{request_number}", RICH_TEXT_EXTRA)])
+            # /chat SessionView scroll+geometry lane: a deliberately WIDE
+            # mermaid diagram (long-labeled LR chain, far beyond any
+            # viewport) so the transcript must classify it wide
+            # (data-mermaid-wide + intrinsic min-width) and the host
+            # viewport must scroll horizontally instead of shrinking.
+            # Additive: no existing route changes.
+            if "render wide mermaid" in last_user_text(body):
+                wide_stages = "\n".join(
+                    f'  S{index}[Stage {index} — long descriptive pipeline stage label {index}] '
+                    f'--> S{index + 1}[Stage {index + 1} — long descriptive pipeline stage label]'
+                    for index in range(8)
+                )
+                return stream_response([text_payload(
+                    f"user-mock-{request_number}",
+                    "## Wide diagram\n\n```mermaid\nflowchart LR\n" + wide_stages + "\n```\n",
+                )])
+            if "reconnect post restart" in last_user_text(body):
+                payload = text_payload(f"user-mock-{request_number}", "reconnect-post-restart-reply")
+                self.send_response(200)
+                self.send_header("content-type", "text/event-stream")
+                self.end_headers()
+                slow_stream_response(self.wfile, [payload], delay=0.0)
+                return None
+            # Failed-turn seed: HTTP 500 before any delta, so the provider
+            # errors and the turn settles as stopReason:"error" with its
+            # persisted errorMessage. The web turn-error lane proves the
+            # transcript renders that reason instead of an empty hole.
+            if "web turn error" in last_user_text(body):
+                error_body = json.dumps(
+                    {"error": {"message": "mock upstream failed", "type": "api_error"}},
+                    separators=(",", ":"),
+                ).encode()
+                self.send_response(500)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(error_body)))
+                self.end_headers()
+                self.wfile.write(error_body)
+                return None
+            # Mid-stream reconnect regression fixture: a slow stream whose
+            # FIRST delta lands immediately but whose terminal delta is gated
+            # behind POST /__release-midstream. The web reconnect lane proves
+            # the connected authority during an in-flight turn — the browser
+            # disconnects while this turn is genuinely streaming (the first
+            # delta is authoritative) and the gate holds the turn open, so a
+            # Send/Stop-mode-based authority could false-pass.
+            if "mid-stream gate" in last_user_text(body):
+                held = HeldStream(
+                    self.wfile,
+                    request_number,
+                    "mid-stream-head-",
+                    "mid-stream-done",
+                    MIDSTREAM_RELEASE,
+                )
+                HELD_STREAMS.append(held)
+                return held
             # Presentation tool-card seeds (coverage command-card driver):
             # each marker emits one real tool call and routes the completed
             # tool result through completed_tool_results so the runtime
@@ -895,6 +1116,82 @@ class UserMockServer(BaseHTTPRequestHandler):
                             f"call-presentation-read-{request_number}",
                             "read",
                             {"path": "logo.png"},
+                        )
+                    ]
+                )
+            # Oversized-grep driver: one REAL grep call against the seeded
+            # fixture (early.txt / huge.txt >64 MiB real text / later.txt).
+            # The streaming scanner must return all three matches in one
+            # call; the pre-fix walker aborted on huge.txt metadata size.
+            if "presentation oversized grep" in last_user_text(body):
+                if last_real_message_is_tool_result(body):
+                    return stream_response([text_payload(f"user-mock-{request_number}", "oversized grep complete")])
+                return stream_response(
+                    [
+                        tool_call_payload(
+                            f"user-mock-{request_number}",
+                            f"call-presentation-grep-{request_number}",
+                            "grep",
+                            {"pattern": "needle"},
+                        )
+                    ]
+                )
+            # Code-review read-only tool probes (P0 repro lane): the comment
+            # marker drives ONE real grep/read tool call, then the follow-up
+            # echoes the RAW tool-result content so the hunk thread shows
+            # whether the side-read-only tool executed (real match/contents)
+            # or failed closed (stub error text) — no mock interpretation.
+            if "cr grep probe" in last_user_text(body):
+                results = completed_tool_results(body, "grep")
+                if results:
+                    return stream_response([
+                        text_payload(f"user-mock-{request_number}", "cr-grep-echo: " + results[0][:300])
+                    ])
+                return stream_response(
+                    [
+                        tool_call_payload(
+                            f"user-mock-{request_number}",
+                            f"call-cr-grep-{request_number}",
+                            "grep",
+                            {"pattern": "needle"},
+                        )
+                    ]
+                )
+            if "cr read probe" in last_user_text(body):
+                results = completed_tool_results(body, "read")
+                if results:
+                    return stream_response([
+                        text_payload(f"user-mock-{request_number}", "cr-read-echo: " + results[0][:300])
+                    ])
+                return stream_response(
+                    [
+                        tool_call_payload(
+                            f"user-mock-{request_number}",
+                            f"call-cr-read-{request_number}",
+                            "read",
+                            {"path": "source.rs"},
+                        )
+                    ]
+                )
+            # Three identical failing grep calls prove backend/DOM identity
+            # reconciliation. Invalid regex is deterministic; the third
+            # failure trips the runtime doom-loop recovery.
+            if "presentation grep doom loop" in last_user_text(body):
+                completed = [
+                    content
+                    for call_id, content in completed_tool_result_entries(body, "grep")
+                    if call_id.startswith("call-presentation-grep-doom-")
+                ]
+                call_number = len(completed) + 1
+                if call_number > 3:
+                    return stream_response([text_payload(f"user-mock-{request_number}", "unexpected fourth grep")])
+                return stream_response(
+                    [
+                        tool_call_payload(
+                            f"user-mock-{request_number}",
+                            f"call-presentation-grep-doom-{call_number}",
+                            "grep",
+                            {"pattern": "["},
                         )
                     ]
                 )
@@ -1164,6 +1461,70 @@ class UserMockServer(BaseHTTPRequestHandler):
                         )
                     ]
                 )
+            # Details child (`web-e2e-subagent-details` only). Long paragraph,
+            # real read of the >100-char relative fixture, then grep, then a
+            # slow hold. Must precede the short `web-e2e-subagent` marker.
+            if "web-e2e-subagent-details" in message_text(body):
+                read_done = completed_tool_results(body, "read")
+                grep_done = completed_tool_results(body, "grep")
+                if read_done and grep_done:
+                    prose = (
+                        "details-hold paragraph stays running after the long read and the "
+                        "grep so Stop can cancel this child before the turn settles. "
+                    )
+                    chunks = [prose[index:index + 48] for index in range(0, len(prose), 48)]
+                    payloads = []
+                    for index, chunk in enumerate(chunks):
+                        payloads.append(
+                            {
+                                "id": f"user-mock-{request_number}-{index}",
+                                "model": "user-mock",
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"content": chunk},
+                                        "finish_reason": None if index < len(chunks) - 1 else "stop",
+                                    }
+                                ],
+                                "usage": {"prompt_tokens": 8, "completion_tokens": len(chunk), "total_tokens": 8 + len(chunk)},
+                            }
+                        )
+                    self.send_response(200)
+                    self.send_header("content-type", "text/event-stream")
+                    self.end_headers()
+                    slow_stream_response(self.wfile, payloads, delay=1.8)
+                    return None
+                if read_done:
+                    return stream_response(
+                        [
+                            tool_call_payload(
+                                f"user-mock-{request_number}",
+                                f"call-grep-details-{request_number}",
+                                "grep",
+                                {
+                                    "pattern": "DETAILSTAIL",
+                                    "path": "fixtures/subagent-details/workspace-relative/long-read-target-for-subagent-details-readability/long-relative-read-target.txt",
+                                },
+                            )
+                        ]
+                    )
+                paragraph = (
+                    "The first assistant paragraph of the details child is one unbroken "
+                    "sentence longer than two hundred forty characters so a one hundred "
+                    "twenty character history line cannot contain DETAILSTAIL by itself "
+                    "and the readable body keeps the full wording."
+                )
+                return stream_response(
+                    [
+                        text_payload(f"user-mock-{request_number}-prose", paragraph),
+                        tool_call_payload(
+                            f"user-mock-{request_number}",
+                            f"call-read-details-{request_number}",
+                            "read",
+                            {"path": "fixtures/subagent-details/workspace-relative/long-read-target-for-subagent-details-readability/long-relative-read-target.txt"},
+                        ),
+                    ]
+                )
             # Subagents-panel e2e: the spawned child's prompt carries the
             # marker text. The FIRST request makes the child really call the
             # `read` tool on the fixture's seed.txt (the runtime executes it,
@@ -1399,9 +1760,15 @@ class UserMockServer(BaseHTTPRequestHandler):
             # so the transcript renders a structured Task card.
             if "tool-card coverage task spawn" in last_user_text(body):
                 if completed_tool_results(body, "task"):
-                    return stream_response(
-                        [text_payload(f"user-mock-{request_number}", "task spawn complete")]
-                    )
+                    payloads = [
+                        text_payload(f"user-mock-{request_number}-{index}", chunk)
+                        for index, chunk in enumerate(["task ", "spawn ", "complete"])
+                    ]
+                    self.send_response(200)
+                    self.send_header("content-type", "text/event-stream")
+                    self.end_headers()
+                    slow_stream_response(self.wfile, payloads, delay=1.0)
+                    return None
                 return stream_response(
                     [
                         tool_call_payload(
@@ -1638,7 +2005,22 @@ class UserMockServer(BaseHTTPRequestHandler):
             #   supervisor planning -> todo init + acceptance (workflow lane)
             #   anything else       instant echo "sessions-reply: <prompt>"
             text = message_text(body)
-            user = last_user_text(body).strip()
+            raw_user = last_user_text(body)
+            # Web composer attachments ride the prompt as `File: <name>` +
+            # fenced-code segments (backend @-expansion uses <file> blocks);
+            # strip both shapes so exact routing matches the typed text only.
+            user = re.sub(r"File: [^\n]*\n`{3,}[^\n]*\n.*?\n`{3,}\s*", "", raw_user, flags=re.DOTALL)
+            user = re.sub(r"<file name=\"[^\"]*\">.*?</file>\s*", "", user, flags=re.DOTALL).strip()
+            if "rm-in-progress-task" in text or "rm-in-progress-task" in user:
+                held = HeldStream(
+                    self.wfile,
+                    request_number,
+                    "rm-in-progress-task/",
+                    "rm-in-progress-task-done",
+                    TODO_TASK_HOLD,
+                )
+                HELD_STREAMS.append(held)
+                return held
             if user == "sessions-slow-b3":
                 held = HeldStream(
                     self.wfile,
@@ -1683,20 +2065,81 @@ class UserMockServer(BaseHTTPRequestHandler):
                     return None
             supervisor = SUPERVISOR_RE.search(text)
             if supervisor:
-                if completed_tool_results(body, "todo"):
+                if supervisor.group(2).strip() == "sessions-fail-closed-objective":
+                    return stream_response(
+                        [text_payload(f"user-mock-{request_number}", "deterministic planning rejection")]
+                    )
+                with SESSION_WORKER_LOCK:
+                    SESSION_WORKER_STATS["planning"] += 1
+                todo_results = completed_tool_results(body, "todo")
+                if len(todo_results) >= 2:
                     return stream_response(
                         [text_payload(f"user-mock-{request_number}", "workflow plan accepted")]
                     )
+                if todo_results:
+                    workflow_id = supervisor.group(1)
+                    objective = supervisor.group(2).strip()
+                    compile_content = f"compile widget [workflowId={workflow_id};name={objective}]"
+                    ship_content = f"ship widget [workflowId={workflow_id};name={objective}]"
+                    # The init result carries the runtime-assigned stable
+                    # task ids; add_dependency targets IDs only. Missing or
+                    # ambiguous ids raise (fail closed) instead of emitting a
+                    # content-keyed edge the DAG could never resolve.
+                    task_ids = todo_task_ids(todo_results[0], (compile_content, ship_content))
+                    return stream_response(
+                        [
+                            tool_call_payload(
+                                f"user-mock-{request_number}",
+                                f"call-sessions-dependency-{request_number}",
+                                "todo",
+                                {
+                                    "op": "add_dependency",
+                                    "task": task_ids[ship_content],
+                                    "dependsOn": [task_ids[compile_content]],
+                                },
+                            )
+                        ]
+                    )
+                workflow_id = supervisor.group(1)
                 return stream_response(
                     [
                         tool_call_payload(
                             f"user-mock-{request_number}",
                             f"call-sessions-todo-{request_number}",
                             "todo",
-                            todo_init([("Build", ["compile widget"]), ("Ship", ["ship widget"])]),
+                            todo_init([
+                                ("Build", [f"compile widget [workflowId={workflow_id};name={supervisor.group(2).strip()}]"]),
+                                ("Ship", [f"ship widget [workflowId={workflow_id};name={supervisor.group(2).strip()}]"]),
+                            ]),
                         )
                     ]
                 )
+            assignment = DELEGATED_RE.search(text)
+            if assignment:
+                task = assignment.group(1).strip()
+                ownership = re.search(r"\[workflowId=(?P<workflow>[^;\[\]]+);name=(?P<name>[^\[\]]+)\]", task)
+                task_key = "compile" if "compile widget" in task else "ship" if "ship widget" in task else None
+                if ownership is None or task_key is None:
+                    raise ValueError(f"sessions workflow assignment omitted exact workflow identity: {task!r}")
+                workflow_id = ownership.group("workflow")
+                workflow_name = ownership.group("name")
+                with SESSION_WORKER_LOCK:
+                    SESSION_WORKER_STATS["workers"] += 1
+                    assignments = SESSION_WORKER_STATS["assignments"]
+                    record = assignments.setdefault(workflow_id, {"name": workflow_name, "tasks": {}})
+                    if record["name"] != workflow_name:
+                        raise ValueError(f"sessions workflow assignment name changed for {workflow_id}")
+                    tasks = record["tasks"]
+                    tasks[task_key] = int(tasks.get(task_key, 0)) + 1
+                held = HeldStream(
+                    self.wfile,
+                    request_number,
+                    f"worker started: {task}",
+                    f"worker completed: {task}",
+                    SESSION_WORKER_RELEASE,
+                )
+                HELD_STREAMS.append(held)
+                return held
             return stream_response(
                 [text_payload(f"user-mock-{request_number}", f"sessions-reply: {user}")]
             )
@@ -1789,6 +2232,7 @@ class UserMockServer(BaseHTTPRequestHandler):
             # route by number). Prompts:
             #   slowclient-burst-<N>-<bytes>          N deltas, back-to-back
             #   slowclient-burstslow-<N>-<bytes>-<d>  N deltas at <d>s cadence
+            #   slowclient-burstslow-<N>-<bytes>-<d>-<salt>  same, scoped markers
             #   slowclient-heavy-<count>              one heavy final message
             user = last_user_text(body).strip()
             burst = re.fullmatch(r"slowclient-burst-(\d+)-(\d+)", user)
@@ -1816,15 +2260,22 @@ class UserMockServer(BaseHTTPRequestHandler):
                         }
                     )
                 return stream_response(payloads)
-            burstslow = re.fullmatch(r"slowclient-burstslow-(\d+)-(\d+)-([0-9.]+)", user)
+            burstslow = re.fullmatch(r"slowclient-burstslow-(\d+)-(\d+)-([0-9.]+)(?:-([A-Za-z0-9]+))?", user)
             if burstslow:
                 count = int(burstslow.group(1))
                 size = int(burstslow.group(2))
                 delay = float(burstslow.group(3))
-                prefix = f"s{count}:"
+                salt = burstslow.group(4)
+                # An optional trailing salt makes the chunk prefix AND the done
+                # marker unique per request, so a web lane can anchor a stall
+                # to THIS flood's first delta even when the transcript already
+                # contains an earlier identical-count burst (the slow-client
+                # C4 combos re-use n=8000 and must not confuse the two floods).
+                prefix = f"s{count}:{salt}:" if salt else f"s{count}:"
+                done_marker = f"slowclient-done-{count}-{salt}" if salt else f"slowclient-done-{count}"
                 payloads = []
                 for index in range(count):
-                    chunk = f"slowclient-done-{count}" if index == count - 1 else f"{prefix}{index}/"
+                    chunk = done_marker if index == count - 1 else f"{prefix}{index}/"
                     if len(chunk) < size:
                         chunk = chunk + "x" * (size - len(chunk))
                     payloads.append(
@@ -1869,6 +2320,52 @@ class UserMockServer(BaseHTTPRequestHandler):
                 )
                 return stream_response([text_payload(f"user-mock-{request_number}", heavy_text)])
             return stream_response([text_payload(f"user-mock-{request_number}", f"slowclient-unrouted: {user}")])
+        if scenario == "orchestration":
+            user = last_user_text(body)
+            if user.strip() == "Have researcher study this":
+                spawned = bool(getattr(type(self), "_orch_researcher_tool", False))
+                print(
+                    f"user-mock orchestration researcher request#{request_number} "
+                    f"spawned={spawned} tools={sorted(tool_names(body))}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if spawned:
+                    return stream_response(
+                        [text_payload(f"user-mock-{request_number}", "researcher-study-complete")]
+                    )
+                type(self)._orch_researcher_tool = True
+                return stream_response(
+                    [
+                        tool_call_payload(
+                            f"user-mock-{request_number}",
+                            f"call-researcher-{request_number}",
+                            "task",
+                            {
+                                "context": (
+                                    "# Goal\nStudy the assigned topic\n\n"
+                                    "# Constraints\nStay in the workspace\n\n"
+                                    "# Contract\nReport findings"
+                                ),
+                                "tasks": [
+                                    {
+                                        "name": "Study",
+                                        "agent": "researcher",
+                                        "task": "Have researcher study this",
+                                        "context": "Study the assigned topic in this workspace.",
+                                    }
+                                ],
+                            },
+                        )
+                    ]
+                )
+            if user.strip() == "Use research for this":
+                return stream_response(
+                    [text_payload(f"user-mock-{request_number}", "skill-only-research")]
+                )
+            return stream_response(
+                [text_payload(f"user-mock-{request_number}", "orchestration-unrouted")]
+            )
         return stream_response([text_payload(f"user-mock-{request_number}", "unrouted")])
 
     def log_message(self, _format: str, *_args: object) -> None:
@@ -1877,7 +2374,7 @@ class UserMockServer(BaseHTTPRequestHandler):
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scenario", required=True, choices=["steering", "bash-card", "todo-dag", "workflow", "xss", "sessions", "scroll", "slowclient"])
+    parser.add_argument("--scenario", required=True, choices=["steering", "bash-card", "todo-dag", "workflow", "xss", "sessions", "scroll", "slowclient", "orchestration"])
     parser.add_argument("--port-file", required=True)
     parser.add_argument(
         "--hold-workers",
@@ -1889,9 +2386,11 @@ def main() -> None:
     HOLD_WORKERS = args.hold_workers
     WORKER_RELEASE.clear()
     SESSION_RELEASE.clear()
+    MIDSTREAM_RELEASE.clear()
     HELD_STREAMS.clear()
     UserMockServer.serial = 0
     UserMockServer.scenario = args.scenario
+    UserMockServer._orch_researcher_tool = False
     # Threaded: held streams wait while the control endpoint accepts their
     # release POST. Other scenario requests also retain concurrency headroom.
     server = ThreadingHTTPServer(("127.0.0.1", 0), UserMockServer)

@@ -8,21 +8,22 @@ use std::{
 use anyhow::Result;
 use anyhow::anyhow;
 use pi_agent::{AbortController, AgentToolResult, ThinkingLevel, ToolCapability};
+use pi_ai::providers::{FauxProviderOptions, FauxProviderRegistration, register_faux_provider};
 use pi_ai::{
     AssistantMessageEvent, AssistantMessageEventStream, ContentBlock, Context, Message, Model,
     SimpleStreamOptions, StopReason, UserMessage, get_api_provider, is_extension_provider,
-    stream_simple,
+    replace_registered_models, stream_simple,
 };
 use pi_coding::{
-    ExtensionActionHost, ExtensionCancellation, ExtensionCapability, ExtensionContextSnapshot,
-    ExtensionEvent, ExtensionInputReduction, ExtensionInstanceId, ExtensionManifestRuntime,
-    ExtensionMode, ExtensionOrigin, ExtensionPermissionSet, ExtensionRuntime,
-    ExtensionRuntimeAction, ExtensionRuntimeOptions, ExtensionSpec, ExtensionSpecRuntime,
-    ExtensionThemeDescriptor, ExtensionUiCapability, ExtensionUiContext,
-    ExtensionUiHost, ExtensionUiRequest, ExtensionUiResponse,
-    PackageResourceKind, PackageResourceSpec, PackageScope,
-    ProcessExtensionManifest, Session, SessionOptions, UiNotificationLevel, UiWidgetPlacement,
-    WorkingIndicatorOptions, extension_spec_from_package_resource,
+    Application, ApplicationRuntimeCandidate, ExtensionCancellation, ExtensionCapability,
+    ExtensionEvent, ExtensionInputReduction, ExtensionManifestRuntime, ExtensionMode,
+    ExtensionOrigin, ExtensionPermissionSet, ExtensionRuntime, ExtensionRuntimeOptions,
+    ExtensionSpec, ExtensionSpecRuntime, ExtensionThemeDescriptor, ExtensionUiCapability,
+    ExtensionUiContext, ExtensionUiHost, ExtensionUiRequest, ExtensionUiResponse,
+    PackageResourceKind, PackageResourceSpec, PackageScope, ProcessExtensionManifest,
+    ResourceDiscovery, ResourceManager, ResourceManagerOptions, Session, SessionOptions,
+    ToolSelection, UiNotificationLevel, UiWidgetPlacement, WorkingIndicatorOptions,
+    extension_spec_from_package_resource, start_session_in,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -31,6 +32,7 @@ fn resource(path: PathBuf, trusted: bool) -> PackageResourceSpec {
     PackageResourceSpec {
         kind: PackageResourceKind::Extension,
         path,
+        managed_root: None,
         package_id: "test-package".to_owned(),
         scope: PackageScope::Project,
         trusted,
@@ -51,6 +53,187 @@ fn write_quickjs_package(root: &TempDir, entry: &str) -> Result<PathBuf> {
         }))?,
     )?;
     Ok(manifest)
+}
+struct ExtensionFauxRegistration {
+    registration: FauxProviderRegistration,
+    model_key: (String, String),
+}
+
+impl Drop for ExtensionFauxRegistration {
+    fn drop(&mut self) {
+        self.registration.unregister();
+        replace_registered_models(&[self.model_key.clone()], Vec::new());
+    }
+}
+fn register_extension_faux_model(model: &Model) -> ExtensionFauxRegistration {
+    ExtensionFauxRegistration {
+        registration: register_faux_provider(FauxProviderOptions {
+            api: model.api.clone(),
+            provider: model.provider.clone(),
+            models: vec![model.clone()],
+            chunk_size: 1,
+        }),
+        model_key: (model.provider.clone(), model.id.clone()),
+    }
+}
+
+async fn bootstrap_extension_application(
+    runtime: ExtensionRuntime,
+    specs: &[ExtensionSpec],
+) -> Result<(Application, ExtensionFauxRegistration)> {
+    bootstrap_extension_application_with_agent_settings(
+        runtime,
+        specs,
+        r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+    )
+    .await
+}
+
+/// `bootstrap_extension_application` with a caller-chosen agent settings
+/// body, so fail-closed sandbox policy proofs (denied working directories)
+/// can stage the same governed extension bootstrap under a different policy.
+async fn bootstrap_extension_application_with_agent_settings(
+    runtime: ExtensionRuntime,
+    specs: &[ExtensionSpec],
+    agent_settings: &str,
+) -> Result<(Application, ExtensionFauxRegistration)> {
+    let first = specs
+        .first()
+        .ok_or_else(|| anyhow!("extension fixture is empty"))?;
+    let cwd = first.working_directory.clone();
+    let mut resource_options = ResourceManagerOptions::new(&cwd);
+    let agent_dir_outside_project = cwd
+        .parent()
+        .ok_or_else(|| anyhow!("extension fixture cwd has no parent"))?
+        .join(format!(
+            "{}-agent",
+            cwd.file_name()
+                .ok_or_else(|| anyhow!("extension fixture cwd has no file name"))?
+                .to_string_lossy()
+        ));
+    resource_options.agent_dir = agent_dir_outside_project;
+    std::fs::create_dir_all(&resource_options.agent_dir)?;
+    resource_options.disable_skills = true;
+    std::fs::write(
+        resource_options.agent_dir.join("settings.json"),
+        agent_settings,
+    )?;
+    resource_options.disable_prompt_templates = true;
+    resource_options.disable_themes = true;
+    resource_options.disable_context_files = true;
+    resource_options.project_trust_override = Some(specs.iter().all(|spec| spec.project_trusted));
+    resource_options.explicit_extension_paths = specs
+        .iter()
+        .map(|spec| spec.working_directory.join("pi-extension.json"))
+        .collect();
+    let resources = ResourceManager::new(resource_options)?;
+    let session_dir = cwd.join(".pi-test-sessions");
+    let suffix = uuid::Uuid::now_v7();
+    let model = Model {
+        id: format!("extension-fixture-model-{suffix}"),
+        name: "Extension Fixture Model".to_owned(),
+        api: format!("extension-fixture-api-{suffix}"),
+        provider: format!("extension-fixture-provider-{suffix}"),
+        base_url: "http://localhost:0".to_owned(),
+        ..Model::default()
+    };
+    let registration = register_extension_faux_model(&model);
+    std::fs::create_dir_all(&session_dir)?;
+    let session = Session::new_with_additional_tools_filtered_and_discovery(
+        SessionOptions {
+            model: model.clone(),
+            cwd: cwd.clone(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: Some(Arc::new(|_model| {
+                Box::pin(async {
+                    Ok(pi_coding::RequestAuth {
+                        api_key: "extension-fixture".to_owned(),
+                        ..pi_coding::RequestAuth::default()
+                    })
+                })
+            })),
+            auth_manager: None,
+        },
+        Vec::new(),
+        ToolSelection::default(),
+        ResourceDiscovery::Disabled,
+    )?;
+    session.set_session_dir(session_dir.clone());
+    let recorder = start_session_in(
+        &cwd,
+        Some(&model),
+        Some("off"),
+        Some(&session_dir),
+        None,
+        None,
+    )?;
+    session.record(recorder)?;
+    session.attach_resources(resources).await?;
+    let application = Application::from_runtime_candidate(
+        ApplicationRuntimeCandidate::new(session)
+            .with_extensions(runtime, ExtensionPermissionSet::allow_all()),
+    )
+    .await?;
+    Ok((application, registration))
+}
+
+#[derive(Debug)]
+struct ExtensionBootstrapFailure {
+    message: String,
+}
+
+struct LoadedExtensionRuntime {
+    application: Option<Application>,
+    runtime: ExtensionRuntime,
+    registration: Option<ExtensionFauxRegistration>,
+    failures: Vec<ExtensionBootstrapFailure>,
+}
+
+impl LoadedExtensionRuntime {
+    fn application(&self) -> &Application {
+        self.application
+            .as_ref()
+            .expect("extension application loaded")
+    }
+}
+
+impl std::ops::Deref for LoadedExtensionRuntime {
+    type Target = ExtensionRuntime;
+
+    fn deref(&self) -> &Self::Target {
+        &self.runtime
+    }
+}
+
+async fn load_extension_runtime(
+    runtime: ExtensionRuntime,
+    specs: &[ExtensionSpec],
+) -> Result<LoadedExtensionRuntime> {
+    let application = bootstrap_extension_application(runtime.clone(), specs).await;
+    let (application, registration, failures) = match application {
+        Ok((application, registration)) => (Some(application), Some(registration), Vec::new()),
+        Err(error) => (
+            None,
+            None,
+            vec![ExtensionBootstrapFailure {
+                message: format!("{error:#}"),
+            }],
+        ),
+    };
+    Ok(LoadedExtensionRuntime {
+        application,
+        runtime,
+        failures,
+        registration,
+    })
 }
 
 #[test]
@@ -76,7 +259,10 @@ fn legacy_process_manifest_deserializes_unchanged() -> Result<()> {
 #[test]
 fn quickjs_manifest_rejects_untrusted_traversal_and_unsupported_entry() -> Result<()> {
     let untrusted = TempDir::new()?;
-    std::fs::write(untrusted.path().join("index.mjs"), "export default () => {}")?;
+    std::fs::write(
+        untrusted.path().join("index.mjs"),
+        "export default () => {}",
+    )?;
     let manifest = write_quickjs_package(&untrusted, "index.mjs")?;
     let error = extension_spec_from_package_resource(&resource(manifest, false))
         .expect_err("untrusted project QuickJS extension must fail closed");
@@ -98,9 +284,7 @@ fn quickjs_manifest_rejects_untrusted_traversal_and_unsupported_entry() -> Resul
     let error = extension_spec_from_package_resource(&resource(manifest, true))
         .expect_err("unsupported entry must fail closed");
     assert!(
-        error
-            .to_string()
-            .contains("must end in .js or .mjs"),
+        error.to_string().contains("must end in .js or .mjs"),
         "{error:#}"
     );
     Ok(())
@@ -174,9 +358,13 @@ export default function (pi) {
     assert!(spec.project_trusted);
 
     let runtime = ExtensionRuntime::process(Some(Arc::new(NotifyUi)), quickjs_options());
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert!(report.failures.is_empty(), "{:?}", report.failures);
-    assert_eq!(runtime.generation(), 1, "first trusted load must mint generation 1");
+    assert_eq!(
+        runtime.generation(),
+        1,
+        "first trusted load must mint generation 1"
+    );
 
     let command_names = runtime
         .commands()
@@ -185,11 +373,7 @@ export default function (pi) {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         command_names,
-        BTreeSet::from([
-            "hello".to_owned(),
-            "alpha".to_owned(),
-            "beta".to_owned()
-        ])
+        BTreeSet::from(["hello".to_owned(), "alpha".to_owned(), "beta".to_owned()])
     );
     assert_eq!(runtime.tools()[0].name, "echo_quickjs");
     assert_eq!(
@@ -283,7 +467,7 @@ export default function (pi) {
             ..quickjs_options()
         },
     );
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert!(report.failures.is_empty(), "{:?}", report.failures);
     let error = runtime
         .invoke_command("oversized", String::new(), None, None)
@@ -345,16 +529,86 @@ async fn project_local_untrusted_executable_extension_is_refused() -> Result<()>
         permissions,
     );
     let runtime = ExtensionRuntime::process(None, ExtensionRuntimeOptions::default());
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
     assert!(
         report.failures[0]
             .message
-            .contains("refusing to execute untrusted project extension"),
+            .contains("explicit project extension requires project trust"),
         "{}",
         report.failures[0].message
     );
     assert!(runtime.commands().is_empty());
+    runtime.shutdown().await;
+    Ok(())
+}
+
+/// Fail-closed validation: a process extension whose working directory is
+/// claimed denied by `sandbox.deniedPaths` cannot launch through the governed
+/// process-extension path. The product refuses the unrestricted-mode +
+/// denied-path combination at policy construction — before any extension
+/// child could start — and the refusal is deterministic on every host (no
+/// launcher probe, no kernel feature). A regression that silently drops
+/// `deniedPaths` (letting an extension inside a denied path run) or spawns
+/// the child before the policy rejects fails here.
+#[tokio::test]
+async fn governed_process_extension_denied_cwd_fails_closed() -> Result<()> {
+    let root = TempDir::new()?;
+    let sentinel = root.path().join("denied-cwd-child-started");
+    let executable = root.path().join("payload.sh");
+    std::fs::write(
+        &executable,
+        format!("#!/bin/sh\ntouch '{}'\n", sentinel.display()),
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&executable)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions)?;
+    }
+    let manifest = root.path().join("pi-extension.json");
+    std::fs::write(
+        &manifest,
+        serde_json::to_vec_pretty(&json!({
+            "schemaVersion": 1,
+            "id": "denied-cwd",
+            "runtime": "process",
+            "executable": "payload.sh",
+            "capabilities": ["commands"]
+        }))?,
+    )?;
+    let spec = extension_spec_from_package_resource(&resource(manifest, true))?;
+    assert_eq!(spec.working_directory, root.path(), "fixture precondition");
+
+    let runtime = ExtensionRuntime::process(None, ExtensionRuntimeOptions::default());
+    let settings = serde_json::to_string(&json!({
+        "sandbox": {
+            "mode": "danger-full-access",
+            "deniedPaths": [root.path()],
+        }
+    }))?;
+    let outcome =
+        bootstrap_extension_application_with_agent_settings(runtime.clone(), &[spec], &settings)
+            .await;
+    let error = match outcome {
+        Ok(_) => panic!("an extension inside sandbox.deniedPaths must fail the governed bootstrap"),
+        Err(error) => error,
+    };
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("deniedPaths") && message.contains("conflicting"),
+        "the failure must name the denied-path policy conflict, got: {message}"
+    );
+    assert!(
+        !sentinel.exists(),
+        "the extension child must never start when its working directory is denied"
+    );
+    assert_eq!(
+        runtime.generation(),
+        0,
+        "no extension generation may be staged when the policy rejects the working directory"
+    );
     runtime.shutdown().await;
     Ok(())
 }
@@ -387,7 +641,7 @@ export default function (pi) {
     let manifest_path = write_quickjs_package(&root, "index.mjs")?;
     let spec = extension_spec_from_package_resource(&resource(manifest_path, true))?;
     let runtime = ExtensionRuntime::process(None, quickjs_options());
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert!(report.failures.is_empty(), "{:?}", report.failures);
 
     let result = runtime
@@ -437,10 +691,10 @@ export default function (pi) {
         }))?,
     )?;
     let good_spec = extension_spec_from_package_resource(&resource(good_manifest, true))?;
-
     let runtime = ExtensionRuntime::process(None, quickjs_options());
-    let loaded = runtime.load(vec![good_spec]).await;
+    let loaded = load_extension_runtime(runtime.clone(), &[good_spec]).await?;
     assert!(loaded.failures.is_empty(), "{:?}", loaded.failures);
+    let application = loaded.application();
     let generation = runtime.generation();
     assert_eq!(generation, 1);
     assert_eq!(
@@ -450,38 +704,18 @@ export default function (pi) {
         json!("stable-ok")
     );
 
-    // Invalid candidate: factory throws during load so validate-then-apply discards.
-    let bad = TempDir::new()?;
     std::fs::write(
-        bad.path().join("index.mjs"),
+        good.path().join("index.mjs"),
         "export default function () { throw new Error('intentional reload failure'); }\n",
     )?;
-    let bad_manifest = bad.path().join("pi-extension.json");
-    std::fs::write(
-        &bad_manifest,
-        serde_json::to_vec_pretty(&json!({
-            "schemaVersion": 1,
-            "id": "broken-ext",
-            "runtime": "quickjs",
-            "entry": "index.mjs",
-            "capabilities": ["commands"]
-        }))?,
-    )?;
-    let bad_spec = extension_spec_from_package_resource(&resource(bad_manifest, true))?;
-
-    let failed = runtime.reload(vec![bad_spec]).await;
-    assert_eq!(failed.failures.len(), 1, "{:?}", failed.failures);
+    let error = application
+        .reload()
+        .await
+        .expect_err("invalid extension update must reject application reload");
+    let message = format!("{error:#}").to_ascii_lowercase();
     assert!(
-        failed.failures[0]
-            .message
-            .to_ascii_lowercase()
-            .contains("intentional reload failure")
-            || failed.failures[0]
-                .message
-                .to_ascii_lowercase()
-                .contains("load"),
-        "reload failure should be actionable: {}",
-        failed.failures[0].message
+        message.contains("intentional reload failure") || message.contains("load"),
+        "reload failure should be actionable: {message}"
     );
     assert_eq!(
         runtime.generation(),
@@ -502,42 +736,6 @@ export default function (pi) {
             .await?,
         json!("stable-ok"),
         "prior generation must remain fully callable after invalid reload"
-    );
-
-    // stage + discard path also preserves the live generation.
-    let missing_root = TempDir::new()?;
-    let permissions = ExtensionPermissionSet {
-        capabilities: BTreeSet::from([ExtensionCapability::Commands]),
-        ui_capabilities: BTreeSet::<ExtensionUiCapability>::new(),
-    };
-    let missing_spec = ExtensionSpec::new_runtime(
-        "missing-entry",
-        ExtensionSpecRuntime::QuickJs {
-            entry: missing_root.path().join("missing.mjs"),
-        },
-        missing_root.path(),
-        ExtensionOrigin::Project,
-        true,
-        permissions,
-    );
-    let candidate = runtime.stage_reload(vec![missing_spec]).await;
-    let staged = candidate.report();
-    assert!(
-        !staged.failures.is_empty(),
-        "missing QuickJS entry must fail during stage_reload: {staged:?}"
-    );
-    assert!(
-        staged.loaded.is_empty(),
-        "failed stage must not report loaded instances"
-    );
-    assert_eq!(runtime.generation(), generation);
-    runtime.discard_reload(candidate).await;
-    assert_eq!(runtime.generation(), generation);
-    assert_eq!(
-        runtime
-            .invoke_command("stable", String::new(), None, None)
-            .await?,
-        json!("stable-ok")
     );
 
     runtime.shutdown().await;
@@ -567,6 +765,31 @@ fn quickjs_package(root: &TempDir, entry: &str, capabilities: &[&str]) -> Result
         }))?,
     )?;
     Ok(manifest)
+}
+fn quickjs_phase4_package(root: &TempDir) -> Result<(PathBuf, Model)> {
+    let manifest = quickjs_package(
+        root,
+        "quickjs-phase4.mjs",
+        &["commands", "tools", "session_actions"],
+    )?;
+    let suffix = uuid::Uuid::now_v7();
+    let model = Model {
+        id: format!("phase4-model-{suffix}"),
+        name: "Phase 4 Model".to_owned(),
+        api: format!("phase4-api-{suffix}"),
+        provider: format!("phase4-provider-{suffix}"),
+        base_url: "http://localhost:0".to_owned(),
+        reasoning: true,
+        ..Model::default()
+    };
+    let entry = root.path().join("quickjs-phase4.mjs");
+    let source = std::fs::read_to_string(&entry)?
+        .replace("test-model", &model.id)
+        .replace("fixture-provider", &model.provider)
+        .replace("openai-completions", &model.api)
+        .replace("https://fixture.invalid/v1", &model.base_url);
+    std::fs::write(entry, source)?;
+    Ok((manifest, model))
 }
 
 /// `quickjs_package` variant that also grants the extension's UI capabilities
@@ -604,115 +827,6 @@ fn quickjs_options() -> ExtensionRuntimeOptions {
         hook_timeout: Duration::from_secs(10),
         shutdown_timeout: Duration::from_secs(5),
         ..ExtensionRuntimeOptions::default()
-    }
-}
-
-/// A minimal but valid context snapshot for the test action hosts. The host
-/// contract rejects real snapshot errors, so the fixtures must answer with a
-/// valid snapshot rather than a shortcut error.
-fn test_context_snapshot() -> ExtensionContextSnapshot {
-    ExtensionContextSnapshot {
-        session_name: None,
-        session_id: None,
-        session_file: None,
-        is_idle: true,
-        project_trusted: true,
-        has_pending_messages: false,
-        context_usage: None,
-        active_tools: Vec::new(),
-        all_tools: Vec::new(),
-        commands: Vec::new(),
-        flag_values: std::collections::BTreeMap::new(),
-        system_prompt: String::new(),
-        model: None,
-        thinking_level: pi_agent::ThinkingLevel::default(),
-    }
-}
-
-/// Action host that answers `SetSessionName` so the JS-side action round-trip
-/// can be exercised end to end.
-#[derive(Default)]
-struct RecordingActionHost;
-
-impl ExtensionActionHost for RecordingActionHost {
-    fn context_snapshot(&self) -> pi_coding::ExtensionFuture<'_, Result<ExtensionContextSnapshot>> {
-        Box::pin(async { Ok(test_context_snapshot()) })
-    }
-
-    fn request(
-        &self,
-        _instance: ExtensionInstanceId,
-        action: ExtensionRuntimeAction,
-        _cancellation: ExtensionCancellation,
-    ) -> pi_coding::ExtensionFuture<'_, Result<Value>> {
-        Box::pin(async move {
-            match action {
-                ExtensionRuntimeAction::SetSessionName { name } => Ok(json!({ "name": name })),
-                other => Err(anyhow!("unexpected extension action {other:?}")),
-            }
-        })
-    }
-}
-
-/// Action host for the Phase 4 surface: records every action (so tests can
-/// assert exact payload shapes and use an action round-trip as a readiness
-/// signal) and answers each action with a deterministic, echo-style value.
-/// `SetModel` returns the boolean the acceptance contract expects.
-#[derive(Default)]
-struct Phase4ActionHost {
-    actions: Arc<Mutex<Vec<ExtensionRuntimeAction>>>,
-}
-
-impl ExtensionActionHost for Phase4ActionHost {
-    fn context_snapshot(&self) -> pi_coding::ExtensionFuture<'_, Result<ExtensionContextSnapshot>> {
-        Box::pin(async { Ok(test_context_snapshot()) })
-    }
-
-    fn request(
-        &self,
-        _instance: ExtensionInstanceId,
-        action: ExtensionRuntimeAction,
-        _cancellation: ExtensionCancellation,
-    ) -> pi_coding::ExtensionFuture<'_, Result<Value>> {
-        let actions = self.actions.clone();
-        Box::pin(async move {
-            actions.lock().unwrap().push(action.clone());
-            match action {
-                ExtensionRuntimeAction::SetModel { .. } => Ok(json!(true)),
-                ExtensionRuntimeAction::SetThinkingLevel { level } => {
-                    Ok(json!({ "level": format!("{level:?}") }))
-                }
-                ExtensionRuntimeAction::SetActiveTools { tool_names } => {
-                    Ok(json!({ "tools": tool_names }))
-                }
-                ExtensionRuntimeAction::SetLabel { entry_id, label } => {
-                    Ok(json!({ "entryId": entry_id, "label": label }))
-                }
-                ExtensionRuntimeAction::AppendEntry { custom_type, data } => {
-                    Ok(json!({ "customType": custom_type, "data": data }))
-                }
-                ExtensionRuntimeAction::SendMessage {
-                    message,
-                    delivery,
-                    trigger_turn,
-                } => Ok(json!({
-                    "customType": message.custom_type,
-                    "delivery": format!("{delivery:?}"),
-                    "triggerTurn": trigger_turn,
-                })),
-                ExtensionRuntimeAction::SendUserMessage { content, delivery } => {
-                    Ok(json!({ "content": content, "delivery": format!("{delivery:?}") }))
-                }
-                ExtensionRuntimeAction::Abort => Ok(json!({ "action": "abort" })),
-                ExtensionRuntimeAction::Shutdown => Ok(json!({ "action": "shutdown" })),
-                ExtensionRuntimeAction::Compact { custom_instructions } => {
-                    Ok(json!({ "customInstructions": custom_instructions }))
-                }
-                ExtensionRuntimeAction::WaitForIdle => Ok(json!({ "action": "wait_for_idle" })),
-                ExtensionRuntimeAction::Reload => Ok(json!({ "action": "reload" })),
-                other => Err(anyhow!("unexpected extension action {other:?}")),
-            }
-        })
     }
 }
 
@@ -784,9 +898,13 @@ async fn trusted_quickjs_manifest_registers_js_commands_and_tools() -> Result<()
     assert!(spec.project_trusted);
 
     let runtime = ExtensionRuntime::process(None, quickjs_options());
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert!(report.failures.is_empty(), "{:?}", report.failures);
-    assert_eq!(runtime.generation(), 1, "first trusted load must mint generation 1");
+    assert_eq!(
+        runtime.generation(),
+        1,
+        "first trusted load must mint generation 1"
+    );
 
     let command_names = runtime
         .commands()
@@ -836,7 +954,7 @@ async fn quickjs_works_without_bun() -> Result<()> {
     );
 
     let runtime = ExtensionRuntime::process(None, quickjs_options());
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert!(
         report.failures.is_empty(),
         "QuickJS must not depend on a Bun binary: {:?}",
@@ -862,12 +980,9 @@ async fn quickjs_invokes_registered_command_and_tool() -> Result<()> {
     )?;
     let spec = extension_spec_from_package_resource(&resource(manifest_path, true))?;
     let runtime = ExtensionRuntime::process(None, quickjs_options());
-    runtime.set_action_host(Arc::new(RecordingActionHost))?;
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert!(report.failures.is_empty(), "{:?}", report.failures);
 
-    // /run and /chain dispatch is ordered sequential invoke_command; defend that
-    // contract here without a PTY so CI stays deterministic.
     let mut chain = Vec::new();
     for (name, args) in [("alpha", "one"), ("beta", "two")] {
         let value = runtime
@@ -883,7 +998,6 @@ async fn quickjs_invokes_registered_command_and_tool() -> Result<()> {
         ]
     );
 
-    // Tool invocation: arguments bridge JSON -> JS, the result bridges back.
     let (_, signal) = AbortController::new();
     let result: AgentToolResult = runtime
         .invoke_tool(
@@ -897,11 +1011,14 @@ async fn quickjs_invokes_registered_command_and_tool() -> Result<()> {
     let encoded = serde_json::to_value(result)?;
     assert_eq!(encoded["content"][0]["text"], "qjs:ok");
 
-    // Session action round-trip: JS -> host action channel -> JS promise.
     let value = runtime
         .invoke_command("rename", "session-a".to_owned(), None, None)
         .await?;
-    assert_eq!(value, json!({ "name": "session-a" }));
+    assert_eq!(value, Value::Null);
+    assert_eq!(
+        report.application().state().await.session_name.as_deref(),
+        Some("session-a")
+    );
 
     runtime.shutdown().await;
     Ok(())
@@ -922,8 +1039,7 @@ async fn quickjs_tool_updates_stream_to_the_host_before_the_result() -> Result<(
     )?;
     let spec = extension_spec_from_package_resource(&resource(manifest_path, true))?;
     let runtime = ExtensionRuntime::process(None, quickjs_options());
-    runtime.set_action_host(Arc::new(Phase4ActionHost::default()))?;
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert!(report.failures.is_empty(), "{:?}", report.failures);
 
     // The tool's execute calls onUpdate twice then returns; both Update frames
@@ -944,7 +1060,11 @@ async fn quickjs_tool_updates_stream_to_the_host_before_the_result() -> Result<(
         .await?;
 
     let received = updates.lock().unwrap().clone();
-    assert_eq!(received.len(), 2, "both onUpdate calls must stream to the host");
+    assert_eq!(
+        received.len(),
+        2,
+        "both onUpdate calls must stream to the host"
+    );
     assert_eq!(
         serde_json::to_value(&received[0])?["content"][0]["text"],
         "partial",
@@ -973,142 +1093,121 @@ async fn quickjs_tool_updates_stream_to_the_host_before_the_result() -> Result<(
 #[tokio::test]
 async fn quickjs_session_actions_resolve_with_the_host_result() -> Result<()> {
     let root = TempDir::new()?;
-    let manifest_path = quickjs_package(
-        &root,
-        "quickjs-phase4.mjs",
-        &["commands", "tools", "session_actions"],
-    )?;
+    let (manifest_path, model) = quickjs_phase4_package(&root)?;
+    let entry = root.path().join("quickjs-phase4.mjs");
+    let source = std::fs::read_to_string(&entry)?
+        .replace(
+            "results.setActiveTools = await pi.setActiveTools([\"tool-a\", \"tool-b\"]);",
+            "results.setActiveTools = await pi.setActiveTools([\"phase4_stream\"]);",
+        )
+        .replace(
+            "results.setLabel = await pi.setLabel(\"entry-1\", \"label-x\");\n      results.appendEntry = await pi.appendEntry(\"custom-type\", { key: \"value\" });",
+            "results.appendEntry = await pi.appendEntry(\"custom-type\", { key: \"value\" });\n      results.setLabel = await pi.setLabel(results.appendEntry, \"label-x\");",
+        )
+        .replace(
+            "      results.abort = await ctx.abort();\n      results.shutdown = await ctx.shutdown();\n      results.compact = await ctx.compact(\"trim it\");\n      results.waitForIdle = await ctx.waitForIdle();\n      results.reload = await ctx.reload();\n",
+            "",
+        )
+        .replace(
+            "      results.sendMessage = await pi.sendMessage(\n        { customType: \"custom\", content: \"hi\", display: true },\n        { deliverAs: \"steer\" },\n      );\n      results.sendUserMessage = await pi.sendUserMessage(\"hello\", { deliverAs: \"followUp\" });\n",
+            "",
+        );
+    std::fs::write(entry, source)?;
+    let registration = register_extension_faux_model(&model);
     let spec = extension_spec_from_package_resource(&resource(manifest_path, true))?;
     let runtime = ExtensionRuntime::process(None, quickjs_options());
-    let host = Arc::new(Phase4ActionHost::default());
-    runtime.set_action_host(host.clone())?;
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert!(report.failures.is_empty(), "{:?}", report.failures);
 
-    // Every session action (pi + ctx) round-trips the host result back.
+    report.application().new_session().await?;
     let value = runtime
         .invoke_command("phase4_session_actions", String::new(), None, None)
         .await?;
     let results = value
         .as_object()
         .expect("session action results must be an object");
-    assert_eq!(results["setModel"], json!(true), "pi.setModel must resolve with the host's boolean");
-    assert_eq!(results["setThinkingLevel"], json!({ "level": "High" }));
+    assert_eq!(results["setModel"], json!(true));
+    assert_eq!(results["setActiveTools"], Value::Null);
+    assert_eq!(results["setLabel"], Value::Null);
+    assert!(!results.contains_key("sendMessage"));
+    assert!(!results.contains_key("sendUserMessage"));
+    assert_eq!(results["setThinkingLevel"]["requested"], json!("high"));
+    assert_eq!(results["setThinkingLevel"]["effective"], json!("off"));
+    assert_eq!(results["setThinkingLevel"]["clamped"], json!(true));
+    let entry_id = results["appendEntry"]
+        .as_str()
+        .expect("appendEntry returns an entry id");
+    let entries = report.application().session_entries(None)?;
+    let entry = entries
+        .entries
+        .iter()
+        .find(|entry| entry.id == entry_id)
+        .expect("the published session records appendEntry");
+    assert_eq!(entry.custom_type.as_deref(), Some("custom-type"));
+    assert_eq!(entry.data, Some(json!({ "key": "value" })));
     assert_eq!(
-        results["setActiveTools"],
-        json!({ "tools": ["tool-a", "tool-b"] })
+        report
+            .application()
+            .state()
+            .await
+            .model
+            .as_ref()
+            .map(|model| &model.id),
+        Some(&model.id)
     );
     assert_eq!(
-        results["setLabel"],
-        json!({ "entryId": "entry-1", "label": "label-x" })
+        report.application().get_active_tool_names(),
+        vec!["phase4_stream".to_owned()]
     );
-    assert_eq!(
-        results["appendEntry"],
-        json!({ "customType": "custom-type", "data": { "key": "value" } })
-    );
-    assert_eq!(
-        results["sendMessage"],
-        json!({ "customType": "custom", "delivery": "Steer", "triggerTurn": false })
-    );
-    assert_eq!(
-        results["sendUserMessage"],
-        json!({ "content": "hello", "delivery": "FollowUp" })
-    );
-    assert_eq!(results["abort"], json!({ "action": "abort" }));
-    assert_eq!(results["shutdown"], json!({ "action": "shutdown" }));
-    assert_eq!(
-        results["compact"],
-        json!({ "customInstructions": "trim it" })
-    );
-    assert_eq!(results["waitForIdle"], json!({ "action": "wait_for_idle" }));
-    assert_eq!(results["reload"], json!({ "action": "reload" }));
-
-    // The recorded actions carry the exact host-side payloads, proving the
-    // JS -> ExtensionRuntimeAction mapping (camelCase fields, delivery
-    // variants, optional data) matches the process bridge's shapes.
-    let recorded = host.actions.lock().unwrap().clone();
-    assert!(recorded.iter().any(|action| matches!(action,
-        ExtensionRuntimeAction::SetModel { model } if model.id == "test-model"
-    )));
-    assert!(recorded.iter().any(|action| matches!(action,
-        ExtensionRuntimeAction::SetThinkingLevel { level } if *level == pi_agent::ThinkingLevel::High
-    )));
-    assert!(recorded.iter().any(|action| matches!(action,
-        ExtensionRuntimeAction::SetActiveTools { tool_names }
-            if tool_names == &vec!["tool-a".to_owned(), "tool-b".to_owned()]
-    )));
-    assert!(recorded.iter().any(|action| matches!(action,
-        ExtensionRuntimeAction::SetLabel { entry_id, label }
-            if entry_id == "entry-1" && label.as_deref() == Some("label-x")
-    )));
-    assert!(recorded.iter().any(|action| matches!(action,
-        ExtensionRuntimeAction::AppendEntry { custom_type, data }
-            if custom_type == "custom-type" && data.as_ref().is_some_and(|data| data["key"] == "value")
-    )));
-    assert!(recorded.iter().any(|action| matches!(action,
-        ExtensionRuntimeAction::SendMessage { message, delivery, trigger_turn }
-            if message.custom_type == "custom"
-                && *delivery == pi_coding::ExtensionMessageDelivery::Steer
-                && !*trigger_turn
-    )));
-    assert!(recorded.iter().any(|action| matches!(action,
-        ExtensionRuntimeAction::SendUserMessage { content, delivery }
-            if content == &pi_ai::CustomMessageContent::Text("hello".to_owned())
-                && *delivery == pi_coding::ExtensionMessageDelivery::FollowUp
-    )));
-    assert!(recorded.iter().any(|action| matches!(action,
-        ExtensionRuntimeAction::Compact { custom_instructions }
-            if custom_instructions.as_deref() == Some("trim it")
-    )));
-    assert!(recorded.iter().any(|action| matches!(action, ExtensionRuntimeAction::Abort)));
-    assert!(recorded.iter().any(|action| matches!(action, ExtensionRuntimeAction::Shutdown)));
-    assert!(recorded.iter().any(|action| matches!(action, ExtensionRuntimeAction::WaitForIdle)));
-    assert!(recorded.iter().any(|action| matches!(action, ExtensionRuntimeAction::Reload)));
-
     runtime.shutdown().await;
+    drop(registration);
     Ok(())
 }
 
 #[tokio::test]
 async fn quickjs_set_model_resolves_with_the_host_boolean() -> Result<()> {
     let root = TempDir::new()?;
-    let manifest_path = quickjs_package(
-        &root,
-        "quickjs-phase4.mjs",
-        &["commands", "tools", "session_actions"],
-    )?;
+    let (manifest_path, model) = quickjs_phase4_package(&root)?;
+    let registration = register_extension_faux_model(&model);
     let spec = extension_spec_from_package_resource(&resource(manifest_path, true))?;
     let runtime = ExtensionRuntime::process(None, quickjs_options());
-    runtime.set_action_host(Arc::new(Phase4ActionHost::default()))?;
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert!(report.failures.is_empty(), "{:?}", report.failures);
 
+    report.application().new_session().await?;
     let value = runtime
         .invoke_command("phase4_set_model", String::new(), None, None)
         .await?;
+    assert_eq!(value, json!(true));
     assert_eq!(
-        value,
-        json!(true),
-        "pi.setModel must resolve with the host's boolean"
+        report
+            .application()
+            .state()
+            .await
+            .model
+            .as_ref()
+            .map(|model| &model.id),
+        Some(&model.id)
     );
 
     runtime.shutdown().await;
+    drop(registration);
     Ok(())
 }
 
 #[tokio::test]
 async fn quickjs_cancel_settles_a_pending_invocation_promptly() -> Result<()> {
     let root = TempDir::new()?;
-    let manifest_path = quickjs_package(
-        &root,
-        "quickjs-phase4.mjs",
-        &["commands", "tools", "session_actions"],
-    )?;
+    let (manifest_path, _) = quickjs_phase4_package(&root)?;
+    let entry = root.path().join("quickjs-phase4.mjs");
+    let source = std::fs::read_to_string(&entry)?.replace(
+        "await pi.setActiveTools([]);",
+        "await pi.setSessionName(\"phase4-hang-ready\");",
+    );
+    std::fs::write(entry, source)?;
     let spec = extension_spec_from_package_resource(&resource(manifest_path, true))?;
     let runtime = ExtensionRuntime::process(None, quickjs_options());
-    let host = Arc::new(Phase4ActionHost::default());
-    runtime.set_action_host(host.clone())?;
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert!(report.failures.is_empty(), "{:?}", report.failures);
 
     // phase4_hang awaits a never-settling promise and publishes readiness by
@@ -1131,12 +1230,8 @@ async fn quickjs_cancel_settles_a_pending_invocation_promptly() -> Result<()> {
     let readiness = tokio::time::sleep(Duration::from_secs(5));
     tokio::pin!(readiness);
     loop {
-        let ready = host
-            .actions
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|action| matches!(action, ExtensionRuntimeAction::SetActiveTools { .. }));
+        let ready =
+            report.application().state().await.session_name.as_deref() == Some("phase4-hang-ready");
         if ready {
             break;
         }
@@ -1167,12 +1262,7 @@ async fn quickjs_cancel_settles_a_pending_invocation_promptly() -> Result<()> {
     // block every subsequent request until its host-side timeout).
     assert_eq!(
         runtime
-            .invoke_command(
-                "probe",
-                String::new(),
-                Some(Duration::from_secs(5)),
-                None,
-            )
+            .invoke_command("probe", String::new(), Some(Duration::from_secs(5)), None,)
             .await?,
         json!("phase4-probe-ok")
     );
@@ -1210,7 +1300,7 @@ export default function (pi) {
     )?;
     let spec = extension_spec_from_package_resource(&resource(manifest, true))?;
     let runtime = ExtensionRuntime::process(None, quickjs_options());
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert!(report.failures.is_empty(), "{:?}", report.failures);
 
     // Without the session_actions capability the request bridge throws
@@ -1244,17 +1334,12 @@ async fn quickjs_memory_and_interrupt_are_wired() -> Result<()> {
             ..quickjs_options()
         },
     );
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert!(report.failures.is_empty(), "{:?}", report.failures);
 
     // Interrupt: a bytecode spin must be killed by set_interrupt_handler.
     let spin_error = runtime
-        .invoke_command(
-            "spin",
-            String::new(),
-            Some(Duration::from_secs(15)),
-            None,
-        )
+        .invoke_command("spin", String::new(), Some(Duration::from_secs(15)), None)
         .await
         .expect_err("spin must be interrupted by the host deadline");
     assert!(
@@ -1350,14 +1435,14 @@ const AUTHORITATIVE_EVENT_NAMES: [&str; 32] = [
 async fn load_quickjs_fixture(
     fixture: &str,
     capabilities: &[&str],
-) -> Result<(TempDir, ExtensionRuntime)> {
+) -> Result<(TempDir, LoadedExtensionRuntime)> {
     let root = TempDir::new()?;
     let manifest_path = quickjs_package(&root, fixture, capabilities)?;
     let spec = extension_spec_from_package_resource(&resource(manifest_path, true))?;
     let runtime = ExtensionRuntime::process(None, quickjs_options());
-    let report = runtime.load(vec![spec]).await;
-    assert!(report.failures.is_empty(), "{:?}", report.failures);
-    Ok((root, runtime))
+    let loaded = load_extension_runtime(runtime, &[spec]).await?;
+    assert!(loaded.failures.is_empty(), "{:?}", loaded.failures);
+    Ok((root, loaded))
 }
 
 fn hook_value(outcomes: &[pi_coding::ExtensionHookOutcome]) -> &Value {
@@ -1423,7 +1508,7 @@ async fn quickjs_hook_return_values_apply_semantic_reductions() -> Result<()> {
         (
             "message_end",
             json!({ "message": { "role": "assistant", "content": [] } }),
-            json!({ "message": { "role": "assistant", "content": [{ "type": "text", "text": "fixture-message" }] } }),
+            json!({ "message": { "role": "assistant", "content": [{ "type": "text", "text": "fixture-message" }], "timestamp": 19 } }),
         ),
         (
             "tool_call",
@@ -1457,7 +1542,8 @@ async fn quickjs_hook_return_values_apply_semantic_reductions() -> Result<()> {
         ),
     ];
     for (event_name, payload, expected) in cases {
-        let value = hook_value(&runtime.emit(ExtensionEvent::new(event_name, payload)).await).clone();
+        let value =
+            hook_value(&runtime.emit(ExtensionEvent::new(event_name, payload)).await).clone();
         for (key, expected_value) in expected.as_object().expect("expected object") {
             assert_eq!(&value[key], expected_value, "event {event_name} key {key}");
         }
@@ -1522,7 +1608,10 @@ async fn quickjs_hook_return_values_apply_semantic_reductions() -> Result<()> {
         .reduce_tool_result("call-1", "read", json!({}), Vec::new(), None, true)
         .await?;
     assert!(!result.is_error);
-    assert_eq!(serde_json::to_value(&result.content[0])?["text"], "fixture-result");
+    assert_eq!(
+        serde_json::to_value(&result.content[0])?["text"],
+        "fixture-result"
+    );
     assert_eq!(result.details, Some(json!({ "replaced": true })));
     assert_eq!(result.usage.expect("fixture usage").cache_read, 3);
     let message = runtime
@@ -1533,22 +1622,29 @@ async fn quickjs_hook_return_values_apply_semantic_reductions() -> Result<()> {
         "fixture-message"
     );
 
-    assert!(runtime
-        .reduce_before_switch(json!({ "reason": "resume" }))
-        .await?);
+    assert!(
+        runtime
+            .reduce_before_switch(json!({ "reason": "resume" }))
+            .await?
+    );
     let fork = runtime
         .reduce_before_fork(json!({ "entryId": "entry", "position": "at" }))
         .await?;
     assert!(fork.cancel && fork.skip_conversation_restore);
-    assert!(runtime
-        .reduce_before_compact(json!({ "reason": "manual", "willRetry": false }))
-        .await?
-        .cancel);
+    assert!(
+        runtime
+            .reduce_before_compact(json!({ "reason": "manual", "willRetry": false }))
+            .await?
+            .cancel
+    );
     let tree = runtime
         .reduce_before_tree(json!({ "preparation": { "targetId": "entry" } }))
         .await?;
     assert!(!tree.cancel);
-    assert_eq!(tree.summary.expect("tree summary").summary, "fixture summary");
+    assert_eq!(
+        tree.summary.expect("tree summary").summary,
+        "fixture summary"
+    );
     assert_eq!(
         tree.custom_instructions.as_deref(),
         Some("fixture instructions")
@@ -1616,32 +1712,83 @@ async fn quickjs_hook_return_values_apply_semantic_reductions() -> Result<()> {
 #[test]
 fn every_allow_listed_event_name_has_a_producer() {
     let allow_list: [&str; 32] = [
-        "trust_decision", "session_start",
+        "trust_decision",
+        "session_start",
         "session_info_changed",
-        "session_before_switch", "session_before_fork", "session_before_compact", "session_compact",
-        "session_shutdown", "session_before_tree", "session_tree", "context",
-        "before_provider_request", "before_provider_headers", "after_provider_response",
-        "before_agent_start", "agent_start", "agent_end", "agent_settled", "turn_start", "turn_end",
-        "message_start", "message_update", "message_end", "tool_execution_start",
-        "tool_execution_update", "tool_execution_end", "model_select", "thinking_level_select",
-        "tool_call", "tool_result", "user_bash", "input",
+        "session_before_switch",
+        "session_before_fork",
+        "session_before_compact",
+        "session_compact",
+        "session_shutdown",
+        "session_before_tree",
+        "session_tree",
+        "context",
+        "before_provider_request",
+        "before_provider_headers",
+        "after_provider_response",
+        "before_agent_start",
+        "agent_start",
+        "agent_end",
+        "agent_settled",
+        "turn_start",
+        "turn_end",
+        "message_start",
+        "message_update",
+        "message_end",
+        "tool_execution_start",
+        "tool_execution_update",
+        "tool_execution_end",
+        "model_select",
+        "thinking_level_select",
+        "tool_call",
+        "tool_result",
+        "user_bash",
+        "input",
     ];
     let producer_backed: [&str; 32] = [
-        "trust_decision", "session_start", "session_info_changed",
-        "session_before_switch", "session_before_fork", "session_before_compact", "session_compact",
-        "session_shutdown", "session_before_tree", "session_tree", "context",
-        "before_provider_request", "before_provider_headers", "after_provider_response",
-        "before_agent_start", "agent_start", "agent_end", "agent_settled", "turn_start", "turn_end",
-        "message_start", "message_update", "message_end", "tool_execution_start",
-        "tool_execution_update", "tool_execution_end", "model_select", "thinking_level_select",
-        "tool_call", "tool_result", "user_bash", "input",
+        "trust_decision",
+        "session_start",
+        "session_info_changed",
+        "session_before_switch",
+        "session_before_fork",
+        "session_before_compact",
+        "session_compact",
+        "session_shutdown",
+        "session_before_tree",
+        "session_tree",
+        "context",
+        "before_provider_request",
+        "before_provider_headers",
+        "after_provider_response",
+        "before_agent_start",
+        "agent_start",
+        "agent_end",
+        "agent_settled",
+        "turn_start",
+        "turn_end",
+        "message_start",
+        "message_update",
+        "message_end",
+        "tool_execution_start",
+        "tool_execution_update",
+        "tool_execution_end",
+        "model_select",
+        "thinking_level_select",
+        "tool_call",
+        "tool_result",
+        "user_bash",
+        "input",
     ];
 
     let mut allow_set: std::collections::BTreeSet<&str> = allow_list.into_iter().collect();
     let producer_set: std::collections::BTreeSet<&str> = producer_backed.into_iter().collect();
 
     // No duplicates inside any single list.
-    assert_eq!(allow_set.len(), allow_list.len(), "duplicate allow-list names");
+    assert_eq!(
+        allow_set.len(),
+        allow_list.len(),
+        "duplicate allow-list names"
+    );
     assert_eq!(
         producer_set.len(),
         producer_backed.len(),
@@ -1689,7 +1836,7 @@ async fn removed_event_names_fail_registration() -> Result<()> {
         )?;
         let spec = extension_spec_from_package_resource(&resource(manifest, true))?;
         let runtime = ExtensionRuntime::process(None, quickjs_options());
-        let report = runtime.load(vec![spec]).await;
+        let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
         assert_eq!(report.failures.len(), 1, "{removed}: {:?}", report.failures);
         assert!(
             report.failures[0]
@@ -1725,10 +1872,12 @@ async fn quickjs_event_registration_fails_closed() -> Result<()> {
     )?;
     let spec = extension_spec_from_package_resource(&resource(manifest, true))?;
     let runtime = ExtensionRuntime::process(None, quickjs_options());
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
     assert!(
-        report.failures[0].message.contains("unsupported extension event not_an_event"),
+        report.failures[0]
+            .message
+            .contains("unsupported extension event not_an_event"),
         "{}",
         report.failures[0].message
     );
@@ -1754,7 +1903,7 @@ async fn quickjs_event_registration_fails_closed() -> Result<()> {
     )?;
     let spec = extension_spec_from_package_resource(&resource(manifest, true))?;
     let runtime = ExtensionRuntime::process(None, quickjs_options());
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
     assert!(
         report.failures[0].message.contains("event_hooks"),
@@ -1774,8 +1923,20 @@ async fn quickjs_event_registration_fails_closed() -> Result<()> {
 /// Every `ExtensionUiCapability` the quickjs-ui fixture exercises, granted via
 /// the manifest's `uiCapabilities` field.
 const QUICKJS_UI_CAPABILITIES: [&str; 14] = [
-    "select", "confirm", "input", "editor", "notify", "status", "widget", "title",
-    "set_editor_text", "editor_text", "working", "hidden_thinking", "theme", "tools_expanded",
+    "select",
+    "confirm",
+    "input",
+    "editor",
+    "notify",
+    "status",
+    "widget",
+    "title",
+    "set_editor_text",
+    "editor_text",
+    "working",
+    "hidden_thinking",
+    "theme",
+    "tools_expanded",
 ];
 
 /// Scripted UI host: records every request and auto-answers interactive
@@ -1850,10 +2011,7 @@ impl ExtensionUiHost for ScriptedUi {
                     ],
                 },
                 ExtensionUiRequest::GetTheme { name } => ExtensionUiResponse::Theme {
-                    theme: (name == "dark").then(|| ExtensionThemeDescriptor {
-                        name,
-                        path: None,
-                    }),
+                    theme: (name == "dark").then(|| ExtensionThemeDescriptor { name, path: None }),
                 },
                 ExtensionUiRequest::SetTheme { name } => ExtensionUiResponse::ThemeSet {
                     success: name == "dark",
@@ -1879,9 +2037,7 @@ impl ExtensionUiHost for ScriptedUi {
 /// Load the quickjs-ui fixture with the full UI surface and a scripted UI
 /// host; the returned runtime auto-answers every dialog. The `TempDir` keeps
 /// the fixture's working directory alive for the lifetime of the runtime.
-async fn load_quickjs_ui_fixture(
-    ui: Arc<ScriptedUi>,
-) -> Result<(TempDir, ExtensionRuntime)> {
+async fn load_quickjs_ui_fixture(ui: Arc<ScriptedUi>) -> Result<(TempDir, LoadedExtensionRuntime)> {
     let root = TempDir::new()?;
     let manifest_path = quickjs_package_with_ui(
         &root,
@@ -1891,9 +2047,9 @@ async fn load_quickjs_ui_fixture(
     )?;
     let spec = extension_spec_from_package_resource(&resource(manifest_path, true))?;
     let runtime = ExtensionRuntime::process(Some(ui), quickjs_options());
-    let report = runtime.load(vec![spec]).await;
-    assert!(report.failures.is_empty(), "{:?}", report.failures);
-    Ok((root, runtime))
+    let loaded = load_extension_runtime(runtime, &[spec]).await?;
+    assert!(loaded.failures.is_empty(), "{:?}", loaded.failures);
+    Ok((root, loaded))
 }
 
 #[tokio::test]
@@ -1982,18 +2138,24 @@ async fn quickjs_ctx_ui_round_trips_through_the_scripted_host() -> Result<()> {
     assert!(requests.iter().any(|request| matches!(request,
         ExtensionUiRequest::SetTheme { name } if name == "dark"
     )));
-    assert!(requests.iter().any(|request| matches!(request,
-        ExtensionUiRequest::GetEditorText
-    )));
-    assert!(requests.iter().any(|request| matches!(request,
-        ExtensionUiRequest::GetAllThemes
-    )));
+    assert!(
+        requests
+            .iter()
+            .any(|request| matches!(request, ExtensionUiRequest::GetEditorText))
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| matches!(request, ExtensionUiRequest::GetAllThemes))
+    );
     assert!(requests.iter().any(|request| matches!(request,
         ExtensionUiRequest::GetTheme { name } if name == "dark"
     )));
-    assert!(requests.iter().any(|request| matches!(request,
-        ExtensionUiRequest::GetToolsExpanded
-    )));
+    assert!(
+        requests
+            .iter()
+            .any(|request| matches!(request, ExtensionUiRequest::GetToolsExpanded))
+    );
 
     runtime.shutdown().await;
     Ok(())
@@ -2069,7 +2231,7 @@ async fn quickjs_ui_rejects_when_no_ui_host_is_bound() -> Result<()> {
     // No UI adapter bound: the interactive gate must reject through the host
     // round trip with an actionable message.
     let runtime = ExtensionRuntime::process(None, quickjs_options());
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert!(report.failures.is_empty(), "{:?}", report.failures);
     let error = runtime
         .invoke_command("confirm-no", String::new(), None, None)
@@ -2091,7 +2253,7 @@ async fn quickjs_ui_rejects_ungranted_ui_capabilities() -> Result<()> {
     let spec = extension_spec_from_package_resource(&resource(manifest_path, true))?;
     let ui = Arc::new(ScriptedUi::default());
     let runtime = ExtensionRuntime::process(Some(ui.clone()), quickjs_options());
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert!(report.failures.is_empty(), "{:?}", report.failures);
     let error = runtime
         .invoke_command("confirm-no", String::new(), None, None)
@@ -2113,7 +2275,7 @@ async fn quickjs_ui_requires_the_ui_capability() -> Result<()> {
     let spec = extension_spec_from_package_resource(&resource(manifest_path, true))?;
     let ui = Arc::new(ScriptedUi::default());
     let runtime = ExtensionRuntime::process(Some(ui.clone()), quickjs_options());
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert!(report.failures.is_empty(), "{:?}", report.failures);
     // Without the ui capability the request bridge throws synchronously,
     // mirroring the process bridge's requireCapability("ui", "UI action").
@@ -2125,194 +2287,6 @@ async fn quickjs_ui_requires_the_ui_capability() -> Result<()> {
     assert!(
         message.contains("requires the ui capability"),
         "expected a capability-gate rejection, got: {message}",
-    );
-    runtime.shutdown().await;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Process-extension sandbox (`settings.sandbox`): process extensions run
-// inside the filesystem sandbox when the sandbox is enabled. The live
-// confinement test exercises the real `unshare` wrapper and is `#[ignore]`d by
-// default (explicit unsupported status, never a fake pass); the fail-closed
-// validation test always runs because it needs no kernel support.
-// ---------------------------------------------------------------------------
-
-/// Returns `Ok(())` when the host can actually run the sandbox: `unshare`
-/// exists and an unprivileged user namespace with mounts can be created. Any
-/// missing prerequisite is an explicit `Err(reason)`; live tests refuse to
-/// fake-pass on it.
-fn sandbox_usable() -> Result<(), String> {
-    if std::env::var_os("PI_TEST_SANDBOX_FORCE_UNSUPPORTED").is_some() {
-        return Err("PI_TEST_SANDBOX_FORCE_UNSUPPORTED=1 (deterministic test seam)".to_owned());
-    }
-    let unshare = std::process::Command::new("unshare").arg("--version").output();
-    match unshare {
-        Ok(output) if output.status.success() => {}
-        Ok(output) => return Err(format!("unshare --version failed: {output:?}")),
-        Err(error) => return Err(format!("unshare is not installed: {error}")),
-    }
-    let probe = std::process::Command::new("unshare")
-        .args(["--user", "--map-root-user", "--mount", "--pid", "--fork", "--net", "--mount-proc"])
-        .arg("sh")
-        .arg("-c")
-        .arg("exit 0")
-        .status();
-    match probe {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => Err(format!(
-            "unprivileged user namespace probe failed ({status}): kernel.unprivileged_userns_clone or an AppArmor profile likely blocks it"
-        )),
-        Err(error) => Err(format!("unprivileged user namespace probe errored: {error}")),
-    }
-}
-
-/// Writes a minimal process-extension fixture executable: a POSIX shell script
-/// speaking the extension JSONL protocol (reply to the host hello, then answer
-/// every host request with a success response). With `check_passwd` it first
-/// fails closed (exit 3, with the reason on stderr) when `/etc/passwd` is not
-/// readable — which is exactly what happens inside the sandbox, because `/etc`
-/// is not among the allowed paths. A plain script keeps the test harness's
-/// output off the protocol pipe (the JSONL protocol rejects foreign lines).
-fn write_process_extension_fixture(root: &TempDir, check_passwd: bool) -> Result<std::path::PathBuf> {
-    let fixture = root.path().join("sandbox-fixture.sh");
-    let body = r#"#!/bin/sh
-# Minimal process-extension protocol fixture (JSONL over stdio).
-if [ "$PI_EXTENSION_SANDBOX_FIXTURE_CHECK" = "passwd" ]; then
-  if ! cat /etc/passwd >/dev/null 2>&1; then
-    echo "sandbox fixture: /etc/passwd is not readable inside the sandbox" >&2
-    sleep 0.1
-    exit 3
-  fi
-fi
-IFS= read -r _host_hello || exit 4
-echo '{"type":"hello","protocolVersion":1,"manifest":{"id":"sandbox-fixture","name":"sandbox fixture","version":"1.0.0","capabilities":[],"uiCapabilities":[]}}'
-while IFS= read -r line; do
-  case "$line" in
-    *'"type":"request"'*)
-      id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
-      [ -n "$id" ] || continue
-      printf '{"type":"response","id":"%s","result":{"status":"success","value":null}}\n' "$id"
-      ;;
-    *'"type":"shutdown"'*) break ;;
-  esac
-done
-exit 0
-"#;
-    std::fs::write(&fixture, body)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(&fixture)?.permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&fixture, permissions)?;
-    }
-    Ok(fixture)
-}
-
-/// A process-extension spec backed by the shell-script fixture. `check_passwd`
-/// makes the fixture fail closed when `/etc/passwd` is not readable.
-fn process_extension_spec(root: &TempDir, check_passwd: bool) -> Result<ExtensionSpec> {
-    let fixture = write_process_extension_fixture(root, check_passwd)?;
-    let mut environment = std::collections::BTreeMap::new();
-    if check_passwd {
-        environment.insert("PI_EXTENSION_SANDBOX_FIXTURE_CHECK".to_owned(), "passwd".to_owned());
-    }
-    let mut spec = ExtensionSpec::new(
-        "sandbox-fixture",
-        fixture,
-        root.path(),
-        ExtensionOrigin::Project,
-        true,
-        ExtensionPermissionSet {
-            capabilities: BTreeSet::new(),
-            ui_capabilities: BTreeSet::new(),
-        },
-    );
-    spec.environment = environment;
-    Ok(spec)
-}
-
-/// A live `settings.sandbox` resolver confining process extensions to `cwd`,
-/// with optional denied paths.
-fn sandbox_extension_resolver(
-    cwd: &std::path::Path,
-    denied: Vec<std::path::PathBuf>,
-) -> pi_coding::SandboxConfigFn {
-    let config = pi_coding::SandboxConfig {
-        enabled: true,
-        network: false,
-        allowed_paths: vec![cwd.to_path_buf()],
-        denied_paths: denied,
-        read_only: false,
-    };
-    Arc::new(move || Some(config.clone()))
-}
-
-/// A process extension that tries to read `/etc/passwd` fails to load under
-/// `sandbox.enabled` (the file is not visible in the confined root), while the
-/// same extension loads fine without the sandbox and a non-passwd-checking
-/// extension loads fine inside it — proving the sandbox itself does not break
-/// process extensions.
-#[ignore = "live confinement test: requires Linux unprivileged user namespaces (run with --include-ignored on a supported kernel)"]
-#[tokio::test]
-async fn sandboxed_process_extension_cannot_read_etc_passwd() -> Result<()> {
-    sandbox_usable().expect("live sandbox test refuses to fake-pass on an unsupported kernel");
-    let root = TempDir::new()?;
-    let check_spec = process_extension_spec(&root, true)?;
-    let plain_spec = process_extension_spec(&root, false)?;
-
-    // Control: without the sandbox the passwd-checking extension loads.
-    let plain_runtime = ExtensionRuntime::process(None, ExtensionRuntimeOptions::default());
-    let report = plain_runtime.load(vec![check_spec.clone()]).await;
-    assert!(report.failures.is_empty(), "{:?}", report.failures);
-    plain_runtime.shutdown().await;
-
-    // Sandboxed: the same extension fails closed — /etc/passwd is invisible.
-    let sandboxed = ExtensionRuntime::process(None, ExtensionRuntimeOptions::default());
-    sandboxed.set_process_sandbox(Some(sandbox_extension_resolver(root.path(), Vec::new())));
-    let report = sandboxed.load(vec![check_spec]).await;
-    assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
-    let message = &report.failures[0].message;
-    assert!(
-        message.contains("exited before its handshake"),
-        "expected the extension process to fail its handshake: {message}"
-    );
-    assert!(
-        message.contains("/etc/passwd is not readable"),
-        "the failure must surface the fixture's actionable stderr: {message}"
-    );
-    sandboxed.shutdown().await;
-
-    // Sandboxed + a fixture that does not touch /etc: loads fine.
-    let healthy = ExtensionRuntime::process(None, ExtensionRuntimeOptions::default());
-    healthy.set_process_sandbox(Some(sandbox_extension_resolver(root.path(), Vec::new())));
-    let report = healthy.load(vec![plain_spec]).await;
-    assert!(report.failures.is_empty(), "{:?}", report.failures);
-    healthy.shutdown().await;
-    Ok(())
-}
-
-/// Fail-closed validation: an extension whose working directory would be
-/// invisible inside the sandbox is refused before the child starts, with the
-/// actionable `sandbox.deniedPaths` error. This contract needs no kernel
-/// support (validation runs before any namespace is created), so it always
-/// runs.
-#[tokio::test]
-async fn sandboxed_process_extension_denied_cwd_fails_closed() -> Result<()> {
-    let root = TempDir::new()?;
-    let spec = process_extension_spec(&root, false)?;
-    let runtime = ExtensionRuntime::process(None, ExtensionRuntimeOptions::default());
-    runtime.set_process_sandbox(Some(sandbox_extension_resolver(
-        root.path(),
-        vec![root.path().to_path_buf()],
-    )));
-    let report = runtime.load(vec![spec]).await;
-    assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
-    assert!(
-        report.failures[0].message.contains("sandbox.deniedPaths"),
-        "expected the fail-closed denied-paths error: {:?}",
-        report.failures[0].message
     );
     runtime.shutdown().await;
     Ok(())
@@ -2389,13 +2363,14 @@ fn isolation_provider_spec(root: &TempDir, id: &str, marker: &str) -> Result<Ext
 
 /// Run a session's own stream dispatch (the namespace-aware wrapper stored in
 /// `child_session_options_snapshot`) and return the terminal message text.
-async fn session_stream_text(
-    session: &Session,
-    model: Model,
-) -> pi_ai::AssistantMessage {
+async fn session_stream_text(session: &Session, model: Model) -> pi_ai::AssistantMessage {
     let snapshot = session.child_session_options_snapshot();
-    let stream = (snapshot.stream_fn)(model, Context::default(), SimpleStreamOptions::default()).await;
-    stream.result().await.expect("session stream must terminate")
+    let stream =
+        (snapshot.stream_fn)(model, Context::default(), SimpleStreamOptions::default()).await;
+    stream
+        .result()
+        .await
+        .expect("session stream must terminate")
 }
 
 fn provider_model(api: &str, provider: &str) -> Model {
@@ -2408,7 +2383,9 @@ fn provider_model(api: &str, provider: &str) -> Model {
     model
 }
 
-async fn collect_provider_events(stream: &AssistantMessageEventStream) -> Vec<AssistantMessageEvent> {
+async fn collect_provider_events(
+    stream: &AssistantMessageEventStream,
+) -> Vec<AssistantMessageEvent> {
     let mut events = Vec::new();
     while let Some(event) = stream.next().await {
         events.push(event);
@@ -2418,11 +2395,13 @@ async fn collect_provider_events(stream: &AssistantMessageEventStream) -> Vec<As
 
 #[tokio::test]
 async fn quickjs_provider_registers_and_resolves_by_api() -> Result<()> {
-    let _guard = PROVIDER_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = PROVIDER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let root = TempDir::new()?;
     let spec = provider_spec(&root, "provider-llm", "quickjs-provider.mjs", &["provider"])?;
     let runtime = ExtensionRuntime::process(None, quickjs_options());
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert!(report.failures.is_empty(), "{:?}", report.failures);
 
     let providers = runtime.providers();
@@ -2447,7 +2426,10 @@ async fn quickjs_provider_registers_and_resolves_by_api() -> Result<()> {
     assert!(
         events.iter().any(|event| matches!(
             event,
-            AssistantMessageEvent::Done { reason: StopReason::Stop, .. }
+            AssistantMessageEvent::Done {
+                reason: StopReason::Stop,
+                ..
+            }
         )),
         "the routed stream must complete with Done"
     );
@@ -2461,11 +2443,13 @@ async fn quickjs_provider_registers_and_resolves_by_api() -> Result<()> {
 
 #[tokio::test]
 async fn quickjs_provider_streams_scripted_events_end_to_end() -> Result<()> {
-    let _guard = PROVIDER_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = PROVIDER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let root = TempDir::new()?;
     let spec = provider_spec(&root, "provider-e2e", "quickjs-provider.mjs", &["provider"])?;
     let runtime = ExtensionRuntime::process(None, quickjs_options());
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert!(report.failures.is_empty(), "{:?}", report.failures);
 
     let model = provider_model("fixture-llm-api", "fixture-llm");
@@ -2496,9 +2480,7 @@ async fn quickjs_provider_streams_scripted_events_end_to_end() -> Result<()> {
             AssistantMessageEvent::ThinkingEnd { content, .. } if content == "hmm" => {
                 seen.push("thinking")
             }
-            AssistantMessageEvent::TextDelta { delta, .. } if delta == "hello" => {
-                seen.push("text")
-            }
+            AssistantMessageEvent::TextDelta { delta, .. } if delta == "hello" => seen.push("text"),
             AssistantMessageEvent::TextDelta { delta, .. } if delta == " world" => {
                 seen.push("delta")
             }
@@ -2529,8 +2511,14 @@ async fn quickjs_provider_streams_scripted_events_end_to_end() -> Result<()> {
         ContentBlock::Text { text, .. } => text,
         _ => panic!("the last block must be the echo text"),
     };
-    assert!(echo.contains("session=sess-1"), "session id must reach JS: {echo}");
-    assert!(echo.contains("messages=2"), "messages must reach JS: {echo}");
+    assert!(
+        echo.contains("session=sess-1"),
+        "session id must reach JS: {echo}"
+    );
+    assert!(
+        echo.contains("messages=2"),
+        "messages must reach JS: {echo}"
+    );
 
     runtime.shutdown().await;
     Ok(())
@@ -2538,11 +2526,18 @@ async fn quickjs_provider_streams_scripted_events_end_to_end() -> Result<()> {
 
 #[tokio::test]
 async fn quickjs_provider_accepts_a_sync_iterable() -> Result<()> {
-    let _guard = PROVIDER_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = PROVIDER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let root = TempDir::new()?;
-    let spec = provider_spec(&root, "provider-sync", "quickjs-provider.mjs", &["provider"])?;
+    let spec = provider_spec(
+        &root,
+        "provider-sync",
+        "quickjs-provider.mjs",
+        &["provider"],
+    )?;
     let runtime = ExtensionRuntime::process(None, quickjs_options());
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert!(report.failures.is_empty(), "{:?}", report.failures);
 
     let model = provider_model("fixture-sync-api", "fixture-sync");
@@ -2564,11 +2559,18 @@ async fn quickjs_provider_accepts_a_sync_iterable() -> Result<()> {
 
 #[tokio::test]
 async fn quickjs_provider_js_error_surfaces_as_typed_stream_error() -> Result<()> {
-    let _guard = PROVIDER_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = PROVIDER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let root = TempDir::new()?;
-    let spec = provider_spec(&root, "provider-failing", "quickjs-provider.mjs", &["provider"])?;
+    let spec = provider_spec(
+        &root,
+        "provider-failing",
+        "quickjs-provider.mjs",
+        &["provider"],
+    )?;
     let runtime = ExtensionRuntime::process(None, quickjs_options());
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert!(report.failures.is_empty(), "{:?}", report.failures);
 
     let model = provider_model("fixture-failing-api", "fixture-failing");
@@ -2599,7 +2601,9 @@ async fn quickjs_provider_js_error_surfaces_as_typed_stream_error() -> Result<()
 
 #[tokio::test]
 async fn quickjs_provider_error_event_is_a_typed_stream_error() -> Result<()> {
-    let _guard = PROVIDER_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = PROVIDER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let root = TempDir::new()?;
     let spec = provider_spec(
         &root,
@@ -2608,7 +2612,7 @@ async fn quickjs_provider_error_event_is_a_typed_stream_error() -> Result<()> {
         &["provider"],
     )?;
     let runtime = ExtensionRuntime::process(None, quickjs_options());
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert!(report.failures.is_empty(), "{:?}", report.failures);
 
     let model = provider_model("fixture-error-event-api", "fixture-error-event");
@@ -2631,7 +2635,9 @@ async fn quickjs_provider_error_event_is_a_typed_stream_error() -> Result<()> {
 
 #[tokio::test]
 async fn quickjs_provider_non_iterable_result_fails_actionably() -> Result<()> {
-    let _guard = PROVIDER_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = PROVIDER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let root = TempDir::new()?;
     let spec = provider_spec(
         &root,
@@ -2640,7 +2646,7 @@ async fn quickjs_provider_non_iterable_result_fails_actionably() -> Result<()> {
         &["provider"],
     )?;
     let runtime = ExtensionRuntime::process(None, quickjs_options());
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert!(report.failures.is_empty(), "{:?}", report.failures);
 
     let model = provider_model("fixture-not-iterable-api", "fixture-not-iterable");
@@ -2666,7 +2672,9 @@ async fn quickjs_provider_non_iterable_result_fails_actionably() -> Result<()> {
 
 #[tokio::test]
 async fn quickjs_provider_unregister_removes_and_reregister_replaces() -> Result<()> {
-    let _guard = PROVIDER_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = PROVIDER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let root = TempDir::new()?;
     let spec = provider_spec(
         &root,
@@ -2675,7 +2683,7 @@ async fn quickjs_provider_unregister_removes_and_reregister_replaces() -> Result
         &["provider"],
     )?;
     let runtime = ExtensionRuntime::process(None, quickjs_options());
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert!(report.failures.is_empty(), "{:?}", report.failures);
 
     // The unregistered provider is gone; the re-registered one replaced its
@@ -2694,7 +2702,9 @@ async fn quickjs_provider_unregister_removes_and_reregister_replaces() -> Result
 
 #[tokio::test]
 async fn quickjs_provider_unregistered_api_resolution_fails_actionably() -> Result<()> {
-    let _guard = PROVIDER_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = PROVIDER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let root = TempDir::new()?;
     let spec = provider_spec(
         &root,
@@ -2703,7 +2713,7 @@ async fn quickjs_provider_unregistered_api_resolution_fails_actionably() -> Resu
         &["provider"],
     )?;
     let runtime = ExtensionRuntime::process(None, quickjs_options());
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert!(report.failures.is_empty(), "{:?}", report.failures);
 
     // A model configured with the unregistered api resolves to the standard
@@ -2730,7 +2740,9 @@ async fn quickjs_provider_unregistered_api_resolution_fails_actionably() -> Resu
 
 #[tokio::test]
 async fn quickjs_provider_invalid_registrations_fail_at_load() -> Result<()> {
-    let _guard = PROVIDER_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = PROVIDER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let cases = [
         (
             "provider-invalid-id",
@@ -2757,7 +2769,7 @@ async fn quickjs_provider_invalid_registrations_fail_at_load() -> Result<()> {
         let root = TempDir::new()?;
         let spec = provider_spec(&root, id, fixture, &["provider"])?;
         let runtime = ExtensionRuntime::process(None, quickjs_options());
-        let report = runtime.load(vec![spec]).await;
+        let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
         assert_eq!(report.failures.len(), 1, "{id} must fail at load");
         let message = report.failures[0].message.to_ascii_lowercase();
         assert!(
@@ -2773,7 +2785,9 @@ async fn quickjs_provider_invalid_registrations_fail_at_load() -> Result<()> {
 
 #[tokio::test]
 async fn quickjs_provider_registration_is_load_phase_only() -> Result<()> {
-    let _guard = PROVIDER_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = PROVIDER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let root = TempDir::new()?;
     let spec = provider_spec(
         &root,
@@ -2782,15 +2796,21 @@ async fn quickjs_provider_registration_is_load_phase_only() -> Result<()> {
         &["provider", "event_hooks"],
     )?;
     let runtime = ExtensionRuntime::process(None, quickjs_options());
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert!(report.failures.is_empty(), "{:?}", report.failures);
-    assert!(runtime.providers().is_empty(), "no provider registered at load");
+    assert!(
+        runtime.providers().is_empty(),
+        "no provider registered at load"
+    );
 
     // A runtime hook calling registerProvider must be rejected: the hook
     // fails with the load-phase gate and the provider never becomes
     // resolvable.
     let outcomes = runtime
-        .emit(ExtensionEvent::new("session_start", json!({ "reason": "test" })))
+        .emit(ExtensionEvent::new(
+            "session_start",
+            json!({ "reason": "test" }),
+        ))
         .await;
     assert_eq!(outcomes.len(), 1, "{outcomes:?}");
     assert!(
@@ -2810,24 +2830,36 @@ async fn quickjs_provider_registration_is_load_phase_only() -> Result<()> {
 
 #[tokio::test]
 async fn quickjs_provider_reload_replaces_the_previous_generation() -> Result<()> {
-    let _guard = PROVIDER_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = PROVIDER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let root = TempDir::new()?;
-    let first = provider_spec(&root, "provider-reload", "quickjs-provider.mjs", &["provider"])?;
-    let runtime = ExtensionRuntime::process(None, quickjs_options());
-    let report = runtime.load(vec![first]).await;
-    assert!(report.failures.is_empty(), "{:?}", report.failures);
-    assert!(get_api_provider("fixture-llm-api").is_some());
-
-    // Reload with a different extension: the old generation's providers must
-    // be unregistered and the new one's registered.
-    let second = provider_spec(
+    let first = provider_spec(
         &root,
         "provider-reload",
-        "provider-registration.mjs",
+        "quickjs-provider.mjs",
         &["provider"],
     )?;
-    let report = runtime.load(vec![second]).await;
-    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    let runtime = ExtensionRuntime::process(None, quickjs_options());
+    let loaded = load_extension_runtime(runtime.clone(), &[first]).await?;
+    assert!(loaded.failures.is_empty(), "{:?}", loaded.failures);
+    assert!(get_api_provider("fixture-llm-api").is_some());
+
+    std::fs::write(
+        root.path().join("provider-registration.mjs"),
+        std::fs::read(fixture_dir().join("provider-registration.mjs"))?,
+    )?;
+    std::fs::write(
+        root.path().join("pi-extension.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schemaVersion": 1,
+            "id": "provider-reload",
+            "runtime": "quickjs",
+            "entry": "provider-registration.mjs",
+            "capabilities": ["provider"],
+        }))?,
+    )?;
+    loaded.application().reload().await?;
     assert!(
         get_api_provider("fixture-llm-api").is_none(),
         "retired provider must be unregistered"
@@ -2846,11 +2878,18 @@ async fn quickjs_provider_reload_replaces_the_previous_generation() -> Result<()
 
 #[tokio::test]
 async fn quickjs_provider_shutdown_unregisters_resolution() -> Result<()> {
-    let _guard = PROVIDER_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = PROVIDER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let root = TempDir::new()?;
-    let spec = provider_spec(&root, "provider-shutdown", "quickjs-provider.mjs", &["provider"])?;
+    let spec = provider_spec(
+        &root,
+        "provider-shutdown",
+        "quickjs-provider.mjs",
+        &["provider"],
+    )?;
     let runtime = ExtensionRuntime::process(None, quickjs_options());
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert!(report.failures.is_empty(), "{:?}", report.failures);
     assert!(get_api_provider("fixture-llm-api").is_some());
     runtime.shutdown().await;
@@ -2863,7 +2902,9 @@ async fn quickjs_provider_shutdown_unregisters_resolution() -> Result<()> {
 
 #[tokio::test]
 async fn concurrent_runtimes_same_api_dispatch_isolation() -> Result<()> {
-    let _guard = PROVIDER_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = PROVIDER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     // Two runtimes loaded from the SAME extension id and registering the SAME
     // api: only their per-runtime pi-ai namespace differs.
     let root_a = TempDir::new()?;
@@ -2872,14 +2913,17 @@ async fn concurrent_runtimes_same_api_dispatch_isolation() -> Result<()> {
     let spec_b = isolation_provider_spec(&root_b, "isolation-shared", "beta")?;
 
     let runtime_a = ExtensionRuntime::process(None, quickjs_options());
-    let report_a = runtime_a.load(vec![spec_a]).await;
+    let report_a = load_extension_runtime(runtime_a.clone(), &[spec_a]).await?;
     assert!(report_a.failures.is_empty(), "{:?}", report_a.failures);
     let runtime_b = ExtensionRuntime::process(None, quickjs_options());
-    let report_b = runtime_b.load(vec![spec_b]).await;
+    let report_b = load_extension_runtime(runtime_b.clone(), &[spec_b]).await?;
     assert!(report_b.failures.is_empty(), "{:?}", report_b.failures);
 
     let api = "isolation-shared-api";
-    assert!(is_extension_provider(api), "the api must be extension-owned");
+    assert!(
+        is_extension_provider(api),
+        "the api must be extension-owned"
+    );
     // While two runtimes own the api, an unscoped lookup must fail closed —
     // never an arbitrary pick between the runtimes.
     assert!(
@@ -2888,28 +2932,8 @@ async fn concurrent_runtimes_same_api_dispatch_isolation() -> Result<()> {
     );
 
     let model = provider_model(api, "isolation-shared");
-    let cwd = tempfile::tempdir().expect("cwd");
-    let build_session = |name: &str| {
-        Session::new(SessionOptions {
-            model: model.clone(),
-            cwd: cwd.path().to_path_buf(),
-            system_prompt: String::new(),
-            thinking_level: ThinkingLevel::Off,
-            api_key: "extension".into(),
-            compaction: None,
-            stream_options: Default::default(),
-            tools: None,
-            before_tool_call: None,
-            after_tool_call: None,
-            stream_fn: None,
-            auth_resolver: None,
-        })
-        .unwrap_or_else(|error| panic!("build session {name}: {error}"))
-    };
-    let session_a = build_session("a");
-    session_a.set_provider_namespace(Some(runtime_a.provider_namespace().to_owned()));
-    let session_b = build_session("b");
-    session_b.set_provider_namespace(Some(runtime_b.provider_namespace().to_owned()));
+    let session_a = report_a.application().session();
+    let session_b = report_b.application().session();
 
     // Concurrent lookups return each session's own runtime response.
     let (result_a, result_b) = tokio::join!(
@@ -2969,7 +2993,10 @@ async fn concurrent_runtimes_same_api_dispatch_isolation() -> Result<()> {
     );
 
     runtime_b.shutdown().await;
-    assert!(get_api_provider(api).is_none(), "shutdown drops the survivor");
+    assert!(
+        get_api_provider(api).is_none(),
+        "shutdown drops the survivor"
+    );
     Ok(())
 }
 
@@ -2982,7 +3009,7 @@ async fn concurrent_runtimes_same_api_dispatch_isolation() -> Result<()> {
 async fn load_quickjs_overlay_fixture(
     source: &str,
     ui: Option<Arc<ScriptedUi>>,
-) -> Result<(TempDir, ExtensionRuntime)> {
+) -> Result<(TempDir, LoadedExtensionRuntime)> {
     let root = TempDir::new()?;
     std::fs::write(root.path().join("overlay.mjs"), source)?;
     let manifest = root.path().join("pi-extension.json");
@@ -3002,9 +3029,9 @@ async fn load_quickjs_overlay_fixture(
         ui.map(|ui| -> Arc<dyn ExtensionUiHost> { ui }),
         quickjs_options(),
     );
-    let report = runtime.load(vec![spec]).await;
-    assert!(report.failures.is_empty(), "{:?}", report.failures);
-    Ok((root, runtime))
+    let loaded = load_extension_runtime(runtime, &[spec]).await?;
+    assert!(loaded.failures.is_empty(), "{:?}", loaded.failures);
+    Ok((root, loaded))
 }
 
 fn overlay_fixture() -> String {
@@ -3042,7 +3069,10 @@ async fn quickjs_register_overlay_is_listed_and_renders_sanitized_rows() -> Resu
     let output = runtime.invoke_overlay_render("chat").await?;
     let rows = &output.rows;
     assert_eq!(rows.len(), 3);
-    assert_eq!(rows[0], pi_coding::OverlayRow::Plain("hello from overlay".to_owned()));
+    assert_eq!(
+        rows[0],
+        pi_coding::OverlayRow::Plain("hello from overlay".to_owned())
+    );
     assert_eq!(
         rows[1],
         pi_coding::OverlayRow::Styled {
@@ -3053,7 +3083,10 @@ async fn quickjs_register_overlay_is_listed_and_renders_sanitized_rows() -> Resu
     // Secret-shaped text is redacted before it becomes displayable.
     let redacted = rows[2].text();
     let token_prefix = ["gh", "p_"].concat();
-    assert!(!redacted.contains(token_prefix.as_str()), "secret must be redacted: {redacted}");
+    assert!(
+        !redacted.contains(token_prefix.as_str()),
+        "secret must be redacted: {redacted}"
+    );
     assert!(redacted.contains("[REDACTED]"), "{redacted}");
     // The fixture returns a bare rows array; the interactive output shape
     // (`{ rows, input? }`) is normalized host-side, so `input` stays absent.
@@ -3064,7 +3097,10 @@ async fn quickjs_register_overlay_is_listed_and_renders_sanitized_rows() -> Resu
         .invoke_overlay_render("missing")
         .await
         .expect_err("unknown overlay must fail");
-    assert!(error.to_string().contains("unknown extension overlay"), "{error:#}");
+    assert!(
+        error.to_string().contains("unknown extension overlay"),
+        "{error:#}"
+    );
     runtime.shutdown().await;
     Ok(())
 }
@@ -3087,16 +3123,21 @@ export default function (pi) {
 
 #[tokio::test]
 async fn quickjs_interactive_overlay_render_and_callbacks_round_trip() -> Result<()> {
-    let (_root, runtime) =
-        load_quickjs_overlay_fixture(INTERACTIVE_OVERLAY_FIXTURE, None).await?;
+    let (_root, runtime) = load_quickjs_overlay_fixture(INTERACTIVE_OVERLAY_FIXTURE, None).await?;
     let submitted_secret = ["gh", "p_", "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghij"].concat();
     let submitted_text = format!("check {submitted_secret}");
 
     // The registration-time input declaration lands in the descriptor.
     let overlays = runtime.overlays();
-    let descriptor = overlays.iter().find(|overlay| overlay.id == "chat").expect("overlay");
+    let descriptor = overlays
+        .iter()
+        .find(|overlay| overlay.id == "chat")
+        .expect("overlay");
     let declaration = descriptor.input.as_ref().expect("input declaration");
-    assert_eq!(declaration.placeholder.as_deref(), Some("Ask the side agent…"));
+    assert_eq!(
+        declaration.placeholder.as_deref(),
+        Some("Ask the side agent…")
+    );
     assert!(!declaration.multiline);
 
     // Render returns rows plus the open-time initial draft.
@@ -3171,9 +3212,14 @@ export default function (pi) {
     let (_root, runtime) = load_quickjs_overlay_fixture(source, None).await?;
     let output = runtime.invoke_overlay_render("big").await?;
     let rows = &output.rows;
-    assert_eq!(rows.len(), pi_coding::OVERLAY_MAX_ROWS, "rows must be capped at 100");
+    assert_eq!(
+        rows.len(),
+        pi_coding::OVERLAY_MAX_ROWS,
+        "rows must be capped at 100"
+    );
     assert!(
-        rows.iter().all(|row| row.text().chars().count() <= pi_coding::OVERLAY_MAX_ROW_CHARS),
+        rows.iter()
+            .all(|row| row.text().chars().count() <= pi_coding::OVERLAY_MAX_ROW_CHARS),
         "every row must be truncated to 200 chars"
     );
     runtime.shutdown().await;
@@ -3198,7 +3244,10 @@ async fn quickjs_overlay_open_round_trips_through_ui_host() -> Result<()> {
         .open_overlay("missing")
         .await
         .expect_err("unknown overlay must fail");
-    assert!(error.to_string().contains("unknown extension overlay"), "{error:#}");
+    assert!(
+        error.to_string().contains("unknown extension overlay"),
+        "{error:#}"
+    );
     runtime.shutdown().await;
     Ok(())
 }
@@ -3231,7 +3280,7 @@ async fn quickjs_overlay_lifecycle_events_are_rejected_at_registration() -> Resu
     )?;
     let spec = extension_spec_from_package_resource(&resource(manifest, true))?;
     let runtime = ExtensionRuntime::process(None, quickjs_options());
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
     assert!(
         report.failures[0]
@@ -3264,7 +3313,7 @@ async fn quickjs_overlay_registration_requires_overlays_capability() -> Result<(
     )?;
     let spec = extension_spec_from_package_resource(&resource(manifest, true))?;
     let runtime = ExtensionRuntime::process(None, quickjs_options());
-    let report = runtime.load(vec![spec]).await;
+    let report = load_extension_runtime(runtime.clone(), &[spec]).await?;
     assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
     assert!(
         report.failures[0].message.contains("overlays capability"),

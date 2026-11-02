@@ -24,8 +24,8 @@ use pi_agent::{AbortController, ThinkingLevel, ToolCallContext};
 use pi_ai::providers::{FauxProviderOptions, FauxResponse, register_faux_provider};
 use pi_ai::{ContentBlock, Message, Model, SimpleStreamOptions, StopReason, ToolCall};
 use pi_coding::{
-    AgentCatalog, AgentDefinition, AgentDefinitionSource, ChildSessionFactory,
-    OrchestrationConfig, OrchestrationRuntime, Session, SessionOptions,
+    AgentCatalog, AgentDefinition, AgentDefinitionSource, ChildSessionFactory, OrchestrationConfig,
+    OrchestrationRuntime, Session, SessionOptions,
 };
 
 /// Deterministic secret-shaped text seeded into Alpha's reply; the rendered
@@ -35,20 +35,28 @@ fn alpha_secret() -> String {
 }
 
 fn definition(name: &str) -> AgentDefinition {
-    AgentDefinition { name: name.to_owned(),
-    description: format!("{name} description"),
-    system_prompt: format!("{name} prompt"),
-    tools: Some(Vec::new()),
-    autoload_skills: Vec::new(),
-    model: None,
-    thinking_level: Some(ThinkingLevel::Off),
-    max_turns: None,
-    max_tool_calls: None,
-    timeout_secs: None,
-    disallowed_tools: Vec::new(),
-    capability_ceiling: None,
-    source: AgentDefinitionSource::Bundled,
-    path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None }
+    AgentDefinition {
+        name: name.to_owned(),
+        description: format!("{name} description"),
+        system_prompt: format!("{name} prompt"),
+        tools: Some(Vec::new()),
+        autoload_skills: Vec::new(),
+        model: None,
+        thinking_level: Some(ThinkingLevel::Off),
+        max_turns: None,
+        max_tool_calls: None,
+        timeout_secs: None,
+        disallowed_tools: Vec::new(),
+        capability_ceiling: None,
+        source: AgentDefinitionSource::Bundled,
+        path: None,
+        trusted: true,
+        kind: pi_coding::AgentDefinitionKind::Agent,
+        personality: None,
+        soft_budget: None,
+        knowledge_roots: Vec::new(),
+        user_proxy: false,
+    }
 }
 
 /// A scripted child model response that emits one `hub` tool call.
@@ -93,6 +101,7 @@ fn scripted_factory(
                 after_tool_call: None,
                 stream_fn: None,
                 auth_resolver: None,
+                auth_manager: None,
             })
         })
     })
@@ -133,6 +142,7 @@ fn tool_context(id: &str, arguments: serde_json::Value) -> ToolCallContext {
         on_update: Arc::new(|_| {}),
         abort,
         model: None,
+        approval_token: None,
     }
 }
 
@@ -247,14 +257,25 @@ async fn beta_reads_alpha_history_through_owned_hub_tool_and_redacts() {
     )
     .expect("runtime");
     let tools = runtime.agent_tools("Main", 0);
-    let task = tools.iter().find(|tool| tool.name == "task").expect("task tool");
-    let hub = tools.iter().find(|tool| tool.name == "hub").expect("hub tool");
+    let task = tools
+        .iter()
+        .find(|tool| tool.name == "task")
+        .expect("task tool");
+    let hub = tools
+        .iter()
+        .find(|tool| tool.name == "hub")
+        .expect("hub tool");
 
     // Alpha settles FIRST so its settle-time history snapshot exists before
     // Beta's read_history runs (deterministic ordering, no race).
-    let alpha_spawn =
-        spawn_and_settle(&runtime, task, "Alpha", "alpha", "Do alpha work, then report back.")
-            .await;
+    let alpha_spawn = spawn_and_settle(
+        &runtime,
+        task,
+        "Alpha",
+        "alpha",
+        "Do alpha work, then report back.",
+    )
+    .await;
     assert_eq!(alpha_spawn.agent_id, "Alpha");
     let beta_spawn = spawn_and_settle(
         &runtime,
@@ -311,7 +332,11 @@ async fn beta_reads_alpha_history_through_owned_hub_tool_and_redacts() {
         "raw secret must never reach the reader: {rendered}"
     );
     assert_eq!(
-        read_result.details.as_ref().and_then(|v| v.get("op")).and_then(serde_json::Value::as_str),
+        read_result
+            .details
+            .as_ref()
+            .and_then(|v| v.get("op"))
+            .and_then(serde_json::Value::as_str),
         Some("read_history"),
         "hub result details must identify the op"
     );
@@ -418,8 +443,14 @@ async fn read_history_lines_bounds_render_window() {
     )
     .expect("runtime");
     let tools = runtime.agent_tools("Main", 0);
-    let task = tools.iter().find(|tool| tool.name == "task").expect("task tool");
-    let hub = tools.iter().find(|tool| tool.name == "hub").expect("hub tool");
+    let task = tools
+        .iter()
+        .find(|tool| tool.name == "task")
+        .expect("task tool");
+    let hub = tools
+        .iter()
+        .find(|tool| tool.name == "hub")
+        .expect("hub tool");
     spawn_and_settle(&runtime, task, "Alpha", "alpha", "Bound the render window.").await;
 
     // lines=1 keeps only the most recent entry: the assistant final reply.

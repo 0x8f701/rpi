@@ -18,15 +18,15 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use pi_coding::{
-    Application, ExtensionCapability, ExtensionMode, ExtensionOrigin, ExtensionPermissionSet,
-    ExtensionRuntime, ExtensionRuntimeOptions, ExtensionSpec, ExtensionSpecRuntime, ResourceManager,
-    ResourceManagerOptions, Session, SessionOptions, TrustDecision, TrustStore,
+    Application, ExtensionCapability, ExtensionMode, ExtensionPermissionSet, ExtensionRuntime,
+    ExtensionRuntimeOptions, ResourceManager, ResourceManagerOptions, Session, SessionOptions,
+    TrustDecision, TrustStore,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use uuid::Uuid;
 
-/// Fixture project with trust-gated `.pi` resources, an isolated agent dir
+/// Fixture project with trust-gated `.rpi` resources, an isolated agent dir
 /// (empty trust store), and an executable host-hook script that captures the
 /// `pre_trust_decision` payload (one JSON object per line) before answering
 /// with the configured response. The hook is declared through
@@ -35,8 +35,11 @@ struct Fixture {
     _cwd: TempDir,
     _agent: TempDir,
     _hook_dir: TempDir,
+    _faux: pi_ai::providers::FauxProviderRegistration,
     cwd: PathBuf,
     agent_dir: PathBuf,
+    session_dir: PathBuf,
+    model: pi_ai::Model,
     hook_capture: PathBuf,
 }
 
@@ -48,31 +51,51 @@ impl Fixture {
         let cwd_path = cwd.path().canonicalize()?;
         let agent_path = agent.path().canonicalize()?;
         let hook_capture = hook_dir.path().join("payloads.jsonl");
-        // Trust-gated project resources: their presence makes the trust store
+        // Trust-gated project resources: a non-empty `.rpi` config dir (the
+        // production CONFIG_DIR_NAME trust gate) makes the trust store
         // consulted, so the hook observation fires.
-        let skill = cwd_path.join(".pi").join("skills").join("secret");
+        let skill = cwd_path.join(".rpi").join("skills").join("secret");
         fs::create_dir_all(&skill)?;
         fs::write(
             skill.join("SKILL.md"),
             "---\nname: secret\ndescription: gated project skill\n---\n# secret\n",
         )?;
+        let suffix = Uuid::now_v7();
+        let api = format!("trust-hook-api-{suffix}");
+        let provider = format!("trust-hook-provider-{suffix}");
+        let mut model = pi_ai::Model::default();
+        model.id = format!("trust-hook-model-{suffix}");
+        model.name = "Trust Hook Model".to_owned();
+        model.api = api.clone();
+        model.provider = provider.clone();
+        model.base_url = "http://localhost:0".to_owned();
+        let faux =
+            pi_ai::providers::register_faux_provider(pi_ai::providers::FauxProviderOptions {
+                api,
+                provider,
+                models: vec![model.clone()],
+                chunk_size: 8,
+            });
+        let session_dir = agent_path.join("sessions");
+        fs::create_dir_all(&session_dir)?;
         Ok(Self {
             _cwd: cwd,
             _agent: agent,
             _hook_dir: hook_dir,
+            _faux: faux,
             hook_capture,
             cwd: cwd_path,
             agent_dir: agent_path,
+            session_dir,
+            model,
         })
     }
 
-    /// Resource manager for the fixture cwd with interactive trust semantics
-    /// (`headless: false` keeps an undecided project at `Ask`, which is what
-    /// the extension approval upgrades).
-    fn resources(&self) -> ResourceManager {
+    fn resources(&self, extension_manifest: Option<PathBuf>) -> ResourceManager {
         let mut options = ResourceManagerOptions::new(self.cwd.clone());
         options.agent_dir = self.agent_dir.clone();
         options.headless = false;
+        options.explicit_extension_paths = extension_manifest.into_iter().collect();
         ResourceManager::new(options).expect("resource manager")
     }
 
@@ -80,7 +103,10 @@ impl Fixture {
     /// payload to the capture file and answers with `response`, then declare
     /// it through `settings.hooks` in the agent dir.
     fn configure_hook(&self, response: &str, fail_closed: bool) -> Result<()> {
-        let tmp = self._hook_dir.path().join(format!("hook.tmp-{}", Uuid::now_v7()));
+        let tmp = self
+            ._hook_dir
+            .path()
+            .join(format!("hook.tmp-{}", Uuid::now_v7()));
         let capture = self.hook_capture.to_string_lossy();
         fs::write(
             &tmp,
@@ -171,9 +197,39 @@ async fn build_application(
     fx: &Fixture,
     with_extension: bool,
 ) -> Result<(Application, Option<ExtensionRuntime>)> {
-    let resources = fx.resources();
+    let extension = if with_extension {
+        let entry = fx._hook_dir.path().join("trust-decision.mjs");
+        fs::write(&entry, extension_source(fx))?;
+        let manifest = fx._hook_dir.path().join("pi-extension.json");
+        fs::write(
+            &manifest,
+            serde_json::to_vec_pretty(&json!({
+                "schemaVersion": 1,
+                "id": "trust-decision",
+                "runtime": "quickjs",
+                "entry": "trust-decision.mjs",
+                "capabilities": ["event_hooks"],
+            }))?,
+        )?;
+        let permissions = ExtensionPermissionSet {
+            capabilities: BTreeSet::from([ExtensionCapability::EventHooks]),
+            ui_capabilities: BTreeSet::new(),
+        };
+        let runtime = ExtensionRuntime::process(
+            None,
+            ExtensionRuntimeOptions {
+                mode: ExtensionMode::Tui,
+                hook_timeout: Duration::from_secs(10),
+                ..ExtensionRuntimeOptions::default()
+            },
+        );
+        Some((manifest, runtime, permissions))
+    } else {
+        None
+    };
+    let resources = fx.resources(extension.as_ref().map(|(manifest, _, _)| manifest.clone()));
     let session = Session::new(SessionOptions {
-        model: pi_ai::Model::default(),
+        model: fx.model.clone(),
         cwd: fx.cwd.clone(),
         system_prompt: String::new(),
         thinking_level: pi_agent::ThinkingLevel::Off,
@@ -185,44 +241,21 @@ async fn build_application(
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: None,
+        auth_manager: None,
     })
     .context("building session")?;
+    session.set_session_dir(fx.session_dir.clone());
     session
-        .attach_resources(resources.clone())
+        .attach_resources(resources)
         .await
         .context("attaching resources")?;
-
-    let (application, runtime) = if with_extension {
-        let entry = fx._hook_dir.path().join("trust-decision.mjs");
-        fs::write(&entry, extension_source(fx))?;
-        let permissions = ExtensionPermissionSet {
-            capabilities: BTreeSet::from([ExtensionCapability::EventHooks]),
-            ui_capabilities: BTreeSet::new(),
-        };
-        let spec = ExtensionSpec::new_runtime(
-            "trust-decision",
-            ExtensionSpecRuntime::QuickJs { entry: entry.clone() },
-            fx._hook_dir.path(),
-            ExtensionOrigin::Project,
-            true,
-            permissions.clone(),
-        );
-        let runtime = ExtensionRuntime::process(
-            None,
-            ExtensionRuntimeOptions {
-                mode: ExtensionMode::Tui,
-                hook_timeout: Duration::from_secs(10),
-                ..ExtensionRuntimeOptions::default()
-            },
-        );
-        let report = runtime.load(vec![spec]).await;
-        anyhow::ensure!(report.failures.is_empty(), "{:?}", report.failures);
-        let application =
-            Application::new_with_extensions(session, runtime.clone(), permissions).await;
-        (application, Some(runtime))
-    } else {
-        let application = Application::new(session).await;
-        (application, None)
+    let (application, runtime) = match extension {
+        Some((_, runtime, permissions)) => {
+            let application =
+                Application::new_with_extensions(session, runtime.clone(), permissions).await;
+            (application, Some(runtime))
+        }
+        None => (Application::new(session).await, None),
     };
     Ok((application, runtime))
 }
@@ -233,7 +266,10 @@ async fn reload_fires_host_hook_and_extension_and_host_block_wins() -> Result<()
     fx.configure_hook(r#"{"decision":"block","reason":"denied by policy"}"#, true)?;
     let (application, runtime) = build_application(&fx, true).await?;
 
-    application.reload().await.context("production reload path")?;
+    application
+        .reload()
+        .await
+        .context("production reload path")?;
 
     let snapshot = application.resource_snapshot().expect("snapshot");
     assert_eq!(
@@ -265,7 +301,10 @@ async fn reload_extension_approval_upgrades_ask_to_trusted() -> Result<()> {
     fx.configure_hook(r#"{"decision":"allow"}"#, true)?;
     let (application, runtime) = build_application(&fx, true).await?;
 
-    application.reload().await.context("production reload path")?;
+    application
+        .reload()
+        .await
+        .context("production reload path")?;
 
     let snapshot = application.resource_snapshot().expect("snapshot");
     assert_eq!(
@@ -294,7 +333,10 @@ async fn reload_never_weakens_a_stored_denial() -> Result<()> {
         .context("storing denial")?;
     let (application, runtime) = build_application(&fx, true).await?;
 
-    application.reload().await.context("production reload path")?;
+    application
+        .reload()
+        .await
+        .context("production reload path")?;
 
     let snapshot = application.resource_snapshot().expect("snapshot");
     assert_eq!(
@@ -321,7 +363,10 @@ async fn reload_hook_failure_fails_open_unless_fail_closed() -> Result<()> {
     let fx = Fixture::new()?;
     fx.configure_hook("not json", false)?;
     let (application, runtime) = build_application(&fx, false).await?;
-    application.reload().await.context("production reload path")?;
+    application
+        .reload()
+        .await
+        .context("production reload path")?;
     let snapshot = application.resource_snapshot().expect("snapshot");
     assert_eq!(
         snapshot.trust.decision,
@@ -336,7 +381,10 @@ async fn reload_hook_failure_fails_open_unless_fail_closed() -> Result<()> {
     let fx = Fixture::new()?;
     fx.configure_hook("not json", true)?;
     let (application, runtime) = build_application(&fx, false).await?;
-    application.reload().await.context("production reload path")?;
+    application
+        .reload()
+        .await
+        .context("production reload path")?;
     let snapshot = application.resource_snapshot().expect("snapshot");
     assert_eq!(
         snapshot.trust.decision,
@@ -385,12 +433,11 @@ async fn startup_fires_hooks_and_records_the_composed_decision() -> Result<()> {
 
 #[tokio::test]
 async fn startup_without_hook_surfaces_keeps_the_plain_decision() -> Result<()> {
-    // No host hooks, no extension runtime: startup must not change anything
     // and must not re-stage resources.
     let fx = Fixture::new()?;
-    let resources = fx.resources();
+    let resources = fx.resources(None);
     let session = Session::new(SessionOptions {
-        model: pi_ai::Model::default(),
+        model: fx.model.clone(),
         cwd: fx.cwd.clone(),
         system_prompt: String::new(),
         thinking_level: pi_agent::ThinkingLevel::Off,
@@ -402,8 +449,10 @@ async fn startup_without_hook_surfaces_keeps_the_plain_decision() -> Result<()> 
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: None,
+        auth_manager: None,
     })
     .context("building session")?;
+    session.set_session_dir(fx.session_dir.clone());
     session
         .attach_resources(resources.clone())
         .await

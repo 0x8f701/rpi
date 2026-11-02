@@ -32,7 +32,7 @@ TOKEN="web-personas-token-$$-$(date +%s)"
 # remove/purge containment (verified on disk by the playwright test) are real.
 seed_persona() {
     local root="$1" name="$2"
-    local dir="$root/home/.pi/agent/personas/$name"
+    local dir="$root/home/.rpi/personas/$name"
     mkdir -p "$dir/memory" "$dir/sessions"
     cat >"$dir/persona.md" <<EOF
 ---
@@ -57,7 +57,7 @@ EOF
 # button's Enter-key path can spawn it for real.
 seed_big_persona() {
     local root="$1" name="$2"
-    local dir="$root/home/.pi/agent/personas/$name"
+    local dir="$root/home/.rpi/personas/$name"
     mkdir -p "$dir/memory" "$dir/sessions"
     {
         printf -- '---\nname: %s\ndescription: oversized persona definition for the read-only web editor\npersonality: patient\n---\n' "$name"
@@ -77,7 +77,7 @@ seed_big_persona() {
 # zero-count persistence summary ("memory: 0 entries · sessions: 0 archives").
 seed_lean_persona() {
     local root="$1" name="$2"
-    local dir="$root/home/.pi/agent/personas/$name"
+    local dir="$root/home/.rpi/personas/$name"
     mkdir -p "$dir"
     cat >"$dir/persona.md" <<EOF
 ---
@@ -93,7 +93,7 @@ EOF
 # path).
 seed_ghost_persona() {
     local root="$1" name="$2"
-    local dir="$root/home/.pi/agent/personas/$name"
+    local dir="$root/home/.rpi/personas/$name"
     mkdir -p "$dir/memory"
     cat >"$dir/persona.md" <<EOF
 ---
@@ -133,7 +133,7 @@ main() {
     seed_lean_persona "$root" "lean"
     seed_ghost_persona "$root" "ghost"
     # Orchestration must be enabled for task_spawn (the Run button path).
-    cat >"$root/home/.pi/agent/settings.json" <<EOF
+    cat >"$root/home/.rpi/settings.json" <<EOF
 {
   "orchestration": {
     "tasks": true,
@@ -150,7 +150,7 @@ EOF
     local pw_status=0
     web_run_playwright "$url" "$evidence" "$root/playwright" \
         "$SCRIPT_DIR/personas_test.mjs" \
-        RPI_PERSONA_ROOT="$root/home/.pi/agent/personas" || pw_status=$?
+        RPI_PERSONA_ROOT="$root/home/.rpi/personas" || pw_status=$?
     if [ "$pw_status" -eq 0 ]; then
         printf 'playwright: personas panel contract: PASSED\n' | tee "$evidence/playwright-summary.txt"
     elif [ "$pw_status" -eq 1 ]; then

@@ -12,10 +12,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use pi_ai::Model;
 
-
 /// Configured fallback chains keyed by role, exact model selector, or provider wildcard.
 pub type RetryFallbackChains = BTreeMap<String, Vec<String>>;
-
 
 /// Parsed model selector used by retry fallback resolution.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,8 +65,7 @@ impl MapModelLookup {
     }
 
     pub fn insert(&mut self, model: Model) {
-        self.providers
-            .insert(model.provider.to_ascii_lowercase());
+        self.providers.insert(model.provider.to_ascii_lowercase());
         self.models.insert(
             (
                 model.provider.to_ascii_lowercase(),
@@ -111,7 +108,10 @@ const THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "x
 #[must_use]
 pub fn format_retry_fallback_selector(model: &Model, thinking_level: Option<&str>) -> String {
     let base = format!("{}/{}", model.provider, model.id);
-    match thinking_level.map(str::trim).filter(|level| !level.is_empty()) {
+    match thinking_level
+        .map(str::trim)
+        .filter(|level| !level.is_empty())
+    {
         Some(level) => format!("{base}:{level}"),
         None => base,
     }
@@ -192,7 +192,11 @@ fn split_thinking_suffix(
     };
     let (base, suffix) = id.split_at(colon);
     let level = &suffix[1..];
-    if base.is_empty() || !THINKING_LEVELS.iter().any(|known| known.eq_ignore_ascii_case(level)) {
+    if base.is_empty()
+        || !THINKING_LEVELS
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(level))
+    {
         return (id.to_owned(), None);
     }
     if let Some(lookup) = model_lookup {
@@ -499,26 +503,6 @@ pub fn aggregate_retry_diagnostics(errors: &[String]) -> String {
     }
 }
 
-/// True when a hard (non-retryable) error may still consult a fallback chain.
-#[must_use]
-pub fn is_hard_error_fallback_eligible(
-    stop_reason_error: bool,
-    is_retryable: bool,
-    has_tool_call: bool,
-    is_context_overflow: bool,
-    is_abort: bool,
-    model_fallback_enabled: bool,
-    has_candidates: bool,
-) -> bool {
-    stop_reason_error
-        && !is_retryable
-        && !has_tool_call
-        && !is_context_overflow
-        && !is_abort
-        && model_fallback_enabled
-        && has_candidates
-}
-
 fn format_retry_fallback_base_selector(selector: &RetryFallbackSelector) -> String {
     format!("{}/{}", selector.provider, selector.id)
 }
@@ -791,7 +775,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("parse {selector:?}"));
             assert_eq!(parsed.provider, provider, "provider for {selector:?}");
             assert_eq!(parsed.id, id, "id for {selector:?}");
-            assert_eq!(parsed.thinking_level.as_deref(), thinking, "thinking for {selector:?}");
+            assert_eq!(
+                parsed.thinking_level.as_deref(),
+                thinking,
+                "thinking for {selector:?}"
+            );
             assert_eq!(parsed.raw, selector.trim(), "raw for {selector:?}");
         }
     }
@@ -806,8 +794,8 @@ mod tests {
         // Slash with empty id: provider set, id empty -> rejected.
         assert!(parse_retry_fallback_selector("primary/", Some(&models)).is_none());
         // Works without a lookup too (no-slash-second-segment heuristic).
-        let parsed =
-            parse_retry_fallback_selector("solo/model", None::<&MapModelLookup>).expect("no lookup");
+        let parsed = parse_retry_fallback_selector("solo/model", None::<&MapModelLookup>)
+            .expect("no lookup");
         assert_eq!(parsed.provider, "solo");
         assert_eq!(parsed.id, "model");
     }
@@ -816,20 +804,22 @@ mod tests {
     fn format_retry_fallback_selector_appends_and_trims_thinking() {
         let m = model("primary", "main");
         assert_eq!(format_retry_fallback_selector(&m, None), "primary/main");
-        assert_eq!(format_retry_fallback_selector(&m, Some("high")), "primary/main:high");
+        assert_eq!(
+            format_retry_fallback_selector(&m, Some("high")),
+            "primary/main:high"
+        );
         // Whitespace-only/empty thinking is dropped, not appended as a bare colon.
-        assert_eq!(format_retry_fallback_selector(&m, Some("   ")), "primary/main");
+        assert_eq!(
+            format_retry_fallback_selector(&m, Some("   ")),
+            "primary/main"
+        );
         assert_eq!(format_retry_fallback_selector(&m, Some("")), "primary/main");
     }
 
     #[test]
     fn expand_default_retry_fallback_chains_applies_to_roles_without_own_chain() {
-        let chains = BTreeMap::from([(
-            "default".to_owned(),
-            vec!["backup/spare".to_owned()],
-        )]);
-        let expanded =
-            expand_default_retry_fallback_chains(&chains, ["task", "main", "default"]);
+        let chains = BTreeMap::from([("default".to_owned(), vec!["backup/spare".to_owned()])]);
+        let expanded = expand_default_retry_fallback_chains(&chains, ["task", "main", "default"]);
         assert_eq!(expanded["task"], vec!["backup/spare".to_owned()]);
         assert_eq!(expanded["main"], vec!["backup/spare".to_owned()]);
         // "default" is not re-inserted (already present).
@@ -856,41 +846,38 @@ mod tests {
     }
 
     #[test]
-    fn is_hard_error_fallback_eligible_gate_table() {
-        // Eligible baseline: stop error, not retryable, no tool call, not
-        // overflow, not abort, fallback enabled, candidates exist.
-        assert!(
-            is_hard_error_fallback_eligible(true, false, false, false, false, true, true),
-            "baseline hard error with fallback enabled must be eligible"
+    fn resolve_retry_fallback_chain_key_prefers_role_hint_over_default() {
+        let chains = BTreeMap::from([
+            ("default".to_owned(), vec!["backup/spare".to_owned()]),
+            ("researcher".to_owned(), vec!["backup/other".to_owned()]),
+        ]);
+        let roles = BTreeMap::new();
+        let models = lookup();
+        let context = RetryFallbackResolutionContext {
+            chains: &chains,
+            model_roles: &roles,
+            model_lookup: &models,
+        };
+        let key = resolve_retry_fallback_chain_key(
+            &context,
+            "primary/main",
+            Some(&model("primary", "main")),
+            Some("researcher"),
         );
-        // Each disqualifying condition flips eligibility off.
-        assert!(
-            !is_hard_error_fallback_eligible(false, false, false, false, false, true, true),
-            "non-error stop reason is not eligible"
+        assert_eq!(key.as_deref(), Some("researcher"));
+        let candidates = find_retry_fallback_candidates(
+            &context,
+            "researcher",
+            "primary/main",
+            Some(&model("primary", "main")),
+            true,
         );
-        assert!(
-            !is_hard_error_fallback_eligible(true, true, false, false, false, true, true),
-            "retryable error stays with the same model, not fallback"
-        );
-        assert!(
-            !is_hard_error_fallback_eligible(true, false, true, false, false, true, true),
-            "error with a tool call is not eligible"
-        );
-        assert!(
-            !is_hard_error_fallback_eligible(true, false, false, true, false, true, true),
-            "context overflow is handled by compaction, not fallback"
-        );
-        assert!(
-            !is_hard_error_fallback_eligible(true, false, false, false, true, true, true),
-            "user abort is not eligible"
-        );
-        assert!(
-            !is_hard_error_fallback_eligible(true, false, false, false, false, false, true),
-            "fallback disabled is not eligible"
-        );
-        assert!(
-            !is_hard_error_fallback_eligible(true, false, false, false, false, true, false),
-            "no fallback candidates is not eligible"
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|selector| selector.raw.as_str())
+                .collect::<Vec<_>>(),
+            ["backup/other"]
         );
     }
 
@@ -916,13 +903,11 @@ mod tests {
     #[test]
     fn parse_retry_fallback_wildcard_splits_known_and_unknown_providers() {
         // Known provider "google" -> provider only, no id prefix.
-        let (provider, prefix) =
-            parse_retry_fallback_wildcard("google/*", |c| c == "google");
+        let (provider, prefix) = parse_retry_fallback_wildcard("google/*", |c| c == "google");
         assert_eq!(provider, "google");
         assert!(prefix.is_none());
         // Unknown "google/gemini" (not a known provider) -> provider + id prefix.
-        let (provider, prefix) =
-            parse_retry_fallback_wildcard("google/gemini/*", |_| false);
+        let (provider, prefix) = parse_retry_fallback_wildcard("google/gemini/*", |_| false);
         assert_eq!(provider, "google");
         assert_eq!(prefix.as_deref(), Some("gemini"));
         // "openrouter/google/gemini-x" is a known provider in the lookup, so

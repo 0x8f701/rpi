@@ -156,7 +156,7 @@ run_workflow_tmux() {
     tmux new-session -d -s "$session" -x 120 -y 40 -c "$root/workspace" \
         "env HOME='$root/home' USERPROFILE='$root/home' \
 PI_CODING_AGENT_DIR='$root/home/.pi/agent' \
-PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 \
+RPI_OFFLINE=1 RPI_SKIP_VERSION_CHECK=1 \
 PI_FAUX_RESPONSE='deterministic-workflow-reply' \
 TERM=xterm-256color \
 '$RPI_BIN' --offline --model faux/faux-1"

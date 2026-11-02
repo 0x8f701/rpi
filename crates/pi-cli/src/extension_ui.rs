@@ -354,6 +354,7 @@ impl ExtensionUiAdapter {
         mode: pi_coding::ExtensionMode,
         tool_name: &str,
         capability: pi_agent::ToolCapability,
+        summary: Option<&pi_agent::ToolApprovalSummary>,
     ) -> Result<HostToolConfirmation> {
         let response = self
             .request(
@@ -363,16 +364,20 @@ impl ExtensionUiAdapter {
                 },
                 ExtensionUiRequest::Confirm {
                     title: "Approve tool call?".to_owned(),
-                    message: format!("Tool: {tool_name}\nCapability: {}", capability_name(capability)),
+                    message: approval_message(tool_name, capability, summary),
                 },
                 ExtensionCancellation::new(),
             )
             .await?;
         match response {
-            ExtensionUiResponse::Confirmed { confirmed: true } => Ok(HostToolConfirmation::Approved),
+            ExtensionUiResponse::Confirmed { confirmed: true } => {
+                Ok(HostToolConfirmation::Approved)
+            }
             ExtensionUiResponse::Confirmed { confirmed: false } => Ok(HostToolConfirmation::Denied),
             ExtensionUiResponse::Cancelled => Ok(HostToolConfirmation::Cancelled),
-            _ => Err(anyhow!("host tool confirmation returned an invalid response")),
+            _ => Err(anyhow!(
+                "host tool confirmation returned an invalid response"
+            )),
         }
     }
 
@@ -482,7 +487,6 @@ impl ExtensionUiHost for NonInteractiveExtensionUiHost {
             });
         }
         self.adapter.request(context, request, cancellation)
-
     }
     fn clear_extension(&self, instance: ExtensionInstanceId) -> ExtensionFuture<'_, Result<()>> {
         self.adapter.clear_extension(instance)
@@ -597,7 +601,9 @@ impl ExtensionUiHost for ExtensionUiAdapter {
                 clear_if_owned(&mut state.hidden_thinking_label, &instance);
                 clear_if_owned(&mut state.active_theme, &instance);
                 clear_if_owned(&mut state.tools_expanded, &instance);
-                state.overlay_rows.retain(|(owner, _), _| owner != &instance);
+                state
+                    .overlay_rows
+                    .retain(|(owner, _), _| owner != &instance);
             }
             publish_event(&inner, ExtensionUiEvent::ExtensionCleared { instance });
             Ok(())
@@ -610,14 +616,8 @@ fn publish_event(inner: &AdapterInner, event: ExtensionUiEvent) {
     let _ = inner.observer_events.send(event);
 }
 
-fn clear_if_owned<T>(
-    value: &mut Option<(ExtensionInstanceId, T)>,
-    instance: &ExtensionInstanceId,
-) {
-    if value
-        .as_ref()
-        .is_some_and(|(owner, _)| owner == instance)
-    {
+fn clear_if_owned<T>(value: &mut Option<(ExtensionInstanceId, T)>, instance: &ExtensionInstanceId) {
+    if value.as_ref().is_some_and(|(owner, _)| owner == instance) {
         *value = None;
     }
 }
@@ -627,6 +627,31 @@ fn host_instance() -> ExtensionInstanceId {
         extension_id: "host".to_owned(),
         generation: 0,
     }
+}
+
+fn approval_message(
+    tool_name: &str,
+    capability: pi_agent::ToolCapability,
+    summary: Option<&pi_agent::ToolApprovalSummary>,
+) -> String {
+    let Some(summary) = summary else {
+        return format!(
+            "Tool: {tool_name}\nCapability: {}",
+            capability_name(capability)
+        );
+    };
+    let audience = summary.credential_audience.as_deref().unwrap_or("none");
+    format!(
+        "Tool: {tool_name}\nCapability: {}\nFamily: {}\nExecutable: {}\nArguments: {}\nWorking directory: {}\nCredential audience: {}\nCredential grants: {}\nTarget descriptors: {}",
+        capability_name(capability),
+        summary.family,
+        summary.executable,
+        summary.argument_count,
+        summary.working_directory,
+        audience,
+        summary.requested_credential_count,
+        summary.target_fds.len(),
+    )
 }
 
 fn capability_name(capability: pi_agent::ToolCapability) -> &'static str {
@@ -720,10 +745,7 @@ fn apply_action(
             }
         }
         ExtensionUiRequest::SetEditorText { text } => {
-            inner
-                .state
-                .lock()
-                .editor_text = Some((context.instance.clone(), text.clone()));
+            inner.state.lock().editor_text = Some((context.instance.clone(), text.clone()));
             publish_event(
                 inner,
                 ExtensionUiEvent::EditorTextChanged {
@@ -782,7 +804,8 @@ fn apply_action(
             );
         }
         ExtensionUiRequest::SetWorkingIndicator { options } => {
-            inner.state.lock().working_indicator = Some((context.instance.clone(), options.clone()));
+            inner.state.lock().working_indicator =
+                Some((context.instance.clone(), options.clone()));
             publish_event(
                 inner,
                 ExtensionUiEvent::WorkingIndicatorChanged {
@@ -792,7 +815,8 @@ fn apply_action(
             );
         }
         ExtensionUiRequest::SetHiddenThinkingLabel { label } => {
-            inner.state.lock().hidden_thinking_label = Some((context.instance.clone(), label.clone()));
+            inner.state.lock().hidden_thinking_label =
+                Some((context.instance.clone(), label.clone()));
             publish_event(
                 inner,
                 ExtensionUiEvent::HiddenThinkingLabelChanged {
@@ -1000,6 +1024,7 @@ mod tests {
                         ExtensionMode::Rpc,
                         "dangerous_tool",
                         pi_agent::ToolCapability::Exec,
+                        None,
                     )
                     .await
             });
@@ -1018,7 +1043,9 @@ mod tests {
             assert!(message.contains("dangerous_tool"));
             assert!(message.contains("exec"));
             assert!(!message.contains('{'));
-            adapter.respond_confirmed(&interaction.id, confirmed).unwrap();
+            adapter
+                .respond_confirmed(&interaction.id, confirmed)
+                .unwrap();
             assert_eq!(pending.await.unwrap().unwrap(), expected);
         }
     }
@@ -1034,6 +1061,7 @@ mod tests {
                     ExtensionMode::Tui,
                     "write",
                     pi_agent::ToolCapability::Write,
+                    None,
                 )
                 .await
         });
@@ -1162,7 +1190,10 @@ mod tests {
                 interval_ms: Some(120),
             })
         );
-        assert_eq!(snapshot.hidden_thinking_label.as_deref(), Some("second hidden"));
+        assert_eq!(
+            snapshot.hidden_thinking_label.as_deref(),
+            Some("second hidden")
+        );
         assert_eq!(snapshot.active_theme.as_deref(), Some("dark"));
         assert!(!snapshot.tools_expanded);
 
@@ -1175,7 +1206,10 @@ mod tests {
         assert_eq!(snapshot.hidden_thinking_label, None);
         assert_eq!(snapshot.active_theme, None);
         assert!(!snapshot.tools_expanded);
-        assert_eq!(snapshot.themes[0].name, "dark", "canonical catalog is host-owned");
+        assert_eq!(
+            snapshot.themes[0].name, "dark",
+            "canonical catalog is host-owned"
+        );
     }
 
     #[tokio::test]

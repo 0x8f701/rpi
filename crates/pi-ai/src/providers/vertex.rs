@@ -8,8 +8,8 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use super::common::{
-    apply_provider_headers, apply_provider_request, client, consume_sse, error_body, fail,
-    notify_response, send_with_retry,
+    apply_provider_headers, apply_provider_request, build_request, client, consume_sse, error_body,
+    fail, notify_response, send_with_retry,
 };
 use crate::*;
 
@@ -144,14 +144,25 @@ async fn run_vertex_stream(
         &options.stream,
     )
     .await?;
-    let http = client(&options.stream)?;
+    client(&options.stream)?;
+    let payload = serde_json::to_vec(&payload)?;
     let response = send_with_retry(&options.stream, || {
-        http.post(&url)
-            .headers(request_headers.clone())
-            .json(&payload)
+        build_request(
+            &options.stream,
+            HttpMethod::Post,
+            &url,
+            &request_headers,
+            payload.clone(),
+        )
     })
     .await?;
-    notify_response(&options.stream, &response, model).await?;
+    notify_response(
+        &options.stream,
+        response.status(),
+        response.headers().clone(),
+        model,
+    )
+    .await?;
     if !response.status().is_success() {
         return Err(anyhow!(
             error_body("Google Vertex", response, &options.stream).await?
@@ -1395,6 +1406,28 @@ pub fn register_google_vertex() {
             stream: native,
             stream_simple: simple,
             generate_image: None,
+            resolve_http_authorities: std::sync::Arc::new(|model, stream| {
+                let options = VertexOptions {
+                    stream: stream.clone(),
+                    ..VertexOptions::default()
+                };
+                let auth_kind = resolve_auth_kind(model, &options)?;
+                let project_location = match auth_kind {
+                    VertexAuthKind::ApiKey => None,
+                    VertexAuthKind::AccessToken => {
+                        Some((resolve_project(&options)?, resolve_location(&options)?))
+                    }
+                };
+                let url = build_vertex_url(
+                    model,
+                    auth_kind,
+                    project_location
+                        .as_ref()
+                        .map(|(project, location)| (project.as_str(), location.as_str())),
+                )?;
+                let (authority, _) = resolve_http_endpoint(&url)?;
+                Ok(std::collections::BTreeSet::from([authority]))
+            }),
         },
         None,
     );
@@ -1452,6 +1485,7 @@ mod tests {
                     ("GOOGLE_CLOUD_PROJECT".into(), "test-project".into()),
                     ("GOOGLE_CLOUD_LOCATION".into(), "us-central1".into()),
                 ]),
+                http_executor: Some(crate::http::test_http_executor()),
                 ..StreamOptions::default()
             },
             ..VertexOptions::default()

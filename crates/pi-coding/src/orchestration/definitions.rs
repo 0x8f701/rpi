@@ -1,6 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -8,6 +6,7 @@ use pi_agent::{ThinkingLevel, ToolCapability};
 use pi_ai::Model;
 use serde::{Deserialize, Serialize};
 
+use crate::fs::{CapabilityEntry, CapabilityRootLease};
 use crate::resources::CONFIG_DIR_NAME;
 use crate::settings::{AgentRuntimeSettings, Settings};
 
@@ -122,7 +121,8 @@ pub struct AgentDefinition {
     /// Wall-clock bound for the whole child run, in seconds. The child is
     /// aborted when the deadline is exceeded.
     pub timeout_secs: Option<u64>,
-    /// Tools the child must never receive, matched against [`crate::TOOL_NAMES`].
+    /// Tools the child must never receive, including explicitly named
+    /// orchestration plumbing and persona-only tools.
     pub disallowed_tools: Vec<String>,
     pub capability_ceiling: Option<CapabilityCeiling>,
     pub source: AgentDefinitionSource,
@@ -138,6 +138,14 @@ pub struct AgentDefinition {
     /// [`crate::orchestration::OrchestrationConfig::soft_budget`] when
     /// configured. `None` falls back to the global budget.
     pub soft_budget: Option<JobSoftBudget>,
+    /// Persona knowledge-root labels (`knowledgeRoots`). Spawn requires each
+    /// absolute path to already be a parent additional workspace root
+    /// (`--add-dir`); placeholders such as `<memory-repo>` are prompt-only.
+    /// Ordinary agents ignore the field.
+    pub knowledge_roots: Vec<String>,
+    /// When true, this persona is the user-proxy: child `hub ask` to the user
+    /// is routed here first. Ordinary agents ignore the field.
+    pub user_proxy: bool,
 }
 
 impl AgentDefinition {
@@ -146,15 +154,28 @@ impl AgentDefinition {
     pub fn is_persona(&self) -> bool {
         self.kind == AgentDefinitionKind::Persona
     }
-
     /// The persona root directory (`<scope>/personas/<name>`) holding
-    /// `persona.md`, `memory/entries.jsonl`, and `sessions/<agent-id>.jsonl`,
-    /// for a persona; `None` for ordinary agents or personas without a path.
+    /// `persona.md`, `memory/entries.jsonl`, `skills/<name>/SKILL.md`, and
+    /// `sessions/<agent-id>.jsonl`; `None` for ordinary agents or personas
+    /// without a path.
     #[must_use]
     pub fn persona_root(&self) -> Option<PathBuf> {
         self.is_persona()
-            .then(|| self.path.as_ref().and_then(|path| path.parent()).map(Path::to_path_buf))
+            .then(|| {
+                self.path
+                    .as_ref()
+                    .and_then(|path| path.parent())
+                    .map(Path::to_path_buf)
+            })
             .flatten()
+    }
+
+    /// Absolute knowledge-root labels that are not already an admitted parent
+    /// workspace root (`--add-dir`). Placeholders (`<memory-repo>`) and
+    /// relative labels are skipped — they never open a host path.
+    #[must_use]
+    pub fn missing_knowledge_roots(&self, workspace: &crate::WorkspaceRoots) -> Vec<String> {
+        missing_knowledge_roots(&self.knowledge_roots, workspace)
     }
 }
 
@@ -179,10 +200,11 @@ impl Default for AgentDefinition {
             kind: AgentDefinitionKind::Agent,
             personality: None,
             soft_budget: None,
+            knowledge_roots: Vec::new(),
+            user_proxy: false,
         }
     }
 }
-
 
 #[derive(Clone, Debug)]
 pub struct AgentDiscoveryOptions {
@@ -208,33 +230,40 @@ pub struct AgentCatalog {
 }
 
 impl AgentCatalog {
-    pub fn discover(options: &AgentDiscoveryOptions) -> Result<Self> {
-        let cwd = absolute_existing_or_lexical(&options.cwd)?;
-        let agent_dir = absolute_existing_or_lexical(&options.agent_dir)?;
+    pub(crate) fn discover_with_roots(
+        options: &AgentDiscoveryOptions,
+        agent_root: CapabilityRootLease,
+        project_root: Option<CapabilityRootLease>,
+    ) -> Result<Self> {
         let mut agents = Vec::new();
         let mut seen = BTreeSet::new();
         let mut total_bytes = 0_u64;
 
         if options.project_trusted {
+            let project_root = project_root
+                .ok_or_else(|| anyhow!("trusted project agent capability is unavailable"))?;
             append_persona_directory(
-                &cwd.join(CONFIG_DIR_NAME).join("personas"),
+                &project_root,
+                &Path::new(CONFIG_DIR_NAME).join("personas"),
                 AgentDefinitionSource::Project,
-                options.project_trusted,
+                true,
                 &mut seen,
                 &mut agents,
                 &mut total_bytes,
             )?;
             append_directory(
-                &cwd.join(CONFIG_DIR_NAME).join("agents"),
+                &project_root,
+                &Path::new(CONFIG_DIR_NAME).join("agents"),
                 AgentDefinitionSource::Project,
-                options.project_trusted,
+                true,
                 &mut seen,
                 &mut agents,
                 &mut total_bytes,
             )?;
         }
         append_persona_directory(
-            &agent_dir.join("personas"),
+            &agent_root,
+            Path::new("personas"),
             AgentDefinitionSource::User,
             true,
             &mut seen,
@@ -242,7 +271,8 @@ impl AgentCatalog {
             &mut total_bytes,
         )?;
         append_directory(
-            &agent_dir.join("agents"),
+            &agent_root,
+            Path::new("agents"),
             AgentDefinitionSource::User,
             true,
             &mut seen,
@@ -255,6 +285,51 @@ impl AgentCatalog {
             }
         }
         Ok(Self { agents })
+    }
+
+    #[cfg(test)]
+    fn discover(options: &AgentDiscoveryOptions) -> Result<Self> {
+        let filesystem = crate::fs::CapabilityFs::new()?;
+        let agent_path = pi_sandbox::AbsolutePath::parse(options.agent_dir.clone())
+            .map_err(|_| anyhow!("invalid agent test root"))?;
+        let agent_root = filesystem
+            .open_read_directory_allowing_link(
+                crate::fs::CapabilityRootPurpose::AgentStore,
+                agent_path.clone(),
+            )
+            .or_else(|error| {
+                if matches!(
+                    error,
+                    crate::fs::FsError::System {
+                        kind: std::io::ErrorKind::NotFound,
+                        ..
+                    }
+                ) {
+                    filesystem.open_root(
+                        crate::fs::CapabilityRootPurpose::AgentStore,
+                        agent_path,
+                        crate::fs::CapabilityAccess::ReadOnly,
+                        crate::fs::RootCreation::Existing,
+                    )
+                } else {
+                    Err(error)
+                }
+            })?;
+        let project_root = options
+            .project_trusted
+            .then(|| {
+                let root = pi_sandbox::AbsolutePath::parse(options.cwd.clone())
+                    .map_err(|_| crate::fs::FsError::InvalidPath)?;
+                filesystem.open_root(
+                    crate::fs::CapabilityRootPurpose::ProjectResources,
+                    root,
+                    crate::fs::CapabilityAccess::ReadOnly,
+                    crate::fs::RootCreation::Existing,
+                )
+            })
+            .transpose()
+            .context("opening project agent test capability")?;
+        Self::discover_with_roots(options, agent_root, project_root)
     }
 
     #[must_use]
@@ -295,6 +370,16 @@ pub enum AgentModelSource {
     Parent,
 }
 
+/// One concrete model in the ordered fallback sequence resolved from a
+/// definition's model list, settings override, or parent fallback.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedAgentModelCandidate {
+    pub model: Model,
+    /// Concrete `provider/id` form with no thinking suffix.
+    pub selector: String,
+    pub thinking_level: Option<ThinkingLevel>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedAgentModel {
     pub model: Model,
@@ -303,6 +388,15 @@ pub struct ResolvedAgentModel {
     pub matched_pattern: Option<String>,
     /// Thinking level parsed from a model suffix such as `:high` or `:max`.
     pub thinking_level: Option<ThinkingLevel>,
+    /// Complete ordered sequence of concrete models the runtime may fall back
+    /// through, resolved once from the available catalog so the child factory
+    /// never reparses wildcard/alias/catalog-local source patterns. The active
+    /// model is at [`ResolvedAgentModel::selected_index`].
+    pub sequence: Vec<ResolvedAgentModelCandidate>,
+    /// 0-based position of [`ResolvedAgentModel::model`] within
+    /// [`ResolvedAgentModel::sequence`]. Always valid when `sequence` is
+    /// non-empty.
+    pub selected_index: usize,
 }
 
 pub fn agent_disabled_error(name: &str) -> anyhow::Error {
@@ -342,15 +436,23 @@ pub fn is_child_plumbing_tool(name: &str) -> bool {
     CHILD_PLUMBING_TOOLS.contains(&name)
 }
 
-/// Whether `name` is a tool a child agent may actually receive: either
-/// orchestration plumbing (auto-appended by the child factory) or one of the
-/// main-session built-ins the factory can construct. Any other declared name
-/// is unknown: it is reported once for a deduped warning and silently dropped
-/// (OMP-aligned — the declaration never becomes an injected tool and never
-/// makes the agent unavailable).
+/// Whether `name` is a tool an ordinary child agent may actually receive:
+/// either orchestration plumbing (auto-appended by the child factory) or one
+/// of the main-session built-ins the factory can construct. Any other
+/// declared name is unknown: it is reported once for a deduped warning and
+/// silently dropped (OMP-aligned — the declaration never becomes an injected
+/// tool and never makes the agent unavailable).
 #[must_use]
 pub fn is_known_child_tool(name: &str) -> bool {
     is_child_plumbing_tool(name) || crate::TOOL_NAMES.contains(&name)
+}
+
+/// Definition-aware child-tool recognition. `learn_skill` is intentionally
+/// absent from the ordinary/main-session catalogs and becomes known only when
+/// a durable persona explicitly declares it.
+#[must_use]
+pub fn is_known_child_tool_for_definition(name: &str, definition: &AgentDefinition) -> bool {
+    is_known_child_tool(name) || (definition.is_persona() && name == "learn_skill")
 }
 
 /// Names an agent declares (via the definition or the
@@ -366,11 +468,80 @@ pub fn unsupported_agent_tools(
     effective_agent_tool_names(definition, settings)
         .into_iter()
         .flatten()
-        .filter(|tool| !is_known_child_tool(tool))
+        .filter(|tool| !is_known_child_tool_for_definition(tool, definition))
         .cloned()
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+/// Coding tools a child actually receives after plumbing, unknowns, and
+/// disallowed names are dropped. `None` (no tools field) inherits the default
+/// factory set — not "zero tools" and not a cap-16 fail-closed list.
+#[must_use]
+pub fn resolved_child_coding_tools(
+    definition: &AgentDefinition,
+    settings: Option<&AgentRuntimeSettings>,
+) -> Vec<String> {
+    let names = match effective_agent_tool_names(definition, settings) {
+        Some(names) => names.to_vec(),
+        None => DEFAULT_CHILD_CODING_TOOLS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect(),
+    };
+    names
+        .into_iter()
+        .filter(|name| {
+            !is_child_plumbing_tool(name)
+                && is_known_child_tool_for_definition(name, definition)
+                && !definition.disallowed_tools.contains(name)
+                && (name.as_str() != "learn_skill"
+                    || definition
+                        .capability_ceiling
+                        .is_none_or(|ceiling| ceiling.write))
+        })
+        .collect()
+}
+
+/// Default coding tools the child factory injects when the definition does
+/// not declare `tools`. Must stay in lockstep with
+/// `create_coding_tools_for_workspace_with_generation_and_persona_skills`
+/// (memory backends are extra and never counted here). An omitted `tools`
+/// field inherits this full set and is exempt from `max_tools_per_agent`;
+/// only an explicit declared list is fail-closed against the cap.
+pub const DEFAULT_CHILD_CODING_TOOLS: &[&str] = &[
+    "read",
+    "inspect_image",
+    "generate_image",
+    "bash",
+    "edit",
+    "write",
+    "grep",
+    "find",
+    "glob",
+    "ls",
+    "browser",
+    "web_search",
+    "ast_grep",
+    "ast_edit",
+    "lsp",
+    "github",
+    "debug",
+    "eval",
+    "notebook",
+];
+
+/// Actionable spawn-time error when an *explicitly declared* child tool list
+/// exceeds `max_tools_per_agent`. Inherited `tools: None` sets skip this
+/// check. Names the agent, the cap, the count, and the resolved list so a
+/// silent queue-then-fail cannot happen.
+pub fn child_tool_cap_error(name: &str, cap: usize, tools: &[String]) -> anyhow::Error {
+    anyhow!(
+        "agent `{name}` resolves to {} tools (cap {cap}): {}. Declare a smaller `tools` list or raise `orchestration.maxToolsPerAgent`",
+        tools.len(),
+        tools.join(", "),
+    )
 }
 
 /// Human-readable, deduped warning for agent-declared tools that will be
@@ -378,7 +549,7 @@ pub fn unsupported_agent_tools(
 /// from re-warning while still surfacing every unknown name.
 pub fn unknown_tools_warning(name: &str, unknown: &[String]) -> String {
     format!(
-        "agent `{name}` declares unknown tools: {}; ignoring them (OMP-compatible — the declared tool is not injected); supported child tools: {}",
+        "agent `{name}` declares unknown tools: {}; ignoring them (OMP-compatible — the declared tool is not injected); supported child tools: {}. Persona definitions may additionally declare the persona-only `learn_skill` tool",
         unknown.join(", "),
         crate::TOOL_NAMES.join(", "),
     )
@@ -429,7 +600,6 @@ pub fn agent_compatibility_error(
         .map(|error| agent_model_error(&definition.name, &error))
 }
 
-
 /// Resolve the model a child session should use.
 ///
 /// Precedence:
@@ -448,22 +618,40 @@ pub fn resolve_agent_model(
 ) -> Result<ResolvedAgentModel> {
     if let Some(pattern) = agent_settings.and_then(AgentRuntimeSettings::model_override) {
         let (model_pattern, thinking_level) = split_agent_model_thinking_suffix(pattern);
-        let model = match_model_pattern(model_pattern, available, parent_model).map_err(|error| {
-            anyhow!(
-                "settings.agents.{}.model override {}: {error}",
-                definition.name,
-                pattern,
-            )
-        })?;
+        let model =
+            match_model_pattern(model_pattern, available, parent_model).map_err(|error| {
+                anyhow!(
+                    "settings.agents.{}.model override {}: {error}",
+                    definition.name,
+                    pattern,
+                )
+            })?;
+        let pattern_owned = pattern.to_owned();
+        let selector = model_id(&model);
         return Ok(ResolvedAgentModel {
-            model,
+            model: model.clone(),
             source: AgentModelSource::SettingsOverride,
-            matched_pattern: Some(pattern.to_owned()),
+            matched_pattern: Some(pattern_owned.clone()),
             thinking_level,
+            sequence: vec![ResolvedAgentModelCandidate {
+                model: model.clone(),
+                selector,
+                thinking_level,
+            }],
+            selected_index: 0,
         });
     }
 
+    // Definition model list: resolve every pattern (wildcard, alias,
+    // catalog-local) against the same available catalog used for initial
+    // selection, preserving thinking suffixes. Ambiguity on any pattern is a
+    // hard error (same contract as before). Successfully resolved patterns
+    // form the ordered fallback sequence; the first one that the old code would
+    // have selected is the active model.
     if let Some(patterns) = definition.model.as_ref() {
+        let mut sequence = Vec::new();
+        let mut selected_index = 0;
+        let mut selected: Option<(Model, Option<ThinkingLevel>, String)> = None;
         for pattern in patterns {
             let pattern = pattern.trim();
             if pattern.is_empty() {
@@ -472,10 +660,13 @@ pub fn resolve_agent_model(
             let (model_pattern, thinking_level) = split_agent_model_thinking_suffix(pattern);
             match match_model_pattern(model_pattern, available, parent_model) {
                 Ok(model) => {
-                    return Ok(ResolvedAgentModel {
-                        model,
-                        source: AgentModelSource::DefinitionFallback,
-                        matched_pattern: Some(pattern.to_owned()),
+                    if selected.is_none() {
+                        selected = Some((model.clone(), thinking_level, pattern.to_owned()));
+                        selected_index = sequence.len();
+                    }
+                    sequence.push(ResolvedAgentModelCandidate {
+                        model: model.clone(),
+                        selector: model_id(&model),
                         thinking_level,
                     });
                 }
@@ -489,13 +680,30 @@ pub fn resolve_agent_model(
                 Err(_) => continue,
             }
         }
+        if let Some((model, thinking_level, matched_pattern)) = selected {
+            return Ok(ResolvedAgentModel {
+                model,
+                source: AgentModelSource::DefinitionFallback,
+                matched_pattern: Some(matched_pattern),
+                thinking_level,
+                sequence,
+                selected_index,
+            });
+        }
     }
 
+    let selector = model_id(parent_model);
     Ok(ResolvedAgentModel {
         model: parent_model.clone(),
         source: AgentModelSource::Parent,
         matched_pattern: None,
         thinking_level: None,
+        sequence: vec![ResolvedAgentModelCandidate {
+            model: parent_model.clone(),
+            selector: selector.clone(),
+            thinking_level: None,
+        }],
+        selected_index: 0,
     })
 }
 
@@ -580,9 +788,7 @@ fn find_matching_model(pattern: &str, available: &[Model]) -> Result<Option<Mode
         [] => {}
         many => {
             let ids = many.iter().map(model_id).collect::<Vec<_>>().join(", ");
-            bail!(
-                "is ambiguous (exact id matches: {ids}); use a unique provider/id"
-            );
+            bail!("is ambiguous (exact id matches: {ids}); use a unique provider/id");
         }
     }
     let matches = available
@@ -595,9 +801,7 @@ fn find_matching_model(pattern: &str, available: &[Model]) -> Result<Option<Mode
         [single] => Ok(Some(single.clone())),
         many => {
             let ids = many.iter().map(model_id).collect::<Vec<_>>().join(", ");
-            bail!(
-                "is ambiguous (matches: {ids}); use provider/id to select exactly one model"
-            );
+            bail!("is ambiguous (matches: {ids}); use provider/id to select exactly one model");
         }
     }
 }
@@ -629,7 +833,9 @@ fn bundled_agents() -> Vec<AgentDefinition> {
     vec![
         AgentDefinition {
             name: "task".to_owned(),
-            description: "General-purpose subagent with full capabilities for delegated multi-step tasks".to_owned(),
+            description:
+                "General-purpose subagent with full capabilities for delegated multi-step tasks"
+                    .to_owned(),
             system_prompt: BUNDLED_TASK_PROMPT.trim().to_owned(),
             tools: None,
             autoload_skills: Vec::new(),
@@ -646,6 +852,8 @@ fn bundled_agents() -> Vec<AgentDefinition> {
             kind: AgentDefinitionKind::Agent,
             personality: None,
             soft_budget: None,
+            knowledge_roots: Vec::new(),
+            user_proxy: false,
         },
         AgentDefinition {
             name: "researcher".to_owned(),
@@ -666,6 +874,8 @@ fn bundled_agents() -> Vec<AgentDefinition> {
             kind: AgentDefinitionKind::Agent,
             personality: None,
             soft_budget: None,
+            knowledge_roots: Vec::new(),
+            user_proxy: false,
         },
     ]
 }
@@ -675,6 +885,7 @@ fn bundled_agents() -> Vec<AgentDefinition> {
 const BUNDLED_AGENT_NAMES: &[&str] = &["task", "researcher"];
 
 fn append_directory(
+    root: &CapabilityRootLease,
     directory: &Path,
     source: AgentDefinitionSource,
     trusted: bool,
@@ -682,49 +893,59 @@ fn append_directory(
     output: &mut Vec<AgentDefinition>,
     total_bytes: &mut u64,
 ) -> Result<()> {
-    let mut paths = match fs::read_dir(directory) {
-        Ok(entries) => entries
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                let file_type = entry.file_type().ok()?;
-                let path = entry.path();
-                ((file_type.is_file() || file_type.is_symlink())
-                    && path.extension().is_some_and(|extension| extension == "md"))
-                .then_some(path)
-            })
-            .collect::<Vec<_>>(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("reading agent definitions from {}", directory.display()));
+    let opened = if source == AgentDefinitionSource::User {
+        match root.open_directory_allowing_link(directory) {
+            Ok(opened) => opened,
+            Err(error) if capability_missing(&error) => match root.open_directory(directory) {
+                Err(strict_error) if capability_missing(&strict_error) => return Ok(()),
+                Err(strict_error) => {
+                    return Err(strict_error).context("reading agent definitions");
+                }
+                Ok(_) => return Err(error).context("reading agent definitions"),
+            },
+            Err(error) => return Err(error).context("reading agent definitions"),
+        }
+    } else {
+        match root.open_directory(directory) {
+            Ok(opened) => opened,
+            Err(error) if capability_missing(&error) => return Ok(()),
+            Err(error) => return Err(error).context("reading agent definitions"),
         }
     };
-    paths.sort();
-    for path in paths {
-        let size = fs::metadata(&path)
-            .with_context(|| format!("reading agent definition metadata {}", path.display()))?
-            .len();
-        if size > MAX_AGENT_DEFINITION_BYTES {
+    let names = opened
+        .read_dir_names_rejecting_unsupported()
+        .context("reading agent definitions")?;
+    for name in names {
+        if Path::new(&name)
+            .extension()
+            .is_none_or(|extension| extension != "md")
+        {
+            continue;
+        }
+        let CapabilityEntry::File(file) = opened
+            .open_entry_exact(Path::new(&name))
+            .context("opening agent definition")?
+        else {
+            continue;
+        };
+        let metadata = file.metadata()?;
+        if metadata.len > MAX_AGENT_DEFINITION_BYTES {
+            bail!("agent definition exceeds maximum size of {MAX_AGENT_DEFINITION_BYTES} bytes");
+        }
+        *total_bytes = total_bytes.saturating_add(metadata.len);
+        if *total_bytes > MAX_AGENT_CATALOG_BYTES {
             bail!(
-                "agent definition {} exceeds maximum size of {} bytes",
-                path.display(),
-                MAX_AGENT_DEFINITION_BYTES
+                "agent definition catalog exceeds maximum size of {MAX_AGENT_CATALOG_BYTES} bytes"
             );
         }
-        *total_bytes = total_bytes.saturating_add(size);
-        if *total_bytes > MAX_AGENT_CATALOG_BYTES {
-            bail!("agent definition catalog exceeds maximum size of {MAX_AGENT_CATALOG_BYTES} bytes");
-        }
-        let mut content = String::with_capacity(usize::try_from(size).unwrap_or(0));
-        File::open(&path)
-            .with_context(|| format!("opening agent definition {}", path.display()))?
-            .take(MAX_AGENT_DEFINITION_BYTES + 1)
-            .read_to_string(&mut content)
-            .with_context(|| format!("reading agent definition {}", path.display()))?;
-        if content.len() as u64 > MAX_AGENT_DEFINITION_BYTES {
-            bail!("agent definition {} grew beyond maximum size while reading", path.display());
-        }
-        let agent = parse_agent_definition(&path, &content, source, trusted)?;
+        let bytes = file.read_bounded(MAX_AGENT_DEFINITION_BYTES)?;
+        let content = String::from_utf8(bytes).context("agent definition is not UTF-8")?;
+        let display = if source == AgentDefinitionSource::User {
+            file.authority_path()
+        } else {
+            root.display_root().join(directory).join(&name)
+        };
+        let agent = parse_agent_definition(&display, &content, source, trusted)?;
         if seen.insert(agent.name.clone()) {
             output.push(agent);
         }
@@ -742,6 +963,7 @@ fn append_directory(
 /// first source to claim a name wins, so callers must invoke this in
 /// precedence order (project personas before user personas, before agents).
 fn append_persona_directory(
+    root: &CapabilityRootLease,
     directory: &Path,
     source: AgentDefinitionSource,
     trusted: bool,
@@ -749,87 +971,83 @@ fn append_persona_directory(
     output: &mut Vec<AgentDefinition>,
     total_bytes: &mut u64,
 ) -> Result<()> {
-    let mut children = match fs::read_dir(directory) {
-        Ok(entries) => entries
-            .collect::<std::io::Result<Vec<_>>>()
-            .map_err(|error| anyhow!("reading persona definitions from {}: {error}", directory.display()))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("reading persona definitions from {}", directory.display()));
+    let personas = if source == AgentDefinitionSource::User {
+        match root.open_directory_allowing_link(directory) {
+            Ok(opened) => opened,
+            Err(error) if capability_missing(&error) => match root.open_directory(directory) {
+                Err(strict_error) if capability_missing(&strict_error) => return Ok(()),
+                Err(strict_error) => {
+                    return Err(strict_error).context("reading persona definitions");
+                }
+                Ok(_) => return Err(error).context("reading persona definitions"),
+            },
+            Err(error) => return Err(error).context("reading persona definitions"),
+        }
+    } else {
+        match root.open_directory(directory) {
+            Ok(opened) => opened,
+            Err(error) if capability_missing(&error) => return Ok(()),
+            Err(error) => return Err(error).context("reading persona definitions"),
         }
     };
-    children.sort_by_key(std::fs::DirEntry::file_name);
-    for entry in children {
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("reading persona directory entry {}", entry.path().display())
-                });
-            }
+    for name in personas
+        .read_dir_names()
+        .context("reading persona definitions")?
+    {
+        let dir_name = name.to_string_lossy().into_owned();
+        let CapabilityEntry::Directory(dir) = personas
+            .open_entry_exact(Path::new(&name))
+            .context("opening persona root")?
+        else {
+            continue;
         };
-        // Only real immediate child directories can host a persona. Symlinked
-        // roots are rejected so persona-local memory and transcript writes
-        // cannot escape the discovered persona scope.
-        if file_type.is_symlink() {
-            bail!("persona directory must not be a symlink: {}", entry.path().display());
+        let file = match dir.open_file(Path::new("persona.md")) {
+            Ok(file) => file,
+            Err(error) if capability_missing(&error) => continue,
+            Err(error) => return Err(error).context("opening persona definition"),
+        };
+        let metadata = file.metadata()?;
+        if metadata.len > MAX_AGENT_DEFINITION_BYTES {
+            bail!("persona definition exceeds maximum size of {MAX_AGENT_DEFINITION_BYTES} bytes");
         }
-        if !file_type.is_dir() {
-            continue;
-        }
-        let dir_name = entry.file_name().to_string_lossy().into_owned();
-        let persona_md = entry.path().join("persona.md");
-        if !persona_md.is_file() {
-            // A child directory without a persona.md is not a persona; skip it
-            // rather than failing, so partial/auxiliary directories are tolerated.
-            continue;
-        }
-        let size = fs::metadata(&persona_md)
-            .with_context(|| format!("reading persona definition metadata {}", persona_md.display()))?
-            .len();
-        if size > MAX_AGENT_DEFINITION_BYTES {
+        *total_bytes = total_bytes.saturating_add(metadata.len);
+        if *total_bytes > MAX_AGENT_CATALOG_BYTES {
             bail!(
-                "persona definition {} exceeds maximum size of {} bytes",
-                persona_md.display(),
-                MAX_AGENT_DEFINITION_BYTES
+                "agent definition catalog exceeds maximum size of {MAX_AGENT_CATALOG_BYTES} bytes"
             );
         }
-        *total_bytes = total_bytes.saturating_add(size);
-        if *total_bytes > MAX_AGENT_CATALOG_BYTES {
-            bail!("agent definition catalog exceeds maximum size of {MAX_AGENT_CATALOG_BYTES} bytes");
-        }
-        let mut content = String::with_capacity(usize::try_from(size).unwrap_or(0));
-        File::open(&persona_md)
-            .with_context(|| format!("opening persona definition {}", persona_md.display()))?
-            .take(MAX_AGENT_DEFINITION_BYTES + 1)
-            .read_to_string(&mut content)
-            .with_context(|| format!("reading persona definition {}", persona_md.display()))?;
-        if content.len() as u64 > MAX_AGENT_DEFINITION_BYTES {
-            bail!("persona definition {} grew beyond maximum size while reading", persona_md.display());
-        }
-        let persona = parse_persona_definition(&persona_md, &content, source, trusted)?;
+        let content = String::from_utf8(file.read_bounded(MAX_AGENT_DEFINITION_BYTES)?)
+            .context("persona definition is not UTF-8")?;
+        let display = dir.authority_path().join("persona.md");
+        let persona = parse_persona_definition(&display, &content, source, trusted)?;
         if persona.name != dir_name {
             bail!(
-                "persona name {:?} must match its directory name {:?} (at {})",
+                "persona name {:?} must match its directory name {:?}",
                 persona.name,
-                dir_name,
-                persona_md.display()
+                dir_name
             );
         }
         if BUNDLED_AGENT_NAMES.contains(&persona.name.as_str()) {
             bail!(
-                "persona name {:?} conflicts with a bundled agent name (at {})",
-                persona.name,
-                persona_md.display()
+                "persona name {:?} conflicts with a bundled agent name",
+                persona.name
             );
         }
-
         if seen.insert(persona.name.clone()) {
             output.push(persona);
         }
     }
     Ok(())
+}
+
+fn capability_missing(error: &crate::fs::FsError) -> bool {
+    matches!(
+        error,
+        crate::fs::FsError::System {
+            kind: std::io::ErrorKind::NotFound,
+            ..
+        }
+    )
 }
 
 pub fn parse_agent_definition(
@@ -868,14 +1086,20 @@ fn parse_definition(
     if body.trim().is_empty() {
         bail!("agent system prompt must not be empty");
     }
-    let tools = fields.get("tools").map(|value| parse_list(value)).transpose()?;
+    let tools = fields
+        .get("tools")
+        .map(|value| parse_list(value))
+        .transpose()?;
     let autoload_skills = fields
         .get("autoloadSkills")
         .or_else(|| fields.get("autoload-skills"))
         .map(|value| parse_list(value))
         .transpose()?
         .unwrap_or_default();
-    let model = fields.get("model").map(|value| parse_list(value)).transpose()?;
+    let model = fields
+        .get("model")
+        .map(|value| parse_list(value))
+        .transpose()?;
     let thinking_level = fields
         .get("thinkingLevel")
         .or_else(|| fields.get("thinking-level"))
@@ -896,7 +1120,8 @@ fn parse_definition(
         .or_else(|| fields.get("timeout-secs"))
         .map(|value| {
             let seconds = parse_positive_contract("timeoutSecs", value)?;
-            u64::try_from(seconds).map_err(|_| anyhow!("agent frontmatter timeoutSecs is too large"))
+            u64::try_from(seconds)
+                .map_err(|_| anyhow!("agent frontmatter timeoutSecs is too large"))
         })
         .transpose()?;
     let disallowed_tools = fields
@@ -923,6 +1148,16 @@ fn parse_definition(
     } else {
         None
     };
+    let knowledge_roots = if kind == AgentDefinitionKind::Persona {
+        parse_knowledge_roots(&fields)?
+    } else {
+        Vec::new()
+    };
+    let user_proxy = if kind == AgentDefinitionKind::Persona {
+        parse_user_proxy(&fields)?
+    } else {
+        false
+    };
     Ok(AgentDefinition {
         name,
         description,
@@ -942,6 +1177,8 @@ fn parse_definition(
         kind,
         personality,
         soft_budget,
+        knowledge_roots,
+        user_proxy,
     })
 }
 
@@ -970,7 +1207,10 @@ fn parse_frontmatter(content: &str) -> Result<(BTreeMap<String, String>, String)
         let indented = line.len() > trimmed.len();
         if let Some(item) = trimmed.strip_prefix("- ") {
             let key = current_list.as_ref().ok_or_else(|| {
-                anyhow!("frontmatter line {} has a list item without a field", index + 1)
+                anyhow!(
+                    "frontmatter line {} has a list item without a field",
+                    index + 1
+                )
             })?;
             let value = unquote(item.trim())?;
             let entry = fields.entry(key.clone()).or_insert_with(String::new);
@@ -983,7 +1223,10 @@ fn parse_frontmatter(content: &str) -> Result<(BTreeMap<String, String>, String)
             continue;
         }
         let Some((key, value)) = line.split_once(':') else {
-            bail!("invalid frontmatter line {}: expected key: value", index + 1);
+            bail!(
+                "invalid frontmatter line {}: expected key: value",
+                index + 1
+            );
         };
         let key = key.trim();
         if key.is_empty() {
@@ -995,7 +1238,10 @@ fn parse_frontmatter(content: &str) -> Result<(BTreeMap<String, String>, String)
             // active block is a structural error (actionable, like a stray
             // list item).
             let parent = current_block.as_ref().ok_or_else(|| {
-                anyhow!("frontmatter line {} is indented without a parent block", index + 1)
+                anyhow!(
+                    "frontmatter line {} is indented without a parent block",
+                    index + 1
+                )
             })?;
             let qualified = format!("{parent}.{key}");
             if value.is_empty() {
@@ -1068,7 +1314,9 @@ fn parse_positive_contract(field: &str, value: &str) -> Result<usize> {
         .parse::<usize>()
         .map_err(|_| anyhow!("agent frontmatter {field} must be a positive integer"))?;
     if parsed == 0 {
-        bail!("agent frontmatter {field} must be a positive integer (got 0; omit the field for no limit)");
+        bail!(
+            "agent frontmatter {field} must be a positive integer (got 0; omit the field for no limit)"
+        );
     }
     Ok(parsed)
 }
@@ -1081,7 +1329,9 @@ fn parse_positive_u64_contract(field: &str, value: &str) -> Result<u64> {
         .parse::<u64>()
         .map_err(|_| anyhow!("agent frontmatter {field} must be a positive integer"))?;
     if parsed == 0 {
-        bail!("agent frontmatter {field} must be a positive integer (got 0; omit the field for no limit)");
+        bail!(
+            "agent frontmatter {field} must be a positive integer (got 0; omit the field for no limit)"
+        );
     }
     Ok(parsed)
 }
@@ -1155,6 +1405,71 @@ fn parse_soft_budget(fields: &BTreeMap<String, String>) -> Result<Option<JobSoft
     }))
 }
 
+/// Persona `knowledgeRoots` labels. Stored as declared (placeholders such as
+/// `<memory-repo>` stay prompt-only). Absolute paths must already be a parent
+/// additional workspace root at spawn; they are never opened from this list.
+fn parse_knowledge_roots(fields: &BTreeMap<String, String>) -> Result<Vec<String>> {
+    let value = fields
+        .get("knowledgeRoots")
+        .or_else(|| fields.get("knowledge-roots"));
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let roots = parse_list(value)?;
+    if roots.len() > 16 {
+        bail!("persona knowledgeRoots may list at most 16 roots");
+    }
+    for root in &roots {
+        if root.chars().count() > 512 {
+            bail!("persona knowledgeRoots entry exceeds 512 characters");
+        }
+        if root.contains('\0') {
+            bail!("persona knowledgeRoots entry must not contain NUL");
+        }
+    }
+    Ok(roots)
+}
+
+fn parse_user_proxy(fields: &BTreeMap<String, String>) -> Result<bool> {
+    let value = fields.get("userProxy").or_else(|| fields.get("user-proxy"));
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "1" => Ok(true),
+        "false" | "no" | "0" => Ok(false),
+        other => bail!("persona userProxy must be true or false, got {other:?}"),
+    }
+}
+
+/// Absolute `knowledgeRoots` entries that are not already an admitted parent
+/// workspace root. Placeholders and relative labels are not treated as paths.
+#[must_use]
+pub fn missing_knowledge_roots(
+    labels: &[String],
+    workspace: &crate::WorkspaceRoots,
+) -> Vec<String> {
+    let admitted = workspace.roots();
+    labels
+        .iter()
+        .filter(|label| label.starts_with('/'))
+        .filter(|label| {
+            let path = Path::new(label.as_str());
+            !admitted
+                .iter()
+                .any(|root| path == root.as_path() || path.starts_with(root))
+        })
+        .cloned()
+        .collect()
+}
+
+pub fn knowledge_root_membership_error(name: &str, missing: &[String]) -> anyhow::Error {
+    anyhow!(
+        "persona `{name}` knowledgeRoots are not in the parent workspace: {}. Add each directory to the parent session with `--add-dir <path>` (or the equivalent additional workspace root) before spawning this persona",
+        missing.join(", "),
+    )
+}
+
 /// Parse a capability ceiling from a list of allowed capabilities
 /// (`read`, `write`, `exec` — the same lowercase names [`ToolCapability`]
 /// serializes with). Capabilities absent from the list are disallowed.
@@ -1218,33 +1533,10 @@ fn unquote(value: &str) -> Result<String> {
         .to_owned())
 }
 
-fn absolute_existing_or_lexical(path: &Path) -> Result<PathBuf> {
-    if let Ok(canonical) = path.canonicalize() {
-        return Ok(canonical);
-    }
-    if path.is_absolute() {
-        return Ok(lexical_normalize(path));
-    }
-    Ok(lexical_normalize(&std::env::current_dir()?.join(path)))
-}
-
-fn lexical_normalize(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            other => normalized.push(other.as_os_str()),
-        }
-    }
-    normalized
-}
-
 #[cfg(test)]
 mod size_tests {
     use super::*;
+    use std::fs;
 
     fn valid_agent_bytes(size: usize) -> Vec<u8> {
         let prefix = b"---\nname: bounded\ndescription: bounded\n---\n";
@@ -1259,8 +1551,13 @@ mod size_tests {
         let root = tempfile::tempdir().expect("root");
         let agents = root.path().join("agents");
         fs::create_dir_all(&agents).expect("agents");
-        fs::write(agents.join("bounded.md"), valid_agent_bytes(MAX_AGENT_DEFINITION_BYTES as usize)).expect("agent");
-        let catalog = AgentCatalog::discover(&AgentDiscoveryOptions::new(root.path(), root.path())).expect("boundary accepted");
+        fs::write(
+            agents.join("bounded.md"),
+            valid_agent_bytes(MAX_AGENT_DEFINITION_BYTES as usize),
+        )
+        .expect("agent");
+        let catalog = AgentCatalog::discover(&AgentDiscoveryOptions::new(root.path(), root.path()))
+            .expect("boundary accepted");
         assert!(catalog.get("bounded").is_some());
     }
 
@@ -1269,18 +1566,27 @@ mod size_tests {
         let root = tempfile::tempdir().expect("root");
         let agents = root.path().join("agents");
         fs::create_dir_all(&agents).expect("agents");
-        fs::write(agents.join("oversized.md"), valid_agent_bytes(MAX_AGENT_DEFINITION_BYTES as usize + 1)).expect("agent");
-        let error = AgentCatalog::discover(&AgentDiscoveryOptions::new(root.path(), root.path())).expect_err("oversized agent rejected").to_string();
+        fs::write(
+            agents.join("oversized.md"),
+            valid_agent_bytes(MAX_AGENT_DEFINITION_BYTES as usize + 1),
+        )
+        .expect("agent");
+        let error = AgentCatalog::discover(&AgentDiscoveryOptions::new(root.path(), root.path()))
+            .expect_err("oversized agent rejected")
+            .to_string();
         assert!(error.contains("exceeds maximum size"));
     }
 
     #[test]
     fn bundled_researcher_is_discovered_and_user_definitions_win() {
-        // P0-C: a normal install must offer the `researcher` role (the literal
+        // A normal install must offer the `researcher` role (the literal
         // `你让researcher…` prompt depends on it), so `discover` bundles it.
         let root = tempfile::tempdir().expect("root");
-        let catalog = AgentCatalog::discover(&AgentDiscoveryOptions::new(root.path(), root.path())).expect("discover");
-        let researcher = catalog.get("researcher").expect("bundled researcher must be discovered");
+        let catalog = AgentCatalog::discover(&AgentDiscoveryOptions::new(root.path(), root.path()))
+            .expect("discover");
+        let researcher = catalog
+            .get("researcher")
+            .expect("bundled researcher must be discovered");
         assert_eq!(researcher.name, "researcher");
         assert_eq!(researcher.source, AgentDefinitionSource::Bundled);
         assert!(researcher.trusted);
@@ -1294,10 +1600,88 @@ mod size_tests {
             "---\nname: researcher\ndescription: user researcher\n---\nUSER_RESEARCHER_PROMPT",
         )
         .expect("user agent");
-        let catalog = AgentCatalog::discover(&AgentDiscoveryOptions::new(root.path(), root.path())).expect("discover");
+        let catalog = AgentCatalog::discover(&AgentDiscoveryOptions::new(root.path(), root.path()))
+            .expect("discover");
         let researcher = catalog.get("researcher").expect("researcher present");
         assert_eq!(researcher.source, AgentDefinitionSource::User);
         assert!(researcher.system_prompt.contains("USER_RESEARCHER_PROMPT"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_top_level_agents_link_loads_but_nested_links_fail_closed() {
+        let root = tempfile::tempdir().expect("root");
+        let external = root.path().join("external-agents");
+        fs::create_dir_all(&external).expect("external agents");
+        fs::write(
+            external.join("linked.md"),
+            "---\nname: linked\ndescription: linked agent\n---\nlinked prompt",
+        )
+        .expect("linked agent");
+        std::os::unix::fs::symlink(&external, root.path().join("agents"))
+            .expect("top-level agents link");
+        let catalog = AgentCatalog::discover(&AgentDiscoveryOptions::new(root.path(), root.path()))
+            .expect("linked agents load");
+        assert!(catalog.get("linked").is_some());
+
+        fs::remove_file(external.join("linked.md")).expect("remove regular definition");
+        let outside = root.path().join("outside.md");
+        fs::write(
+            &outside,
+            "---\nname: escaped\ndescription: escaped agent\n---\nescaped prompt",
+        )
+        .expect("outside agent");
+        std::os::unix::fs::symlink(&outside, external.join("escaped.md"))
+            .expect("nested agent link");
+        AgentCatalog::discover(&AgentDiscoveryOptions::new(root.path(), root.path()))
+            .expect_err("nested agent link remains rejected");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_project_agents_symlink_is_rejected_strict() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("root");
+        let external = root.path().join("external-agents");
+        fs::create_dir_all(&external).expect("external agents");
+        fs::write(
+            external.join("linked.md"),
+            "---\nname: linked\ndescription: linked agent\n---\nlinked prompt",
+        )
+        .expect("linked agent");
+        let project_dir = root.path().join("project");
+        let project_agents = project_dir.join(".rpi").join("agents");
+        fs::create_dir_all(&project_agents).expect("project agents dir");
+        symlink(&external, project_agents.join("linked.md")).expect("project agent symlink");
+        let mut options = AgentDiscoveryOptions::new(&project_dir, root.path());
+        options.project_trusted = true;
+        let error =
+            AgentCatalog::discover(&options).expect_err("Project agent symlink must fail closed");
+        assert!(format!("{error:#}").contains("reading agent definitions"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_project_agents_nested_escape_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("root");
+        let project_dir = root.path().join("project");
+        let project_agents = project_dir.join(".rpi").join("agents");
+        fs::create_dir_all(&project_agents).expect("project agents dir");
+        let outside = root.path().join("outside.md");
+        fs::write(
+            &outside,
+            "---\nname: escaped\ndescription: escaped agent\n---\nescaped prompt",
+        )
+        .expect("outside agent");
+        symlink(&outside, project_agents.join("escaped.md")).expect("nested project agent escape");
+        let mut options = AgentDiscoveryOptions::new(&project_dir, root.path());
+        options.project_trusted = true;
+        let error = AgentCatalog::discover(&options)
+            .expect_err("Project nested agent symlink must fail closed");
+        assert!(format!("{error:#}").contains("reading agent definitions"));
     }
 
     #[test]
@@ -1312,11 +1696,12 @@ mod size_tests {
             bytes.resize(MAX_AGENT_DEFINITION_BYTES as usize, b'x');
             fs::write(agents.join(format!("{index:02}.md")), bytes).expect("agent");
         }
-        let error = AgentCatalog::discover(&AgentDiscoveryOptions::new(root.path(), root.path())).expect_err("aggregate rejected").to_string();
+        let error = AgentCatalog::discover(&AgentDiscoveryOptions::new(root.path(), root.path()))
+            .expect_err("aggregate rejected")
+            .to_string();
         assert!(error.contains("catalog exceeds maximum size"));
     }
 }
-
 
 #[cfg(test)]
 mod model_resolution_tests {
@@ -1352,6 +1737,8 @@ mod model_resolution_tests {
             kind: AgentDefinitionKind::Agent,
             personality: None,
             soft_budget: None,
+            knowledge_roots: Vec::new(),
+            user_proxy: false,
         }
     }
 
@@ -1377,6 +1764,39 @@ mod model_resolution_tests {
     }
 
     #[test]
+    fn definition_model_list_returns_complete_resolved_sequence() {
+        let parent = model("openai", "gpt-4.1");
+        let available = vec![
+            model("openai", "gpt-4.1"),
+            model("anthropic", "claude-sonnet-4-5"),
+            model("google", "gemini-2.5-pro"),
+        ];
+        let definition = def(
+            "reviewer",
+            Some(vec![
+                "anthropic/claude-sonnet-4-5:high",
+                "google/gemini-2.5-pro:low",
+                "openai/gpt-4.1",
+            ]),
+        );
+        let resolved =
+            resolve_agent_model(&definition, None, &parent, &available).expect("ordered sequence");
+        assert_eq!(resolved.selected_index, 0);
+        assert_eq!(resolved.sequence.len(), 3);
+        assert_eq!(resolved.sequence[0].selector, "anthropic/claude-sonnet-4-5");
+        assert_eq!(
+            resolved.sequence[0].thinking_level,
+            Some(ThinkingLevel::High)
+        );
+        assert_eq!(resolved.sequence[1].selector, "google/gemini-2.5-pro");
+        assert_eq!(
+            resolved.sequence[1].thinking_level,
+            Some(ThinkingLevel::Low)
+        );
+        assert_eq!(resolved.sequence[2].selector, "openai/gpt-4.1");
+    }
+
+    #[test]
     fn settings_override_beats_definition_and_parent() {
         let parent = model("openai", "gpt-4.1");
         let available = vec![
@@ -1388,14 +1808,17 @@ mod model_resolution_tests {
         let settings = AgentRuntimeSettings {
             enabled: Some(true),
             model: Some("anthropic/claude-sonnet-4-5".to_owned()),
-                tools: None,
-            };
+            tools: None,
+        };
         let resolved = resolve_agent_model(&definition, Some(&settings), &parent, &available)
             .expect("settings override must resolve");
         assert_eq!(resolved.source, AgentModelSource::SettingsOverride);
         assert_eq!(resolved.model.provider, "anthropic");
         assert_eq!(resolved.model.id, "claude-sonnet-4-5");
-        assert_eq!(resolved.matched_pattern.as_deref(), Some("anthropic/claude-sonnet-4-5"));
+        assert_eq!(
+            resolved.matched_pattern.as_deref(),
+            Some("anthropic/claude-sonnet-4-5")
+        );
     }
 
     #[test]
@@ -1407,13 +1830,20 @@ mod model_resolution_tests {
         ];
         let definition = def(
             "reviewer",
-            Some(vec!["missing/model", "anthropic/claude-sonnet-4-5", "openai/gpt-4.1"]),
+            Some(vec![
+                "missing/model",
+                "anthropic/claude-sonnet-4-5",
+                "openai/gpt-4.1",
+            ]),
         );
         let resolved = resolve_agent_model(&definition, None, &parent, &available)
             .expect("definition fallback must resolve");
         assert_eq!(resolved.source, AgentModelSource::DefinitionFallback);
         assert_eq!(resolved.model.provider, "anthropic");
-        assert_eq!(resolved.matched_pattern.as_deref(), Some("anthropic/claude-sonnet-4-5"));
+        assert_eq!(
+            resolved.matched_pattern.as_deref(),
+            Some("anthropic/claude-sonnet-4-5")
+        );
     }
 
     #[test]
@@ -1463,8 +1893,8 @@ mod model_resolution_tests {
         let settings = AgentRuntimeSettings {
             enabled: Some(true),
             model: Some("openai".to_owned()),
-                tools: None,
-            };
+            tools: None,
+        };
         let error = resolve_agent_model(&definition, Some(&settings), &parent, &available)
             .expect_err("provider-only multi-match must fail");
         let message = error.to_string();
@@ -1490,16 +1920,13 @@ mod model_resolution_tests {
     #[test]
     fn exact_provider_id_still_unique_among_siblings() {
         let parent = model("openai", "gpt-4.1");
-        let available = vec![
-            model("openai", "gpt-4.1"),
-            model("openai", "gpt-4.1-mini"),
-        ];
+        let available = vec![model("openai", "gpt-4.1"), model("openai", "gpt-4.1-mini")];
         let definition = def("reviewer", None);
         let settings = AgentRuntimeSettings {
             enabled: Some(true),
             model: Some("openai/gpt-4.1-mini".to_owned()),
-                tools: None,
-            };
+            tools: None,
+        };
         let resolved = resolve_agent_model(&definition, Some(&settings), &parent, &available)
             .expect("exact provider/id must resolve");
         assert_eq!(resolved.model.id, "gpt-4.1-mini");
@@ -1530,12 +1957,15 @@ mod model_resolution_tests {
         let settings = AgentRuntimeSettings {
             enabled: Some(true),
             model: Some("totally-missing/model".to_owned()),
-                tools: None,
-            };
+            tools: None,
+        };
         let error = resolve_agent_model(&definition, Some(&settings), &parent, &available)
             .expect_err("invalid settings override must not fall through");
         let message = error.to_string();
-        assert!(message.contains("settings.agents.reviewer.model"), "{message}");
+        assert!(
+            message.contains("settings.agents.reviewer.model"),
+            "{message}"
+        );
         assert!(message.contains("totally-missing/model"), "{message}");
     }
 }
@@ -1545,7 +1975,12 @@ mod contract_tests {
     use super::*;
 
     fn parse(content: &str) -> Result<AgentDefinition> {
-        parse_agent_definition(Path::new("role.md"), content, AgentDefinitionSource::User, true)
+        parse_agent_definition(
+            Path::new("role.md"),
+            content,
+            AgentDefinitionSource::User,
+            true,
+        )
     }
 
     #[test]
@@ -1639,7 +2074,10 @@ mod contract_tests {
     fn non_numeric_contract_values_are_rejected() {
         let definition = parse("---\nname: bounded\ndescription: d\nmaxTurns: many\n---\nprompt")
             .expect_err("non-numeric maxTurns must be rejected");
-        assert!(definition.to_string().contains("maxTurns"), "{definition:#}");
+        assert!(
+            definition.to_string().contains("maxTurns"),
+            "{definition:#}"
+        );
     }
 
     #[test]
@@ -1648,10 +2086,7 @@ mod contract_tests {
             "---\nname: bounded\ndescription: d\ncapabilityCeiling: [read, delete]\n---\nprompt",
         )
         .expect_err("unknown ceiling item must be rejected");
-        assert!(
-            definition.to_string().contains("delete"),
-            "{definition:#}"
-        );
+        assert!(definition.to_string().contains("delete"), "{definition:#}");
     }
 
     #[test]
@@ -1665,7 +2100,11 @@ mod contract_tests {
         assert!(all.is_unrestricted());
         assert_eq!(
             all.allowed_capabilities(),
-            vec![ToolCapability::Read, ToolCapability::Write, ToolCapability::Exec]
+            vec![
+                ToolCapability::Read,
+                ToolCapability::Write,
+                ToolCapability::Exec
+            ]
         );
         let read_only = CapabilityCeiling {
             read: true,
@@ -1701,6 +2140,8 @@ mod child_tool_validation_tests {
             kind: AgentDefinitionKind::Agent,
             personality: None,
             soft_budget: None,
+            knowledge_roots: Vec::new(),
+            user_proxy: false,
         }
     }
 
@@ -1712,8 +2153,14 @@ mod child_tool_validation_tests {
                 "{name:?} must be child plumbing"
             );
         }
-        assert!(!is_child_plumbing_tool("read"), "read is a real tool, not plumbing");
-        assert!(!is_child_plumbing_tool("yieldx"), "yieldx must not match yield");
+        assert!(
+            !is_child_plumbing_tool("read"),
+            "read is a real tool, not plumbing"
+        );
+        assert!(
+            !is_child_plumbing_tool("yieldx"),
+            "yieldx must not match yield"
+        );
         assert_eq!(CHILD_PLUMBING_TOOLS.len(), 6);
         // yield must NOT leak into the main-session built-in set: the validator
         // accepts it only because it is auto-provided child plumbing.
@@ -1740,11 +2187,65 @@ mod child_tool_validation_tests {
 
     #[test]
     fn definition_declaring_only_plumbing_tools_has_no_unsupported_tools() {
-        let definition = def_with_tools("plumbing", &["todo", "process", "task", "hub", "goal", "yield"]);
+        let definition = def_with_tools(
+            "plumbing",
+            &["todo", "process", "task", "hub", "goal", "yield"],
+        );
         let unsupported = unsupported_agent_tools(&definition, None);
         assert!(
             unsupported.is_empty(),
             "all orchestration plumbing must be accepted: {unsupported:?}"
+        );
+    }
+
+    #[test]
+    fn omitted_tools_inherit_full_default_child_coding_set() {
+        assert_eq!(DEFAULT_CHILD_CODING_TOOLS.len(), 19);
+        assert!(
+            DEFAULT_CHILD_CODING_TOOLS.len() > 16,
+            "default factory set is larger than the legacy explicit-list cap: {}",
+            DEFAULT_CHILD_CODING_TOOLS.len()
+        );
+        let mut definition = def_with_tools("task", &[]);
+        definition.tools = None;
+        let resolved = resolved_child_coding_tools(&definition, None);
+        assert_eq!(
+            resolved,
+            DEFAULT_CHILD_CODING_TOOLS
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            effective_agent_tool_names(&definition, None).is_none(),
+            "omitted tools must remain inherit-None, not an empty list"
+        );
+    }
+
+    #[test]
+    fn child_tool_cap_error_names_explicit_list_and_setting() {
+        let mut definition = def_with_tools("task", &[]);
+        definition.tools = None;
+        let resolved = resolved_child_coding_tools(&definition, None);
+        let error = child_tool_cap_error("wide", 16, &resolved).to_string();
+        assert!(error.contains("cap 16"), "{error}");
+        assert!(
+            error.contains(&format!("{} tools", resolved.len())),
+            "{error}"
+        );
+        assert!(error.contains("read"), "{error}");
+        assert!(error.contains("notebook"), "{error}");
+        assert!(error.contains("orchestration.maxToolsPerAgent"), "{error}");
+    }
+
+    #[test]
+    fn declared_tools_drop_plumbing_unknowns_and_disallowed_before_cap() {
+        let mut definition =
+            def_with_tools("qa", &["read", "grep", "yield", "todo", "ghost", "bash"]);
+        definition.disallowed_tools = vec!["bash".to_owned()];
+        assert_eq!(
+            resolved_child_coding_tools(&definition, None),
+            vec!["read".to_owned(), "grep".to_owned()]
         );
     }
 
@@ -1761,12 +2262,8 @@ mod child_tool_validation_tests {
             vec!["not_a_real_tool".to_owned()],
             "only the truly unknown tool is unsupported: {unsupported:?}"
         );
-        let error = agent_compatibility_error(
-            &definition,
-            None,
-            &Model::default(),
-            &available_models(),
-        );
+        let error =
+            agent_compatibility_error(&definition, None, &Model::default(), &available_models());
         assert!(
             error.is_none(),
             "unknown tools must not make the definition incompatible: {error:?}"
@@ -1801,8 +2298,16 @@ mod child_tool_validation_tests {
         let definition = def_with_tools(
             "qa",
             &[
-                "read", "grep", "glob", "bash", "edit", "write", "yield",
-                "yield_output", "computer", "imaginary_tool",
+                "read",
+                "grep",
+                "glob",
+                "bash",
+                "edit",
+                "write",
+                "yield",
+                "yield_output",
+                "computer",
+                "imaginary_tool",
             ],
         );
         let unsupported = unsupported_agent_tools(&definition, None);
@@ -1811,12 +2316,8 @@ mod child_tool_validation_tests {
             vec!["computer", "imaginary_tool", "yield_output"],
             "only the ghost/unknown names are unsupported: {unsupported:?}"
         );
-        let error = agent_compatibility_error(
-            &definition,
-            None,
-            &Model::default(),
-            &available_models(),
-        );
+        let error =
+            agent_compatibility_error(&definition, None, &Model::default(), &available_models());
         assert!(
             error.is_none(),
             "a qa-style definition with ghost tools must stay available: {error:?}"
@@ -1831,9 +2332,34 @@ mod child_tool_validation_tests {
         for name in crate::TOOL_NAMES {
             assert!(is_known_child_tool(name), "{name:?} is a built-in");
         }
-        for name in ["yield_output", "computer", "imaginary_tool"] {
-            assert!(!is_known_child_tool(name), "{name:?} must be unknown");
+        for name in ["learn_skill", "yield_output", "computer", "imaginary_tool"] {
+            assert!(
+                !is_known_child_tool(name),
+                "{name:?} must be unknown to ordinary agents"
+            );
         }
+    }
+
+    #[test]
+    fn learn_skill_is_known_only_for_persona_definitions() {
+        let ordinary = def_with_tools("task", &["learn_skill"]);
+        assert_eq!(
+            unsupported_agent_tools(&ordinary, None),
+            vec!["learn_skill"]
+        );
+
+        let mut persona = def_with_tools("librarian", &["learn_skill"]);
+        persona.kind = AgentDefinitionKind::Persona;
+        assert!(
+            unsupported_agent_tools(&persona, None).is_empty(),
+            "persona declaration must recognize learn_skill"
+        );
+        assert!(is_known_child_tool_for_definition("learn_skill", &persona));
+        assert!(!is_known_child_tool_for_definition(
+            "learn_skill",
+            &ordinary
+        ));
+        assert!(!crate::TOOL_NAMES.contains(&"learn_skill"));
     }
 
     #[test]
@@ -1872,18 +2398,30 @@ mod child_tool_validation_tests {
     }
 }
 
-
 #[cfg(test)]
 mod persona_tests {
     use super::*;
+    use std::fs;
 
     fn parse(content: &str) -> Result<AgentDefinition> {
-        parse_persona_definition(Path::new("persona.md"), content, AgentDefinitionSource::User, true)
+        parse_persona_definition(
+            Path::new("persona.md"),
+            content,
+            AgentDefinitionSource::User,
+            true,
+        )
     }
 
     fn write_persona_md(dir: &Path, body: &str) {
         fs::create_dir_all(dir).expect("persona dir");
         fs::write(dir.join("persona.md"), body).expect("persona.md");
+    }
+    fn discovery_roots(root: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+        let cwd = root.path().join("cwd");
+        let agent_dir = root.path().join("agent-home");
+        fs::create_dir_all(&cwd).expect("project root");
+        fs::create_dir_all(&agent_dir).expect("agent root");
+        (cwd, agent_dir)
     }
 
     #[test]
@@ -1918,26 +2456,24 @@ mod persona_tests {
 
     #[test]
     fn personality_scalar_is_parsed() {
-        let definition = parse(
-            "---\nname: p\ndescription: d\npersonality: calm and concise\n---\nprompt",
-        )
-        .expect("parse");
+        let definition =
+            parse("---\nname: p\ndescription: d\npersonality: calm and concise\n---\nprompt")
+                .expect("parse");
         assert_eq!(definition.personality.as_deref(), Some("calm and concise"));
     }
 
     #[test]
     fn quoted_personality_is_unquoted() {
-        let definition = parse(
-            "---\nname: p\ndescription: d\npersonality: \"warm, direct\"\n---\nprompt",
-        )
-        .expect("parse");
+        let definition =
+            parse("---\nname: p\ndescription: d\npersonality: \"warm, direct\"\n---\nprompt")
+                .expect("parse");
         assert_eq!(definition.personality.as_deref(), Some("warm, direct"));
     }
 
     #[test]
     fn blank_personality_is_none() {
-        let definition = parse("---\nname: p\ndescription: d\npersonality:   \n---\nprompt")
-            .expect("parse");
+        let definition =
+            parse("---\nname: p\ndescription: d\npersonality:   \n---\nprompt").expect("parse");
         assert!(definition.personality.is_none());
     }
 
@@ -1967,10 +2503,9 @@ mod persona_tests {
 
     #[test]
     fn soft_budget_partial_block_leaves_unspecified_knobs_unlimited() {
-        let definition = parse(
-            "---\nname: p\ndescription: d\nsoftBudget:\n  maxRequests: 5\n---\nprompt",
-        )
-        .expect("parse");
+        let definition =
+            parse("---\nname: p\ndescription: d\nsoftBudget:\n  maxRequests: 5\n---\nprompt")
+                .expect("parse");
         let budget = definition.soft_budget.expect("soft budget present");
         assert_eq!(budget.max_requests, Some(5));
         assert!(budget.max_tokens.is_none());
@@ -1996,8 +2531,9 @@ mod persona_tests {
 
     #[test]
     fn soft_budget_non_numeric_nested_field_is_rejected() {
-        let error = parse("---\nname: p\ndescription: d\nsoftBudget:\n  maxRequests: many\n---\nprompt")
-            .expect_err("non-numeric soft budget field must be rejected");
+        let error =
+            parse("---\nname: p\ndescription: d\nsoftBudget:\n  maxRequests: many\n---\nprompt")
+                .expect_err("non-numeric soft budget field must be rejected");
         let message = error.to_string();
         assert!(message.contains("maxRequests"), "{message}");
         assert!(message.contains("positive integer"), "{message}");
@@ -2029,26 +2565,36 @@ mod persona_tests {
     #[test]
     fn user_persona_is_discovered_as_persona_with_valid_root() {
         let root = tempfile::tempdir().expect("root");
-        let persona_dir = root.path().join("personas").join("mentor");
-        write_persona_md(&persona_dir, "---\nname: mentor\ndescription: d\n---\nmentor prompt");
-        let catalog =
-            AgentCatalog::discover(&AgentDiscoveryOptions::new(root.path(), root.path()))
-                .expect("discover");
+        let (cwd, agent_dir) = discovery_roots(&root);
+        let persona_dir = agent_dir.join("personas").join("mentor");
+        write_persona_md(
+            &persona_dir,
+            "---\nname: mentor\ndescription: d\n---\nmentor prompt",
+        );
+        let catalog = AgentCatalog::discover(&AgentDiscoveryOptions::new(&cwd, &agent_dir))
+            .expect("discover");
         let mentor = catalog.get("mentor").expect("persona discovered");
         assert_eq!(mentor.kind, AgentDefinitionKind::Persona);
         assert!(mentor.is_persona());
         assert_eq!(mentor.source, AgentDefinitionSource::User);
-        assert_eq!(mentor.persona_root().as_deref(), Some(persona_dir.as_path()));
+        assert_eq!(
+            mentor.persona_root().as_deref(),
+            Some(persona_dir.as_path())
+        );
     }
 
     #[test]
     fn project_persona_excluded_when_untrusted() {
         let root = tempfile::tempdir().expect("root");
-        let persona_dir = root.path().join(".pi").join("personas").join("mentor");
-        write_persona_md(&persona_dir, "---\nname: mentor\ndescription: d\n---\nmentor prompt");
+        let (cwd, agent_dir) = discovery_roots(&root);
+        let persona_dir = cwd.join(".rpi").join("personas").join("mentor");
+        write_persona_md(
+            &persona_dir,
+            "---\nname: mentor\ndescription: d\n---\nmentor prompt",
+        );
         let options = AgentDiscoveryOptions {
-            cwd: root.path().to_path_buf(),
-            agent_dir: root.path().to_path_buf(),
+            cwd,
+            agent_dir,
             project_trusted: false,
         };
         let catalog = AgentCatalog::discover(&options).expect("discover");
@@ -2060,48 +2606,144 @@ mod persona_tests {
 
     #[cfg(unix)]
     #[test]
+    fn user_top_level_personas_link_loads_retained_external_directory() {
+        let root = tempfile::tempdir().expect("root");
+        let (cwd, agent_dir) = discovery_roots(&root);
+        let external = root.path().join("external-personas");
+        let mentor = external.join("mentor");
+        write_persona_md(
+            &mentor,
+            "---\nname: mentor\ndescription: d\n---\nexternal mentor prompt",
+        );
+        std::os::unix::fs::symlink(&external, agent_dir.join("personas"))
+            .expect("top-level personas link");
+
+        let catalog = AgentCatalog::discover(&AgentDiscoveryOptions::new(&cwd, &agent_dir))
+            .expect("linked top-level personas directory loads");
+        let definition = catalog.get("mentor").expect("external persona discovered");
+        assert_eq!(definition.persona_root().as_deref(), Some(mentor.as_path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_top_level_personas_link_preserves_resolved_durable_path() {
+        let root = tempfile::tempdir().expect("root");
+        let (cwd, agent_dir) = discovery_roots(&root);
+        let external = root.path().join("external-personas");
+        let mentor = external.join("mentor");
+        write_persona_md(
+            &mentor,
+            "---\nname: mentor\ndescription: d\n---\nexternal mentor prompt",
+        );
+        std::os::unix::fs::symlink(&external, agent_dir.join("personas"))
+            .expect("top-level personas link");
+
+        let catalog = AgentCatalog::discover(&AgentDiscoveryOptions::new(&cwd, &agent_dir))
+            .expect("linked personas load");
+        let definition = catalog.get("mentor").expect("persona discovered");
+        // The persona_root must follow the resolved target (external/mentor),
+        // not the display path (agent_dir/personas/mentor), so durable
+        // memory/sessions are anchored at the real directory.
+        assert_eq!(definition.persona_root().as_deref(), Some(mentor.as_path()));
+        assert!(
+            !definition.persona_root().unwrap().starts_with(&agent_dir),
+            "durable persona path must follow resolved target, not display path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_top_level_personas_link_failures_and_nested_escape_fail_closed() {
+        let root = tempfile::tempdir().expect("root");
+        let (cwd, agent_dir) = discovery_roots(&root);
+        let link = agent_dir.join("personas");
+        std::os::unix::fs::symlink(root.path().join("missing"), &link).expect("missing link");
+        let error = AgentCatalog::discover(&AgentDiscoveryOptions::new(&cwd, &agent_dir))
+            .expect_err("missing target must fail closed");
+        assert!(format!("{error:#}").contains("reading persona definitions"));
+
+        fs::remove_file(&link).expect("remove missing link");
+        let external = root.path().join("external-personas");
+        fs::create_dir_all(&external).expect("external personas");
+        let outside = root.path().join("outside-persona");
+        write_persona_md(&outside, "---\nname: mentor\ndescription: d\n---\nprompt");
+        std::os::unix::fs::symlink(&outside, external.join("mentor"))
+            .expect("nested persona escape");
+        std::os::unix::fs::symlink(&external, &link).expect("top-level personas link");
+        AgentCatalog::discover(&AgentDiscoveryOptions::new(&cwd, &agent_dir))
+            .expect_err("nested persona symlink must remain rejected");
+
+        fs::remove_file(&link).expect("remove directory link");
+        let file = root.path().join("not-a-directory");
+        fs::write(&file, "x").expect("file target");
+        std::os::unix::fs::symlink(&file, &link).expect("file target link");
+        AgentCatalog::discover(&AgentDiscoveryOptions::new(&cwd, &agent_dir))
+            .expect_err("non-directory target must fail closed");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn user_persona_symlink_root_is_rejected() {
         let root = tempfile::tempdir().expect("root");
+        let (cwd, agent_dir) = discovery_roots(&root);
         let outside = root.path().join("outside");
         write_persona_md(
             &outside,
             "---\nname: mentor\ndescription: d\n---\nmentor prompt",
         );
-        let personas = root.path().join("personas");
+        let personas = agent_dir.join("personas");
         fs::create_dir_all(&personas).expect("personas root");
-        std::os::unix::fs::symlink(&outside, personas.join("mentor"))
-            .expect("persona symlink");
+        std::os::unix::fs::symlink(&outside, personas.join("mentor")).expect("persona symlink");
 
-        let error = AgentCatalog::discover(&AgentDiscoveryOptions::new(
-            root.path(),
-            root.path(),
-        ))
-        .expect_err("symlinked persona root must fail");
-        assert!(error.to_string().contains("must not be a symlink"), "{error:#}");
+        let error = AgentCatalog::discover(&AgentDiscoveryOptions::new(&cwd, &agent_dir))
+            .expect_err("symlinked persona root is rejected by capability discovery");
+        assert!(
+            error.chain().any(|source| {
+                source
+                    .downcast_ref::<crate::fs::FsError>()
+                    .is_some_and(|error| matches!(error, crate::fs::FsError::UnsupportedEntryType))
+            }),
+            "{error:#}"
+        );
+        assert!(outside.join("persona.md").is_file());
     }
 
     #[test]
     fn project_persona_discovered_when_trusted() {
         let root = tempfile::tempdir().expect("root");
-        let persona_dir = root.path().join(".pi").join("personas").join("mentor");
-        write_persona_md(&persona_dir, "---\nname: mentor\ndescription: d\n---\nmentor prompt");
-        let mut options = AgentDiscoveryOptions::new(root.path(), root.path());
+        let (cwd, agent_dir) = discovery_roots(&root);
+        let persona_dir = cwd.join(".rpi").join("personas").join("mentor");
+        write_persona_md(
+            &persona_dir,
+            "---\nname: mentor\ndescription: d\n---\nmentor prompt",
+        );
+        let mut options = AgentDiscoveryOptions::new(&cwd, &agent_dir);
         options.project_trusted = true;
         let catalog = AgentCatalog::discover(&options).expect("discover");
         let mentor = catalog.get("mentor").expect("project persona discovered");
         assert_eq!(mentor.kind, AgentDefinitionKind::Persona);
         assert_eq!(mentor.source, AgentDefinitionSource::Project);
-        assert_eq!(mentor.persona_root().as_deref(), Some(persona_dir.as_path()));
+        assert_eq!(
+            mentor.persona_root().as_deref(),
+            Some(persona_dir.as_path())
+        );
     }
 
     #[test]
     fn project_persona_wins_over_user_persona_with_same_name() {
         let root = tempfile::tempdir().expect("root");
-        let user_persona = root.path().join("personas").join("shared");
-        write_persona_md(&user_persona, "---\nname: shared\ndescription: user\n---\nuser prompt");
-        let project_persona = root.path().join(".pi").join("personas").join("shared");
-        write_persona_md(&project_persona, "---\nname: shared\ndescription: project\n---\nproject prompt");
-        let mut options = AgentDiscoveryOptions::new(root.path(), root.path());
+        let (cwd, agent_dir) = discovery_roots(&root);
+        let user_persona = agent_dir.join("personas").join("shared");
+        write_persona_md(
+            &user_persona,
+            "---\nname: shared\ndescription: user\n---\nuser prompt",
+        );
+        let project_persona = cwd.join(".rpi").join("personas").join("shared");
+        write_persona_md(
+            &project_persona,
+            "---\nname: shared\ndescription: project\n---\nproject prompt",
+        );
+        let mut options = AgentDiscoveryOptions::new(&cwd, &agent_dir);
         options.project_trusted = true;
         let catalog = AgentCatalog::discover(&options).expect("discover");
         let shared = catalog.get("shared").expect("shared discovered once");
@@ -2109,7 +2751,11 @@ mod persona_tests {
         assert_eq!(shared.kind, AgentDefinitionKind::Persona);
         assert!(shared.system_prompt.contains("project prompt"));
         assert_eq!(
-            catalog.agents().iter().filter(|agent| agent.name == "shared").count(),
+            catalog
+                .agents()
+                .iter()
+                .filter(|agent| agent.name == "shared")
+                .count(),
             1
         );
     }
@@ -2117,16 +2763,20 @@ mod persona_tests {
     #[test]
     fn project_agent_wins_over_user_persona_with_same_name() {
         let root = tempfile::tempdir().expect("root");
-        let user_persona = root.path().join("personas").join("dup");
-        write_persona_md(&user_persona, "---\nname: dup\ndescription: persona\n---\npersona prompt");
-        let project_agents = root.path().join(".pi").join("agents");
+        let (cwd, agent_dir) = discovery_roots(&root);
+        let user_persona = agent_dir.join("personas").join("dup");
+        write_persona_md(
+            &user_persona,
+            "---\nname: dup\ndescription: persona\n---\npersona prompt",
+        );
+        let project_agents = cwd.join(".rpi").join("agents");
         fs::create_dir_all(&project_agents).expect("project agents");
         fs::write(
             project_agents.join("dup.md"),
             "---\nname: dup\ndescription: agent\n---\nagent prompt",
         )
         .expect("project agent");
-        let mut options = AgentDiscoveryOptions::new(root.path(), root.path());
+        let mut options = AgentDiscoveryOptions::new(&cwd, &agent_dir);
         options.project_trusted = true;
         let catalog = AgentCatalog::discover(&options).expect("discover");
         let dup = catalog.get("dup").expect("dup discovered once");
@@ -2140,9 +2790,10 @@ mod persona_tests {
     #[test]
     fn persona_rejects_bundled_agent_name() {
         let root = tempfile::tempdir().expect("root");
-        let persona_dir = root.path().join("personas").join("task");
+        let (cwd, agent_dir) = discovery_roots(&root);
+        let persona_dir = agent_dir.join("personas").join("task");
         write_persona_md(&persona_dir, "---\nname: task\ndescription: d\n---\nprompt");
-        let error = AgentCatalog::discover(&AgentDiscoveryOptions::new(root.path(), root.path()))
+        let error = AgentCatalog::discover(&AgentDiscoveryOptions::new(&cwd, &agent_dir))
             .expect_err("bundled persona name must be rejected");
         assert!(error.to_string().contains("bundled"), "{error}");
     }
@@ -2150,9 +2801,13 @@ mod persona_tests {
     #[test]
     fn persona_name_must_match_its_directory() {
         let root = tempfile::tempdir().expect("root");
-        let persona_dir = root.path().join("personas").join("mentor");
-        write_persona_md(&persona_dir, "---\nname: guide\ndescription: d\n---\nprompt");
-        let error = AgentCatalog::discover(&AgentDiscoveryOptions::new(root.path(), root.path()))
+        let (cwd, agent_dir) = discovery_roots(&root);
+        let persona_dir = agent_dir.join("personas").join("mentor");
+        write_persona_md(
+            &persona_dir,
+            "---\nname: guide\ndescription: d\n---\nprompt",
+        );
+        let error = AgentCatalog::discover(&AgentDiscoveryOptions::new(&cwd, &agent_dir))
             .expect_err("name/directory mismatch must be rejected");
         assert!(error.to_string().contains("must match"), "{error}");
     }
@@ -2160,16 +2815,20 @@ mod persona_tests {
     #[test]
     fn persona_state_files_and_subdirectories_are_ignored() {
         let root = tempfile::tempdir().expect("root");
-        let persona_dir = root.path().join("personas").join("mentor");
-        write_persona_md(&persona_dir, "---\nname: mentor\ndescription: d\n---\nprompt");
+        let (cwd, agent_dir) = discovery_roots(&root);
+        let persona_dir = agent_dir.join("personas").join("mentor");
+        write_persona_md(
+            &persona_dir,
+            "---\nname: mentor\ndescription: d\n---\nprompt",
+        );
         fs::create_dir_all(persona_dir.join("memory")).expect("memory");
         fs::write(persona_dir.join("memory").join("entries.jsonl"), "{}").expect("entries");
         fs::create_dir_all(persona_dir.join("sessions")).expect("sessions");
         fs::write(persona_dir.join("sessions").join("abc.jsonl"), "{}").expect("session");
         fs::write(persona_dir.join("notes.txt"), "ignore me").expect("notes");
         // A stray .md at the personas root is not a persona directory.
-        fs::write(root.path().join("personas").join("stray.md"), "ignore").expect("stray");
-        let catalog = AgentCatalog::discover(&AgentDiscoveryOptions::new(root.path(), root.path()))
+        fs::write(agent_dir.join("personas").join("stray.md"), "ignore").expect("stray");
+        let catalog = AgentCatalog::discover(&AgentDiscoveryOptions::new(&cwd, &agent_dir))
             .expect("discover");
         let mentor = catalog.get("mentor").expect("persona still discovered");
         assert_eq!(mentor.kind, AgentDefinitionKind::Persona);
@@ -2179,10 +2838,61 @@ mod persona_tests {
     }
 
     #[test]
+    fn knowledge_roots_and_user_proxy_are_parsed_for_personas_only() {
+        let persona = parse_persona_definition(
+            Path::new("persona.md"),
+            "---\nname: mentor\ndescription: d\nknowledgeRoots: [<memory-repo>, /workspace/memory]\nuserProxy: true\n---\nprompt",
+            AgentDefinitionSource::User,
+            true,
+        )
+        .expect("persona");
+        assert_eq!(
+            persona.knowledge_roots,
+            vec!["<memory-repo>".to_owned(), "/workspace/memory".to_owned()]
+        );
+        assert!(persona.user_proxy);
+
+        let ordinary = parse_agent_definition(
+            Path::new("task.md"),
+            "---\nname: task\ndescription: d\nknowledgeRoots: [/secret]\nuserProxy: true\n---\nprompt",
+            AgentDefinitionSource::User,
+            true,
+        )
+        .expect("ordinary");
+        assert!(ordinary.knowledge_roots.is_empty());
+        assert!(!ordinary.user_proxy);
+    }
+
+    #[test]
+    fn missing_knowledge_roots_skip_placeholders_and_require_parent_workspace() {
+        let extra = tempfile::tempdir().expect("extra");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let workspace =
+            crate::WorkspaceRoots::new(cwd.path(), vec![extra.path()]).expect("workspace");
+        let extra_path = extra.path().to_string_lossy().into_owned();
+        let labels = vec![
+            "<memory-repo>".to_owned(),
+            extra_path.clone(),
+            "/not-admitted".to_owned(),
+            "relative/docs".to_owned(),
+        ];
+        assert_eq!(
+            missing_knowledge_roots(&labels, &workspace),
+            vec!["/not-admitted".to_owned()]
+        );
+        let error =
+            knowledge_root_membership_error("mentor", &["/not-admitted".to_owned()]).to_string();
+        assert!(error.contains("mentor"), "{error}");
+        assert!(error.contains("/not-admitted"), "{error}");
+        assert!(error.contains("--add-dir"), "{error}");
+    }
+
+    #[test]
     fn child_directory_without_persona_md_is_skipped() {
         let root = tempfile::tempdir().expect("root");
-        fs::create_dir_all(root.path().join("personas").join("empty")).expect("dir");
-        let catalog = AgentCatalog::discover(&AgentDiscoveryOptions::new(root.path(), root.path()))
+        let (cwd, agent_dir) = discovery_roots(&root);
+        fs::create_dir_all(agent_dir.join("personas").join("empty")).expect("dir");
+        let catalog = AgentCatalog::discover(&AgentDiscoveryOptions::new(&cwd, &agent_dir))
             .expect("discover");
         assert!(catalog.get("empty").is_none());
     }
@@ -2190,12 +2900,13 @@ mod persona_tests {
     #[test]
     fn persona_personality_and_soft_budget_are_parsed_through_discovery() {
         let root = tempfile::tempdir().expect("root");
-        let persona_dir = root.path().join("personas").join("mentor");
+        let (cwd, agent_dir) = discovery_roots(&root);
+        let persona_dir = agent_dir.join("personas").join("mentor");
         write_persona_md(
             &persona_dir,
             "---\nname: mentor\ndescription: d\npersonality: calm\nsoftBudget:\n  maxRequests: 4\n  yieldAfter: 2\n---\nprompt",
         );
-        let catalog = AgentCatalog::discover(&AgentDiscoveryOptions::new(root.path(), root.path()))
+        let catalog = AgentCatalog::discover(&AgentDiscoveryOptions::new(&cwd, &agent_dir))
             .expect("discover");
         let mentor = catalog.get("mentor").expect("persona discovered");
         assert_eq!(mentor.personality.as_deref(), Some("calm"));

@@ -103,7 +103,56 @@ pub fn load_prompt_templates(options: &LoadPromptTemplatesOptions) -> Result<Vec
         } else if metadata.is_file() && path.extension().is_some_and(|ext| ext == "md") {
             templates.push(load_template_from_file(&path, scope)?);
         } else {
-            bail!("prompt template path is not a markdown file or directory: {}", path.display());
+            bail!(
+                "prompt template path is not a markdown file or directory: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(dedupe_templates(templates))
+}
+
+pub(crate) fn load_project_prompt_templates_from_root(
+    root: &crate::fs::CapabilityRootLease,
+    explicit_paths: &[PathBuf],
+) -> Result<Vec<PromptTemplate>> {
+    let prompts = match root.lease_directory(
+        Path::new(CONFIG_DIR_NAME).join("prompts").as_path(),
+        crate::fs::CapabilityAccess::ReadOnly,
+        crate::fs::RootCreation::Existing,
+    ) {
+        Ok(prompts) => prompts,
+        Err(crate::fs::FsError::System {
+            kind: std::io::ErrorKind::NotFound,
+            ..
+        }) => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut templates = Vec::new();
+    for name in prompts.read_dir_names_strict(Path::new(""))? {
+        let path = PathBuf::from(&name);
+        if path.extension().is_some_and(|extension| extension == "md") {
+            let content = crate::resources::read_resource_text_from_root(
+                &prompts,
+                &path,
+                "prompt template",
+            )?;
+            templates.push(load_template_from_content(
+                prompts.display_root().join(&path),
+                ResourceScope::Project,
+                content,
+            )?);
+        }
+    }
+    for raw in explicit_paths {
+        let relative = raw.strip_prefix(root.display_root()).unwrap_or(raw);
+        if relative.extension().is_some_and(|extension| extension == "md") {
+            let content = crate::resources::read_resource_text_from_root(root, relative, "prompt template")?;
+            templates.push(load_template_from_content(
+                root.display_root().join(relative),
+                ResourceScope::Project,
+                content,
+            )?);
         }
     }
     Ok(dedupe_templates(templates))
@@ -117,11 +166,14 @@ fn load_templates_from_dir(
     let mut entries = match fs::read_dir(directory) {
         Ok(entries) => entries
             .collect::<std::io::Result<Vec<_>>>()
-            .with_context(|| format!("reading prompt template directory {}", directory.display()))?,
+            .with_context(|| {
+                format!("reading prompt template directory {}", directory.display())
+            })?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
-            return Err(error)
-                .with_context(|| format!("reading prompt template directory {}", directory.display()));
+            return Err(error).with_context(|| {
+                format!("reading prompt template directory {}", directory.display())
+            });
         }
     };
     entries.sort_by_key(std::fs::DirEntry::file_name);
@@ -138,6 +190,14 @@ fn load_templates_from_dir(
 
 fn load_template_from_file(path: &Path, scope: ResourceScope) -> Result<PromptTemplate> {
     let content = crate::read_resource_text(path, "prompt template")?;
+    load_template_from_content(path.to_path_buf(), scope, content)
+}
+
+fn load_template_from_content(
+    path: PathBuf,
+    scope: ResourceScope,
+    content: String,
+) -> Result<PromptTemplate> {
     let (frontmatter, body) = parse_frontmatter(&content)
         .with_context(|| format!("parsing prompt template frontmatter {}", path.display()))?;
     let name = path
@@ -164,7 +224,7 @@ fn load_template_from_file(path: &Path, scope: ResourceScope) -> Result<PromptTe
         description,
         argument_hint,
         content: body,
-        file_path: path.to_path_buf(),
+        file_path: path,
         scope,
     })
 }
@@ -245,7 +305,10 @@ pub fn substitute_args(content: &str, arguments: &[String]) -> String {
                         .map_or("", String::as_str)
                 };
                 return if value.is_empty() {
-                    captures.get(2).map_or("", |value| value.as_str()).to_owned()
+                    captures
+                        .get(2)
+                        .map_or("", |value| value.as_str())
+                        .to_owned()
                 } else {
                     value.to_owned()
                 };
@@ -329,7 +392,10 @@ fn parse_frontmatter(content: &str) -> Result<(BTreeMap<String, String>, String)
             continue;
         }
         let Some((key, value)) = line.split_once(':') else {
-            bail!("invalid frontmatter line {}: expected key: value", index + 1);
+            bail!(
+                "invalid frontmatter line {}: expected key: value",
+                index + 1
+            );
         };
         if key.trim().is_empty() {
             bail!("invalid frontmatter line {}: key is empty", index + 1);
@@ -344,14 +410,20 @@ fn unquote(value: &str) -> Result<String> {
     if value.is_empty() {
         return Ok(String::new());
     }
-    if let Some(inner) = value.strip_prefix('"').and_then(|value| value.strip_suffix('"')) {
+    if let Some(inner) = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    {
         return Ok(inner
             .replace("\\n", "\n")
             .replace("\\t", "\t")
             .replace("\\\"", "\"")
             .replace("\\\\", "\\"));
     }
-    if let Some(inner) = value.strip_prefix('\'').and_then(|value| value.strip_suffix('\'')) {
+    if let Some(inner) = value
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+    {
         return Ok(inner.replace("''", "'"));
     }
     if value.starts_with(['"', '\'']) || value.ends_with(['"', '\'']) {
@@ -369,7 +441,9 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
         Ok(lexical_normalize(path))
     } else {
         Ok(lexical_normalize(
-            &std::env::current_dir().context("getting current directory")?.join(path),
+            &std::env::current_dir()
+                .context("getting current directory")?
+                .join(path),
         ))
     }
 }
@@ -397,7 +471,12 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn template(name: &str, content: &str, scope: ResourceScope, file_path: &str) -> PromptTemplate {
+    fn template(
+        name: &str,
+        content: &str,
+        scope: ResourceScope,
+        file_path: &str,
+    ) -> PromptTemplate {
         PromptTemplate {
             name: name.to_owned(),
             description: String::new(),
@@ -428,9 +507,24 @@ mod tests {
     #[test]
     fn later_duplicate_shadows_earlier_at_later_position() {
         let templates = vec![
-            template("shared", "global-content", ResourceScope::Global, "/g/shared.md"),
-            template("other", "other-content", ResourceScope::Global, "/g/other.md"),
-            template("shared", "explicit-content", ResourceScope::Explicit, "/e/shared.md"),
+            template(
+                "shared",
+                "global-content",
+                ResourceScope::Global,
+                "/g/shared.md",
+            ),
+            template(
+                "other",
+                "other-content",
+                ResourceScope::Global,
+                "/g/other.md",
+            ),
+            template(
+                "shared",
+                "explicit-content",
+                ResourceScope::Explicit,
+                "/e/shared.md",
+            ),
         ];
         let deduped = dedupe_templates(templates);
         assert_eq!(deduped.len(), 2);
@@ -458,8 +552,18 @@ mod tests {
     #[test]
     fn project_template_shadows_global_of_same_name() {
         let templates = vec![
-            template("deploy", "global deploy", ResourceScope::Global, "/g/deploy.md"),
-            template("deploy", "project deploy", ResourceScope::Project, "/p/deploy.md"),
+            template(
+                "deploy",
+                "global deploy",
+                ResourceScope::Global,
+                "/g/deploy.md",
+            ),
+            template(
+                "deploy",
+                "project deploy",
+                ResourceScope::Project,
+                "/p/deploy.md",
+            ),
         ];
         let deduped = dedupe_templates(templates);
         assert_eq!(deduped.len(), 1);

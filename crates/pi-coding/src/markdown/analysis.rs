@@ -303,7 +303,10 @@ fn parse_heading(line: &str) -> Option<(u8, &str)> {
 }
 
 fn parse_list_item(line: &str) -> Option<ListItem> {
-    let indent = line.chars().take_while(|ch| matches!(ch, ' ' | '\t')).count();
+    let indent = line
+        .chars()
+        .take_while(|ch| matches!(ch, ' ' | '\t'))
+        .count();
     let depth = indent / 2;
     let rest = &line[indent..];
     let (marker, body) = if let Some(first) = rest.chars().next() {
@@ -340,9 +343,14 @@ fn parse_list_item(line: &str) -> Option<ListItem> {
         && body.starts_with('[')
         && body.as_bytes()[2] == b']'
         && matches!(body.as_bytes()[1], b' ' | b'x' | b'X')
-        && body.get(3..).is_none_or(|tail| tail.is_empty() || tail.starts_with(char::is_whitespace))
+        && body
+            .get(3..)
+            .is_none_or(|tail| tail.is_empty() || tail.starts_with(char::is_whitespace))
     {
-        (Some(!matches!(body.as_bytes()[1], b' ')), body[3..].trim_start())
+        (
+            Some(!matches!(body.as_bytes()[1], b' ')),
+            body[3..].trim_start(),
+        )
     } else {
         (None, body)
     };
@@ -366,7 +374,10 @@ fn parse_quote_line(line: &str) -> Option<&str> {
 }
 
 fn is_thematic_break(line: &str) -> bool {
-    let compact = line.chars().filter(|ch| !ch.is_whitespace()).collect::<String>();
+    let compact = line
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
     let Some(marker) = compact.chars().next() else {
         return false;
     };

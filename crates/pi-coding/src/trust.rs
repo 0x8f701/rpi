@@ -1,4 +1,4 @@
-//! Versioned project trust storage and fail-closed trust resolution.
+//! Versioned trust storage with project and exact-canonical resolution.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -11,7 +11,7 @@ use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::resources::{CONFIG_DIR_NAME, agent_dir_path};
+use crate::resources::{CONFIG_DIR_NAME, agent_dir_path, project_context_boundary};
 use crate::settings::{DefaultProjectTrust, atomic_write};
 
 pub const TRUST_STORE_VERSION: u32 = 1;
@@ -194,7 +194,7 @@ impl TrustStore {
     }
 
     pub fn resolve(&self, cwd: impl AsRef<Path>) -> Result<TrustResolution> {
-        let project_path = canonical_path(cwd.as_ref())?;
+        let project_path = project_context_boundary(cwd.as_ref())?;
         let document = self.read_document()?;
         let mut current = project_path.as_path();
         loop {
@@ -224,6 +224,66 @@ impl TrustStore {
         })
     }
 
+    fn resolve_project_path(&self, project_path: PathBuf) -> Result<TrustResolution> {
+        let document = self.read_document()?;
+        let mut current = project_path.as_path();
+        loop {
+            if let Some(decision) = document.decisions.get(current) {
+                return Ok(TrustResolution {
+                    decision: if *decision { TrustDecision::Trusted } else { TrustDecision::Untrusted },
+                    matched_path: Some(current.to_path_buf()),
+                    project_path,
+                });
+            }
+            let Some(parent) = current.parent() else { break };
+            if parent == current { break }
+            current = parent;
+        }
+        Ok(TrustResolution {
+            decision: TrustDecision::Ask,
+            matched_path: None,
+            project_path,
+        })
+    }
+
+    /// Resolve only the decision stored for this canonical path. Unlike
+    /// project trust, this performs neither Git-boundary remapping nor parent
+    /// inheritance.
+    pub(crate) fn resolve_exact(&self, path: impl AsRef<Path>) -> Result<TrustDecision> {
+        let path = canonical_path(path.as_ref())?;
+        let document = self.read_document()?;
+        Ok(match document.decisions.get(&path) {
+            Some(true) => TrustDecision::Trusted,
+            Some(false) => TrustDecision::Untrusted,
+            None => TrustDecision::Ask,
+        })
+    }
+
+    /// Store a decision under exactly this canonical path, without applying
+    /// project-boundary semantics.
+    pub(crate) fn set_exact(&self, path: impl AsRef<Path>, decision: TrustDecision) -> Result<()> {
+        let path = canonical_path(path.as_ref())?;
+        let _guard = self.write_lock.lock();
+        let mut document = self.read_document()?;
+        match decision {
+            TrustDecision::Trusted => {
+                document.decisions.insert(path, true);
+            }
+            TrustDecision::Untrusted => {
+                document.decisions.insert(path, false);
+            }
+            TrustDecision::Ask => {
+                document.decisions.remove(&path);
+            }
+        }
+        self.write_document(&document)
+    }
+
+    /// Clear only the decision stored for this canonical path.
+    pub(crate) fn clear_exact(&self, path: impl AsRef<Path>) -> Result<()> {
+        self.set_exact(path, TrustDecision::Ask)
+    }
+
     pub fn set(&self, path: impl AsRef<Path>, decision: TrustDecision) -> Result<()> {
         self.set_many([(path.as_ref().to_path_buf(), decision)])
     }
@@ -235,7 +295,7 @@ impl TrustStore {
         let _guard = self.write_lock.lock();
         let mut document = self.read_document()?;
         for (path, decision) in updates {
-            let path = canonical_path(&path)?;
+            let path = project_context_boundary(&path)?;
             match decision {
                 TrustDecision::Trusted => {
                     document.decisions.insert(path, true);
@@ -248,7 +308,11 @@ impl TrustStore {
                 }
             }
         }
-        let mut bytes = serde_json::to_vec_pretty(&document)
+        self.write_document(&document)
+    }
+
+    fn write_document(&self, document: &TrustDocument) -> Result<()> {
+        let mut bytes = serde_json::to_vec_pretty(document)
             .with_context(|| format!("serializing trust store {}", self.path.display()))?;
         bytes.push(b'\n');
         atomic_write(&self.path, &bytes)
@@ -306,7 +370,7 @@ fn resolve_project_trust_inner(
     default: DefaultProjectTrust,
     headless: bool,
 ) -> Result<ResolvedTrust> {
-    let project_path = canonical_path(cwd.as_ref())?;
+    let project_path = project_context_boundary(cwd.as_ref())?;
     if let Some(trusted) = one_run_override {
         return Ok(ResolvedTrust {
             resolution: TrustResolution {
@@ -321,7 +385,7 @@ fn resolve_project_trust_inner(
             observation: None,
         });
     }
-    if !has_project_config_resources(&project_path) {
+    if !has_project_config_resources(cwd.as_ref()) {
         return Ok(ResolvedTrust {
             resolution: TrustResolution {
                 decision: TrustDecision::Trusted,
@@ -357,6 +421,57 @@ fn resolve_project_trust_inner(
         }),
     })
 }
+pub(crate) fn resolve_project_trust_from_root(
+    store: &TrustStore,
+    root: &crate::fs::CapabilityRootLease,
+    one_run_override: Option<bool>,
+    default: DefaultProjectTrust,
+    headless: bool,
+) -> Result<TrustResolution> {
+    let project_path = root.display_root().to_path_buf();
+    if let Some(trusted) = one_run_override {
+        return Ok(TrustResolution {
+            decision: if trusted { TrustDecision::Trusted } else { TrustDecision::Untrusted },
+            matched_path: None,
+            project_path,
+        });
+    }
+    let has_resources = match root.read_dir_names_strict(Path::new(CONFIG_DIR_NAME)) {
+        Ok(entries) => !entries.is_empty(),
+        Err(crate::fs::FsError::System {
+            kind: std::io::ErrorKind::NotFound,
+            ..
+        }) => false,
+        Err(_) => true,
+    } || ["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]
+        .iter()
+        .any(|name| match root.metadata(Path::new(name)) {
+            Ok(_) => true,
+            Err(crate::fs::FsError::System {
+                kind: std::io::ErrorKind::NotFound,
+                ..
+            }) => false,
+            Err(_) => true,
+        });
+    if !has_resources {
+        return Ok(TrustResolution {
+            decision: TrustDecision::Trusted,
+            matched_path: None,
+            project_path,
+        });
+    }
+    let stored = store.resolve_project_path(project_path)?;
+    if stored.decision != TrustDecision::Ask {
+        return Ok(stored);
+    }
+    let decision = match default {
+        DefaultProjectTrust::Always => TrustDecision::Trusted,
+        DefaultProjectTrust::Never => TrustDecision::Untrusted,
+        DefaultProjectTrust::Ask if headless => TrustDecision::Untrusted,
+        DefaultProjectTrust::Ask => TrustDecision::Ask,
+    };
+    Ok(TrustResolution { decision, ..stored })
+}
 
 /// Resolve the effective decision without persisting one-run overrides.
 pub fn resolve_project_trust(
@@ -387,14 +502,37 @@ pub fn resolve_project_trust_with_observation(
     Ok((resolved.resolution, resolved.observation))
 }
 
-/// Any entry under project `.pi` is trust-gated. This deliberately treats
-/// future resource kinds as gated without needing to update a hard-coded list.
+/// Project trust is required when the project boundary contains any `.rpi`
+/// entry or any AGENTS.md/CLAUDE.md candidate entry, including invalid,
+/// unreadable, non-regular, and symbolic-link candidates.
 #[must_use]
 pub fn has_project_config_resources(cwd: impl AsRef<Path>) -> bool {
-    let path = cwd.as_ref().join(CONFIG_DIR_NAME);
-    fs::read_dir(path)
-        .map(|mut entries| entries.next().is_some())
-        .unwrap_or(false)
+    let Ok(boundary) = project_context_boundary(cwd.as_ref()) else {
+        return true;
+    };
+    let Ok(cwd) = canonical_path(cwd.as_ref()) else {
+        return true;
+    };
+    let mut directories = cwd
+        .ancestors()
+        .take_while(|ancestor| *ancestor != boundary)
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    directories.push(boundary);
+    directories.into_iter().any(|directory| {
+        let pi = directory.join(CONFIG_DIR_NAME);
+        let has_pi = match fs::read_dir(&pi) {
+            Ok(mut entries) => entries.next().is_some(),
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        };
+        has_pi
+            || ["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]
+                .iter()
+                .any(|name| match fs::symlink_metadata(directory.join(name)) {
+                    Ok(_) => true,
+                    Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+                })
+    })
 }
 
 pub fn canonical_path(path: &Path) -> Result<PathBuf> {
@@ -445,10 +583,7 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     normalized
 }
 
-fn parse_canonical_trust(
-    document: CanonicalTrustDocument,
-    path: &Path,
-) -> Result<TrustDocument> {
+fn parse_canonical_trust(document: CanonicalTrustDocument, path: &Path) -> Result<TrustDocument> {
     let mut decisions = BTreeMap::new();
     let mut source_keys = BTreeMap::new();
     for (key, decision) in document.decisions {
@@ -460,9 +595,8 @@ fn parse_canonical_trust(
                 path.display(),
             );
         }
-        let canonical = canonical_path(key_path).with_context(|| {
-            format!("canonicalizing trust path {} in {}", key, path.display())
-        })?;
+        let canonical = canonical_path(key_path)
+            .with_context(|| format!("canonicalizing trust path {} in {}", key, path.display()))?;
         if let Some(previous) = source_keys.insert(canonical.clone(), key.clone()) {
             bail!(
                 "duplicate canonical trust path {} from keys {} and {} in {}",
@@ -593,13 +727,19 @@ mod tests {
         );
         write_store(&trust_path, &body);
 
-        assert_eq!(store.resolve(&trusted).unwrap().decision, TrustDecision::Trusted);
+        assert_eq!(
+            store.resolve(&trusted).unwrap().decision,
+            TrustDecision::Trusted
+        );
         assert_eq!(
             store.resolve(&untrusted).unwrap().decision,
             TrustDecision::Untrusted
         );
         // A path absent from the legacy map has no persisted decision.
-        assert_eq!(store.resolve(&unknown).unwrap().decision, TrustDecision::Ask);
+        assert_eq!(
+            store.resolve(&unknown).unwrap().decision,
+            TrustDecision::Ask
+        );
     }
 
     #[test]
@@ -626,17 +766,65 @@ mod tests {
     }
 
     #[test]
+    fn exact_operations_do_not_remap_or_inherit_project_trust() {
+        let dir = TempDir::new().unwrap();
+        let (store, _) = store_in(&dir);
+        let repo = project_in(&dir, "repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let plugin = repo.join("extensions/plugin");
+        let sibling = repo.join("extensions/sibling");
+        fs::create_dir_all(&plugin).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+
+        store.set_exact(&plugin, TrustDecision::Trusted).unwrap();
+        assert_eq!(
+            store.resolve_exact(&plugin).unwrap(),
+            TrustDecision::Trusted
+        );
+        assert_eq!(store.resolve_exact(&sibling).unwrap(), TrustDecision::Ask);
+        assert_eq!(store.resolve_exact(&repo).unwrap(), TrustDecision::Ask);
+        assert_eq!(store.resolve(&plugin).unwrap().decision, TrustDecision::Ask);
+
+        store.set(&plugin, TrustDecision::Untrusted).unwrap();
+        assert_eq!(
+            store.resolve(&sibling).unwrap().decision,
+            TrustDecision::Untrusted,
+            "project trust must retain Git-boundary remapping and parent inheritance"
+        );
+        store.set_exact(&plugin, TrustDecision::Trusted).unwrap();
+        assert_eq!(
+            store.resolve_exact(&plugin).unwrap(),
+            TrustDecision::Trusted,
+            "the exact plugin decision must remain distinct from project trust"
+        );
+        assert_eq!(
+            store.resolve_exact(&sibling).unwrap(),
+            TrustDecision::Ask,
+            "exact trust must not inherit the repo's project decision"
+        );
+
+        store.clear_exact(&plugin).unwrap();
+        assert_eq!(store.resolve_exact(&plugin).unwrap(), TrustDecision::Ask);
+        assert_eq!(
+            store.resolve(&sibling).unwrap().decision,
+            TrustDecision::Untrusted,
+            "clearing exact trust must not alter the project decision"
+        );
+    }
+
+    #[test]
     fn legacy_null_resolves_ask_and_is_dropped_on_write() {
         let dir = TempDir::new().unwrap();
         let (store, trust_path) = store_in(&dir);
         let project = project_in(&dir, "project");
-        write_store(
-            &trust_path,
-            &format!("{{\"{}\":null}}", project.display()),
-        );
+        write_store(&trust_path, &format!("{{\"{}\":null}}", project.display()));
 
         // `null` carries no persisted decision -> Ask, not Untrusted.
-        assert_eq!(store.resolve(&project).unwrap().decision, TrustDecision::Ask);
+        assert_eq!(
+            store.resolve(&project).unwrap().decision,
+            TrustDecision::Ask
+        );
 
         // A `set` of an unrelated path rewrites the file in versioned shape and
         // the legacy null entry (no decision) must not survive the migration.
@@ -656,10 +844,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (store, trust_path) = store_in(&dir);
         let project = project_in(&dir, "project");
-        write_store(
-            &trust_path,
-            &format!("{{\"{}\":true}}", project.display()),
-        );
+        write_store(&trust_path, &format!("{{\"{}\":true}}", project.display()));
 
         // Touching the store with any decision rewrites the file canonically.
         store.set(&project, TrustDecision::Trusted).unwrap();
@@ -755,14 +940,12 @@ mod tests {
         ] {
             let dir = TempDir::new().unwrap();
             let (store, trust_path) = store_in(&dir);
-            let mut legacy = serde_json::Map::new();
-            legacy.insert("version".to_owned(), value);
-            write_store(
-                &trust_path,
-                &serde_json::Value::Object(legacy).to_string(),
-            );
 
-            let version_path = canonical_path(Path::new("version")).unwrap();
+            let version = project_in(&dir, "version");
+            let version_path = canonical_path(&version).unwrap();
+            let version_key = version_path.display().to_string();
+            let legacy = serde_json::json!({ version_key.clone(): value });
+            write_store(&trust_path, &legacy.to_string());
             let expected_decision = match expected {
                 Some(true) => TrustDecision::Trusted,
                 Some(false) => TrustDecision::Untrusted,
@@ -884,7 +1067,10 @@ mod tests {
         assert!(store.resolve(&project).is_err());
 
         // A string is not a valid legacy trust value either.
-        write_store(&trust_path, &format!("{{\"{}\":\"true\"}}", project.display()));
+        write_store(
+            &trust_path,
+            &format!("{{\"{}\":\"true\"}}", project.display()),
+        );
         assert!(store.resolve(&project).is_err());
     }
 
@@ -953,7 +1139,10 @@ mod tests {
         assert_eq!(TrustDecision::Trusted.as_str(), "trusted");
         assert_eq!(TrustDecision::Untrusted.as_str(), "untrusted");
         assert_eq!(TrustDecision::Ask.as_str(), "ask");
-        assert_eq!(serde_json::to_string(&TrustDecision::Ask).unwrap(), "\"ask\"");
+        assert_eq!(
+            serde_json::to_string(&TrustDecision::Ask).unwrap(),
+            "\"ask\""
+        );
     }
 
     #[test]
@@ -1003,7 +1192,7 @@ mod tests {
     fn gated_project(dir: &TempDir, name: &str) -> PathBuf {
         let project = project_in(dir, name);
         // `has_project_config_resources` requires at least one entry under
-        // `.pi`; an empty directory does not gate the project.
+        // `.rpi`; an empty directory does not gate the project.
         let config_dir = project.join(CONFIG_DIR_NAME);
         fs::create_dir_all(&config_dir).unwrap();
         fs::write(config_dir.join("settings.json"), "{}").unwrap();
@@ -1049,7 +1238,10 @@ mod tests {
         assert!(!observation.is_new);
 
         // The observation round-trips through the extension payload contract.
-        assert_eq!(observation.to_payload()["path"], denied.to_string_lossy().as_ref());
+        assert_eq!(
+            observation.to_payload()["path"],
+            denied.to_string_lossy().as_ref()
+        );
         assert_eq!(observation.to_payload()["decision"], "untrusted");
         assert_eq!(observation.to_payload()["isNew"], false);
 

@@ -1,6 +1,6 @@
-use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
@@ -13,7 +13,7 @@ use super::log::ProcessLog;
 use super::{
     DEFAULT_LOG_READ_BYTES, MAX_PROCESS_LABEL_BYTES, ProcessEvent, ProcessId, ProcessInfo,
     ProcessKey, ProcessLogs, ProcessManagerConfig, ProcessOwnerId, ProcessSignal, ProcessSpawnSpec,
-    ProcessState, ProcessTerminalSize,
+    ProcessState, ProcessTerminalSize, authorize_spawn_with_auth,
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 512;
@@ -29,19 +29,23 @@ impl std::fmt::Debug for ProcessManager {
         formatter
             .debug_struct("ProcessManager")
             .field("session_count", &self.inner.sessions.lock().len())
-            .field("max_processes", &self.inner.config.max_processes)
-            .field("max_output_bytes", &self.inner.config.max_output_bytes)
+            .field("max_processes", &self.inner.config.lock().max_processes)
+            .field("max_output_bytes", &self.inner.config.lock().max_output_bytes)
             .finish()
     }
 }
 
-
 struct ManagerInner {
-    config: ProcessManagerConfig,
+    config: Mutex<ProcessManagerConfig>,
+    publication: OnceLock<Weak<crate::application::generation::ApplicationPublication>>,
+    auth_manager: OnceLock<Arc<crate::AuthManager>>,
     sessions: Mutex<HashMap<ProcessId, Arc<ProcessSession>>>,
+    /// Exit snapshots kept after explicit stop removes the live row.
+    settled: Mutex<Vec<ProcessInfo>>,
     events: broadcast::Sender<ProcessEvent>,
     shutdown: AtomicBool,
     idle_reaper_started: AtomicBool,
+    idle_changed: Notify,
 }
 
 struct ProcessSession {
@@ -73,22 +77,85 @@ impl ProcessManager {
 
     #[must_use]
     pub fn with_config(config: ProcessManagerConfig) -> Self {
-        assert!(config.max_processes > 0, "max_processes must be greater than zero");
-        assert!(config.max_output_bytes > 0, "max_output_bytes must be greater than zero");
+        assert!(
+            config.max_processes > 0,
+            "max_processes must be greater than zero"
+        );
+        assert!(
+            config.max_output_bytes > 0,
+            "max_output_bytes must be greater than zero"
+        );
         assert!(
             config.idle_timeout.is_none() || !config.idle_scan_interval.is_zero(),
             "idle_scan_interval must be greater than zero when idle expiration is enabled"
         );
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let inner = Arc::new(ManagerInner {
-            config,
+            publication: OnceLock::new(),
+            auth_manager: OnceLock::new(),
+            config: Mutex::new(config),
             sessions: Mutex::new(HashMap::new()),
+            settled: Mutex::new(Vec::new()),
             events,
             shutdown: AtomicBool::new(false),
             idle_reaper_started: AtomicBool::new(false),
+            idle_changed: Notify::new(),
         });
         spawn_idle_reaper(&inner);
         Self { inner }
+    }
+
+    pub(crate) fn bind_publication(
+        &self,
+        publication: &Arc<crate::application::generation::ApplicationPublication>,
+    ) -> Result<()> {
+        self.inner
+            .publication
+            .set(Arc::downgrade(publication))
+            .map_err(|_| anyhow!("process manager publication is already bound"))
+    }
+
+    pub(crate) fn bind_auth_manager(&self, auth_manager: Arc<crate::AuthManager>) -> Result<()> {
+        if let Some(existing) = self.inner.auth_manager.get() {
+            return if Arc::ptr_eq(existing, &auth_manager) {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "process manager authentication owner is already bound"
+                ))
+            };
+        }
+        self.inner
+            .auth_manager
+            .set(auth_manager)
+            .map_err(|_| anyhow!("process manager authentication owner is already bound"))
+    }
+
+    pub fn replace_config(&self, config: ProcessManagerConfig) -> Result<()> {
+        if config.max_processes == 0 {
+            bail!("max_processes must be greater than zero");
+        }
+        if config.max_output_bytes == 0 {
+            bail!("max_output_bytes must be greater than zero");
+        }
+        if config.idle_timeout.is_some() && config.idle_scan_interval.is_zero() {
+            bail!("idle_scan_interval must be greater than zero when idle expiration is enabled");
+        }
+        *self.inner.config.lock() = config;
+        spawn_idle_reaper(&self.inner);
+        self.inner.idle_changed.notify_waiters();
+        Ok(())
+    }
+
+    fn capture_generation(
+        &self,
+    ) -> Result<Arc<crate::application::generation::ApplicationGeneration>> {
+        self.inner
+            .publication
+            .get()
+            .and_then(Weak::upgrade)
+            .map(|publication| publication.capture())
+            .ok_or_else(|| anyhow!("process manager generation is unavailable"))
     }
 
     #[must_use]
@@ -101,17 +168,68 @@ impl ProcessManager {
         owner_id: ProcessOwnerId,
         spec: ProcessSpawnSpec,
     ) -> Result<ProcessInfo> {
-        validate_spawn_spec(&spec, &self.inner.config)?;
+        validate_spawn_spec(&spec, &self.inner.config.lock())?;
         if self.inner.shutdown.load(Ordering::Acquire) {
             bail!("process manager is shutting down");
         }
         spawn_idle_reaper(&self.inner);
 
-        let env = child_environment(&spec.env);
-        let terminal_size = spec.terminal_size.unwrap_or_default();
+        let generation = self.capture_generation()?;
+        let authorized = authorize_spawn_with_auth(
+            generation.clone(),
+            self.inner.auth_manager.get().map(Arc::as_ref),
+            crate::sandbox::RawSpawnRequest {
+                authorization: crate::sandbox::SpawnAuthorization::Captured(
+                    generation.sandbox().clone(),
+                ),
+                family: if spec.tty {
+                    pi_sandbox::SpawnFamily::ManagedPtyProcess
+                } else {
+                    pi_sandbox::SpawnFamily::ManagedPipeProcess
+                },
+                audience: crate::sandbox::CredentialAudience::new_spawn_family(if spec.tty {
+                    pi_sandbox::SpawnFamily::ManagedPtyProcess
+                } else {
+                    pi_sandbox::SpawnFamily::ManagedPipeProcess
+                })?,
+                argv: spec.argv.iter().cloned().map(Into::into).collect(),
+                cwd: spec.cwd.clone(),
+                requested_env: spec
+                    .env
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            std::ffi::OsString::from(name),
+                            value.clone().map(Into::into),
+                        )
+                    })
+                    .collect(),
+                requested_grants: BTreeSet::new(),
+                stdio: if spec.tty {
+                    pi_sandbox::StdioMode::Pty
+                } else {
+                    pi_sandbox::StdioMode::Merged
+                },
+                terminal_size: spec
+                    .terminal_size
+                    .map(backend::sandbox_terminal_size)
+                    .transpose()?,
+                timeout_ms: spec.timeout_ms,
+                target_fd_mappings: Vec::new(),
+                #[cfg(unix)]
+                owned_target_fd_mappings: Vec::new(),
+                #[cfg(unix)]
+                mount_sources: Vec::new(),
+                #[cfg(unix)]
+                retained_executable: None,
+                #[cfg(unix)]
+                retained_working_directory: None,
+            },
+        )
+        .await?;
         let output_bytes = spec
             .output_bytes
-            .unwrap_or(self.inner.config.max_output_bytes);
+            .unwrap_or(self.inner.config.lock().max_output_bytes);
         let id = ProcessId::generate();
         let started_at_ms = now_ms();
         let session = Arc::new(ProcessSession {
@@ -138,24 +256,16 @@ impl ProcessManager {
                 .values()
                 .filter(|session| !session.runtime.lock().state.is_terminal())
                 .count();
-            if active >= self.inner.config.max_processes {
+            if active >= self.inner.config.lock().max_processes {
                 bail!(
                     "process limit reached (maximum {})",
-                    self.inner.config.max_processes
+                    self.inner.config.lock().max_processes
                 );
             }
             sessions.insert(id.clone(), session.clone());
         }
 
-        let backend = match backend::spawn(
-            &spec.argv,
-            &spec.cwd,
-            &env,
-            spec.tty,
-            terminal_size,
-        )
-        .await
-        {
+        let backend = match backend::spawn(authorized).await {
             Ok(backend) => backend,
             Err(error) => {
                 self.inner.sessions.lock().remove(&id);
@@ -169,10 +279,9 @@ impl ProcessManager {
         }
         *session.controller.lock() = Some(backend.controller.clone());
         let info = session.info();
-        let _ = self
-            .inner
-            .events
-            .send(ProcessEvent::ProcessStarted { process: info.clone() });
+        let _ = self.inner.events.send(ProcessEvent::ProcessStarted {
+            process: info.clone(),
+        });
         session.changed.notify_waiters();
 
         let weak = Arc::downgrade(&self.inner);
@@ -314,22 +423,52 @@ impl ProcessManager {
         grace: Option<Duration>,
     ) -> Result<ProcessInfo> {
         let session = self.session(owner_id, id)?;
-        if session.runtime.lock().state.is_terminal() {
-            return Ok(session.info());
-        }
-        {
-            let mut runtime = session.runtime.lock();
-            runtime.state = ProcessState::Stopping;
-        }
-        session.controller()?.signal(ProcessSignal::Sigterm)?;
-        let wait = self.wait(owner_id, id, grace.or(Some(self.inner.config.terminate_grace)));
-        match wait.await {
-            Ok(info) => Ok(info),
-            Err(_) => {
-                session.controller()?.signal(ProcessSignal::Sigkill)?;
-                self.wait(owner_id, id, Some(Duration::from_secs(5))).await
+        // Subscribe BEFORE the stop signal: supervise emits ProcessExited as
+        // part of reaching the terminal state, and the stop response must not
+        // unblock the caller before that event lands. The registry row is
+        // reclaimed only after the event is observed.
+        let mut exited_event = self.inner.events.subscribe();
+        let info = if session.runtime.lock().state.is_terminal() {
+            session.info()
+        } else {
+            {
+                let mut runtime = session.runtime.lock();
+                runtime.state = ProcessState::Stopping;
             }
+            session.controller()?.signal(ProcessSignal::Sigterm)?;
+            let wait = self.wait(
+                owner_id,
+                id,
+                grace.or(Some(self.inner.config.lock().terminate_grace)),
+            );
+            match wait.await {
+                Ok(info) => info,
+                Err(_) => {
+                    session.controller()?.signal(ProcessSignal::Sigkill)?;
+                    self.wait(owner_id, id, Some(Duration::from_secs(5))).await?
+                }
+            }
+        };
+        if info.state.is_terminal() {
+            loop {
+                match exited_event.try_recv() {
+                    Ok(ProcessEvent::ProcessExited { process })
+                        if process.id == *id =>
+                    {
+                        break;
+                    }
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                }
+            }
+            self.remember_settled(info.clone());
+            self.inner.sessions.lock().remove(id);
         }
+        Ok(info)
     }
 
     pub async fn wait(
@@ -338,7 +477,11 @@ impl ProcessManager {
         id: &ProcessId,
         timeout: Option<Duration>,
     ) -> Result<ProcessInfo> {
-        let session = self.session(owner_id, id)?;
+        let Some(session) = self.try_session(owner_id, id) else {
+            return self
+                .settled(owner_id, id)
+                .ok_or_else(|| anyhow!("process not found"));
+        };
         let future = async {
             loop {
                 let notified = session.changed.notified();
@@ -370,25 +513,29 @@ impl ProcessManager {
                     let _ = controller.signal(ProcessSignal::Sigterm);
                 }
             }
-            tokio::time::sleep(self.inner.config.terminate_grace).await;
-            for session in &sessions {
-                if !session.runtime.lock().state.is_terminal()
-                    && let Ok(controller) = session.controller()
-                {
-                    let _ = controller.signal(ProcessSignal::Sigkill);
-                }
-            }
-            for session in sessions {
-                let future = async {
-                    loop {
-                        let notified = session.changed.notified();
-                        if session.runtime.lock().state.is_terminal() {
-                            break;
-                        }
-                        notified.await;
+            // Notify-driven wait bounded by the configured grace: it returns
+            // as soon as every cooperative process reaches a terminal state,
+            // so a SIGTERM-respecting owner settles far before the full grace
+            // instead of consuming it in a fixed sleep.
+            let grace = self.inner.config.lock().terminate_grace;
+            let _ = tokio::time::timeout(grace, wait_all_terminal(&sessions)).await;
+            let stragglers: Vec<_> = sessions
+                .iter()
+                .filter(|session| !session.runtime.lock().state.is_terminal())
+                .cloned()
+                .collect();
+            if !stragglers.is_empty() {
+                for session in &stragglers {
+                    if let Ok(controller) = session.controller() {
+                        let _ = controller.signal(ProcessSignal::Sigkill);
                     }
-                };
-                let _ = tokio::time::timeout(Duration::from_secs(5), future).await;
+                }
+                // One shared final bound for the survivors SIGKILL should
+                // reap, avoiding the per-process 5s multiplication of the old
+                // sequential wait loop.
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(5), wait_all_terminal(&stragglers))
+                        .await;
             }
         }
 
@@ -410,7 +557,13 @@ impl ProcessManager {
 
     pub fn shutdown_now(&self) {
         self.inner.shutdown.store(true, Ordering::Release);
-        let sessions = self.inner.sessions.lock().values().cloned().collect::<Vec<_>>();
+        let sessions = self
+            .inner
+            .sessions
+            .lock()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         for session in sessions {
             if let Ok(controller) = session.controller() {
                 let _ = controller.signal(ProcessSignal::Sigkill);
@@ -419,13 +572,38 @@ impl ProcessManager {
     }
 
     fn session(&self, owner_id: &ProcessOwnerId, id: &ProcessId) -> Result<Arc<ProcessSession>> {
+        self.try_session(owner_id, id)
+            .ok_or_else(|| anyhow!("process not found"))
+    }
+
+    fn try_session(&self, owner_id: &ProcessOwnerId, id: &ProcessId) -> Option<Arc<ProcessSession>> {
         self.inner
             .sessions
             .lock()
             .get(id)
             .filter(|session| &session.owner_id == owner_id)
             .cloned()
-            .ok_or_else(|| anyhow!("process not found"))
+    }
+
+    fn remember_settled(&self, info: ProcessInfo) {
+        let mut settled = self.inner.settled.lock();
+        settled.retain(|row| row.id != info.id);
+        settled.push(info);
+        let cap = self.inner.config.lock().max_processes.max(1);
+        if settled.len() > cap {
+            let overflow = settled.len() - cap;
+            settled.drain(0..overflow);
+        }
+    }
+
+    fn settled(&self, owner_id: &ProcessOwnerId, id: &ProcessId) -> Option<ProcessInfo> {
+        self.inner
+            .settled
+            .lock()
+            .iter()
+            .rev()
+            .find(|row| row.id == *id && &row.owner_id == owner_id)
+            .cloned()
     }
 
     fn owner_sessions(&self, owner_id: &ProcessOwnerId) -> Vec<Arc<ProcessSession>> {
@@ -564,7 +742,7 @@ async fn supervise(
                     runtime.terminal_override = Some(ProcessState::TimedOut);
                 }
                 let _ = controller.signal(ProcessSignal::Sigterm);
-                let grace = manager.upgrade().map_or(Duration::from_secs(1), |manager| manager.config.terminate_grace);
+                let grace = manager.upgrade().map_or(Duration::from_secs(1), |manager| manager.config.lock().terminate_grace);
                 tokio::time::sleep(grace).await;
                 let _ = controller.signal(ProcessSignal::Sigkill);
                 timeout_sleep.set(None);
@@ -579,17 +757,21 @@ async fn supervise(
     {
         let mut runtime = session.runtime.lock();
         runtime.state = runtime.terminal_override.unwrap_or(ProcessState::Exited);
-        runtime.exit_code = Some(if runtime.state == ProcessState::TimedOut { 124 } else { code });
+        runtime.exit_code = Some(if runtime.state == ProcessState::TimedOut {
+            124
+        } else {
+            code
+        });
         runtime.exited_at_ms = Some(now_ms());
     }
     session.controller.lock().take();
-    session.changed.notify_waiters();
     if let Some(manager) = manager.upgrade() {
         let _ = manager.events.send(ProcessEvent::ProcessExited {
             process: session.info(),
         });
         prune_terminal_sessions(&manager, &session.id);
     }
+    session.changed.notify_waiters();
 }
 
 fn prune_terminal_sessions(manager: &ManagerInner, newest_id: &ProcessId) {
@@ -598,15 +780,13 @@ fn prune_terminal_sessions(manager: &ManagerInner, newest_id: &ProcessId) {
         .values()
         .filter(|session| session.runtime.lock().state.is_terminal())
         .count();
-    if terminal_count <= manager.config.max_processes {
+    if terminal_count <= manager.config.lock().max_processes {
         return;
     }
-    let remove_count = terminal_count - manager.config.max_processes;
+    let remove_count = terminal_count - manager.config.lock().max_processes;
     let mut terminal = sessions
         .values()
-        .filter(|session| {
-            session.id != *newest_id && session.runtime.lock().state.is_terminal()
-        })
+        .filter(|session| session.id != *newest_id && session.runtime.lock().state.is_terminal())
         .map(|session| (session.started_at_ms, session.id.clone()))
         .collect::<Vec<_>>();
     terminal.sort_by_key(|(started_at, _)| *started_at);
@@ -616,9 +796,9 @@ fn prune_terminal_sessions(manager: &ManagerInner, newest_id: &ProcessId) {
 }
 
 fn spawn_idle_reaper(inner: &Arc<ManagerInner>) {
-    let Some(idle_timeout) = inner.config.idle_timeout else {
+    if inner.config.lock().idle_timeout.is_none() {
         return;
-    };
+    }
     if tokio::runtime::Handle::try_current().is_err() {
         return;
     }
@@ -629,14 +809,32 @@ fn spawn_idle_reaper(inner: &Arc<ManagerInner>) {
     {
         return;
     }
-    let interval = inner.config.idle_scan_interval;
     let weak = Arc::downgrade(inner);
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(interval).await;
             let Some(inner) = weak.upgrade() else {
                 break;
             };
+            if inner.shutdown.load(Ordering::Acquire) {
+                break;
+            }
+            let tick = {
+                let config = inner.config.lock();
+                config
+                    .idle_timeout
+                    .map(|idle_timeout| (idle_timeout, config.idle_scan_interval))
+            };
+            let (idle_timeout, interval) = match tick {
+                Some(tick) => tick,
+                None => {
+                    inner.idle_changed.notified().await;
+                    continue;
+                }
+            };
+            tokio::select! {
+                () = tokio::time::sleep(interval) => {}
+                () = inner.idle_changed.notified() => continue,
+            }
             if inner.shutdown.load(Ordering::Acquire) {
                 break;
             }
@@ -665,7 +863,7 @@ fn spawn_idle_reaper(inner: &Arc<ManagerInner>) {
                 if let Ok(controller) = session.controller() {
                     let _ = controller.signal(ProcessSignal::Sigterm);
                     let controller = controller.clone();
-                    let grace = inner.config.terminate_grace;
+                    let grace = inner.config.lock().terminate_grace;
                     tokio::spawn(async move {
                         tokio::time::sleep(grace).await;
                         let _ = controller.signal(ProcessSignal::Sigkill);
@@ -727,21 +925,6 @@ fn validate_terminal_size(size: ProcessTerminalSize) -> Result<()> {
     Ok(())
 }
 
-fn child_environment(overrides: &BTreeMap<String, Option<String>>) -> BTreeMap<String, String> {
-    let mut env = std::env::vars().collect::<BTreeMap<_, _>>();
-    for (key, value) in overrides {
-        match value {
-            Some(value) => {
-                env.insert(key.clone(), value.clone());
-            }
-            None => {
-                env.remove(key);
-            }
-        }
-    }
-    env
-}
-
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -750,3 +933,21 @@ fn now_ms() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
+/// Concurrently wait for every session to reach a terminal state.
+///
+/// Each wait future registers its `Notify` permit before checking the terminal
+/// flag (matching `ProcessManager::wait`), so a transition observed between the
+/// check and the await is not lost. `join_all` drives them concurrently, so the
+/// returned future resolves as soon as *all* sessions have settled.
+async fn wait_all_terminal(sessions: &[Arc<ProcessSession>]) {
+    let waits = sessions.iter().cloned().map(|session| async move {
+        loop {
+            let notified = session.changed.notified();
+            if session.runtime.lock().state.is_terminal() {
+                return;
+            }
+            notified.await;
+        }
+    });
+    futures_util::future::join_all(waits).await;
+}

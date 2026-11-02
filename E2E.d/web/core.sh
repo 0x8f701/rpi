@@ -37,6 +37,9 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 E2E_DIR="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd -P)"
 # shellcheck source=../lib/common.sh
 . "$E2E_DIR/lib/common.sh"
+# shellcheck source=lib/fixture.sh
+. "$SCRIPT_DIR/lib/fixture.sh"
+
 
 SCENARIO="web"
 TOKEN="web-e2e-token-$$-$(date +%s)"
@@ -71,8 +74,8 @@ spawn_rpi() {
     env -i \
         HOME="$root/home" USERPROFILE="$root/home" \
         PATH="${PATH:-/usr/bin:/bin}" LANG="${LANG:-C.UTF-8}" LC_ALL="${LC_ALL:-C.UTF-8}" \
-        PI_CODING_AGENT_DIR="$root/home/.pi/agent" \
-        PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 \
+        RPI_HOME="$root/home/.rpi" \
+        RPI_OFFLINE=1 RPI_SKIP_VERSION_CHECK=1 \
         RPI_WEB_DEV_DIR="${RPI_WEB_DEV_DIR:-}" \
         "$RPI_BIN" --offline \
         --listen 127.0.0.1:0 \
@@ -139,6 +142,8 @@ run_playwright() {
     # ESM bare-specifier resolution walks up from the script's directory, so
     # run the test from the install dir where node_modules lives.
     cp "$SCRIPT_DIR/playwright_test.mjs" "$work/playwright_test.mjs"
+    mkdir -p "$work/lib"
+    cp "$SCRIPT_DIR/lib/session-lifecycle.mjs" "$work/lib/session-lifecycle.mjs"
     # Hard-coverage mode: preload the V8 coverage hook (node --import) and
     # name payloads after this lane so step 6's payload check finds them.
     local -a node_preload=()
@@ -168,6 +173,7 @@ main() {
     # The web lanes are playwright-only hard gates: node is required (fail
     # fast); the usable-Chromium requirement is verified by run_playwright.
     require_cmd node
+    web_prepare_dist "$WORK_ROOT/web-dist"
 
     local root evidence port url
     root="$(scenario_workspace "$SCENARIO")"
@@ -186,7 +192,7 @@ main() {
     printf 'web e2e seed\n' >"$root/workspace/seed.txt"
     git -C "$root/workspace" add -- seed.txt
     git -C "$root/workspace" -c commit.gpgsign=false commit -q -m seed
-    cat >"$root/home/.pi/agent/models.json" <<EOF
+    cat >"$root/home/.rpi/models.json" <<EOF
 {
   "providers": {
     "user-steering": {
@@ -203,7 +209,7 @@ EOF
     # runtime attached) and define a trusted writer agent the spawned child
     # runs as. The mock streams the child's marker prompt slowly, so the job
     # stays running long enough to assert live status and cancel it.
-    cat >"$root/home/.pi/agent/settings.json" <<EOF
+    cat >"$root/home/.rpi/settings.json" <<EOF
 {
   "orchestration": {
     "tasks": true,
@@ -212,8 +218,8 @@ EOF
   }
 }
 EOF
-    mkdir -p "$root/home/.pi/agent/agents"
-    cat >"$root/home/.pi/agent/agents/writer.md" <<'EOF'
+    mkdir -p "$root/home/.rpi/agents"
+    cat >"$root/home/.rpi/agents/writer.md" <<'EOF'
 ---
 name: writer
 description: Write assigned content

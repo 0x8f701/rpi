@@ -15,11 +15,11 @@ use parking_lot::Mutex;
 use pi_agent::{Agent, AgentEvent, AgentTool, ThinkingLevel, ToolCapability};
 use pi_ai::{AssistantMessageEvent, ContentBlock, Message, Model};
 use pi_coding::{
-    Application, SideChatFork, SideChatMainPeek, create_all_tools, create_all_tools_with_rules,
-    create_peek_main_tool, create_read_only_tools, filter_tools_by_capabilities,
-    tools_include_mutation,
+    Application, ApplicationRuntimeCandidate, ResourceDiscovery, Session, SessionOptions,
+    SideChatFork, SideChatMainPeek, ToolSelection, WorkspaceRoots, create_peek_main_tool,
+    filter_tools_by_capabilities, tools_include_mutation,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -49,10 +49,93 @@ impl SideChatToolMode {
 /// Renderable transcript row local to the side panel.
 #[derive(Clone, Debug)]
 pub struct SideChatEntry {
+    pub id: String,
+    pub kind: SideChatEntryKind,
     pub role: SideChatRole,
     pub text: String,
+    pub tool_name: Option<String>,
+    pub tool_args: Option<Value>,
+    pub output: Option<String>,
+    pub thinking: Option<String>,
     pub is_error: bool,
     pub is_partial: bool,
+}
+
+impl Default for SideChatEntry {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            kind: SideChatEntryKind::System,
+            role: SideChatRole::System,
+            text: String::new(),
+            tool_name: None,
+            tool_args: None,
+            output: None,
+            thinking: None,
+            is_error: false,
+            is_partial: false,
+        }
+    }
+}
+
+impl SideChatEntry {
+    fn from_role(id: String, role: SideChatRole, text: String) -> Self {
+        Self {
+            id,
+            kind: SideChatEntryKind::from_role(role),
+            role,
+            text,
+            ..Self::default()
+        }
+    }
+
+    /// Wire object for `side_chat_list` / new / switch / close / prompt.
+    #[must_use]
+    pub fn to_wire_json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "kind": match self.kind {
+                SideChatEntryKind::User => "user",
+                SideChatEntryKind::Assistant => "assistant",
+                SideChatEntryKind::Tool => "tool",
+                SideChatEntryKind::System => "system",
+                SideChatEntryKind::Thinking => "thinking",
+            },
+            "role": match self.role {
+                SideChatRole::User => "user",
+                SideChatRole::Assistant => "assistant",
+                SideChatRole::Tool => "tool",
+                SideChatRole::System => "system",
+            },
+            "text": self.text,
+            "toolName": self.tool_name,
+            "toolArgs": self.tool_args,
+            "output": self.output,
+            "thinking": self.thinking,
+            "isError": self.is_error,
+            "isPartial": self.is_partial,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SideChatEntryKind {
+    User,
+    Assistant,
+    Tool,
+    System,
+    Thinking,
+}
+
+impl SideChatEntryKind {
+    fn from_role(role: SideChatRole) -> Self {
+        match role {
+            SideChatRole::User => Self::User,
+            SideChatRole::Assistant => Self::Assistant,
+            SideChatRole::Tool => Self::Tool,
+            SideChatRole::System => Self::System,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,6 +235,10 @@ enum SideChatInternalEvent {
 pub struct SideChatController {
     agent: Agent,
     fork: SideChatFork,
+    /// Parent prompt plus the one standard side-chat suffix, captured before
+    /// any tool contract. Tool changes rebuild from this instead of scanning
+    /// the live prompt.
+    side_prompt_base: String,
     tool_mode: SideChatToolMode,
     entries: Vec<SideChatEntry>,
     editor_lines: Vec<String>,
@@ -169,6 +256,10 @@ pub struct SideChatController {
     /// Subscription keep-alive (dropped on shutdown).
     _subscription: Option<pi_agent::Subscription>,
     main_application: Application,
+    /// Published isolated application whose generation governs every side tool.
+    side_application: Application,
+    /// Private recording namespace retained for the isolated application lifetime.
+    side_session_dir: PathBuf,
     warned_first_mutation: bool,
     /// In-flight tool calls awaiting finalization, keyed by tool call id to
     /// the index of their streamed partial transcript row. Bounded by the
@@ -180,6 +271,14 @@ pub struct SideChatController {
     /// suppressed for these. Bounded by removal on consume and cleared on
     /// turn boundaries / transcript reset.
     finalized_tool_calls: HashSet<String>,
+    entry_seq: u64,
+    pending_thinking_index: Option<usize>,
+    pending_assistant_index: Option<usize>,
+    /// One submitted turn already published its display row. The next
+    /// `MessageEnd::User` is that turn's model prompt and is not a second
+    /// display row, even when the texts differ. Cleared when consumed or when
+    /// the turn/transcript ends.
+    pending_user_echo: bool,
 }
 
 impl SideChatController {
@@ -192,13 +291,25 @@ impl SideChatController {
     async fn from_fork(application: &Application, fork: SideChatFork) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let file_tracker = Arc::new(Mutex::new(FileActivityTracker::new()));
-        let tools = Self::build_tools(
+        let (side_application, side_session_dir) =
+            Self::build_isolated_application(application, &fork).await?;
+        let tools = match Self::build_tools(
             application,
+            &side_application,
             &fork,
             SideChatToolMode::ReadOnly,
             file_tracker.clone(),
-        )?;
-        let agent = Application::create_side_chat_agent(&fork, tools);
+        ) {
+            Ok(tools) => tools,
+            Err(error) => {
+                side_application.cleanup().await;
+                let _ = std::fs::remove_dir_all(&side_session_dir);
+                return Err(error);
+            }
+        };
+        let agent = Application::create_side_chat_agent(&fork, Vec::new());
+        let side_prompt_base = agent.state().await.system_prompt;
+        install_side_tools(&agent, &side_prompt_base, tools).await;
         let subscription_tx = event_tx.clone();
         let subscription = agent
             .subscribe_simple(move |event| {
@@ -212,6 +323,7 @@ impl SideChatController {
         Ok(Self {
             agent,
             fork,
+            side_prompt_base,
             tool_mode: SideChatToolMode::ReadOnly,
             entries: Vec::new(),
             editor_lines: vec![String::new()],
@@ -228,33 +340,90 @@ impl SideChatController {
             prompt_task: None,
             _subscription: Some(subscription),
             main_application: application.clone(),
+            side_application,
+            side_session_dir,
             warned_first_mutation: false,
             pending_tool_calls: HashMap::new(),
             finalized_tool_calls: HashSet::new(),
+            entry_seq: 0,
+            pending_thinking_index: None,
+            pending_assistant_index: None,
+            pending_user_echo: false,
         })
+    }
+
+    async fn build_isolated_application(
+        application: &Application,
+        fork: &SideChatFork,
+    ) -> Result<(Application, PathBuf)> {
+        let main_session = application.session();
+        let child_options = main_session.child_session_options_snapshot();
+        let side_session_dir =
+            std::env::temp_dir().join(format!("rpi-side-chat-{}", uuid::Uuid::now_v7().simple()));
+        std::fs::create_dir(&side_session_dir)?;
+        let result = async {
+            let resources = main_session
+                .resource_manager()
+                .ok_or_else(|| anyhow!("main application has no published resource manager"))?
+                .rebuild_for_cwd(&fork.cwd)?;
+            let workspace = child_options.workspace;
+            let session = Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
+                SessionOptions {
+                    model: fork.model.clone(),
+                    cwd: fork.cwd.clone(),
+                    system_prompt: fork.system_prompt.clone(),
+                    thinking_level: fork.thinking_level,
+                    api_key: fork.api_key.clone(),
+                    compaction: None,
+                    stream_options: fork.stream_options.clone(),
+                    tools: None,
+                    before_tool_call: None,
+                    after_tool_call: None,
+                    stream_fn: Some(fork.stream_fn.clone()),
+                    auth_resolver: fork.auth_resolver.clone(),
+                    auth_manager: child_options.auth_manager,
+                },
+                Vec::new(),
+                ToolSelection::default(),
+                ResourceDiscovery::Disabled,
+                workspace,
+                None,
+            )?;
+            session.set_session_dir(side_session_dir.clone());
+            session.set_permission_rules(fork.permission_rules.clone());
+            session.attach_resources(resources).await?;
+            Application::from_runtime_candidate(ApplicationRuntimeCandidate::new(session)).await
+        }
+        .await;
+        match result {
+            Ok(application) => Ok((application, side_session_dir)),
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&side_session_dir);
+                Err(error)
+            }
+        }
     }
 
     fn build_tools(
         application: &Application,
+        side_application: &Application,
         fork: &SideChatFork,
         mode: SideChatToolMode,
         tracker: Arc<Mutex<FileActivityTracker>>,
     ) -> Result<Vec<AgentTool>> {
-        let cwd = fork.cwd.to_string_lossy().into_owned();
-        let mut tools = match mode {
-            SideChatToolMode::ReadOnly => create_read_only_tools(&cwd),
-            SideChatToolMode::Edit => {
-                // Build fresh workspace-scoped tools. Never clone the main
-                // Session's stateful todo/process/task/hub/goal/extension
-                // closures into the detached side agent. The main session's
-                // live permission-rule source is threaded into the lsp tool so
-                // its rename preflight obeys the same rules as host approval.
-                wrap_mutation_tools_with_warning(
-                    create_all_tools_with_rules(&cwd, fork.permission_rules.clone()),
-                    tracker,
+        let mut tools = side_application
+            .get_all_tools()
+            .into_iter()
+            .filter(|tool| {
+                !matches!(
+                    tool.name.as_str(),
+                    "todo" | "goal" | "task" | "hub" | "process" | "extension"
                 )
-            }
-        };
+            })
+            .collect::<Vec<_>>();
+        if mode == SideChatToolMode::Edit {
+            tools = wrap_mutation_tools_with_warning(tools, tracker);
+        }
         if mode == SideChatToolMode::ReadOnly {
             tools = filter_tools_by_capabilities(tools, &[ToolCapability::Read]);
         }
@@ -306,6 +475,94 @@ impl SideChatController {
     #[must_use]
     pub fn entries(&self) -> &[SideChatEntry] {
         &self.entries
+    }
+
+    fn alloc_entry_id(&mut self) -> String {
+        self.entry_seq += 1;
+        format!("sc-{}", self.entry_seq)
+    }
+
+    fn push_entry(&mut self, mut entry: SideChatEntry) -> usize {
+        if entry.id.is_empty() {
+            entry.id = self.alloc_entry_id();
+        }
+        self.entries.push(entry);
+        self.entries.len() - 1
+    }
+
+    fn push_role(&mut self, role: SideChatRole, text: String, is_error: bool, is_partial: bool) -> usize {
+        let id = self.alloc_entry_id();
+        let mut entry = SideChatEntry::from_role(id, role, text);
+        entry.is_error = is_error;
+        entry.is_partial = is_partial;
+        self.push_entry(entry)
+    }
+
+    fn finalize_thinking_entry(&mut self, thinking: String) {
+        if thinking.is_empty() {
+            if let Some(index) = self.pending_thinking_index
+                && let Some(entry) = self.entries.get_mut(index)
+            {
+                entry.is_partial = false;
+            }
+            return;
+        }
+        if let Some(index) = self.pending_thinking_index {
+            if let Some(entry) = self.entries.get_mut(index) {
+                entry.thinking = Some(thinking.clone());
+                entry.text = thinking;
+                entry.is_partial = false;
+            }
+            return;
+        }
+        let id = self.alloc_entry_id();
+        let index = self.push_entry(SideChatEntry {
+            id,
+            kind: SideChatEntryKind::Thinking,
+            role: SideChatRole::Assistant,
+            text: thinking.clone(),
+            thinking: Some(thinking),
+            is_partial: false,
+            ..SideChatEntry::default()
+        });
+        self.pending_thinking_index = Some(index);
+    }
+
+    fn settle_streaming_assistant(&mut self, text: String, is_partial: bool) {
+        self.streaming_text.clear();
+        match self.pending_assistant_index.take() {
+            Some(index) => {
+                if let Some(entry) = self.entries.get_mut(index) {
+                    entry.text = text;
+                    entry.is_partial = is_partial;
+                }
+            }
+            None if !text.is_empty() => {
+                self.push_role(SideChatRole::Assistant, text, false, is_partial);
+            }
+            None => {}
+        }
+    }
+
+    fn append_streaming_text(&mut self, delta: &str) {
+        self.streaming_text.push_str(delta);
+        if let Some(index) = self.pending_assistant_index {
+            if let Some(entry) = self.entries.get_mut(index) {
+                entry.text = self.streaming_text.clone();
+                entry.is_partial = true;
+            }
+            return;
+        }
+        let id = self.alloc_entry_id();
+        let index = self.push_entry(SideChatEntry {
+            id,
+            kind: SideChatEntryKind::Assistant,
+            role: SideChatRole::Assistant,
+            text: self.streaming_text.clone(),
+            is_partial: true,
+            ..SideChatEntry::default()
+        });
+        self.pending_assistant_index = Some(index);
     }
 
     #[must_use]
@@ -364,12 +621,8 @@ impl SideChatController {
                 SideChatInternalEvent::PromptFailed(message) => {
                     self.is_streaming = false;
                     self.streaming_text.clear();
-                    self.entries.push(SideChatEntry {
-                        role: SideChatRole::System,
-                        text: message,
-                        is_error: true,
-                        is_partial: false,
-                    });
+                    self.pending_user_echo = false;
+                    self.push_role(SideChatRole::System, message, true, false);
                     self.status = "Side chat error".to_owned();
                 }
             }
@@ -382,62 +635,122 @@ impl SideChatController {
         changed
     }
 
-    fn apply_agent_event(&mut self, event: AgentEvent) {
+    pub(crate) fn apply_agent_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::AgentStart => {
                 self.is_streaming = true;
                 self.streaming_text.clear();
+                self.pending_assistant_index = None;
                 self.status = "Side chat thinking…".to_owned();
             }
             AgentEvent::TurnStart => {
                 self.pending_tool_calls.clear();
                 self.finalized_tool_calls.clear();
+                self.pending_thinking_index = None;
             }
             AgentEvent::MessageUpdate {
                 assistant_message_event: AssistantMessageEvent::TextDelta { delta, .. },
                 ..
             } => {
-                self.streaming_text.push_str(&delta);
+                self.append_streaming_text(&delta);
             }
-            AgentEvent::MessageEnd { message } => match message {
-                Message::User(user) => {
-                    let text = content_text(&user.content);
-                    if !self.entries.last().is_some_and(|entry| {
-                        entry.role == SideChatRole::User && entry.text == text
-                    }) {
-                        self.entries.push(SideChatEntry {
-                            role: SideChatRole::User,
-                            text,
-                            is_error: false,
-                            is_partial: false,
-                        });
-                    }
+            AgentEvent::MessageUpdate {
+                assistant_message_event: AssistantMessageEvent::ThinkingStart { .. },
+                ..
+            } => {
+                if self.pending_thinking_index.is_some() {
+                    return;
                 }
-                Message::Assistant(assistant) => {
-                    let text = content_text(&assistant.content);
-                    self.streaming_text.clear();
-                    if !text.is_empty() {
-                        self.entries.push(SideChatEntry {
-                            role: SideChatRole::Assistant,
-                            text,
-                            is_error: false,
-                            is_partial: false,
-                        });
-                    }
+                let id = self.alloc_entry_id();
+                let index = self.push_entry(SideChatEntry {
+                    id,
+                    kind: SideChatEntryKind::Thinking,
+                    role: SideChatRole::Assistant,
+                    text: String::new(),
+                    thinking: Some(String::new()),
+                    is_partial: true,
+                    ..SideChatEntry::default()
+                });
+                self.pending_thinking_index = Some(index);
+            }
+            AgentEvent::MessageUpdate {
+                assistant_message_event: AssistantMessageEvent::ThinkingDelta { delta, .. },
+                ..
+            } => {
+                if self.pending_thinking_index.is_none() {
+                    let id = self.alloc_entry_id();
+                    let index = self.push_entry(SideChatEntry {
+                        id,
+                        kind: SideChatEntryKind::Thinking,
+                        role: SideChatRole::Assistant,
+                        text: String::new(),
+                        thinking: Some(String::new()),
+                        is_partial: true,
+                        ..SideChatEntry::default()
+                    });
+                    self.pending_thinking_index = Some(index);
                 }
-                Message::ToolResult(result) => {
-                    if !self.finalized_tool_calls.remove(&result.tool_call_id) {
-                        let text = content_text(&result.content);
-                        self.entries.push(SideChatEntry {
-                            role: SideChatRole::Tool,
-                            text: format!("[{}] {text}", result.tool_name),
-                            is_error: result.is_error,
-                            is_partial: false,
-                        });
-                    }
+                if let Some(index) = self.pending_thinking_index
+                    && let Some(entry) = self.entries.get_mut(index)
+                {
+                    entry.thinking.get_or_insert_with(String::new).push_str(&delta);
+                    entry.text = entry.thinking.clone().unwrap_or_default();
                 }
-                _ => {}
-            },
+            }
+            AgentEvent::MessageUpdate {
+                assistant_message_event: AssistantMessageEvent::ThinkingEnd { content, .. },
+                ..
+            } => {
+                self.finalize_thinking_entry(content);
+            }
+            AgentEvent::MessageEnd { message } => {
+                match message {
+                    Message::User(user) => {
+                        if !std::mem::take(&mut self.pending_user_echo) {
+                            let text = content_text(&user.content);
+                            self.push_role(SideChatRole::User, text, false, false);
+                        }
+                    }
+                    Message::Assistant(assistant) => {
+                        let thinking = content_thinking(&assistant.content);
+                        self.finalize_thinking_entry(thinking);
+                        self.pending_thinking_index = None;
+                        let text = content_text(&assistant.content);
+                        let streamed = if text.is_empty() {
+                            std::mem::take(&mut self.streaming_text)
+                        } else {
+                            self.streaming_text.clear();
+                            text
+                        };
+                        if streamed.is_empty() {
+                            if let Some(index) = self.pending_assistant_index.take()
+                                && let Some(entry) = self.entries.get_mut(index)
+                            {
+                                entry.is_partial = false;
+                            }
+                        } else {
+                            self.settle_streaming_assistant(streamed, false);
+                        }
+                    }
+                    Message::ToolResult(result) => {
+                        if !self.finalized_tool_calls.remove(&result.tool_call_id) {
+                            let output = content_text(&result.content);
+                            let id = self.alloc_entry_id();
+                            self.push_entry(SideChatEntry {
+                                id,
+                                kind: SideChatEntryKind::Tool,
+                                role: SideChatRole::Tool,
+                                text: format!("[{}] {output}", result.tool_name),
+                                tool_name: Some(result.tool_name),
+                                output: Some(output),
+                                is_error: result.is_error,
+                                ..SideChatEntry::default()
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
             AgentEvent::ToolExecutionStart {
                 tool_call_id,
                 tool_name,
@@ -445,29 +758,33 @@ impl SideChatController {
             } => {
                 if self.tool_mode.is_edit() && !self.warned_first_mutation {
                     let capability = self
-                        .main_application
+                        .side_application
                         .get_tool_definition(&tool_name)
                         .map(|tool| tool.capability)
                         .unwrap_or(ToolCapability::Read);
                     if matches!(capability, ToolCapability::Write | ToolCapability::Exec) {
                         self.warned_first_mutation = true;
-                        self.entries.push(SideChatEntry {
-                            role: SideChatRole::System,
-                            text: "⚠ Edit mode: Write/Exec tools can conflict with the main agent. Coordinate file changes carefully.".to_owned(),
-                            is_error: true,
-                            is_partial: false,
-                        });
+                        self.push_role(
+                            SideChatRole::System,
+                            "⚠ Edit mode: Write/Exec tools can conflict with the main agent. Coordinate file changes carefully.".to_owned(),
+                            true,
+                            false,
+                        );
                     }
                 }
                 let summary = tool_start_summary(&tool_name, &arguments);
-                self.entries.push(SideChatEntry {
+                let id = self.alloc_entry_id();
+                let index = self.push_entry(SideChatEntry {
+                    id,
+                    kind: SideChatEntryKind::Tool,
                     role: SideChatRole::Tool,
                     text: summary,
-                    is_error: false,
+                    tool_name: Some(tool_name),
+                    tool_args: Some(arguments),
                     is_partial: true,
+                    ..SideChatEntry::default()
                 });
-                self.pending_tool_calls
-                    .insert(tool_call_id, self.entries.len() - 1);
+                self.pending_tool_calls.insert(tool_call_id, index);
             }
             AgentEvent::ToolExecutionUpdate {
                 tool_call_id,
@@ -480,7 +797,12 @@ impl SideChatController {
                     && entry.role == SideChatRole::Tool
                     && entry.is_partial
                 {
-                    entry.text = format!("[{tool_name}] {}", content_text(&partial_result.content));
+                    let output = content_text(&partial_result.content);
+                    entry.text = format!("[{tool_name}] {output}");
+                    entry.output = Some(output);
+                    if entry.tool_name.is_none() {
+                        entry.tool_name = Some(tool_name);
+                    }
                 }
             }
             AgentEvent::ToolExecutionEnd {
@@ -489,7 +811,7 @@ impl SideChatController {
                 result,
                 is_error,
             } => {
-                let text = content_text(&result.content);
+                let output = content_text(&result.content);
                 let finalized_in_place = self
                     .pending_tool_calls
                     .remove(&tool_call_id)
@@ -498,31 +820,43 @@ impl SideChatController {
                         if entry.role != SideChatRole::Tool || !entry.is_partial {
                             return false;
                         }
-                        entry.text = format!("[{tool_name}] {text}");
+                        entry.text = format!("[{tool_name}] {output}");
+                        entry.tool_name = Some(tool_name.clone());
+                        entry.output = Some(output.clone());
                         entry.is_error = is_error;
                         entry.is_partial = false;
                         true
                     });
                 if !finalized_in_place {
-                    self.entries.push(SideChatEntry {
+                    let id = self.alloc_entry_id();
+                    self.push_entry(SideChatEntry {
+                        id,
+                        kind: SideChatEntryKind::Tool,
                         role: SideChatRole::Tool,
-                        text: format!("[{tool_name}] {text}"),
+                        text: format!("[{tool_name}] {output}"),
+                        tool_name: Some(tool_name),
+                        output: Some(output),
                         is_error,
-                        is_partial: false,
+                        ..SideChatEntry::default()
                     });
                 }
                 self.finalized_tool_calls.insert(tool_call_id);
             }
             AgentEvent::AgentEnd { .. } => {
                 self.is_streaming = false;
+                self.pending_user_echo = false;
                 if !self.streaming_text.is_empty() {
                     let text = std::mem::take(&mut self.streaming_text);
-                    self.entries.push(SideChatEntry {
-                        role: SideChatRole::Assistant,
-                        text,
-                        is_error: false,
-                        is_partial: false,
-                    });
+                    self.settle_streaming_assistant(text, false);
+                } else if let Some(index) = self.pending_assistant_index.take()
+                    && let Some(entry) = self.entries.get_mut(index)
+                {
+                    entry.is_partial = false;
+                }
+                if let Some(index) = self.pending_thinking_index.take()
+                    && let Some(entry) = self.entries.get_mut(index)
+                {
+                    entry.is_partial = false;
                 }
                 self.pending_tool_calls.clear();
                 self.finalized_tool_calls.clear();
@@ -555,27 +889,59 @@ impl SideChatController {
     }
 
     /// Submit a side-chat prompt. Never writes to main session/transcript.
-    pub fn submit_prompt(&mut self, prompt: impl Into<String>) {
+    ///
+    /// The transcript row and the model prompt are the same text. Callers
+    /// that show different text use [`Self::submit_displayed_prompt`].
+    pub fn submit_prompt(&mut self, prompt: impl Into<String>, images: Vec<ContentBlock>) {
+        self.submit_displayed_prompt(prompt, images, None);
+    }
+
+    /// Submit one prompt. `display` is the transcript row; `None` shows the
+    /// model text. The model prompt is captured before the row is published
+    /// and is never rewritten afterward.
+    pub fn submit_displayed_prompt(
+        &mut self,
+        prompt: impl Into<String>,
+        images: Vec<ContentBlock>,
+        display: Option<&str>,
+    ) {
         let prompt = prompt.into();
         let trimmed = prompt.trim();
-        if trimmed.is_empty() || self.is_streaming {
+        let images: Vec<ContentBlock> = images
+            .into_iter()
+            .filter(|block| matches!(block, ContentBlock::Image { .. }))
+            .collect();
+        if (trimmed.is_empty() && images.is_empty()) || self.is_streaming {
             return;
         }
-        self.entries.push(SideChatEntry {
-            role: SideChatRole::User,
-            text: trimmed.to_owned(),
-            is_error: false,
-            is_partial: false,
-        });
+        let shown = display.unwrap_or(trimmed);
+        self.push_role(SideChatRole::User, shown.to_owned(), false, false);
         self.clear_editor();
         self.is_streaming = true;
+        self.pending_user_echo = true;
         self.streaming_text.clear();
+        self.pending_assistant_index = None;
         self.status = "Side chat thinking…".to_owned();
         let agent = self.agent.clone();
         let tx = self.event_tx.clone();
         let prompt = trimmed.to_owned();
         self.prompt_task = Some(tokio::spawn(async move {
-            if let Err(error) = agent.prompt(prompt).await {
+            let result = if images.is_empty() {
+                agent.prompt(prompt).await
+            } else {
+                let mut content = Vec::new();
+                if !prompt.is_empty() {
+                    content.push(ContentBlock::text(prompt));
+                }
+                content.extend(images);
+                agent
+                    .prompt_messages(vec![Message::User(pi_ai::UserMessage {
+                        content,
+                        timestamp: pi_ai::now_millis(),
+                    })])
+                    .await
+            };
+            if let Err(error) = result {
                 let _ = tx.send(SideChatInternalEvent::PromptFailed(format!(
                     "Side chat failed: {error:#}"
                 )));
@@ -597,11 +963,12 @@ impl SideChatController {
         };
         let tools = Self::build_tools(
             &self.main_application,
+            &self.side_application,
             &self.fork,
             next,
             self.file_tracker.clone(),
         )?;
-        self.agent.set_tools(tools).await;
+        install_side_tools(&self.agent, &self.side_prompt_base, tools).await;
         self.tool_mode = next;
         self.show_edit_warning = next.is_edit();
         self.warned_first_mutation = false;
@@ -630,12 +997,7 @@ impl SideChatController {
         } else {
             "Read-only mode restored. Write/Exec tools disabled.".to_owned()
         };
-        self.entries.push(SideChatEntry {
-            role: SideChatRole::System,
-            text: warning,
-            is_error: next.is_edit(),
-            is_partial: false,
-        });
+        self.push_role(SideChatRole::System, warning, next.is_edit(), false);
         Ok(())
     }
 
@@ -666,15 +1028,13 @@ impl SideChatController {
             }
         }
         self.is_streaming = false;
+        self.pending_user_echo = false;
         if was_streaming {
             if !self.streaming_text.is_empty() {
                 let text = std::mem::take(&mut self.streaming_text);
-                self.entries.push(SideChatEntry {
-                    role: SideChatRole::Assistant,
-                    text,
-                    is_error: false,
-                    is_partial: true,
-                });
+                self.settle_streaming_assistant(text, true);
+            } else {
+                self.pending_assistant_index = None;
             }
             self.status = "Side chat aborted".to_owned();
         }
@@ -685,19 +1045,33 @@ impl SideChatController {
         self.abort_streaming().await;
         self._subscription = None;
         while self.event_rx.try_recv().is_ok() {}
+        self.side_application.cleanup().await;
+        let _ = std::fs::remove_dir_all(&self.side_session_dir);
     }
 
     /// Refork from the current main leaf, discarding side transcript.
     pub async fn refork_from_main(&mut self) -> Result<()> {
         self.abort_streaming().await;
         let fork = self.main_application.fork_side_chat().await?;
-        let tools = Self::build_tools(
+        let (side_application, side_session_dir) =
+            Self::build_isolated_application(&self.main_application, &fork).await?;
+        let tools = match Self::build_tools(
             &self.main_application,
+            &side_application,
             &fork,
             self.tool_mode,
             self.file_tracker.clone(),
-        )?;
-        let agent = Application::create_side_chat_agent(&fork, tools);
+        ) {
+            Ok(tools) => tools,
+            Err(error) => {
+                side_application.cleanup().await;
+                let _ = std::fs::remove_dir_all(&side_session_dir);
+                return Err(error);
+            }
+        };
+        let agent = Application::create_side_chat_agent(&fork, Vec::new());
+        let side_prompt_base = agent.state().await.system_prompt;
+        install_side_tools(&agent, &side_prompt_base, tools).await;
         let subscription_tx = self.event_tx.clone();
         let subscription = agent
             .subscribe_simple(move |event| {
@@ -709,17 +1083,27 @@ impl SideChatController {
             })
             .await;
         self.agent = agent;
+        let previous_side_application =
+            std::mem::replace(&mut self.side_application, side_application);
         self.fork = fork;
+        self.side_prompt_base = side_prompt_base;
         self.entries.clear();
         self.streaming_text.clear();
         self.is_streaming = false;
+        let previous_side_session_dir =
+            std::mem::replace(&mut self.side_session_dir, side_session_dir);
         self.pending_tool_calls.clear();
         self.finalized_tool_calls.clear();
+        self.pending_thinking_index = None;
+        self.pending_assistant_index = None;
+        self.pending_user_echo = false;
         self._subscription = Some(subscription);
+        previous_side_application.cleanup().await;
         self.status = format!(
             "Side chat reforked · {} tools · Esc close",
             self.tool_mode.label()
         );
+        let _ = std::fs::remove_dir_all(previous_side_session_dir);
         Ok(())
     }
 
@@ -732,6 +1116,9 @@ impl SideChatController {
         self.streaming_text.clear();
         self.pending_tool_calls.clear();
         self.finalized_tool_calls.clear();
+        self.pending_thinking_index = None;
+        self.pending_assistant_index = None;
+        self.pending_user_echo = false;
         self.status = "Side chat cleared".to_owned();
         Ok(())
     }
@@ -754,7 +1141,7 @@ impl SideChatController {
                 ) =>
             {
                 let text = self.editor_text();
-                self.submit_prompt(text);
+                self.submit_prompt(text, Vec::new());
                 SideChatAction::Handled
             }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -816,8 +1203,12 @@ impl SideChatController {
                 }
                 SideChatAction::Handled
             }
-            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::ALT) => SideChatAction::Handled,
-            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::ALT) => SideChatAction::Handled,
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::ALT) => {
+                SideChatAction::Handled
+            }
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::ALT) => {
+                SideChatAction::Handled
+            }
             KeyCode::Char(character)
                 if !key
                     .modifiers
@@ -988,6 +1379,18 @@ impl SideChatController {
         self.agent.state().await.messages
     }
 
+    #[cfg(test)]
+    pub(crate) async fn wait_for_prompt_idle(&mut self) -> Result<()> {
+        let Some(task) = self.prompt_task.take() else {
+            return Err(anyhow!("side-chat prompt task was not submitted"));
+        };
+        task.await.map_err(|error| {
+            anyhow!("side-chat prompt task failed to complete: {error}")
+        })
+    }
+
+
+
     pub fn peek_main(&self, since_fork: bool) -> Result<SideChatMainPeek> {
         if since_fork {
             if let Some(leaf_id) = self.fork.leaf_id.as_deref() {
@@ -1127,7 +1530,9 @@ impl SideChatTabs {
     /// every parallel session, including tabs that are streaming in the
     /// background after a switch.
     pub fn tabs(&self) -> impl Iterator<Item = (&str, &SideChatController)> {
-        self.tabs.iter().map(|tab| (tab.name.as_str(), &tab.controller))
+        self.tabs
+            .iter()
+            .map(|tab| (tab.name.as_str(), &tab.controller))
     }
 
     /// True when a tab with this name exists.
@@ -1145,9 +1550,7 @@ impl SideChatTabs {
             return Err(anyhow!("a side tab named {name:?} is already open"));
         }
         if self.tabs.len() >= MAX_SIDE_CHAT_TABS {
-            return Err(anyhow!(
-                "maximum of {MAX_SIDE_CHAT_TABS} side tabs reached"
-            ));
+            return Err(anyhow!("maximum of {MAX_SIDE_CHAT_TABS} side tabs reached"));
         }
         let controller = SideChatController::fork_from(application).await?;
         self.tabs.push(SideChatTab {
@@ -1237,12 +1640,52 @@ impl DerefMut for SideChatTabs {
         &mut self.tabs[self.active].controller
     }
 }
+async fn install_side_tools(agent: &Agent, base: &str, tools: Vec<AgentTool>) {
+    let prompt = format!("{base}{}", side_tool_contract(&tools));
+    agent.set_tools_and_system_prompt(tools, prompt).await;
+}
+
+fn side_tool_contract(tools: &[AgentTool]) -> String {
+    let names = tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let shell_available = tools.iter().any(|tool| tool.name == "bash");
+    let shell = if shell_available {
+        "A shell tool is installed; call only a shell name present in this list."
+    } else {
+        "No shell tool is installed. Never call bash or any other shell name."
+    };
+    format!(
+        "\n\n{SIDE_TOOL_CONTRACT_HEADER}\nAvailable tools: {names}. \
+Use only these tools. Inherited tool inventories, examples, and shell guidance do not grant tools that are absent from this list. \
+{shell} \
+Investigate files with the available read and search tools. \
+If none of them can perform the requested operation, report that limitation instead of attempting an absent tool."
+    )
+}
+
+const SIDE_TOOL_CONTRACT_HEADER: &str = "# Side chat tools";
+
+
 
 fn content_text(content: &[ContentBlock]) -> String {
     content
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn content_thinking(content: &[ContentBlock]) -> String {
+    content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -1337,43 +1780,158 @@ fn wrap_mutation_tools_with_warning(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi_agent::AgentToolResult;
-    use pi_ai::{Model, ToolResultMessage};
+    use pi_agent::{AgentToolResult, ToolCallContext};
+    use pi_ai::providers::{
+        FauxProviderOptions, FauxProviderRegistration, FauxResponse, register_faux_provider,
+    };
+    use pi_ai::{ContentBlock, Model, ToolResultMessage};
 
-    fn test_session(cwd: &Path) -> pi_coding::Session {
-        pi_coding::Session::new(pi_coding::SessionOptions {
-            model: Model::default(),
-            cwd: cwd.to_path_buf(),
-            system_prompt: "main system".to_owned(),
-            thinking_level: ThinkingLevel::Off,
-            api_key: "test-key".to_owned(),
-            compaction: None,
-            stream_options: Default::default(),
-            tools: Some(create_all_tools(&cwd.to_string_lossy())),
-            before_tool_call: None,
-            after_tool_call: None,
-            stream_fn: None,
-            auth_resolver: None,
-        })
-        .expect("session")
+    struct SideChatTestApplication {
+        application: Application,
+        _cwd: Option<tempfile::TempDir>,
+        _agent: tempfile::TempDir,
+        _session: tempfile::TempDir,
+        _resources: pi_coding::ResourceManager,
+        faux: FauxProviderRegistration,
+    }
+
+    impl Deref for SideChatTestApplication {
+        type Target = Application;
+
+        fn deref(&self) -> &Self::Target {
+            &self.application
+        }
+    }
+    impl SideChatTestApplication {
+        async fn load_history(&self, messages: Vec<Message>) -> anyhow::Result<()> {
+            self.application.session().load_history(messages).await
+        }
+    }
+
+    async fn test_application(cwd: &Path) -> SideChatTestApplication {
+        test_application_with_roots(cwd, Vec::<PathBuf>::new()).await
+    }
+
+    async fn test_application_with_roots(
+        cwd: &Path,
+        additional: Vec<PathBuf>,
+    ) -> SideChatTestApplication {
+        test_application_with(cwd, additional, false).await
+    }
+
+    /// Parent `stream_fn` is the registered faux provider, so a queued response
+    /// completes a real `submit_displayed_prompt` turn.
+    async fn test_application_live_faux(cwd: &Path) -> SideChatTestApplication {
+        test_application_with(cwd, Vec::new(), true).await
+    }
+
+    async fn test_application_with(
+        cwd: &Path,
+        additional: Vec<PathBuf>,
+        live_faux: bool,
+    ) -> SideChatTestApplication {
+        let suffix = uuid::Uuid::now_v7().simple().to_string();
+        let model = Model {
+            id: format!("side-chat-{suffix}"),
+            name: "Side chat fixture".to_owned(),
+            api: format!("side-chat-api-{suffix}"),
+            provider: format!("side-chat-provider-{suffix}"),
+            base_url: "http://localhost:0".to_owned(),
+            ..Model::default()
+        };
+        let faux = register_faux_provider(FauxProviderOptions {
+            api: model.api.clone(),
+            provider: model.provider.clone(),
+            models: vec![model.clone()],
+            chunk_size: 4,
+        });
+        let stream_fn: pi_agent::StreamFn = if live_faux {
+            pi_ai::get_api_provider(&model.api)
+                .expect("registered side-chat faux provider")
+                .stream_simple
+        } else {
+            Arc::new(|_, _, _| {
+                Box::pin(async { pi_ai::new_assistant_message_event_stream() })
+            })
+        };
+        let workspace = pi_coding::WorkspaceRoots::new(cwd, additional).expect("workspace");
+        let session =
+            pi_coding::Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
+                pi_coding::SessionOptions {
+                    model,
+                    cwd: cwd.to_path_buf(),
+                    system_prompt: "main system\nUse bash for file operations like ls, rg, find."
+                        .to_owned(),
+                    thinking_level: ThinkingLevel::Off,
+                    api_key: "faux".to_owned(),
+                    compaction: None,
+                    stream_options: Default::default(),
+                    tools: Some(Vec::new()),
+                    before_tool_call: None,
+                    after_tool_call: None,
+                    stream_fn: Some(stream_fn),
+                    auth_resolver: None,
+                    auth_manager: None,
+                },
+                Vec::new(),
+                Default::default(),
+                pi_coding::ResourceDiscovery::Disabled,
+                workspace,
+                None,
+            )
+            .expect("session");
+        let agent = tempfile::tempdir().expect("agent dir");
+        std::fs::write(
+            agent.path().join("settings.json"),
+            r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+        )
+        .expect("sandbox settings");
+        let session_dir = tempfile::tempdir().expect("session dir");
+        session.set_session_dir(session_dir.path().to_path_buf());
+        let mut options = pi_coding::ResourceManagerOptions::new(cwd);
+        options.agent_dir = agent.path().to_path_buf();
+        options.project_trust_override = Some(true);
+        options.disable_extensions = true;
+        options.disable_skills = true;
+        options.disable_prompt_templates = true;
+        options.disable_themes = true;
+        options.disable_context_files = true;
+        let resources = pi_coding::ResourceManager::new(options).expect("resources");
+        session
+            .attach_resources(resources.clone())
+            .await
+            .expect("attach resources");
+        let application = Application::from_runtime_candidate(
+            pi_coding::ApplicationRuntimeCandidate::new(session),
+        )
+        .await
+        .expect("publish application");
+        SideChatTestApplication {
+            _cwd: None,
+            application,
+            _agent: agent,
+            _session: session_dir,
+            _resources: resources,
+            faux,
+        }
     }
 
     #[tokio::test]
     async fn fork_does_not_mutate_main() {
         let cwd = tempfile::tempdir().expect("cwd");
-        let session = test_session(cwd.path());
+        let session = test_application(cwd.path()).await;
         session
             .load_history(vec![Message::user_text("main hello", 1)])
             .await
             .expect("history");
-        let application = Application::new(session).await;
+        let application = session;
         let before_state = application.state().await;
         let before_messages = application.messages();
 
         let mut side = SideChatController::fork_from(&application)
             .await
             .expect("fork");
-        side.submit_prompt("side only");
+        side.submit_prompt("side only", Vec::new());
         let after_state = application.state().await;
         assert_eq!(after_state.session_id, before_state.session_id);
         assert_eq!(after_state.session_file, before_state.session_file);
@@ -1387,16 +1945,16 @@ mod tests {
     #[tokio::test]
     async fn independent_transcripts_and_events() {
         let cwd = tempfile::tempdir().expect("cwd");
-        let session = test_session(cwd.path());
+        let session = test_application(cwd.path()).await;
         session
             .load_history(vec![Message::user_text("shared", 1)])
             .await
             .expect("history");
-        let application = Application::new(session).await;
+        let application = session;
         let mut side = SideChatController::fork_from(&application)
             .await
             .expect("fork");
-        side.submit_prompt("side turn");
+        side.submit_prompt("side turn", Vec::new());
         assert!(
             application.messages().iter().all(|message| match message {
                 Message::User(user) => content_text(&user.content) != "side turn",
@@ -1415,23 +1973,190 @@ mod tests {
     #[tokio::test]
     async fn reopen_persistence_keeps_controller_state() {
         let cwd = tempfile::tempdir().expect("cwd");
-        let session = test_session(cwd.path());
-        let application = Application::new(session).await;
+        let session = test_application(cwd.path()).await;
+        let application = session;
         let mut side = SideChatController::fork_from(&application)
             .await
             .expect("fork");
-        side.submit_prompt("remember me");
+        side.submit_prompt("remember me", Vec::new());
         let entries_before = side.entries().len();
         assert_eq!(side.entries().len(), entries_before);
         assert_eq!(side.entries()[0].text, "remember me");
         side.shutdown().await;
     }
 
+    /// Native Ask wire for one turn whose display text and model prompt differ.
+    ///
+    /// The fixture is the captured snapshot (`src/lib.rs` lines 1-1): the
+    /// transcript keeps the typed question and the assistant reply, and does
+    /// not display the composed model prompt. The agent still receives that
+    /// prompt. Identity is the submitted display versus `MessageEnd::User`,
+    /// not a `FILE CONTEXT` parse.
+    #[tokio::test]
+    async fn submit_displayed_prompt_with_distinct_model_text_shows_one_user_and_assistant() {
+        const DISPLAY: &str = "Explain this selected line";
+        const MODEL: &str = "Explain this selected line\n\n--- FILE CONTEXT: src/lib.rs \u{00b7} lines 1-1 ---\npub fn answer() -> u32 {\n--- END FILE CONTEXT ---";
+        const ASSISTANT: &str = "The selected file context is src/lib.rs \u{00b7} lines 1-1.";
+
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = test_application_live_faux(cwd.path()).await;
+        session
+            .faux
+            .set_responses(vec![FauxResponse::text(ASSISTANT)]);
+        let mut side = SideChatController::fork_from(&session)
+            .await
+            .expect("fork");
+        side.submit_displayed_prompt(MODEL, Vec::new(), Some(DISPLAY));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            side.wait_for_prompt_idle(),
+        )
+        .await
+        .expect("displayed prompt timed out")
+        .expect("displayed prompt");
+        side.poll_events();
+
+        let wires: Vec<Value> = side
+            .entries()
+            .iter()
+            .map(SideChatEntry::to_wire_json)
+            .collect();
+        let without_ids: Vec<Value> = wires
+            .iter()
+            .map(|wire| {
+                let mut wire = wire.clone();
+                wire.as_object_mut()
+                    .expect("wire object")
+                    .remove("id");
+                wire
+            })
+            .collect();
+        assert_eq!(
+            without_ids,
+            vec![
+                json!({
+                    "kind": "user",
+                    "role": "user",
+                    "text": DISPLAY,
+                    "toolName": null,
+                    "toolArgs": null,
+                    "output": null,
+                    "thinking": null,
+                    "isError": false,
+                    "isPartial": false,
+                }),
+                json!({
+                    "kind": "assistant",
+                    "role": "assistant",
+                    "text": ASSISTANT,
+                    "toolName": null,
+                    "toolArgs": null,
+                    "output": null,
+                    "thinking": null,
+                    "isError": false,
+                    "isPartial": false,
+                }),
+            ],
+            "one display user row and the assistant; model context must not be a wire row: {wires:?}"
+        );
+        assert!(
+            wires.iter().all(|wire| {
+                wire["id"]
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty())
+            }),
+            "wire ids must stay populated: {wires:?}"
+        );
+        assert_ne!(wires[0]["id"], wires[1]["id"]);
+
+        let captured = side.agent_messages().await;
+        let model_text = captured
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                Message::User(user) => Some(content_text(&user.content)),
+                _ => None,
+            })
+            .expect("model user message");
+        assert_eq!(
+            model_text, MODEL,
+            "the agent must still receive the composed prompt"
+        );
+        side.shutdown().await;
+    }
+
+    fn user_event(text: &str) -> AgentEvent {
+        AgentEvent::MessageEnd {
+            message: Message::user_text(text, 1),
+        }
+    }
+
+    fn user_texts(side: &SideChatController) -> Vec<&str> {
+        side.entries()
+            .iter()
+            .filter(|entry| entry.role == SideChatRole::User)
+            .map(|entry| entry.text.as_str())
+            .collect()
+    }
+
+    /// The pending flag consumes exactly one user echo. A later user event
+    /// with the same text is a real row, not another echo of the display.
+    #[tokio::test]
+    async fn later_identical_user_message_is_not_dropped() {
+        let (_cwd, mut side) = fresh_side().await;
+        side.submit_displayed_prompt("composed model prompt", Vec::new(), Some("same line"));
+        side.apply_agent_event(AgentEvent::AgentStart);
+        side.apply_agent_event(AgentEvent::TurnStart);
+        side.apply_agent_event(user_event("composed model prompt"));
+        assert_eq!(user_texts(&side), vec!["same line"]);
+
+        side.apply_agent_event(user_event("same line"));
+        assert_eq!(
+            user_texts(&side),
+            vec!["same line", "same line"],
+            "a user event after the pending echo is consumed must stay"
+        );
+        side.shutdown().await;
+    }
+
+    /// Each terminal event the controller applies retires the pending echo,
+    /// so a following user event with the same text is kept. Seed controller
+    /// state directly: submitting to `fresh_side` starts a non-terminating
+    /// stream, and synthetic terminal events do not finish that prompt task.
+    #[tokio::test]
+    async fn terminal_events_clear_pending_user_echo() {
+        let (_cwd, mut side) = fresh_side().await;
+        side.push_role(SideChatRole::User, "shown".to_owned(), false, false);
+        side.is_streaming = true;
+        side.pending_user_echo = true;
+        side.apply_agent_event(AgentEvent::AgentEnd { messages: Vec::new() });
+        assert!(!side.pending_user_echo);
+        assert!(!side.is_streaming);
+        side.apply_agent_event(user_event("shown"));
+        assert_eq!(user_texts(&side), vec!["shown", "shown"]);
+
+        side.push_role(SideChatRole::User, "again".to_owned(), false, false);
+        side.is_streaming = true;
+        side.pending_user_echo = true;
+        side.event_tx
+            .send(SideChatInternalEvent::PromptFailed(
+                "Side chat failed: boom".to_owned(),
+            ))
+            .expect("queue prompt failure");
+        assert!(side.poll_events());
+        assert!(!side.pending_user_echo);
+        assert!(!side.is_streaming);
+        side.apply_agent_event(user_event("again"));
+        assert_eq!(user_texts(&side), vec!["shown", "shown", "again", "again"]);
+        assert!(side.prompt_task.is_none());
+        side.shutdown().await;
+    }
+
     #[tokio::test]
     async fn read_only_default_lacks_write_exec() {
         let cwd = tempfile::tempdir().expect("cwd");
-        let session = test_session(cwd.path());
-        let application = Application::new(session).await;
+        let session = test_application(cwd.path()).await;
+        let application = session;
         let side = SideChatController::fork_from(&application)
             .await
             .expect("fork");
@@ -1441,14 +2166,126 @@ mod tests {
             "default tools must be Read-only by capability: {caps:?}"
         );
         assert!(caps.iter().any(|(name, _)| name == "peek_main"));
-        assert!(!caps.iter().any(|(name, _)| name == "write" || name == "bash"));
+        assert!(
+            !caps
+                .iter()
+                .any(|(name, _)| name == "write" || name == "bash")
+        );
     }
+
+    fn tool_context(arguments: Value) -> ToolCallContext {
+        let (controller, abort) = pi_agent::AbortController::new();
+        std::mem::forget(controller);
+        ToolCallContext {
+            tool_call_id: "boundary".to_owned(),
+            arguments,
+            on_update: Arc::new(|_: AgentToolResult| {}),
+            abort,
+            model: None,
+            approval_token: None,
+        }
+    }
+
+    fn tool_text(result: &AgentToolResult) -> String {
+        match result.content.first() {
+            Some(ContentBlock::Text { text, .. }) => text.clone(),
+            _ => String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn additional_authorized_root_is_readable_and_exec_stays_absent() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let authorized = tempfile::tempdir().expect("authorized root");
+        let outside = tempfile::tempdir().expect("outside root");
+        let sentinel = "side-chat-authorized-sentinel-7f3a";
+        std::fs::write(authorized.path().join("only-here.txt"), format!("{sentinel}\n"))
+            .expect("authorized sentinel");
+        std::fs::write(outside.path().join("secret.txt"), "outside-sentinel\n").expect("outside");
+        let session = test_application_with_roots(
+            cwd.path(),
+            vec![authorized.path().to_path_buf()],
+        )
+        .await;
+        let side = SideChatController::fork_from(&session)
+            .await
+            .expect("fork");
+        let child_roots = side
+            .side_application
+            .session()
+            .workspace_roots()
+            .roots()
+            .to_vec();
+        let parent_roots = session.session().workspace_roots().roots().to_vec();
+        assert_eq!(child_roots, parent_roots);
+        assert!(
+            child_roots.iter().any(|root| root == authorized.path()),
+            "child must retain the authorized additional root: {child_roots:?}"
+        );
+
+        let tools = side.agent.state().await.tools;
+        assert!(tools.iter().all(|tool| tool.capability == ToolCapability::Read));
+        assert!(tools.iter().any(|tool| tool.name == "grep"));
+        assert!(tools.iter().any(|tool| tool.name == "read"));
+        assert!(!tools.iter().any(|tool| {
+            tool.name == "bash"
+                || matches!(tool.capability, ToolCapability::Write | ToolCapability::Exec)
+        }));
+        let prompt = side.agent.state().await.system_prompt;
+        assert!(
+            prompt.contains("Use bash for file operations"),
+            "inherited shell guidance must remain so the contract has something to override: {prompt}"
+        );
+        let contract = prompt
+            .rsplit_once(SIDE_TOOL_CONTRACT_HEADER)
+            .map(|(_, section)| section)
+            .expect("final tool contract");
+        assert!(contract.contains("grep") && contract.contains("read"), "{contract}");
+        assert!(
+            contract.contains("Never call bash") && contract.contains("No shell tool is installed"),
+            "{contract}"
+        );
+        let inventory = contract
+            .split("Available tools:")
+            .nth(1)
+            .and_then(|section| section.split('.').next())
+            .unwrap_or("");
+        assert!(
+            !inventory.split(',').any(|name| name.trim() == "bash"),
+            "contract inventory must not advertise bash: {inventory}"
+        );
+
+        let grep = tools.iter().find(|tool| tool.name == "grep").expect("grep");
+        let found = (grep.execute)(tool_context(json!({
+            "pattern": sentinel,
+            "path": authorized.path(),
+        })))
+        .await
+        .expect("authorized grep");
+        let found_text = tool_text(&found);
+        assert!(
+            found_text.contains(sentinel),
+            "grep must read the additional authorized root, got: {found_text}"
+        );
+        let denied = (grep.execute)(tool_context(json!({
+            "pattern": "outside-sentinel",
+            "path": outside.path(),
+        })))
+        .await
+        .expect_err("outside root must stay denied")
+        .to_string();
+        assert!(
+            denied.starts_with("path_outside_workspace:"),
+            "{denied}"
+        );
+    }
+
 
     #[tokio::test]
     async fn mode_toggle_shows_warning_and_restores_readonly() {
         let cwd = tempfile::tempdir().expect("cwd");
-        let session = test_session(cwd.path());
-        let application = Application::new(session).await;
+        let session = test_application(cwd.path()).await;
+        let application = session;
         let mut side = SideChatController::fork_from(&application)
             .await
             .expect("fork");
@@ -1457,13 +2294,11 @@ mod tests {
         assert!(side.tool_mode().is_edit());
         assert!(side.show_edit_warning());
         assert!(side.status().to_ascii_lowercase().contains("edit"));
-        assert!(
-            side.entries().iter().any(|entry| {
-                entry.text.contains("Edit mode")
-                    || entry.text.contains("overlap")
-                    || entry.text.contains("Write/Exec")
-            })
-        );
+        assert!(side.entries().iter().any(|entry| {
+            entry.text.contains("Edit mode")
+                || entry.text.contains("overlap")
+                || entry.text.contains("Write/Exec")
+        }));
         let caps = side.tool_capabilities().await;
         assert!(
             caps.iter()
@@ -1481,7 +2316,7 @@ mod tests {
     #[tokio::test]
     async fn peek_main_returns_main_history_read_only() {
         let cwd = tempfile::tempdir().expect("cwd");
-        let session = test_session(cwd.path());
+        let session = test_application(cwd.path()).await;
         session
             .load_history(vec![
                 Message::user_text("alpha", 1),
@@ -1489,7 +2324,7 @@ mod tests {
             ])
             .await
             .expect("history");
-        let application = Application::new(session).await;
+        let application = session;
         let side = SideChatController::fork_from(&application)
             .await
             .expect("fork");
@@ -1502,12 +2337,12 @@ mod tests {
     #[tokio::test]
     async fn side_cleanup_on_shutdown() {
         let cwd = tempfile::tempdir().expect("cwd");
-        let session = test_session(cwd.path());
-        let application = Application::new(session).await;
+        let session = test_application(cwd.path()).await;
+        let application = session;
         let mut side = SideChatController::fork_from(&application)
             .await
             .expect("fork");
-        side.submit_prompt("running");
+        side.submit_prompt("running", Vec::new());
         side.shutdown().await;
         assert!(!side.is_streaming());
     }
@@ -1515,8 +2350,8 @@ mod tests {
     #[tokio::test]
     async fn paste_isolation_stays_in_side_editor() {
         let cwd = tempfile::tempdir().expect("cwd");
-        let session = test_session(cwd.path());
-        let application = Application::new(session).await;
+        let session = test_application(cwd.path()).await;
+        let application = session;
         let mut side = SideChatController::fork_from(&application)
             .await
             .expect("fork");
@@ -1552,8 +2387,8 @@ mod tests {
     #[tokio::test]
     async fn tabs_default_opens_legacy_single_session() {
         let cwd = tempfile::tempdir().expect("cwd");
-        let session = test_session(cwd.path());
-        let application = Application::new(session).await;
+        let session = test_application(cwd.path()).await;
+        let application = session;
         let mut tabs = SideChatTabs::new_default(&application)
             .await
             .expect("default container");
@@ -1563,7 +2398,7 @@ mod tests {
         assert!(tabs.entries().is_empty(), "fresh default tab is empty");
 
         // Legacy `/btw <prompt>` behavior: submit goes to the active tab.
-        tabs.submit_prompt("legacy prompt");
+        tabs.submit_prompt("legacy prompt", Vec::new());
         assert_eq!(tabs.entries().len(), 1);
         assert_eq!(tabs.entries()[0].role, SideChatRole::User);
         assert_eq!(tabs.entries()[0].text, "legacy prompt");
@@ -1574,14 +2409,14 @@ mod tests {
     #[tokio::test]
     async fn tabs_write_switch_round_trip_preserves_transcripts() {
         let cwd = tempfile::tempdir().expect("cwd");
-        let session = test_session(cwd.path());
-        let application = Application::new(session).await;
+        let session = test_application(cwd.path()).await;
+        let application = session;
         let mut tabs = SideChatTabs::new_default(&application)
             .await
             .expect("default container");
 
         // Write in the default tab.
-        tabs.submit_prompt("draft in default");
+        tabs.submit_prompt("draft in default", Vec::new());
         assert_eq!(tabs.active_name(), DEFAULT_SIDE_CHAT_TAB);
         let default_entries = tabs
             .entries()
@@ -1591,10 +2426,12 @@ mod tests {
         assert_eq!(default_entries, vec!["draft in default"]);
 
         // New tab is active and starts empty; write there too.
-        tabs.new_tab(&application, "alpha").await.expect("alpha tab");
+        tabs.new_tab(&application, "alpha")
+            .await
+            .expect("alpha tab");
         assert_eq!(tabs.active_name(), "alpha");
         assert!(tabs.entries().is_empty());
-        tabs.submit_prompt("draft in alpha");
+        tabs.submit_prompt("draft in alpha", Vec::new());
         let alpha_entries = tabs
             .entries()
             .iter()
@@ -1603,7 +2440,8 @@ mod tests {
         assert_eq!(alpha_entries, vec!["draft in alpha"]);
 
         // Switch back to default: its transcript is preserved in its own record.
-        tabs.switch_to(DEFAULT_SIDE_CHAT_TAB).expect("switch to default");
+        tabs.switch_to(DEFAULT_SIDE_CHAT_TAB)
+            .expect("switch to default");
         assert_eq!(tabs.active_name(), DEFAULT_SIDE_CHAT_TAB);
         let default_again = tabs
             .entries()
@@ -1632,14 +2470,15 @@ mod tests {
     #[tokio::test]
     async fn tabs_list_and_close() {
         let cwd = tempfile::tempdir().expect("cwd");
-        let session = test_session(cwd.path());
-        let application = Application::new(session).await;
+        let session = test_application(cwd.path()).await;
+        let application = session;
         let mut tabs = SideChatTabs::new_default(&application)
             .await
             .expect("default container");
         tabs.new_tab(&application, "alpha").await.expect("alpha");
         tabs.new_tab(&application, "beta").await.expect("beta");
-        tabs.switch_to(DEFAULT_SIDE_CHAT_TAB).expect("switch to default");
+        tabs.switch_to(DEFAULT_SIDE_CHAT_TAB)
+            .expect("switch to default");
 
         // list
         assert_eq!(tabs.tab_names(), vec!["default", "alpha", "beta"]);
@@ -1648,17 +2487,24 @@ mod tests {
         assert_eq!(tabs.active_name(), "default");
 
         // close an inactive tab: active stays put
-        tabs.close_tab(&application, "alpha").await.expect("close alpha");
+        tabs.close_tab(&application, "alpha")
+            .await
+            .expect("close alpha");
         assert_eq!(tabs.tab_names(), vec!["default", "beta"]);
         assert_eq!(tabs.active_name(), "default");
 
         // close the active tab: active moves to the neighbor
-        tabs.close_tab(&application, "default").await.expect("close default");
+        tabs.close_tab(&application, "default")
+            .await
+            .expect("close default");
         assert_eq!(tabs.tab_names(), vec!["beta"]);
         assert_eq!(tabs.active_name(), "beta");
 
         // close unknown: error, no mutation
-        let error = tabs.close_tab(&application, "missing").await.expect_err("unknown tab");
+        let error = tabs
+            .close_tab(&application, "missing")
+            .await
+            .expect_err("unknown tab");
         assert!(error.to_string().contains("no side tab named"));
         assert_eq!(tabs.tab_names(), vec!["beta"]);
 
@@ -1668,8 +2514,8 @@ mod tests {
     #[tokio::test]
     async fn tabs_max_bound_rejects_overflow() {
         let cwd = tempfile::tempdir().expect("cwd");
-        let session = test_session(cwd.path());
-        let application = Application::new(session).await;
+        let session = test_application(cwd.path()).await;
+        let application = session;
         let mut tabs = SideChatTabs::new_default(&application)
             .await
             .expect("default container");
@@ -1688,7 +2534,11 @@ mod tests {
             error.to_string().contains("maximum"),
             "bound error must explain the limit: {error}"
         );
-        assert_eq!(tabs.len(), MAX_SIDE_CHAT_TABS, "bound must not mutate state");
+        assert_eq!(
+            tabs.len(),
+            MAX_SIDE_CHAT_TABS,
+            "bound must not mutate state"
+        );
 
         // Duplicate names are rejected too.
         let duplicate = tabs
@@ -1702,12 +2552,12 @@ mod tests {
     #[tokio::test]
     async fn tabs_close_last_replaces_with_fresh_default() {
         let cwd = tempfile::tempdir().expect("cwd");
-        let session = test_session(cwd.path());
-        let application = Application::new(session).await;
+        let session = test_application(cwd.path()).await;
+        let application = session;
         let mut tabs = SideChatTabs::new_default(&application)
             .await
             .expect("default container");
-        tabs.submit_prompt("old default content");
+        tabs.submit_prompt("old default content", Vec::new());
         assert_eq!(tabs.entries().len(), 1);
 
         tabs.close_tab(&application, DEFAULT_SIDE_CHAT_TAB)
@@ -1753,8 +2603,8 @@ mod tests {
     #[tokio::test]
     async fn tabs_poll_events_and_observe_cover_every_tab() {
         let cwd = tempfile::tempdir().expect("cwd");
-        let session = test_session(cwd.path());
-        let application = Application::new(session).await;
+        let session = test_application(cwd.path()).await;
+        let application = session;
         let mut tabs = SideChatTabs::new_default(&application)
             .await
             .expect("default container");
@@ -1767,14 +2617,14 @@ mod tests {
         tabs.shutdown().await;
     }
 
-    async fn fresh_side() -> (tempfile::TempDir, SideChatController) {
+    async fn fresh_side() -> (SideChatTestApplication, SideChatController) {
         let cwd = tempfile::tempdir().expect("cwd");
-        let session = test_session(cwd.path());
-        let application = Application::new(session).await;
+        let mut application = test_application(cwd.path()).await;
+        application._cwd = Some(cwd);
         let side = SideChatController::fork_from(&application)
             .await
             .expect("fork");
-        (cwd, side)
+        (application, side)
     }
 
     fn tool_result_message(id: &str, name: &str, text: &str, is_error: bool) -> Message {
@@ -1834,7 +2684,11 @@ mod tests {
             message: tool_result_message("call-1", "read", "hello world", false),
         });
         let rows = tool_rows(&side);
-        assert_eq!(rows.len(), 1, "exactly one final row per tool call: {rows:?}");
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one final row per tool call: {rows:?}"
+        );
         assert!(!rows[0].is_partial);
         assert_eq!(rows[0].text, "[read] hello world");
         assert!(!rows[0].is_error);
@@ -1938,12 +2792,7 @@ mod tests {
         });
         // Trailing MessageEnd echo must not create a second error row.
         side.apply_agent_event(AgentEvent::MessageEnd {
-            message: tool_result_message(
-                "call-err",
-                "bash",
-                "exit 1: permission denied",
-                true,
-            ),
+            message: tool_result_message("call-err", "bash", "exit 1: permission denied", true),
         });
 
         let rows = tool_rows(&side);
@@ -1958,7 +2807,10 @@ mod tests {
             .find(|row| row.text.contains("exit 1: permission denied"))
             .expect("final error text must replace the streamed partial");
         assert_eq!(err.text, "[bash] exit 1: permission denied");
-        assert!(err.is_error, "is_error=true must mark the matching row error");
+        assert!(
+            err.is_error,
+            "is_error=true must mark the matching row error"
+        );
         assert!(
             !err.is_partial,
             "final error row must not remain partial/running"
@@ -1986,7 +2838,11 @@ mod tests {
         });
 
         let final_rows = tool_rows(&side);
-        assert_eq!(final_rows.len(), 2, "no duplicate final rows: {final_rows:?}");
+        assert_eq!(
+            final_rows.len(),
+            2,
+            "no duplicate final rows: {final_rows:?}"
+        );
 
         let err = final_rows
             .iter()
@@ -2018,5 +2874,265 @@ mod tests {
         assert_eq!(rows[0].text, "[read] fallback result");
         assert!(!rows[0].is_error);
         assert!(!rows[0].is_partial);
+        assert_eq!(rows[0].tool_name.as_deref(), Some("read"));
+        assert_eq!(rows[0].output.as_deref(), Some("fallback result"));
+        let wire = rows[0].to_wire_json();
+        assert_eq!(wire["kind"], "tool");
+        assert_eq!(wire["toolName"], "read");
+        assert_eq!(wire["output"], "fallback result");
+        assert_eq!(wire["id"], rows[0].id);
+    }
+
+    #[tokio::test]
+    async fn tool_start_captures_args_and_thinking_projects_fold_fields() {
+        let (_cwd, mut side) = fresh_side().await;
+        side.apply_agent_event(AgentEvent::AgentStart);
+        side.apply_agent_event(AgentEvent::TurnStart);
+        side.apply_agent_event(AgentEvent::ToolExecutionStart {
+            tool_call_id: "call-bash".into(),
+            tool_name: "bash".into(),
+            arguments: json!({"command": "ls"}),
+        });
+        side.apply_agent_event(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "call-bash".into(),
+            tool_name: "bash".into(),
+            result: AgentToolResult::text("ok"),
+            is_error: false,
+        });
+        let tool = tool_rows(&side)[0];
+        assert_eq!(tool.kind, SideChatEntryKind::Tool);
+        assert_eq!(tool.tool_name.as_deref(), Some("bash"));
+        assert_eq!(tool.tool_args, Some(json!({"command": "ls"})));
+        assert_eq!(tool.output.as_deref(), Some("ok"));
+        let tool_wire = tool.to_wire_json();
+        assert_eq!(tool_wire["kind"], "tool");
+        assert_eq!(tool_wire["toolName"], "bash");
+        assert_eq!(tool_wire["toolArgs"]["command"], "ls");
+        assert_eq!(tool_wire["output"], "ok");
+        assert!(tool_wire["id"].as_str().is_some_and(|id| !id.is_empty()));
+
+        let mut partial = pi_ai::AssistantMessage::pending(side.model());
+        side.apply_agent_event(AgentEvent::MessageUpdate {
+            message: Message::Assistant(partial.clone()),
+            assistant_message_event: AssistantMessageEvent::ThinkingStart {
+                content_index: 0,
+                partial: partial.clone(),
+            },
+        });
+        side.apply_agent_event(AgentEvent::MessageUpdate {
+            message: Message::Assistant(partial.clone()),
+            assistant_message_event: AssistantMessageEvent::ThinkingDelta {
+                content_index: 0,
+                delta: "consider the queue".into(),
+                partial: partial.clone(),
+            },
+        });
+        side.apply_agent_event(AgentEvent::MessageUpdate {
+            message: Message::Assistant(partial.clone()),
+            assistant_message_event: AssistantMessageEvent::ThinkingEnd {
+                content_index: 0,
+                content: "consider the queue".into(),
+                partial: partial.clone(),
+            },
+        });
+        partial.content.push(ContentBlock::thinking("consider the queue"));
+        partial.content.push(ContentBlock::text("done"));
+        side.apply_agent_event(AgentEvent::MessageEnd {
+            message: Message::Assistant(partial),
+        });
+        let thinking = side
+            .entries()
+            .iter()
+            .find(|entry| entry.kind == SideChatEntryKind::Thinking)
+            .expect("thinking row");
+        assert_eq!(thinking.thinking.as_deref(), Some("consider the queue"));
+        assert!(!thinking.is_partial);
+        let thinking_wire = thinking.to_wire_json();
+        assert_eq!(thinking_wire["kind"], "thinking");
+        assert_eq!(thinking_wire["thinking"], "consider the queue");
+        assert!(
+            thinking_wire["id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        );
+        let assistant = side
+            .entries()
+            .iter()
+            .find(|entry| entry.kind == SideChatEntryKind::Assistant)
+            .expect("assistant row");
+        assert_eq!(assistant.text, "done");
+    }
+
+    #[tokio::test]
+    async fn thinking_end_then_text_delta_then_message_end_keeps_one_thinking_row() {
+        let (_cwd, mut side) = fresh_side().await;
+        side.apply_agent_event(AgentEvent::AgentStart);
+        side.apply_agent_event(AgentEvent::TurnStart);
+        let mut partial = pi_ai::AssistantMessage::pending(side.model());
+        side.apply_agent_event(AgentEvent::MessageUpdate {
+            message: Message::Assistant(partial.clone()),
+            assistant_message_event: AssistantMessageEvent::ThinkingStart {
+                content_index: 0,
+                partial: partial.clone(),
+            },
+        });
+        side.apply_agent_event(AgentEvent::MessageUpdate {
+            message: Message::Assistant(partial.clone()),
+            assistant_message_event: AssistantMessageEvent::ThinkingDelta {
+                content_index: 0,
+                delta: "REASONBLOCKQ".into(),
+                partial: partial.clone(),
+            },
+        });
+        side.apply_agent_event(AgentEvent::MessageUpdate {
+            message: Message::Assistant(partial.clone()),
+            assistant_message_event: AssistantMessageEvent::ThinkingEnd {
+                content_index: 0,
+                content: "REASONBLOCKQ".into(),
+                partial: partial.clone(),
+            },
+        });
+        let thinking_after_end: Vec<_> = side
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == SideChatEntryKind::Thinking)
+            .collect();
+        assert_eq!(thinking_after_end.len(), 1);
+        let thinking_id = thinking_after_end[0].id.clone();
+        assert!(!thinking_after_end[0].is_partial);
+
+        side.apply_agent_event(AgentEvent::MessageUpdate {
+            message: Message::Assistant(partial.clone()),
+            assistant_message_event: AssistantMessageEvent::TextDelta {
+                content_index: 1,
+                delta: "LIVEANSWERZX".into(),
+                partial: partial.clone(),
+            },
+        });
+        let thinking_after_delta: Vec<_> = side
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == SideChatEntryKind::Thinking)
+            .collect();
+        assert_eq!(thinking_after_delta.len(), 1);
+        assert_eq!(thinking_after_delta[0].id, thinking_id);
+        let live_assistants: Vec<_> = side
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == SideChatEntryKind::Assistant)
+            .collect();
+        assert_eq!(live_assistants.len(), 1);
+        let assistant_id = live_assistants[0].id.clone();
+        assert!(live_assistants[0].is_partial);
+        assert_eq!(live_assistants[0].text, "LIVEANSWERZX");
+        assert_eq!(side.streaming_text(), "LIVEANSWERZX");
+
+        partial.content.push(ContentBlock::thinking("REASONBLOCKQ"));
+        partial.content.push(ContentBlock::text("LIVEANSWERZX"));
+        side.apply_agent_event(AgentEvent::MessageEnd {
+            message: Message::Assistant(partial),
+        });
+        let thinking_settled: Vec<_> = side
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == SideChatEntryKind::Thinking)
+            .collect();
+        assert_eq!(thinking_settled.len(), 1);
+        assert_eq!(thinking_settled[0].id, thinking_id);
+        assert_eq!(thinking_settled[0].thinking.as_deref(), Some("REASONBLOCKQ"));
+        assert!(!thinking_settled[0].is_partial);
+        let assistant_settled: Vec<_> = side
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == SideChatEntryKind::Assistant)
+            .collect();
+        assert_eq!(assistant_settled.len(), 1);
+        assert_eq!(assistant_settled[0].id, assistant_id);
+        assert_eq!(assistant_settled[0].text, "LIVEANSWERZX");
+        assert!(!assistant_settled[0].is_partial);
+        assert!(side.streaming_text().is_empty());
+        let thinking_wire = thinking_settled[0].to_wire_json();
+        assert_eq!(thinking_wire["id"], thinking_id);
+        assert_eq!(thinking_wire["kind"], "thinking");
+        assert_eq!(thinking_wire["thinking"], "REASONBLOCKQ");
+        assert_eq!(thinking_wire["isPartial"], false);
+        let assistant_wire = assistant_settled[0].to_wire_json();
+        assert_eq!(assistant_wire["id"], assistant_id);
+        assert_eq!(assistant_wire["kind"], "assistant");
+        assert_eq!(assistant_wire["text"], "LIVEANSWERZX");
+        assert_eq!(assistant_wire["isPartial"], false);
+    }
+
+    #[tokio::test]
+    async fn text_delta_projects_partial_then_settles_same_id() {
+        let (_cwd, mut side) = fresh_side().await;
+        side.apply_agent_event(AgentEvent::AgentStart);
+        side.apply_agent_event(AgentEvent::TurnStart);
+        let mut partial = pi_ai::AssistantMessage::pending(side.model());
+        side.apply_agent_event(AgentEvent::MessageUpdate {
+            message: Message::Assistant(partial.clone()),
+            assistant_message_event: AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: "Hel".into(),
+                partial: partial.clone(),
+            },
+        });
+        let live = side
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == SideChatEntryKind::Assistant)
+            .collect::<Vec<_>>();
+        assert_eq!(live.len(), 1, "live buffer must be one identifiable row");
+        assert_eq!(live[0].text, "Hel");
+        assert!(live[0].is_partial);
+        let live_id = live[0].id.clone();
+        let live_wire = live[0].to_wire_json();
+        assert_eq!(live_wire["id"], live_id);
+        assert_eq!(live_wire["kind"], "assistant");
+        assert_eq!(live_wire["text"], "Hel");
+        assert_eq!(live_wire["isPartial"], true);
+        assert_eq!(side.streaming_text(), "Hel");
+
+        side.apply_agent_event(AgentEvent::MessageUpdate {
+            message: Message::Assistant(partial.clone()),
+            assistant_message_event: AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: "lo".into(),
+                partial: partial.clone(),
+            },
+        });
+        let mid = side
+            .entries()
+            .iter()
+            .find(|entry| entry.id == live_id)
+            .expect("same id while streaming");
+        assert_eq!(mid.text, "Hello");
+        assert!(mid.is_partial);
+        assert_eq!(
+            side.entries()
+                .iter()
+                .filter(|entry| entry.kind == SideChatEntryKind::Assistant)
+                .count(),
+            1
+        );
+
+        partial.content.push(ContentBlock::text("Hello"));
+        side.apply_agent_event(AgentEvent::MessageEnd {
+            message: Message::Assistant(partial),
+        });
+        let settled: Vec<_> = side
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == SideChatEntryKind::Assistant)
+            .collect();
+        assert_eq!(settled.len(), 1, "MessageEnd must not append a second row");
+        assert_eq!(settled[0].id, live_id);
+        assert_eq!(settled[0].text, "Hello");
+        assert!(!settled[0].is_partial);
+        let settled_wire = settled[0].to_wire_json();
+        assert_eq!(settled_wire["id"], live_id);
+        assert_eq!(settled_wire["isPartial"], false);
+        assert_eq!(settled_wire["text"], "Hello");
+        assert!(side.streaming_text().is_empty());
     }
 }

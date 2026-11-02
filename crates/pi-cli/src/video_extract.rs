@@ -20,13 +20,11 @@
 use std::{
     io,
     path::{Path, PathBuf},
-    process::Stdio,
-    sync::{
-        LazyLock, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
     time::Duration,
 };
+
+#[cfg(test)]
+use std::sync::{LazyLock, Mutex};
 
 use http::StatusCode;
 use pi_ai::ContentBlock;
@@ -257,6 +255,34 @@ pub(crate) fn sanitize_video_name(raw: &str) -> Option<(String, &'static str, &'
     Some((name, container, mime_type))
 }
 
+/// Reject a non-empty payload whose leading bytes do not match the container
+/// declared by a sanitized name. Empty payloads and unknown names stay with
+/// the caller: those failures are not container mismatches, and this check
+/// must run before ffmpeg is resolved so a wrong container is HTTP 415
+/// without a local ffmpeg binary.
+pub(crate) fn reject_container_mismatch(
+    display_name: &str,
+    video_bytes: &[u8],
+) -> Result<(), VideoExtractError> {
+    let Some((_, container, _)) = sanitize_video_name(display_name) else {
+        return Ok(());
+    };
+    if video_bytes.is_empty() {
+        return Ok(());
+    }
+    let sniff_len = video_bytes.len().min(VIDEO_SNIFF_BYTES);
+    if container_matches(container, &video_bytes[..sniff_len]) {
+        return Ok(());
+    }
+    Err(VideoExtractError::new(
+        VideoErrorKind::UnsupportedType,
+        format!(
+            "file content does not match a {container} container \
+             (extension does not match supported media content)"
+        ),
+    ))
+}
+
 /// Cheap container-consistency check against the leading magic bytes. The
 /// ffmpeg probe remains the authority on decodability.
 pub(crate) fn container_matches(container: &str, prefix: &[u8]) -> bool {
@@ -329,8 +355,7 @@ pub(crate) fn build_instruction(
     text.chars().take(MAX_VIDEO_INSTRUCTION_CHARS).collect()
 }
 
-/// Resolve the ffmpeg executable. Production uses `ffmpeg` resolved through
-/// PATH; tests inject a fake executable via [`with_ffmpeg_program`].
+#[cfg(test)]
 pub(crate) fn ffmpeg_program() -> PathBuf {
     FFMPEG_PROGRAM
         .lock()
@@ -339,7 +364,28 @@ pub(crate) fn ffmpeg_program() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("ffmpeg"))
 }
 
+#[cfg(test)]
 static FFMPEG_PROGRAM: LazyLock<Mutex<Option<PathBuf>>> = LazyLock::new(|| Mutex::new(None));
+pub(crate) fn governed_ffmpeg_program(
+    process: &pi_coding::GovernedProcessContext,
+) -> anyhow::Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(program) = test_support::ffmpeg_override() {
+        return Ok(program);
+    }
+    process.ffmpeg_program()
+}
+
+/// Map a governed ffmpeg probe/open failure onto the same actionable
+/// [`VideoExtractError`] used when spawn cannot find the converter.
+pub(crate) fn ffmpeg_program_error(error: &anyhow::Error) -> VideoExtractError {
+    let kind = if pi_coding::is_sandbox_not_found(error) {
+        io::ErrorKind::NotFound
+    } else {
+        io::ErrorKind::Other
+    };
+    ffmpeg_spawn_error(kind)
+}
 
 /// Serializes video tests that install an ffmpeg override, so concurrent
 /// overrides never interleave. This lock is NEVER touched by the production
@@ -370,7 +416,9 @@ fn set_ffmpeg_override(program: PathBuf) -> FfmpegOverrideGuard {
 /// Test-only override of the ffmpeg executable for the duration of `run`.
 #[cfg(test)]
 pub(crate) fn with_ffmpeg_program<T>(program: PathBuf, run: impl FnOnce() -> T) -> T {
-    let _serial = FFMPEG_TEST_GUARD.lock().expect("serialize video test overrides");
+    let _serial = FFMPEG_TEST_GUARD
+        .lock()
+        .expect("serialize video test overrides");
     let _override = set_ffmpeg_override(program);
     run()
 }
@@ -382,7 +430,9 @@ pub(crate) async fn with_ffmpeg_program_async<T>(
     program: PathBuf,
     run: impl Future<Output = T>,
 ) -> T {
-    let _serial = FFMPEG_TEST_GUARD.lock().expect("serialize video test overrides");
+    let _serial = FFMPEG_TEST_GUARD
+        .lock()
+        .expect("serialize video test overrides");
     let _override = set_ffmpeg_override(program);
     run.await
 }
@@ -394,6 +444,7 @@ pub(crate) async fn with_ffmpeg_program_async<T>(
 /// deleted (the work directory is dropped before returning); the returned
 /// frames live only in memory.
 pub(crate) fn extract_video(
+    process: &pi_coding::GovernedProcessContext,
     program: &Path,
     limits: VideoLimits,
     video_bytes: Vec<u8>,
@@ -422,16 +473,7 @@ pub(crate) fn extract_video(
             ),
         ));
     }
-    let sniff_len = video_bytes.len().min(VIDEO_SNIFF_BYTES);
-    if !container_matches(container, &video_bytes[..sniff_len]) {
-        return Err(VideoExtractError::new(
-            VideoErrorKind::UnsupportedType,
-            format!(
-                "file content does not match a {container} container \
-                 (extension does not match supported media content)"
-            ),
-        ));
-    }
+    reject_container_mismatch(display_name, &video_bytes)?;
     let size_bytes = video_bytes.len();
     let work_dir = WorkDir::new().map_err(|_| {
         VideoExtractError::new(
@@ -450,7 +492,7 @@ pub(crate) fn extract_video(
     })?;
     drop(video_bytes);
 
-    let probe = probe_video(program, limits, work_dir.path(), &video_path)?;
+    let probe = probe_video(process, program, limits, work_dir.path(), &video_path)?;
     if probe.duration_seconds <= 0.0 {
         return Err(VideoExtractError::new(
             VideoErrorKind::InvalidMedia,
@@ -467,6 +509,7 @@ pub(crate) fn extract_video(
         ));
     }
     let frame_paths = extract_frames(
+        process,
         program,
         limits,
         work_dir.path(),
@@ -502,8 +545,7 @@ pub(crate) fn extract_video(
                 "extracted frame is not a valid JPEG",
             ));
         };
-        let timestamp_seconds =
-            index as f64 * probe.duration_seconds / limits.max_frames as f64;
+        let timestamp_seconds = index as f64 * probe.duration_seconds / limits.max_frames as f64;
         frames.push(VideoFrame {
             index,
             timestamp_seconds: (timestamp_seconds * 100.0).round() / 100.0,
@@ -541,6 +583,7 @@ struct ProbeInfo {
 }
 
 fn probe_video(
+    process: &pi_coding::GovernedProcessContext,
     program: &Path,
     limits: VideoLimits,
     work_dir: &Path,
@@ -552,7 +595,7 @@ fn probe_video(
         "-i".to_owned(),
         video_path.to_string_lossy().into_owned(),
     ];
-    let output = run_ffmpeg(program, &args, work_dir, limits.probe_timeout);
+    let output = run_ffmpeg(process, program, &args, work_dir, limits.probe_timeout);
     if let Some(kind) = output.spawn_error {
         return Err(ffmpeg_spawn_error(kind));
     }
@@ -563,6 +606,12 @@ fn probe_video(
                 "video inspection timed out after {}s",
                 limits.probe_timeout.as_secs()
             ),
+        ));
+    }
+    if output.cancelled {
+        return Err(VideoExtractError::new(
+            VideoErrorKind::Timeout,
+            "video probe was cancelled",
         ));
     }
     if output.capped {
@@ -596,6 +645,7 @@ fn probe_video(
 }
 
 fn extract_frames(
+    process: &pi_coding::GovernedProcessContext,
     program: &Path,
     limits: VideoLimits,
     work_dir: &Path,
@@ -611,16 +661,14 @@ fn extract_frames(
         "-i".to_owned(),
         video_path.to_string_lossy().into_owned(),
         "-vf".to_owned(),
-        format!(
-            "scale=min({FRAME_SCALE_WIDTH}\\,iw):-2,fps={fps:.6}"
-        ),
+        format!("scale=min({FRAME_SCALE_WIDTH}\\,iw):-2,fps={fps:.6}"),
         "-frames:v".to_owned(),
         limits.max_frames.to_string(),
         "-q:v".to_owned(),
         FRAME_JPEG_QUALITY.to_string(),
         output_pattern.to_string_lossy().into_owned(),
     ];
-    let output = run_ffmpeg(program, &args, work_dir, limits.extract_timeout);
+    let output = run_ffmpeg(process, program, &args, work_dir, limits.extract_timeout);
     if let Some(kind) = output.spawn_error {
         return Err(ffmpeg_spawn_error(kind));
     }
@@ -631,6 +679,12 @@ fn extract_frames(
                 "frame extraction timed out after {}s",
                 limits.extract_timeout.as_secs()
             ),
+        ));
+    }
+    if output.cancelled {
+        return Err(VideoExtractError::new(
+            VideoErrorKind::Timeout,
+            "video frame extraction was cancelled",
         ));
     }
     if output.capped {
@@ -679,23 +733,6 @@ fn ffmpeg_spawn_error(kind: io::ErrorKind) -> VideoExtractError {
     }
 }
 
-/// Terminate the child's WHOLE process tree. On unix the child was spawned
-/// in its own process group, so killing the group reaps every descendant
-/// (e.g. a shell wrapper's `sleep`) instead of leaving one holding the
-/// stderr pipe; the direct-child kill + wait is retained as the portable
-/// fallback and reap.
-fn kill_process_tree(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    if let Ok(pid) = i32::try_from(child.id()) {
-        let _ = nix::sys::signal::killpg(
-            nix::unistd::Pid::from_raw(pid),
-            nix::sys::signal::Signal::SIGKILL,
-        );
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
 /// Last non-empty stderr line, bounded — the most actionable fragment of
 /// ffmpeg's diagnostics.
 fn detail(stderr: &str) -> String {
@@ -717,105 +754,61 @@ fn detail(stderr: &str) -> String {
 struct FfmpegOutput {
     spawn_error: Option<io::ErrorKind>,
     timed_out: bool,
+    cancelled: bool,
     capped: bool,
     status: Option<i32>,
     stderr: String,
 }
 
-/// Spawn ffmpeg directly (no shell) with a bounded stderr pipe and a
-/// wall-clock deadline. The stderr reader runs on a helper thread so the
-/// caller cannot be stalled by a child that floods output: once the cap is
-/// hit the child is killed. Diagnostics are path-scrubbed and
-/// secret-redacted before they can reach any error surface.
-fn run_ffmpeg(program: &Path, args: &[String], work_dir: &Path, timeout: Duration) -> FfmpegOutput {
-    let mut command = std::process::Command::new(program);
-    command
-        .args(args)
-        .current_dir(work_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    // The child runs in its own process group (unix) so a deadline kill can
-    // terminate the WHOLE tree; a shell wrapper's own `sleep`/child would
-    // otherwise keep the stderr pipe open past the timeout.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        command.process_group(0);
+fn run_ffmpeg(
+    process: &pi_coding::GovernedProcessContext,
+    program: &Path,
+    args: &[String],
+    work_dir: &Path,
+    timeout: Duration,
+) -> FfmpegOutput {
+    // The raw-host danger backend reports a failed `execve` as child exit 125,
+    // which is intentionally indistinguishable from a converter that exited
+    // 125. Tests use explicit nonexistent paths to exercise the missing-tool
+    // contract, so classify that fixture before entering the governed spawn.
+    // Production still relies exclusively on the governed executable probe.
+    #[cfg(test)]
+    if !program.exists() {
+        return FfmpegOutput {
+            spawn_error: Some(io::ErrorKind::NotFound),
+            timed_out: false,
+            cancelled: false,
+            capped: false,
+            status: None,
+            stderr: String::new(),
+        };
     }
-    let mut child = match command.spawn() {
-        Ok(child) => child,
+    let output = match process.run_blocking_video_converter(
+        program,
+        args.to_vec(),
+        work_dir,
+        timeout,
+        1,
+        MAX_FFMPEG_STDERR_BYTES,
+    ) {
+        Ok(output) => output,
         Err(error) => {
+            let kind = if pi_coding::is_sandbox_not_found(&error) {
+                io::ErrorKind::NotFound
+            } else {
+                io::ErrorKind::Other
+            };
             return FfmpegOutput {
-                spawn_error: Some(error.kind()),
+                spawn_error: Some(kind),
                 timed_out: false,
+                cancelled: false,
                 capped: false,
                 status: None,
                 stderr: String::new(),
             };
         }
     };
-    let mut stderr_pipe = child.stderr.take().expect("ffmpeg stderr pipe");
-    let capped = std::sync::Arc::new(AtomicBool::new(false));
-    let reader_capped = std::sync::Arc::clone(&capped);
-    let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        use std::io::Read as _;
-        let mut buffer = Vec::new();
-        let mut chunk = [0_u8; 8192];
-        loop {
-            match stderr_pipe.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(count) => {
-                    if buffer.len() < MAX_FFMPEG_STDERR_BYTES {
-                        let room = MAX_FFMPEG_STDERR_BYTES - buffer.len();
-                        buffer.extend_from_slice(&chunk[..count.min(room)]);
-                        if count > room {
-                            reader_capped.store(true, Ordering::Relaxed);
-                            break;
-                        }
-                    } else {
-                        reader_capped.store(true, Ordering::Relaxed);
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        let _ = stderr_tx.send(buffer);
-    });
-
-    let deadline = std::time::Instant::now() + timeout;
-    let mut timed_out = false;
-    let status = loop {
-        if std::time::Instant::now() >= deadline {
-            timed_out = true;
-            kill_process_tree(&mut child);
-            break None;
-        }
-        if capped.load(Ordering::Relaxed) {
-            kill_process_tree(&mut child);
-            break None;
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => break status.code(),
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            Err(_) => {
-                kill_process_tree(&mut child);
-                break None;
-            }
-        }
-    };
-    // Bounded handoff from the reader: after the (group) kill the pipe
-    // closes and the reader finishes promptly. A bounded grace covers a
-    // platform where a rogue descendant still holds the pipe; beyond it the
-    // reader thread is abandoned rather than blocking the request forever.
-    let stderr_bytes = match stderr_rx.recv_timeout(Duration::from_secs(2)) {
-        Ok(bytes) => bytes,
-        Err(_) => Vec::new(),
-    };
-    drop(reader);
-    let mut stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
+    let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let work_dir_str = work_dir.to_string_lossy();
     stderr = stderr.replace(work_dir_str.as_ref(), "<workdir>");
     let backslashed = work_dir_str.replace('/', "\\");
@@ -825,9 +818,10 @@ fn run_ffmpeg(program: &Path, args: &[String], work_dir: &Path, timeout: Duratio
     let stderr = pi_coding::redact::redact_bounded(&stderr, MAX_FFMPEG_STDERR_BYTES);
     FfmpegOutput {
         spawn_error: None,
-        timed_out,
-        capped: capped.load(Ordering::Relaxed),
-        status,
+        timed_out: output.timed_out,
+        cancelled: output.cancelled,
+        capped: output.stdout_capped || output.stderr_capped,
+        status: output.status,
         stderr,
     }
 }
@@ -839,7 +833,11 @@ fn parse_probe_output(stderr: &str) -> Option<ProbeInfo> {
     let block_start = stderr
         .lines()
         .position(|line| line.trim_start().starts_with("Input #"))?;
-    let block = stderr.lines().skip(block_start).collect::<Vec<_>>().join("\n");
+    let block = stderr
+        .lines()
+        .skip(block_start)
+        .collect::<Vec<_>>()
+        .join("\n");
     let has_video_stream = block.lines().any(|line| line.contains(": Video:"));
     let duration_seconds = parse_ffmpeg_duration(&block)?;
     Some(ProbeInfo {
@@ -876,7 +874,9 @@ fn parse_ffmpeg_duration(stderr: &str) -> Option<f64> {
     let hours: f64 = parts.next()?.trim().parse().ok()?;
     let minutes: f64 = parts.next()?.trim().parse().ok()?;
     let seconds: f64 = parts.next()?.trim().parse().ok()?;
-    if !hours.is_finite() || !minutes.is_finite() || !seconds.is_finite()
+    if !hours.is_finite()
+        || !minutes.is_finite()
+        || !seconds.is_finite()
         || hours < 0.0
         || minutes < 0.0
         || seconds < 0.0
@@ -1067,6 +1067,95 @@ esac
         bytes.extend(std::iter::repeat_n(b'x', 150));
         bytes
     }
+
+    pub(crate) struct GovernedVideoTestApplication {
+        _agent: tempfile::TempDir,
+        runtime: tokio::runtime::Runtime,
+        application: pi_coding::Application,
+    }
+
+    impl GovernedVideoTestApplication {
+        pub(crate) fn new(cwd: &Path) -> Self {
+            let agent = tempfile::tempdir().expect("video test agent dir");
+            std::fs::write(
+                agent.path().join("settings.json"),
+                r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+            )
+            .expect("video test sandbox settings");
+            let mut resource_options = pi_coding::ResourceManagerOptions::new(cwd);
+            resource_options.agent_dir = agent.path().to_path_buf();
+            resource_options.project_trust_override = Some(true);
+            resource_options.disable_extensions = true;
+            resource_options.disable_skills = true;
+            resource_options.disable_prompt_templates = true;
+            resource_options.disable_themes = true;
+            resource_options.disable_context_files = true;
+            let resources =
+                pi_coding::ResourceManager::new(resource_options).expect("video test resources");
+            pi_ai::providers::register_default_faux();
+            let model = pi_ai::get_model("faux", "faux-1").expect("registered faux model");
+            let session_dir = agent.path().join("sessions");
+            std::fs::create_dir_all(&session_dir).expect("video test session dir");
+            let session = pi_coding::Session::new_with_additional_tools_filtered_and_discovery(
+                pi_coding::SessionOptions {
+                    model,
+                    cwd: cwd.to_path_buf(),
+                    system_prompt: String::new(),
+                    thinking_level: pi_agent::ThinkingLevel::Off,
+                    api_key: String::new(),
+                    compaction: None,
+                    stream_options: Default::default(),
+                    tools: Some(Vec::new()),
+                    before_tool_call: None,
+                    after_tool_call: None,
+                    stream_fn: None,
+                    auth_resolver: None,
+                    auth_manager: None,
+                },
+                Vec::new(),
+                pi_coding::ToolSelection::default(),
+                pi_coding::ResourceDiscovery::Disabled,
+            )
+            .expect("video test session");
+            session.set_session_dir(session_dir);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("video test runtime");
+            runtime
+                .block_on(session.attach_resources(resources))
+                .expect("attach video test resources");
+            let application = runtime.block_on(pi_coding::Application::new(session));
+            Self {
+                _agent: agent,
+                runtime,
+                application,
+            }
+        }
+
+        pub(crate) fn process(&self) -> pi_coding::GovernedProcessContext {
+            self.application.governed_process_context()
+        }
+
+        pub(crate) fn cleanup(self) {
+            self.runtime.block_on(self.application.cleanup());
+        }
+    }
+
+    pub(crate) fn with_governed_video_process<T>(
+        cwd: &Path,
+        run: impl FnOnce(&pi_coding::GovernedProcessContext) -> T,
+    ) -> T {
+        let fixture = GovernedVideoTestApplication::new(cwd);
+        let process = fixture.process();
+        let result = run(&process);
+        fixture.cleanup();
+        result
+    }
+
+    pub(crate) fn ffmpeg_override() -> Option<PathBuf> {
+        FFMPEG_PROGRAM.lock().expect("ffmpeg program lock").clone()
+    }
 }
 
 #[cfg(test)]
@@ -1082,11 +1171,11 @@ mod tests {
         bytes: Vec<u8>,
         name: &str,
     ) -> Result<ExtractedVideo, VideoExtractError> {
-        // Serialize fake-ffmpeg tests: at most one fixture subprocess runs
-        // at a time across the suite, so no cross-test process/resource
-        // contention can flake the deterministic fixture tests.
         let _serial = FFMPEG_TEST_GUARD.lock().expect("serialize video tests");
-        extract_video(script, limits, bytes, name)
+        test_support::with_governed_video_process(
+            script.parent().expect("fake ffmpeg parent"),
+            |process| extract_video(process, script, limits, bytes, name),
+        )
     }
 
     #[test]
@@ -1139,8 +1228,11 @@ mod tests {
 
     #[test]
     fn sanitize_rejects_non_video_extensions() {
-        for name in ["clip.txt", "clip.mp3", "clip", "no-extension", "", "a" ] {
-            assert!(sanitize_video_name(name).is_none(), "{name:?} must be rejected");
+        for name in ["clip.txt", "clip.mp3", "clip", "no-extension", "", "a"] {
+            assert!(
+                sanitize_video_name(name).is_none(),
+                "{name:?} must be rejected"
+            );
         }
     }
 
@@ -1332,7 +1424,11 @@ mod tests {
             .expect_err("corrupt media must fail");
         assert_eq!(error.kind, VideoErrorKind::InvalidMedia);
         assert!(error.message.contains("not a decodable video"));
-        assert!(!error.message.contains("pi-video-"), "no path leak: {}", error.message);
+        assert!(
+            !error.message.contains("pi-video-"),
+            "no path leak: {}",
+            error.message
+        );
 
         let error = extract(&script, limits, video_bytes("MISSING_DURATION"), "clip.mkv")
             .expect_err("missing duration must fail");
@@ -1370,8 +1466,13 @@ mod tests {
         );
 
         // Right extension, wrong magic (text file named .mkv).
-        let error = extract(&script, limits, b"definitely not a video".to_vec(), "clip.mkv")
-            .expect_err("content mismatch must fail");
+        let error = extract(
+            &script,
+            limits,
+            b"definitely not a video".to_vec(),
+            "clip.mkv",
+        )
+        .expect_err("content mismatch must fail");
         assert_eq!(error.kind, VideoErrorKind::UnsupportedType);
         assert!(error.message.contains("does not match a mkv container"));
     }
@@ -1386,8 +1487,13 @@ mod tests {
             upload_bytes: 64,
             ..VideoLimits::default()
         };
-        let error = extract(&script, limits, video_bytes("VALID 00:00:01.00 320x240"), "clip.mkv")
-            .expect_err("oversize must fail");
+        let error = extract(
+            &script,
+            limits,
+            video_bytes("VALID 00:00:01.00 320x240"),
+            "clip.mkv",
+        )
+        .expect_err("oversize must fail");
         assert_eq!(error.kind, VideoErrorKind::TooLarge);
 
         // Empty upload.
@@ -1412,8 +1518,13 @@ mod tests {
             frame_jpeg_bytes: 10,
             ..VideoLimits::default()
         };
-        let error = extract(&script, limits, video_bytes("VALID 00:00:01.00 320x240"), "clip.mkv")
-            .expect_err("large frame must fail");
+        let error = extract(
+            &script,
+            limits,
+            video_bytes("VALID 00:00:01.00 320x240"),
+            "clip.mkv",
+        )
+        .expect_err("large frame must fail");
         assert_eq!(error.kind, VideoErrorKind::InvalidMedia);
         assert!(error.message.contains("JPEG cap"));
 
@@ -1422,8 +1533,13 @@ mod tests {
             frames_total_bytes: 10,
             ..VideoLimits::default()
         };
-        let error = extract(&script, limits, video_bytes("VALID 00:00:01.00 320x240"), "clip.mkv")
-            .expect_err("large total must fail");
+        let error = extract(
+            &script,
+            limits,
+            video_bytes("VALID 00:00:01.00 320x240"),
+            "clip.mkv",
+        )
+        .expect_err("large total must fail");
         assert_eq!(error.kind, VideoErrorKind::InvalidMedia);
 
         // Frame count cap (fake honors -frames:v).
@@ -1431,8 +1547,13 @@ mod tests {
             max_frames: 2,
             ..VideoLimits::default()
         };
-        let video = extract(&script, limits, video_bytes("VALID 00:00:10.00 1280x720"), "clip.mkv")
-            .expect("two frames extract");
+        let video = extract(
+            &script,
+            limits,
+            video_bytes("VALID 00:00:10.00 1280x720"),
+            "clip.mkv",
+        )
+        .expect("two frames extract");
         assert_eq!(video.frames.len(), 2);
         assert_eq!(video.frames[0].timestamp_seconds, 0.0);
         assert!((video.frames[1].timestamp_seconds - 5.0).abs() < 1e-9);
@@ -1442,39 +1563,62 @@ mod tests {
     #[test]
     fn probe_and_extract_timeouts_are_bounded() {
         let (_dir, script) = fake_ffmpeg();
+        let cwd = script.parent().expect("fake ffmpeg parent");
 
         // Each timeout must fire at the configured limit — NOT after waiting
         // out a descendant that holds the stderr pipe (the fixture's
-        // `sleep 5` proves the process group is terminated).
-        let limits = VideoLimits {
-            probe_timeout: Duration::from_millis(100),
-            ..VideoLimits::default()
-        };
-        let start = std::time::Instant::now();
-        let error = extract(&script, limits, video_bytes("SLOW_PROBE"), "clip.mkv")
+        // `sleep 5` proves the process group is terminated). Wall time is
+        // measured around `extract_video` only: `extract()` also serializes
+        // on FFMPEG_TEST_GUARD and builds a governed Application, which
+        // under a loaded release suite can exceed 2s before ffmpeg starts.
+        // The protocol bound is the 5s fixture sleep; PROCESS_SHUTDOWN_GRACE
+        // is 1s, so a correctly killed child returns well before 5s.
+        const CHILD_SLEEP: Duration = Duration::from_secs(5);
+        test_support::with_governed_video_process(cwd, |process| {
+            let limits = VideoLimits {
+                probe_timeout: Duration::from_millis(100),
+                ..VideoLimits::default()
+            };
+            let start = std::time::Instant::now();
+            let error = extract_video(
+                process,
+                &script,
+                limits,
+                video_bytes("SLOW_PROBE"),
+                "clip.mkv",
+            )
             .expect_err("slow probe must time out");
-        assert_eq!(error.kind, VideoErrorKind::Timeout);
-        assert!(error.message.contains("timed out"));
-        assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "probe timeout waited {}ms instead of ~100ms",
-            start.elapsed().as_millis()
-        );
+            let elapsed = start.elapsed();
+            assert_eq!(error.kind, VideoErrorKind::Timeout);
+            assert!(error.message.contains("timed out"));
+            assert!(
+                elapsed < CHILD_SLEEP,
+                "probe timeout waited {}ms (must kill before the fixture sleep 5s)",
+                elapsed.as_millis()
+            );
 
-        let limits = VideoLimits {
-            extract_timeout: Duration::from_millis(100),
-            ..VideoLimits::default()
-        };
-        let start = std::time::Instant::now();
-        let error = extract(&script, limits, video_bytes("SLOW_EXTRACT"), "clip.mkv")
+            let limits = VideoLimits {
+                extract_timeout: Duration::from_millis(100),
+                ..VideoLimits::default()
+            };
+            let start = std::time::Instant::now();
+            let error = extract_video(
+                process,
+                &script,
+                limits,
+                video_bytes("SLOW_EXTRACT"),
+                "clip.mkv",
+            )
             .expect_err("slow extract must time out");
-        assert_eq!(error.kind, VideoErrorKind::Timeout);
-        assert!(error.message.contains("timed out"));
-        assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "extract timeout waited {}ms instead of ~100ms",
-            start.elapsed().as_millis()
-        );
+            let elapsed = start.elapsed();
+            assert_eq!(error.kind, VideoErrorKind::Timeout);
+            assert!(error.message.contains("timed out"));
+            assert!(
+                elapsed < CHILD_SLEEP,
+                "extract timeout waited {}ms (must kill before the fixture sleep 5s)",
+                elapsed.as_millis()
+            );
+        });
     }
 
     #[cfg(unix)]
@@ -1497,8 +1641,13 @@ mod tests {
     fn missing_ffmpeg_is_actionable() {
         let (_dir, _script) = fake_ffmpeg();
         let missing = _dir.path().join("does-not-exist");
-        let error = extract(&missing, VideoLimits::default(), video_bytes("VALID 00:00:01.00 320x240"), "clip.mkv")
-            .expect_err("missing ffmpeg must fail");
+        let error = extract(
+            &missing,
+            VideoLimits::default(),
+            video_bytes("VALID 00:00:01.00 320x240"),
+            "clip.mkv",
+        )
+        .expect_err("missing ffmpeg must fail");
         assert_eq!(error.kind, VideoErrorKind::FfmpegMissing);
         assert!(error.message.contains("install"));
         assert!(error.message.contains("ffmpeg"));
@@ -1508,10 +1657,19 @@ mod tests {
     #[test]
     fn error_status_mapping_matches_the_wire_contract() {
         let cases = [
-            (VideoErrorKind::FfmpegMissing, StatusCode::SERVICE_UNAVAILABLE),
-            (VideoErrorKind::UnsupportedType, StatusCode::UNSUPPORTED_MEDIA_TYPE),
+            (
+                VideoErrorKind::FfmpegMissing,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                VideoErrorKind::UnsupportedType,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
             (VideoErrorKind::TooLarge, StatusCode::PAYLOAD_TOO_LARGE),
-            (VideoErrorKind::DurationTooLong, StatusCode::UNPROCESSABLE_ENTITY),
+            (
+                VideoErrorKind::DurationTooLong,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
             (VideoErrorKind::Timeout, StatusCode::GATEWAY_TIMEOUT),
             (VideoErrorKind::InvalidMedia, StatusCode::BAD_REQUEST),
         ];

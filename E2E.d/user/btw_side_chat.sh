@@ -40,7 +40,7 @@ main() {
     tmux new-session -d -s "$session" -x 140 -y 42 -c "$root/workspace" \
         "env HOME='$root/home' USERPROFILE='$root/home' \
 PI_CODING_AGENT_DIR='$root/home/.pi/agent' \
-PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 \
+RPI_OFFLINE=1 RPI_SKIP_VERSION_CHECK=1 \
 PI_FAUX_RESPONSE='$FAUX_REPLY' \
 TERM=xterm-256color \
 '$RPI_BIN' --offline --model faux/faux-1; printf '===TUI-DONE-btw-side-chat===\n'"

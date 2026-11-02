@@ -1,24 +1,171 @@
-use std::sync::{Arc, LazyLock, Mutex, atomic::{AtomicUsize, Ordering}};
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
-use pi_ai::providers::{FauxProviderOptions, FauxResponse, FauxProviderRegistration, register_faux_provider};
+use pi_ai::providers::{
+    FauxProviderOptions, FauxProviderRegistration, FauxResponse, register_faux_provider,
+};
 use pi_ai::{ContentBlock, Context, Message, Model, StopReason, Usage};
 use pi_coding::{
-    ACTIVE_GOAL_CUSTOM_TYPE, Application, GoalActivationOutcome, GoalContinuationDecision,
-    GoalLifecycle, GoalPauseReason, GoalUsageDelta, Session, SessionOptions,
+    ACTIVE_GOAL_CUSTOM_TYPE, Application, ApplicationEvent, ApplicationRuntimeCandidate,
+    GoalActivationOutcome, GoalContinuationDecision, GoalLifecycle, GoalPauseReason,
+    GoalUsageDelta, ResourceDiscovery, ResourceManager, ResourceManagerOptions, Session,
+    SessionOptions, ToolSelection,
 };
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-static FAUX_REGISTRY_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+const DANGER_SETTINGS: &str = r#"{"sandbox":{"mode":"danger-full-access"}}"#;
 
-fn usage_session(usage: Usage) -> Session {
-    let model = Model {
-        id: "application-goal-model".to_owned(),
-        name: "Application Goal Model".to_owned(),
-        api: "application-goal-api".to_owned(),
-        provider: "application-goal-provider".to_owned(),
-        ..Model::default()
-    };
+struct HermeticGoalFixture {
+    workspace: tempfile::TempDir,
+    _agent_dir: tempfile::TempDir,
+    session_dir: tempfile::TempDir,
+    resources: ResourceManager,
+    session: Session,
+    registration: FauxProviderRegistration,
+}
+
+impl HermeticGoalFixture {
+    fn new(
+        label: &str,
+        responses: Vec<FauxResponse>,
+        stream_fn: Option<pi_agent::StreamFn>,
+    ) -> Self {
+        let workspace = tempfile::tempdir().expect("fixture workspace");
+        let agent_dir = tempfile::tempdir().expect("fixture agent dir");
+        let session_dir = tempfile::tempdir().expect("fixture session dir");
+        std::fs::write(agent_dir.path().join("settings.json"), DANGER_SETTINGS)
+            .expect("fixture danger settings");
+
+        let suffix = uuid::Uuid::now_v7();
+        let model = Model {
+            id: format!("{label}-model-{suffix}"),
+            name: format!("{label} Model"),
+            api: format!("{label}-api-{suffix}"),
+            provider: format!("{label}-provider-{suffix}"),
+            base_url: "http://localhost:0".to_owned(),
+            ..Model::default()
+        };
+        let registration = register_faux_provider(FauxProviderOptions {
+            api: model.api.clone(),
+            provider: model.provider.clone(),
+            models: vec![model.clone()],
+            chunk_size: 64,
+        });
+        registration.set_responses(responses);
+
+        let mut resource_options = ResourceManagerOptions::new(workspace.path());
+        resource_options.agent_dir = agent_dir.path().to_path_buf();
+        resource_options.project_trust_override = Some(true);
+        resource_options.disable_extensions = true;
+        resource_options.disable_skills = true;
+        resource_options.disable_prompt_templates = true;
+        resource_options.disable_themes = true;
+        resource_options.disable_context_files = true;
+        let resources = ResourceManager::new(resource_options).expect("fixture resources");
+
+        let session = Session::new_with_additional_tools_filtered_and_discovery(
+            SessionOptions {
+                model,
+                cwd: workspace.path().to_path_buf(),
+                system_prompt: resources
+                    .snapshot()
+                    .system_prompt
+                    .clone()
+                    .unwrap_or_default(),
+                thinking_level: pi_agent::ThinkingLevel::Off,
+                api_key: String::new(),
+                compaction: None,
+                stream_options: Default::default(),
+                tools: Some(Vec::new()),
+                before_tool_call: None,
+                after_tool_call: None,
+                stream_fn,
+                auth_resolver: None,
+                auth_manager: None,
+            },
+            Vec::new(),
+            ToolSelection::default(),
+            ResourceDiscovery::Disabled,
+        )
+        .expect("fixture session");
+        session.set_session_dir(session_dir.path().to_path_buf());
+
+        Self {
+            workspace,
+            _agent_dir: agent_dir,
+            session_dir,
+            resources,
+            session,
+            registration,
+        }
+    }
+
+    fn session(&self) -> Session {
+        self.session.clone()
+    }
+
+    fn workspace(&self) -> &Path {
+        self.workspace.path()
+    }
+
+    fn session_dir(&self) -> &Path {
+        self.session_dir.path()
+    }
+
+    fn model_key(&self) -> (String, String) {
+        let model = self.session.model().expect("fixture model");
+        (model.provider, model.id)
+    }
+
+    fn start_recording(&self, session_id: &str) -> PathBuf {
+        let recorder = pi_coding::start_session_in(
+            self.workspace(),
+            self.session.model().as_ref(),
+            Some("off"),
+            Some(self.session_dir()),
+            Some(session_id),
+            None,
+        )
+        .expect("fixture recorder");
+        let path = recorder.path();
+        self.session
+            .record(recorder)
+            .expect("attach fixture recorder");
+        path
+    }
+
+    async fn application(&self) -> Application {
+        self.session
+            .attach_resources(self.resources.clone())
+            .await
+            .expect("attach fixture resources");
+        let application =
+            Application::from_runtime_candidate(ApplicationRuntimeCandidate::new(self.session()))
+                .await
+                .expect("publish application generation");
+        assert_eq!(
+            application.resource_generation(),
+            Some(1),
+            "published fixture generation"
+        );
+        application
+    }
+}
+
+impl Drop for HermeticGoalFixture {
+    fn drop(&mut self) {
+        self.registration.unregister();
+        pi_ai::replace_registered_models(&[self.model_key()], Vec::new());
+    }
+}
+
+fn usage_fixture(usage: Usage) -> HermeticGoalFixture {
     let stream_fn: pi_agent::StreamFn = Arc::new(move |model, _context, _options| {
         let usage = usage.clone();
         Box::pin(async move {
@@ -34,41 +181,19 @@ fn usage_session(usage: Usage) -> Session {
             stream
         })
     });
-    Session::new(SessionOptions {
-        model,
-        cwd: std::env::current_dir().expect("cwd"),
-        system_prompt: String::new(),
-        thinking_level: pi_agent::ThinkingLevel::Off,
-        api_key: String::new(),
-        compaction: None,
-        stream_options: Default::default(),
-        tools: Some(Vec::new()),
-        before_tool_call: None,
-        after_tool_call: None,
-        stream_fn: Some(stream_fn),
-        auth_resolver: None,
-    })
-    .expect("session")
+    HermeticGoalFixture::new("application-goal", Vec::new(), Some(stream_fn))
 }
 
 /// Fake provider session whose `block_call`-th model call blocks until the
 /// given token is cancelled, so a specific turn's completion (and its usage
 /// charge) can be held at a deterministic point. Every reply carries a fixed
 /// 3-token usage so completed turns always commit a usage update.
-fn controlled_usage_session(
+fn controlled_usage_fixture(
     calls: Arc<AtomicUsize>,
     started: Arc<Notify>,
     release: CancellationToken,
     block_call: usize,
-) -> Session {
-    let suffix = uuid::Uuid::now_v7();
-    let model = Model {
-        id: format!("goal-controlled-model-{suffix}"),
-        name: "Goal Controlled Model".to_owned(),
-        api: format!("goal-controlled-api-{suffix}"),
-        provider: format!("goal-controlled-provider-{suffix}"),
-        ..Model::default()
-    };
+) -> HermeticGoalFixture {
     let stream_fn: pi_agent::StreamFn = Arc::new(move |model, _context, _options| {
         let call = calls.fetch_add(1, Ordering::SeqCst) + 1;
         let started = started.clone();
@@ -95,21 +220,7 @@ fn controlled_usage_session(
             stream
         })
     });
-    Session::new(SessionOptions {
-        model,
-        cwd: std::env::current_dir().expect("cwd"),
-        system_prompt: String::new(),
-        thinking_level: pi_agent::ThinkingLevel::Off,
-        api_key: String::new(),
-        compaction: None,
-        stream_options: Default::default(),
-        tools: Some(Vec::new()),
-        before_tool_call: None,
-        after_tool_call: None,
-        stream_fn: Some(stream_fn),
-        auth_resolver: None,
-    })
-    .expect("controlled usage session")
+    HermeticGoalFixture::new("goal-controlled", Vec::new(), Some(stream_fn))
 }
 
 async fn wait_for_calls(calls: &AtomicUsize, started: &Notify, expected: usize) {
@@ -126,6 +237,33 @@ async fn wait_for_calls(calls: &AtomicUsize, started: &Notify, expected: usize) 
     .expect("provider call started");
 }
 
+async fn wait_for_matching_turn_terminal(
+    events: &mut tokio::sync::broadcast::Receiver<ApplicationEvent>,
+) -> String {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut started = None::<String>;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "goal work never published TurnStarted+TurnTerminal"
+        );
+        match tokio::time::timeout(remaining, events.recv()).await {
+            Ok(Ok(ApplicationEvent::TurnStarted { turn_id, .. })) => {
+                started = Some(turn_id);
+            }
+            Ok(Ok(ApplicationEvent::TurnTerminal { turn_id, .. })) => {
+                let expected = started.expect("TurnTerminal without TurnStarted");
+                assert_eq!(turn_id, expected);
+                return turn_id;
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(_)) => panic!("goal work event channel closed"),
+            Err(_) => panic!("goal work never published TurnStarted+TurnTerminal"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn goal_activation_starts_a_hidden_model_turn_and_charges_usage() {
     let usage = Usage {
@@ -134,37 +272,59 @@ async fn goal_activation_starts_a_hidden_model_turn_and_charges_usage() {
         total_tokens: 3,
         ..Usage::default()
     };
-    let session = usage_session(usage);
-    let application = Application::new(session.clone()).await;
+    let fixture = usage_fixture(usage);
+    let session = fixture.session();
+    let application = fixture.application().await;
+    let mut events = application.subscribe();
 
     assert_eq!(
-        application.activate_goal("start visible work", Some(100)).await.expect("activate"),
+        application
+            .activate_goal("start visible work", Some(100))
+            .await
+            .expect("activate"),
         GoalActivationOutcome::Started
     );
+    wait_for_matching_turn_terminal(&mut events).await;
     application.wait_for_idle().await;
+    assert!(
+        !application.is_streaming(),
+        "goal work must emit TurnTerminal so is_streaming is false after idle"
+    );
     let goal = application.goal_state().current.expect("goal");
     assert_eq!(goal.usage.tokens_used, 3);
     assert_eq!(goal.lifecycle, GoalLifecycle::Active);
-    assert!(session.history().iter().any(|message| matches!(message, Message::Assistant(_))));
-    assert!(!session.history().iter().any(|message| matches!(message, Message::User(_))));
+    assert!(
+        session
+            .history()
+            .iter()
+            .any(|message| matches!(message, Message::Assistant(_)))
+    );
+    assert!(
+        !session
+            .history()
+            .iter()
+            .any(|message| matches!(message, Message::User(_)))
+    );
     let transcript = serde_json::to_string(&application.messages()).expect("transcript");
     assert_no_active_goal_projection(&transcript);
 }
 
 #[tokio::test]
 async fn failed_goal_activation_can_be_retried_once() {
-    let directory = tempfile::tempdir().expect("cwd");
     let contexts = Arc::new(Mutex::new(Vec::new()));
-    let (session, registration) = capturing_session(directory.path(), contexts.clone(), 0);
-    registration.set_responses(vec![
+    let fixture = capturing_fixture(contexts.clone(), 0);
+    fixture.registration.set_responses(vec![
         FauxResponse::error("first activation failed"),
         FauxResponse::text("recovered"),
     ]);
-    session.set_auto_retry_enabled(false);
-    let application = Application::new(session).await;
+    fixture.session().set_auto_retry_enabled(false);
+    let application = fixture.application().await;
 
     assert_eq!(
-        application.activate_goal("retry failed work", Some(100)).await.expect("activate"),
+        application
+            .activate_goal("retry failed work", Some(100))
+            .await
+            .expect("activate"),
         GoalActivationOutcome::Started
     );
     application.wait_for_idle().await;
@@ -175,8 +335,14 @@ async fn failed_goal_activation_can_be_retried_once() {
     application.wait_for_idle().await;
 
     assert!(contexts.lock().expect("contexts").len() >= 2);
-    assert!(application.messages().iter().filter(|message| matches!(message, Message::Assistant(_))).count() >= 2);
-    registration.unregister();
+    assert!(
+        application
+            .messages()
+            .iter()
+            .filter(|message| matches!(message, Message::Assistant(_)))
+            .count()
+            >= 2
+    );
 }
 
 #[tokio::test]
@@ -184,14 +350,12 @@ async fn goal_resume_starts_exactly_once_and_pause_cancels_queued_work() {
     let calls = Arc::new(AtomicUsize::new(0));
     let started = Arc::new(Notify::new());
     let release_second = CancellationToken::new();
-    let application = Application::new(controlled_usage_session(
-        calls.clone(),
-        started.clone(),
-        release_second.clone(),
-        2,
-    ))
-    .await;
-    application.goal_create("resume exactly once", Some(100)).expect("create metadata");
+    let fixture =
+        controlled_usage_fixture(calls.clone(), started.clone(), release_second.clone(), 2);
+    let application = fixture.application().await;
+    application
+        .goal_create("resume exactly once", Some(100))
+        .expect("create metadata");
     application.goal_pause().expect("pause");
 
     assert_eq!(
@@ -199,7 +363,10 @@ async fn goal_resume_starts_exactly_once_and_pause_cancels_queued_work() {
         GoalActivationOutcome::Started
     );
     assert_eq!(
-        application.resume_goal_work().await.expect("duplicate resume"),
+        application
+            .resume_goal_work()
+            .await
+            .expect("duplicate resume"),
         GoalActivationOutcome::AlreadyActive
     );
     application.wait_for_idle().await;
@@ -218,7 +385,11 @@ async fn goal_resume_starts_exactly_once_and_pause_cancels_queued_work() {
     application.goal_pause().expect("cancel queued goal work");
     release_second.cancel();
     application.wait_for_idle().await;
-    assert_eq!(calls.load(Ordering::SeqCst), 2, "queued paused work must not start a second provider call");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "queued paused work must not start a second provider call"
+    );
 }
 
 #[tokio::test]
@@ -237,16 +408,15 @@ async fn goal_resume_survives_prior_turn_usage_charge_race() {
     let calls = Arc::new(AtomicUsize::new(0));
     let started = Arc::new(Notify::new());
     let release_first = CancellationToken::new();
-    let application = Application::new(controlled_usage_session(
-        calls.clone(),
-        started.clone(),
-        release_first.clone(),
-        1,
-    ))
-    .await;
+    let fixture =
+        controlled_usage_fixture(calls.clone(), started.clone(), release_first.clone(), 1);
+    let application = fixture.application().await;
 
     assert_eq!(
-        application.activate_goal("race the resume", Some(100)).await.expect("activate"),
+        application
+            .activate_goal("race the resume", Some(100))
+            .await
+            .expect("activate"),
         GoalActivationOutcome::Started
     );
     wait_for_calls(&calls, &started, 1).await;
@@ -257,7 +427,10 @@ async fn goal_resume_survives_prior_turn_usage_charge_race() {
     // "goal is not active" — because the schedule is keyed to the revision
     // the resume itself committed.
     assert_eq!(
-        application.resume_goal_work().await.expect("resume must succeed"),
+        application
+            .resume_goal_work()
+            .await
+            .expect("resume must succeed"),
         GoalActivationOutcome::Queued
     );
 
@@ -293,14 +466,12 @@ async fn pause_then_mutation_only_resume_does_not_resurrect_queued_activation() 
     let calls = Arc::new(AtomicUsize::new(0));
     let started = Arc::new(Notify::new());
     let release_prompt = CancellationToken::new();
-    let application = Application::new(controlled_usage_session(
-        calls.clone(),
-        started.clone(),
-        release_prompt.clone(),
-        1,
-    ))
-    .await;
-    application.goal_create("panel goal", Some(100)).expect("create metadata");
+    let fixture =
+        controlled_usage_fixture(calls.clone(), started.clone(), release_prompt.clone(), 1);
+    let application = fixture.application().await;
+    application
+        .goal_create("panel goal", Some(100))
+        .expect("create metadata");
     application.goal_pause().expect("pause");
 
     // The busy prompt holds the turn gate so the resume queues behind it.
@@ -314,7 +485,9 @@ async fn pause_then_mutation_only_resume_does_not_resurrect_queued_activation() 
         GoalActivationOutcome::Queued
     );
     // Pause invalidates the queued reservation…
-    application.goal_pause().expect("pause invalidates queued work");
+    application
+        .goal_pause()
+        .expect("pause invalidates queued work");
     // …and the mutation-only resume (GoalPanel / RPC activate:false) returns
     // the goal to Active WITHOUT scheduling; it must not resurrect the
     // invalidated reservation.
@@ -340,16 +513,16 @@ async fn newer_resume_supersedes_queued_continuation_and_only_newest_runs() {
     let calls = Arc::new(AtomicUsize::new(0));
     let started = Arc::new(Notify::new());
     let release_first = CancellationToken::new();
-    let session = controlled_usage_session(
-        calls.clone(),
-        started.clone(),
-        release_first.clone(),
-        1,
-    );
-    let application = Application::new(session.clone()).await;
+    let fixture =
+        controlled_usage_fixture(calls.clone(), started.clone(), release_first.clone(), 1);
+    let session = fixture.session();
+    let application = fixture.application().await;
 
     assert_eq!(
-        application.activate_goal("supersede me", Some(100)).await.expect("activate"),
+        application
+            .activate_goal("supersede me", Some(100))
+            .await
+            .expect("activate"),
         GoalActivationOutcome::Started
     );
     wait_for_calls(&calls, &started, 1).await;
@@ -415,16 +588,15 @@ async fn stale_continuation_already_started_then_superseded_still_runs_newest_on
     let calls = Arc::new(AtomicUsize::new(0));
     let started = Arc::new(Notify::new());
     let release_old = CancellationToken::new();
-    let session = controlled_usage_session(
-        calls.clone(),
-        started.clone(),
-        release_old.clone(),
-        2,
-    );
-    let application = Application::new(session.clone()).await;
+    let fixture = controlled_usage_fixture(calls.clone(), started.clone(), release_old.clone(), 2);
+    let session = fixture.session();
+    let application = fixture.application().await;
 
     assert_eq!(
-        application.activate_goal("stale start", Some(100)).await.expect("activate"),
+        application
+            .activate_goal("stale start", Some(100))
+            .await
+            .expect("activate"),
         GoalActivationOutcome::Started
     );
     application.wait_for_idle().await;
@@ -439,7 +611,9 @@ async fn stale_continuation_already_started_then_superseded_still_runs_newest_on
     wait_for_calls(&calls, &started, 2).await;
 
     // While the stale continuation is in flight, pause + newer resume.
-    application.goal_pause().expect("pause while stale turn runs");
+    application
+        .goal_pause()
+        .expect("pause while stale turn runs");
     assert_eq!(
         application.resume_goal_work().await.expect("newer resume"),
         GoalActivationOutcome::Queued
@@ -471,31 +645,10 @@ async fn stale_continuation_already_started_then_superseded_still_runs_newest_on
     );
 }
 
-fn capturing_session(
-    cwd: &std::path::Path,
+fn capturing_fixture(
     contexts: Arc<Mutex<Vec<Context>>>,
     response_count: usize,
-) -> (Session, FauxProviderRegistration) {
-    let suffix = uuid::Uuid::now_v7();
-    let model = Model {
-        id: format!("goal-context-model-{suffix}"),
-        name: "Goal Context Model".to_owned(),
-        api: format!("goal-context-api-{suffix}"),
-        provider: format!("goal-context-provider-{suffix}"),
-        base_url: "http://localhost:0".to_owned(),
-        ..Model::default()
-    };
-    let registration = register_faux_provider(FauxProviderOptions {
-        api: model.api.clone(),
-        provider: model.provider.clone(),
-        models: vec![model.clone()],
-        chunk_size: 64,
-    });
-    registration.set_responses(
-        std::iter::repeat_with(|| FauxResponse::text("done"))
-            .take(response_count)
-            .collect(),
-    );
+) -> HermeticGoalFixture {
     let stream_fn: pi_agent::StreamFn = Arc::new(move |model, context, options| {
         let contexts = contexts.clone();
         Box::pin(async move {
@@ -503,22 +656,13 @@ fn capturing_session(
             pi_ai::stream_simple(model, context, options).await
         })
     });
-    let session = Session::new(SessionOptions {
-        model,
-        cwd: cwd.to_path_buf(),
-        system_prompt: String::new(),
-        thinking_level: pi_agent::ThinkingLevel::Off,
-        api_key: String::new(),
-        compaction: None,
-        stream_options: Default::default(),
-        tools: Some(Vec::new()),
-        before_tool_call: None,
-        after_tool_call: None,
-        stream_fn: Some(stream_fn),
-        auth_resolver: None,
-    })
-    .expect("capturing session");
-    (session, registration)
+    HermeticGoalFixture::new(
+        "goal-context",
+        std::iter::repeat_with(|| FauxResponse::text("done"))
+            .take(response_count)
+            .collect(),
+        Some(stream_fn),
+    )
 }
 
 fn context_text(context: &Context) -> String {
@@ -552,22 +696,10 @@ fn assert_no_active_goal_projection(text: &str) {
 
 #[tokio::test]
 async fn active_goal_is_projected_once_to_provider_but_never_persisted_or_displayed() {
-    let _registry_guard = FAUX_REGISTRY_LOCK.lock().expect("faux registry lock");
-    let directory = tempfile::tempdir().expect("session dir");
     let contexts = Arc::new(Mutex::new(Vec::new()));
-    let (session, registration) = capturing_session(directory.path(), contexts.clone(), 1);
-    let recorder = pi_coding::start_session_in(
-        directory.path(),
-        session.model().as_ref(),
-        Some("off"),
-        Some(directory.path()),
-        Some("goal-model-context"),
-        None,
-    )
-    .expect("recorder");
-    let session_path = recorder.path();
-    session.record(recorder).expect("attach recorder");
-    let application = Application::new(session).await;
+    let fixture = capturing_fixture(contexts.clone(), 1);
+    let session_path = fixture.start_recording("goal-model-context");
+    let application = fixture.application().await;
 
     application
         .goal_create("ship <safely> & preserve context", Some(100))
@@ -583,9 +715,18 @@ async fn active_goal_is_projected_once_to_provider_but_never_persisted_or_displa
     let provider_text = context_text(&contexts[0]);
     assert_eq!(provider_text.matches("<system-reminder>").count(), 1);
     assert_eq!(provider_text.matches("Active session goal (").count(), 1);
-    assert!(provider_text.contains("revision 1, lifecycle active"), "{provider_text}");
-    assert!(provider_text.contains("Objective: ship &lt;safely&gt; &amp; preserve context"), "{provider_text}");
-    assert!(provider_text.contains("Token budget: 0/100."), "{provider_text}");
+    assert!(
+        provider_text.contains("revision 1, lifecycle active"),
+        "{provider_text}"
+    );
+    assert!(
+        provider_text.contains("Objective: ship &lt;safely&gt; &amp; preserve context"),
+        "{provider_text}"
+    );
+    assert!(
+        provider_text.contains("Token budget: 0/100."),
+        "{provider_text}"
+    );
     drop(contexts);
 
     let transcript = serde_json::to_string(&application.messages()).expect("transcript JSON");
@@ -596,25 +737,34 @@ async fn active_goal_is_projected_once_to_provider_but_never_persisted_or_displa
     let persisted = std::fs::read_to_string(&session_path).expect("session JSONL");
     assert_no_active_goal_projection(&persisted);
 
-    let html_path = directory.path().join("goal.html");
-    application.export_html(Some(&html_path)).expect("HTML export");
+    let html_path = fixture.workspace().join("goal.html");
+    application
+        .export_html(Some(&html_path))
+        .expect("HTML export");
     assert_no_active_goal_projection(&std::fs::read_to_string(html_path).expect("HTML"));
-    let jsonl_path = directory.path().join("goal-export.jsonl");
-    application.export_jsonl(Some(&jsonl_path)).expect("JSONL export");
+    let jsonl_path = fixture.workspace().join("goal-export.jsonl");
+    application
+        .export_jsonl(Some(&jsonl_path))
+        .expect("JSONL export");
     assert_no_active_goal_projection(&std::fs::read_to_string(jsonl_path).expect("JSONL"));
-    registration.unregister();
 }
 
 #[tokio::test]
 async fn goal_pins_are_projected_into_the_goal_turn_context() {
-    let _registry_guard = FAUX_REGISTRY_LOCK.lock().expect("faux registry lock");
-    let directory = tempfile::tempdir().expect("cwd");
     let contexts = Arc::new(Mutex::new(Vec::new()));
-    let (session, registration) = capturing_session(directory.path(), contexts.clone(), 1);
+    let fixture = capturing_fixture(contexts.clone(), 1);
+    let application = fixture.application().await;
+    let session = application.session();
     let runtime = session.goal_runtime();
-    runtime.create("pinned change", Some(100)).expect("create goal");
-    runtime.pin("keep <safely> & in scope").expect("pin with escapes");
-    runtime.pin("follow the omp skill-card style").expect("second pin");
+    runtime
+        .create("pinned change", Some(100))
+        .expect("create goal");
+    runtime
+        .pin("keep <safely> & in scope")
+        .expect("pin with escapes");
+    runtime
+        .pin("follow the omp skill-card style")
+        .expect("second pin");
     session.run("work", Vec::new()).await.expect("pinned turn");
 
     let contexts = contexts.lock().expect("contexts");
@@ -634,24 +784,31 @@ async fn goal_pins_are_projected_into_the_goal_turn_context() {
     );
     assert_eq!(provider_text.matches("Role-model pins:").count(), 1);
     drop(contexts);
-    registration.unregister();
 }
 
 #[tokio::test]
 async fn goal_projection_refreshes_lifecycle_revision_and_usage_on_each_provider_call() {
-    let _registry_guard = FAUX_REGISTRY_LOCK.lock().expect("faux registry lock");
-    let directory = tempfile::tempdir().expect("cwd");
     let contexts = Arc::new(Mutex::new(Vec::new()));
-    let (session, registration) = capturing_session(directory.path(), contexts.clone(), 3);
+    let fixture = capturing_fixture(contexts.clone(), 3);
+    let application = fixture.application().await;
+    let session = application.session();
     let runtime = session.goal_runtime();
-    runtime.create("finish the focused change", Some(20)).expect("create");
-    session.run("active", Vec::new()).await.expect("active turn");
+    runtime
+        .create("finish the focused change", Some(20))
+        .expect("create");
+    session
+        .run("active", Vec::new())
+        .await
+        .expect("active turn");
 
     runtime
         .update_usage(GoalUsageDelta::new(3, 7))
         .expect("charge usage");
     runtime.pause().expect("pause");
-    session.run("paused", Vec::new()).await.expect("paused turn");
+    session
+        .run("paused", Vec::new())
+        .await
+        .expect("paused turn");
 
     runtime.complete().expect("complete");
     session
@@ -671,38 +828,44 @@ async fn goal_projection_refreshes_lifecycle_revision_and_usage_on_each_provider
     assert!(active.contains("Token budget: 0/20."), "{active}");
     assert!(paused.contains("revision 3, lifecycle paused"), "{paused}");
     assert!(paused.contains("Token budget: 3/20."), "{paused}");
-    assert!(completed.contains("revision 4, lifecycle completed"), "{completed}");
+    assert!(
+        completed.contains("revision 4, lifecycle completed"),
+        "{completed}"
+    );
     assert!(completed.contains("Token budget: 3/20."), "{completed}");
     drop(contexts);
     assert_no_active_goal_projection(
         &serde_json::to_string(&session.history()).expect("history JSON"),
     );
-    registration.unregister();
 }
 
 #[tokio::test]
 async fn absent_and_dropped_goals_emit_no_provider_projection() {
-    let _registry_guard = FAUX_REGISTRY_LOCK.lock().expect("faux registry lock");
-    let directory = tempfile::tempdir().expect("cwd");
     let contexts = Arc::new(Mutex::new(Vec::new()));
-    let (session, registration) = capturing_session(directory.path(), contexts.clone(), 2);
-    session.run("absent", Vec::new()).await.expect("absent turn");
+    let fixture = capturing_fixture(contexts.clone(), 2);
+    let application = fixture.application().await;
+    let session = application.session();
+    session
+        .run("absent", Vec::new())
+        .await
+        .expect("absent turn");
     let runtime = session.goal_runtime();
     runtime.create("discard this goal", None).expect("create");
     runtime.drop().expect("drop");
-    session.run("dropped", Vec::new()).await.expect("dropped turn");
+    session
+        .run("dropped", Vec::new())
+        .await
+        .expect("dropped turn");
 
     let contexts = contexts.lock().expect("contexts");
     assert_eq!(contexts.len(), 2);
     assert_no_active_goal_projection(&context_text(&contexts[0]));
     assert_no_active_goal_projection(&context_text(&contexts[1]));
-    registration.unregister();
 }
 
 #[tokio::test]
 async fn application_charges_post_turn_usage_once_and_pauses_at_budget() {
-    let directory = tempfile::tempdir().expect("session dir");
-    let session = usage_session(Usage {
+    let fixture = usage_fixture(Usage {
         input: 7,
         output: 3,
         cache_read: 2,
@@ -710,20 +873,8 @@ async fn application_charges_post_turn_usage_once_and_pauses_at_budget() {
         total_tokens: 13,
         ..Usage::default()
     });
-    session
-        .record(
-            pi_coding::start_session_in(
-                std::env::current_dir().expect("cwd"),
-                session.model().as_ref(),
-                Some("off"),
-                Some(directory.path()),
-                Some("application-goal-usage"),
-                None,
-            )
-            .expect("recorder"),
-        )
-        .expect("attach recorder");
-    let application = Application::new(session).await;
+    fixture.start_recording("application-goal-usage");
+    let application = fixture.application().await;
     application
         .goal_create("finish within budget", Some(13))
         .expect("create goal");
@@ -750,43 +901,41 @@ async fn application_charges_post_turn_usage_once_and_pauses_at_budget() {
 
 #[tokio::test]
 async fn application_resume_safety_and_fork_lineage_rebuild_goal_runtime() {
-    let directory = tempfile::tempdir().expect("session dir");
-    let first = usage_session(Usage::default());
-    let first_recorder = pi_coding::start_session_in(
-        std::env::current_dir().expect("cwd"),
-        first.model().as_ref(),
-        Some("off"),
-        Some(directory.path()),
-        Some("goal-source"),
-        None,
-    )
-    .expect("source recorder");
-    let source_path = first_recorder.path();
-    first.record(first_recorder).expect("attach source recorder");
-    let source = Application::new(first).await;
-    let original = source.goal_create("preserve lineage", Some(50)).expect("goal");
+    let source_fixture = usage_fixture(Usage::default());
+    let source_path = source_fixture.start_recording("goal-source");
+    let source = source_fixture.application().await;
+    let original = source
+        .goal_create("preserve lineage", Some(50))
+        .expect("goal");
 
-    let resumed_session = usage_session(Usage::default());
-    resumed_session
+    let resumed_fixture = usage_fixture(Usage::default());
+    resumed_fixture
+        .session()
         .record(pi_coding::resume_session(&source_path).expect("resume recorder"))
         .expect("attach resumed recorder");
-    let resumed = Application::new(resumed_session).await;
+    let resumed = resumed_fixture.application().await;
     resumed.prepare_resumed_goal(false).expect("resume safety");
     let resumed_goal = resumed.goal_state().current.expect("resumed goal");
     assert_eq!(resumed_goal.id, original.id);
     assert_eq!(resumed_goal.lifecycle, GoalLifecycle::Paused);
-    assert_eq!(resumed_goal.pause_reason, Some(GoalPauseReason::ResumeSafety));
+    assert_eq!(
+        resumed_goal.pause_reason,
+        Some(GoalPauseReason::ResumeSafety)
+    );
 
+    let fork_fixture = usage_fixture(Usage::default());
     let fork_recorder = pi_coding::fork_session_in(
         &source_path,
-        std::env::current_dir().expect("cwd"),
-        Some(directory.path()),
+        fork_fixture.workspace(),
+        Some(fork_fixture.session_dir()),
         Some("goal-fork"),
     )
     .expect("fork recorder");
-    let fork = usage_session(Usage::default());
-    fork.record(fork_recorder).expect("attach fork recorder");
-    let fork = Application::new(fork).await;
+    fork_fixture
+        .session()
+        .record(fork_recorder)
+        .expect("attach fork recorder");
+    let fork = fork_fixture.application().await;
     fork.prepare_resumed_goal(true).expect("fork goal");
     let forked = fork.goal_state().current.expect("forked goal");
     assert_ne!(forked.id, original.id);

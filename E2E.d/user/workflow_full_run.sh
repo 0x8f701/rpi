@@ -94,7 +94,7 @@ EOF
     tmux new-session -d -s "$session" -x 150 -y 44 -c "$root/workspace" \
         "env HOME='$root/home' USERPROFILE='$root/home' \
 PI_CODING_AGENT_DIR='$root/home/.pi/agent' \
-PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 \
+RPI_OFFLINE=1 RPI_SKIP_VERSION_CHECK=1 \
 TERM=xterm-256color \
 '$RPI_BIN' --offline --model user-workflow/mock --api-key user-mock-key; printf '===TUI-DONE-workflow-full-run===\n'"
 
@@ -125,12 +125,16 @@ TERM=xterm-256color \
     wait_for 'ship-flow' 20
     wait_for 'completed' 20
 
-    # --- Detail page: Status + Todo DAG + Integration sections ---
+    # --- Detail pages: Todo tasks, status, then Integration. ---
     tmux send-keys -t "$session":0 Enter
-    wait_for 'Todo DAG' 30
+    tmux send-keys -t "$session":0 -l '.'
     wait_for 'compile widget' 30
     wait_for 'ship widget' 30
     wait_for 'Status' 15
+    local section
+    for section in 1 2 3 4 5; do
+        tmux send-keys -t "$session":0 -l '.'
+    done
     wait_for 'Integrated' 30
 
     # Close the panel.

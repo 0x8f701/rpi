@@ -8,7 +8,7 @@
 //! - Fresh non-explicit Application attachment binds before parent JSONL creation
 //! - Child JSONL lives under `<parent-dir>/children/<parent-id>/` with
 //!   parentSession linkage; pathful and pathless revival append real turns
-//! - Interrupted agents recover as Parked; unsettled jobs as Cancelled
+//! - Interrupted agents recover as Queued for revival; unsettled jobs keep Running
 //! - Mailbox contents restore across runtime reconstruction
 //! - Parked send returns Revived; concurrent sends claim at most one revival job
 //! - Running Woken delivery is durable before active steering (not exactly-once)
@@ -30,10 +30,11 @@ use pi_agent::{AbortController, AgentTool, ThinkingLevel, ToolCallContext};
 use pi_ai::{Model, StopReason};
 use pi_coding::{
     AgentCatalog, AgentDefinition, AgentDefinitionSource, AgentSnapshot, AgentStatus, Application,
-    ChildSessionFactory, DURABLE_STATE_VERSION, DeliveryOutcome, DeliveryReceipt, DurableRuntime,
-    DurableState, JobSnapshot, JobStatus, MailboxMessage, OrchestrationConfig,
-    OrchestrationRuntime, PersistedAgent, PersistedDefinition, PersistedRequest, Session,
-    SessionOptions, TaskSpawn, start_durable_child_session_in, start_session_in,
+    ApplicationRuntimeCandidate, ChildSessionFactory, DURABLE_STATE_VERSION, DeliveryOutcome,
+    DeliveryReceipt, DurableState, JobSnapshot, JobStatus, MailboxMessage, OrchestrationConfig,
+    OrchestrationRuntime, PersistedAgent, PersistedDefinition, PersistedRequest, ResourceManager,
+    ResourceManagerOptions, Session, SessionOptions, TaskSpawn, start_durable_child_session_in,
+    start_session_in,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Barrier, Notify};
@@ -59,6 +60,8 @@ fn task_definition() -> AgentDefinition {
         kind: pi_coding::AgentDefinitionKind::Agent,
         personality: None,
         soft_budget: None,
+        knowledge_roots: Vec::new(),
+        user_proxy: false,
     }
 }
 
@@ -82,6 +85,8 @@ fn reviewer_definition() -> AgentDefinition {
         kind: pi_coding::AgentDefinitionKind::Agent,
         personality: None,
         soft_budget: None,
+        knowledge_roots: Vec::new(),
+        user_proxy: false,
     }
 }
 
@@ -89,8 +94,8 @@ fn test_model() -> Model {
     Model {
         id: "durable-orch-e2e".to_owned(),
         name: "Durable Orch E2E".to_owned(),
-        api: "durable-orch-e2e".to_owned(),
-        provider: "durable-orch-e2e".to_owned(),
+        api: pi_ai::API_FAUX.to_owned(),
+        provider: "faux".to_owned(),
         ..Model::default()
     }
 }
@@ -110,6 +115,7 @@ fn context(id: &str, arguments: Value) -> ToolCallContext {
         on_update: Arc::new(|_| {}),
         abort,
         model: None,
+        approval_token: None,
     }
 }
 
@@ -133,20 +139,26 @@ fn quick_factory(response_text: &'static str) -> ChildSessionFactory {
                     stream
                 })
             });
-            Session::new(SessionOptions {
-                model: request.model,
-                cwd: std::env::current_dir().expect("cwd"),
-                system_prompt: request.system_prompt,
-                thinking_level: ThinkingLevel::Off,
-                api_key: String::new(),
-                compaction: None,
-                stream_options: Default::default(),
-                tools: Some(request.orchestration_tools),
-                before_tool_call: None,
-                after_tool_call: None,
-                stream_fn: Some(stream_fn),
-                auth_resolver: None,
-            })
+            Session::new_with_additional_tools_filtered_and_discovery(
+                SessionOptions {
+                    model: request.model,
+                    cwd: std::env::current_dir().expect("cwd"),
+                    system_prompt: request.system_prompt,
+                    thinking_level: ThinkingLevel::Off,
+                    api_key: String::new(),
+                    compaction: None,
+                    stream_options: Default::default(),
+                    tools: Some(request.orchestration_tools),
+                    before_tool_call: None,
+                    after_tool_call: None,
+                    stream_fn: Some(stream_fn),
+                    auth_resolver: None,
+                    auth_manager: None,
+                },
+                Vec::new(),
+                Default::default(),
+                pi_coding::ResourceDiscovery::Disabled,
+            )
         })
     })
 }
@@ -179,20 +191,26 @@ fn capturing_factory(
                     stream
                 })
             });
-            Session::new(SessionOptions {
-                model: request.model,
-                cwd: std::env::current_dir().expect("cwd"),
-                system_prompt: request.system_prompt,
-                thinking_level: ThinkingLevel::Off,
-                api_key: String::new(),
-                compaction: None,
-                stream_options: Default::default(),
-                tools: Some(request.orchestration_tools),
-                before_tool_call: None,
-                after_tool_call: None,
-                stream_fn: Some(stream_fn),
-                auth_resolver: None,
-            })
+            Session::new_with_additional_tools_filtered_and_discovery(
+                SessionOptions {
+                    model: request.model,
+                    cwd: std::env::current_dir().expect("cwd"),
+                    system_prompt: request.system_prompt,
+                    thinking_level: ThinkingLevel::Off,
+                    api_key: String::new(),
+                    compaction: None,
+                    stream_options: Default::default(),
+                    tools: Some(request.orchestration_tools),
+                    before_tool_call: None,
+                    after_tool_call: None,
+                    stream_fn: Some(stream_fn),
+                    auth_resolver: None,
+                    auth_manager: None,
+                },
+                Vec::new(),
+                Default::default(),
+                pi_coding::ResourceDiscovery::Disabled,
+            )
         })
     })
 }
@@ -221,20 +239,26 @@ fn blocking_factory(started: Arc<Notify>, release: CancellationToken) -> ChildSe
                     stream
                 })
             });
-            Session::new(SessionOptions {
-                model: request.model,
-                cwd: std::env::current_dir().expect("cwd"),
-                system_prompt: request.system_prompt,
-                thinking_level: ThinkingLevel::Off,
-                api_key: String::new(),
-                compaction: None,
-                stream_options: Default::default(),
-                tools: Some(request.orchestration_tools),
-                before_tool_call: None,
-                after_tool_call: None,
-                stream_fn: Some(stream_fn),
-                auth_resolver: None,
-            })
+            Session::new_with_additional_tools_filtered_and_discovery(
+                SessionOptions {
+                    model: request.model,
+                    cwd: std::env::current_dir().expect("cwd"),
+                    system_prompt: request.system_prompt,
+                    thinking_level: ThinkingLevel::Off,
+                    api_key: String::new(),
+                    compaction: None,
+                    stream_options: Default::default(),
+                    tools: Some(request.orchestration_tools),
+                    before_tool_call: None,
+                    after_tool_call: None,
+                    stream_fn: Some(stream_fn),
+                    auth_resolver: None,
+                    auth_manager: None,
+                },
+                Vec::new(),
+                Default::default(),
+                pi_coding::ResourceDiscovery::Disabled,
+            )
         })
     })
 }
@@ -261,20 +285,26 @@ fn parent_session(artifacts: &Path, session_dir: &Path) -> (Session, String, Pat
         .expect("materialize real parent header for durable fixture");
     let parent_id = recorder.id();
     let parent_path = recorder.path();
-    let parent = Session::new(SessionOptions {
-        model: test_model(),
-        cwd: artifacts.to_path_buf(),
-        system_prompt: String::new(),
-        thinking_level: ThinkingLevel::Off,
-        api_key: String::new(),
-        compaction: None,
-        stream_options: Default::default(),
-        tools: Some(Vec::new()),
-        before_tool_call: None,
-        after_tool_call: None,
-        stream_fn: None,
-        auth_resolver: None,
-    })
+    let parent = Session::new_with_additional_tools_filtered_and_discovery(
+        SessionOptions {
+            model: test_model(),
+            cwd: artifacts.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+            auth_manager: None,
+        },
+        Vec::new(),
+        Default::default(),
+        pi_coding::ResourceDiscovery::Disabled,
+    )
     .expect("parent session");
     parent.set_session_dir(session_dir.to_path_buf());
     parent.record(recorder).expect("attach parent recorder");
@@ -301,23 +331,31 @@ fn fresh_unmaterialized_parent_session(
         "fresh non-explicit recorder stays pending before its first real turn: {}",
         parent_path.display()
     );
-    let parent = Session::new(SessionOptions {
-        model: test_model(),
-        cwd: artifacts.to_path_buf(),
-        system_prompt: String::new(),
-        thinking_level: ThinkingLevel::Off,
-        api_key: String::new(),
-        compaction: None,
-        stream_options: Default::default(),
-        tools: Some(Vec::new()),
-        before_tool_call: None,
-        after_tool_call: None,
-        stream_fn: None,
-        auth_resolver: None,
-    })
+    let parent = Session::new_with_additional_tools_filtered_and_discovery(
+        SessionOptions {
+            model: test_model(),
+            cwd: artifacts.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+            auth_manager: None,
+        },
+        Vec::new(),
+        Default::default(),
+        pi_coding::ResourceDiscovery::Disabled,
+    )
     .expect("fresh parent session");
     parent.set_session_dir(session_dir.to_path_buf());
-    parent.record(recorder).expect("attach fresh parent recorder");
+    parent
+        .record(recorder)
+        .expect("attach fresh parent recorder");
     (parent, parent_id, parent_path)
 }
 
@@ -336,23 +374,31 @@ fn parent_session_with_id(
     )
     .expect("explicit parent recorder");
     let parent_path = recorder.path();
-    let parent = Session::new(SessionOptions {
-        model: test_model(),
-        cwd: artifacts.to_path_buf(),
-        system_prompt: String::new(),
-        thinking_level: ThinkingLevel::Off,
-        api_key: String::new(),
-        compaction: None,
-        stream_options: Default::default(),
-        tools: Some(Vec::new()),
-        before_tool_call: None,
-        after_tool_call: None,
-        stream_fn: None,
-        auth_resolver: None,
-    })
+    let parent = Session::new_with_additional_tools_filtered_and_discovery(
+        SessionOptions {
+            model: test_model(),
+            cwd: artifacts.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+            auth_manager: None,
+        },
+        Vec::new(),
+        Default::default(),
+        pi_coding::ResourceDiscovery::Disabled,
+    )
     .expect("explicit parent session");
     parent.set_session_dir(session_dir.to_path_buf());
-    parent.record(recorder).expect("attach explicit parent recorder");
+    parent
+        .record(recorder)
+        .expect("attach explicit parent recorder");
     (parent, parent_path)
 }
 
@@ -395,6 +441,57 @@ fn plant_child_jsonl(child_root: &Path, parent_path: &Path, marker: &str) -> Pat
     );
     contents.push('\n');
     std::fs::write(&path, contents).expect("plant child history");
+    path
+}
+
+fn plant_child_jsonl_with_orphan_tool_call(
+    child_root: &Path,
+    parent_path: &Path,
+    marker: &str,
+    tool_call_id: &str,
+    tool_name: &str,
+) -> PathBuf {
+    let path = plant_child_jsonl(child_root, parent_path, marker);
+    let mut contents = std::fs::read_to_string(&path).expect("read planted child jsonl");
+    contents.push_str(
+        &serde_json::json!({
+            "type": "message",
+            "id": "assistant-orphan-tool",
+            "parentId": "user-marker",
+            "timestamp": "2026-01-01T00:00:01.000Z",
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "toolCall",
+                    "id": tool_call_id,
+                    "name": tool_name,
+                    "arguments": {"command": "echo once"}
+                }],
+                "api": test_model().api,
+                "provider": test_model().provider,
+                "model": test_model().id,
+                "usage": {
+                    "input": 0,
+                    "output": 0,
+                    "cacheRead": 0,
+                    "cacheWrite": 0,
+                    "totalTokens": 0,
+                    "cost": {
+                        "input": 0.0,
+                        "output": 0.0,
+                        "cacheRead": 0.0,
+                        "cacheWrite": 0.0,
+                        "total": 0.0
+                    }
+                },
+                "stopReason": "toolUse",
+                "timestamp": 1
+            }
+        })
+        .to_string(),
+    );
+    contents.push('\n');
+    std::fs::write(&path, contents).expect("plant orphan tool call");
     path
 }
 
@@ -481,55 +578,203 @@ fn running_job(id: &str, agent_id: &str) -> JobSnapshot {
     }
 }
 
-fn plant_sidecar(
-    parent_id: &str,
-    parent_path: &Path,
+async fn application_with_orchestration_and_optional_bindings(
+    parent: &Session,
+    runtime: OrchestrationRuntime,
+    bindings: Option<(pi_coding::GoalToolBinding, pi_coding::TodoChildToolBinding)>,
+) -> anyhow::Result<Application> {
+    let agent_dir = parent
+        .session_dir()
+        .join("agents")
+        .join(uuid::Uuid::now_v7().to_string());
+    std::fs::create_dir_all(&agent_dir)?;
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+    )?;
+    let mut options = ResourceManagerOptions::new(parent.cwd());
+    options.agent_dir = agent_dir;
+    options.disable_extensions = true;
+    options.disable_skills = true;
+    options.disable_prompt_templates = true;
+    options.disable_themes = true;
+    options.disable_context_files = true;
+    parent
+        .attach_resources(ResourceManager::new(options)?)
+        .await?;
+    let mut candidate =
+        ApplicationRuntimeCandidate::new(parent.clone()).with_orchestration(runtime);
+    if let Some((goal_tool, todo_child_tool)) = bindings {
+        candidate = candidate
+            .with_goal_tool(goal_tool)
+            .with_todo_child_tool(todo_child_tool);
+    }
+    Application::from_runtime_candidate(candidate).await
+}
+
+async fn application_with_orchestration(
+    parent: &Session,
+    runtime: OrchestrationRuntime,
+) -> anyhow::Result<Application> {
+    application_with_orchestration_and_optional_bindings(parent, runtime, None).await
+}
+
+async fn application_with_isolated_resources(parent: &Session) -> anyhow::Result<Application> {
+    let agent_dir = parent
+        .session_dir()
+        .join("agents")
+        .join(uuid::Uuid::now_v7().to_string());
+    std::fs::create_dir_all(&agent_dir)?;
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+    )?;
+    let mut options = ResourceManagerOptions::new(parent.cwd());
+    options.agent_dir = agent_dir;
+    options.disable_extensions = true;
+    options.disable_skills = true;
+    options.disable_prompt_templates = true;
+    options.disable_themes = true;
+    options.disable_context_files = true;
+    parent
+        .attach_resources(ResourceManager::new(options)?)
+        .await?;
+    Ok(Application::new(parent.clone()).await)
+}
+
+fn restarted_parent_session(parent: &Session) -> anyhow::Result<Session> {
+    let (_, parent_path) = parent
+        .recorder_info()
+        .ok_or_else(|| anyhow::anyhow!("parent recording is unavailable"))?;
+    let restarted = Session::new_with_additional_tools_filtered_and_discovery(
+        SessionOptions {
+            model: test_model(),
+            cwd: parent.cwd().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+            auth_manager: None,
+        },
+        Vec::new(),
+        Default::default(),
+        pi_coding::ResourceDiscovery::Disabled,
+    )?;
+    restarted.set_session_dir(parent.session_dir());
+    restarted.record(pi_coding::resume_session(parent_path)?)?;
+    Ok(restarted)
+}
+
+async fn plant_sidecar(
+    parent: &Session,
+    artifacts: &Path,
     agents: Vec<PersistedAgent>,
     jobs: Vec<JobSnapshot>,
 ) -> PathBuf {
-    let child_root = child_root_for(parent_path, parent_id);
-    let durable = DurableRuntime::new(parent_id.to_owned(), parent_path.to_path_buf(), child_root)
-        .expect("durable runtime");
-    // Persist using the canonical parent path DurableRuntime bound to.
+    let (parent_id, parent_path) = parent.recorder_info().expect("parent recorder");
+    let child_root = child_root_for(&parent_path, &parent_id);
+    let seed_runtime = OrchestrationRuntime::new(
+        config(artifacts, vec![task_definition(), reviewer_definition()]),
+        quick_factory("unused durable fixture owner"),
+    )
+    .expect("durable fixture runtime");
+    let application = application_with_orchestration(parent, seed_runtime)
+        .await
+        .expect("production durable fixture owner");
+    let durable_policy = application
+        .durable_policy_state()
+        .expect("live generation durable policy");
+    let sidecar = child_root.join("orchestration-state.json");
+    application.cleanup().await;
+
     let mut agents = agents;
     for agent in &mut agents {
-        if let Some(session_path) = agent.session_path.take() {
-            let canonical = durable
-                .canonicalize_child_session_path(Path::new(&session_path))
-                .unwrap_or_else(|error| {
-                    panic!("planted child session path must canonicalize: {error:#}")
-                });
-            agent.session_path = Some(canonical.to_string_lossy().into_owned());
+        if let Some(session_path) = agent.session_path.as_mut() {
+            let canonical = std::fs::canonicalize(&*session_path)
+                .unwrap_or_else(|error| panic!("canonicalize planted child session: {error}"));
+            assert!(
+                canonical.starts_with(&child_root),
+                "planted child session escapes durable root: {} vs {}",
+                canonical.display(),
+                child_root.display()
+            );
+            *session_path = canonical.to_string_lossy().into_owned();
         }
     }
     let state = DurableState {
         version: DURABLE_STATE_VERSION,
-        parent_session_id: durable.parent_session_id().to_owned(),
-        parent_session_path: durable
-            .parent_session_path()
-            .to_string_lossy()
-            .into_owned(),
+        parent_session_id: parent_id,
+        parent_session_path: parent_path.to_string_lossy().into_owned(),
+        group_id: uuid::Uuid::now_v7().to_string(),
+        durable_policy,
         main_mailbox: Vec::new(),
+        delivered_messages: Vec::new(),
         agents,
         jobs,
     };
-    durable.persist(&state).expect("plant sidecar");
-    durable.sidecar_path().to_path_buf()
+    std::fs::write(
+        &sidecar,
+        serde_json::to_vec_pretty(&state).expect("serialize planted durable state"),
+    )
+    .expect("plant durable sidecar");
+    sidecar
 }
 
-/// Planted-sidecar path: bind without writing, then strict recover (errors if missing).
-fn bind_then_recover_existing(runtime: &OrchestrationRuntime, parent: &Session) {
-    runtime
-        .bind_parent_session(parent)
-        .expect("bind parent session");
-    runtime.recover().expect("recover existing durable state");
+fn load_sidecar(parent_path: &Path, parent_id: &str) -> DurableState {
+    serde_json::from_slice(
+        &std::fs::read(child_root_for(parent_path, parent_id).join("orchestration-state.json"))
+            .expect("read durable sidecar"),
+    )
+    .expect("decode durable sidecar")
 }
 
-/// Fresh-parent path: public recover-or-initialize after bind.
-fn bind_fresh_parent(runtime: &OrchestrationRuntime, parent: &Session) {
+/// Planted-sidecar path: production application ownership performs strict recovery.
+async fn bind_then_recover_existing(
+    runtime: &OrchestrationRuntime,
+    parent: &Session,
+) -> Application {
+    let restarted = restarted_parent_session(parent).expect("reopen durable parent recording");
+    application_with_orchestration(&restarted, runtime.clone())
+        .await
+        .expect("recover existing durable runtime")
+}
+
+/// Fresh-parent path: production application ownership initializes after binding.
+async fn bind_fresh_parent(runtime: &OrchestrationRuntime, parent: &Session) -> Application {
+    application_with_orchestration(parent, runtime.clone())
+        .await
+        .expect("bind and initialize durable application owner")
+}
+
+async fn spawn_persistent_worker(runtime: &OrchestrationRuntime) {
+    let spawn = runtime
+        .spawn_tasks(
+            runtime.main_agent_id(),
+            0,
+            vec![pi_coding::TaskItem {
+                index: 0,
+                id: "Worker".to_owned(),
+                agent: "task".to_owned(),
+                assignment: "establish durable sender identity".to_owned(),
+                todo_task_id: None,
+                ..Default::default()
+            }],
+        )
+        .expect("spawn durable Worker");
     runtime
-        .bind_and_recover(parent)
-        .expect("bind and recover/initialize parent");
+        .wait_jobs(
+            &[spawn[0].job_id.clone()],
+            Some(Duration::from_secs(5)),
+            None,
+        )
+        .await
+        .expect("settle durable Worker");
 }
 
 fn receipts_from_send(
@@ -541,10 +786,11 @@ fn receipts_from_send(
     runtime.send(from, to, body, None)
 }
 
-/// Existing sidecar must load on the second runtime: Parked agent, Cancelled
-/// interrupted job, and restored mailbox — without bind wiping state first.
+/// Existing sidecar must load on the second runtime: Queued agent, Running
+/// unsettled job, and restored mailbox — without bind wiping state first.
+/// Unsettled jobs keep Running for revival; the agent is queued for revival.
 #[tokio::test]
-async fn two_runtime_restart_recovers_parked_cancelled_and_mailbox() {
+async fn two_runtime_restart_recovers_queued_running_and_mailbox() {
     let artifacts = tempfile::tempdir().expect("artifacts");
     let sessions = tempfile::tempdir().expect("sessions");
     let (parent, parent_id, parent_path) = parent_session(artifacts.path(), sessions.path());
@@ -559,8 +805,8 @@ async fn two_runtime_restart_recovers_parked_cancelled_and_mailbox() {
         reply_to: None,
     };
     let sidecar = plant_sidecar(
-        &parent_id,
-        &parent_path,
+        &parent,
+        artifacts.path(),
         vec![persisted_worker(
             "Worker",
             AgentStatus::Running,
@@ -569,8 +815,13 @@ async fn two_runtime_restart_recovers_parked_cancelled_and_mailbox() {
             vec![mail.clone()],
         )],
         vec![running_job("job-running-1", "Worker")],
+    )
+    .await;
+    assert!(
+        sidecar.is_file(),
+        "sidecar planted at {}",
+        sidecar.display()
     );
-    assert!(sidecar.is_file(), "sidecar planted at {}", sidecar.display());
 
     let runtime_a = OrchestrationRuntime::new(
         config(artifacts.path(), vec![task_definition()]),
@@ -583,7 +834,7 @@ async fn two_runtime_restart_recovers_parked_cancelled_and_mailbox() {
         quick_factory("from B"),
     )
     .expect("runtime B");
-    bind_then_recover_existing(&runtime_b, &parent);
+    let _application = bind_then_recover_existing(&runtime_b, &parent).await;
 
     let peers = runtime_b.list("Main");
     let worker = peers
@@ -592,8 +843,8 @@ async fn two_runtime_restart_recovers_parked_cancelled_and_mailbox() {
         .unwrap_or_else(|| panic!("Worker must recover; peers={peers:?}"));
     assert_eq!(
         worker.status,
-        AgentStatus::Parked,
-        "interrupted Running agent recovers as Parked"
+        AgentStatus::Queued,
+        "interrupted Running agent recovers as Queued for revival"
     );
     assert_eq!(worker.agent, "task", "agent type survives recovery");
 
@@ -604,19 +855,20 @@ async fn two_runtime_restart_recovers_parked_cancelled_and_mailbox() {
         .unwrap_or_else(|| panic!("interrupted job must recover; jobs={jobs:?}"));
     assert_eq!(
         job.status,
-        JobStatus::Cancelled,
-        "unsettled job recovers as Cancelled (truthful interruption)"
+        JobStatus::Running,
+        "unsettled job keeps Running for revival"
     );
     assert!(
-        job.result
-            .as_ref()
-            .and_then(|result| result.error.as_ref())
-            .is_some_and(|error| error.contains("interrupted")),
-        "cancelled job carries interruption context: {:?}",
+        job.result.is_none(),
+        "unsettled job carries no synthetic result: {:?}",
         job.result
     );
+    assert_eq!(
+        job.finished_at, None,
+        "unsettled job is not finished on recovery"
+    );
 
-    let inbox = runtime_b.inbox("Worker", true);
+    let inbox = runtime_b.inbox("Worker", true).expect("inbox");
     assert_eq!(
         inbox.len(),
         1,
@@ -627,7 +879,13 @@ async fn two_runtime_restart_recovers_parked_cancelled_and_mailbox() {
 
     let root_entries: Vec<_> = std::fs::read_dir(sessions.path())
         .expect("read session root")
-        .map(|entry| entry.expect("entry").file_name().to_string_lossy().into_owned())
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect();
     assert!(
         root_entries.iter().any(|name| name.ends_with(".jsonl")),
@@ -656,6 +914,139 @@ async fn two_runtime_restart_recovers_parked_cancelled_and_mailbox() {
     runtime_b.shutdown().await;
 }
 
+#[tokio::test]
+async fn restart_reconciles_started_no_result_tool_without_replay() {
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let sessions = tempfile::tempdir().expect("sessions");
+    let (parent, parent_id, parent_path) = parent_session(artifacts.path(), sessions.path());
+    let child_root = child_root_for(&parent_path, &parent_id);
+    let executions = Arc::new(AtomicUsize::new(0));
+    let child_jsonl = plant_child_jsonl_with_orphan_tool_call(
+        &child_root,
+        &parent_path,
+        "started-no-result assignment",
+        "call-started-no-result",
+        "side_effect",
+    );
+    let _sidecar = plant_sidecar(
+        &parent,
+        artifacts.path(),
+        vec![persisted_worker(
+            "Worker",
+            AgentStatus::Running,
+            "do durable work",
+            Some(&child_jsonl),
+            Vec::new(),
+        )],
+        vec![running_job("job-running-1", "Worker")],
+    )
+    .await;
+
+    let executions_for_factory = executions.clone();
+    let factory: ChildSessionFactory = Arc::new(move |request| {
+        let executions = executions_for_factory.clone();
+        Box::pin(async move {
+            let side_effect = AgentTool::new(
+                "side_effect",
+                "Must not replay after restart.",
+                pi_ai::Schema::object_ordered(vec![(
+                    "command".to_owned(),
+                    pi_ai::Schema::string(),
+                    true,
+                )]),
+                move |_context| {
+                    let executions = executions.clone();
+                    async move {
+                        executions.fetch_add(1, Ordering::SeqCst);
+                        Ok(pi_agent::AgentToolResult::text("side-effect executed"))
+                    }
+                },
+            );
+            let stream_fn: pi_agent::StreamFn = Arc::new(move |model, _ctx, _opts| {
+                Box::pin(async move {
+                    let stream = pi_ai::new_assistant_message_event_stream();
+                    let producer = stream.clone();
+                    tokio::spawn(async move {
+                        let mut message = pi_ai::AssistantMessage::pending(&model);
+                        message.content.push(pi_ai::ContentBlock::text(
+                            "continued after interrupted tool",
+                        ));
+                        message.stop_reason = StopReason::Stop;
+                        producer.end(Some(message)).await;
+                    });
+                    stream
+                })
+            });
+            let mut tools = request.orchestration_tools;
+            tools.push(side_effect);
+            Session::new_with_additional_tools_filtered_and_discovery(
+                SessionOptions {
+                    model: request.model,
+                    cwd: std::env::current_dir().expect("cwd"),
+                    system_prompt: request.system_prompt,
+                    thinking_level: ThinkingLevel::Off,
+                    api_key: String::new(),
+                    compaction: None,
+                    stream_options: Default::default(),
+                    tools: Some(tools),
+                    before_tool_call: None,
+                    after_tool_call: None,
+                    stream_fn: Some(stream_fn),
+                    auth_resolver: None,
+                    auth_manager: None,
+                },
+                Vec::new(),
+                Default::default(),
+                pi_coding::ResourceDiscovery::Disabled,
+            )
+        })
+    });
+
+    let runtime =
+        OrchestrationRuntime::new(config(artifacts.path(), vec![task_definition()]), factory)
+            .expect("runtime");
+    let application = bind_then_recover_existing(&runtime, &parent).await;
+    let settled = tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime.wait_jobs(&["job-running-1".to_owned()], None, None),
+    )
+    .await
+    .expect("revived job wait")
+    .expect("revived job result");
+    assert_eq!(settled.len(), 1);
+    assert_eq!(settled[0].id, "job-running-1");
+    assert_eq!(settled[0].status, JobStatus::Completed);
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        0,
+        "started-no-result tool must not replay"
+    );
+
+    let tree = pi_coding::load_session_tree(&child_jsonl).expect("reload child jsonl");
+    let messages = tree.build_context(None).messages;
+    let interrupted = messages
+        .iter()
+        .find_map(|message| match message {
+            pi_ai::Message::ToolResult(result)
+                if result.tool_call_id == "call-started-no-result" =>
+            {
+                Some(result)
+            }
+            _ => None,
+        })
+        .expect("interrupted tool result must exist");
+    assert!(interrupted.is_error);
+    assert!(
+        interrupted
+            .content
+            .iter()
+            .any(|block| matches!(block, pi_ai::ContentBlock::Text { text, .. } if text.contains("not replayed"))),
+        "interrupted result must keep original toolCallId without replay: {interrupted:?}"
+    );
+    application.cleanup().await;
+    runtime.shutdown().await;
+}
+
 /// Revival after recovery reuses the recorded child JSONL path and returns Revived.
 #[tokio::test]
 async fn parked_recovery_revives_reusing_recorded_child_jsonl() {
@@ -673,8 +1064,8 @@ async fn parked_recovery_revives_reusing_recorded_child_jsonl() {
     );
 
     plant_sidecar(
-        &parent_id,
-        &parent_path,
+        &parent,
+        artifacts.path(),
         vec![persisted_worker(
             "Worker",
             AgentStatus::Parked,
@@ -690,14 +1081,15 @@ async fn parked_recovery_revives_reusing_recorded_child_jsonl() {
             }],
         )],
         vec![],
-    );
+    )
+    .await;
 
     let runtime = OrchestrationRuntime::new(
         config(artifacts.path(), vec![task_definition()]),
         quick_factory("revived assistant turn"),
     )
     .expect("runtime");
-    bind_then_recover_existing(&runtime, &parent);
+    let _application = bind_then_recover_existing(&runtime, &parent).await;
 
     let worker = runtime
         .list("Main")
@@ -748,6 +1140,19 @@ async fn parked_recovery_revives_reusing_recorded_child_jsonl() {
         after.contains(marker),
         "revival must reuse the same transcript (marker lost): {after}"
     );
+    let tree = pi_coding::load_session_tree(&child_jsonl).expect("reload revived child jsonl");
+    let assignment_count = tree
+        .build_context(None)
+        .messages
+        .iter()
+        .filter(|message| {
+            matches!(message, pi_ai::Message::User(user) if user.content.iter().any(|block| matches!(block, pi_ai::ContentBlock::Text { text, .. } if text == marker)))
+        })
+        .count();
+    assert_eq!(
+        assignment_count, 1,
+        "recovery must continue the text-only transcript without appending the assignment again"
+    );
     assert!(
         after.contains("wake and continue"),
         "revival must append the wake delivery to the reused transcript: {after}"
@@ -782,8 +1187,8 @@ async fn concurrent_sends_claim_single_revival_job() {
     let child_root = child_root_for(&parent_path, &parent_id);
     let child_jsonl = plant_child_jsonl(&child_root, &parent_path, "concurrent-revival");
     plant_sidecar(
-        &parent_id,
-        &parent_path,
+        &parent,
+        artifacts.path(),
         vec![persisted_worker(
             "Worker",
             AgentStatus::Parked,
@@ -792,7 +1197,8 @@ async fn concurrent_sends_claim_single_revival_job() {
             Vec::new(),
         )],
         vec![],
-    );
+    )
+    .await;
 
     let factory_calls = Arc::new(AtomicUsize::new(0));
     let calls = factory_calls.clone();
@@ -815,20 +1221,26 @@ async fn concurrent_sends_claim_single_revival_job() {
                     stream
                 })
             });
-            Session::new(SessionOptions {
-                model: request.model,
-                cwd: std::env::current_dir().expect("cwd"),
-                system_prompt: request.system_prompt,
-                thinking_level: ThinkingLevel::Off,
-                api_key: String::new(),
-                compaction: None,
-                stream_options: Default::default(),
-                tools: Some(request.orchestration_tools),
-                before_tool_call: None,
-                after_tool_call: None,
-                stream_fn: Some(stream_fn),
-                auth_resolver: None,
-            })
+            Session::new_with_additional_tools_filtered_and_discovery(
+                SessionOptions {
+                    model: request.model,
+                    cwd: std::env::current_dir().expect("cwd"),
+                    system_prompt: request.system_prompt,
+                    thinking_level: ThinkingLevel::Off,
+                    api_key: String::new(),
+                    compaction: None,
+                    stream_options: Default::default(),
+                    tools: Some(request.orchestration_tools),
+                    before_tool_call: None,
+                    after_tool_call: None,
+                    stream_fn: Some(stream_fn),
+                    auth_resolver: None,
+                    auth_manager: None,
+                },
+                Vec::new(),
+                Default::default(),
+                pi_coding::ResourceDiscovery::Disabled,
+            )
         })
     });
 
@@ -836,7 +1248,7 @@ async fn concurrent_sends_claim_single_revival_job() {
         OrchestrationRuntime::new(config(artifacts.path(), vec![task_definition()]), factory)
             .expect("runtime"),
     );
-    bind_then_recover_existing(&runtime, &parent);
+    let _application = bind_then_recover_existing(&runtime, &parent).await;
 
     let barrier = Arc::new(Barrier::new(8));
     let mut handles = Vec::new();
@@ -863,7 +1275,9 @@ async fn concurrent_sends_claim_single_revival_job() {
         assert_eq!(receipts.len(), 1, "{receipts:?}");
         match receipts[0].outcome {
             DeliveryOutcome::Revived => revived += 1,
-            DeliveryOutcome::Queued | DeliveryOutcome::Woken => queued += 1,
+            DeliveryOutcome::Queued | DeliveryOutcome::Woken | DeliveryOutcome::Processed => {
+                queued += 1
+            }
             DeliveryOutcome::Failed => failed += 1,
         }
         if receipts[0].error.is_none() {
@@ -918,8 +1332,8 @@ async fn persistence_failure_propagates_without_false_revived() {
     let child_root = child_root_for(&parent_path, &parent_id);
     let child_jsonl = plant_child_jsonl(&child_root, &parent_path, "persist-fail");
     let sidecar = plant_sidecar(
-        &parent_id,
-        &parent_path,
+        &parent,
+        artifacts.path(),
         vec![persisted_worker(
             "Worker",
             AgentStatus::Parked,
@@ -928,14 +1342,15 @@ async fn persistence_failure_propagates_without_false_revived() {
             Vec::new(),
         )],
         vec![],
-    );
+    )
+    .await;
 
     let runtime = OrchestrationRuntime::new(
         config(artifacts.path(), vec![task_definition()]),
         quick_factory("should not false-revive"),
     )
     .expect("runtime");
-    bind_then_recover_existing(&runtime, &parent);
+    let _application = bind_then_recover_existing(&runtime, &parent).await;
 
     std::fs::remove_file(&sidecar).expect("remove sidecar file");
     std::fs::create_dir(&sidecar).expect("sidecar path becomes directory");
@@ -968,8 +1383,10 @@ async fn persistence_failure_propagates_without_false_revived() {
 
     // Message must not be silently lost: either still in the mailbox after the
     // failed commit, or the Failed receipt is the observable failure surface.
-    let inbox = runtime.inbox("Worker", true);
-    let retained = inbox.iter().any(|message| message.body == "must not vanish");
+    let inbox = runtime.inbox("Worker", true).expect("inbox");
+    let retained = inbox
+        .iter()
+        .any(|message| message.body == "must not vanish");
     assert!(
         retained || receipt.error.is_some(),
         "message must remain observable (inbox or Failed receipt); inbox={inbox:?} receipt={receipt:?}"
@@ -979,8 +1396,8 @@ async fn persistence_failure_propagates_without_false_revived() {
 }
 
 /// The mailbox commit precedes the revival claim. If the claim cannot be
-/// persisted, the Failed receipt must leave the already-durable message queued
-/// in both live and recovered state.
+/// persisted, the truthful receipt remains Queued with an error and the
+/// already-durable message stays queued in both live and recovered state.
 #[tokio::test]
 async fn revival_claim_failure_keeps_committed_mailbox_message() {
     let artifacts = tempfile::tempdir().expect("artifacts");
@@ -1007,8 +1424,8 @@ async fn revival_claim_failure_keeps_committed_mailbox_message() {
         })
         .collect();
     let sidecar = plant_sidecar(
-        &parent_id,
-        &parent_path,
+        &parent,
+        artifacts.path(),
         vec![persisted_worker(
             "Worker",
             AgentStatus::Parked,
@@ -1017,30 +1434,34 @@ async fn revival_claim_failure_keeps_committed_mailbox_message() {
             Vec::new(),
         )],
         jobs,
-    );
+    )
+    .await;
     let runtime = OrchestrationRuntime::new(
         config(artifacts.path(), vec![task_definition()]),
         quick_factory("must not launch"),
     )
     .expect("runtime");
-    bind_then_recover_existing(&runtime, &parent);
+    let _application = bind_then_recover_existing(&runtime, &parent).await;
 
     let receipts = runtime.send("Main", "Worker", "durably queued", None);
     assert_eq!(receipts.len(), 1);
-    assert_eq!(receipts[0].outcome, DeliveryOutcome::Failed, "{receipts:?}");
+    assert_eq!(receipts[0].outcome, DeliveryOutcome::Queued, "{receipts:?}");
     assert!(receipts[0].error.is_some(), "{receipts:?}");
-    assert!(runtime.inbox("Worker", true).iter().any(|message| message.body == "durably queued"));
+    assert!(
+        runtime
+            .inbox("Worker", true)
+            .expect("inbox")
+            .iter()
+            .any(|message| message.body == "durably queued")
+    );
 
-    let durable = DurableRuntime::new(
-        parent_id,
-        parent_path,
-        child_root,
-    )
-    .expect("durable reader");
-    let state = durable.load().expect("restored sidecar");
+    let state = load_sidecar(&parent_path, &parent_id);
     assert!(state.agents.iter().any(|agent| {
         agent.snapshot.id == "Worker"
-            && agent.mailbox.iter().any(|message| message.body == "durably queued")
+            && agent
+                .mailbox
+                .iter()
+                .any(|message| message.body == "durably queued")
     }));
     assert!(sidecar.is_file());
     runtime.shutdown().await;
@@ -1061,8 +1482,8 @@ async fn hub_inbox_drain_failure_restores_mailbox() {
         reply_to: None,
     };
     let sidecar = plant_sidecar(
-        &parent_id,
-        &parent_path,
+        &parent,
+        artifacts.path(),
         vec![persisted_worker(
             "Worker",
             AgentStatus::Parked,
@@ -1071,14 +1492,19 @@ async fn hub_inbox_drain_failure_restores_mailbox() {
             Vec::new(),
         )],
         Vec::new(),
-    );
+    )
+    .await;
     let runtime = OrchestrationRuntime::new(
         config(artifacts.path(), vec![task_definition()]),
         quick_factory("unused"),
     )
     .expect("runtime");
-    bind_then_recover_existing(&runtime, &parent);
-    assert!(runtime.send("Worker", "Main", &message.body, None)[0].error.is_none());
+    let _application = bind_then_recover_existing(&runtime, &parent).await;
+    assert!(
+        runtime.send("Worker", "Main", &message.body, None)[0]
+            .error
+            .is_none()
+    );
     std::fs::remove_file(&sidecar).expect("remove sidecar");
     std::fs::create_dir(&sidecar).expect("block sidecar writes");
 
@@ -1087,8 +1513,17 @@ async fn hub_inbox_drain_failure_restores_mailbox() {
     let error = (hub.execute)(context("inbox-fail", json!({ "op": "inbox" })))
         .await
         .expect_err("inbox drain persistence failure must propagate");
-    assert!(error.to_string().contains("persist") || error.to_string().contains("durable"), "{error:#}");
-    assert!(runtime.inbox("Main", true).iter().any(|queued| queued.body == "keep me"));
+    assert!(
+        error.to_string().contains("persist") || error.to_string().contains("durable"),
+        "{error:#}"
+    );
+    assert!(
+        runtime
+            .inbox("Main", true)
+            .expect("inbox")
+            .iter()
+            .any(|queued| queued.body == "keep me")
+    );
     runtime.shutdown().await;
 }
 
@@ -1104,7 +1539,8 @@ async fn main_mailbox_survives_runtime_reconstruction() {
         quick_factory("unused"),
     )
     .expect("runtime A");
-    bind_fresh_parent(&runtime_a, &parent);
+    let _application_a = bind_fresh_parent(&runtime_a, &parent).await;
+    spawn_persistent_worker(&runtime_a).await;
     let receipts = runtime_a.send("Worker", "Main", "durable Main reply", None);
     assert!(receipts[0].error.is_none(), "{receipts:?}");
     runtime_a.shutdown().await;
@@ -1114,14 +1550,46 @@ async fn main_mailbox_survives_runtime_reconstruction() {
         quick_factory("unused"),
     )
     .expect("runtime B");
-    bind_then_recover_existing(&runtime_b, &parent);
+    let _application_b = bind_then_recover_existing(&runtime_b, &parent).await;
     assert!(
         runtime_b
             .inbox("Main", true)
+            .expect("inbox")
             .iter()
             .any(|message| message.body == "durable Main reply"),
         "runtime B recovers the unconsumed root mailbox"
     );
+    runtime_b.shutdown().await;
+}
+
+#[tokio::test]
+async fn delivered_message_history_survives_runtime_reconstruction() {
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let sessions = tempfile::tempdir().expect("sessions");
+    let (parent, _, _) = parent_session(artifacts.path(), sessions.path());
+    let runtime_a = OrchestrationRuntime::new(
+        config(artifacts.path(), vec![task_definition()]),
+        quick_factory("unused"),
+    )
+    .expect("runtime A");
+    let _application_a = bind_fresh_parent(&runtime_a, &parent).await;
+    spawn_persistent_worker(&runtime_a).await;
+    let receipt = runtime_a.send("Worker", "Main", "durable IRC history", None);
+    let message_id = receipt[0].message_id.clone().expect("message id");
+    runtime_a.inbox("Main", false).expect("consume mailbox");
+    assert!(runtime_a.inbox("Main", true).expect("peek").is_empty());
+    runtime_a.shutdown().await;
+
+    let runtime_b = OrchestrationRuntime::new(
+        config(artifacts.path(), vec![task_definition()]),
+        quick_factory("unused"),
+    )
+    .expect("runtime B");
+    let _application_b = bind_then_recover_existing(&runtime_b, &parent).await;
+    let history = runtime_b.delivered_messages();
+    assert_eq!(history.len(), 1, "consumed IRC history survives restart");
+    assert_eq!(history[0].id, message_id);
+    assert_eq!(history[0].body, "durable IRC history");
     runtime_b.shutdown().await;
 }
 
@@ -1132,21 +1600,23 @@ async fn configured_main_identity_recovers_root_mailbox() {
     let (parent, _, _) = parent_session(artifacts.path(), sessions.path());
     let mut config_a = config(artifacts.path(), vec![task_definition()]);
     config_a.main_agent_id = "Coordinator".to_owned();
-    let runtime_a = OrchestrationRuntime::new(config_a, quick_factory("unused"))
-        .expect("runtime A");
-    bind_fresh_parent(&runtime_a, &parent);
+    let runtime_a =
+        OrchestrationRuntime::new(config_a, quick_factory("unused")).expect("runtime A");
+    let _application_a = bind_fresh_parent(&runtime_a, &parent).await;
+    spawn_persistent_worker(&runtime_a).await;
     let receipts = runtime_a.send("Worker", "Coordinator", "configured root reply", None);
     assert!(receipts[0].error.is_none(), "{receipts:?}");
     runtime_a.shutdown().await;
 
     let mut config_b = config(artifacts.path(), vec![task_definition()]);
     config_b.main_agent_id = "Coordinator".to_owned();
-    let runtime_b = OrchestrationRuntime::new(config_b, quick_factory("unused"))
-        .expect("runtime B");
-    bind_then_recover_existing(&runtime_b, &parent);
+    let runtime_b =
+        OrchestrationRuntime::new(config_b, quick_factory("unused")).expect("runtime B");
+    let _application_b = bind_then_recover_existing(&runtime_b, &parent).await;
     assert!(
         runtime_b
             .inbox("Coordinator", true)
+            .expect("inbox")
             .iter()
             .any(|message| message.body == "configured root reply"),
         "configured root mailbox survives reconstruction"
@@ -1165,8 +1635,8 @@ async fn lifecycle_rebind_after_runtime_and_session_replacement() {
     let old_child_root = child_root_for(&old_path, &old_id);
     let old_child = plant_child_jsonl(&old_child_root, &old_path, "old-parent-child");
     plant_sidecar(
-        &old_id,
-        &old_path,
+        &parent_old,
+        artifacts.path(),
         vec![persisted_worker(
             "Legacy",
             AgentStatus::Parked,
@@ -1175,14 +1645,15 @@ async fn lifecycle_rebind_after_runtime_and_session_replacement() {
             Vec::new(),
         )],
         vec![],
-    );
+    )
+    .await;
 
     let runtime_old = OrchestrationRuntime::new(
         config(artifacts.path(), vec![task_definition()]),
         quick_factory("old runtime"),
     )
     .expect("old runtime");
-    bind_then_recover_existing(&runtime_old, &parent_old);
+    let _old_application = bind_then_recover_existing(&runtime_old, &parent_old).await;
     assert!(
         runtime_old
             .list("Main")
@@ -1201,7 +1672,7 @@ async fn lifecycle_rebind_after_runtime_and_session_replacement() {
         quick_factory("new runtime"),
     )
     .expect("new runtime");
-    bind_fresh_parent(&runtime_new, &parent_new);
+    let _new_application = bind_fresh_parent(&runtime_new, &parent_new).await;
 
     let new_peers = runtime_new.list("Main");
     assert!(
@@ -1294,7 +1765,7 @@ async fn sibling_roster_same_batch_visibility_and_xml_bounds() {
         capturing_factory(prompts.clone(), "batch done"),
     )
     .expect("runtime");
-    bind_fresh_parent(&runtime, &parent);
+    let _application = bind_fresh_parent(&runtime, &parent).await;
 
     let tools = runtime.agent_tools("Main", 0);
     let task = tool(&tools, "task");
@@ -1433,7 +1904,7 @@ async fn hub_agent_type_projection_after_recovery() {
         "review carefully\n\n<delegated_assignment>\nreview the tree\n</delegated_assignment>",
     );
 
-    plant_sidecar(&parent_id, &parent_path, vec![agent], vec![]);
+    plant_sidecar(&parent, artifacts.path(), vec![agent], vec![]).await;
 
     let runtime = OrchestrationRuntime::new(
         config(
@@ -1443,7 +1914,7 @@ async fn hub_agent_type_projection_after_recovery() {
         quick_factory("typed"),
     )
     .expect("runtime");
-    bind_then_recover_existing(&runtime, &parent);
+    let _application = bind_then_recover_existing(&runtime, &parent).await;
 
     let main_tools = runtime.agent_tools("Main", 0);
     let hub = tool(&main_tools, "hub");
@@ -1465,8 +1936,7 @@ async fn hub_agent_type_projection_after_recovery() {
             && text.contains("agent reviewer"),
         "hub list text must distinguish id, display name, and agent type:\n{text}"
     );
-    let peers: Vec<Value> =
-        serde_json::from_value(listed.details["peers"].clone()).expect("peers");
+    let peers: Vec<Value> = serde_json::from_value(listed.details["peers"].clone()).expect("peers");
     let review = peers
         .iter()
         .find(|peer| peer["id"] == "review-job")
@@ -1492,7 +1962,7 @@ async fn durable_spawn_keeps_parent_catalog_clean_and_nested_child_root() {
         quick_factory("spawn complete"),
     )
     .expect("runtime");
-    bind_fresh_parent(&runtime, &parent);
+    let _application = bind_fresh_parent(&runtime, &parent).await;
     assert!(runtime.is_durable(), "bound runtime reports durable");
 
     let tools = runtime.agent_tools("Main", 0);
@@ -1530,7 +2000,10 @@ async fn durable_spawn_keeps_parent_catalog_clean_and_nested_child_root() {
     );
     assert!(
         root_jsonl.iter().all(|path| {
-            let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
             !name.contains("Nested")
         }),
         "child id must not appear as a top-level catalog jsonl: {root_jsonl:?}"
@@ -1595,11 +2068,13 @@ async fn corrupt_sidecar_fails_closed_without_registry_mutation() {
         quick_factory("unused"),
     )
     .expect("runtime");
-    let recovered = runtime.bind_parent_session(&parent);
-    assert!(
-        recovered.is_err(),
-        "corrupt sidecar must fail the transactional bind, got {recovered:?}"
-    );
+    let restarted = restarted_parent_session(&parent).expect("reopen corrupt parent recording");
+    let recovered = application_with_orchestration(&restarted, runtime.clone()).await;
+    let recovered_error = match recovered {
+        Ok(_) => panic!("corrupt sidecar must fail the transactional bind"),
+        Err(error) => error,
+    };
+    assert!(!recovered_error.to_string().is_empty());
     assert!(
         sidecar.is_file(),
         "corrupt sidecar must not be deleted on failure"
@@ -1614,11 +2089,19 @@ async fn corrupt_sidecar_fails_closed_without_registry_mutation() {
         "failed recover must not insert jobs"
     );
 
+    let durable_policy = application_with_isolated_resources(&parent)
+        .await
+        .expect("isolated policy application")
+        .durable_policy_state()
+        .expect("live generation durable policy");
     let foreign = DurableState {
         version: DURABLE_STATE_VERSION,
         parent_session_id: "foreign-parent".to_owned(),
         parent_session_path: parent_path.to_string_lossy().into_owned(),
+        group_id: uuid::Uuid::now_v7().to_string(),
+        durable_policy: durable_policy.clone(),
         main_mailbox: Vec::new(),
+        delivered_messages: Vec::new(),
         agents: vec![persisted_worker(
             "Intruder",
             AgentStatus::Parked,
@@ -1629,18 +2112,6 @@ async fn corrupt_sidecar_fails_closed_without_registry_mutation() {
         jobs: vec![],
     };
     let _ = std::fs::remove_file(&sidecar);
-    let durable = DurableRuntime::new(parent_id.clone(), parent_path.clone(), child_root.clone())
-        .expect("durable");
-    durable
-        .persist(&DurableState {
-            version: DURABLE_STATE_VERSION,
-            parent_session_id: parent_id.clone(),
-            parent_session_path: parent_path.to_string_lossy().into_owned(),
-            main_mailbox: Vec::new(),
-            agents: vec![],
-            jobs: vec![],
-        })
-        .expect("valid seed");
     std::fs::write(
         &sidecar,
         serde_json::to_vec(&foreign).expect("serialize foreign"),
@@ -1652,11 +2123,13 @@ async fn corrupt_sidecar_fails_closed_without_registry_mutation() {
         quick_factory("unused"),
     )
     .expect("runtime2");
-    let mismatched = runtime2.bind_parent_session(&parent);
-    assert!(
-        mismatched.is_err(),
-        "mismatched parent id must fail the transactional bind: {mismatched:?}"
-    );
+    let restarted = restarted_parent_session(&parent).expect("reopen mismatched parent recording");
+    let mismatched = application_with_orchestration(&restarted, runtime2.clone()).await;
+    let mismatched_error = match mismatched {
+        Ok(_) => panic!("mismatched parent id must fail the transactional bind"),
+        Err(error) => error,
+    };
+    assert!(!mismatched_error.to_string().is_empty());
     assert!(
         runtime2.list("Main").iter().all(|peer| peer.id == "Main"),
         "no partial foreign roster import"
@@ -1681,24 +2154,31 @@ async fn fresh_non_explicit_application_attach_binds_before_parent_jsonl_exists(
         quick_factory("unused"),
     )
     .expect("runtime");
-    let application = Application::new(parent).await;
+    let application = application_with_isolated_resources(&parent)
+        .await
+        .expect("isolated fresh parent application");
 
     application
         .attach_orchestration_with_override(runtime.clone(), false)
         .await
         .expect("fresh non-explicit application attachment");
 
-    assert!(runtime.is_durable(), "attachment binds durable orchestration");
+    assert!(
+        runtime.is_durable(),
+        "attachment binds durable orchestration"
+    );
     assert!(
         !parent_path.exists(),
         "binding must not change ordinary pending-recorder persistence semantics: {}",
         parent_path.display()
     );
     let sidecar = child_root.join("orchestration-state.json");
-    assert!(sidecar.is_file(), "fresh binding initializes {}", sidecar.display());
-    let durable = DurableRuntime::new(parent_id, parent_path.clone(), child_root)
-        .expect("fresh durable reader");
-    let state = durable.load().expect("fresh sidecar remains loadable");
+    assert!(
+        sidecar.is_file(),
+        "fresh binding initializes {}",
+        sidecar.display()
+    );
+    let state = load_sidecar(&parent_path, &parent_id);
     assert!(state.agents.is_empty());
     assert!(state.jobs.is_empty());
 
@@ -1720,10 +2200,8 @@ async fn dotted_parent_session_id_binds_and_round_trips() {
     )
     .expect("runtime");
 
-    bind_fresh_parent(&runtime, &parent);
-    let durable = DurableRuntime::new(parent_id.to_owned(), parent_path, child_root)
-        .expect("dotted parent durable reader");
-    let state = durable.load().expect("dotted parent sidecar");
+    let _application = bind_fresh_parent(&runtime, &parent).await;
+    let state = load_sidecar(&parent_path, parent_id);
     assert_eq!(state.parent_session_id, parent_id);
 
     runtime.shutdown().await;
@@ -1739,8 +2217,8 @@ async fn pathless_parked_revival_creates_and_appends_fresh_child_jsonl() {
     let (parent, parent_id, parent_path) = parent_session(artifacts.path(), sessions.path());
     let child_root = child_root_for(&parent_path, &parent_id);
     plant_sidecar(
-        &parent_id,
-        &parent_path,
+        &parent,
+        artifacts.path(),
         vec![persisted_worker(
             "Worker",
             AgentStatus::Parked,
@@ -1749,22 +2227,31 @@ async fn pathless_parked_revival_creates_and_appends_fresh_child_jsonl() {
             Vec::new(),
         )],
         Vec::new(),
-    );
+    )
+    .await;
     let runtime = OrchestrationRuntime::new(
         config(artifacts.path(), vec![task_definition()]),
         quick_factory("fresh revived assistant turn"),
     )
     .expect("runtime");
-    bind_then_recover_existing(&runtime, &parent);
+    let _application = bind_then_recover_existing(&runtime, &parent).await;
 
     let receipts = receipts_from_send(&runtime, "Main", "Worker", "wake pathless worker");
     assert_eq!(receipts.len(), 1, "{receipts:?}");
-    assert_eq!(receipts[0].outcome, DeliveryOutcome::Revived, "{receipts:?}");
+    assert_eq!(
+        receipts[0].outcome,
+        DeliveryOutcome::Revived,
+        "{receipts:?}"
+    );
     assert!(receipts[0].error.is_none(), "{receipts:?}");
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let job_id = loop {
-        if let Some(job) = runtime.jobs(None).into_iter().find(|job| job.agent_id == "Worker") {
+        if let Some(job) = runtime
+            .jobs(None)
+            .into_iter()
+            .find(|job| job.agent_id == "Worker")
+        {
             if job.status.is_settled() {
                 break job.id;
             }
@@ -1772,10 +2259,16 @@ async fn pathless_parked_revival_creates_and_appends_fresh_child_jsonl() {
                 .wait_jobs(&[job.id], Some(Duration::from_millis(400)), None)
                 .await;
         } else {
-            assert!(std::time::Instant::now() < deadline, "revival job was not created");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "revival job was not created"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(std::time::Instant::now() < deadline, "revival job did not settle");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "revival job did not settle"
+        );
     };
     let job = runtime
         .jobs(None)
@@ -1784,9 +2277,7 @@ async fn pathless_parked_revival_creates_and_appends_fresh_child_jsonl() {
         .expect("settled revival job");
     assert_eq!(job.status, JobStatus::Completed, "{job:?}");
 
-    let durable = DurableRuntime::new(parent_id, parent_path, child_root.clone())
-        .expect("durable reader");
-    let state = durable.load().expect("post-revival state");
+    let state = load_sidecar(&parent_path, &parent_id);
     let worker = state
         .agents
         .iter()
@@ -1798,8 +2289,16 @@ async fn pathless_parked_revival_creates_and_appends_fresh_child_jsonl() {
             .as_deref()
             .expect("pathless revival persists a fresh session path"),
     );
-    assert!(session_path.starts_with(&child_root), "{}", session_path.display());
-    assert!(session_path.is_file(), "fresh child JSONL at {}", session_path.display());
+    assert!(
+        session_path.starts_with(&child_root),
+        "{}",
+        session_path.display()
+    );
+    assert!(
+        session_path.is_file(),
+        "fresh child JSONL at {}",
+        session_path.display()
+    );
     let transcript = std::fs::read_to_string(&session_path).expect("fresh child transcript");
     assert!(
         transcript.contains("parentSession") && transcript.contains("wake pathless worker"),
@@ -1823,8 +2322,8 @@ async fn failed_revival_persists_terminal_result_agent_identity() {
     let child_root = child_root_for(&parent_path, &parent_id);
     let child_jsonl = plant_child_jsonl(&child_root, &parent_path, "failed-revival");
     plant_sidecar(
-        &parent_id,
-        &parent_path,
+        &parent,
+        artifacts.path(),
         vec![persisted_worker(
             "Worker",
             AgentStatus::Parked,
@@ -1833,20 +2332,23 @@ async fn failed_revival_persists_terminal_result_agent_identity() {
             Vec::new(),
         )],
         Vec::new(),
-    );
+    )
+    .await;
     let factory: ChildSessionFactory = Arc::new(|_| {
         Box::pin(async { Err(anyhow::anyhow!("forced revived child factory failure")) })
     });
-    let runtime = OrchestrationRuntime::new(
-        config(artifacts.path(), vec![task_definition()]),
-        factory,
-    )
-    .expect("runtime");
-    bind_then_recover_existing(&runtime, &parent);
+    let runtime =
+        OrchestrationRuntime::new(config(artifacts.path(), vec![task_definition()]), factory)
+            .expect("runtime");
+    let _application = bind_then_recover_existing(&runtime, &parent).await;
 
     let receipts = runtime.send("Main", "Worker", "trigger failed revival", None);
     assert_eq!(receipts.len(), 1, "{receipts:?}");
-    assert_eq!(receipts[0].outcome, DeliveryOutcome::Revived, "{receipts:?}");
+    assert_eq!(
+        receipts[0].outcome,
+        DeliveryOutcome::Revived,
+        "{receipts:?}"
+    );
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let terminal = loop {
@@ -1857,7 +2359,10 @@ async fn failed_revival_persists_terminal_result_agent_identity() {
         {
             break job;
         }
-        assert!(std::time::Instant::now() < deadline, "failed revival did not settle");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "failed revival did not settle"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
     assert_eq!(terminal.status, JobStatus::Failed, "{terminal:?}");
@@ -1872,9 +2377,7 @@ async fn failed_revival_persists_terminal_result_agent_identity() {
         "{terminal:?}"
     );
 
-    let durable = DurableRuntime::new(parent_id, parent_path, child_root)
-        .expect("durable restart reader");
-    let state = durable.load().expect("failed revival sidecar remains readable");
+    let state = load_sidecar(&parent_path, &parent_id);
     let persisted = state
         .jobs
         .iter()
@@ -1883,7 +2386,11 @@ async fn failed_revival_persists_terminal_result_agent_identity() {
     assert_eq!(persisted.status, JobStatus::Failed, "{persisted:?}");
     assert_eq!(persisted.agent, "task");
     assert_eq!(
-        persisted.result.as_ref().expect("persisted failure result").agent,
+        persisted
+            .result
+            .as_ref()
+            .expect("persisted failure result")
+            .agent,
         persisted.agent
     );
 
@@ -1900,8 +2407,8 @@ async fn corrupt_new_parent_rebind_preserves_old_live_binding_and_state() {
     let (old_parent, old_id, old_path) = parent_session(artifacts.path(), sessions.path());
     let old_child_root = child_root_for(&old_path, &old_id);
     let old_sidecar = plant_sidecar(
-        &old_id,
-        &old_path,
+        &old_parent,
+        artifacts.path(),
         vec![persisted_worker(
             "Legacy",
             AgentStatus::Running,
@@ -1917,23 +2424,18 @@ async fn corrupt_new_parent_rebind_preserves_old_live_binding_and_state() {
             }],
         )],
         vec![running_job("old-job", "Legacy")],
-    );
+    )
+    .await;
     let runtime = OrchestrationRuntime::new(
         config(artifacts.path(), vec![task_definition()]),
         quick_factory("unused"),
     )
     .expect("runtime");
-    bind_then_recover_existing(&runtime, &old_parent);
+    let _application = bind_then_recover_existing(&runtime, &old_parent).await;
     let old_peers = runtime.list("Main");
     let old_jobs = runtime.jobs(None);
-    let old_mailbox = runtime.inbox("Legacy", true);
-    let old_reader = DurableRuntime::new(
-        old_id.clone(),
-        old_path.clone(),
-        old_child_root.clone(),
-    )
-    .expect("old durable reader");
-    let old_state = old_reader.load().expect("old state after initial recovery");
+    let old_mailbox = runtime.inbox("Legacy", true).expect("inbox");
+    let old_state = load_sidecar(&old_path, &old_id);
 
     let (new_parent, new_id, new_path) = parent_session(artifacts.path(), sessions.path());
     let new_child_root = child_root_for(&new_path, &new_id);
@@ -1951,7 +2453,10 @@ async fn corrupt_new_parent_rebind_preserves_old_live_binding_and_state() {
         version: DURABLE_STATE_VERSION,
         parent_session_id: new_id,
         parent_session_path: new_path.to_string_lossy().into_owned(),
+        group_id: uuid::Uuid::now_v7().to_string(),
+        durable_policy: old_state.durable_policy.clone(),
         main_mailbox: Vec::new(),
+        delivered_messages: Vec::new(),
         agents: vec![mismatched],
         jobs: Vec::new(),
     };
@@ -1961,15 +2466,23 @@ async fn corrupt_new_parent_rebind_preserves_old_live_binding_and_state() {
     runtime
         .bind_and_recover(&new_parent)
         .expect_err("mismatched replacement state must fail closed");
-    assert_eq!(runtime.list("Main"), old_peers, "old roster survives failed rebind");
-    assert_eq!(runtime.jobs(None), old_jobs, "old jobs survive failed rebind");
     assert_eq!(
-        runtime.inbox("Legacy", true),
+        runtime.list("Main"),
+        old_peers,
+        "old roster survives failed rebind"
+    );
+    assert_eq!(
+        runtime.jobs(None),
+        old_jobs,
+        "old jobs survive failed rebind"
+    );
+    assert_eq!(
+        runtime.inbox("Legacy", true).expect("inbox"),
         old_mailbox,
         "old mailbox survives failed rebind"
     );
     assert_eq!(
-        old_reader.load().expect("old sidecar after failed rebind"),
+        load_sidecar(&old_path, &old_id),
         old_state,
         "failed cutover must not rewrite or erase old durable state"
     );
@@ -1979,12 +2492,12 @@ async fn corrupt_new_parent_rebind_preserves_old_live_binding_and_state() {
         "invalid replacement sidecar remains intact for diagnosis"
     );
     assert!(old_sidecar.is_file(), "old sidecar remains installed");
-    runtime
-        .recover()
-        .expect("runtime remains bound to the previous valid parent");
     assert!(
-        runtime.list("Main").iter().any(|agent| agent.id == "Legacy"),
-        "old binding remains recoverable"
+        runtime
+            .list("Main")
+            .iter()
+            .any(|agent| agent.id == "Legacy"),
+        "old binding remains recoverable without clobbering live jobs"
     );
 
     runtime.shutdown().await;
@@ -2002,7 +2515,7 @@ async fn public_recovery_rejects_active_child_without_mutating_live_state() {
         blocking_factory(started.clone(), release.clone()),
     )
     .expect("runtime");
-    bind_fresh_parent(&runtime, &parent);
+    let _application = bind_fresh_parent(&runtime, &parent).await;
     let spawn = runtime
         .spawn_tasks(
             "Main",
@@ -2025,7 +2538,9 @@ async fn public_recovery_rejects_active_child_without_mutating_live_state() {
     let before_agents = runtime.list("Main");
     let before_jobs = runtime.jobs(None);
     for error in [
-        runtime.recover().expect_err("strict recover rejects active child"),
+        runtime
+            .recover()
+            .expect_err("strict recover rejects active child"),
         runtime
             .recover_or_initialize()
             .expect_err("recover-or-initialize rejects active child"),
@@ -2037,8 +2552,16 @@ async fn public_recovery_rejects_active_child_without_mutating_live_state() {
             "unexpected recovery error: {error:#}"
         );
     }
-    assert_eq!(runtime.list("Main"), before_agents, "live roster is preserved");
-    assert_eq!(runtime.jobs(None), before_jobs, "live job state is preserved");
+    assert_eq!(
+        runtime.list("Main"),
+        before_agents,
+        "live roster is preserved"
+    );
+    assert_eq!(
+        runtime.jobs(None),
+        before_jobs,
+        "live job state is preserved"
+    );
     assert!(
         runtime
             .jobs(Some(std::slice::from_ref(&spawn.job_id)))
@@ -2071,7 +2594,7 @@ async fn running_woken_message_is_durable_before_active_delivery() {
         blocking_factory(started.clone(), release.clone()),
     )
     .expect("runtime");
-    bind_fresh_parent(&runtime, &parent);
+    let _application = bind_fresh_parent(&runtime, &parent).await;
     let spawn = runtime
         .spawn_tasks(
             "Main",
@@ -2095,9 +2618,7 @@ async fn running_woken_message_is_durable_before_active_delivery() {
     assert_eq!(receipts[0].outcome, DeliveryOutcome::Woken, "{receipts:?}");
     assert!(receipts[0].error.is_none(), "{receipts:?}");
 
-    let durable = DurableRuntime::new(parent_id, parent_path, child_root)
-        .expect("durable crash-window reader");
-    let state = durable.load().expect("load immediately after Woken receipt");
+    let state = load_sidecar(&parent_path, &parent_id);
     assert!(
         state.agents.iter().any(|agent| {
             agent.snapshot.id == "Runner"
@@ -2123,49 +2644,58 @@ async fn running_woken_message_is_durable_before_active_delivery() {
 
 /// Serialized state larger than 16 MiB is rejected before atomic replacement,
 /// leaving the previously committed sidecar byte-for-byte intact and loadable.
-#[test]
-fn oversize_serialized_write_is_rejected_before_replacement() {
+#[tokio::test]
+async fn oversize_serialized_write_is_rejected_before_replacement() {
     const MAX_SIDECAR_BYTES: usize = 16 * 1024 * 1024;
 
-    let root = tempfile::tempdir().expect("root");
-    let parent_id = "oversize.parent";
-    let parent_path = root.path().join("parent.jsonl");
-    std::fs::write(&parent_path, b"{}\n").expect("parent jsonl");
-    let child_root = root.path().join("children").join(parent_id);
-    let durable = DurableRuntime::new(parent_id.to_owned(), parent_path.clone(), child_root)
-        .expect("durable runtime");
-    let baseline = DurableState {
-        version: DURABLE_STATE_VERSION,
-        parent_session_id: parent_id.to_owned(),
-        parent_session_path: parent_path.to_string_lossy().into_owned(),
-        main_mailbox: Vec::new(),
-        agents: vec![persisted_worker(
-            "Worker",
-            AgentStatus::Parked,
-            "small state",
-            None,
-            Vec::new(),
-        )],
-        jobs: Vec::new(),
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let sessions = tempfile::tempdir().expect("sessions");
+    let (parent, parent_id, parent_path) = parent_session(artifacts.path(), sessions.path());
+    let mut runtime_config = config(artifacts.path(), vec![task_definition()]);
+    runtime_config.mailbox_capacity = 1024;
+    let runtime = OrchestrationRuntime::new(
+        runtime_config,
+        quick_factory("oversize persistence response"),
+    )
+    .expect("runtime");
+    let _application = bind_fresh_parent(&runtime, &parent).await;
+    let sidecar = child_root_for(&parent_path, &parent_id).join("orchestration-state.json");
+    let legal_body = "x".repeat(64 * 1024);
+    let mut successful_messages = 0;
+    let (receipts, before, before_state) = loop {
+        let before = std::fs::read(&sidecar).expect("sidecar before production persist");
+        let before_state = load_sidecar(&parent_path, &parent_id);
+        let receipts = runtime.send("Main", "Main", &legal_body, None);
+        assert_eq!(receipts.len(), 1, "{receipts:?}");
+        if receipts[0].outcome == DeliveryOutcome::Failed {
+            break (receipts, before, before_state);
+        }
+        assert_eq!(receipts[0].outcome, DeliveryOutcome::Queued, "{receipts:?}");
+        assert!(receipts[0].error.is_none(), "{receipts:?}");
+        successful_messages += 1;
+        assert!(
+            successful_messages < 1024,
+            "sidecar limit must precede mailbox capacity"
+        );
     };
-    durable.persist(&baseline).expect("baseline persist");
-    let before = std::fs::read(durable.sidecar_path()).expect("baseline bytes");
-
-    let mut oversized = baseline.clone();
-    oversized.agents[0].definition.system_prompt = "x".repeat(MAX_SIDECAR_BYTES + 1);
-    let error = durable
-        .persist(&oversized)
-        .expect_err("oversize serialized state must be rejected");
     assert!(
-        error.to_string().contains("maximum") || error.to_string().contains("16"),
-        "oversize context: {error:#}"
+        receipts[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("durable state sidecar exceeds maximum size")),
+        "production persist must report the oversize rejection: {receipts:?}"
     );
     assert_eq!(
-        std::fs::read(durable.sidecar_path()).expect("sidecar after rejection"),
+        runtime.inbox("Main", true).expect("inbox").len(),
+        successful_messages,
+        "failed send must roll back only its uncommitted live mailbox entry",
+    );
+    assert_eq!(
+        std::fs::read(&sidecar).expect("sidecar after rejection"),
         before,
         "oversize rejection must occur before atomic replacement"
     );
-    assert_eq!(durable.load().expect("baseline remains loadable"), baseline);
+    assert_eq!(load_sidecar(&parent_path, &parent_id), before_state);
 }
 /// Two-runtime recovery is proven from state produced only through public live
 /// runtime operations: bind, spawn, shutdown, recover, and revival. The
@@ -2181,7 +2711,7 @@ async fn public_live_persist_restart_recovers_mailbox_and_transcript_continuity(
         quick_factory("public restart assistant"),
     )
     .expect("runtime A");
-    bind_fresh_parent(&runtime_a, &parent);
+    let _application_a = bind_fresh_parent(&runtime_a, &parent).await;
 
     let spawn = runtime_a
         .spawn_tasks(
@@ -2206,13 +2736,7 @@ async fn public_live_persist_restart_recovers_mailbox_and_transcript_continuity(
         .await
         .expect("initial public job");
 
-    let reader = DurableRuntime::new(
-        parent_id.clone(),
-        parent_path.clone(),
-        child_root.clone(),
-    )
-    .expect("durable reader after live runtime A");
-    let live_state = reader.load().expect("runtime A sidecar");
+    let live_state = load_sidecar(&parent_path, &parent_id);
     let live_worker = live_state
         .agents
         .iter()
@@ -2225,8 +2749,14 @@ async fn public_live_persist_restart_recovers_mailbox_and_transcript_continuity(
             .expect("runtime A persisted real child transcript path"),
     );
     let before_restart = std::fs::read_to_string(&child_path).expect("runtime A child transcript");
-    assert!(before_restart.contains("initial public durable turn"), "{before_restart}");
-    assert!(before_restart.contains("public restart assistant"), "{before_restart}");
+    assert!(
+        before_restart.contains("initial public durable turn"),
+        "{before_restart}"
+    );
+    assert!(
+        before_restart.contains("public restart assistant"),
+        "{before_restart}"
+    );
     runtime_a.shutdown().await;
 
     let runtime_b = OrchestrationRuntime::new(
@@ -2234,18 +2764,25 @@ async fn public_live_persist_restart_recovers_mailbox_and_transcript_continuity(
         quick_factory("public restart assistant"),
     )
     .expect("runtime B");
-    bind_then_recover_existing(&runtime_b, &parent);
+    let _application_b = bind_then_recover_existing(&runtime_b, &parent).await;
     let worker = runtime_b
         .list("Main")
         .into_iter()
         .find(|agent| agent.id == "Worker")
         .expect("runtime B recovered Worker");
     assert_eq!(worker.status, AgentStatus::Parked, "{worker:?}");
-    assert!(runtime_b.inbox("Worker", true).is_empty(), "runtime B starts without queued mail");
+    assert!(
+        runtime_b.inbox("Worker", true).expect("inbox").is_empty(),
+        "runtime B starts without queued mail"
+    );
 
     let receipts = runtime_b.send("Main", "Worker", "continue after public restart", None);
     assert_eq!(receipts.len(), 1, "{receipts:?}");
-    assert_eq!(receipts[0].outcome, DeliveryOutcome::Revived, "{receipts:?}");
+    assert_eq!(
+        receipts[0].outcome,
+        DeliveryOutcome::Revived,
+        "{receipts:?}"
+    );
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let jobs = runtime_b
@@ -2253,14 +2790,23 @@ async fn public_live_persist_restart_recovers_mailbox_and_transcript_continuity(
             .into_iter()
             .filter(|job| job.agent_id == "Worker")
             .collect::<Vec<_>>();
-        if jobs.iter().any(|job| job.status.is_settled() && job.id != spawn[0].job_id) {
+        if jobs
+            .iter()
+            .any(|job| job.status.is_settled() && job.id != spawn[0].job_id)
+        {
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "revival did not settle: {jobs:?}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "revival did not settle: {jobs:?}"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let after_restart = std::fs::read_to_string(&child_path).expect("continued child transcript");
-    assert!(after_restart.contains("initial public durable turn"), "{after_restart}");
+    assert!(
+        after_restart.contains("initial public durable turn"),
+        "{after_restart}"
+    );
     assert!(
         after_restart.contains("continue after public restart"),
         "the restart wake appends to the same transcript: {after_restart}"
@@ -2287,7 +2833,9 @@ async fn application_switch_rebind_is_transactional_and_uses_new_child_root() {
         quick_factory("application child turn"),
     )
     .expect("runtime");
-    let application = Application::new(old_parent).await;
+    let application = application_with_isolated_resources(&old_parent)
+        .await
+        .expect("isolated switch application");
     application
         .attach_orchestration(runtime.clone())
         .await
@@ -2314,15 +2862,13 @@ async fn application_switch_rebind_is_transactional_and_uses_new_child_root() {
         )
         .await
         .expect("wait Legacy");
-    assert!(runtime.list("Main").iter().any(|agent| agent.id == "Legacy"));
-    let old_state = DurableRuntime::new(
-        old_id.clone(),
-        old_path.clone(),
-        old_child_root.clone(),
-    )
-    .expect("old application durable reader")
-    .load()
-    .expect("old application sidecar");
+    assert!(
+        runtime
+            .list("Main")
+            .iter()
+            .any(|agent| agent.id == "Legacy")
+    );
+    let old_state = load_sidecar(&old_path, &old_id);
 
     let (new_parent, new_path) =
         parent_session_with_id(artifacts.path(), sessions.path(), "application.parent.v2");
@@ -2343,7 +2889,10 @@ async fn application_switch_rebind_is_transactional_and_uses_new_child_root() {
         version: DURABLE_STATE_VERSION,
         parent_session_id: new_id.to_owned(),
         parent_session_path: new_path.to_string_lossy().into_owned(),
+        group_id: uuid::Uuid::now_v7().to_string(),
+        durable_policy: old_state.durable_policy.clone(),
         main_mailbox: Vec::new(),
+        delivered_messages: Vec::new(),
         agents: vec![invalid_agent],
         jobs: Vec::new(),
     };
@@ -2361,8 +2910,14 @@ async fn application_switch_rebind_is_transactional_and_uses_new_child_root() {
         .session()
         .recorder_info()
         .expect("failed Application cutover retains old parent recorder");
-    assert_eq!(retained_id, old_id, "failed Application cutover retains old parent id");
-    assert_eq!(retained_path, old_path, "failed Application cutover retains old parent path");
+    assert_eq!(
+        retained_id, old_id,
+        "failed Application cutover retains old parent id"
+    );
+    assert_eq!(
+        retained_path, old_path,
+        "failed Application cutover retains old parent path"
+    );
     let attached = application
         .orchestration_runtime()
         .expect("application retains orchestration runtime");
@@ -2372,14 +2927,17 @@ async fn application_switch_rebind_is_transactional_and_uses_new_child_root() {
         "same live runtime remains attached"
     );
     assert!(
-        attached.list("Main").iter().any(|agent| agent.id == "Legacy"),
+        attached
+            .list("Main")
+            .iter()
+            .any(|agent| agent.id == "Legacy"),
         "failed Application cutover preserves old live roster"
     );
-    let old_after_failure = DurableRuntime::new(old_id, old_path, old_child_root)
-        .expect("old reader after failed application switch")
-        .load()
-        .expect("old state after failed application switch");
-    assert_eq!(old_after_failure, old_state, "failed Application cutover preserves old sidecar");
+    let old_after_failure = load_sidecar(&old_path, &old_id);
+    assert_eq!(
+        old_after_failure, old_state,
+        "failed Application cutover preserves old sidecar"
+    );
 
     std::fs::remove_file(&new_sidecar).expect("repair invalid replacement sidecar");
     let switched = application
@@ -2393,11 +2951,21 @@ async fn application_switch_rebind_is_transactional_and_uses_new_child_root() {
         .expect("successful Application cutover installs new parent recorder");
     assert_eq!(switched_id, new_id);
     assert_eq!(switched_path, new_path);
+    let live = application
+        .orchestration_runtime()
+        .expect("successful Application cutover keeps an attached runtime");
     assert!(
-        runtime.list("Main").iter().all(|agent| agent.id != "Legacy"),
+        live.list("Main").iter().all(|agent| agent.id != "Legacy"),
         "successful Application cutover cannot leak Legacy"
     );
-    let fresh = runtime
+    assert!(
+        runtime
+            .list("Main")
+            .iter()
+            .any(|agent| agent.id == "Legacy"),
+        "outgoing runtime remains resident with the previous parent roster"
+    );
+    let fresh = live
         .spawn_tasks(
             "Main",
             0,
@@ -2411,26 +2979,455 @@ async fn application_switch_rebind_is_transactional_and_uses_new_child_root() {
             }],
         )
         .expect("spawn Fresh after Application cutover");
-    runtime
-        .wait_jobs(
-            &[fresh[0].job_id.clone()],
-            Some(Duration::from_secs(5)),
-            None,
-        )
-        .await
-        .expect("wait Fresh");
-    let new_state = DurableRuntime::new(new_id.to_owned(), new_path, new_child_root.clone())
-        .expect("new application durable reader")
-        .load()
-        .expect("new application sidecar");
-    assert!(new_state.agents.iter().all(|agent| agent.snapshot.id != "Legacy"));
+    live.wait_jobs(
+        &[fresh[0].job_id.clone()],
+        Some(Duration::from_secs(5)),
+        None,
+    )
+    .await
+    .expect("wait Fresh");
+    let new_state = load_sidecar(&new_path, new_id);
+    assert!(
+        new_state
+            .agents
+            .iter()
+            .all(|agent| agent.snapshot.id != "Legacy")
+    );
     let fresh_agent = new_state
         .agents
         .iter()
         .find(|agent| agent.snapshot.id == "Fresh")
         .expect("Fresh persisted under new application parent");
-    let fresh_path = PathBuf::from(fresh_agent.session_path.as_deref().expect("Fresh transcript"));
-    assert!(fresh_path.starts_with(&new_child_root), "{}", fresh_path.display());
+    let fresh_path = PathBuf::from(
+        fresh_agent
+            .session_path
+            .as_deref()
+            .expect("Fresh transcript"),
+    );
+    assert!(
+        fresh_path.starts_with(&new_child_root),
+        "{}",
+        fresh_path.display()
+    );
+
+    application.cleanup().await;
+}
+
+/// Materialize a target session file with an explicit id and one recorded user
+/// message so a later `switch_session` has a real transcript to restore.
+fn target_session_with_message(
+    artifacts: &Path,
+    sessions: &Path,
+    id: &str,
+    message: &str,
+) -> PathBuf {
+    let recorder = start_session_in(
+        artifacts,
+        Some(&test_model()),
+        Some("off"),
+        Some(sessions),
+        Some(id),
+        None,
+    )
+    .expect("explicit id target recorder");
+    let path = recorder.path();
+    recorder
+        .record_message(&pi_ai::Message::user_text(message, 1))
+        .expect("record target user message");
+    recorder.persist_now().expect("persist target transcript");
+    drop(recorder);
+    path
+}
+
+/// A resumed Session over an existing materialized session file, used when a
+/// fixture helper (e.g. `plant_sidecar`) needs a recorded parent Session.
+fn resumed_session_at(path: &Path, cwd: &Path, session_dir: &Path) -> anyhow::Result<Session> {
+    let session = Session::new_with_additional_tools_filtered_and_discovery(
+        SessionOptions {
+            model: test_model(),
+            cwd: cwd.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+            auth_manager: None,
+        },
+        Vec::new(),
+        Default::default(),
+        pi_coding::ResourceDiscovery::Disabled,
+    )?;
+    session.set_session_dir(session_dir.to_path_buf());
+    session.record(pi_coding::resume_session(path)?)?;
+    Ok(session)
+}
+
+/// Demote a valid current-version sidecar to the exact historical v1 wire
+/// shape. V1 predates both `durablePolicy` and `groupId`; removing both fields
+/// and setting `version: 1` reproduces the historical authority boundary while
+/// retaining the shared nested agent/job/mailbox shapes.
+fn demote_sidecar_to_legacy_v1(sidecar: &Path) {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(sidecar).expect("read current sidecar"))
+            .expect("decode current sidecar");
+    value
+        .as_object_mut()
+        .expect("sidecar object")
+        .remove("durablePolicy");
+    value
+        .as_object_mut()
+        .expect("sidecar object")
+        .remove("groupId");
+    value["version"] = serde_json::json!(1);
+    std::fs::write(
+        sidecar,
+        serde_json::to_vec_pretty(&value).expect("encode legacy v1 sidecar"),
+    )
+    .expect("write legacy v1 sidecar");
+}
+
+/// Rewrite only the `version` field of a sidecar, preserving every other byte
+/// of semantic content (used to plant future/zero-version fixtures).
+fn rewrite_sidecar_version(sidecar: &Path, version: u32) {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(sidecar).expect("read sidecar"))
+            .expect("decode sidecar");
+    value["version"] = serde_json::json!(version);
+    std::fs::write(
+        sidecar,
+        serde_json::to_vec_pretty(&value).expect("encode sidecar version"),
+    )
+    .expect("write sidecar version");
+}
+
+/// Regression: switching to a session whose durable child root carries a
+/// legacy v1 sidecar (schema 5d8dc15, before `durablePolicy` existed) must
+/// not abort with `parsing durable state sidecar`. A v1 sidecar holds no
+/// durable orchestration authority for the current generation, so the switch
+/// treats it as absent: the target transcript is restored and a fresh valid
+/// v3 sidecar is published with the live durable policy, group identity, and
+/// an empty roster.
+#[tokio::test]
+async fn switch_session_with_legacy_v1_sidecar_restores_transcript_and_publishes_fresh_v3() {
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let sessions = tempfile::tempdir().expect("sessions");
+    let (old_parent, _old_id, _old_path) = parent_session(artifacts.path(), sessions.path());
+    let runtime = OrchestrationRuntime::new(
+        config(artifacts.path(), vec![task_definition()]),
+        quick_factory("legacy-v1 switch"),
+    )
+    .expect("runtime");
+    let application = application_with_isolated_resources(&old_parent)
+        .await
+        .expect("isolated switch application");
+    application
+        .attach_orchestration(runtime.clone())
+        .await
+        .expect("attach switch orchestration");
+
+    let new_id = "legacy.v1.target";
+    let new_path = target_session_with_message(
+        artifacts.path(),
+        sessions.path(),
+        new_id,
+        "legacy v1 target transcript marker",
+    );
+    let new_child_root = child_root_for(&new_path, new_id);
+    let resumed = resumed_session_at(&new_path, artifacts.path(), sessions.path())
+        .expect("resumed legacy target");
+    let sidecar = plant_sidecar(
+        &resumed,
+        artifacts.path(),
+        vec![persisted_worker(
+            "Worker",
+            AgentStatus::Parked,
+            "legacy durable work",
+            None,
+            Vec::new(),
+        )],
+        vec![],
+    )
+    .await;
+    let v3_bytes = std::fs::read(&sidecar).expect("read v3 sidecar");
+    let v3_value: serde_json::Value = serde_json::from_slice(&v3_bytes).expect("decode v3");
+    assert!(
+        v3_value["durablePolicy"].is_object(),
+        "planted v3 sidecar carries durablePolicy"
+    );
+    assert!(
+        v3_value["groupId"].is_string(),
+        "planted v3 sidecar carries groupId"
+    );
+    demote_sidecar_to_legacy_v1(&sidecar);
+    let v1_bytes = std::fs::read(&sidecar).expect("read legacy v1 sidecar");
+    assert_ne!(
+        v3_bytes, v1_bytes,
+        "demotion must drop durable authority fields"
+    );
+    let probe: serde_json::Value =
+        serde_json::from_slice(&v1_bytes).expect("decode legacy v1 sidecar");
+    assert_eq!(
+        probe["version"],
+        serde_json::json!(1),
+        "legacy fixture is version 1"
+    );
+    assert!(
+        probe.get("durablePolicy").is_none(),
+        "a real legacy v1 sidecar never carried durablePolicy"
+    );
+    assert_eq!(
+        probe["parentSessionId"],
+        serde_json::json!(new_id),
+        "legacy fixture names the target parent"
+    );
+
+    let outcome = application
+        .switch_session(&new_path)
+        .await
+        .expect("legacy v1 sidecar must not block the switch");
+    assert!(!outcome.cancelled);
+
+    // Transcript restoration: the live application session is the target.
+    assert_eq!(
+        application.messages(),
+        vec![pi_ai::Message::user_text(
+            "legacy v1 target transcript marker",
+            1
+        )],
+        "switched application must serve the target transcript"
+    );
+    let (switched_id, switched_path) = application
+        .session()
+        .recorder_info()
+        .expect("switched recorder");
+    assert_eq!(switched_id, new_id);
+    assert_eq!(switched_path, new_path);
+
+    // Fresh valid v3 publication: strict current-version parse succeeds and
+    // names the target parent with the live durable policy and group identity.
+    // The legacy v1 worker is never fabricated into authority.
+    let fresh = std::fs::read(&sidecar).expect("read published v3 sidecar");
+    let state: DurableState = serde_json::from_slice(&fresh)
+        .expect("fresh sidecar must parse as strict current-version DurableState");
+    assert_eq!(
+        state.version, DURABLE_STATE_VERSION,
+        "fresh v3 sidecar replaces the legacy v1"
+    );
+    assert_eq!(state.parent_session_id, new_id);
+    assert_eq!(
+        state.parent_session_path,
+        new_path.to_string_lossy(),
+        "fresh v3 sidecar keeps the exact switched parent path"
+    );
+    assert!(
+        uuid::Uuid::parse_str(&state.group_id).is_ok(),
+        "fresh v3 group identity"
+    );
+    assert!(
+        state.agents.is_empty(),
+        "legacy v1 agents must not leak into fresh v3"
+    );
+    assert!(
+        state.jobs.is_empty(),
+        "legacy v1 jobs must not leak into fresh v3"
+    );
+    assert_eq!(
+        state.durable_policy,
+        application
+            .durable_policy_state()
+            .expect("live generation durable policy"),
+        "fresh v3 sidecar carries the live generation durable policy"
+    );
+
+    application.cleanup().await;
+}
+
+/// Every invalid target sidecar fails a real switch closed: truncated JSON, a
+/// malformed v1 envelope (missing required fields, or carrying an unknown
+/// `durablePolicy` key — a loose envelope must not bypass validation), a
+/// future version, and version zero. Each failure preserves the exact sidecar
+/// bytes on disk and retains the live source session (id, path, sidecar).
+#[tokio::test]
+async fn switch_session_fails_closed_on_invalid_target_sidecars_and_retains_source() {
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let sessions = tempfile::tempdir().expect("sessions");
+    let (old_parent, old_id, old_path) = parent_session(artifacts.path(), sessions.path());
+    let runtime = OrchestrationRuntime::new(
+        config(artifacts.path(), vec![task_definition()]),
+        quick_factory("invalid-sidecar switch"),
+    )
+    .expect("runtime");
+    let application = application_with_isolated_resources(&old_parent)
+        .await
+        .expect("isolated switch application");
+    application
+        .attach_orchestration(runtime.clone())
+        .await
+        .expect("attach switch orchestration");
+    let old_sidecar_before =
+        std::fs::read(child_root_for(&old_path, &old_id).join("orchestration-state.json"))
+            .expect("read source sidecar before");
+
+    for case in 0..5usize {
+        let new_id = format!("invalid-target-{case}");
+        let new_path = target_session_with_message(
+            artifacts.path(),
+            sessions.path(),
+            &new_id,
+            "target message never reached",
+        );
+        let new_child_root = child_root_for(&new_path, &new_id);
+        let sidecar = new_child_root.join("orchestration-state.json");
+        let (expected, planted_bytes) = match case {
+            // Truncated JSON: unparseable regardless of version.
+            0 => {
+                std::fs::create_dir_all(&new_child_root).expect("child root");
+                let bytes = b"{ \"version\": 2, \"parentSessionId\": ".to_vec();
+                std::fs::write(&sidecar, &bytes).expect("write truncated sidecar");
+                ("durable state sidecar", bytes)
+            }
+            // Malformed v1: `version: 1` with no required fields.
+            1 => {
+                std::fs::create_dir_all(&new_child_root).expect("child root");
+                let bytes = serde_json::to_vec_pretty(&serde_json::json!({ "version": 1 }))
+                    .expect("encode minimal v1");
+                std::fs::write(&sidecar, &bytes).expect("write minimal v1 sidecar");
+                ("durable state sidecar", bytes)
+            }
+            // v1 wire with an unknown `durablePolicy` field (deny_unknown_fields).
+            2 => {
+                let resumed = resumed_session_at(&new_path, artifacts.path(), sessions.path())
+                    .expect("resumed invalid target");
+                plant_sidecar(&resumed, artifacts.path(), vec![], vec![]).await;
+                rewrite_sidecar_version(&sidecar, 1);
+                let bytes = std::fs::read(&sidecar).expect("read v1-with-policy sidecar");
+                ("durable state sidecar", bytes)
+            }
+            // Future version on an otherwise valid current-version sidecar.
+            4 => {
+                let resumed = resumed_session_at(&new_path, artifacts.path(), sessions.path())
+                    .expect("resumed future target");
+                plant_sidecar(&resumed, artifacts.path(), vec![], vec![]).await;
+                rewrite_sidecar_version(&sidecar, DURABLE_STATE_VERSION + 1);
+                let bytes = std::fs::read(&sidecar).expect("read future sidecar");
+                ("unsupported (expected", bytes)
+            }
+            // Version zero on an otherwise valid current-version sidecar.
+            _ => {
+                let resumed = resumed_session_at(&new_path, artifacts.path(), sessions.path())
+                    .expect("resumed zero-version target");
+                plant_sidecar(&resumed, artifacts.path(), vec![], vec![]).await;
+                rewrite_sidecar_version(&sidecar, 0);
+                let bytes = std::fs::read(&sidecar).expect("read zero-version sidecar");
+                ("unsupported (expected", bytes)
+            }
+        };
+
+        let error = application
+            .switch_session(&new_path)
+            .await
+            .expect_err(&format!(
+                "case {case} ({expected}) must fail the switch closed"
+            ));
+        assert!(
+            error.to_string().contains(expected),
+            "case {case}: expected failure mentioning {expected:?}, got: {error:#}"
+        );
+        let (retained_id, retained_path) = application
+            .session()
+            .recorder_info()
+            .expect("retained source recorder");
+        assert_eq!(
+            retained_id, old_id,
+            "case {case}: source session id retained"
+        );
+        assert_eq!(
+            retained_path, old_path,
+            "case {case}: source session path retained"
+        );
+        assert_eq!(
+            std::fs::read(&sidecar).expect("read sidecar after failure"),
+            planted_bytes,
+            "case {case}: failed switch must preserve the exact target sidecar bytes"
+        );
+        let old_sidecar_after =
+            std::fs::read(child_root_for(&old_path, &old_id).join("orchestration-state.json"))
+                .expect("read source sidecar after");
+        assert_eq!(
+            old_sidecar_after, old_sidecar_before,
+            "case {case}: failed switch must not touch the source sidecar"
+        );
+    }
+
+    application.cleanup().await;
+}
+
+/// Durable-resumed parent first generation must provision CALLABLE goal and
+/// Todo-child bindings — executed, not just name-present — via the real
+/// persisted fixture (recorded parent, planted sidecar, strict recovery).
+#[tokio::test]
+async fn durable_resumed_parent_first_generation_provisions_callable_goal_and_todo_child() {
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let sessions = tempfile::tempdir().expect("sessions");
+    let (parent, _parent_id, _parent_path) = parent_session(artifacts.path(), sessions.path());
+    let sidecar = plant_sidecar(&parent, artifacts.path(), Vec::new(), Vec::new()).await;
+    assert!(
+        sidecar.exists(),
+        "durable sidecar must be persisted before recovery"
+    );
+
+    let runtime = OrchestrationRuntime::new(
+        config(artifacts.path(), vec![task_definition()]),
+        quick_factory("unused durable recovery"),
+    )
+    .expect("orchestration runtime");
+    let restarted = restarted_parent_session(&parent).expect("reopen durable parent recording");
+    let application = application_with_orchestration_and_optional_bindings(
+        &restarted,
+        runtime,
+        Some((
+            pi_coding::GoalToolBinding::default(),
+            pi_coding::TodoChildToolBinding::default(),
+        )),
+    )
+    .await
+    .expect("recover existing durable runtime with fresh goal and todo-child bindings");
+
+    // Production wiring (build_session): the caller owns an isolated real
+    // TodoChildService; its client holds a Weak, so keep the Arc alive here.
+    let todo_child_service = pi_coding::TodoChildService::new();
+    application
+        .attach_todo_child_client(todo_child_service.client())
+        .expect("attach isolated real todo child service");
+    let tools = application.get_all_tools();
+    for name in ["task", "hub", "goal", "todo_child_list"] {
+        tool(&tools, name);
+    }
+
+    let goal = tool(&tools, "goal");
+    let goal_result = (goal.execute)(context("durable-goal-get", json!({ "op": "get" })))
+        .await
+        .expect("goal binding must be attached and callable in the durable first generation");
+    assert!(
+        goal_result.details.is_object(),
+        "goal execution must return the goal state object: {:?}",
+        goal_result.details
+    );
+
+    let todo_child_list = tool(&tools, "todo_child_list");
+    let list_result = (todo_child_list.execute)(context("durable-todo-child-list", json!({})))
+        .await
+        .expect("todo-child binding must be attached and callable in the durable first generation");
+    assert!(
+        list_result.details.is_object() || list_result.details.is_array(),
+        "todo_child_list execution must return serializable state: {:?}",
+        list_result.details
+    );
 
     application.cleanup().await;
 }

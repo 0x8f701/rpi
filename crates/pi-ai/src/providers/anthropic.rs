@@ -15,8 +15,8 @@ use serde_json::{Map, Value, json};
 use crate::*;
 
 use super::common::{
-    apply_provider_headers, apply_provider_request, client, consume_sse, error_body, fail,
-    insert_header, insert_header_map, is_aborted, notify_response, send_with_retry,
+    apply_provider_headers, apply_provider_request, build_request, client, consume_sse, error_body,
+    fail, insert_header, insert_header_map, is_aborted, notify_response, send_with_retry,
 };
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -634,29 +634,20 @@ fn convert_anthropic_tools(
             t.name.clone()
         };
         let strict = resolve_json_schema_strict_sampling(t, supports_strict_tools)?;
-        let schema_val = serde_json::to_value(&t.parameters).unwrap_or_else(|_| json!({}));
-        let props = schema_val
-            .get("properties")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-        let required = schema_val
-            .get("required")
-            .cloned()
-            .unwrap_or_else(|| json!([]));
-        let mut input_schema = json!({
-            "type": "object",
-            "properties": props,
-            "required": required,
-        });
-        if strict {
-            if let Value::Object(mut full) = schema_val {
-                if let Value::Object(legacy) = &input_schema {
-                    for (k, v) in legacy {
-                        full.insert(k.clone(), v.clone());
-                    }
-                }
-                input_schema = Value::Object(full);
-            }
+        // Anthropic input_schema must carry the actual tool schema — the strict
+        // flag only controls provider-side constrained decoding, so keywords
+        // like additionalProperties, defaults, bounds, items, and combinators
+        // survive in both strict and non-strict sampling.
+        let mut input_schema = serde_json::to_value(&t.parameters).unwrap_or_else(|_| json!({}));
+        if let Value::Object(map) = &mut input_schema {
+            // Compat baseline: fill the object keywords Anthropic expects when
+            // the caller's schema leaves them implicit.
+            map.entry("type".to_owned())
+                .or_insert_with(|| json!("object"));
+            map.entry("properties".to_owned()).or_insert_with(|| json!({}));
+            map.entry("required".to_owned()).or_insert_with(|| json!([]));
+        } else {
+            input_schema = json!({"type": "object", "properties": {}, "required": []});
         }
         let mut tool = json!({
             "name": name,
@@ -1459,13 +1450,10 @@ async fn run_anthropic_stream(
     };
     let url = format!("{base_url}/v1/messages");
 
-    let http = match client(&opts.stream) {
-        Ok(c) => c,
-        Err(e) => {
-            fail(&stream, out, e.to_string(), aborted()).await;
-            return;
-        }
-    };
+    if let Err(e) = client(&opts.stream) {
+        fail(&stream, out, e.to_string(), aborted()).await;
+        return;
+    }
 
     let has_tools = !req.tools.is_empty();
 
@@ -1490,11 +1478,21 @@ async fn run_anthropic_stream(
             return;
         }
     };
-    let payload = body;
+    let payload = match serde_json::to_vec(&body) {
+        Ok(payload) => payload,
+        Err(e) => {
+            fail(&stream, out, e.to_string(), aborted()).await;
+            return;
+        }
+    };
     let build = || {
-        http.post(&url)
-            .json(&payload)
-            .headers(request_headers.clone())
+        build_request(
+            &opts.stream,
+            HttpMethod::Post,
+            &url,
+            &request_headers,
+            payload.clone(),
+        )
     };
 
     let resp = match send_with_retry(&opts.stream, build).await {
@@ -1504,7 +1502,9 @@ async fn run_anthropic_stream(
             return;
         }
     };
-    if let Err(e) = notify_response(&opts.stream, &resp, &model).await {
+    if let Err(e) =
+        notify_response(&opts.stream, resp.status(), resp.headers().clone(), &model).await
+    {
         fail(&stream, out, e.to_string(), aborted()).await;
         return;
     }
@@ -1934,6 +1934,19 @@ pub fn register_anthropic() {
             stream: stream_fn,
             stream_simple: simple_fn,
             generate_image: None,
+            resolve_http_authorities: Arc::new(|model, options| {
+                let configured = if model.base_url.is_empty() {
+                    ANTHROPIC_DEFAULT_BASE_URL
+                } else {
+                    model.base_url.as_str()
+                };
+                let url = format!(
+                    "{}/v1/messages",
+                    resolve_base_url(configured, &options.env)?.trim_end_matches('/')
+                );
+                let (authority, _) = resolve_http_endpoint(&url)?;
+                Ok(std::collections::BTreeSet::from([authority]))
+            }),
         },
         None,
     );
@@ -1958,11 +1971,13 @@ mod tests {
         assert!(!is_oauth_token("sk-ant-oa"));
         assert!(!is_oauth_token("π-sk-ant-oa"));
         assert!(is_oauth_token(
-            std::str::from_utf8(&[b'\xcf', b'\x80', b'-']
-                .into_iter()
-                .chain(prefix)
-                .collect::<Vec<_>>())
-                .expect("UTF-8 OAuth token")
+            std::str::from_utf8(
+                &[b'\xcf', b'\x80', b'-']
+                    .into_iter()
+                    .chain(prefix)
+                    .collect::<Vec<_>>()
+            )
+            .expect("UTF-8 OAuth token")
         ));
 
         let mut embedded = b"before-".to_vec();
@@ -2382,10 +2397,9 @@ data: {\"type\":\"message_stop\"}\n\
             convert_anthropic_tools(&[&preferred_tool], false, false, false, None, false)
                 .expect("prefer fallback");
         assert!(preferred[0].get("strict").is_none());
-        assert!(
-            preferred[0]["input_schema"]
-                .get("additionalProperties")
-                .is_none()
+        assert_eq!(
+            preferred[0]["input_schema"]["additionalProperties"], false,
+            "strict flag absence must not drop schema keywords"
         );
 
         let required = tool(ConstrainedSamplingStrictness::Require);
@@ -2394,6 +2408,148 @@ data: {\"type\":\"message_stop\"}\n\
         assert_eq!(
             error.to_string(),
             "Tool \"rich\" requires JSON-schema constrained sampling, but strict tools are unsupported."
+        );
+    }
+
+    /// Anthropic compatibility: the shared [`crate::Schema`] keeps emitting
+    /// standard JSON-Schema `type: [T, "null"]` unions on the Anthropic path
+    /// (only the OpenAI strict boundary rewrites them into anyOf). A nullable
+    /// array field must arrive with its type union AND items intact.
+    #[test]
+    fn anthropic_input_schema_keeps_nullable_type_unions() {
+        let schema = crate::Schema {
+            schema_type: Some(json!("object")),
+            properties: std::collections::HashMap::from([(
+                "list".to_owned(),
+                crate::Schema {
+                    schema_type: Some(json!("array")),
+                    items: Some(Box::new(crate::Schema {
+                        schema_type: Some(json!("string")),
+                        ..Default::default()
+                    })),
+                    nullable: true,
+                    ..Default::default()
+                },
+            )]),
+            required: vec!["list".to_owned()],
+            ..Default::default()
+        };
+        let tool = crate::ToolDefinition {
+            name: "todo".into(),
+            description: "todo".into(),
+            parameters: schema,
+            constrained_sampling: None,
+        };
+        // Drive the real converter (same seam production requests use).
+        let converted = convert_anthropic_tools(&[&tool], false, false, false, None, false)
+            .expect("convert anthropic tool");
+        let field = &converted[0]["input_schema"]["properties"]["list"];
+        assert_eq!(field["type"], json!(["array", "null"]));
+        assert_eq!(field["items"]["type"], json!("string"));
+        assert!(
+            field.get("anyOf").is_none(),
+            "Anthropic path must not rewrite to anyOf"
+        );
+    }
+
+    /// Regression: a non-constrained Grep-like tool must serialize its actual
+    /// schema into `input_schema` — additionalProperties, defaults, bounds,
+    /// items, and enums survive without the strict flag, and `strict` stays
+    /// absent exactly as when constrained sampling is off.
+    #[test]
+    fn anthropic_non_strict_input_schema_keeps_full_tool_schema() {
+        let schema = crate::Schema {
+            additional_properties: Some(json!(false)),
+            ..crate::Schema::object_ordered(vec![
+                (
+                    "pattern".into(),
+                    crate::Schema {
+                        min_length: Some(1),
+                        ..Schema::string()
+                    },
+                    true,
+                ),
+                (
+                    "paths".into(),
+                    crate::Schema {
+                        schema_type: Some(json!("array")),
+                        items: Some(Box::new(Schema::string())),
+                        ..Default::default()
+                    },
+                    false,
+                ),
+                (
+                    "limit".into(),
+                    crate::Schema {
+                        schema_type: Some(json!("integer")),
+                        default: Some(json!(10)),
+                        minimum: Some(1.0),
+                        maximum: Some(100.0),
+                        ..Default::default()
+                    },
+                    false,
+                ),
+                (
+                    "output_mode".into(),
+                    crate::Schema {
+                        schema_type: Some(json!("string")),
+                        enum_values: vec![json!("content"), json!("files_with_matches")],
+                        ..Default::default()
+                    },
+                    false,
+                ),
+            ])
+        };
+        let tool = crate::ToolDefinition {
+            name: "grep".into(),
+            description: "like Grep".into(),
+            parameters: schema,
+            constrained_sampling: None,
+        };
+        let converted = convert_anthropic_tools(&[&tool], false, false, false, None, false)
+            .expect("convert non-strict tool");
+        let entry = &converted[0];
+
+        assert!(
+            entry.get("strict").is_none(),
+            "strict flag must stay absent without constrained sampling"
+        );
+        let input_schema = &entry["input_schema"];
+        assert_eq!(input_schema["type"], json!("object"));
+        assert_eq!(input_schema["additionalProperties"], json!(false));
+        assert_eq!(input_schema["required"], json!(["pattern"]));
+        assert_eq!(input_schema["properties"]["pattern"]["type"], json!("string"));
+        assert_eq!(input_schema["properties"]["pattern"]["minLength"], json!(1));
+        assert_eq!(
+            input_schema["properties"]["paths"]["items"]["type"],
+            json!("string")
+        );
+        assert_eq!(
+            input_schema["properties"]["limit"]["default"],
+            json!(10)
+        );
+        assert_eq!(input_schema["properties"]["limit"]["minimum"], json!(1.0));
+        assert_eq!(input_schema["properties"]["limit"]["maximum"], json!(100.0));
+        assert_eq!(
+            input_schema["properties"]["output_mode"]["enum"],
+            json!(["content", "files_with_matches"])
+        );
+        // Exact field set: nothing dropped, nothing invented.
+        let mut keys = input_schema
+            .as_object()
+            .expect("input_schema object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "additionalProperties".to_owned(),
+                "properties".to_owned(),
+                "required".to_owned(),
+                "type".to_owned(),
+            ]
         );
     }
 
@@ -2438,12 +2594,8 @@ data: {\"type\":\"message_stop\"}\n\
             false,
         )
         .expect("headers");
-        let request = client(&opts.stream)
-            .expect("client")
-            .get("http://example.test")
-            .headers(headers)
-            .build()
-            .expect("request");
+        let request =
+            crate::http::test_http_request(HttpMethod::Get, "http://example.test", &headers);
         assert_eq!(request.headers().get_all("x-api-key").iter().count(), 1);
         assert_eq!(
             request
@@ -2480,12 +2632,8 @@ data: {\"type\":\"message_stop\"}\n\
         let headers =
             anthropic_request_headers(&model, &Context::default(), &opts, false, "", "", false)
                 .expect("headers");
-        let request = client(&opts.stream)
-            .expect("client")
-            .get("http://example.test")
-            .headers(headers)
-            .build()
-            .expect("request");
+        let request =
+            crate::http::test_http_request(HttpMethod::Get, "http://example.test", &headers);
         assert_eq!(request.headers().get_all("x-api-key").iter().count(), 1);
         assert_eq!(
             request
@@ -2530,12 +2678,8 @@ data: {\"type\":\"message_stop\"}\n\
             false,
         )
         .expect("headers");
-        let request = client(&opts.stream)
-            .expect("client")
-            .get("http://example.test")
-            .headers(headers)
-            .build()
-            .expect("request");
+        let request =
+            crate::http::test_http_request(HttpMethod::Get, "http://example.test", &headers);
         assert_eq!(
             request
                 .headers()
@@ -2578,12 +2722,8 @@ data: {\"type\":\"message_stop\"}\n\
             false,
         )
         .expect("headers");
-        let request = client(&opts.stream)
-            .expect("client")
-            .get("http://example.test")
-            .headers(headers)
-            .build()
-            .expect("request");
+        let request =
+            crate::http::test_http_request(HttpMethod::Get, "http://example.test", &headers);
         assert_eq!(
             request
                 .headers()
@@ -2618,12 +2758,8 @@ data: {\"type\":\"message_stop\"}\n\
         let headers =
             anthropic_request_headers(&model, &Context::default(), &opts, false, "", "", false)
                 .expect("headers");
-        let request = client(&opts.stream)
-            .expect("client")
-            .get("http://example.test")
-            .headers(headers)
-            .build()
-            .expect("request");
+        let request =
+            crate::http::test_http_request(HttpMethod::Get, "http://example.test", &headers);
         assert_eq!(
             request
                 .headers()
@@ -2661,12 +2797,8 @@ data: {\"type\":\"message_stop\"}\n\
         let headers =
             anthropic_request_headers(&model, &context, &opts, false, "copilot-token", "", false)
                 .expect("headers");
-        let request = client(&opts.stream)
-            .expect("client")
-            .get("http://example.test")
-            .headers(headers)
-            .build()
-            .expect("request");
+        let request =
+            crate::http::test_http_request(HttpMethod::Get, "http://example.test", &headers);
         assert_eq!(
             request
                 .headers()
@@ -2724,6 +2856,7 @@ data: {\"type\":\"message_stop\"}\n\
             stream: StreamOptions {
                 api_key: Some("test-key".into()),
                 max_retries: 0,
+                http_executor: Some(crate::http::test_http_executor()),
                 ..StreamOptions::default()
             },
             ..AnthropicOptions::default()
@@ -2814,6 +2947,7 @@ data: {\"type\":\"message_stop\"}\n\
                 stream: StreamOptions {
                     api_key: Some("bad".into()),
                     max_retries: 0,
+                    http_executor: Some(crate::http::test_http_executor()),
                     ..StreamOptions::default()
                 },
                 ..AnthropicOptions::default()

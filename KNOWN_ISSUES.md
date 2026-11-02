@@ -6,6 +6,9 @@ at `main@4c01c709380621c5ff2719162cd7a7973dcb2799`.
 
 Severity legend:
 
+- **OPEN HIGH** — confirmed correctness, isolation, or duplicate-side-effect risk.
+- **OPEN MEDIUM** — confirmed architectural debt with active drift or maintenance risk.
+- **OPEN LOW** — confirmed dead or disconnected implementation without current user impact.
 - **HIGH** — breaks reading or interoperating with upstream data / clients.
 - **MEDIUM** — silent behavior change or data loss on round-trip.
 - **LOW** — cosmetic or edge-case divergence.
@@ -87,9 +90,25 @@ The `PI_SESSION_ID`, `PI_SESSION_FILE`, `PI_PROVIDER`, `PI_MODEL`, and
 
 ### By design — rpi-only variables
 
-`PI_HOME`, `PI_FAUX_RESPONSE`, `PI_CACHE_RETENTION`, `PI_OAUTH_CALLBACK_HOST`,
-`PI_SHARE_VIEWER_URL`, `PI_CLIPBOARD_IMAGE`,
-`PI_SKIP_VERSION_CHECK` are rpi extensions. They do not affect compatibility.
+The canonical `RPI_*` controls are rpi-specific extensions:
+
+- `RPI_HOME` — managed install/update root and default agent base.
+- `RPI_UPDATE_BASE_URL` — release API endpoint override for installers/updater.
+- `RPI_OFFLINE` — disables updater networking and non-essential network calls.
+- `RPI_SKIP_VERSION_CHECK` — disables only the nonfatal interactive startup
+  version check.
+
+These are intentionally not aliases for any upstream `PI_*` spelling; the
+installers reject the legacy `PI_HOME` and `PI_UPDATE_BASE_URL` names with an
+actionable error.
+
+Preserved upstream names still read by rpi include `PI_CODING_AGENT_DIR`,
+`PI_CODING_AGENT_SESSION_DIR`, `PI_PACKAGE_DIR`, `PI_PROFILE`, `PI_AUTH_SCOPE`,
+`PI_CACHE_RETENTION`, `PI_OAUTH_CALLBACK_HOST`, and `PI_SHARE_VIEWER_URL`.
+
+Child-process/test-only `PI_*` names are `PI_PROVIDER`, `PI_MODEL`,
+`PI_REASONING_LEVEL`, `PI_SESSION_ID`, `PI_SESSION_FILE`, `PI_FAUX_RESPONSE`,
+and `PI_CLIPBOARD_IMAGE`. They do not affect upstream compatibility.
 
 ### RESOLVED — pinned Rust toolchain
 
@@ -194,7 +213,7 @@ Peer contrast:
 rpi now registers a `web_search` tool that queries the DuckDuckGo Instant
 Answer API. It is listed in the built-in tool identifiers
 (`crates/pi-coding/src/tools.rs:113`) and wired into the tool factories
-(`tools.rs:260,380,450`). The implementation respects truthy `PI_OFFLINE`
+(`tools.rs:260,380,450`). The implementation respects truthy `RPI_OFFLINE`
 values (`1`/`true`/`yes`), caps `max_results` at 10 (default 5), applies a 15s
 timeout, percent-encodes the query, and renders title/url/snippet blocks
 (`crates/pi-coding/src/tools/web_search.rs:23-106,139-142,238-247`). Tests
@@ -250,32 +269,30 @@ rpi imports 6 session formats (Pi, OMP, Codex, Claude, Grok, Droid)
 only native Pi JSONL (`packages/coding-agent/src/modes/interactive/interactive-mode.ts:5546-5575`).
 rpi is a superset here; upstream sessions import cleanly into rpi.
 
-### By design — `sessionImportSources` gates automatic foreign resume
+### By design — `sessionImportSources` gates automatic external resume
 
-Foreign sessions are not silently imported on resume unless explicitly
-enabled. The `sessionImportSources` setting lists allowed foreign source kinds;
-native Pi is always implicitly included. Allowed values are `omp`, `codex`,
-`claude`, `grok`, and `droid`; the default empty list means only native Pi is
-eligible (`crates/pi-coding/src/settings.rs:415-416,511-519,1401-1403`).
+External sessions are not silently imported on resume unless explicitly
+enabled. The `sessionImportSources` setting lists allowed immutable external
+source kinds; native rpi is always implicitly included. Allowed values are
+`pi`, `omp`, `codex`, `claude`, `grok`, and `droid`; an explicit empty list
+means only native rpi is eligible, while the Web listener's absent-setting
+default enables Pi, OMP, Codex, and Grok discovery.
 Validation rejects unsupported or duplicate entries
-(`settings.rs:1548-1560`). The effective list drives startup resume selection
-(`crates/pi-cli/src/session_run.rs:404-405`) and the unified catalog adapter
-(`crates/pi-cli/src/resume_catalog.rs:62-65`). The setting is reloadable and
-exposed in the settings catalog as a typed string-list enum
-(`crates/pi-coding/src/settings_catalog.rs:242`).
+(`crates/pi-coding/src/settings.rs`). The effective list drives startup resume
+selection and the unified catalog adapter (`crates/pi-cli/src/resume_catalog.rs`).
+The setting is reloadable and exposed in the settings catalog as a typed
+string-list enum (`crates/pi-coding/src/settings_catalog.rs`).
 
 ## Shell execution
 
-### By design — system-bash spawn instead of embedded brush shell
+### By design — default bash routes through the embedded brush shell
 
-rpi executes every bash tool call by spawning a system shell:
-`/bin/bash` → `bash` on PATH → `sh` (`crates/pi-coding/src/tools.rs:1529-1537`),
-then `Command::new(&shell).args(&shell_args).arg(command)` per invocation
-(`tools.rs:1676-1678`). This is a deliberate portability choice: it keeps rpi
-compatible with upstream `pi`'s shell behavior and avoids embedding a
-platform-specific bash engine or maintaining in-process shell state. The
-current system-bash path is fully functional; an embedded brush-style shell
-remains a future feature, not a bug fix.
+The default (unsandboxed) bash tool executes inside the embedded brush shell
+(`crates/pi-coding/src/tools/bash/brush.rs`), with a subprocess fallback to the
+system `/bin/bash` → `bash` → `sh` chain (`tools.rs`) when brush cannot serve a
+call. Confined sandbox routes spawn the pinned wrapper shell instead, and PTY
+processes run outside the brush path. Upstream compatibility is preserved at
+the tool-result boundary; in-process shell state stays per-session.
 
 ## Session behavior
 
@@ -330,10 +347,10 @@ label clearing, latest-label selection, and fork rechaining
 
 ### By design — `--continue` is deliberately native-only
 
-rpi restricts `--continue` to native Pi sessions
-(`crates/pi-cli/src/session_run.rs:410-414`); upstream picks any `.jsonl` in the
-session directory. Because rpi imports multiple session formats, it must not
-surprise-import a foreign session.
+rpi restricts `--continue` to native rpi sessions
+(`crates/pi-cli/src/session_run.rs`); upstream picks any `.jsonl` in the
+session directory. Because rpi imports multiple immutable external formats,
+it must not surprise-import an external session.
 
 ### RESOLVED — durable child recovery and mailbox-triggered revival
 
@@ -509,7 +526,7 @@ Parser regressions cover subcommand parsing, redundant-but-consistent
 
 ### RESOLVED — `get_commands` projects the primary command catalog
 
-RPC discovery now returns the same ordered 22-command primary catalog used by
+RPC discovery now returns the same ordered 32-command primary catalog used by
 the interactive command UI, including `workflow`, `code-review` and `btw`, via
 `visible_catalog()` (`crates/pi-cli/src/modes/rpc.rs:1570-1582`). Hidden
 built-ins and dynamic prompt/skill/extension commands remain executable but do
@@ -868,36 +885,35 @@ unsupported APIs above.
 
 ## Sandbox and process isolation
 
-rpi ships an **opt-in Linux filesystem sandbox** (`Settings.sandbox`) for the
-`bash` tool, process extensions, and subagent children. It is default-off,
-same-user confinement (not privilege isolation), and applies per command or
-child spawn. QuickJS in-process extensions remain same-process. The supervised
-process manager that hosts long-running `/process` commands is outside the
-per-call bash sandbox.
+rpi defaults governed execution to `danger-full-access` when `sandbox` settings
+are absent. The clean-cutover schema has exactly `read-only`,
+`workspace-write`, and `danger-full-access`; it also owns tagged child
+networking, exact host HTTP, credential grants, four confined resource limits,
+approval binding, and durable authority.
 
-### RESOLVED — opt-in Linux filesystem sandbox for bash
+### RESOLVED — cross-platform sandbox authority
 
-rpi now ships an opt-in filesystem sandbox for the `bash` tool. `Settings.sandbox`
-configures fresh Linux mount/pid/net namespaces via `unshare`, with a tmpfs root,
-`pivot_root` host-root detachment, bind-mounted allowed paths, read-only system
-binds, and denied-path overlays. Network is off by default
-(`crates/pi-coding/src/sandbox.rs:1-83,36-62,106-153,270-363`). The per-call
-`bash` parameter `sandboxed` overrides the setting for one command, defaulting
-to cwd + agent dir when no settings block exists
-(`crates/pi-coding/src/tools.rs:1141-1179`). Validation fails closed on
-non-Linux platforms, missing `unshare`, and a cwd outside allowed paths
-(`sandbox.rs:62-105`). Integration smoke tests exercise denied `/etc/passwd`,
-cwd write access, default network isolation, allowed/denied path overlays,
-timeout kill of the namespace tree, and per-call override
-(`crates/pi-coding/tests/sandbox_smoke.rs:23-245`). Unit tests in `sandbox.rs`
-cover config resolution, wrapper argv shape, env serialization, and validation
-(`sandbox.rs:368-617`).
+Linux confined execution starts from an empty bubblewrap root and uses only
+identity-pinned FD mount sources, pinned wrapper/current/target executables,
+no-new-privileges, seccomp, and the fixed resource limits. macOS confined
+execution uses a complete deny-default Seatbelt profile and the same four
+limits. Both backends reject unavailable or unrepresentable prerequisites
+instead of falling back to raw execution.
 
-`read`, `write`, and `edit` remain unsandboxed (they use path-level permission
-rules instead). The sandbox is same-user confinement, not privilege isolation.
-OS isolation for process extensions and subagent children is implemented when
-their respective settings enable the sandbox; an always-on, privilege-reducing
-OS boundary remains future work.
+Windows deliberately makes no confinement claim. Absent settings resolve to
+`danger-full-access`; explicitly configured confined settings fail before
+publication or raw process construction. The supported Windows execution route
+covers the eighteen non-Browser governed families. File authority preserves
+the full 128-bit Windows file identity.
+
+`danger-full-access` means ambient host filesystem, environment, and network
+authority with no confined hardening or resource-limit claim. It is selected by
+default or configured explicitly, cannot be granted by approval, and is never
+selected as a backend fallback.
+
+Source: `crates/pi-sandbox/src/policy.rs`, `backend.rs`, `coverage.rs`,
+`bwrap.rs`, `seatbelt.rs`; `crates/pi-coding/src/sandbox/generation.rs` and
+`fs/windows.rs`.
 
 ### RESOLVED — path-level permission rules
 
@@ -934,16 +950,30 @@ syscall result is ignored so unsupported platforms start normally
 unit test exercises the startup path on unix
 (`crates/pi-cli/src/lib.rs:369).
 
-### RESOLVED — OS isolation for process extensions and subagent children
+### RESOLVED — governed process families and durable authority
 
-The filesystem sandbox is generalized (`SandboxConfig::wrapper_command` + `run_in_sandbox`/`spawn_piped`, killpg on timeout/abort): process extensions spawn through the sandbox when `settings.sandbox.enabled` (extension cwd + agent dir allowed; fail-closed validation), and subagent children run confined when `orchestration.sandboxed` (default false; allowed = workspace + agent dir + sandbox.allowedPaths; resolver threads into every child tool incl. bash). QuickJS in-process extensions remain same-process (documented; trust boundary = trust/approval path). `sandbox.rs`, `extensions.rs` process-spawn region, `runtime.rs` child factory, `session_run_blueprint.rs` wiring. Tests: sandboxed process extension cannot read /etc/passwd; sandboxed subagent child confined to workspace; flag-off keeps current behavior.
+All nineteen spawn families use captured sandbox authority. Linux confined and
+Linux/macOS danger cover all nineteen; generic macOS confined and Windows
+danger cover the eighteen non-Browser families. Confined Unix uses the sealed
+custom pipe/PTY launcher; portable PTY remains danger-only. Direct governed
+`Command` construction is restricted to the exact reviewed platform/operator
+symbols.
 
-Remaining limits: the sandbox is opt-in and default-off, confines filesystem
-access only (no network/syscall/credential isolation), and is same-user
-confinement. QuickJS in-process extensions rely on the trust/approval path.
-Workflow git worktrees isolate branches and working files, not host
-privileges (`crates/pi-coding/src/workflow_worktree/mod.rs:1-83`). A stronger,
-always-on OS boundary remains future work.
+Approval authorizes one exact final call with zero policy or credential delta.
+The single-use token is burned before validation and secret resolution and is
+never serialized. Credential outputs are resolved for an exact audience,
+inserted last into the child environment, and not stored in durable state.
+
+Application reload stages settings, resources, sandbox, tools, extensions,
+orchestration, runtime, and security into one immutable generation before one
+pointer swap. Durable workflow/orchestration resume validates the stored policy
+digest and credential registry, revalidates current-platform filesystem and
+backend authority, and reconstructs a child only after the complete generation
+exists. Current settings do not rewrite stored authority.
+
+The previous boolean settings, per-call and orchestration selectors,
+shell-based launcher, live resolver closures, direct governed process
+construction, and compatibility translation are removed.
 
 ### By design — project trust gates executable resources, not tool authority
 
@@ -954,10 +984,10 @@ extensions are launched only from trusted manifests
 (`docs/extensions.md:86-97,264-287`). Tool approval is intentionally separate
 from that trust decision.
 
-This is deliberate: trusting a project authorizes its local resources to load;
-it does not claim to sandbox those resources or commands. The HIGH sandbox,
-path-rule, and process-hardening gaps above therefore remain visible even
-though the trust model itself is working as designed.
+This separation is deliberate: project trust decides whether project-authored
+resources may load, while the captured sandbox generation governs the authority
+those resources and their processes receive. Trust and approval therefore
+cannot disable confinement or promote a call to danger.
 
 ### RESOLVED — users can attach directly to a running PTY
 
@@ -981,20 +1011,24 @@ todo, process, task, hub, goal`. OMP documents 31 tools; grok registers native
 tools plus compatibility ports. The following are missing entirely from rpi
 (verified by grep across `crates/`).
 
-### RESOLVED — `browser` tool for headless web automation
+### RESOLVED — governed native-sandbox Browser proof
 
-rpi now registers a `browser` tool that drives a headless Chrome/Chromium
-instance over a hand-rolled Chrome DevTools Protocol (CDP) client using
-`tokio-tungstenite`. Supported actions are `navigate`, `click`, `fill`,
-`screenshot`, `extract`, `list_tabs`, and `close`
-(`crates/pi-coding/src/tools/browser.rs:1-83,79-1095`). Chrome discovery
-prefers `CHROME_PATH`, well-known install locations, and then `PATH`; a missing
-binary is rejected with an actionable message (`browser.rs:50-59`). The tool
-is listed in `TOOL_NAMES` and wired into the coding tool factories
-(`crates/pi-coding/src/tools.rs:132,285,490,516,547`). Tests cover action
-parsing, URL validation, argument shape, screenshot path resolution, missing
-Chrome rejection, and a skip-guarded real-browser smoke against a local `data:`
-page (`crates/pi-coding/src/tools/browser.rs:867-975`).
+The Browser family launches Chrome/Chromium through the captured governed
+process boundary and controls it only through target FD 3/4 debugging pipes.
+It has no debugging TCP port, HTTP discovery, or CDP WebSocket path. A Browser
+session is exposed only after a NUL-framed `Browser.getVersion` request returns
+nonempty product and protocol-version values within the single 15-second launch
+deadline.
+
+Sandbox-disabling, single-process, alternate debugging-port, and remote-origin
+switches are rejected. Linux supports the real proof in confined and danger
+modes; macOS supports it in danger mode; Windows rejects Browser before
+approval or raw construction. Hosted Linux and both macOS runner architectures
+execute the real native Browser proof as required release dependencies rather
+than skip-on-unavailable tests.
+
+Source: `crates/pi-coding/src/tools/browser.rs` and
+`crates/pi-coding/tests/browser_native_sandbox.rs`.
 
 The native desktop `computer` automation tool (capture/input) remains
 unimplemented.
@@ -1487,7 +1521,7 @@ context in summaries (`:254-256`). rpi compacts via LLM summary only
 
 ### RESOLVED — `/fresh`, `/dump`, and encrypted share
 
-`/fresh` (new session, current archived), `/dump [--jsonl] [path]` (HTML default / JSONL via existing export path), and `/share --encrypt [passphrase]` (AES-256-GCM via `ring` — already a workspace dep — key = SHA-256(passphrase), 12-byte nonce prefix, plaintext never stored; `crates/pi-coding/src/encrypt.rs` + share.rs). 8 encrypt + 2 share + 5 cli tests incl. round-trip and wrong-passphrase rejection.
+`/fresh` (new session, current archived), `/dump [--jsonl] [path]` (HTML default / JSONL via existing export path), and `/share --encrypt [passphrase]` (AES-256-GCM via `ring` — already a workspace dep — key = PBKDF2-HMAC-SHA256(passphrase, salt, 210,000 iterations), `salt (16) || nonce (12) || ciphertext+tag` layout, plaintext never stored; `crates/pi-coding/src/encrypt.rs` + share.rs). 8 encrypt + 2 share + 5 cli tests incl. round-trip and wrong-passphrase rejection.
 
 OMP ships `/fresh` (reset provider session without losing local transcript),
 `/dump` (plain-text copy to clipboard), and E2E-encrypted `/share`
@@ -1855,8 +1889,8 @@ peer evidence, and risk levels are in the sections above.
 
 | Gap | Impact | Effort |
 |---|---|---|
-| **Security permissions/hardening** | Filesystem sandbox resolved; OS isolation for subagents/trusted extensions remains | Medium |
-| **Secrets/session retention** | Presentation redaction, rewind/checkpoint, handoff, and snapcompact resolved; raw secrets still stored verbatim in session JSONL | Medium |
+| **Security permissions/hardening** | Resolved: default raw-host authority with confined Linux/macOS opt-in; Windows danger only | — |
+| **Secrets/session retention** | Presentation redaction, rewind/checkpoint, handoff, snapcompact, and sandbox credential non-persistence resolved; ordinary user/model text remains durable session content | Medium |
 | **Web search** | Resolved: DuckDuckGo Instant Answer tool now available | — |
 | **Document reading** | Resolved: PDF, Office, EPUB, and Jupyter notebook conversion now available | — |
 | **Browser** | Resolved: headless Chrome/Chromium `browser` tool now available | — |
@@ -1871,57 +1905,242 @@ peer evidence, and risk levels are in the sections above.
 | **ACP** | Resolved: ACP v1 (`rpi agent stdio`/`serve`) now available | — |
 | **Desktop automation (`computer`)** | Cannot drive the host desktop (screenshots, clicks, typing, scrolling) | High |
 
-Approval modes are now the safety baseline. Suggested next order: OS isolation
-for subagents and trusted extensions → secrets/session retention → OAuth →
-lower-impact ecosystem parity (desktop `computer` automation, highest effort
-last).
+Sandbox isolation and approval modes are now the safety baseline. Suggested next
+order: secrets/session retention → OAuth → lower-impact ecosystem parity
+(desktop `computer` automation, highest effort last).
 
-## Internal code quality: file granularity
+## Open internal architecture and code-quality issues
 
-Focused panels and control-plane code now live in separate modules, but the
-central runtime files remain far above the 800-line investigation threshold.
-Current counts from the working tree are:
+### In scope
+
+This section records confirmed ownership, durability, projection, and product
+surface problems in the current working tree. Each entry identifies the
+authoritative code involved, the observable or testable failure, and the
+condition for resolution.
+
+### Out of scope
+
+Concept count alone is not a defect. Workflow and Todo remain separate
+systems; side chats remain distinct from durable sessions; application
+generation/provenance remains distinct from sandbox authority; orchestration
+subagents remain distinct from full child applications; and workflow
+worktree/generation/integration state remains workflow-owned. The entries
+below must not be used to collapse these boundaries into one global manager,
+one global lock, or one shared mutable state machine.
+
+### OPEN HIGH — publication ownership can still reject a session runtime
+
+Application publication is a valid turn-stability mechanism: a turn captures a
+generation while reload publishes a new generation for later turns. The defect
+is ownership. `ProcessManager`, `ApplicationRuntime`, and `ResourceManager`
+each retain exactly one publication and reject a second binding
+(`crates/pi-coding/src/process/manager.rs:41-47,98-106`;
+`crates/pi-coding/src/application/runtime.rs:177-185`;
+`crates/pi-coding/src/resource_manager.rs:580-588`). The rejection is locked in
+by a test that expects `process manager publication is already bound`
+(`crates/pi-coding/src/application.rs:6822-6836`).
+
+The multi-session host is designed around independently constructed runtimes,
+per-file open locks, and fan-in event channels
+(`crates/pi-cli/src/modes/session_runtime_manager.rs:987-1025`). Any path that
+shares a bound process/resource/runtime owner between applications therefore
+turns an ownership mistake into a user-visible session-switch failure.
+
+Resolution requires every loaded application to own its publication-bound
+runtime services. A global lock or permitting publication rebinding is not a
+valid fix: rebinding would let one active session capture another session's
+generation. Regression coverage must run two streaming sessions concurrently,
+switch the viewed session repeatedly, and verify that both event streams and
+process authority retain their own session ids.
+
+### OPEN HIGH — Todo terminal-receipt failure can replay executed side effects
+
+The Todo supervisor durably appends an accepted receipt before enqueueing and
+treats later manifest updates as a projection, so accepted sends no longer
+report false rejection (`crates/pi-coding/src/application/todo_child.rs:733-755`).
+The terminal path still has a crash-recovery hole. After a child turn executes,
+a terminal receipt append failure only marks in-memory state failed
+(`todo_child.rs:960-991,1041-1055`). On restart, recovery converts every last
+durable `Running` receipt back to `Queued` and restores its message body
+(`todo_child.rs:1189-1244`). A tool call that completed before the failed
+terminal append can therefore execute again after restart.
+
+Resolution requires an explicit durable state for "execution happened but
+settlement is unresolved", or another recovery protocol that never
+automatically re-executes that receipt. A fault-injection regression must fail
+the terminal append after a side-effecting child turn, restart the child, and
+prove the side effect occurs exactly once.
+
+### RESOLVED — Unified Todo surface preserves distinct state ownership
+
+`/todo` is now the sole public Todo slash command. Its unified grammar covers
+the active application's DAG and durable child sessions in one catalog entry
+(`crates/pi-cli/src/interactive_commands.rs:1694-1699`). The TUI routes bare
+`/todo` and `/todo list` to one overlay, sends child verbs through the durable
+child handlers, and sends DAG verbs through `TodoOp`
+(`crates/pi-cli/src/tui.rs:10723-10854`). The REPL likewise projects DAG and
+child summaries together and dispatches both verb families from `/todo`
+(`crates/pi-cli/src/repl.rs:837-910`).
+
+The unified human surface does not merge the underlying state owners. Typed
+`todo_child_*` RPC variants remain distinct wire operations
+(`crates/pi-cli/src/modes/rpc.rs:982-1088`), while child selection and archive
+continue through parent-scoped durable child storage
+(`crates/pi-coding/src/application/todo_child.rs:679-758`). `/workflow` still
+manages separate automation runtimes whose durable records and isolated
+checkouts remain Workflow-owned
+(`crates/pi-cli/src/interactive_commands.rs:1667-1673`;
+`crates/pi-coding/src/application/workflows.rs:1042-1149`).
+
+The TUI mounts the DAG and child domains inside one Todo overlay
+(`crates/pi-cli/src/tui.rs:6749-6769`). Workflow-owned DAG snapshots may be
+projected there for navigation, but projection does not move Workflow state
+into the child store or merge their managers
+(`crates/pi-cli/src/tui.rs:4662-4665`;
+`crates/pi-cli/src/todo_dag_panel.rs:194-213,378-381`).
+
+### OPEN MEDIUM — Workflow projection has too many drift boundaries
+
+One workflow is represented as `WorkflowSnapshot`,
+`WorkflowSupervisorProjection`, `WorkflowRuntimeDetail`,
+`WorkflowWireSnapshot`, and `WorkflowPanelSnapshot`
+(`crates/pi-coding/src/workflow/manager.rs:45-76`;
+`crates/pi-coding/src/workflow/supervisor.rs:201-220`;
+`crates/pi-coding/src/workflow/detail.rs:18-53`;
+`crates/pi-cli/src/workflow_rpc.rs:26-57`;
+`crates/pi-cli/src/workflow_panel.rs:162-194`). Supervisor and subagent detail
+types add another pair of substantially overlapping actor projections
+(`crates/pi-coding/src/workflow/detail.rs:56-120`).
+
+The issue is not that renderer DTOs exist; it is that every added field must be
+manually propagated across several parallel shapes, allowing TUI and Web views
+to drift. Resolution should converge on one documented flow:
+`Durable record -> live projection -> public DTO -> renderer`, with conversion
+tests at each remaining boundary. Workflow must remain independent from Todo.
+
+### OPEN MEDIUM — background work has no complete read-only activity view
+
+Background execution is split across process-manager sessions
+(`crates/pi-coding/src/process/manager.rs:23-47`), transcript-level
+`BashExecutionMessage` handling (`crates/pi-coding/src/session.rs:646`),
+orchestration `JobSnapshot` records
+(`crates/pi-coding/src/orchestration/jobs.rs:63-101`), and TUI-local
+`BackgroundEvent` tasks (`crates/pi-cli/src/tui.rs:747-815`). Consequently,
+`/ps` describes process-manager work, not all work running for the session.
+
+The runtime owners should stay separate. Resolution is a bounded, read-only
+Activity projection that carries session identity, owner kind, lifecycle,
+start time, and cancellation capability without centralizing execution or
+introducing a global lock.
+
+### OPEN MEDIUM — Plugin and Package maintain parallel installation engines
+
+A plugin is documented as an extension package and is ultimately exposed as
+`PackageResourceKind::Extension` (`crates/pi-coding/src/plugin.rs:1-9,634-681`).
+Nevertheless, `PluginMarketplace::install` owns its own staging, validation,
+rename, replacement, and removal path (`plugin.rs:457-502,565-589`), while
+`PackageManager` independently owns install/remove and staging replacement
+(`crates/pi-coding/src/packages.rs:392-412,520-528,711-786`).
+
+The user-facing concepts are valid: Extension is a runtime capability,
+Package is an installation unit, and Plugin marketplace is a discovery
+surface. The duplicated installation machinery is the issue. Resolution
+requires one fail-closed package installation transaction reused by both
+entry points, while preserving marketplace-specific discovery and trust UX.
+
+### OPEN MEDIUM — Session and runtime names do not communicate ownership
+
+The codebase has a raw model `Session`, an internal coding `SessionRuntime`, a
+complete `Application`, and a different CLI-host `SessionRuntime`
+(`crates/pi-coding/src/session.rs:145-172,897-943`;
+`crates/pi-coding/src/application.rs:515-552`;
+`crates/pi-cli/src/modes/session_runtime_manager.rs:138-190`). These names do
+not reveal which object owns model history, application generation, process
+authority, event routing, or a hosted multi-session slot.
+
+This ambiguity contributed to publication-bound services being considered
+shareable and makes partial child implementations easy to mistake for full
+applications. Resolution is a behavior-preserving naming and ownership pass
+after the current feature work is stable; no compatibility wrapper or extra
+`Manager` layer should be introduced solely for renaming.
+
+### OPEN LOW — `ToolCardSummary` is computed but not consumed by production TUI
+
+`ToolCardPresentationAdapter::summary` exposes a typed `ToolCardSummary` for
+read/write/edit/search/generic tools
+(`crates/pi-cli/src/tool_card_adapter.rs:268,519-636`). The TUI imports and
+uses row projections and bash rows, but does not request this summary
+(`crates/pi-cli/src/tui.rs:104-106,4061-4064`). Current summary consumers are
+the adapter's own tests (`tool_card_adapter.rs:997-1129`).
+
+Resolution is binary: wire the summary into the actual compact tool-card
+rendering path and add a terminal-facing regression, or delete the unused
+projection and its self-only tests. Keeping a tested but disconnected product
+projection is not completion.
+
+### OPEN MEDIUM — central files remain far beyond the repository size bound
+
+`AGENTS.md` sets an investigation threshold of about 800 lines for a source
+file. A current source-only count finds 125 of 267 Rust `src` files above that
+threshold, containing 307,664 of 359,147 Rust source lines. The largest active
+state machines are:
 
 | File | Lines | Over 800-line threshold |
 |---|---:|---:|
-| `crates/pi-cli/src/tui.rs` | 32,049 | 40.1× |
-| `crates/pi-coding/src/session.rs` | 8,859 | 11.1× |
-| `crates/pi-coding/src/orchestration/runtime.rs` | 8,447 | 10.6× |
-| `crates/pi-cli/src/modes/rpc.rs` | 5,716 | 7.1× |
-| `crates/pi-coding/src/tools.rs` | 5,530 | 6.9× |
-| `crates/pi-coding/src/extensions.rs` | 5,358 | 6.7× |
-| `crates/pi-coding/src/application.rs` | 4,502 | 5.6× |
-| `crates/pi-coding/src/session_store.rs` | 4,477 | 5.6× |
+| `crates/pi-cli/src/tui.rs` | 38,618 | 48.3× |
+| `crates/pi-cli/src/modes/rpc.rs` | 12,375 | 15.5× |
+| `crates/pi-coding/src/orchestration/runtime.rs` | 12,313 | 15.4× |
+| `crates/pi-coding/src/session.rs` | 10,682 | 13.4× |
+| `crates/pi-coding/src/application.rs` | 6,920 | 8.7× |
+| `crates/pi-coding/src/tools.rs` | 6,525 | 8.2× |
+| `crates/pi-coding/src/session_store.rs` | 5,920 | 7.4× |
+| `crates/pi-coding/src/extensions.rs` | 5,626 | 7.0× |
+| `crates/pi-cli/src/code_review_panel.rs` | 5,473 | 6.8× |
+| `crates/pi-cli/web/src/App.tsx` | 5,374 | 6.7× |
 
-The largest files are also the highest-risk state machines. Mechanical splits
-while durable recovery, live control, and side-chat behavior are changing would
-hide regressions rather than reduce risk. New features therefore use focused
-modules (`modes/listen.rs`, `settings_panel.rs`, `todo_dag_panel.rs`,
-`code_review.rs`, `code_review_panel.rs`, and side-chat modules), with central
-files limited to wiring.
+Raw line count does not prove a bug, but concentrating session lifecycle,
+concurrency, protocol dispatch, rendering, and test fixtures in these files
+raises review and conflict risk. Mechanical splitting during active behavior
+changes would make this worse. After feature freeze and E2E protection, split
+by state owner and durability boundary, then keep central files as wiring.
 
-Refactoring order after behavior is frozen and E2E-protected:
+### Resolution order
 
-1. split orchestration runtime/persistence/job lifecycle by ownership and
-   durability boundaries;
-2. split session storage/compaction/runtime behavior without moving public
-   wire types;
-3. split TUI state, event routing, panels, and rendering while keeping one
-   overlay arbiter and terminal lifecycle owner; and
-4. split RPC command families around the shared dispatcher.
+1. close the Todo exactly-once recovery hole;
+2. prove publication-bound ownership and concurrent session switching;
+3. reduce Workflow projection boundaries;
+4. add the unified read-only activity projection;
+5. converge Plugin and Package installation transactions;
+6. connect or remove `ToolCardSummary`; and
+7. only then perform behavior-preserving ownership renames and file splits.
 
-Each extraction must be behavior-preserving and independently verified; no
-style-only mass move should be mixed with a feature change.
+### Evidence refresh commands
+
+Run these from the repository root before changing classifications or counts:
+
+- `rg -n "bind_publication|publication is already bound" crates/pi-coding/src crates/pi-cli/src`
+- `rg -n "persist_receipt|recover_receipts|TodoChildReceiptStatus::Running" crates/pi-coding/src/application/todo_child.rs`
+- `rg -n 'name: "todo"|TODO_SLASH_USAGE|update_workflows' crates/pi-cli/src`
+- `rg -n '^pub struct Workflow' crates/pi-coding/src/workflow crates/pi-cli/src/workflow_rpc.rs crates/pi-cli/src/workflow_panel.rs`
+- `rg -n 'ToolCardSummary|\.summary\(' crates/pi-cli/src`
+- `python3 - <<'PY'`
+  `from pathlib import Path`
+  `files = [(sum(1 for _ in path.open(errors="replace")), path) for path in Path("crates").rglob("*.rs") if "src" in path.parts]`
+  `print(len(files), sum(lines for lines, _ in files), sum(lines > 800 for lines, _ in files), sum(lines for lines, _ in files if lines > 800))`
+  `PY`
+
+The numeric inventory is a working-tree snapshot, not a release claim. Test
+count and source-line count do not establish behavioral coverage; release
+readiness still depends on the executable verification gates below.
 
 ## Resolution snapshot
 
-The current inventory contains 131 classified entries: 103 `RESOLVED`, 28 `By
-design`, and 0 `PARTIAL`. Observable fixes
-therefore account for 78.6% of all entries. Excluding deliberate divergences,
-all 103 actionable entries are resolved (100%). These
-figures describe this document's headings, not test coverage or release
-readiness; the evidence behind each `RESOLVED` entry must be refreshed by
-running the commands in the Verification checklist before a release.
+The current inventory contains 140 classified entries: 104 `RESOLVED`, 28 `By
+design`, and 8 `OPEN`. Observable fixes account for 74.3% of all entries and
+92.9% of actionable entries. These figures classify document headings only;
+they do not measure test coverage or release readiness. Open architecture
+entries remain release-relevant until their stated failure sequence and
+resolution check are closed.
 
 ## Verification
 
@@ -1966,5 +2185,5 @@ not a pass report.
   — evidence under `$EVIDENCE_ROOT/collab`
 - `bash E2E.d/web/coverage.sh run` — measured gate that runs every web lane:
   `core goal xss abort reconnect switch mobile auth extras sessions`
-- `target/release-dist/rpi --version` must print `rpi 0.2.4`
+- `target/release-dist/rpi --version` must print `rpi 1.0.0`
 - `git diff --check` after staging the release artifacts

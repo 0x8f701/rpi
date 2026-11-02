@@ -15,11 +15,11 @@
 //! session owns the registry and `Drop` never leaks a child process.
 //!
 //! **Session cutover:** a logical session replacement in the same working
-//! directory reaps every live client (awaited `shutdown` handshake + child
-//! wait) via [`McpRegistry::reset_live_sessions`] before the replacement is
-//! committed, so the new session never inherits the old session's stdio
-//! children, initialized protocol state, or external auth. Configuration
-//! survives the reset; the next tool call lazily spawns a fresh server.
+//! directory first reserves MCP admission and owns every current client slot
+//! without mutation. After all other fallible preparation succeeds, detached
+//! commit performs the awaited shutdown and leaves the slots empty, so the new
+//! session never inherits initialized protocol state or external auth.
+//! Configuration survives; the next tool call lazily spawns a fresh server.
 //!
 //! **Fast-start gate:** the first tool call against a server waits up to
 //! [`SPAWN_DEFER`] (250 ms, matching OMP's startup window) while holding the
@@ -55,25 +55,28 @@
 //! [`redact_secrets`](crate::redact::redact_secrets)); results are truncated
 //! to [`OUTPUT_MAX_BYTES`].
 
-use std::collections::BTreeMap;
-use std::process::Stdio;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
-use futures_util::future::BoxFuture;
+use anyhow::{Context, Result, anyhow, bail};
 use futures_util::FutureExt;
+use futures_util::future::BoxFuture;
 use parking_lot::{Mutex, RwLock};
-use serde_json::{json, Value};
+use pi_sandbox::{CredentialGrantId, SpawnFamily, StdioMode};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use pi_agent::{AbortSignal, AgentTool, AgentToolResult, ToolCallContext, ToolCapability};
 
+use crate::application::generation::{ApplicationGeneration, GenerationCaptureFn};
+use crate::process::{GovernedChild, authorize_spawn_with_auth, launch_authorized_pipe};
 use crate::redact::redact_secrets;
+use crate::sandbox::{CredentialAudience, McpServerName, RawSpawnRequest, SpawnAuthorization};
 use crate::settings::{McpServerConfig, McpTransport};
-use crate::tools::framing::{encode_message, MAX_JUNK_HEADER_LINES};
+use crate::tools::framing::{MAX_JUNK_HEADER_LINES, encode_message};
 use crate::tools::{arg_str, check_aborted, s_object, s_string, text_result};
 use crate::truncate::truncate_head;
 
@@ -162,11 +165,11 @@ async fn read_message(reader: &mut (impl AsyncBufRead + Unpin)) -> Result<Value>
 // Client
 // ---------------------------------------------------------------------------
 
-/// A per-server MCP session: spawned child + framed stdin/stdout.
+/// A per-server MCP session: governed child + framed stdin/stdout.
 pub(crate) struct McpClient {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    child: GovernedChild,
+    stdin: tokio::fs::File,
+    stdout: BufReader<tokio::fs::File>,
     next_id: i64,
     initialized: bool,
     /// Protocol version negotiated during initialize.
@@ -187,8 +190,12 @@ pub(crate) struct McpClient {
 }
 
 impl McpClient {
-    /// Spawns the configured stdio server as a child process.
-    pub(crate) async fn spawn(config: &McpServerConfig) -> Result<Self> {
+    /// Spawns the configured stdio server through the captured process authority.
+    pub(crate) async fn spawn(
+        generation: Arc<ApplicationGeneration>,
+        auth: Option<&crate::AuthManager>,
+        config: &McpServerConfig,
+    ) -> Result<Self> {
         let command_name = config
             .command
             .as_deref()
@@ -196,31 +203,72 @@ impl McpClient {
             .trim()
             .to_owned();
         if command_name.is_empty() {
-            bail!("MCP server `{}` has no command (stdio transport)", config.name);
+            bail!(
+                "MCP server `{}` has no command (stdio transport)",
+                config.name
+            );
         }
-        let mut command = Command::new(&command_name);
+        let mut argv = Vec::with_capacity(1 + config.args.as_ref().map_or(0, Vec::len));
+        argv.push(OsString::from(&command_name));
         if let Some(args) = &config.args {
-            command.args(args);
+            argv.extend(args.iter().map(OsString::from));
         }
-        if let Some(env) = &config.env {
-            for (key, value) in env {
-                command.env(key, value);
-            }
-        }
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(false);
-        let mut child = command.spawn().with_context(|| {
+        let requested_env = config
+            .env
+            .as_ref()
+            .map(|env| {
+                env.iter()
+                    .map(|(name, value)| (OsString::from(name), Some(OsString::from(value))))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let requested_grants = config
+            .credential_grants
+            .iter()
+            .cloned()
+            .map(CredentialGrantId::parse)
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let audience =
+            CredentialAudience::new_mcp_server(McpServerName::parse(config.name.clone())?)?;
+        let authorized = authorize_spawn_with_auth(
+            generation.clone(),
+            auth,
+            RawSpawnRequest {
+                authorization: SpawnAuthorization::Captured(generation.sandbox().clone()),
+                family: SpawnFamily::McpStdio,
+                audience,
+                argv,
+                cwd: generation.resource().cwd.clone(),
+                requested_env,
+                requested_grants,
+                stdio: StdioMode::Piped,
+                terminal_size: None,
+                timeout_ms: None,
+                target_fd_mappings: Vec::new(),
+                #[cfg(unix)]
+                owned_target_fd_mappings: Vec::new(),
+                #[cfg(unix)]
+                mount_sources: Vec::new(),
+                #[cfg(unix)]
+                retained_executable: None,
+                #[cfg(unix)]
+                retained_working_directory: None,
+            },
+        )
+        .await?;
+        let mut child = launch_authorized_pipe(authorized).with_context(|| {
             format!(
                 "spawning MCP server `{}` (command `{command_name}`)",
                 config.name
             )
         })?;
-        let stdin = child.stdin.take().context("MCP server stdin unavailable")?;
-        let stdout = child.stdout.take().context("MCP server stdout unavailable")?;
-        let stderr = child.stderr.take().context("MCP server stderr unavailable")?;
+        let stdin = child.take_stdin().context("MCP server stdin unavailable")?;
+        let stdout = child
+            .take_stdout()
+            .context("MCP server stdout unavailable")?;
+        let stderr = child
+            .take_stderr()
+            .context("MCP server stderr unavailable")?;
         let stderr_tail = Arc::new(Mutex::new(String::new()));
         {
             let tail = stderr_tail.clone();
@@ -341,10 +389,7 @@ impl McpClient {
         if let Some(version) = result.get("protocolVersion").and_then(Value::as_str) {
             self.protocol_version = version.to_owned();
         }
-        self.capabilities = result
-            .get("capabilities")
-            .cloned()
-            .unwrap_or(Value::Null);
+        self.capabilities = result.get("capabilities").cloned().unwrap_or(Value::Null);
         self.notify("notifications/initialized", json!({})).await?;
         self.initialized = true;
         Ok(result)
@@ -436,9 +481,10 @@ impl McpClient {
                         .and_then(Value::as_array)
                         .cloned()
                         .unwrap_or_default();
-                    if let Some(tool) = matches.into_iter().find(|tool| {
-                        tool.get("name").and_then(Value::as_str) == Some(name)
-                    }) {
+                    if let Some(tool) = matches
+                        .into_iter()
+                        .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+                    {
                         self.tool_cache.insert(name.to_owned(), tool);
                         return Ok(true);
                     }
@@ -450,9 +496,9 @@ impl McpClient {
                     // The advertised extension is not actually implemented:
                     // fall back to the full tools/list (also cached).
                     let tools = self.list_tools().await?;
-                    return Ok(tools.iter().any(|tool| {
-                        tool.get("name").and_then(Value::as_str) == Some(name)
-                    }));
+                    return Ok(tools
+                        .iter()
+                        .any(|tool| tool.get("name").and_then(Value::as_str) == Some(name)));
                 }
             }
         }
@@ -470,7 +516,11 @@ impl McpClient {
     /// `tools/search` (see [`Self::resolve_tool`]) and rejected from that
     /// result without loading the full list. Otherwise — no cached list, no
     /// search extension — the server's JSON-RPC error is surfaced verbatim.
-    pub(crate) async fn call_tool(&mut self, name: &str, arguments: Option<Value>) -> Result<Value> {
+    pub(crate) async fn call_tool(
+        &mut self,
+        name: &str,
+        arguments: Option<Value>,
+    ) -> Result<Value> {
         if let Some(names) = &self.tool_names {
             if !names.iter().any(|known| known == name) {
                 bail!(
@@ -499,17 +549,14 @@ impl McpClient {
     /// kills) the child. Never fails the caller.
     pub(crate) async fn shutdown(&mut self) {
         if self.initialized {
-            let _ = tokio::time::timeout(
-                SHUTDOWN_TIMEOUT,
-                self.request("shutdown", json!(null)),
-            )
-            .await;
+            let _ =
+                tokio::time::timeout(SHUTDOWN_TIMEOUT, self.request("shutdown", json!(null))).await;
             let _ = self.notify("notifications/exit", json!(null)).await;
         }
         match tokio::time::timeout(EXIT_TIMEOUT, self.child.wait()).await {
             Ok(Ok(_)) => {}
             _ => {
-                let _ = self.child.kill().await;
+                let _ = self.child.signal(crate::ProcessSignal::Sigkill);
                 let _ = self.child.wait().await;
             }
         }
@@ -523,9 +570,8 @@ impl McpClient {
 
 impl Drop for McpClient {
     fn drop(&mut self) {
-        // Never leak a server process, even on panic/abort paths.
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.start_kill();
+        if self.child.exit_status().is_none() {
+            let _ = self.child.signal(crate::ProcessSignal::Sigkill);
         }
     }
 }
@@ -561,29 +607,47 @@ impl Default for McpRegistryState {
 /// Cloning shares the same state. A session builds one registry, threads it
 /// into the `mcp` tool, and calls [`McpRegistry::configure`] on resource
 /// reloads so settings changes take effect without losing live sessions whose
-/// configuration did not change. Logical same-CWD session replacements call
-/// [`McpRegistry::reset_live_sessions`] first so the new session starts with
-/// fresh (uninitialized) MCP clients.
-#[derive(Clone, Default)]
+/// configuration did not change. Logical same-CWD session replacements first
+/// reserve MCP admission with [`McpRegistry::prepare_reset_live_sessions`],
+/// then reap the owned clients only after every other fallible cutover gate has
+/// passed.
+#[derive(Clone)]
 pub(crate) struct McpRegistry {
     inner: Arc<RwLock<McpRegistryState>>,
+    admission: Arc<AsyncMutex<()>>,
+    capture_generation: Option<GenerationCaptureFn>,
+    auth_manager: Option<Arc<crate::AuthManager>>,
 }
 
 impl McpRegistry {
-    /// An empty registry (no servers configured).
-    pub(crate) fn new() -> Self {
-        Self::default()
+    pub(crate) fn new(
+        capture_generation: GenerationCaptureFn,
+        auth_manager: Option<Arc<crate::AuthManager>>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(McpRegistryState::default())),
+            admission: Arc::new(AsyncMutex::new(())),
+            capture_generation: Some(capture_generation),
+            auth_manager,
+        }
     }
 
-    /// A registry with a custom fast-start window. Tests use a shorter (or
-    /// zero) window to keep the suite fast; production uses [`SPAWN_DEFER`].
+    #[cfg(test)]
     pub(crate) fn with_spawn_defer(defer: Duration) -> Self {
         Self {
             inner: Arc::new(RwLock::new(McpRegistryState {
                 spawn_defer: defer,
                 ..McpRegistryState::default()
             })),
+            admission: Arc::new(AsyncMutex::new(())),
+            capture_generation: None,
+            auth_manager: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn empty_for_tests() -> Self {
+        Self::with_spawn_defer(SPAWN_DEFER)
     }
 
     /// The fast-start window for this registry.
@@ -661,65 +725,60 @@ impl McpRegistry {
         self.live_servers().len()
     }
 
-    /// Reaps every live MCP client (awaited `shutdown` handshake + child
-    /// wait) while preserving the configured servers. Session slots are
-    /// reset to the empty state, so the next tool call lazily spawns a fresh
-    /// server process.
+    #[cfg(test)]
+    fn admission_available(&self) -> bool {
+        self.admission.try_lock().is_ok()
+    }
+
+    /// Non-destructively reserves new MCP admission and owns every current
+    /// session slot. No client is removed or shut down during preparation, so
+    /// dropping the returned guard restores admission with the registry
+    /// unchanged.
     ///
-    /// The registry map lock is held only while draining the slots (bounded,
-    /// non-async); the actual shutdowns run outside the lock so a slow or
-    /// wedged server can never block registry operations. Called on every
-    /// logical same-CWD session cutover (new/fresh/resume/switch/fork/clone)
-    /// before the replacement is committed: without it the new session would
-    /// inherit the old session's stdio children, initialized protocol state,
-    /// and external auth.
-    ///
-    /// Fails when a slot is still held by an in-flight tool call or a client
-    /// refuses to die even after the kill fallback — the caller must not
-    /// proceed, or the old server process leaks across the boundary.
-    pub(crate) async fn reset_live_sessions(&self) -> Result<()> {
-        // Drain under the write lock (bounded): replace the session map with
-        // fresh empty slots and take the old ones out to reap them outside
-        // the lock. Configuration (`servers`) is untouched.
-        let drained: Vec<(String, Arc<AsyncMutex<Option<McpClient>>>)> = {
-            let mut state = self.inner.write();
-            std::mem::take(&mut state.sessions).into_iter().collect()
-        };
-        let mut failures: Vec<String> = Vec::new();
-        for (name, slot) in drained {
-            let mut guard = match slot.try_lock() {
-                Ok(guard) => guard,
-                Err(_) => {
-                    // The cutover only runs on an idle session, so a held
-                    // slot means a tool call is genuinely in flight — fail
-                    // with context rather than leak the child.
-                    failures.push(format!(
-                        "MCP server `{name}` has a tool call in flight and could not be shut down"
-                    ));
-                    continue;
-                }
-            };
-            let Some(mut client) = guard.take() else {
-                continue; // empty slot (touched but never spawned) — nothing live
-            };
-            drop(guard);
-            client.shutdown().await;
-            if client.child.try_wait().ok().flatten().is_none() {
-                // `shutdown` is best-effort; escalate to kill, then verify
-                // the child is actually gone before allowing the cutover.
-                let _ = client.child.kill().await;
-                match tokio::time::timeout(EXIT_TIMEOUT, client.child.wait()).await {
-                    Ok(Ok(_)) => {}
-                    _ => failures.push(format!(
-                        "MCP server `{name}` child process did not exit after shutdown"
-                    )),
-                }
-            }
+    /// Tool calls acquire `admission` before `session()`, so holding the guard
+    /// also prevents late slot insertion. Configuration changes remain under
+    /// the application resource-operation gate; same-CWD cutover already owns
+    /// that gate before reaching this registry-local admission boundary.
+    pub(crate) async fn prepare_reset_live_sessions(&self) -> PreparedMcpReset {
+        let admission = self.admission.clone().lock_owned().await;
+        let slots = self
+            .inner
+            .read()
+            .sessions
+            .iter()
+            .map(|(name, slot)| (name.clone(), slot.clone()))
+            .collect::<Vec<_>>();
+        let mut owned = Vec::with_capacity(slots.len());
+        for (name, slot) in slots {
+            owned.push((name, slot.lock_owned().await));
         }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            bail!("failed to shut down live MCP sessions: {}", failures.join("; "))
+        PreparedMcpReset {
+            _admission: admission,
+            slots: owned,
+        }
+    }
+}
+
+/// RAII reservation for a logical-session MCP reset.
+///
+/// Before [`Self::commit`] this guard is wholly non-destructive. Commit is the
+/// reset point of no return: each client's bounded shutdown includes the kill
+/// fallback and is deliberately infallible, because a process that has exited
+/// cannot be rolled back to the same live client/PID if a later shutdown were
+/// reported as an error.
+pub(crate) struct PreparedMcpReset {
+    _admission: OwnedMutexGuard<()>,
+    slots: Vec<(String, OwnedMutexGuard<Option<McpClient>>)>,
+}
+
+impl PreparedMcpReset {
+    /// Reaps all reserved clients and leaves their existing slots empty.
+    pub(crate) async fn commit(mut self) {
+        for (_, slot) in &mut self.slots {
+            let Some(mut client) = slot.take() else {
+                continue;
+            };
+            client.shutdown().await;
         }
     }
 }
@@ -818,15 +877,19 @@ pub(crate) async fn run_mcp(
                 let render_server = render_server.clone();
                 async move {
                     let result = client.call_tool(&tool, arguments).await?;
-                    Ok(text_result(render_call_result(&render_server, &tool, &result)))
+                    Ok(text_result(render_call_result(
+                        &render_server,
+                        &tool,
+                        &result,
+                    )))
                 }
                 .boxed()
             })
             .await
         }
-        other => bail!(
-            "unknown mcp action `{other}` (expected one of: list_servers, list_tools, call)"
-        ),
+        other => {
+            bail!("unknown mcp action `{other}` (expected one of: list_servers, list_tools, call)")
+        }
     }
 }
 
@@ -838,9 +901,7 @@ fn reconnect_delay(next_attempt: usize) -> Duration {
     let ms = RECONNECT_BASE_DELAY_MS
         .checked_shl(exponent)
         .unwrap_or(u64::MAX);
-    Duration::from_millis(
-        ms.min(RECONNECT_MAX_DELAY.as_millis() as u64),
-    )
+    Duration::from_millis(ms.min(RECONNECT_MAX_DELAY.as_millis() as u64))
 }
 
 /// Spawns and initializes the configured stdio server, attaching the
@@ -848,10 +909,12 @@ fn reconnect_delay(next_attempt: usize) -> Duration {
 /// failures keep their [`Retryable`] marker so the reconnect loop recognizes
 /// them; JSON-RPC initialize errors do not.
 async fn spawn_initialized(
+    generation: Arc<ApplicationGeneration>,
+    auth: Option<&crate::AuthManager>,
     config: &McpServerConfig,
     server: &str,
 ) -> Result<McpClient> {
-    let mut client = McpClient::spawn(config)
+    let mut client = McpClient::spawn(generation, auth, config)
         .await
         .map_err(Retryable::wrap)
         .with_context(|| format!("spawning MCP server `{server}`"))?;
@@ -900,6 +963,7 @@ where
     T: Send + 'static,
     F: for<'a> Fn(&'a mut McpClient) -> BoxFuture<'a, Result<T>> + Send + 'static,
 {
+    let admission = registry.admission.clone().lock_owned().await;
     let session = registry.session(server).ok_or_else(|| {
         let configured = registry
             .list_servers()
@@ -927,7 +991,13 @@ where
              build (stdio servers only); configure it with transport \"stdio\" and a command"
         );
     }
+    let generation = (registry
+        .capture_generation
+        .as_ref()
+        .ok_or_else(|| anyhow!("MCP process authority is unavailable"))?)()?;
+    let auth_manager = registry.auth_manager.clone();
     let mut guard = session.lock().await;
+    drop(admission);
     let spawn_defer = registry.spawn_defer();
     let mut last_error: Option<anyhow::Error> = None;
     let mut stderr_tail = String::new();
@@ -949,7 +1019,9 @@ where
                     _ = abort.cancelled() => bail!("Operation aborted"),
                 }
             }
-            match spawn_initialized(&config, server).await {
+            match spawn_initialized(generation.clone(), auth_manager.as_deref(), &config, server)
+                .await
+            {
                 Ok(client) => *guard = Some(client),
                 Err(error) => {
                     stderr_tail.clear();
@@ -998,9 +1070,8 @@ where
     }
     let last = last_error.unwrap_or_else(|| anyhow!("MCP request to `{server}` failed"));
     let attempts_label = if attempt == 1 { "attempt" } else { "attempts" };
-    let mut message = format!(
-        "MCP server `{server}` failed after {attempt} {attempts_label}: {last:#}"
-    );
+    let mut message =
+        format!("MCP server `{server}` failed after {attempt} {attempts_label}: {last:#}");
     let stderr = redact_secrets(&stderr_tail);
     if !stderr.trim().is_empty() && !message.contains("--- server stderr ---") {
         message.push_str("\n--- server stderr ---\n");
@@ -1112,7 +1183,10 @@ fn render_tools(server: &str, tools: &[Value]) -> String {
 }
 
 fn render_call_result(server: &str, tool: &str, result: &Value) -> String {
-    let is_error = result.get("isError").and_then(Value::as_bool).unwrap_or(false);
+    let is_error = result
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let content = result
         .get("content")
         .and_then(Value::as_array)
@@ -1188,6 +1262,141 @@ mod tests {
 
     use crate::settings::{McpServerConfig, McpTransport};
 
+    struct McpFixture {
+        _root: tempfile::TempDir,
+        workspace: std::path::PathBuf,
+        _application: crate::Application,
+        _faux: pi_ai::providers::FauxProviderRegistration,
+        generation: Arc<crate::application::generation::ApplicationGeneration>,
+    }
+
+    impl McpFixture {
+        async fn new() -> Self {
+            let root = tempfile::tempdir().expect("fixture root");
+            let workspace_path = root.path().join("workspace");
+            let agent_path = root.path().join("agent");
+            let session_path = root.path().join("session");
+            std::fs::create_dir(&workspace_path).expect("workspace dir");
+            std::fs::create_dir(&agent_path).expect("agent dir");
+            std::fs::create_dir(&session_path).expect("session dir");
+            std::fs::write(
+                agent_path.join("settings.json"),
+                r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+            )
+            .expect("sandbox settings");
+
+            let mut resource_options = crate::ResourceManagerOptions::new(&workspace_path);
+            resource_options.agent_dir = agent_path;
+            resource_options.project_trust_override = Some(true);
+            resource_options.disable_extensions = true;
+            resource_options.disable_skills = true;
+            resource_options.disable_prompt_templates = true;
+            resource_options.disable_themes = true;
+            resource_options.disable_context_files = true;
+            let resources = crate::ResourceManager::new(resource_options).expect("resources");
+
+            let faux = pi_ai::providers::register_faux_provider(Default::default());
+            let workspace_roots =
+                crate::WorkspaceRoots::for_tool_factory(&workspace_path.to_string_lossy());
+            let session =
+                crate::Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
+                    crate::SessionOptions {
+                        model: faux.model(None).expect("faux model"),
+                        cwd: workspace_path,
+                        system_prompt: String::new(),
+                        thinking_level: pi_agent::ThinkingLevel::Off,
+                        api_key: "test".to_owned(),
+                        compaction: None,
+                        stream_options: Default::default(),
+                        tools: Some(Vec::new()),
+                        before_tool_call: None,
+                        after_tool_call: None,
+                        stream_fn: None,
+                        auth_resolver: None,
+                        auth_manager: None,
+                    },
+                    Vec::new(),
+                    crate::ToolSelection::default(),
+                    crate::ResourceDiscovery::Disabled,
+                    workspace_roots,
+                    None,
+                )
+                .expect("session");
+            session.set_session_dir(session_path);
+            session
+                .attach_resources(resources)
+                .await
+                .expect("attach resources");
+            let application = crate::Application::from_runtime_candidate(
+                crate::ApplicationRuntimeCandidate::new(session),
+            )
+            .await
+            .expect("publish application");
+            let generation = application.capture_generation();
+            let workspace = generation.resource().cwd.clone();
+            Self {
+                _root: root,
+                workspace,
+                _application: application,
+                _faux: faux,
+                generation,
+            }
+        }
+
+        fn path(&self, name: &str) -> std::path::PathBuf {
+            self.workspace.join(name)
+        }
+
+        fn registry_with_spawn_defer(&self, defer: Duration) -> McpRegistry {
+            let generation = self.generation.clone();
+            let registry = McpRegistry::new(Arc::new(move || Ok(generation.clone())), None);
+            registry.inner.write().spawn_defer = defer;
+            registry
+        }
+
+        fn registry(&self) -> McpRegistry {
+            self.registry_with_spawn_defer(Duration::from_millis(5))
+        }
+
+        fn fake_server_config(&self) -> McpServerConfig {
+            McpServerConfig {
+                name: "fake".to_owned(),
+                disabled: false,
+                transport: McpTransport::Stdio,
+                command: Some(crate::mcp::fake_server_exe().to_string_lossy().into_owned()),
+                args: Some(vec![
+                    "mcp::tests::fake_mcp_server_process".to_owned(),
+                    "--nocapture".to_owned(),
+                ]),
+                url: None,
+                env: Some(crate::McpEnvironmentWire::from_iter([(
+                    "PI_FAKE_MCP_SERVER".to_owned(),
+                    "1".to_owned(),
+                )])),
+                credential_grants: Vec::new(),
+            }
+        }
+
+        async fn spawn_client_with(&self, extra_env: &[(&str, &str)]) -> McpClient {
+            let mut config = self.fake_server_config();
+            {
+                let env = config.env.as_mut().expect("fake env");
+                for (key, value) in extra_env {
+                    env.insert((*key).to_owned(), (*value).to_owned());
+                }
+            }
+            let mut client = McpClient::spawn(self.generation.clone(), None, &config)
+                .await
+                .expect("fake server spawn");
+            client.initialize().await.expect("fake server initializes");
+            client
+        }
+
+        async fn spawn_client(&self) -> McpClient {
+            self.spawn_client_with(&[]).await
+        }
+    }
+
     fn stdio_config(name: &str) -> McpServerConfig {
         McpServerConfig {
             name: name.to_owned(),
@@ -1197,14 +1406,8 @@ mod tests {
             args: None,
             url: None,
             env: None,
-            extra: Default::default(),
+            credential_grants: Vec::new(),
         }
-    }
-
-    /// A registry with a minimal fast-start window so spawn tests stay fast;
-    /// the fast-start batching behavior itself is covered by dedicated tests.
-    fn test_registry() -> McpRegistry {
-        McpRegistry::with_spawn_defer(Duration::from_millis(5))
     }
 
     // -----------------------------------------------------------------------
@@ -1232,7 +1435,11 @@ mod tests {
         let header = format!("Content-Length: {}\r\n\r\n", serialized.len());
         assert!(bytes.starts_with(header.as_bytes()));
         let text_chars = body["text"].as_str().unwrap().chars().count();
-        assert!(serialized.len() > text_chars, "bytes {} vs chars {text_chars}", serialized.len());
+        assert!(
+            serialized.len() > text_chars,
+            "bytes {} vs chars {text_chars}",
+            serialized.len()
+        );
         assert_eq!(&bytes[header.len()..], &serialized[..]);
     }
 
@@ -1459,7 +1666,16 @@ mod tests {
                 }
                 (Some("notifications/initialized"), _) => {}
                 (Some("tools/search"), Some(id)) => {
-                    trace(&trace_path, &format!("search:{}", message.pointer("/params/name").and_then(Value::as_str).unwrap_or("")));
+                    trace(
+                        &trace_path,
+                        &format!(
+                            "search:{}",
+                            message
+                                .pointer("/params/name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                        ),
+                    );
                     if search_fallback {
                         send(
                             &mut writer,
@@ -1681,9 +1897,10 @@ mod tests {
             }
             if let Some((name, value)) = header.trim_end().split_once(':') {
                 if name.trim().eq_ignore_ascii_case("Content-Length") {
-                    content_length = Some(value.trim().parse().map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-                    })?);
+                    content_length =
+                        Some(value.trim().parse().map_err(|e| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                        })?);
                 }
             }
         }
@@ -1696,37 +1913,19 @@ mod tests {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
-    /// Path to this test binary for the re-exec fake server (copied once per
-    /// test process to a private temp path — see the top-level helper).
-    fn fake_server_exe() -> std::path::PathBuf {
-        crate::mcp::fake_server_exe()
+    async fn spawn_fake_client_with(extra_env: &[(&str, &str)]) -> (McpFixture, McpClient) {
+        let fixture = McpFixture::new().await;
+        let client = fixture.spawn_client_with(extra_env).await;
+        (fixture, client)
     }
 
-    async fn spawn_fake_client_with(extra_env: &[(&str, &str)]) -> McpClient {
-        let mut config = fake_server_config();
-        {
-            let env = config.env.as_mut().expect("fake env");
-            for (key, value) in extra_env {
-                env.insert((*key).to_owned(), (*value).to_owned());
-            }
-        }
-        let mut client = McpClient::spawn(&config)
-            .await
-            .expect("fake server spawn");
-        client
-            .initialize()
-            .await
-            .expect("fake server initializes");
-        client
-    }
-
-    async fn spawn_fake_client() -> McpClient {
+    async fn spawn_fake_client() -> (McpFixture, McpClient) {
         spawn_fake_client_with(&[]).await
     }
 
     #[tokio::test]
     async fn client_initializes_and_lists_tools() {
-        let mut client = spawn_fake_client().await;
+        let (_fixture, mut client) = spawn_fake_client().await;
         assert_eq!(client.protocol_version(), "2024-11-05");
         let tools = client.list_tools().await.expect("tools/list");
         let names = tools
@@ -1739,7 +1938,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_calls_tool_with_object_arguments() {
-        let mut client = spawn_fake_client().await;
+        let (_fixture, mut client) = spawn_fake_client().await;
         let _ = client.list_tools().await.expect("tools/list");
         let result = client
             .call_tool("add", Some(json!({ "a": 20, "b": 22 })))
@@ -1751,7 +1950,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_rejects_unknown_tool_against_cached_list() {
-        let mut client = spawn_fake_client().await;
+        let (_fixture, mut client) = spawn_fake_client().await;
         let _ = client.list_tools().await.expect("tools/list");
         let err = client
             .call_tool("does_not_exist", None)
@@ -1767,7 +1966,7 @@ mod tests {
     #[tokio::test]
     async fn client_surfaces_server_error_for_unknown_tool_without_cache() {
         // A fresh session with no cached tools/list lets the server answer.
-        let mut client = spawn_fake_client().await;
+        let (_fixture, mut client) = spawn_fake_client().await;
         let err = client
             .call_tool("does_not_exist", None)
             .await
@@ -1779,7 +1978,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_renders_is_error_results() {
-        let mut client = spawn_fake_client().await;
+        let (_fixture, mut client) = spawn_fake_client().await;
         let result = client.call_tool("boom", None).await.expect("tools/call");
         assert_eq!(result["isError"], true);
         let rendered = render_call_result("fake", "boom", &result);
@@ -1790,7 +1989,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_shutdown_handshake_completes() {
-        let mut client = spawn_fake_client().await;
+        let (_fixture, mut client) = spawn_fake_client().await;
         client.shutdown().await;
         // The child must have exited; nothing more to assert without a race,
         // but a wedged shutdown would hang the test binary's exit wait.
@@ -1808,16 +2007,14 @@ mod tests {
             args: None,
             url: None,
             env: None,
-            extra: Default::default(),
+            credential_grants: Vec::new(),
         };
-        let err = match McpClient::spawn(&config).await {
+        let fixture = McpFixture::new().await;
+        let err = match McpClient::spawn(fixture.generation.clone(), None, &config).await {
             Ok(_) => panic!("spawn without a command must fail"),
             Err(error) => error,
         };
-        assert!(
-            err.to_string().contains("`hollow` has no command"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("`hollow` has no command"), "{err}");
     }
 
     #[tokio::test]
@@ -1825,20 +2022,28 @@ mod tests {
         // The server answers tools/list in two pages via nextCursor; the
         // client must follow the cursor, aggregate both pages, and cache the
         // union for client-side call validation.
-        let trace_dir = tempfile::tempdir().expect("trace dir");
-        let trace_file = trace_dir.path().join("trace.txt");
-        let mut client = spawn_fake_client_with(&[
-            ("PI_FAKE_MCP_PAGE", "1"),
-            ("PI_FAKE_MCP_TRACE", trace_file.to_str().expect("trace path")),
-        ])
-        .await;
+        let fixture = McpFixture::new().await;
+        let trace_file = fixture.path("paging-trace.txt");
+        let mut client = fixture
+            .spawn_client_with(&[
+                ("PI_FAKE_MCP_PAGE", "1"),
+                (
+                    "PI_FAKE_MCP_TRACE",
+                    trace_file.to_str().expect("trace path"),
+                ),
+            ])
+            .await;
 
         let tools = client.list_tools().await.expect("paged tools/list");
         let names = tools
             .iter()
             .filter_map(|tool| tool.get("name").and_then(Value::as_str))
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["echo", "add", "large"], "pages must be aggregated");
+        assert_eq!(
+            names,
+            vec!["echo", "add", "large"],
+            "pages must be aggregated"
+        );
 
         let lines = read_trace_lines(&trace_file);
         assert!(
@@ -1852,7 +2057,10 @@ mod tests {
 
         // The paged union is cached: a tool from the second page resolves,
         // and an unknown tool is rejected client-side.
-        let result = client.call_tool("large", None).await.expect("tool from second page");
+        let result = client
+            .call_tool("large", None)
+            .await
+            .expect("tool from second page");
         assert_eq!(result["content"][0]["text"], "x".repeat(100_000));
         let err = client
             .call_tool("missing", None)
@@ -1867,7 +2075,7 @@ mod tests {
         // The server pushes an id-less notifications/message before its
         // tools/call answer; the client must skip notifications and still
         // pair the response with its own request id.
-        let mut client = spawn_fake_client_with(&[("PI_FAKE_MCP_NOTIFY", "1")]).await;
+        let (_fixture, mut client) = spawn_fake_client_with(&[("PI_FAKE_MCP_NOTIFY", "1")]).await;
         let result = client
             .call_tool("echo", Some(json!({ "message": "hi" })))
             .await
@@ -1884,11 +2092,10 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Tool surface
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn mcp_tool_list_servers_with_empty_registry() {
-        let registry = McpRegistry::new();
+        let registry = McpRegistry::empty_for_tests();
         let tool = mcp_tool(registry);
         let context = tool_context(json!({ "action": "list_servers" }));
         let result = (tool.execute)(context).await.expect("list_servers");
@@ -1915,6 +2122,7 @@ mod tests {
             on_update: Arc::new(|_| {}),
             abort: AbortSignal::none(),
             model: None,
+            approval_token: None,
         }
     }
 
@@ -1923,55 +2131,38 @@ mod tests {
         Ok(result_text(&result))
     }
 
-    fn registry_with_fake_server() -> McpRegistry {
-        let registry = test_registry();
-        registry.configure(vec![stdio_config("fake")]);
-        registry
-    }
-
-    fn fake_server_config() -> McpServerConfig {
-        let exe = fake_server_exe();
-        McpServerConfig {
-            name: "fake".to_owned(),
-            disabled: false,
-            transport: McpTransport::Stdio,
-            command: Some(exe.to_string_lossy().into_owned()),
-            args: Some(vec![
-                "mcp::tests::fake_mcp_server_process".to_owned(),
-                "--nocapture".to_owned(),
-            ]),
-            url: None,
-            env: Some(BTreeMap::from([(
-                "PI_FAKE_MCP_SERVER".to_owned(),
-                "1".to_owned(),
-            )])),
-            extra: Default::default(),
-        }
-    }
-
     #[tokio::test]
     async fn mcp_tool_lists_configured_servers_without_echoing_env() {
-        let registry = McpRegistry::new();
+        let registry = McpRegistry::empty_for_tests();
         registry.configure(vec![McpServerConfig {
             name: "github".to_owned(),
             disabled: false,
             transport: McpTransport::Stdio,
             command: Some("npx".to_owned()),
-            args: Some(vec!["-y".to_owned(), "@modelcontextprotocol/server-github".to_owned()]),
+            args: Some(vec![
+                "-y".to_owned(),
+                "@modelcontextprotocol/server-github".to_owned(),
+            ]),
             url: None,
-            env: Some(BTreeMap::from([(
+            env: Some(crate::McpEnvironmentWire::from_iter([(
                 "GITHUB_TOKEN".to_owned(),
                 "super-secret-token".to_owned(),
             )])),
-            extra: Default::default(),
+            credential_grants: Vec::new(),
         }]);
         let tool = mcp_tool(registry);
         let text = tool_text(&tool, json!({ "action": "list_servers" }))
             .await
             .expect("list_servers");
         assert!(text.contains("github"), "{text}");
-        assert!(text.contains("stdio: npx -y @modelcontextprotocol/server-github"), "{text}");
-        assert!(!text.contains("super-secret-token"), "env must never be echoed: {text}");
+        assert!(
+            text.contains("stdio: npx -y @modelcontextprotocol/server-github"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("super-secret-token"),
+            "env must never be echoed: {text}"
+        );
     }
 
     #[tokio::test]
@@ -1979,8 +2170,9 @@ mod tests {
         // A fake server that logs credential-shaped text to stderr and then
         // refuses initialize: the tool error must embed the stderr tail but
         // never the secret values.
-        let registry = test_registry();
-        let mut config = fake_server_config();
+        let fixture = McpFixture::new().await;
+        let registry = fixture.registry();
+        let mut config = fixture.fake_server_config();
         config
             .env
             .as_mut()
@@ -1999,29 +2191,34 @@ mod tests {
         for secret in [ghp.as_str(), sk.as_str()] {
             assert!(!text.contains(secret), "{secret} leaked: {text}");
         }
-        assert!(text.contains("[REDACTED]"), "redaction marker missing: {text}");
+        assert!(
+            text.contains("[REDACTED]"),
+            "redaction marker missing: {text}"
+        );
     }
 
     #[tokio::test]
     async fn mcp_tool_list_tools_against_fake_server() {
-        let registry = test_registry();
-        registry.configure(vec![fake_server_config()]);
+        let fixture = McpFixture::new().await;
+        let registry = fixture.registry();
+        registry.configure(vec![fixture.fake_server_config()]);
         let tool = mcp_tool(registry);
-        let text = tool_text(
-            &tool,
-            json!({ "action": "list_tools", "server": "fake" }),
-        )
-        .await
-        .expect("list_tools");
+        let text = tool_text(&tool, json!({ "action": "list_tools", "server": "fake" }))
+            .await
+            .expect("list_tools");
         assert!(text.contains("Tools from MCP server `fake` (3):"), "{text}");
-        assert!(text.contains("- echo — Echo the given message back"), "{text}");
+        assert!(
+            text.contains("- echo — Echo the given message back"),
+            "{text}"
+        );
         assert!(text.contains("- add"), "{text}");
     }
 
     #[tokio::test]
     async fn mcp_tool_call_with_json_string_arguments() {
-        let registry = test_registry();
-        registry.configure(vec![fake_server_config()]);
+        let fixture = McpFixture::new().await;
+        let registry = fixture.registry();
+        registry.configure(vec![fixture.fake_server_config()]);
         let tool = mcp_tool(registry);
         let text = tool_text(
             &tool,
@@ -2040,7 +2237,7 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_tool_missing_server_error() {
-        let registry = McpRegistry::new();
+        let registry = McpRegistry::empty_for_tests();
         registry.configure(vec![stdio_config("alpha")]);
         let tool = mcp_tool(registry);
         let err = tool_text(
@@ -2049,37 +2246,41 @@ mod tests {
         )
         .await
         .expect_err("unknown server must fail");
-        assert!(err.to_string().contains("no MCP server configured with name `beta`"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("no MCP server configured with name `beta`"),
+            "{err}"
+        );
         assert!(err.to_string().contains("alpha"), "{err}");
     }
 
     #[tokio::test]
     async fn mcp_tool_no_servers_error_lists_remedy() {
-        let tool = mcp_tool(McpRegistry::new());
+        let tool = mcp_tool(McpRegistry::empty_for_tests());
         let err = tool_text(
             &tool,
             json!({ "action": "list_tools", "server": "anything" }),
         )
         .await
         .expect_err("no servers must fail");
-        assert!(err.to_string().contains("no MCP servers configured"), "{err}");
+        assert!(
+            err.to_string().contains("no MCP servers configured"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
     async fn mcp_tool_call_requires_tool_name() {
-        let tool = mcp_tool(McpRegistry::new());
-        let err = tool_text(
-            &tool,
-            json!({ "action": "call", "server": "fake" }),
-        )
-        .await
-        .expect_err("missing tool must fail");
+        let tool = mcp_tool(McpRegistry::empty_for_tests());
+        let err = tool_text(&tool, json!({ "action": "call", "server": "fake" }))
+            .await
+            .expect_err("missing tool must fail");
         assert!(err.to_string().contains("`tool`"), "{err}");
     }
 
     #[tokio::test]
     async fn mcp_tool_rejects_invalid_args_json() {
-        let registry = McpRegistry::new();
+        let registry = McpRegistry::empty_for_tests();
         registry.configure(vec![stdio_config("fake")]);
         let tool = mcp_tool(registry);
         let err = tool_text(
@@ -2093,16 +2294,19 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_tool_rejects_unknown_action() {
-        let tool = mcp_tool(McpRegistry::new());
+        let tool = mcp_tool(McpRegistry::empty_for_tests());
         let err = tool_text(&tool, json!({ "action": "fly" }))
             .await
             .expect_err("unknown action must fail");
-        assert!(err.to_string().contains("unknown mcp action `fly`"), "{err}");
+        assert!(
+            err.to_string().contains("unknown mcp action `fly`"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
     async fn mcp_tool_sse_server_reports_transport_limitation() {
-        let registry = McpRegistry::new();
+        let registry = McpRegistry::empty_for_tests();
         registry.configure(vec![McpServerConfig {
             name: "remote".to_owned(),
             disabled: false,
@@ -2111,7 +2315,7 @@ mod tests {
             args: None,
             url: Some("https://example.com/mcp".to_owned()),
             env: None,
-            extra: Default::default(),
+            credential_grants: Vec::new(),
         }]);
         let tool = mcp_tool(registry);
         let text = tool_text(&tool, json!({ "action": "list_servers" }))
@@ -2119,19 +2323,17 @@ mod tests {
             .expect("list_servers");
         assert!(text.contains("sse: https://example.com/mcp"), "{text}");
         // Calling an sse server must fail fast with the transport limitation.
-        let err = tool_text(
-            &tool,
-            json!({ "action": "list_tools", "server": "remote" }),
-        )
-        .await
-        .expect_err("sse transport is not implemented");
+        let err = tool_text(&tool, json!({ "action": "list_tools", "server": "remote" }))
+            .await
+            .expect_err("sse transport is not implemented");
         assert!(err.to_string().contains("sse"), "{err}");
     }
 
     #[tokio::test]
     async fn mcp_tool_large_output_is_bounded() {
-        let registry = test_registry();
-        registry.configure(vec![fake_server_config()]);
+        let fixture = McpFixture::new().await;
+        let registry = fixture.registry();
+        registry.configure(vec![fixture.fake_server_config()]);
         let tool = mcp_tool(registry);
         let text = tool_text(
             &tool,
@@ -2139,14 +2341,19 @@ mod tests {
         )
         .await
         .expect("call large");
-        assert!(text.len() < OUTPUT_MAX_BYTES + 512, "bounded: {}", text.len());
+        assert!(
+            text.len() < OUTPUT_MAX_BYTES + 512,
+            "bounded: {}",
+            text.len()
+        );
         assert!(text.contains("[output truncated]"), "truncation marker");
     }
 
     #[tokio::test]
     async fn mcp_tool_abort_cancels_in_flight_call() {
-        let registry = test_registry();
-        registry.configure(vec![fake_server_config()]);
+        let fixture = McpFixture::new().await;
+        let registry = fixture.registry();
+        registry.configure(vec![fixture.fake_server_config()]);
         let tool = mcp_tool(registry);
         let (controller, abort) = pi_agent::AbortController::new();
         let context = pi_agent::ToolCallContext {
@@ -2155,6 +2362,7 @@ mod tests {
             on_update: Arc::new(|_| {}),
             abort: abort.clone(),
             model: None,
+            approval_token: None,
         };
         controller.abort();
         let err = (tool.execute)(context)
@@ -2165,7 +2373,7 @@ mod tests {
 
     #[tokio::test]
     async fn registry_configure_drops_changed_sessions_and_keeps_unchanged() {
-        let registry = McpRegistry::new();
+        let registry = McpRegistry::empty_for_tests();
         let alpha = stdio_config("alpha");
         let beta = stdio_config("beta");
         registry.configure(vec![alpha.clone(), beta.clone()]);
@@ -2181,8 +2389,14 @@ mod tests {
             ..beta.clone()
         };
         registry.configure(vec![alpha.clone(), beta_changed]);
-        assert!(registry.session("alpha").is_some(), "unchanged server keeps session");
-        assert!(registry.session("beta").is_some(), "changed server gets a fresh slot");
+        assert!(
+            registry.session("alpha").is_some(),
+            "unchanged server keeps session"
+        );
+        assert!(
+            registry.session("beta").is_some(),
+            "changed server gets a fresh slot"
+        );
         assert_eq!(registry.config("alpha"), Some(alpha.clone()));
         assert_eq!(
             registry.config("beta"),
@@ -2193,13 +2407,17 @@ mod tests {
         );
         // Removing a server removes its session slot entirely.
         registry.configure(vec![alpha]);
-        assert!(registry.session("beta").is_none(), "removed server has no session");
+        assert!(
+            registry.session("beta").is_none(),
+            "removed server has no session"
+        );
     }
 
     #[tokio::test]
     async fn failed_call_drops_session_for_respawn() {
-        let registry = test_registry();
-        registry.configure(vec![fake_server_config()]);
+        let fixture = McpFixture::new().await;
+        let registry = fixture.registry();
+        registry.configure(vec![fixture.fake_server_config()]);
         let tool = mcp_tool(registry.clone());
         // Unknown tool without a cached list: the server answers with an
         // error, and the session must be dropped so the next call respawns.
@@ -2209,8 +2427,15 @@ mod tests {
         )
         .await
         .expect_err("unknown tool fails");
-        assert!(err.to_string().contains("Unknown tool: missing_tool"), "{err}");
-        assert_eq!(registry.live_session_count(), 0, "session dropped after error");
+        assert!(
+            err.to_string().contains("Unknown tool: missing_tool"),
+            "{err}"
+        );
+        assert_eq!(
+            registry.live_session_count(),
+            0,
+            "session dropped after error"
+        );
         // A subsequent healthy call respawns and succeeds.
         let text = tool_text(
             &tool,
@@ -2224,8 +2449,9 @@ mod tests {
 
     #[tokio::test]
     async fn call_after_list_tools_validates_against_cached_names() {
-        let registry = test_registry();
-        registry.configure(vec![fake_server_config()]);
+        let fixture = McpFixture::new().await;
+        let registry = fixture.registry();
+        registry.configure(vec![fixture.fake_server_config()]);
         let tool = mcp_tool(registry);
         let _ = tool_text(&tool, json!({ "action": "list_tools", "server": "fake" }))
             .await
@@ -2242,15 +2468,16 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Disabled servers
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn disabled_server_is_excluded_and_never_spawns() {
-        let registry = McpRegistry::new();
-        let mut disabled = fake_server_config();
+        let fixture = McpFixture::new().await;
+        let registry = McpRegistry::empty_for_tests();
+        let enabled = fixture.fake_server_config();
+        let mut disabled = enabled.clone();
         disabled.name = "off".to_owned();
         disabled.disabled = true;
-        registry.configure(vec![fake_server_config(), disabled]);
+        registry.configure(vec![enabled, disabled]);
 
         // list_servers excludes the disabled entry entirely.
         let names = registry
@@ -2267,14 +2494,12 @@ mod tests {
 
         // Calls against it are rejected before any spawn can happen.
         let tool = mcp_tool(registry.clone());
-        let err = tool_text(
-            &tool,
-            json!({ "action": "list_tools", "server": "off" }),
-        )
-        .await
-        .expect_err("disabled server must be rejected");
+        let err = tool_text(&tool, json!({ "action": "list_tools", "server": "off" }))
+            .await
+            .expect_err("disabled server must be rejected");
         assert!(
-            err.to_string().contains("no MCP server configured with name `off`"),
+            err.to_string()
+                .contains("no MCP server configured with name `off`"),
             "{err}"
         );
         assert_eq!(
@@ -2286,8 +2511,9 @@ mod tests {
 
     #[tokio::test]
     async fn configure_drops_session_when_server_becomes_disabled() {
-        let registry = test_registry();
-        registry.configure(vec![fake_server_config()]);
+        let fixture = McpFixture::new().await;
+        let registry = fixture.registry();
+        registry.configure(vec![fixture.fake_server_config()]);
         let tool = mcp_tool(registry.clone());
         let _ = tool_text(&tool, json!({ "action": "list_tools", "server": "fake" }))
             .await
@@ -2296,7 +2522,7 @@ mod tests {
 
         // Reconfigure with the same server disabled: the live session must be
         // torn down and the slot removed.
-        let mut disabled = fake_server_config();
+        let mut disabled = fixture.fake_server_config();
         disabled.disabled = true;
         registry.configure(vec![disabled]);
         assert_eq!(
@@ -2308,7 +2534,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Session cutover reset (reset_live_sessions)
+    // Session cutover reset reservation
     // -----------------------------------------------------------------------
 
     /// Pids recorded by the fake server (one line per spawn).
@@ -2327,27 +2553,26 @@ mod tests {
 
     /// A registry configured with the fake server that appends its pid per
     /// spawn to `pid_file`, plus a ready `mcp` tool.
-    fn registry_with_pid_tracking(pid_file: &std::path::Path) -> (McpRegistry, AgentTool) {
-        let registry = test_registry();
-        let mut config = fake_server_config();
-        config
-            .env
-            .as_mut()
-            .expect("fake env")
-            .insert(
-                "PI_FAKE_MCP_PID_FILE".to_owned(),
-                pid_file.to_string_lossy().into_owned(),
-            );
+    fn registry_with_pid_tracking(
+        fixture: &McpFixture,
+        pid_file: &std::path::Path,
+    ) -> (McpRegistry, AgentTool) {
+        let registry = fixture.registry();
+        let mut config = fixture.fake_server_config();
+        config.env.as_mut().expect("fake env").insert(
+            "PI_FAKE_MCP_PID_FILE".to_owned(),
+            pid_file.to_string_lossy().into_owned(),
+        );
         registry.configure(vec![config]);
         let tool = mcp_tool(registry.clone());
         (registry, tool)
     }
 
     #[tokio::test]
-    async fn reset_live_sessions_reaps_client_keeps_config_and_respawns_fresh() {
-        let trace_dir = tempfile::tempdir().expect("trace dir");
-        let pid_file = trace_dir.path().join("pids.txt");
-        let (registry, tool) = registry_with_pid_tracking(&pid_file);
+    async fn prepared_reset_reaps_client_keeps_config_and_respawns_fresh() {
+        let fixture = McpFixture::new().await;
+        let pid_file = fixture.path("pids.txt");
+        let (registry, tool) = registry_with_pid_tracking(&fixture, &pid_file);
 
         // First call spawns a live client; record its process id.
         let text = tool_text(
@@ -2361,18 +2586,28 @@ mod tests {
         let pids = read_pid_lines(&pid_file);
         assert_eq!(pids.len(), 1, "exactly one spawn so far: {pids:?}");
         let old_pid = pids[0];
-        assert!(process_alive(old_pid), "client must be running before the reset");
+        assert!(
+            process_alive(old_pid),
+            "client must be running before the reset"
+        );
 
-        // Reset: the client must be dead before the call returns, the slot
-        // drained, and the server configuration preserved.
-        registry.reset_live_sessions().await.expect("reset");
+        // Commit: the client must be dead before the call returns, the slot
+        // empty, and the server configuration preserved.
+        registry.prepare_reset_live_sessions().await.commit().await;
         assert!(
             !process_alive(old_pid),
             "old MCP client must be reaped before the reset returns"
         );
-        assert_eq!(registry.live_session_count(), 0, "no live sessions after reset");
+        assert_eq!(
+            registry.live_session_count(),
+            0,
+            "no live sessions after reset"
+        );
         assert!(
-            registry.list_servers().iter().any(|server| server.name == "fake"),
+            registry
+                .list_servers()
+                .iter()
+                .any(|server| server.name == "fake"),
             "server configuration must survive the reset"
         );
 
@@ -2393,51 +2628,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reset_live_sessions_ignores_empty_slots_and_preserves_config() {
-        let registry = test_registry();
+    async fn prepared_reset_ignores_empty_slots_and_preserves_config() {
+        let registry = McpRegistry::empty_for_tests();
         registry.configure(vec![stdio_config("fake")]);
         // A slot created (e.g. by a failed spawn or a touched session) with
         // no live client must be a silent no-op, not an error.
         assert!(registry.session("fake").is_some(), "slot created");
         assert_eq!(registry.live_session_count(), 0);
-        registry
-            .reset_live_sessions()
-            .await
-            .expect("reset with no live client must succeed");
+        registry.prepare_reset_live_sessions().await.commit().await;
         assert_eq!(registry.live_session_count(), 0);
         assert!(
-            registry.list_servers().iter().any(|server| server.name == "fake"),
+            registry
+                .list_servers()
+                .iter()
+                .any(|server| server.name == "fake"),
             "configuration must survive"
         );
     }
 
     #[tokio::test]
-    async fn reset_live_sessions_fails_with_context_when_slot_is_in_flight() {
-        let registry = test_registry();
-        registry.configure(vec![stdio_config("fake")]);
-        // Simulate a tool call in flight: hold the slot lock.
-        let slot = registry.session("fake").expect("configured slot");
-        let (held, release) = tokio::sync::oneshot::channel::<()>();
-        let task = {
-            let slot = slot.clone();
-            tokio::spawn(async move {
-                let _guard = slot.lock().await;
-                let _ = held.send(());
-                std::future::pending::<()>().await;
-            })
-        };
-        let _ = release.await.expect("slot lock acquired");
+    async fn dropping_prepared_reset_preserves_live_client_and_admission() {
+        let fixture = McpFixture::new().await;
+        let pid_file = fixture.path("reserved-pids.txt");
+        let (registry, tool) = registry_with_pid_tracking(&fixture, &pid_file);
+        let first = tool_text(
+            &tool,
+            json!({ "action": "call", "server": "fake", "tool": "echo", "args": { "message": "before" } }),
+        )
+        .await
+        .expect("first call");
+        assert!(first.contains("before"), "{first}");
+        let old_pid = read_pid_lines(&pid_file)[0];
 
-        let error = registry
-            .reset_live_sessions()
-            .await
-            .expect_err("an in-flight slot must fail the reset");
-        let text = error.to_string();
-        assert!(text.contains("fake"), "error must name the server: {text}");
-        assert!(text.contains("in flight"), "error must explain the cause: {text}");
+        let prepared = registry.prepare_reset_live_sessions().await;
+        assert!(
+            process_alive(old_pid),
+            "preparation must not reap the client"
+        );
+        assert!(
+            !registry.admission_available(),
+            "preparation must reserve new MCP admission"
+        );
+        drop(prepared);
+        assert!(
+            registry.admission_available(),
+            "dropping preparation must restore admission"
+        );
 
-        // Unblock the holder so teardown drops cleanly.
-        task.abort();
+        let second = tool_text(
+            &tool,
+            json!({ "action": "call", "server": "fake", "tool": "echo", "args": { "message": "after" } }),
+        )
+        .await
+        .expect("call after reservation rollback");
+        assert!(second.contains("after"), "{second}");
+        assert_eq!(
+            read_pid_lines(&pid_file),
+            [old_pid],
+            "rollback must reuse the exact client"
+        );
+        assert!(
+            process_alive(old_pid),
+            "rolled-back client must remain alive"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2465,18 +2718,14 @@ mod tests {
         // Two calls to the same server issued back-to-back must share a single
         // spawn: the first waits the fast-start window holding the session
         // lock, the second queues behind it and reuses the spawned client.
-        let trace_dir = tempfile::tempdir().expect("trace dir");
-        let trace_file = trace_dir.path().join("trace.txt");
-        let registry = McpRegistry::with_spawn_defer(Duration::from_millis(300));
-        let mut config = fake_server_config();
-        config
-            .env
-            .as_mut()
-            .expect("fake env")
-            .insert(
-                "PI_FAKE_MCP_TRACE".to_owned(),
-                trace_file.to_string_lossy().into_owned(),
-            );
+        let fixture = McpFixture::new().await;
+        let trace_file = fixture.path("batch-trace.txt");
+        let registry = fixture.registry_with_spawn_defer(Duration::from_millis(300));
+        let mut config = fixture.fake_server_config();
+        config.env.as_mut().expect("fake env").insert(
+            "PI_FAKE_MCP_TRACE".to_owned(),
+            trace_file.to_string_lossy().into_owned(),
+        );
         registry.configure(vec![config]);
 
         let started = std::time::Instant::now();
@@ -2493,7 +2742,10 @@ mod tests {
         let elapsed = started.elapsed();
         let first = first.expect("first call succeeds");
         let second = second.expect("second call succeeds");
-        assert!(first.contains("one") && second.contains("two"), "{first} / {second}");
+        assert!(
+            first.contains("one") && second.contains("two"),
+            "{first} / {second}"
+        );
 
         let lines = read_trace_lines(&trace_file);
         let spawns = lines.iter().filter(|line| line.as_str() == "spawn").count();
@@ -2510,8 +2762,9 @@ mod tests {
     async fn fast_start_window_is_skippable_with_zero_defer() {
         // A zero-window registry spawns immediately; used by the reconnect
         // tests and available to sessions that want no batching delay.
-        let registry = McpRegistry::with_spawn_defer(Duration::ZERO);
-        registry.configure(vec![fake_server_config()]);
+        let fixture = McpFixture::new().await;
+        let registry = fixture.registry_with_spawn_defer(Duration::ZERO);
+        registry.configure(vec![fixture.fake_server_config()]);
         let started = std::time::Instant::now();
         let text = run_mcp_text(
             &registry,
@@ -2548,11 +2801,11 @@ mod tests {
         // The first spawned process crashes on its first tools/call (marker
         // file arms the crash); the client must detect the transport failure,
         // back off, respawn, and complete the call on the second attempt.
-        let trace_dir = tempfile::tempdir().expect("trace dir");
-        let trace_file = trace_dir.path().join("trace.txt");
-        let crash_mark = trace_dir.path().join("crash.mark");
-        let registry = McpRegistry::with_spawn_defer(Duration::ZERO);
-        let mut config = fake_server_config();
+        let fixture = McpFixture::new().await;
+        let trace_file = fixture.path("reconnect-trace.txt");
+        let crash_mark = fixture.path("crash.mark");
+        let registry = fixture.registry_with_spawn_defer(Duration::ZERO);
+        let mut config = fixture.fake_server_config();
         {
             let env = config.env.as_mut().expect("fake env");
             env.insert(
@@ -2577,15 +2830,15 @@ mod tests {
 
         let lines = read_trace_lines(&trace_file);
         let spawns = lines.iter().filter(|line| line.as_str() == "spawn").count();
-        assert_eq!(
-            spawns, 2,
-            "exactly one respawn after the crash: {lines:?}"
-        );
+        assert_eq!(spawns, 2, "exactly one respawn after the crash: {lines:?}");
         let calls = lines
             .iter()
             .filter(|line| line.starts_with("call:echo"))
             .count();
-        assert_eq!(calls, 2, "the call is re-issued against the respawned server: {lines:?}");
+        assert_eq!(
+            calls, 2,
+            "the call is re-issued against the respawned server: {lines:?}"
+        );
     }
 
     #[tokio::test]
@@ -2594,10 +2847,10 @@ mod tests {
         // mode) is a protocol refusal, not a transport failure: the client
         // must surface it after exactly one spawn instead of burning the
         // reconnect budget on a server that will refuse again.
-        let trace_dir = tempfile::tempdir().expect("trace dir");
-        let trace_file = trace_dir.path().join("trace.txt");
-        let registry = McpRegistry::with_spawn_defer(Duration::ZERO);
-        let mut config = fake_server_config();
+        let fixture = McpFixture::new().await;
+        let trace_file = fixture.path("refusal-trace.txt");
+        let registry = fixture.registry_with_spawn_defer(Duration::ZERO);
+        let mut config = fixture.fake_server_config();
         {
             let env = config.env.as_mut().expect("fake env");
             env.insert("PI_FAKE_MCP_SERVER_BOOM".to_owned(), "1".to_owned());
@@ -2609,12 +2862,9 @@ mod tests {
         registry.configure(vec![config]);
         let tool = mcp_tool(registry.clone());
 
-        let err = tool_text(
-            &tool,
-            json!({ "action": "list_tools", "server": "fake" }),
-        )
-        .await
-        .expect_err("initialize refusal must fail");
+        let err = tool_text(&tool, json!({ "action": "list_tools", "server": "fake" }))
+            .await
+            .expect_err("initialize refusal must fail");
         assert!(err.to_string().contains("failed to initialize"), "{err}");
 
         let lines = read_trace_lines(&trace_file);
@@ -2635,10 +2885,10 @@ mod tests {
         // A persistently crashing server: after the bounded attempts the error
         // must name the server and how many attempts were made, and the
         // session must be dropped (so a later call tries again fresh).
-        let trace_dir = tempfile::tempdir().expect("trace dir");
-        let trace_file = trace_dir.path().join("trace.txt");
-        let registry = McpRegistry::with_spawn_defer(Duration::ZERO);
-        let mut config = fake_server_config();
+        let fixture = McpFixture::new().await;
+        let trace_file = fixture.path("exhausted-trace.txt");
+        let registry = fixture.registry_with_spawn_defer(Duration::ZERO);
+        let mut config = fixture.fake_server_config();
         {
             let env = config.env.as_mut().expect("fake env");
             env.insert(
@@ -2672,13 +2922,12 @@ mod tests {
     // -----------------------------------------------------------------------
     // Progressive search_tool discovery
     // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn search_tool_discovery_uses_tools_search_without_full_list() {
-        let trace_dir = tempfile::tempdir().expect("trace dir");
-        let trace_file = trace_dir.path().join("trace.txt");
-        let registry = McpRegistry::with_spawn_defer(Duration::ZERO);
-        let mut config = fake_server_config();
+        let fixture = McpFixture::new().await;
+        let trace_file = fixture.path("search-trace.txt");
+        let registry = fixture.registry_with_spawn_defer(Duration::ZERO);
+        let mut config = fixture.fake_server_config();
         {
             let env = config.env.as_mut().expect("fake env");
             env.insert(
@@ -2734,19 +2983,26 @@ mod tests {
         // .search_tool` as an object rather than a boolean under
         // `capabilities.tools.search_tool`; both shapes must enable the
         // progressive tools/search path.
-        let trace_dir = tempfile::tempdir().expect("trace dir");
-        let trace_file = trace_dir.path().join("trace.txt");
-        let mut client = spawn_fake_client_with(&[
-            ("PI_FAKE_MCP_SEARCH_EXPERIMENTAL", "1"),
-            ("PI_FAKE_MCP_TRACE", trace_file.to_str().expect("trace path")),
-        ])
-        .await;
+        let fixture = McpFixture::new().await;
+        let trace_file = fixture.path("experimental-search-trace.txt");
+        let mut client = fixture
+            .spawn_client_with(&[
+                ("PI_FAKE_MCP_SEARCH_EXPERIMENTAL", "1"),
+                (
+                    "PI_FAKE_MCP_TRACE",
+                    trace_file.to_str().expect("trace path"),
+                ),
+            ])
+            .await;
         assert!(
             client.search_tool_supported(),
             "experimental object-form search_tool must be detected"
         );
         assert!(
-            client.resolve_tool("echo").await.expect("tools/search resolves"),
+            client
+                .resolve_tool("echo")
+                .await
+                .expect("tools/search resolves"),
             "echo must resolve through tools/search"
         );
         let lines = read_trace_lines(&trace_file);
@@ -2766,10 +3022,10 @@ mod tests {
         // The server advertises search_tool but answers tools/search with
         // method-not-found: the client must fall back to the full tools/list
         // and complete the call.
-        let trace_dir = tempfile::tempdir().expect("trace dir");
-        let trace_file = trace_dir.path().join("trace.txt");
-        let registry = McpRegistry::with_spawn_defer(Duration::ZERO);
-        let mut config = fake_server_config();
+        let fixture = McpFixture::new().await;
+        let trace_file = fixture.path("fallback-trace.txt");
+        let registry = fixture.registry_with_spawn_defer(Duration::ZERO);
+        let mut config = fixture.fake_server_config();
         {
             let env = config.env.as_mut().expect("fake env");
             env.insert(

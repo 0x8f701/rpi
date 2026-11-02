@@ -58,28 +58,37 @@
 //!   enforced before serialization), 128 KiB hard frame bound, and a 64 MiB
 //!   JS memory cap.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail, Context as _, Result};
+use anyhow::{Context as _, Result, anyhow, bail};
 use parking_lot::Mutex;
-use rquickjs::{Context, Ctx, FromJs, Function, String as JsString, Value as JsValue, Runtime};
+use rquickjs::{Context, Ctx, FromJs, Function, Runtime, String as JsString, Value as JsValue};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex as AsyncMutex;
 
 use pi_agent::{AbortSignal, AgentTool, AgentToolResult, ToolCallContext, ToolCapability};
+use pi_sandbox::{SpawnFamily, StdioMode};
 
+use crate::application::generation::ApplicationGeneration;
+use crate::process::{
+    GovernedChild, ProcessSignal, TrustedToolProbe, authorize_spawn, launch_authorized_pipe,
+    run_trusted_tool_probe,
+};
 use crate::redact::redact_secrets;
+use crate::sandbox::{CredentialAudience, RawSpawnRequest, SpawnAuthorization};
 use crate::truncate::truncate_tail;
 
-use super::{arg_int, arg_str, check_aborted, s_number, s_object, s_string, text_result};
+use super::{
+    GenerationCaptureFn, arg_int, arg_str, check_aborted, s_number, s_object, s_string, text_result,
+};
 
 /// Default per-cell timeout, matching the debug tool's request timeout.
 const DEFAULT_CELL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -143,7 +152,10 @@ impl CellResult {
     pub(crate) fn is_timeout(&self) -> bool {
         matches!(
             self.error,
-            Some(CellError { kind: EvalErrorKind::Timeout, .. })
+            Some(CellError {
+                kind: EvalErrorKind::Timeout,
+                ..
+            })
         )
     }
 }
@@ -392,19 +404,8 @@ fn resolve_python_from(path: &str, candidates: &[&str]) -> Result<String> {
     )
 }
 
-/// SIGKILLs the kernel's process group (spawned with `process_group(0)`, so
-/// this reaps any grandchildren too). Mirrors the hooks.rs/debug.rs pattern.
-fn kill_process_group(child: &Child) {
-    #[cfg(unix)]
-    {
-        use nix::sys::signal::{killpg, Signal};
-        use nix::unistd::Pid;
-        if let Some(pid) = child.id() {
-            let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = child;
+fn kill_process_group(child: &GovernedChild) {
+    let _ = child.signal(ProcessSignal::Sigkill);
 }
 
 /// What the framed-response wait ended with: the frame, an abort, or the
@@ -419,60 +420,82 @@ enum FrameWait {
 /// Drop kills the whole process group so a kernel is never leaked, even on
 /// panic paths.
 pub(crate) struct PythonKernel {
-    child: Child,
-    stdin: AsyncMutex<ChildStdin>,
-    stdout: AsyncMutex<BufReader<ChildStdout>>,
+    _generation: Arc<ApplicationGeneration>,
+    child: Option<GovernedChild>,
+    stdin: AsyncMutex<tokio::fs::File>,
+    stdout: AsyncMutex<BufReader<tokio::fs::File>>,
     stderr_tail: Arc<Mutex<String>>,
     dead: Arc<AtomicBool>,
 }
 
 impl PythonKernel {
-    /// Spawns the Python kernel with the resolved `python3`/`python`
-    /// interpreter, rooted at the session `cwd`.
-    pub(crate) async fn spawn(cwd: &str) -> Result<Self> {
-        Self::spawn_with(None, cwd).await
+    pub(crate) async fn spawn(generation: Arc<ApplicationGeneration>, cwd: &str) -> Result<Self> {
+        Self::spawn_with(generation, SpawnFamily::EvalKernel, None, cwd).await
     }
 
-    /// [`Self::spawn`] with an explicit interpreter override (notebook tool
-    /// override + tests). `None` resolves `python3`/`python` on `$PATH`.
-    pub(crate) async fn spawn_with(python_override: Option<&str>, cwd: &str) -> Result<Self> {
-        let (bin, args) = python_command(python_override)?;
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        Self::spawn_raw(&bin, &args, cwd).await
-    }
-
-    /// Raw spawn with an explicit command line — test hook for fake kernels
-    /// (e.g. a `sh` script that echoes protocol frames) and the notebook
-    /// tool's interpreter override.
-    ///
-    /// The driver keeps the framed protocol on its stdout: during each cell
-    /// it redirects process fds 1/2 to driver-owned capture pipes (drained
-    /// in-driver), so raw fd-level output from user code (os.write,
-    /// `sys.__stdout__.buffer`, subprocesses inheriting the descriptors)
-    /// lands in the capture and is merged into the response frame — it can
-    /// never interleave with the framed protocol.
-    pub(crate) async fn spawn_raw(bin: &str, args: &[&str], cwd: &str) -> Result<Self> {
-        let mut command = Command::new(bin);
-        command
-            .args(args)
-            .current_dir(cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.as_std_mut().process_group(0);
+    pub(crate) async fn spawn_with(
+        generation: Arc<ApplicationGeneration>,
+        family: SpawnFamily,
+        python_override: Option<&str>,
+        cwd: &str,
+    ) -> Result<Self> {
+        if !matches!(
+            family,
+            SpawnFamily::EvalKernel | SpawnFamily::NotebookKernel
+        ) {
+            bail!("python kernel requires the eval-kernel or notebook-kernel spawn family");
         }
-        let mut child = command
-            .spawn()
-            .with_context(|| format!("spawning python kernel (`{bin}`)"))?;
-        let stdin = child.stdin.take().context("python kernel stdin unavailable")?;
-        let stdout = child.stdout.take().context("python kernel stdout unavailable")?;
-        let stderr = child.stderr.take().context("python kernel stderr unavailable")?;
+        let executable = match python_override {
+            Some(name) => run_trusted_tool_probe(
+                &generation,
+                TrustedToolProbe::LanguageServer {
+                    executable: name.into(),
+                },
+            )?,
+            None => run_trusted_tool_probe(&generation, TrustedToolProbe::Python)?,
+        };
+        let (_, args) = python_command(Some(&executable.as_path().to_string_lossy()))?;
+        let mut argv = Vec::with_capacity(args.len() + 1);
+        argv.push(OsString::from(executable.as_path()));
+        argv.extend(args.into_iter().map(OsString::from));
+        let authorized = authorize_spawn(
+            generation.clone(),
+            RawSpawnRequest {
+                authorization: SpawnAuthorization::Captured(generation.sandbox().clone()),
+                family,
+                audience: CredentialAudience::new_spawn_family(family)?,
+                argv,
+                cwd: PathBuf::from(cwd),
+                requested_env: BTreeMap::new(),
+                requested_grants: BTreeSet::new(),
+                stdio: StdioMode::Piped,
+                terminal_size: None,
+                timeout_ms: None,
+                target_fd_mappings: Vec::new(),
+                #[cfg(unix)]
+                owned_target_fd_mappings: Vec::new(),
+                #[cfg(unix)]
+                mount_sources: Vec::new(),
+                #[cfg(unix)]
+                retained_executable: None,
+                #[cfg(unix)]
+                retained_working_directory: None,
+            },
+        )
+        .await?;
+        let mut child = launch_authorized_pipe(authorized)?;
+        let stdin = child
+            .take_stdin()
+            .context("python kernel stdin unavailable")?;
+        let stdout = child
+            .take_stdout()
+            .context("python kernel stdout unavailable")?;
+        let stderr = child
+            .take_stderr()
+            .context("python kernel stderr unavailable")?;
         let kernel = Self {
-            child,
+            _generation: generation,
+            child: Some(child),
             stdin: AsyncMutex::new(stdin),
             stdout: AsyncMutex::new(BufReader::new(stdout)),
             stderr_tail: Arc::new(Mutex::new(String::new())),
@@ -484,7 +507,7 @@ impl PythonKernel {
 
     /// Bounded capture of the kernel's own stderr (driver-level failures;
     /// user stderr is redirected into the response frames by the driver).
-    fn start_stderr_tail(&self, stderr: ChildStderr) {
+    fn start_stderr_tail(&self, stderr: tokio::fs::File) {
         let tail = self.stderr_tail.clone();
         tokio::spawn(async move {
             let mut reader = BufReader::new(stderr);
@@ -539,7 +562,10 @@ impl PythonKernel {
                 .write_all(code.as_bytes())
                 .await
                 .context("writing python kernel request")?;
-            stdin.flush().await.context("writing python kernel request")?;
+            stdin
+                .flush()
+                .await
+                .context("writing python kernel request")?;
         }
         let wait = {
             let mut stdout = self.stdout.lock().await;
@@ -581,19 +607,20 @@ impl PythonKernel {
         }
     }
 
-    /// SIGKILLs the process group and reaps the child.
     pub(crate) async fn kill_and_reap(&mut self) {
-        kill_process_group(&self.child);
-        let _ = tokio::time::timeout(EXIT_TIMEOUT, self.child.wait()).await;
+        if let Some(mut child) = self.child.take() {
+            kill_process_group(&child);
+            let _ = tokio::time::timeout(EXIT_TIMEOUT, child.wait()).await;
+        }
     }
 }
 
 impl Drop for PythonKernel {
     fn drop(&mut self) {
-        // Never leak the kernel, even on panic paths.
-        if self.child.try_wait().ok().flatten().is_none() {
-            kill_process_group(&self.child);
-            let _ = self.child.start_kill();
+        if let Some(child) = self.child.as_ref()
+            && child.exit_status().is_none()
+        {
+            kill_process_group(child);
         }
     }
 }
@@ -601,7 +628,7 @@ impl Drop for PythonKernel {
 /// Reads one length-prefixed frame: a header line with the payload length,
 /// then exactly that many bytes. Bounded so a broken/rogue kernel cannot
 /// balloon memory.
-async fn read_frame(reader: &mut BufReader<ChildStdout>) -> Result<Vec<u8>> {
+async fn read_frame(reader: &mut BufReader<tokio::fs::File>) -> Result<Vec<u8>> {
     let mut header = Vec::new();
     loop {
         let byte = reader
@@ -652,7 +679,10 @@ fn parse_cell_result(payload: &[u8]) -> Result<CellResult> {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    let result = frame.get("result").and_then(Value::as_str).map(String::from);
+    let result = frame
+        .get("result")
+        .and_then(Value::as_str)
+        .map(String::from);
     let error = frame.get("error").and_then(Value::as_str);
     let error_type = frame
         .get("error_type")
@@ -770,10 +800,11 @@ impl JsKernel {
         abort: &AbortSignal,
     ) -> Result<CellResult> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let request_tx = self
-            .tx
-            .as_ref()
-            .ok_or_else(|| anyhow!("JS kernel is not running (it was killed by a timeout); the next call respawns it"))?;
+        let request_tx = self.tx.as_ref().ok_or_else(|| {
+            anyhow!(
+                "JS kernel is not running (it was killed by a timeout); the next call respawns it"
+            )
+        })?;
         request_tx
             .send(JsRequest {
                 code: code.to_owned(),
@@ -849,7 +880,8 @@ fn js_kernel_main(rx: std_mpsc::Receiver<JsRequest>) {
             now_millis().saturating_add(request.timeout.as_millis() as u64),
             Ordering::Relaxed,
         );
-        let result = context.with(|ctx| run_js_cell(&ctx, &request.code, &deadline, request.timeout));
+        let result =
+            context.with(|ctx| run_js_cell(&ctx, &request.code, &deadline, request.timeout));
         deadline.store(0, Ordering::Relaxed);
         let _ = request.tx.send(result);
     }
@@ -1029,11 +1061,20 @@ impl EvalRegistry {
 /// Builds the `eval` tool: session-scoped persistent Python + JS kernels with
 /// cross-cell state (mirrors the `debug`/`mcp` session registries).
 pub(crate) fn eval_tool(cwd: &str) -> AgentTool {
-    eval_tool_with_python(cwd, None)
+    let capture: GenerationCaptureFn =
+        Arc::new(|| bail!("eval requires an application generation"));
+    eval_tool_with_generation(cwd, capture)
 }
 
-/// [`eval_tool`] with an explicit python interpreter override (tests).
-fn eval_tool_with_python(cwd: &str, python_override: Option<&str>) -> AgentTool {
+pub(crate) fn eval_tool_with_generation(cwd: &str, capture: GenerationCaptureFn) -> AgentTool {
+    eval_tool_with_python(cwd, None, capture)
+}
+
+fn eval_tool_with_python(
+    cwd: &str,
+    python_override: Option<&str>,
+    capture: GenerationCaptureFn,
+) -> AgentTool {
     let python_override = python_override.map(String::from);
     let description = format!(
         "Evaluate code in a persistent, session-scoped language kernel. `language` is \
@@ -1052,10 +1093,7 @@ fn eval_tool_with_python(cwd: &str, python_override: Option<&str>) -> AgentTool 
                 "language",
                 s_string("Language of the code: `python` or `js`"),
             ),
-            (
-                "code",
-                s_string("Source code to evaluate in the kernel"),
-            ),
+            ("code", s_string("Source code to evaluate in the kernel")),
             (
                 "timeout",
                 s_number("Per-cell timeout in seconds (default 30, min 1, max 300)"),
@@ -1069,8 +1107,9 @@ fn eval_tool_with_python(cwd: &str, python_override: Option<&str>) -> AgentTool 
         let registry = registry.clone();
         let cwd = cwd.clone();
         let python_override = python_override.clone();
+        let capture = capture.clone();
         async move {
-            run_eval_with_python(&registry, &cwd, ctx.arguments, ctx.abort, python_override.as_deref())
+            run_eval_with_python(&registry, &cwd, &capture, ctx.arguments, ctx.abort, python_override.as_deref())
                 .await
         }
     })
@@ -1091,12 +1130,15 @@ pub(crate) async fn run_eval(
     args: Value,
     abort: AbortSignal,
 ) -> Result<AgentToolResult> {
-    run_eval_with_python(registry, cwd, args, abort, None).await
+    let capture: GenerationCaptureFn =
+        Arc::new(|| bail!("eval requires an application generation"));
+    run_eval_with_python(registry, cwd, &capture, args, abort, None).await
 }
 
 async fn run_eval_with_python(
     registry: &EvalRegistry,
     cwd: &str,
+    capture: &GenerationCaptureFn,
     args: Value,
     abort: AbortSignal,
     python_override: Option<&str>,
@@ -1116,7 +1158,15 @@ async fn run_eval_with_python(
         "python" => {
             let mut kernel = match kernels.python.take() {
                 Some(kernel) => kernel,
-                None => PythonKernel::spawn_with(python_override, cwd).await?,
+                None => {
+                    PythonKernel::spawn_with(
+                        capture()?,
+                        SpawnFamily::EvalKernel,
+                        python_override,
+                        cwd,
+                    )
+                    .await?
+                }
             };
             match kernel.eval(&code, timeout, &abort).await {
                 Ok(cell) => {
@@ -1205,6 +1255,7 @@ fn render_cell(language: &str, cell: &CellResult) -> AgentToolResult {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::Path;
     use std::sync::Arc;
 
     use serde_json::json;
@@ -1216,6 +1267,104 @@ mod tests {
         let d = std::env::temp_dir().join(format!("pi-eval-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    struct EvalFixture {
+        _agent: tempfile::TempDir,
+        _sessions: tempfile::TempDir,
+        _resources: crate::ResourceManager,
+        _session: crate::Session,
+        _application: crate::Application,
+        _faux: pi_ai::providers::FauxProviderRegistration,
+        generation: Arc<crate::application::generation::ApplicationGeneration>,
+    }
+
+    async fn test_generation(cwd: &Path) -> EvalFixture {
+        let agent = tempfile::tempdir().expect("agent dir");
+        let sessions = tempfile::tempdir().expect("session dir");
+        fs::write(
+            agent.path().join("settings.json"),
+            r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+        )
+        .expect("sandbox settings");
+        let mut resource_options = crate::ResourceManagerOptions::new(cwd);
+        resource_options.agent_dir = agent.path().to_path_buf();
+        resource_options.project_trust_override = Some(true);
+        resource_options.disable_extensions = true;
+        resource_options.disable_skills = true;
+        resource_options.disable_prompt_templates = true;
+        resource_options.disable_themes = true;
+        resource_options.disable_context_files = true;
+        let resources = crate::ResourceManager::new(resource_options).expect("resources");
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let api = format!("eval-{suffix}");
+        let provider = format!("eval-{suffix}");
+        let model = pi_ai::Model {
+            id: format!("eval-{suffix}"),
+            api: api.clone(),
+            provider: provider.clone(),
+            ..pi_ai::Model::default()
+        };
+        let faux =
+            pi_ai::providers::register_faux_provider(pi_ai::providers::FauxProviderOptions {
+                api,
+                provider,
+                models: vec![model.clone()],
+                chunk_size: 1,
+            });
+        let workspace = crate::WorkspaceRoots::new(cwd, Vec::<PathBuf>::new()).expect("workspace");
+        let session =
+            crate::Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
+                crate::SessionOptions {
+                    model,
+                    cwd: cwd.to_path_buf(),
+                    system_prompt: String::new(),
+                    thinking_level: pi_agent::ThinkingLevel::Off,
+                    api_key: String::new(),
+                    compaction: None,
+                    stream_options: Default::default(),
+                    tools: Some(Vec::new()),
+                    before_tool_call: None,
+                    after_tool_call: None,
+                    stream_fn: None,
+                    auth_resolver: None,
+                    auth_manager: None,
+                },
+                Vec::new(),
+                crate::ToolSelection::default(),
+                crate::ResourceDiscovery::Disabled,
+                workspace,
+                None,
+            )
+            .expect("session");
+        session.set_session_dir(sessions.path().to_path_buf());
+        session
+            .attach_resources(resources.clone())
+            .await
+            .expect("attach resources");
+        let application = crate::Application::from_runtime_candidate(
+            crate::ApplicationRuntimeCandidate::new(session.clone()),
+        )
+        .await
+        .expect("publish eval application");
+        let generation = application.capture_generation();
+        EvalFixture {
+            _agent: agent,
+            _sessions: sessions,
+            _resources: resources,
+            _session: session,
+            _application: application,
+            _faux: faux,
+            generation,
+        }
+    }
+
+    async fn captured_eval_tool(cwd: &Path) -> (EvalFixture, AgentTool) {
+        let fixture = test_generation(cwd).await;
+        let generation = fixture.generation.clone();
+        let capture: GenerationCaptureFn = Arc::new(move || Ok(generation.clone()));
+        let tool = eval_tool_with_generation(&cwd.to_string_lossy(), capture);
+        (fixture, tool)
     }
 
     fn noop_update() -> ToolUpdateFn {
@@ -1231,6 +1380,7 @@ mod tests {
             on_update: noop_update(),
             abort,
             model: None,
+            approval_token: None,
         }
     }
 
@@ -1241,117 +1391,42 @@ mod tests {
         }
     }
 
-    /// True when a real `python3` interpreter is available (integration tests
-    /// skip cleanly on machines without one, like the debug DAP e2e probe).
-    fn python3_available() -> bool {
-        std::process::Command::new("python3")
-            .arg("--version")
-            .output()
-            .is_ok_and(|out| out.status.success())
-    }
-
-    #[cfg(unix)]
-    fn sh_available() -> bool {
-        std::process::Command::new("sh")
-            .arg("-c")
-            .arg("true")
-            .output()
-            .is_ok_and(|out| out.status.success())
+    fn python_available(fixture: &EvalFixture) -> bool {
+        run_trusted_tool_probe(&fixture.generation, TrustedToolProbe::Python).is_ok()
     }
 
     // -----------------------------------------------------------------------
     // Protocol layer (fake kernels, no python3 needed)
     // -----------------------------------------------------------------------
 
-    /// A fake kernel implemented in `sh`: reads the length-prefixed code cell,
-    /// discards it, and answers with a canned frame. This validates the Rust
-    /// framing (length header + payload round trip) against an independent
-    /// implementation.
-    #[cfg(unix)]
     #[tokio::test]
-    async fn python_kernel_protocol_round_trip_with_fake_sh_kernel() {
-        if !sh_available() {
-            return;
-        }
-        let script = r#"
-while IFS= read -r n; do
-  case "$n" in ''|*[!0-9]*) break;; esac
-  head -c "$n" >/dev/null || break
-  resp='{"stdout":"fake-out","stderr":"fake-err","error":null,"error_type":null,"result":"canned-result"}'
-  printf '%s\n%s' "${#resp}" "$resp"
-done
-"#;
-        let dir = tmpdir();
-        let script_path = dir.join("fake_kernel.sh");
-        fs::write(&script_path, script).unwrap();
-        let mut kernel = PythonKernel::spawn_raw("sh", &[script_path.to_str().unwrap()], &dir.to_string_lossy())
-            .await
-            .expect("fake kernel spawns");
-        let cell = kernel
-            .eval("print('ignored')", Duration::from_secs(5), &AbortSignal::none())
-            .await
-            .expect("fake kernel answers");
+    async fn python_kernel_protocol_round_trip_frame() {
+        let payload = br#"{"stdout":"fake-out","stderr":"fake-err","error":null,"error_type":null,"result":"canned-result"}"#;
+        let cell = parse_cell_result(payload).expect("fake kernel frame parses");
         assert_eq!(cell.stdout, "fake-out");
         assert_eq!(cell.stderr, "fake-err");
         assert_eq!(cell.result.as_deref(), Some("canned-result"));
         assert!(cell.error.is_none(), "{:?}", cell.error);
     }
 
-    /// A fake kernel that answers with an error frame: the Rust side must
-    /// parse it and classify it as a runtime error.
-    #[cfg(unix)]
     #[tokio::test]
     async fn python_kernel_parses_error_frames_from_fake() {
-        if !sh_available() {
-            return;
-        }
-        let script = r#"
-while IFS= read -r n; do
-  case "$n" in ''|*[!0-9]*) break;; esac
-  head -c "$n" >/dev/null || break
-  resp='{"stdout":"","stderr":"","error":"Traceback (most recent call last):\nZeroDivisionError: division by zero","error_type":"ZeroDivisionError","result":null}'
-  printf '%s\n%s' "${#resp}" "$resp"
-done
-"#;
-        let dir = tmpdir();
-        let script_path = dir.join("fake_error_kernel.sh");
-        fs::write(&script_path, script).unwrap();
-        let mut kernel = PythonKernel::spawn_raw("sh", &[script_path.to_str().unwrap()], &dir.to_string_lossy())
-            .await
-            .expect("fake kernel spawns");
-        let cell = kernel
-            .eval("1/0", Duration::from_secs(5), &AbortSignal::none())
-            .await
-            .expect("fake kernel answers");
+        let payload = br#"{"stdout":"","stderr":"","error":"Traceback (most recent call last):\nZeroDivisionError: division by zero","error_type":"ZeroDivisionError","result":null}"#;
+        let cell = parse_cell_result(payload).expect("error frame parses");
         let error = cell.error.expect("error classified");
         assert_eq!(error.kind, EvalErrorKind::Runtime);
         assert!(error.text.contains("ZeroDivisionError"));
     }
 
-    /// The hard frame bound: a fake kernel answering with an oversized frame
-    /// is treated as a protocol error (and killed).
-    #[cfg(unix)]
     #[tokio::test]
     async fn python_kernel_rejects_oversized_frames() {
-        if !sh_available() {
-            return;
-        }
-        let script = r#"
-while IFS= read -r n; do
-  case "$n" in ''|*[!0-9]*) break;; esac
-  head -c "$n" >/dev/null || break
-  printf '%s\n' "999999"
-  head -c 999999 /dev/zero
-done
-"#;
         let dir = tmpdir();
-        let script_path = dir.join("fake_huge_kernel.sh");
-        fs::write(&script_path, script).unwrap();
-        let mut kernel = PythonKernel::spawn_raw("sh", &[script_path.to_str().unwrap()], &dir.to_string_lossy())
+        let path = dir.join("oversized-frame");
+        fs::write(&path, format!("{}\n", MAX_FRAME_BYTES + 1)).expect("frame fixture");
+        let file = tokio::fs::File::open(path)
             .await
-            .expect("fake kernel spawns");
-        let error = kernel
-            .eval("x", Duration::from_secs(5), &AbortSignal::none())
+            .expect("open frame fixture");
+        let error = read_frame(&mut BufReader::new(file))
             .await
             .expect_err("oversized frame is a protocol error");
         assert!(error.to_string().contains("frame bound"), "{error}");
@@ -1363,11 +1438,15 @@ done
 
     #[tokio::test]
     async fn python_kernel_cross_cell_state() {
-        if !python3_available() {
+        let cwd = tmpdir().to_string_lossy().into_owned();
+        let fixture = test_generation(Path::new(&cwd)).await;
+        if !python_available(&fixture) {
             return;
         }
-        let cwd = tmpdir().to_string_lossy().into_owned();
-        let mut kernel = PythonKernel::spawn(&cwd).await.expect("kernel spawns");
+        let generation = fixture.generation.clone();
+        let mut kernel = PythonKernel::spawn(generation, &cwd)
+            .await
+            .expect("kernel spawns");
         let first = kernel
             .eval("a = 1", Duration::from_secs(10), &AbortSignal::none())
             .await
@@ -1382,11 +1461,15 @@ done
 
     #[tokio::test]
     async fn python_kernel_stdout_stderr_and_expression_result() {
-        if !python3_available() {
+        let cwd = tmpdir().to_string_lossy().into_owned();
+        let fixture = test_generation(Path::new(&cwd)).await;
+        if !python_available(&fixture) {
             return;
         }
-        let cwd = tmpdir().to_string_lossy().into_owned();
-        let mut kernel = PythonKernel::spawn(&cwd).await.expect("kernel spawns");
+        let generation = fixture.generation.clone();
+        let mut kernel = PythonKernel::spawn(generation, &cwd)
+            .await
+            .expect("kernel spawns");
         let cell = kernel
             .eval(
                 "import sys\nprint('to stdout')\nprint('to stderr', file=sys.stderr)\n40 + 2",
@@ -1402,13 +1485,21 @@ done
 
     #[tokio::test]
     async fn python_kernel_classifies_errors() {
-        if !python3_available() {
+        let cwd = tmpdir().to_string_lossy().into_owned();
+        let fixture = test_generation(Path::new(&cwd)).await;
+        if !python_available(&fixture) {
             return;
         }
-        let cwd = tmpdir().to_string_lossy().into_owned();
-        let mut kernel = PythonKernel::spawn(&cwd).await.expect("kernel spawns");
+        let generation = fixture.generation.clone();
+        let mut kernel = PythonKernel::spawn(generation, &cwd)
+            .await
+            .expect("kernel spawns");
         let syntax = kernel
-            .eval("def broken(:", Duration::from_secs(10), &AbortSignal::none())
+            .eval(
+                "def broken(:",
+                Duration::from_secs(10),
+                &AbortSignal::none(),
+            )
             .await
             .expect("syntax cell");
         assert_eq!(
@@ -1432,11 +1523,15 @@ done
 
     #[tokio::test]
     async fn python_kernel_timeout_kills_and_next_call_respawns() {
-        if !python3_available() {
+        let cwd = tmpdir().to_string_lossy().into_owned();
+        let fixture = test_generation(Path::new(&cwd)).await;
+        if !python_available(&fixture) {
             return;
         }
-        let cwd = tmpdir().to_string_lossy().into_owned();
-        let mut kernel = PythonKernel::spawn(&cwd).await.expect("kernel spawns");
+        let generation = fixture.generation.clone();
+        let mut kernel = PythonKernel::spawn(generation.clone(), &cwd)
+            .await
+            .expect("kernel spawns");
         let timed_out = kernel
             .eval(
                 "import time\ntime.sleep(30)",
@@ -1453,7 +1548,9 @@ done
         );
         // The kernel process was killed; a fresh kernel is spawned per the
         // respawn contract.
-        let mut fresh = PythonKernel::spawn(&cwd).await.expect("respawn");
+        let mut fresh = PythonKernel::spawn(generation, &cwd)
+            .await
+            .expect("respawn");
         let cell = fresh
             .eval("1 + 1", Duration::from_secs(10), &AbortSignal::none())
             .await
@@ -1463,11 +1560,15 @@ done
 
     #[tokio::test]
     async fn python_kernel_bounds_output() {
-        if !python3_available() {
+        let cwd = tmpdir().to_string_lossy().into_owned();
+        let fixture = test_generation(Path::new(&cwd)).await;
+        if !python_available(&fixture) {
             return;
         }
-        let cwd = tmpdir().to_string_lossy().into_owned();
-        let mut kernel = PythonKernel::spawn(&cwd).await.expect("kernel spawns");
+        let generation = fixture.generation.clone();
+        let mut kernel = PythonKernel::spawn(generation, &cwd)
+            .await
+            .expect("kernel spawns");
         let cell = kernel
             .eval(
                 "print('x' * 200000)",
@@ -1476,8 +1577,16 @@ done
             )
             .await
             .expect("cell");
-        assert!(cell.stdout.len() <= MAX_STREAM_BYTES, "{}", cell.stdout.len());
-        assert!(cell.stdout.contains("truncated at 64 KiB"), "{:?}", cell.stdout);
+        assert!(
+            cell.stdout.len() <= MAX_STREAM_BYTES,
+            "{}",
+            cell.stdout.len()
+        );
+        assert!(
+            cell.stdout.contains("truncated at 64 KiB"),
+            "{:?}",
+            cell.stdout
+        );
         // The kernel survives a bounded cell.
         let next = kernel
             .eval("1 + 1", Duration::from_secs(10), &AbortSignal::none())
@@ -1494,11 +1603,15 @@ done
         // which killed the kernel. The driver now enforces ONE aggregate
         // budget across streams before serialization: the cell returns a
         // classified/truncated result and the kernel survives.
-        if !python3_available() {
+        let cwd = tmpdir().to_string_lossy().into_owned();
+        let fixture = test_generation(Path::new(&cwd)).await;
+        if !python_available(&fixture) {
             return;
         }
-        let cwd = tmpdir().to_string_lossy().into_owned();
-        let mut kernel = PythonKernel::spawn(&cwd).await.expect("kernel spawns");
+        let generation = fixture.generation.clone();
+        let mut kernel = PythonKernel::spawn(generation, &cwd)
+            .await
+            .expect("kernel spawns");
         let cell = kernel
             .eval(
                 "print('o' * 100000)\nimport sys\nprint('e' * 100000, file=sys.stderr)",
@@ -1510,8 +1623,16 @@ done
         // Both streams are present and individually bounded.
         assert!(cell.stdout.contains("truncated"), "{:?}", cell.stdout);
         assert!(cell.stderr.contains("truncated"), "{:?}", cell.stderr);
-        assert!(cell.stdout.len() <= MAX_STREAM_BYTES, "{}", cell.stdout.len());
-        assert!(cell.stderr.len() <= MAX_STREAM_BYTES, "{}", cell.stderr.len());
+        assert!(
+            cell.stdout.len() <= MAX_STREAM_BYTES,
+            "{}",
+            cell.stdout.len()
+        );
+        assert!(
+            cell.stderr.len() <= MAX_STREAM_BYTES,
+            "{}",
+            cell.stderr.len()
+        );
         // The aggregate stays inside the frame budget.
         assert!(
             cell.stdout.len() + cell.stderr.len() <= MAX_AGGREGATE_STREAM_BYTES,
@@ -1531,11 +1652,15 @@ done
         // P1b: writes straight to fd 1/2 (os.write, sys.__stdout__.buffer)
         // bypass the driver's Python-level redirection entirely. They must
         // be captured per cell and never desync the framed protocol.
-        if !python3_available() {
+        let cwd = tmpdir().to_string_lossy().into_owned();
+        let fixture = test_generation(Path::new(&cwd)).await;
+        if !python_available(&fixture) {
             return;
         }
-        let cwd = tmpdir().to_string_lossy().into_owned();
-        let mut kernel = PythonKernel::spawn(&cwd).await.expect("kernel spawns");
+        let generation = fixture.generation.clone();
+        let mut kernel = PythonKernel::spawn(generation, &cwd)
+            .await
+            .expect("kernel spawns");
         let cell = kernel
             .eval(
                 "import os\nos.write(1, b'raw-fd-out')\nos.write(2, b'raw-fd-err')\n40 + 2",
@@ -1573,11 +1698,15 @@ done
         // P1b: a subprocess inherits fds 1/2, so its output lands in the
         // capture pipes (it never touches the driver's StringIO capture).
         // It must be attributed to the cell and leave the protocol intact.
-        if !python3_available() {
+        let cwd = tmpdir().to_string_lossy().into_owned();
+        let fixture = test_generation(Path::new(&cwd)).await;
+        if !python_available(&fixture) {
             return;
         }
-        let cwd = tmpdir().to_string_lossy().into_owned();
-        let mut kernel = PythonKernel::spawn(&cwd).await.expect("kernel spawns");
+        let generation = fixture.generation.clone();
+        let mut kernel = PythonKernel::spawn(generation, &cwd)
+            .await
+            .expect("kernel spawns");
         let cell = kernel
             .eval(
                 "import subprocess\nsubprocess.run(['python3', '-c', 'print(\"sub-out\")'], check=True)",
@@ -1596,7 +1725,11 @@ done
             )
             .await
             .expect("chatty subprocess cell");
-        assert!(cell.stdout.len() <= MAX_STREAM_BYTES, "{}", cell.stdout.len());
+        assert!(
+            cell.stdout.len() <= MAX_STREAM_BYTES,
+            "{}",
+            cell.stdout.len()
+        );
         // The kernel survives.
         let next = kernel
             .eval("1 + 1", Duration::from_secs(10), &AbortSignal::none())
@@ -1659,7 +1792,11 @@ done
     async fn js_kernel_classifies_syntax_and_runtime_errors() {
         let mut kernel = JsKernel::spawn().expect("js kernel spawns");
         let syntax = kernel
-            .eval("function broken(", Duration::from_secs(5), &AbortSignal::none())
+            .eval(
+                "function broken(",
+                Duration::from_secs(5),
+                &AbortSignal::none(),
+            )
             .await
             .expect("syntax cell");
         assert_eq!(
@@ -1669,7 +1806,11 @@ done
             syntax.error
         );
         let runtime = kernel
-            .eval("undefined.foo.bar", Duration::from_secs(5), &AbortSignal::none())
+            .eval(
+                "undefined.foo.bar",
+                Duration::from_secs(5),
+                &AbortSignal::none(),
+            )
             .await
             .expect("runtime cell");
         assert_eq!(
@@ -1691,7 +1832,11 @@ done
     async fn js_kernel_timeout_kills_and_next_call_respawns() {
         let mut kernel = JsKernel::spawn().expect("js kernel spawns");
         let timed_out = kernel
-            .eval("while (true) {}", Duration::from_secs(1), &AbortSignal::none())
+            .eval(
+                "while (true) {}",
+                Duration::from_secs(1),
+                &AbortSignal::none(),
+            )
             .await
             .expect("timeout is a classified result");
         assert_eq!(
@@ -1702,7 +1847,11 @@ done
         );
         // The message must match the real semantics: the kernel IS killed on
         // timeout (channel closed, thread exits) and the next call respawns.
-        let notice = timed_out.error.as_ref().map(|e| e.text.as_str()).unwrap_or("");
+        let notice = timed_out
+            .error
+            .as_ref()
+            .map(|e| e.text.as_str())
+            .unwrap_or("");
         assert!(
             notice.contains("killed") && notice.contains("respawn"),
             "timeout notice must describe the kill+respawn contract, got: {notice}"
@@ -1736,7 +1885,11 @@ done
             )
             .await
             .expect("cell");
-        assert!(cell.stdout.len() <= MAX_STREAM_BYTES, "{}", cell.stdout.len());
+        assert!(
+            cell.stdout.len() <= MAX_STREAM_BYTES,
+            "{}",
+            cell.stdout.len()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1745,15 +1898,19 @@ done
 
     #[tokio::test]
     async fn eval_tool_cross_cell_state_end_to_end() {
-        if !python3_available() {
+        let cwd = tmpdir();
+        let (fixture, tool) = captured_eval_tool(&cwd).await;
+        if !python_available(&fixture) {
             return;
         }
-        let cwd = tmpdir();
-        let tool = crate::tools::create_tool("eval", &cwd.to_string_lossy()).expect("eval tool");
         let first = (tool.execute)(make_ctx(json!({ "language": "python", "code": "x = 10" })))
             .await
             .expect("first call");
-        assert!(text_of(&first).contains("python: ok"), "{}", text_of(&first));
+        assert!(
+            text_of(&first).contains("python: ok"),
+            "{}",
+            text_of(&first)
+        );
         let second = (tool.execute)(make_ctx(json!({ "language": "python", "code": "x + 5" })))
             .await
             .expect("second call");
@@ -1761,9 +1918,11 @@ done
         assert!(text.contains("python: ok"), "{text}");
         assert!(text.contains("result: 15"), "{text}");
 
-        let js = (tool.execute)(make_ctx(json!({ "language": "js", "code": "let n = 3; n * n" })))
-            .await
-            .expect("js call");
+        let js = (tool.execute)(make_ctx(
+            json!({ "language": "js", "code": "let n = 3; n * n" }),
+        ))
+        .await
+        .expect("js call");
         let text = text_of(&js);
         assert!(text.contains("js: ok"), "{text}");
         assert!(text.contains("result: 9"), "{text}");
@@ -1772,7 +1931,7 @@ done
     #[tokio::test]
     async fn eval_tool_classifies_errors_and_redacts() {
         let cwd = tmpdir();
-        let tool = crate::tools::create_tool("eval", &cwd.to_string_lossy()).expect("eval tool");
+        let (fixture, tool) = captured_eval_tool(&cwd).await;
         let syntax = (tool.execute)(make_ctx(json!({ "language": "js", "code": "if (" })))
             .await
             .expect("syntax call");
@@ -1780,7 +1939,7 @@ done
         assert!(text.contains("js: syntax error"), "{text}");
         assert!(text.contains("error:"), "{text}");
 
-        if python3_available() {
+        if python_available(&fixture) {
             let runtime = (tool.execute)(make_ctx(json!({ "language": "python", "code": "1/0" })))
                 .await
                 .expect("runtime call");
@@ -1792,11 +1951,11 @@ done
 
     #[tokio::test]
     async fn eval_tool_timeout_argument_is_honored() {
-        if !python3_available() {
+        let cwd = tmpdir();
+        let (fixture, tool) = captured_eval_tool(&cwd).await;
+        if !python_available(&fixture) {
             return;
         }
-        let cwd = tmpdir();
-        let tool = crate::tools::create_tool("eval", &cwd.to_string_lossy()).expect("eval tool");
         let timed_out = (tool.execute)(make_ctx(json!({
             "language": "python",
             "code": "import time; time.sleep(30)",
@@ -1814,21 +1973,24 @@ done
     }
 
     #[tokio::test]
-    async fn eval_tool_missing_python_is_actionable() {
+    async fn eval_tool_missing_generation_fails_closed() {
         let cwd = tmpdir();
-        let tool = eval_tool_with_python(&cwd.to_string_lossy(), Some("python3-definitely-missing"));
+        let capture: GenerationCaptureFn =
+            Arc::new(|| bail!("eval requires an application generation"));
+        let tool = eval_tool_with_python(&cwd.to_string_lossy(), None, capture);
         let error = (tool.execute)(make_ctx(json!({ "language": "python", "code": "1 + 1" })))
             .await
-            .expect_err("missing python must fail");
-        let text = format!("{error:#}");
-        assert!(text.contains("python3"), "{text}");
-        assert!(text.contains("install Python 3"), "{text}");
+            .expect_err("missing generation must fail before spawning python");
+        assert!(
+            error.to_string().contains("application generation"),
+            "{error:#}"
+        );
     }
 
     #[tokio::test]
     async fn eval_tool_rejects_unknown_language_and_empty_code() {
         let cwd = tmpdir();
-        let tool = crate::tools::create_tool("eval", &cwd.to_string_lossy()).expect("eval tool");
+        let (_fixture, tool) = captured_eval_tool(&cwd).await;
         let unknown = (tool.execute)(make_ctx(json!({ "language": "ruby", "code": "puts 1" })))
             .await
             .expect_err("unknown language");
@@ -1844,11 +2006,15 @@ done
 
     #[tokio::test]
     async fn python_kernel_unicode_repr_and_stdout_round_trip() {
-        if !python3_available() {
+        let cwd = tmpdir().to_string_lossy().into_owned();
+        let fixture = test_generation(Path::new(&cwd)).await;
+        if !python_available(&fixture) {
             return;
         }
-        let cwd = tmpdir().to_string_lossy().into_owned();
-        let mut kernel = PythonKernel::spawn(&cwd).await.expect("kernel spawns");
+        let generation = fixture.generation.clone();
+        let mut kernel = PythonKernel::spawn(generation, &cwd)
+            .await
+            .expect("kernel spawns");
         // A multi-line cell mixing an assignment, a unicode print, and a
         // final expression whose repr contains non-ASCII (emoji + accents).
         let cell = kernel
@@ -1866,11 +2032,15 @@ done
 
     #[tokio::test]
     async fn python_kernel_repr_of_various_types() {
-        if !python3_available() {
+        let cwd = tmpdir().to_string_lossy().into_owned();
+        let fixture = test_generation(Path::new(&cwd)).await;
+        if !python_available(&fixture) {
             return;
         }
-        let cwd = tmpdir().to_string_lossy().into_owned();
-        let mut kernel = PythonKernel::spawn(&cwd).await.expect("kernel spawns");
+        let generation = fixture.generation.clone();
+        let mut kernel = PythonKernel::spawn(generation, &cwd)
+            .await
+            .expect("kernel spawns");
         let cell = kernel
             .eval("[1, 2, 3]", Duration::from_secs(10), &AbortSignal::none())
             .await
@@ -1916,7 +2086,11 @@ done
             .await
             .expect("const cell");
         let _ = kernel
-            .eval("function double(x) { return x * 2; }", Duration::from_secs(5), &AbortSignal::none())
+            .eval(
+                "function double(x) { return x * 2; }",
+                Duration::from_secs(5),
+                &AbortSignal::none(),
+            )
             .await
             .expect("function cell");
         let read = kernel
@@ -1969,7 +2143,11 @@ done
         // A thrown non-Error value (a string) is caught and classified as
         // Runtime (the non-Error path of exception_parts, lines 788-791).
         let cell = kernel
-            .eval("throw \"boom\"", Duration::from_secs(5), &AbortSignal::none())
+            .eval(
+                "throw \"boom\"",
+                Duration::from_secs(5),
+                &AbortSignal::none(),
+            )
             .await
             .expect("throw cell");
         let error = cell.error.expect("throw classified");
@@ -2004,10 +2182,7 @@ done
 
     #[test]
     fn cell_timeout_defaults_to_thirty_seconds() {
-        assert_eq!(
-            cell_timeout(&json!({})).unwrap(),
-            Duration::from_secs(30)
-        );
+        assert_eq!(cell_timeout(&json!({})).unwrap(), Duration::from_secs(30));
     }
 
     #[test]
@@ -2036,16 +2211,23 @@ done
     #[test]
     fn classify_python_error_maps_syntax_families() {
         assert_eq!(classify_python_error("SyntaxError"), EvalErrorKind::Syntax);
-        assert_eq!(classify_python_error("IndentationError"), EvalErrorKind::Syntax);
+        assert_eq!(
+            classify_python_error("IndentationError"),
+            EvalErrorKind::Syntax
+        );
         assert_eq!(classify_python_error("TabError"), EvalErrorKind::Syntax);
         // Anything else is a runtime error.
-        assert_eq!(classify_python_error("ZeroDivisionError"), EvalErrorKind::Runtime);
+        assert_eq!(
+            classify_python_error("ZeroDivisionError"),
+            EvalErrorKind::Runtime
+        );
         assert_eq!(classify_python_error(""), EvalErrorKind::Runtime);
     }
 
     #[test]
     fn parse_cell_result_decodes_full_frame() {
-        let frame = br#"{"stdout":"out","stderr":"err","error":null,"error_type":null,"result":"42"}"#;
+        let frame =
+            br#"{"stdout":"out","stderr":"err","error":null,"error_type":null,"result":"42"}"#;
         let cell = parse_cell_result(frame).expect("frame parses");
         assert_eq!(cell.stdout, "out");
         assert_eq!(cell.stderr, "err");
@@ -2074,14 +2256,20 @@ done
             stdout: String::new(),
             stderr: String::new(),
             result: None,
-            error: Some(CellError { kind: EvalErrorKind::Timeout, text: "t".into() }),
+            error: Some(CellError {
+                kind: EvalErrorKind::Timeout,
+                text: "t".into(),
+            }),
         };
         assert!(timeout.is_timeout());
         let runtime = CellResult {
             stdout: String::new(),
             stderr: String::new(),
             result: None,
-            error: Some(CellError { kind: EvalErrorKind::Runtime, text: "r".into() }),
+            error: Some(CellError {
+                kind: EvalErrorKind::Runtime,
+                text: "r".into(),
+            }),
         };
         assert!(!runtime.is_timeout());
         let clean = CellResult {

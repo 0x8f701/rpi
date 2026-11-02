@@ -5,11 +5,98 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
+use pi_ai::providers::{FauxProviderOptions, FauxProviderRegistration, register_faux_provider};
+use pi_ai::Model;
 use pi_coding::{
-    ProcessEvent, ProcessKey, ProcessManager, ProcessManagerConfig, ProcessOwnerId, ProcessSignal,
-    ProcessSpawnSpec, ProcessState, ProcessTerminalSize,
+    Application, ProcessEvent, ProcessKey, ProcessManager, ProcessManagerConfig, ProcessOwnerId,
+    ProcessSignal, ProcessSpawnSpec, ProcessState, ProcessTerminalSize, ResourceDiscovery,
+    ResourceManager, ResourceManagerOptions, Session, SessionOptions, ToolSelection,
 };
 
+struct BoundProcess {
+    manager: ProcessManager,
+    owner: ProcessOwnerId,
+    cwd: tempfile::TempDir,
+    _application: Application,
+    _agent: tempfile::TempDir,
+    _registration: FauxProviderRegistration,
+}
+async fn bound_process(config: Option<ProcessManagerConfig>) -> BoundProcess {
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let suffix = uuid::Uuid::now_v7().to_string();
+    let api = format!("process-manager-api-{suffix}");
+    let provider = format!("process-manager-provider-{suffix}");
+    let model = Model {
+        id: "process-manager-model".to_owned(),
+        name: "Process Manager Model".to_owned(),
+        api: api.clone(),
+        provider: provider.clone(),
+        ..Model::default()
+    };
+    let registration = register_faux_provider(FauxProviderOptions {
+        api,
+        provider,
+        models: vec![model.clone()],
+        chunk_size: 1,
+    });
+    let agent = tempfile::tempdir().expect("agent dir");
+    let session_dir = agent.path().join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    std::fs::write(
+        agent.path().join("settings.json"),
+        r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+    )
+    .expect("danger settings");
+    let mut resource_options = ResourceManagerOptions::new(cwd.path());
+    resource_options.agent_dir = agent.path().to_path_buf();
+    resource_options.disable_extensions = true;
+    resource_options.disable_skills = true;
+    resource_options.disable_prompt_templates = true;
+    resource_options.disable_themes = true;
+    resource_options.disable_context_files = true;
+    let resources = ResourceManager::new(resource_options).expect("resources");
+    let session = Session::new_with_additional_tools_filtered_and_discovery(
+        SessionOptions {
+            model,
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: pi_agent::ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: None,
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+            auth_manager: None,
+        },
+        Vec::new(),
+        ToolSelection::default(),
+        ResourceDiscovery::Disabled,
+    )
+    .expect("session");
+    session.set_session_dir(session_dir);
+    session.start_new_recording().expect("session recording");
+    session
+        .attach_resources(resources)
+        .await
+        .expect("attach resources");
+    let application = Application::new(session).await;
+    let manager = application.process_manager();
+    if let Some(config) = config {
+        manager.replace_config(config).expect("replace process config");
+    }
+    let owner = application.session().process_owner_id();
+    BoundProcess {
+        manager,
+        owner,
+        cwd,
+        _application: application,
+        _agent: agent,
+        _registration: registration,
+    }
+}
 fn spec(cwd: &Path, script: &str) -> ProcessSpawnSpec {
     ProcessSpawnSpec {
         argv: vec!["/bin/sh".to_owned(), "-c".to_owned(), script.to_owned()],
@@ -40,26 +127,27 @@ async fn all_output(
 
 #[tokio::test]
 async fn output_cursor_truncation_and_serialized_events() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    let manager = ProcessManager::with_config(ProcessManagerConfig {
+    let bound = bound_process(Some(ProcessManagerConfig {
         max_output_bytes: 5,
         idle_timeout: None,
         ..ProcessManagerConfig::default()
-    });
-    let owner = ProcessOwnerId::new("owner-a");
+    }))
+    .await;
+    let manager = &bound.manager;
+    let owner = &bound.owner;
     let mut events = manager.subscribe();
     let info = manager
-        .spawn(owner.clone(), spec(directory.path(), "printf 123456789"))
+        .spawn(owner.clone(), spec(bound.cwd.path(), "printf 123456789"))
         .await
         .expect("spawn");
     let exited = manager
-        .wait(&owner, &info.id, Some(Duration::from_secs(3)))
+        .wait(owner, &info.id, Some(Duration::from_secs(3)))
         .await
         .expect("wait");
     assert_eq!(exited.output_start_cursor, 4);
     assert_eq!(exited.output_cursor, 9);
     let logs = manager
-        .logs(&owner, &info.id, 0, Some(64), false, None)
+        .logs(owner, &info.id, 0, Some(64), false, None)
         .await
         .expect("logs");
     assert!(logs.lost);
@@ -111,33 +199,41 @@ async fn output_cursor_truncation_and_serialized_events() {
 
 #[tokio::test]
 async fn merged_pipe_preserves_stdout_stderr_order() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    let manager = ProcessManager::new();
-    let owner = ProcessOwnerId::new("owner");
+    let bound = bound_process(Some(ProcessManagerConfig {
+        idle_timeout: None,
+        ..ProcessManagerConfig::default()
+    }))
+    .await;
+    let manager = &bound.manager;
+    let owner = &bound.owner;
     let info = manager
         .spawn(
             owner.clone(),
-            spec(directory.path(), "printf A; printf B >&2; printf C"),
+            spec(bound.cwd.path(), "printf A; printf B >&2; printf C"),
         )
         .await
         .expect("spawn");
     manager
-        .wait(&owner, &info.id, Some(Duration::from_secs(3)))
+        .wait(owner, &info.id, Some(Duration::from_secs(3)))
         .await
         .expect("wait");
-    assert_eq!(all_output(&manager, &owner, &info.id).await, b"ABC");
+    assert_eq!(all_output(manager, owner, &info.id).await, b"ABC");
 }
 
 #[tokio::test]
 async fn pipe_input_exit_and_owner_isolation() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    let manager = ProcessManager::new();
-    let owner = ProcessOwnerId::new("owner");
+    let bound = bound_process(Some(ProcessManagerConfig {
+        idle_timeout: None,
+        ..ProcessManagerConfig::default()
+    }))
+    .await;
+    let manager = &bound.manager;
+    let owner = &bound.owner;
     let other = ProcessOwnerId::new("other");
     let info = manager
         .spawn(
             owner.clone(),
-            spec(directory.path(), "read line; printf '<%s>' \"$line\""),
+            spec(bound.cwd.path(), "read line; printf '<%s>' \"$line\""),
         )
         .await
         .expect("spawn");
@@ -149,59 +245,97 @@ async fn pipe_input_exit_and_owner_isolation() {
             .is_err()
     );
     manager
-        .write(&owner, &info.id, b"hello\n".to_vec(), true)
+        .write(owner, &info.id, b"hello\n".to_vec(), true)
         .await
         .expect("write");
     let exited = manager
-        .wait(&owner, &info.id, Some(Duration::from_secs(3)))
+        .wait(owner, &info.id, Some(Duration::from_secs(3)))
         .await
         .expect("wait");
     assert_eq!(exited.exit_code, Some(0));
-    assert_eq!(all_output(&manager, &owner, &info.id).await, b"<hello>");
+    assert_eq!(all_output(manager, owner, &info.id).await, b"<hello>");
 }
 
 #[tokio::test]
 async fn pty_input_resize_and_signal() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    let manager = ProcessManager::new();
-    let owner = ProcessOwnerId::new("pty-owner");
-    let mut pty_spec = spec(directory.path(), "trap 'printf INTERRUPTED; exit 0' INT; stty size; read line; printf '<%s>' \"$line\"; while :; do sleep 1; done");
+    let bound = bound_process(Some(ProcessManagerConfig {
+        idle_timeout: None,
+        ..ProcessManagerConfig::default()
+    }))
+    .await;
+    let manager = &bound.manager;
+    let owner = &bound.owner;
+    let mut pty_spec = spec(
+        bound.cwd.path(),
+        "trap 'printf INTERRUPTED; exit 0' INT; stty size; read line; printf '<%s>' \"$line\"; while :; do sleep 1; done",
+    );
     pty_spec.tty = true;
     pty_spec.terminal_size = Some(ProcessTerminalSize { rows: 24, cols: 80 });
-    let info = manager.spawn(owner.clone(), pty_spec).await.expect("spawn PTY");
+    let info = manager
+        .spawn(owner.clone(), pty_spec)
+        .await
+        .expect("spawn PTY");
     manager
-        .resize(&owner, &info.id, ProcessTerminalSize { rows: 40, cols: 120 })
+        .resize(
+            owner,
+            &info.id,
+            ProcessTerminalSize {
+                rows: 40,
+                cols: 120,
+            },
+        )
         .expect("resize PTY");
     manager
-        .write(&owner, &info.id, b"hello".to_vec(), false)
+        .write(owner, &info.id, b"hello".to_vec(), false)
         .await
         .expect("write PTY");
     manager
-        .send_keys(&owner, &info.id, &[ProcessKey::Enter])
+        .send_keys(owner, &info.id, &[ProcessKey::Enter])
         .await
         .expect("send key");
     let mut cursor = 0;
     let mut output = Vec::new();
     for _ in 0..20 {
         let logs = manager
-            .logs(&owner, &info.id, cursor, None, true, Some(Duration::from_millis(100)))
+            .logs(
+                owner,
+                &info.id,
+                cursor,
+                None,
+                true,
+                Some(Duration::from_millis(100)),
+            )
             .await
             .expect("PTY logs");
         cursor = logs.cursor;
-        output.extend(logs.chunks.iter().flat_map(pi_coding::ProcessLogChunk::bytes));
-        if output.windows(b"<hello>".len()).any(|window| window == b"<hello>") {
+        output.extend(
+            logs.chunks
+                .iter()
+                .flat_map(pi_coding::ProcessLogChunk::bytes),
+        );
+        if output
+            .windows(b"<hello>".len())
+            .any(|window| window == b"<hello>")
+        {
             break;
         }
     }
-    assert!(output.windows(b"<hello>".len()).any(|window| window == b"<hello>"));
+    assert!(
+        output
+            .windows(b"<hello>".len())
+            .any(|window| window == b"<hello>")
+    );
     manager
-        .send_keys(&owner, &info.id, &[ProcessKey::CtrlC])
+        .send_keys(owner, &info.id, &[ProcessKey::CtrlC])
         .await
         .expect("send Ctrl-C");
-    let exited = manager.wait(&owner, &info.id, Some(Duration::from_secs(3))).await.expect("wait PTY");
+    let exited = manager
+        .wait(owner, &info.id, Some(Duration::from_secs(3)))
+        .await
+        .expect("wait PTY");
     assert!(exited.state.is_terminal());
     assert!(
-        all_output(&manager, &owner, &info.id)
+        all_output(manager, owner, &info.id)
             .await
             .windows(b"INTERRUPTED".len())
             .any(|window| window == b"INTERRUPTED")
@@ -210,20 +344,22 @@ async fn pty_input_resize_and_signal() {
 
 #[tokio::test]
 async fn concurrent_spawns_cannot_exceed_cap() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    let manager = ProcessManager::with_config(ProcessManagerConfig {
+    let bound = bound_process(Some(ProcessManagerConfig {
         max_processes: 1,
         idle_timeout: None,
         ..ProcessManagerConfig::default()
-    });
-    let owner = ProcessOwnerId::new("cap-owner");
+    }))
+    .await;
+    let manager = bound.manager.clone();
+    let owner = bound.owner.clone();
+    let cwd = bound.cwd.path().to_path_buf();
     let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
     let mut attempts = Vec::new();
     for _ in 0..2 {
         let manager = manager.clone();
         let owner = owner.clone();
         let barrier = barrier.clone();
-        let cwd = directory.path().to_path_buf();
+        let cwd = cwd.clone();
         attempts.push(tokio::spawn(async move {
             barrier.wait().await;
             manager.spawn(owner, spec(&cwd, "sleep 30")).await
@@ -234,21 +370,26 @@ async fn concurrent_spawns_cannot_exceed_cap() {
     let second = attempts.remove(0).await.expect("second join");
     assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
     let running = first.ok().or_else(|| second.ok()).expect("one process");
-    manager.signal(&owner, &running.id, ProcessSignal::Sigkill).expect("cleanup");
-    manager.wait(&owner, &running.id, Some(Duration::from_secs(3))).await.expect("wait cleanup");
+    manager
+        .signal(&owner, &running.id, ProcessSignal::Sigkill)
+        .expect("cleanup");
+    manager
+        .wait(&owner, &running.id, Some(Duration::from_secs(3)))
+        .await
+        .expect("wait cleanup");
     let replacement = manager
-        .spawn(owner.clone(), spec(directory.path(), "exit 0"))
+        .spawn(owner.clone(), spec(&cwd, "exit 0"))
         .await
         .expect("cap slot released");
     manager
         .wait(&owner, &replacement.id, Some(Duration::from_secs(3)))
         .await
         .expect("replacement exit");
-    let mut invalid = spec(directory.path(), "exit 0");
+    let mut invalid = spec(&cwd, "exit 0");
     invalid.argv = vec!["/definitely/missing/pi-process-test".to_owned()];
     assert!(manager.spawn(owner.clone(), invalid).await.is_err());
     let after_failure = manager
-        .spawn(owner.clone(), spec(directory.path(), "exit 0"))
+        .spawn(owner.clone(), spec(&cwd, "exit 0"))
         .await
         .expect("failed spawn reservation released");
     manager
@@ -259,40 +400,41 @@ async fn concurrent_spawns_cannot_exceed_cap() {
 
 #[tokio::test]
 async fn signal_timeout_and_cap_refusal() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    let manager = ProcessManager::with_config(ProcessManagerConfig {
+    let bound = bound_process(Some(ProcessManagerConfig {
         max_processes: 1,
         idle_timeout: None,
         ..ProcessManagerConfig::default()
-    });
-    let owner = ProcessOwnerId::new("owner");
+    }))
+    .await;
+    let manager = &bound.manager;
+    let owner = &bound.owner;
     let first = manager
-        .spawn(owner.clone(), spec(directory.path(), "sleep 30"))
+        .spawn(owner.clone(), spec(bound.cwd.path(), "sleep 30"))
         .await
         .expect("spawn first");
     assert!(
         manager
-            .spawn(owner.clone(), spec(directory.path(), "sleep 30"))
+            .spawn(owner.clone(), spec(bound.cwd.path(), "sleep 30"))
             .await
             .is_err()
     );
     manager
-        .signal(&owner, &first.id, ProcessSignal::Sigint)
+        .signal(owner, &first.id, ProcessSignal::Sigint)
         .expect("signal");
     let signalled = manager
-        .wait(&owner, &first.id, Some(Duration::from_secs(3)))
+        .wait(owner, &first.id, Some(Duration::from_secs(3)))
         .await
         .expect("wait signal");
     assert_eq!(signalled.exit_code, Some(130));
 
-    let mut timed_spec = spec(directory.path(), "sleep 30");
+    let mut timed_spec = spec(bound.cwd.path(), "sleep 30");
     timed_spec.timeout_ms = Some(50);
     let timed = manager
         .spawn(owner.clone(), timed_spec)
         .await
         .expect("spawn timed");
     let timed = manager
-        .wait(&owner, &timed.id, Some(Duration::from_secs(3)))
+        .wait(owner, &timed.id, Some(Duration::from_secs(3)))
         .await
         .expect("wait timed");
     assert_eq!(timed.state, ProcessState::TimedOut);
@@ -301,22 +443,23 @@ async fn signal_timeout_and_cap_refusal() {
 
 #[tokio::test]
 async fn idle_expiry_and_process_group_cleanup() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    let pid_file = directory.path().join("grandchild.pid");
-    let manager = ProcessManager::with_config(ProcessManagerConfig {
+    let bound = bound_process(Some(ProcessManagerConfig {
         idle_timeout: Some(Duration::from_millis(50)),
         idle_scan_interval: Duration::from_millis(10),
         terminate_grace: Duration::from_millis(20),
         ..ProcessManagerConfig::default()
-    });
-    let owner = ProcessOwnerId::new("owner");
+    }))
+    .await;
+    let pid_file = bound.cwd.path().join("grandchild.pid");
+    let manager = &bound.manager;
+    let owner = &bound.owner;
     let script = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
     let info = manager
-        .spawn(owner.clone(), spec(directory.path(), &script))
+        .spawn(owner.clone(), spec(bound.cwd.path(), &script))
         .await
         .expect("spawn");
     let result = manager
-        .wait(&owner, &info.id, Some(Duration::from_secs(3)))
+        .wait(owner, &info.id, Some(Duration::from_secs(3)))
         .await
         .expect("wait expiry");
     assert_eq!(result.state, ProcessState::Expired);
@@ -331,35 +474,32 @@ async fn idle_expiry_and_process_group_cleanup() {
 
 #[tokio::test]
 async fn dropping_last_manager_kills_process_group() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    let pid_file = directory.path().join("root.pid");
-    let pid = {
-        let manager = ProcessManager::with_config(ProcessManagerConfig {
-            idle_timeout: None,
-            ..ProcessManagerConfig::default()
-        });
-        let owner = ProcessOwnerId::new("owner");
-        let script = format!("echo $$ > '{}'; exec sleep 30", pid_file.display());
-        manager
-            .spawn(owner, spec(directory.path(), &script))
-            .await
-            .expect("spawn");
-        let pid_deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            if let Ok(text) = std::fs::read_to_string(&pid_file) {
-                // The shell truncates the pid file before `echo` writes it;
-                // an empty read must retry instead of failing the parse.
-                let pid = text.trim();
-                if !pid.is_empty() {
-                    break pid.parse::<i32>().expect("pid");
-                }
+    let bound = bound_process(Some(ProcessManagerConfig {
+        idle_timeout: None,
+        ..ProcessManagerConfig::default()
+    }))
+    .await;
+    let pid_file = bound.cwd.path().join("root.pid");
+    let script = format!("echo $$ > '{}'; exec sleep 30", pid_file.display());
+    bound
+        .manager
+        .spawn(bound.owner.clone(), spec(bound.cwd.path(), &script))
+        .await
+        .expect("spawn");
+    let pid_deadline = Instant::now() + Duration::from_secs(3);
+    let pid = loop {
+        if let Ok(text) = std::fs::read_to_string(&pid_file) {
+            let pid = text.trim();
+            if !pid.is_empty() {
+                break pid.parse::<i32>().expect("pid");
             }
-            if Instant::now() > pid_deadline {
-                panic!("spawned shell never wrote a pid to {}", pid_file.display());
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        if Instant::now() > pid_deadline {
+            panic!("spawned shell never wrote a pid to {}", pid_file.display());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     };
+    drop(bound);
     for _ in 0..100 {
         if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
             return;
@@ -371,38 +511,42 @@ async fn dropping_last_manager_kills_process_group() {
 
 #[tokio::test]
 async fn task_abort_keeps_supervised_process_listed_and_alive_then_explicit_stop_cleans_up() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    let manager = ProcessManager::with_config(ProcessManagerConfig {
+    let bound = bound_process(Some(ProcessManagerConfig {
         idle_timeout: None,
         ..ProcessManagerConfig::default()
-    });
-    let owner = ProcessOwnerId::new("task-abort-owner");
+    }))
+    .await;
+    let manager = &bound.manager;
+    let owner = &bound.owner;
     let info = manager
-        .spawn(owner.clone(), spec(directory.path(), "sleep 30"))
+        .spawn(owner.clone(), spec(bound.cwd.path(), "sleep 30"))
         .await
         .expect("spawn supervised process");
 
-    // A task interrupt is external to the manager: `Application::abort` cancels
-    // the active turn by firing the AbortSignal the agent's in-flight tool
-    // calls observe (`agent.abort`). The ProcessManager must be oblivious to it
-    // — no unlist, no signal, no drop.
     let (controller, _abort) = pi_agent::AbortController::new();
     controller.abort();
 
-    let listed = manager.list(&owner);
-    assert_eq!(listed.len(), 1, "task interrupt must keep the process listed");
+    let listed = manager.list(owner);
+    assert_eq!(
+        listed.len(),
+        1,
+        "task interrupt must keep the process listed"
+    );
     assert_eq!(listed[0].id, info.id);
     assert_eq!(listed[0].state, ProcessState::Running);
     let pid = listed[0].pid.expect("managed pid") as i32;
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
         .expect("supervised process must stay alive across a task interrupt");
 
-    // Only an explicit /ps stop terminates it.
     let stopped = manager
-        .stop(&owner, &info.id, Some(Duration::from_secs(3)))
+        .stop(owner, &info.id, Some(Duration::from_secs(3)))
         .await
         .expect("explicit stop");
     assert!(stopped.state.is_terminal());
+    assert!(
+        manager.list(owner).iter().all(|row| row.id != info.id),
+        "explicit stop must drop the process from the live registry"
+    );
     for _ in 0..100 {
         if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
             return;
@@ -410,6 +554,50 @@ async fn task_abort_keeps_supervised_process_listed_and_alive_then_explicit_stop
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("supervised process survived an explicit stop");
+}
+
+#[tokio::test]
+async fn wait_after_explicit_stop_returns_the_terminal_snapshot() {
+    let bound = bound_process(None).await;
+    let info = bound
+        .manager
+        .spawn(bound.owner.clone(), spec(bound.cwd.path(), "sleep 30"))
+        .await
+        .expect("spawn");
+    let stopped = bound
+        .manager
+        .stop(&bound.owner, &info.id, Some(Duration::from_secs(3)))
+        .await
+        .expect("stop");
+    assert!(stopped.state.is_terminal());
+    assert!(
+        bound
+            .manager
+            .list(&bound.owner)
+            .iter()
+            .all(|row| row.id != info.id),
+        "stop still drops the live row"
+    );
+    let waited = bound
+        .manager
+        .wait(&bound.owner, &info.id, Some(Duration::from_secs(1)))
+        .await
+        .expect("wait after stop");
+    assert_eq!(waited.id, info.id);
+    assert!(waited.state.is_terminal());
+    let stranger = bound
+        .manager
+        .wait(
+            &ProcessOwnerId::new("other-owner"),
+            &info.id,
+            Some(Duration::from_secs(1)),
+        )
+        .await
+        .expect_err("another owner must not read the settled snapshot");
+    assert!(
+        stranger.to_string().contains("process not found"),
+        "{stranger}"
+    );
 }
 
 #[test]

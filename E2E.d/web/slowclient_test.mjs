@@ -10,6 +10,12 @@
 // Mock scenario: `slowclient` (E2E.d/lib/user_mock_server.py) —
 //   slowclient-burst-<N>-<bytes>          N text deltas, back-to-back
 //   slowclient-burstslow-<N>-<bytes>-<d>  N text deltas at <d>s cadence
+//   slowclient-burstslow-<N>-<bytes>-<d>-<salt>  same, with a per-request
+//                                         salt scoping the chunk prefix
+//                                         (s<N>:<salt>:) and done marker
+//                                         (slowclient-done-<N>-<salt>) so
+//                                         repeated same-size floods stay
+//                                         distinguishable in one transcript
 //   slowclient-heavy-<count>              one heavy final message (KaTeX +
 //                                         mermaid + table)
 //
@@ -29,6 +35,12 @@
 //        (C4.1/C4.2: turns complete); a SUSTAINED no-read stall (C4.3, >5s
 //        grace) must still surface the real 1008 with the server's reason —
 //        the browser genuinely not reading IS the disconnect cause
+//   C5   streaming Markdown authority: the real listener's text_delta paints
+//        <strong>, a policy-safe <a>, inline code, and a fenced code block
+//        while #send-btn is Stop generating and before the held real
+//        message_end/turn_terminal frames are delivered; releasing those
+//        frames commits the authoritative final, and a real second session
+//        cannot receive or mutate the first session's stream/item
 //   C6   1008/close toast guard: every non-1000 close the app experiences
 //        MUST surface as a "connection closed (code N...)" toast — the
 //        slow-client handling never hides a real close (incl. a genuine
@@ -38,7 +50,6 @@
 //        mislabeled "connection replaced" — after a close no misleading
 //        "send failed: connection replaced"/"command timed out" toast may
 //        appear; the accurate close toast is the surface
-//
 // Evidence: the lane always writes <evidence>/slowclient-metrics.json with
 // per-step wire-receive frames (CDP), JS-handler timestamps/costs, longtask
 // records, close codes/reasons, drain times, and message-order proofs — the
@@ -46,6 +57,7 @@
 
 import { chromium } from 'playwright';
 import fs from 'node:fs';
+import { createFreshSessionViaManage } from './lib/session-lifecycle.mjs';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
@@ -66,6 +78,7 @@ const DOCUMENTED_IDS = [
   'C2.1',
   'C3.1', 'C3.2', 'C3.3',
   'C4.1', 'C4.2', 'C4.3', 'C4.4',
+  'C5.1', 'C5.2', 'C5.3',
   'C6.1',
   'C7.1', 'C7.2',
 ];
@@ -130,24 +143,21 @@ async function waitFor(page, fn, label, timeoutMs = 30000, arg) {
 async function connOn(page, label) {
   await waitFor(
     page,
-    () => document.getElementById('conn-state')?.dataset.state === 'on',
+    () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true,
     label || 'C0.2: WS did not reach connected',
     30000
   );
 }
 
-/** Wait until the turn completes: the marker text is in the DOM AND the
- *  streaming badge hides (message_end/agent_settled committed the final
- *  render). */
+/** Wait until the turn completes: the marker text is in the DOM AND
+ *  #send-btn is not Stop generating (message_end/agent_settled committed
+ *  the final render). */
 async function waitTurnDone(page, marker, label, timeoutMs = 90000) {
   await waitFor(page, (m) => document.body.textContent.includes(m), label, timeoutMs, marker);
   await waitFor(
     page,
-    () => {
-      const badge = document.getElementById('stream-badge');
-      return !badge || badge.hasAttribute('hidden');
-    },
-    `${label}: streaming badge never hid (turn not settled)`,
+    () => document.getElementById('send-btn')?.getAttribute('aria-label') !== 'Stop generating',
+    `${label}: send-btn never left Stop generating (turn not settled)`,
     20000
   );
 }
@@ -255,7 +265,15 @@ async function main() {
     // observer. The app's handlers are preserved verbatim — this only
     // measures around them.
     await page.addInitScript((t) => {
-      window.__slowclient = { messages: [], closes: [], closeToasts: [], longtasks: [], opens: 0 };
+      const heldSockets = new Set();
+      window.__slowclient = {
+        messages: [], closes: [], closeToasts: [], longtasks: [], opens: 0,
+        holdMessageEndMarker: '',
+        heldFrames: 0,
+        releaseHeldFrames() {
+          for (const socket of [...heldSockets]) socket.__scReleaseHeld();
+        },
+      };
       window.localStorage.setItem('rpi-web-token', t);
       const authority = new URL(window.location.href).host;
       window.localStorage.setItem(`rpi-web-token:${encodeURIComponent(authority)}`, t);
@@ -264,6 +282,15 @@ async function main() {
         constructor(...args) {
           super(...args);
           this.__scHandlers = { message: null, close: null, open: null, error: null };
+          this.__scHolding = false;
+          this.__scHeld = [];
+          this.__scReleaseHeld = () => {
+            this.__scHolding = false;
+            heldSockets.delete(this);
+            const frames = this.__scHeld.splice(0);
+            window.__slowclient.heldFrames = Math.max(0, window.__slowclient.heldFrames - frames.length);
+            for (const deliver of frames) deliver();
+          };
           Object.defineProperty(this, 'onmessage', {
             configurable: true,
             get() { return this.__scHandlers.message; },
@@ -285,9 +312,10 @@ async function main() {
             set(fn) { this.__scHandlers.error = fn; },
           });
           super.addEventListener('message', (ev) => {
-            const t0 = performance.now();
-            const h = this.__scHandlers.message;
-            if (h) {
+            const deliver = () => {
+              const t0 = performance.now();
+              const h = this.__scHandlers.message;
+              if (!h) return;
               try {
                 h(ev);
               } finally {
@@ -297,9 +325,33 @@ async function main() {
                   len: String(ev.data).length,
                 });
               }
+            };
+            if (!this.__scHolding && window.__slowclient.holdMessageEndMarker) {
+              try {
+                const frame = JSON.parse(String(ev.data));
+                // User MessageEnd carries the same prompt marker and precedes assistant deltas.
+                if (
+                  frame?.type === 'message_end'
+                  && frame?.message?.role === 'assistant'
+                  && JSON.stringify(frame.message || {}).includes(window.__slowclient.holdMessageEndMarker)
+                ) {
+                  this.__scHolding = true;
+                  heldSockets.add(this);
+                }
+              } catch {
+                /* non-JSON frame: deliver normally */
+              }
             }
+            if (this.__scHolding) {
+              this.__scHeld.push(deliver);
+              window.__slowclient.heldFrames += 1;
+              return;
+            }
+            deliver();
           });
           super.addEventListener('close', (ev) => {
+            heldSockets.delete(this);
+            this.__scHeld.length = 0;
             window.__slowclient.closes.push({
               code: ev.code,
               reason: ev.reason || '',
@@ -371,6 +423,166 @@ async function main() {
     const bootCloseCount = await page.evaluate(() => window.__slowclient.closes.length);
     if (bootCloseCount !== 0) {
       fail(`C0: unexpected close at boot: ${JSON.stringify(await page.evaluate(() => window.__slowclient.closes))}`);
+    }
+
+    /* ---------------- C5: pre-end Markdown + session isolation ----------- */
+    {
+      // Use the real Manage Session -> new_session lifecycle so the streamed
+      // assistant has a different authoritative session from the boot session.
+      const { beforeSessionId: sessionA, sessionId: sessionB } = await createFreshSessionViaManage(
+        page,
+        waitFor,
+        'C5 streaming Markdown session setup',
+      );
+      const marker = `stream-md-${Date.now().toString(36)}`;
+      // The slowclient fixture echoes unmatched prompts as
+      // `slowclient-unrouted: <prompt>`, so this exact prompt is real streamed
+      // Markdown while its unique marker still identifies message_end.
+      const prompt = [
+        `**stream strong ${marker}** and [safe stream link](https://example.com/stream?q=1) with \`inline_stream_code()\`.`,
+        '',
+        '```rust',
+        'fn streamed_fence() -> &\'static str { "safe" }',
+        '```',
+      ].join('\n');
+      const beforeCount = await page.evaluate(() => document.querySelectorAll('.msg--assistant .assistant-text').length);
+      await page.evaluate((m) => { window.__slowclient.holdMessageEndMarker = m; }, marker);
+      await page.fill('#prompt-input', prompt);
+      await page.press('#prompt-input', 'Enter');
+
+      // The real text_delta must have rendered structured Markdown while the
+      // real message_end and later terminal frames are still held at the
+      // instrumented slow-client boundary. No DOM is inserted by the test.
+      try {
+        await page.waitForFunction(
+          ({ sid, mark, before }) => {
+            const btn = document.getElementById('send-btn');
+            if (!btn || btn.getAttribute('aria-label') !== 'Stop generating' || window.__slowclient.heldFrames < 1) return false;
+            const nodes = [...document.querySelectorAll('.assistant-text[data-stream-item-id]')];
+            const live = nodes.find((el) => el.dataset.streamSessionId === sid && (el.textContent || '').includes(mark));
+            if (!live || document.querySelectorAll('.msg--assistant .assistant-text').length <= before) return false;
+            const link = live.querySelector('a');
+            const inline = [...live.querySelectorAll('code.md-code')].find((el) => !el.closest('.md-fence'));
+            const fence = live.querySelector('.md-fence .md-fence__pre code.md-code');
+            return live.querySelector('strong')?.textContent === `stream strong ${mark}`
+              && link?.textContent === 'safe stream link'
+              && link?.getAttribute('href') === 'https://example.com/stream?q=1'
+              && inline?.textContent === 'inline_stream_code()'
+              && (fence?.textContent || '').includes('fn streamed_fence()');
+          },
+          { sid: sessionB, mark: marker, before: beforeCount },
+          { timeout: 30000 },
+        );
+      } catch {
+        const dump = await page.evaluate(() => ({
+          heldFrames: window.__slowclient.heldFrames,
+          aria: document.getElementById('send-btn')?.getAttribute('aria-label') || '',
+          live: [...document.querySelectorAll('.assistant-text[data-stream-item-id]')].map((el) => ({
+            sid: el.dataset.streamSessionId || '',
+            html: (el.innerHTML || '').slice(0, 240),
+          })),
+        }));
+        fail(`C5.1: real pre-message_end streaming Markdown DOM never appeared (timeout 30000ms) dump=${JSON.stringify(dump)}`);
+      }
+      record('C5.1');
+      const streamingIdentity = await page.evaluate((mark) => {
+        const live = [...document.querySelectorAll('.assistant-text[data-stream-item-id]')]
+          .find((el) => (el.textContent || '').includes(mark));
+        return live ? {
+          sessionId: live.dataset.streamSessionId || '',
+          itemId: live.dataset.streamItemId || '',
+          text: live.textContent || '',
+        } : null;
+      }, marker);
+      if (!streamingIdentity || streamingIdentity.sessionId !== sessionB || !streamingIdentity.itemId) {
+        fail(`C5.1: streaming assistant identity missing or cross-session (${JSON.stringify(streamingIdentity)})`);
+      }
+
+      await page.evaluate(() => {
+        window.__slowclient.holdMessageEndMarker = '';
+        window.__slowclient.releaseHeldFrames();
+      });
+      await waitFor(
+        page,
+        (mark) => {
+          const btn = document.getElementById('send-btn');
+          if (btn && btn.getAttribute('aria-label') === 'Stop generating') return false;
+          const final = [...document.querySelectorAll('.msg--assistant .assistant-text')]
+            .find((el) => !el.hasAttribute('data-stream-item-id') && (el.textContent || '').includes(mark));
+          if (!final) return false;
+          const link = final.querySelector('a');
+          const inline = [...final.querySelectorAll('code.md-code')].find((el) => !el.closest('.md-fence'));
+          const fence = final.querySelector('.md-fence .md-fence__pre code.md-code');
+          return final.querySelector('strong')?.textContent === `stream strong ${mark}`
+            && link?.getAttribute('href') === 'https://example.com/stream?q=1'
+            && inline?.textContent === 'inline_stream_code()'
+            && (fence?.textContent || '').includes('fn streamed_fence()');
+        },
+        'C5.2: authoritative final Markdown structure never committed',
+        30000,
+        marker,
+      );
+      const finalB = await page.evaluate((mark) => {
+        const final = [...document.querySelectorAll('.msg--assistant .assistant-text')]
+          .find((el) => (el.textContent || '').includes(mark));
+        return final ? { text: final.textContent || '', html: final.innerHTML } : null;
+      }, marker);
+      if (!finalB || finalB.text !== streamingIdentity.text) {
+        fail('C5.2: authoritative final text did not equal the accumulated streamed text');
+      }
+
+      const switchedToA = await page.evaluate((sid) => {
+        const row = [...document.querySelectorAll('.session-sidebar__switch')].find((el) => el.dataset.sessionId === sid);
+        if (!row) return false;
+        row.click();
+        return true;
+      }, sessionA);
+      if (!switchedToA) fail(`C5.3: boot session row ${sessionA} missing`);
+      await waitFor(
+        page,
+        (sid) => document.querySelector('.session-sidebar__row--active .session-sidebar__switch')?.dataset.sessionId === sid,
+        'C5.3: did not switch to isolation session',
+        30000,
+        sessionA,
+      );
+      const isolationPrompt = 'slowclient-burst-24-16';
+      await promptAndWait(page, isolationPrompt, 'slowclient-done-24', 'C5.3: isolation-session stream never completed', 60000);
+      const leakedIntoA = await page.evaluate(
+        ({ mark, itemId }) => {
+          const active = document.querySelector('#transcript .transcript-surface:not([hidden])');
+          if (!active) return true;
+          return (active.textContent || '').includes(mark)
+            || active.querySelector(`[data-stream-item-id="${CSS.escape(itemId)}"]`) !== null;
+        },
+        { mark: marker, itemId: streamingIdentity.itemId },
+      );
+      if (leakedIntoA) fail('C5.3: session B Markdown/item identity leaked into the visible isolation session');
+
+      const switchedToB = await page.evaluate((sid) => {
+        const row = [...document.querySelectorAll('.session-sidebar__switch')].find((el) => el.dataset.sessionId === sid);
+        if (!row) return false;
+        row.click();
+        return true;
+      }, sessionB);
+      if (!switchedToB) fail(`C5.3: Markdown session row ${sessionB} missing`);
+      await waitFor(
+        page,
+        ({ sid, mark }) => document.querySelector('.session-sidebar__row--active .session-sidebar__switch')?.dataset.sessionId === sid
+          && (document.querySelector('#transcript .transcript-surface:not([hidden])')?.textContent || '').includes(mark),
+        'C5.3: did not restore isolated Markdown session',
+        30000,
+        { sid: sessionB, mark: marker },
+      );
+      const restoredB = await page.evaluate((mark) => {
+        const final = [...document.querySelectorAll('.msg--assistant .assistant-text')]
+          .find((el) => (el.textContent || '').includes(mark));
+        return final ? { text: final.textContent || '', html: final.innerHTML } : null;
+      }, marker);
+      if (!restoredB || restoredB.text !== finalB.text || restoredB.html !== finalB.html) {
+        fail('C5.3: another session stream mutated the authoritative Markdown final');
+      }
+      record('C5.3');
+      metrics.steps['C5-streaming-markdown'] = { sessionA, sessionB, itemId: streamingIdentity.itemId };
     }
 
     /* ---------------- C1: calibration burst ---------------- */
@@ -466,8 +678,7 @@ async function main() {
             markerEl,
             closes: window.__slowclient.closes.map((c) => ({ code: c.code, reason: c.reason })),
             totalMessages: window.__slowclient.messages.length,
-            connState: document.getElementById('conn-state')?.dataset.state,
-            badgeHidden: document.getElementById('stream-badge')?.hasAttribute('hidden'),
+            sendBtnLabel: document.getElementById('send-btn')?.getAttribute('aria-label') ?? null,
           };
         });
         metrics.steps['C3-diagnostic'] = diag;
@@ -521,18 +732,26 @@ async function main() {
         const t0 = Date.now();
         const base = await stepBase(page);
         const closesBefore = await page.evaluate(() => window.__slowclient.closes.length);
-        const prompt = `slowclient-burstslow-${combo.n}-${combo.bytes}-0.0`;
+        // Salt the burstslow prompt per combo: repeated n=8000 combos would
+        // otherwise reuse the `s8000:`/`slowclient-done-8000` transcript text
+        // of the earlier combo, which would satisfy the C4.1 anchor and the
+        // outcome marker instantly — the stall would then overlap the flood
+        // START instead of its middle (a stale-anchor sequencing bug). The
+        // mock scopes the chunk prefix (s<N>:<salt>:) and the done marker
+        // (slowclient-done-<N>-<salt>) to this combo's flood.
+        const salt = `c${combo.n}s${combo.stallMs}`;
+        const prompt = `slowclient-burstslow-${combo.n}-${combo.bytes}-0.0-${salt}`;
         await page.fill('#prompt-input', prompt);
         await page.press('#prompt-input', 'Enter');
         // Start the stall as soon as THIS burst's first delta renders (the
-        // s<N>: prefix is unique per combo, so restored transcript text from
-        // an earlier flood cannot fake the start).
+        // s<N>:<salt>: prefix is unique per combo, so restored transcript text
+        // from an earlier flood cannot fake the start).
         await waitFor(
           page,
           (pfx) => document.body.textContent.includes(`${pfx}0/`),
           'C4.1: flood never started',
           30000,
-          `s${combo.n}:`
+          `s${combo.n}:${salt}:`
         );
         record('C4.1');
         await injectStall(page, combo.stallMs);
@@ -545,9 +764,8 @@ async function main() {
         try {
           const outcome = await page.waitForFunction(
             ({ marker, closes }) => {
-              const badge = document.getElementById('stream-badge');
               const done = document.body.textContent.includes(marker) &&
-                (!badge || badge.hasAttribute('hidden'));
+                document.getElementById('send-btn')?.getAttribute('aria-label') !== 'Stop generating';
               if (window.__slowclient.closes.length > closes) {
                 const c = window.__slowclient.closes.slice(-1)[0];
                 return { done: false, closed: { code: c.code, reason: c.reason } };
@@ -555,23 +773,21 @@ async function main() {
               if (done) return { done: true, closed: null };
               return null;
             },
-            { marker: `slowclient-done-${combo.n}`, closes: closesBefore },
+            { marker: `slowclient-done-${combo.n}-${salt}`, closes: closesBefore },
             { timeout: 90000 }
           );
           res = await outcome.jsonValue();
         } catch (err) {
           const diag = await page.evaluate((pfx) => {
-            const badge = document.getElementById('stream-badge');
             return {
               markerInBody: document.body.textContent.includes(pfx),
-              badgeHidden: !badge || badge.hasAttribute('hidden'),
-              connState: document.getElementById('conn-state')?.dataset.state,
+              sendBtnLabel: document.getElementById('send-btn')?.getAttribute('aria-label') ?? null,
               closes: window.__slowclient.closes.map((c) => ({ code: c.code, reason: c.reason })),
               totalMessages: window.__slowclient.messages.length,
               lastMsgDur: window.__slowclient.messages.slice(-1)[0]?.dur,
               streamingNodes: [...document.querySelectorAll('.msg--assistant .assistant-text')].map((el) => el.textContent?.length ?? 0),
             };
-          }, `slowclient-done-${combo.n}`);
+          }, `slowclient-done-${combo.n}-${salt}`);
           metrics.steps[`C4-flood-${combo.n}-${combo.stallMs}ms`] = { timeoutDiag: diag, stallMs: combo.stallMs };
           fail(`C4: combo (n=${combo.n}, stall=${combo.stallMs}ms) outcome timed out: ${JSON.stringify(diag)}`);
         }
@@ -621,16 +837,13 @@ async function main() {
         // writing mock flood). Use the unified Stop control and wait for
         // quiescence so the next prompt cannot steer into the previous run.
         // The continuing turn (if any) replays onto the reconnected socket;
-        // its flood can starve the bootstrap, so do NOT require conn-state
-        // 'on' here. Wait briefly for the streaming badge to show the resumed
-        // turn, Stop it, then wait for quiescence.
+        // its flood can starve the bootstrap, so do NOT require the Send
+        // button to be enabled here. Wait briefly for #send-btn to show Stop generating on the
+        // resumed turn, Stop it, then wait for quiescence.
         try {
           await waitFor(
             page,
-            () => {
-              const badge = document.getElementById('stream-badge');
-              return badge && !badge.hasAttribute('hidden');
-            },
+            () => document.getElementById('send-btn')?.getAttribute('aria-label') === 'Stop generating',
             'C4.5: turn did not resume streaming after combo',
             15000
           );
@@ -646,10 +859,7 @@ async function main() {
         try {
           await waitFor(
             page,
-            () => {
-              const badge = document.getElementById('stream-badge');
-              return !badge || badge.hasAttribute('hidden');
-            },
+            () => document.getElementById('send-btn')?.getAttribute('aria-label') !== 'Stop generating',
             'C4.5: turn never stopped after combo',
             30000
           );

@@ -27,6 +27,7 @@
 
 import { chromium } from 'playwright';
 import fs from 'node:fs';
+import { createFreshSessionViaManage } from './lib/session-lifecycle.mjs';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
@@ -36,19 +37,20 @@ const fixtureKey = process.env.RPI_FIXTURE_KEY || 'stt-rpc-fixture-key';
 const sttBaseUrlFixture = process.env.RPI_STT_BASE_URL || 'http://127.0.0.1:0';
 const chromePath = process.env.RPI_CHROME || '';
 const evidence = process.env.RPI_EVIDENCE || '.';
+const releaseUrl = process.env.RPI_STT_RELEASE_URL || '';
 
 function fail(message) {
   console.error(`web-stt-rpc (${phase}): FAIL: ${message}`);
   process.exit(2);
 }
 
-async function waitFor(page, fn, label, timeoutMs = 25000) {
+async function waitFor(page, fn, label, timeoutMs = 25000, arg) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (await page.evaluate(fn)) return;
+    if (await page.evaluate(fn, arg)) return;
     await page.waitForTimeout(120);
   }
-  fail(`${label} (timeout ${timeoutMs}ms)`);
+  throw new Error(`${label} (timeout ${timeoutMs}ms)`);
 }
 
 /** Node-side poll for conditions over captured WS frames/DOM — never runs in
@@ -61,6 +63,12 @@ async function waitForNode(fn, label, timeoutMs = 25000) {
     await new Promise((resolve) => setTimeout(resolve, 120));
   }
   fail(`${label} (timeout ${timeoutMs}ms)`);
+}
+
+async function releaseStt() {
+  if (!releaseUrl) fail('RPI_STT_RELEASE_URL is required for the owner-isolation phase');
+  const response = await fetch(releaseUrl, { method: 'POST' });
+  if (!response.ok) fail(`STT release endpoint returned ${response.status}`);
 }
 
 async function main() {
@@ -99,10 +107,9 @@ async function main() {
     });
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
-    await waitFor(page, () => document.getElementById('conn-state') !== null, 'conn-state missing');
     await waitFor(
       page,
-      () => document.getElementById('conn-state').dataset.state === 'on',
+      () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true,
       'WS did not reach "connected"'
     );
     await waitFor(page, () => document.getElementById('mic-btn') !== null, 'mic button missing');
@@ -211,6 +218,42 @@ async function main() {
       fail(`S1: stt_transcribe payload carries a URL/key-shaped field (${JSON.stringify(transcribePayload)})`);
     }
 
+
+    if (phase === 'owner-error') {
+      const evidenceDeadline = Date.now() + 15000;
+      while (Date.now() < evidenceDeadline && !fs.existsSync(sttEvidence)) {
+        await page.waitForTimeout(200);
+      }
+      if (!fs.existsSync(sttEvidence)) fail('S5: delayed-error proxy evidence never appeared');
+      const ownerA = transcribePayload.sessionId;
+      const created = await createFreshSessionViaManage(page, waitFor, 'S5: create session B during delayed transcription failure');
+      if (created.beforeSessionId !== ownerA) {
+        fail(`S5: delayed STT owner ${ownerA} did not match session A ${created.beforeSessionId}`);
+      }
+      await page.fill('#prompt-input', 'session B error draft');
+      await releaseStt();
+      const responseDeadline = Date.now() + 15000;
+      while (Date.now() < responseDeadline && !receivedFrames.some((raw) => {
+        try { const frame = JSON.parse(raw); return frame.type === 'response' && frame.id === transcribePayload.id; } catch { return false; }
+      })) {
+        await page.waitForTimeout(100);
+      }
+      if (!receivedFrames.some((raw) => {
+        try { const frame = JSON.parse(raw); return frame.type === 'response' && frame.id === transcribePayload.id; } catch { return false; }
+      })) fail('S5: delayed STT command never settled after release');
+      const composer = await page.inputValue('#prompt-input');
+      if (composer !== 'session B error draft') {
+        fail(`S5: late A failure changed B composer (${JSON.stringify(composer)})`);
+      }
+      const toasts = await page.locator('.toast').allTextContents();
+      if (toasts.length > 0) {
+        fail(`S5: late A transcription failure surfaced toast(s) on B (${JSON.stringify(toasts)})`);
+      }
+      await page.screenshot({ path: `${evidence}/stt-session-switch-error-isolated.png`, fullPage: true });
+
+      console.log('web-stt-rpc (owner-error): PASSED (delayed A failure stays silent after A→B switch)');
+      return;
+    }
     if (phase === 'error') {
       // ---- S5: mock 500 -> bounded transcription-failed toast, no
       // transcript, but the proxy path is still PROVEN: the evidence (written
@@ -262,16 +305,6 @@ async function main() {
       return;
     }
 
-    // ---- S3: the returned transcript lands in the composer ----
-    await waitFor(
-      page,
-      () => (document.getElementById('prompt-input')?.value || '').includes('web stt transcript'),
-      'S3: the transcript never reached the composer',
-      20000
-    );
-    const composerValue = await page.evaluate(() => document.getElementById('prompt-input')?.value || '');
-    await page.screenshot({ path: `${evidence}/stt-transcript.png`, fullPage: true });
-
     // ---- S2: the Rust proxy reached the mock (metadata-only evidence) ----
     const evidenceDeadline = Date.now() + 15000;
     let meta = null;
@@ -292,14 +325,48 @@ async function main() {
     if (meta.wavPresent !== true) fail(`S2: the WAV bytes are missing from the forwarded form (${JSON.stringify(meta)})`);
     if (meta.modelPresent !== true) fail(`S2: the model field is missing (${JSON.stringify(meta)})`);
 
+    // ---- S3: switch A→B while the backend transcription is still held.
+    // The stt_transcribe command must stay targeted at A, and its late result
+    // must not mutate B's composer. ----
+    const transcribeSession = transcribePayload.sessionId;
+    if (typeof transcribeSession !== 'string' || transcribeSession === '') {
+      fail(`S3: stt_transcribe missing its captured session owner (${JSON.stringify(transcribePayload)})`);
+    }
+    const framesBeforeSessionPanel = sentFrames.length;
+    let created;
+    try {
+      created = await createFreshSessionViaManage(page, waitFor, 'S3: create session B during transcription');
+    } catch (error) {
+      const frames = sentFrames.slice(framesBeforeSessionPanel).map((raw) => {
+        try {
+          const frame = JSON.parse(raw);
+          return { type: frame.type, id: frame.id, sessionId: frame.sessionId };
+        } catch {
+          return { type: 'non-json' };
+        }
+      });
+      fail(`S3: Session panel lifecycle failed: ${error instanceof Error ? error.message : String(error)}; frames=${JSON.stringify(frames)}`);
+    }
+    if (created.beforeSessionId !== transcribeSession) {
+      fail(`S3: STT command owner ${transcribeSession} did not match session A ${created.beforeSessionId}`);
+    }
+    await page.fill('#prompt-input', 'session B draft');
+    await releaseStt();
+    await page.waitForTimeout(800);
+    const bComposer = await page.inputValue('#prompt-input');
+    if (bComposer !== 'session B draft') {
+      fail(`S3: late A transcript polluted B composer (${JSON.stringify(bComposer)})`);
+    }
+    if (bComposer.includes('web stt transcript')) fail('S3: session A transcript landed in session B composer');
+    await page.screenshot({ path: `${evidence}/stt-session-switch-isolated.png`, fullPage: true });
+
     // ---- S4: the fixture key never appears in the DOM or the evidence ----
     const domText = await page.evaluate(() => document.body.innerText || '');
     if (domText.includes(fixtureKey)) fail('S4: the fixture key leaked into the page DOM');
     const evidenceText = fs.readFileSync(sttEvidence, 'utf8');
     if (evidenceText.includes(fixtureKey)) fail('S4: the fixture key leaked into the evidence file');
-    if (!composerValue.includes('web stt transcript')) fail('S3: composer value regressed after evidence checks');
 
-    console.log('web-stt-rpc (ok): PASSED (synthetic-mic hold -> stt_transcribe RPC {audioBase64, mimeType} -> backend multipart + server-held Bearer -> transcript in composer, key absent from DOM/evidence)');
+    console.log('web-stt-rpc (ok): PASSED (synthetic mic -> owner-stamped STT RPC/proxy + A→B switch drops late A transcript + key absent)');
   } finally {
     await browser.close().catch(() => {});
   }

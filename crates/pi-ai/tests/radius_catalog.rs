@@ -1,20 +1,118 @@
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
-use pi_ai::*;
+use ::http::HeaderMap;
 use pi_ai::providers::{
     DEFAULT_RADIUS_GATEWAY, RadiusCatalog, RadiusCatalogSnapshot, RadiusGatewayConfig,
     RadiusGatewayModel, RadiusRefreshOptions, models_from_config,
 };
+use pi_ai::*;
 use serde_json::json;
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
+
+struct TestHttpExecutor {
+    client: reqwest::Client,
+}
+
+impl HttpExecutor for TestHttpExecutor {
+    fn execute<'a>(
+        &'a self,
+        request: HttpRequest,
+    ) -> futures_util::future::BoxFuture<'a, anyhow::Result<HttpResponse>> {
+        use futures_util::{FutureExt as _, StreamExt as _};
+        async move {
+            let parts = request.into_parts();
+            let host = match parts.authority.host() {
+                ResolvedHttpHost::Dns(host) => host.clone(),
+                ResolvedHttpHost::Ip(address) if address.is_ipv6() => format!("[{address}]"),
+                ResolvedHttpHost::Ip(address) => address.to_string(),
+            };
+            let scheme = match parts.authority.scheme() {
+                ResolvedHttpScheme::Http => "http",
+                ResolvedHttpScheme::Https => "https",
+            };
+            let url = format!(
+                "{scheme}://{host}:{}{}",
+                parts.authority.port(),
+                parts.path_and_query
+            );
+            let method = match parts.method {
+                HttpMethod::Get => reqwest::Method::GET,
+                HttpMethod::Post => reqwest::Method::POST,
+                HttpMethod::Put => reqwest::Method::PUT,
+                HttpMethod::Patch => reqwest::Method::PATCH,
+                HttpMethod::Delete => reqwest::Method::DELETE,
+            };
+            let mut builder = self
+                .client
+                .request(method, url)
+                .headers(parts.headers.into_iter().collect::<HeaderMap>());
+            if !parts.body.is_empty() {
+                builder = builder.body(parts.body);
+            }
+            let response = match parts.abort_signal {
+                Some(token) => tokio::select! {
+                    biased;
+                    _ = token.cancelled() => return Err(anyhow::anyhow!("Request was aborted")),
+                    response = builder.send() => response,
+                },
+                None => builder.send().await,
+            }?;
+            let status = response.status();
+            let headers = response.headers().clone();
+            let bound = parts.max_response_bytes.get() as usize;
+            if response
+                .content_length()
+                .is_some_and(|length| length > bound as u64)
+            {
+                return Err(anyhow::anyhow!(
+                    "Radius config response exceeds {bound} bytes"
+                ));
+            }
+            let mut received = 0_usize;
+            let body = response.bytes_stream().map(move |chunk| {
+                let chunk = chunk?.to_vec();
+                received = received.saturating_add(chunk.len());
+                if received > bound {
+                    Err(anyhow::anyhow!(
+                        "Radius config response exceeds {bound} bytes"
+                    ))
+                } else {
+                    Ok(chunk)
+                }
+            });
+            Ok(HttpResponse::new(status, headers, Box::pin(body)))
+        }
+        .boxed()
+    }
+}
+
+fn test_http_executor() -> SharedHttpExecutor {
+    Arc::new(TestHttpExecutor {
+        client: reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("test HTTP client"),
+    })
+}
 
 async fn read_request(socket: &mut tokio::net::TcpStream) -> String {
     let mut request = Vec::new();
     let mut buffer = [0_u8; 4096];
     loop {
         let count = socket.read(&mut buffer).await.expect("read request");
-        if count == 0 { break; }
+        if count == 0 {
+            break;
+        }
         request.extend_from_slice(&buffer[..count]);
-        if request.windows(4).any(|window| window == b"\r\n\r\n") { break; }
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
     }
     String::from_utf8(request).expect("UTF-8 request")
 }
@@ -28,13 +126,18 @@ fn config(id: &str, base_url: &str) -> RadiusGatewayConfig {
             reasoning: true,
             thinking_level_map: None,
             input: vec!["text".into(), "image".into()],
-            cost: ModelCost { input:1.0,output:2.0,cache_read:0.5,cache_write:0.25,tiers:vec![] },
+            cost: ModelCost {
+                input: 1.0,
+                output: 2.0,
+                cache_read: 0.5,
+                cache_write: 0.25,
+                tiers: vec![],
+            },
             context_window: 32_000,
             max_tokens: 4_096,
         }],
     }
 }
-
 
 #[test]
 fn refresh_options_debug_omits_header_values() {
@@ -65,15 +168,33 @@ async fn authenticated_refresh_applies_only_after_valid_catalog() {
         let (mut socket, _) = listener.accept().await.expect("accept");
         let request = read_request(&mut socket).await;
         assert!(request.starts_with("GET /v1/config "));
-        assert!(request.to_ascii_lowercase().contains("authorization: bearer radius-secret"));
-        let body = serde_json::to_string(&config("dynamic", "https://stream.radius.test/v1")).expect("catalog JSON");
-        let response = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
-        socket.write_all(response.as_bytes()).await.expect("response");
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer radius-secret")
+        );
+        let body = serde_json::to_string(&config("dynamic", "https://stream.radius.test/v1"))
+            .expect("catalog JSON");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("response");
     });
     let provider = "radius-refresh-fixture";
     let catalog = RadiusCatalog::new(provider, format!("http://{address}")).expect("catalog");
     assert!(get_models(provider).is_empty());
-    let snapshot = catalog.refresh("radius-secret", RadiusRefreshOptions::default()).await.expect("refresh");
+    let snapshot = catalog
+        .refresh(
+            "radius-secret",
+            test_http_executor(),
+            RadiusRefreshOptions::default(),
+        )
+        .await
+        .expect("refresh");
     assert_eq!(snapshot.models.len(), 1);
     let registered = get_model(provider, "dynamic").expect("registered model");
     assert_eq!(registered.api, API_PI_MESSAGES);
@@ -84,7 +205,11 @@ async fn authenticated_refresh_applies_only_after_valid_catalog() {
 async fn invalid_refresh_retains_stale_snapshot_and_catalog() {
     let provider = "radius-invalid-fixture";
     let catalog = RadiusCatalog::new(provider, "http://127.0.0.1:1").expect("catalog");
-    let stale = RadiusCatalogSnapshot { models:models_from_config(provider,config("old","https://old.radius.test/v1")).expect("models"),checked_at:Some(7) };
+    let stale = RadiusCatalogSnapshot {
+        models: models_from_config(provider, config("old", "https://old.radius.test/v1"))
+            .expect("models"),
+        checked_at: Some(7),
+    };
     catalog.restore_snapshot(stale.clone()).expect("restore");
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -93,12 +218,29 @@ async fn invalid_refresh_retains_stale_snapshot_and_catalog() {
         let (mut socket, _) = listener.accept().await.expect("accept");
         let _ = read_request(&mut socket).await;
         let body = json!({"baseUrl":"", "models":[]}).to_string();
-        let response = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
-        socket.write_all(response.as_bytes()).await.expect("response");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("response");
     });
     let failing = RadiusCatalog::new(provider, format!("http://{address}")).expect("catalog");
-    failing.restore_snapshot(stale.clone()).expect("restore stale");
-    assert!(failing.refresh("secret", RadiusRefreshOptions::default()).await.is_err());
+    failing
+        .restore_snapshot(stale.clone())
+        .expect("restore stale");
+    assert!(
+        failing
+            .refresh(
+                "secret",
+                test_http_executor(),
+                RadiusRefreshOptions::default()
+            )
+            .await
+            .is_err()
+    );
     assert_eq!(failing.snapshot(), stale);
     assert!(get_model(provider, "old").is_some());
 }
@@ -117,19 +259,24 @@ async fn oversized_streamed_refresh_retains_stale_catalog() {
         let (mut socket, _) = listener.accept().await.expect("accept");
         let _ = read_request(&mut socket).await;
         socket
-            .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n")
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n",
+            )
             .await
             .expect("response headers");
         let oversized = vec![b'x'; 1024 * 1024 + 1];
         let _ = socket.write_all(&oversized).await;
     });
-    let catalog = RadiusCatalog::new(provider, format!("http://{address}"))
-        .expect("catalog");
+    let catalog = RadiusCatalog::new(provider, format!("http://{address}")).expect("catalog");
     catalog
         .restore_snapshot(stale.clone())
         .expect("restore stale");
     let error = catalog
-        .refresh("secret", RadiusRefreshOptions::default())
+        .refresh(
+            "secret",
+            test_http_executor(),
+            RadiusRefreshOptions::default(),
+        )
         .await
         .expect_err("oversized response");
     assert!(error.to_string().contains("exceeds 1048576 bytes"));
@@ -152,7 +299,11 @@ async fn oversized_declared_length_is_rejected_before_body_read() {
     let catalog = RadiusCatalog::new("radius-length-cap-fixture", format!("http://{address}"))
         .expect("catalog");
     let error = catalog
-        .refresh("secret", RadiusRefreshOptions::default())
+        .refresh(
+            "secret",
+            test_http_executor(),
+            RadiusRefreshOptions::default(),
+        )
         .await
         .expect_err("oversized declared length");
     assert!(error.to_string().contains("exceeds 1048576 bytes"));
@@ -169,19 +320,40 @@ async fn refresh_retries_and_secret_is_redacted_on_failure() {
         for attempt in 0..2 {
             let (mut socket, _) = listener.accept().await.expect("accept");
             let request = read_request(&mut socket).await;
-            assert!(request.to_ascii_lowercase().contains("authorization: bearer top-secret"));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer top-secret")
+            );
             server_attempts.fetch_add(1, Ordering::SeqCst);
             let response = if attempt == 0 {
                 "HTTP/1.1 503 Service Unavailable\r\nretry-after-ms: 0\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_owned()
             } else {
                 let body = json!({"error":{"message":"top-secret rejected"}}).to_string();
-                format!("HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len())
+                format!(
+                    "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
             };
-            socket.write_all(response.as_bytes()).await.expect("response");
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("response");
         }
     });
-    let catalog = RadiusCatalog::new("radius-redact-fixture", format!("http://{address}")).expect("catalog");
-    let error = catalog.refresh("top-secret", RadiusRefreshOptions { max_retries:1,..Default::default() }).await.expect_err("failure");
+    let catalog =
+        RadiusCatalog::new("radius-redact-fixture", format!("http://{address}")).expect("catalog");
+    let error = catalog
+        .refresh(
+            "top-secret",
+            test_http_executor(),
+            RadiusRefreshOptions {
+                max_retries: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("failure");
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
     assert!(error.to_string().contains("[REDACTED]"));
     assert!(!error.to_string().contains("top-secret"));
@@ -205,15 +377,26 @@ async fn refresh_redacts_overridden_authorization_from_failure() {
                 .count(),
             1
         );
-        let body = json!({"error":{"message":"override-secret rejected default-secret"}}).to_string();
-        let response = format!("HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
-        socket.write_all(response.as_bytes()).await.expect("response");
+        let body =
+            json!({"error":{"message":"override-secret rejected default-secret"}}).to_string();
+        let response = format!(
+            "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("response");
     });
-    let catalog = RadiusCatalog::new("radius-override-redact-fixture", format!("http://{address}"))
-        .expect("catalog");
+    let catalog = RadiusCatalog::new(
+        "radius-override-redact-fixture",
+        format!("http://{address}"),
+    )
+    .expect("catalog");
     let error = catalog
         .refresh(
             "default-secret",
+            test_http_executor(),
             RadiusRefreshOptions {
                 headers: std::collections::HashMap::from([(
                     "Authorization".into(),
@@ -234,11 +417,25 @@ async fn refresh_redacts_overridden_authorization_from_failure() {
 async fn cancelled_refresh_retains_stale_snapshot() {
     let provider = "radius-cancel-fixture";
     let catalog = RadiusCatalog::new(provider, DEFAULT_RADIUS_GATEWAY).expect("catalog");
-    let stale = RadiusCatalogSnapshot { models:models_from_config(provider,config("old","https://old.radius.test/v1")).expect("models"),checked_at:Some(9) };
+    let stale = RadiusCatalogSnapshot {
+        models: models_from_config(provider, config("old", "https://old.radius.test/v1"))
+            .expect("models"),
+        checked_at: Some(9),
+    };
     catalog.restore_snapshot(stale.clone()).expect("restore");
     let token = tokio_util::sync::CancellationToken::new();
     token.cancel();
-    let error = catalog.refresh("secret", RadiusRefreshOptions { abort_signal:Some(token),..Default::default() }).await.expect_err("cancelled");
+    let error = catalog
+        .refresh(
+            "secret",
+            test_http_executor(),
+            RadiusRefreshOptions {
+                abort_signal: Some(token),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("cancelled");
     assert_eq!(error.to_string(), "Request was aborted");
     assert_eq!(catalog.snapshot(), stale);
     assert!(get_model(provider, "old").is_some());

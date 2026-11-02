@@ -68,8 +68,7 @@ async function main() {
     });
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
-    await waitFor(page, () => document.getElementById('conn-state') !== null, 'conn-state missing');
-    await waitFor(page, () => document.getElementById('conn-state').dataset.state === 'on', 'WS never connected');
+    await waitFor(page, () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true, 'WS never connected');
 
     // --- Personas panel ---
     await page.click('#personas-toggle-btn');
@@ -371,6 +370,40 @@ async function main() {
       15000
     );
 
+    // Destructive persona ops fail while any persona job is live, and
+    // reload will not rebuild the orchestration catalog until those jobs
+    // settle (`begin_persona_destructive_operation`).
+    await page.click('#subagents-toggle-btn');
+    await waitFor(page, () => document.getElementById('subagents-panel') !== null, 'subagents panel did not reopen before remove');
+    await waitFor(
+      page,
+      () => {
+        const cards = [...document.querySelectorAll('.subagent-job')];
+        return cards.some(
+          (c) =>
+            (c.textContent || '').includes('(mentor)') || (c.textContent || '').includes('(big)'),
+        );
+      },
+      'spawned persona jobs never reappeared in Subagents before remove',
+      15000
+    );
+    await page.evaluate(() => {
+      for (const card of document.querySelectorAll('.subagent-job')) {
+        const cancel = [...card.querySelectorAll('.subagent-job__action')].find((b) =>
+          (b.textContent || '').includes('Cancel'),
+        );
+        if (cancel && !cancel.disabled) cancel.click();
+      }
+    });
+    await waitFor(
+      page,
+      () => document.querySelectorAll('.subagent-job').length === 0,
+      'persona jobs never left the Running filter after cancel',
+      15000
+    );
+    await page.click('#personas-toggle-btn');
+    await waitFor(page, () => document.getElementById('personas-panel') !== null, 'personas panel did not reopen before remove');
+
     // --- Remove vs purge: confirmation dialog keeps the two semantics distinct ---
     // Remove mentor: persona.md deleted, memory/ and sessions/ KEPT on disk.
     const mentorMd = path.join(personaRoot, 'mentor', 'persona.md');
@@ -402,12 +435,28 @@ async function main() {
     }
     if (!confirmA11y.focusOnCancel) fail('confirm dialog initial focus did not land on Cancel');
     await page.click('[data-persona-confirm-remove]');
-    await waitFor(
-      page,
-      () => document.querySelector('[data-persona-name="mentor"]') === null,
-      'mentor still listed after remove',
-      15000
-    );
+    try {
+      await page.waitForFunction(
+        () => document.querySelector('[data-persona-name="mentor"] [data-persona-persistence]') === null,
+        null,
+        { timeout: 15000 },
+      );
+    } catch {
+      const dump = await page.evaluate(() => {
+        const names = [...document.querySelectorAll('[data-persona-persistence]')]
+          .map((el) => el.closest('[data-persona-name]')?.getAttribute('data-persona-name') || '');
+        return {
+          listed: names,
+          panelError: document.querySelector('[data-panel-error]')?.textContent || '',
+          confirmOpen: document.querySelector('[data-persona-confirm]') !== null,
+          removeDisabled: document.querySelector('[data-persona-confirm-remove]')?.disabled === true,
+        };
+      });
+      const removeFrames = sentFrames.filter((f) => f.includes('"persona_remove"')).length;
+      fail(
+        `mentor still listed after remove: listed=${JSON.stringify(dump.listed)} error=${JSON.stringify(dump.panelError)} confirmOpen=${dump.confirmOpen} removeDisabled=${dump.removeDisabled} persona_remove_frames=${removeFrames}`,
+      );
+    }
     if (fs.existsSync(mentorMd)) fail('remove must delete persona.md on disk');
     if (!fs.existsSync(mentorMemory)) fail('remove must KEEP memory/entries.jsonl on disk');
     if (!fs.existsSync(mentorSessions)) fail('remove must KEEP sessions archives on disk');
@@ -418,12 +467,27 @@ async function main() {
     await page.click('[data-persona-name="scribe"] [data-action="purge"]');
     await waitFor(page, () => document.querySelector('[data-persona-confirm]') !== null, 'purge confirm dialog never opened');
     await page.click('[data-persona-confirm-purge]');
-    await waitFor(
-      page,
-      () => document.querySelector('[data-persona-name="scribe"]') === null,
-      'scribe still listed after purge',
-      15000
-    );
+    try {
+      await page.waitForFunction(
+        () => document.querySelector('[data-persona-name="scribe"] [data-persona-persistence]') === null,
+        null,
+        { timeout: 15000 },
+      );
+    } catch {
+      const dump = await page.evaluate(() => {
+        const names = [...document.querySelectorAll('[data-persona-persistence]')]
+          .map((el) => el.closest('[data-persona-name]')?.getAttribute('data-persona-name') || '');
+        return {
+          listed: names,
+          panelError: document.querySelector('[data-panel-error]')?.textContent || '',
+          confirmOpen: document.querySelector('[data-persona-confirm]') !== null,
+        };
+      });
+      const purgeFrames = sentFrames.filter((f) => f.includes('"persona_purge"')).length;
+      fail(
+        `scribe still listed after purge: listed=${JSON.stringify(dump.listed)} error=${JSON.stringify(dump.panelError)} confirmOpen=${dump.confirmOpen} persona_purge_frames=${purgeFrames}`,
+      );
+    }
     if (fs.existsSync(scribeRoot)) fail('purge must delete the whole persona root on disk');
     await page.screenshot({ path: `${evidence}/personas-final.png`, fullPage: true });
 

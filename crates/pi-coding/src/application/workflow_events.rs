@@ -40,7 +40,11 @@ impl WorkflowForwardingState {
         events
     }
 
-    pub(super) fn accept(&mut self, event: &WorkflowEvent, authoritative: Option<WorkflowSnapshot>) -> bool {
+    pub(super) fn accept(
+        &mut self,
+        event: &WorkflowEvent,
+        authoritative: Option<WorkflowSnapshot>,
+    ) -> bool {
         match event {
             WorkflowEvent::Created { snapshot } | WorkflowEvent::Updated { snapshot } => {
                 if authoritative.as_ref() != Some(snapshot)
@@ -96,8 +100,11 @@ impl WorkflowForwardingState {
 
 pub(super) fn event_workflow_id(event: &WorkflowEvent) -> &WorkflowId {
     match event {
-        WorkflowEvent::Created { snapshot } | WorkflowEvent::Updated { snapshot } => &snapshot.workflow_id,
-        WorkflowEvent::StatusChanged { workflow_id, .. } | WorkflowEvent::Removed { workflow_id, .. } => workflow_id,
+        WorkflowEvent::Created { snapshot } | WorkflowEvent::Updated { snapshot } => {
+            &snapshot.workflow_id
+        }
+        WorkflowEvent::StatusChanged { workflow_id, .. }
+        | WorkflowEvent::Removed { workflow_id, .. } => workflow_id,
     }
 }
 
@@ -108,11 +115,25 @@ mod tests {
 
     fn snapshot(id: &str, generation: u64, status: WorkflowStatus) -> WorkflowSnapshot {
         WorkflowSnapshot {
-            workflow_id: WorkflowId::new(id), name: id.to_owned(), objective: "test forwarding".to_owned(), status,
-            created_at_ms: 1, updated_at_ms: 2, generation,
-            todo: TodoState { phases: Vec::new(), storage: TodoStorage::Memory },
-            worktree_label: Some(id.to_owned()), branch: Some(format!("rpi/workflow/{id}")), supervisor_agent_id: None,
-            supervisor_job_id: None, failure: None, integration: WorkflowIntegration::None,
+            workflow_id: WorkflowId::new(id),
+            name: id.to_owned(),
+            objective: "test forwarding".to_owned(),
+            status,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            generation,
+            durable_policy: crate::sandbox::generation::test_durable_policy_state(),
+            todo: TodoState {
+                phases: Vec::new(),
+                storage: TodoStorage::Memory,
+            },
+            worktree_label: Some(id.to_owned()),
+            branch: Some(format!("rpi/workflow/{id}")),
+            supervisor_agent_id: None,
+            supervisor_job_id: None,
+            failure: None,
+            integration: WorkflowIntegration::None,
+            planning_prompts_consumed: 0,
         }
     }
 
@@ -120,16 +141,23 @@ mod tests {
     fn reconciliation_emits_removals_and_updates() {
         let removed = snapshot("removed", 3, WorkflowStatus::Cancelled);
         let current = snapshot("current", 5, WorkflowStatus::Running);
-        let mut state = WorkflowForwardingState::new(vec![removed.clone(), snapshot("current", 5, WorkflowStatus::Paused)]);
+        let mut state = WorkflowForwardingState::new(vec![
+            removed.clone(),
+            snapshot("current", 5, WorkflowStatus::Paused),
+        ]);
         let events = state.reconcile(vec![current.clone()]);
-        assert!(events.contains(&WorkflowEvent::Removed { workflow_id: removed.workflow_id, generation: 3 }));
+        assert!(events.contains(&WorkflowEvent::Removed {
+            workflow_id: removed.workflow_id,
+            generation: 3
+        }));
         assert!(events.contains(&WorkflowEvent::Updated { snapshot: current }));
     }
 
     #[test]
     fn reconciliation_keeps_newer_generation_authoritative() {
         let current = snapshot("current", 5, WorkflowStatus::Running);
-        let mut state = WorkflowForwardingState::new(vec![snapshot("current", 4, WorkflowStatus::Paused)]);
+        let mut state =
+            WorkflowForwardingState::new(vec![snapshot("current", 4, WorkflowStatus::Paused)]);
         let events = state.reconcile(vec![current.clone()]);
         assert_eq!(events, vec![WorkflowEvent::Updated { snapshot: current }]);
     }
@@ -140,9 +168,18 @@ mod tests {
         let mut state = WorkflowForwardingState::new(Vec::new());
         state.reconcile(vec![current.clone()]);
         let stale_events = [
-            WorkflowEvent::Updated { snapshot: snapshot("current", 4, WorkflowStatus::Paused) },
-            WorkflowEvent::StatusChanged { workflow_id: current.workflow_id.clone(), generation: 4, status: WorkflowStatus::Failed },
-            WorkflowEvent::Removed { workflow_id: current.workflow_id.clone(), generation: 4 },
+            WorkflowEvent::Updated {
+                snapshot: snapshot("current", 4, WorkflowStatus::Paused),
+            },
+            WorkflowEvent::StatusChanged {
+                workflow_id: current.workflow_id.clone(),
+                generation: 4,
+                status: WorkflowStatus::Failed,
+            },
+            WorkflowEvent::Removed {
+                workflow_id: current.workflow_id.clone(),
+                generation: 4,
+            },
         ];
         for event in stale_events {
             assert!(!state.accept(&event, Some(current.clone())));

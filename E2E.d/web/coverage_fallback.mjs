@@ -27,15 +27,34 @@
 import { chromium } from 'playwright';
 import fs from 'node:fs';
 import path from 'node:path';
+import { createFreshSessionViaManage } from './lib/session-lifecycle.mjs';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
 const chromePath = process.env.RPI_CHROME || '';
 const evidence = process.env.RPI_EVIDENCE || '.';
 
-const executed = new Set();
+const executed = new Map(); // id -> exact execution count (per-ID ledger, no Set erasure)
+// The documented contract this driver must execute EXACTLY once — IN THE
+// ACTUAL ASSERTION-SITE (runtime) ORDER (the matrix requires the published
+// executed array to equal the documented array in order).
+const DOCUMENTED_IDS = [
+  'fallback.session-refresh',
+  'fallback.session-rename-enter',
+  'fallback.redact-credential-panel',
+  'fallback.session-fork',
+  'fallback.session-clone',
+  'fallback.session-switch-row',
+  'fallback.app-close-session',
+  'fallback.goal-unpin',
+  'fallback.app-close-goal',
+  'fallback.sidechat-enter-prompt',
+  'fallback.sidechat-tab-switch',
+  'fallback.sidechat-tab-close',
+  'fallback.app-close-sidechat',
+];
 function record(id) {
-  executed.add(id);
+  executed.set(id, (executed.get(id) || 0) + 1);
   console.log(`[web-cov-fallback:assert] ${id}`);
 }
 
@@ -65,15 +84,14 @@ async function connectPage(page) {
   }
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
   await waitFor(page, () => document.title === 'rpi web', 'page title missing');
-  await waitFor(page, () => document.querySelector('#conn-state') !== null, 'conn-state missing');
-  await waitFor(page, () => document.getElementById('conn-state').dataset.state === 'on', 'WS did not reach "connected"');
+  await waitFor(page, () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true, 'WS did not reach "connected"');
 }
 
-// Wait for the main session to be idle (stream-badge cleared) — the turn-gate
-// rejects a prompt issued while a run is in flight, so every priming prompt
-// must only be sent once the previous turn finished.
+// Wait for the main session to be idle (unified action back to Send) — the
+// turn-gate rejects a prompt issued while a run is in flight, so every
+// priming prompt must only be sent once the previous turn finished.
 async function waitForIdle(page, label, timeoutMs = 30000) {
-  await waitFor(page, () => document.getElementById('stream-badge').hidden === true, `${label}: main session still streaming`, timeoutMs);
+  await waitFor(page, () => document.getElementById('send-btn')?.getAttribute('aria-label') === 'Send message', `${label}: main session still streaming`, timeoutMs);
 }
 
 // Send one main-session prompt and wait for a NEW non-empty assistant message
@@ -90,7 +108,7 @@ async function primeTurn(page, text, label) {
       return (
         nodes.length > b &&
         (nodes[nodes.length - 1]?.textContent || '').trim() !== '' &&
-        document.getElementById('stream-badge').hidden === true
+        document.getElementById('send-btn')?.getAttribute('aria-label') === 'Send message'
       );
     },
     `${label}: priming turn never completed`,
@@ -100,23 +118,55 @@ async function primeTurn(page, text, label) {
 }
 
 
-// Wait for the SessionPanel to report a lifecycle outcome. runLifecycle sets
-// the panel status to "<label> ok" on success or "<label> failed: <err>" on
-// error — either proves onClone/onFork/onSwitch ran the RPC through the App
-// lifecycle path (the observable contract). Robust to a clone/fork that the
-// fixture refuses (e.g. no forkable leaf): the journey still executed.
-async function waitForSessionStatus(page, label, timeoutMs = 30000) {
+// Wait until a fork/clone lifecycle action is OBSERVABLE under the CURRENT
+// panel contract — the panel never renders an in-panel status surface:
+//   * SUCCESS — the keyed panel REMOUNTS and its "Session id" row changes
+//     (the runLifecycle status is set on the unmounted instance; the
+//     session-id/active identity change is the observable, mirroring the
+//     core driver's session.switch-new-id);
+//   * REFUSAL — exactly ONE new bottom-right error toast names the action
+//     ("<label> failed: ...") and the panel renders NO status element.
+// Either outcome proves onFork/onClone + runLifecycle + the RPC executed.
+// `previousId` (panel session id) and `toastsBefore` (toast count) are
+// captured by the CALLER strictly BEFORE the action click — a fast refusal
+// or cutover must never fall outside the baseline. The helper never
+// baselines internally after the action. Returns 'identity' or 'refused'.
+async function waitForLifecycleOutcome(page, label, previousId, toastsBefore, timeoutMs = 30000) {
   await waitFor(
     page,
-    (want) => {
-      const status = document.querySelector('#session-panel .panel__status');
-      return status !== null && (status.textContent || '').includes(want);
+    ({ prevId, prevToasts }) => {
+      const dts = [...document.querySelectorAll('#session-panel dl dt')];
+      const idx = dts.findIndex((dt) => dt.textContent === 'Session id');
+      const id = idx >= 0 ? (dts[idx]?.nextElementSibling?.textContent || '').trim() : '';
+      const identityChanged = id !== '' && id !== '—' && id !== prevId;
+      const fresh = [...document.querySelectorAll('#toasts .toast')].slice(prevToasts)
+        .map((t) => t.textContent || '');
+      return identityChanged || fresh.some((t) => t.includes(`${label} failed:`));
     },
-    `session lifecycle "${label}" never reported a panel status`,
+    `session lifecycle "${label}" never became observable (identity change or refusal toast)`,
     timeoutMs,
-    label
+    { prevId: previousId, prevToasts: toastsBefore },
   );
+  const outcome = await page.evaluate((prevToasts) => {
+    const dts = [...document.querySelectorAll('#session-panel dl dt')];
+    const idx = dts.findIndex((dt) => dt.textContent === 'Session id');
+    const id = idx >= 0 ? (dts[idx]?.nextElementSibling?.textContent || '').trim() : '';
+    return {
+      id,
+      freshToasts: [...document.querySelectorAll('#toasts .toast')].slice(prevToasts).map((t) => t.textContent || ''),
+      panelStatus: document.querySelector('#session-panel .panel__status'),
+    };
+  }, toastsBefore);
+  if (outcome.id !== '' && outcome.id !== '—' && outcome.id !== previousId) return 'identity';
+  if (outcome.freshToasts.length !== 1 || !outcome.freshToasts[0].includes(`${label} failed:`)) {
+    fail(`session lifecycle "${label}": expected a session-id cutover or exactly one refusal toast (got ${JSON.stringify(outcome.freshToasts)})`);
+  }
+  if (outcome.panelStatus !== null) {
+    fail(`session lifecycle "${label}": panel rendered an in-panel status surface`);
+  }
+  return 'refused';
 }
+
 
 // Read the active session id from the SessionPanel's "Session id" row. Used
 // for lifecycle ops that SUCCEED (new_session / switch_session): the panel is
@@ -196,27 +246,44 @@ async function main() {
     // root user message (no parent) makes the spawner fall back to a fresh
     // session, so fork always yields a snapshot — the active session cuts over
     // to the fork, leaving the original as a non-current saved row (the switch
-    // target below). The panel status ("fork ok" / "fork failed: ...") is the
-    // observable: either proves onFork + runLifecycle + the fork RPC executed.
+    // target below). The panel remounts for the fork target, so the
+    // session-id/active identity CHANGE is the observable (the panel never
+    // renders an in-panel status).
+    const forkPreviousId = await readSessionId(page);
+    const forkToastsBefore = await page.evaluate(() => document.querySelectorAll('#toasts .toast').length);
     await waitFor(
       page,
       () => {
-        const opt = document.querySelector('#session-fork-select option:not([value=""])');
-        return opt !== null && !document.getElementById('session-fork-btn')?.disabled;
+        // The fork candidate window is the accessible bounded listbox
+        // (#session-fork-list): a selectable option row exists and the Fork
+        // button is enabled without manual selection (auto-selected first
+        // forkable message).
+        const list = document.getElementById('session-fork-list');
+        const selectable = list
+          ? [...list.querySelectorAll('[role="option"]')]
+            .some((option) => option.id.startsWith('session-fork-option-')
+              && option.getAttribute('aria-disabled') !== 'true')
+          : false;
+        const active = list?.getAttribute('aria-activedescendant') || '';
+        return selectable && active !== '' && !document.getElementById('session-fork-btn')?.disabled;
       },
-      'fork select never populated with a forkable message'
+      'fork listbox never populated with a selectable forkable message'
     );
     await page.click('#session-fork-btn');
-    await waitForSessionStatus(page, 'fork');
+    await waitForLifecycleOutcome(page, 'fork', forkPreviousId, forkToastsBefore);
     record('fallback.session-fork');
 
     // Clone -> onClone -> clone RPC -> onLifecycleResult. clone_from needs the
-    // active session's recorder leaf; if the fixture's session tree has no
-    // selected leaf the RPC refuses, the panel reports "clone failed: ...",
-    // and onLifecycleResult falls back to refreshState — but onClone +
-    // runLifecycle + the clone RPC still executed (the observable contract).
+    // active session's recorder leaf; the fixture's session tree has no
+    // selected leaf, so the RPC refuses: the observable is EXACTLY ONE
+    // bottom-right error toast naming "clone failed: ..." and ZERO in-panel
+    // status — but onClone + runLifecycle + the clone RPC still executed.
+    // Should a fixture allow clone, the helper accepts the identity-change
+    // outcome instead (never an in-panel status).
+    const clonePreviousId = await readSessionId(page);
+    const cloneToastsBefore = await page.evaluate(() => document.querySelectorAll('#toasts .toast').length);
     await page.click('#session-clone-btn');
-    await waitForSessionStatus(page, 'clone');
+    await waitForLifecycleOutcome(page, 'clone', clonePreviousId, cloneToastsBefore);
     record('fallback.session-clone');
     // Create a second session via new_session (the core driver proves this
     // path works in the fixture; fork/clone above are refused by the fixture's
@@ -226,20 +293,11 @@ async function main() {
     // with a Switch button. A successful cutover REMOUNTS the keyed panel, so
     // the runLifecycle status is set on the unmounted instance — assert the
     // session-id change instead (mirrors the core driver).
-    const originalId = await readSessionId(page);
-    if (!originalId) fail('current session id never rendered before new_session');
-    await page.click('#session-new-btn');
-    await waitFor(
+    const { beforeSessionId: originalId } = await createFreshSessionViaManage(
       page,
-      (b) => {
-        const dts = [...document.querySelectorAll('#session-panel dl dt')];
-        const idx = dts.findIndex((dt) => dt.textContent === 'Session id');
-        const id = idx >= 0 ? (dts[idx]?.nextElementSibling?.textContent || '') : '';
-        return id !== '' && id !== b;
-      },
-      'new_session never produced a different session id',
-      30000,
-      originalId
+      waitFor,
+      'fallback session lifecycle',
+      { closePanel: false, timeoutMs: 30000 },
     );
 
     // Switch via a saved-session row's Switch button -> onSwitch(path) ->
@@ -395,7 +453,31 @@ async function main() {
     record('fallback.app-close-sidechat');
 
     fs.mkdirSync(evidence, { recursive: true });
-    fs.writeFileSync(path.join(evidence, 'coverage-assertions.json'), JSON.stringify({ executed: [...executed] }, null, 2));
+    // Exact per-ID ledger gate BEFORE any write: every documented id must
+    // have executed EXACTLY once and nothing undocumented may execute; the
+    // published executed array is the documented order (ordered equality).
+    const missing = DOCUMENTED_IDS.filter((id) => !executed.has(id));
+    if (missing.length > 0) {
+      fail(`fallback coverage evidence incomplete: ${missing.join(', ')} never executed (coverage matrix contract)`);
+    }
+    const overExecuted = [...executed.keys()].filter((id) => !DOCUMENTED_IDS.includes(id));
+    if (overExecuted.length > 0) {
+      fail(`fallback coverage evidence drift: executed-but-undocumented ids: ${overExecuted.join(', ')}`);
+    }
+    const repeatedIds = [...executed].filter(([, count]) => count !== 1).map(([id]) => id);
+    if (repeatedIds.length > 0) {
+      fail(`fallback coverage evidence exact-once violation: ${repeatedIds.join(', ')}`);
+    }
+    // Publish the REAL ledger: executed is the Map's insertion order (actual
+    // execution order — never a reconstruction of DOCUMENTED_IDS) and counts
+    // the real per-ID ledger. The gate above proved documented == executed
+    // as exact-once sets; the matrix's ordered gate additionally proves the
+    // runtime order matches the documented order.
+    fs.writeFileSync(path.join(evidence, 'coverage-assertions.json'), JSON.stringify({
+      documented: [...DOCUMENTED_IDS],
+      executed: [...executed.keys()],
+      counts: Object.fromEntries(executed),
+    }, null, 2));
     console.log(`web-cov-fallback: PASSED (${executed.size} assertions) — evidence at ${path.join(evidence, 'coverage-assertions.json')}`);
   } finally {
     await browser.close().catch(() => {});

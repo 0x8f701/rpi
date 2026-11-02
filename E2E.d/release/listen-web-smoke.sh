@@ -25,7 +25,7 @@ start_listener() {
     local tag="$1"; shift
     env -i HOME="$root/home" USERPROFILE="$root/home" PATH="${PATH:-/usr/bin:/bin}" \
         LANG="${LANG:-C.UTF-8}" LC_ALL="${LC_ALL:-C.UTF-8}" TERM="xterm-256color" \
-        PI_CODING_AGENT_DIR="$root/home/.pi/agent" PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 \
+        PI_CODING_AGENT_DIR="$root/home/.pi/agent" RPI_OFFLINE=1 RPI_SKIP_VERSION_CHECK=1 \
         PI_FAUX_RESPONSE='release Web persisted reply' \
         "$RPI_BIN" --offline -C "$root/workspace" --listen "127.0.0.1:$port" \
         --listen-plaintext --model faux/faux-1 --api-key faux --session-dir "$session_dir" "$@" \

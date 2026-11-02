@@ -9,8 +9,7 @@
 // Asserts:
 //   Side chat (multi-tab):
 //     1. the panel opens and starts with the default tab
-//     2. a NEW tab is created from the panel form (second tab appears and is
-//        activated)
+//     2. a NEW tab is created from button.side-chat__new (SideChatPanel.tsx:708-718)
 //     3. prompting the tab round-trips through the real side-chat session and
 //        the assistant entry renders the streamed mock reply (the side-agent
 //        turn may land on either the odd slow or the even instant path, so
@@ -54,11 +53,9 @@ async function main() {
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await waitFor(page, () => document.title === 'rpi web', 'page title missing');
-    await waitFor(page, () => document.querySelector('#conn-state') !== null, 'conn-state missing');
-
     await waitFor(
       page,
-      () => document.getElementById('conn-state').dataset.state === 'on',
+      () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true,
       'WS did not reach "connected"'
     );
 
@@ -73,25 +70,16 @@ async function main() {
       'side chat never showed the default tab'
     );
 
-    // 2. Create a second tab from the panel form. (The RPC validates tab
-    //    names: letters/digits/underscores only — keep the name hyphen-free.)
-    await page.fill('.side-chat__new input', 'regression_tab');
-    await page.click('.side-chat__new button');
+    const tabsBefore = await page.evaluate(() => document.querySelectorAll('.side-chat__tab-select').length);
+    await page.click('button.side-chat__new[aria-label="New side-chat tab"]');
     await waitFor(
       page,
-      () =>
-        Array.from(document.querySelectorAll('.side-chat__tab-select')).some((b) =>
-          b.textContent.includes('regression_tab')
-        ),
-      'the new tab never appeared in the tab list'
-    );
-    await waitFor(
-      page,
-      () =>
-        Array.from(document.querySelectorAll('.side-chat__tab-select')).some(
-          (b) => b.textContent.includes('regression_tab') && b.getAttribute('aria-selected') === 'true'
-        ),
-      'the new tab was not activated'
+      (before) =>
+        document.querySelectorAll('.side-chat__tab-select').length > before
+        && !!document.querySelector('.side-chat__tab--active .side-chat__tab-select')?.textContent.trim(),
+      'the new tab never appeared in the tab list',
+      25000,
+      tabsBefore
     );
     await page.screenshot({ path: `${evidence}/sidechat-tabs.png`, fullPage: true });
 
@@ -100,7 +88,7 @@ async function main() {
     //    land on the odd slow stream or the even instant reply, so any
     //    non-empty assistant entry text satisfies the assertion.
     await page.fill('.side-chat__composer textarea', 'hello side agent');
-    await page.click('.side-chat__composer button');
+    await page.click('.side-chat__composer-action--send');
     await waitFor(
       page,
       () =>

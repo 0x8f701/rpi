@@ -14,8 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 /// A real 1x1 transparent PNG, base64-encoded.
-const ONE_PX_PNG_B64: &str =
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+const ONE_PX_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
 fn tmpdir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("pi-image-gen-{}", uuid::Uuid::new_v4()));
@@ -32,6 +31,7 @@ fn make_ctx(args: Value) -> ToolCallContext {
         on_update: Arc::new(|_result: AgentToolResult| {}),
         abort,
         model: None,
+        approval_token: None,
     }
 }
 
@@ -132,10 +132,7 @@ async fn spawn_mock_swapping_images(cwd: &Path, outside: &Path, status: &str) ->
 }
 
 fn json_data_response(items: &[&str]) -> String {
-    let data: Vec<Value> = items
-        .iter()
-        .map(|b64| json!({ "b64_json": b64 }))
-        .collect();
+    let data: Vec<Value> = items.iter().map(|b64| json!({ "b64_json": b64 })).collect();
     json!({ "data": data }).to_string()
 }
 
@@ -151,12 +148,16 @@ fn image_model(base_url: String, image_generation: bool) -> pi_ai::Model {
     }
 }
 
+struct TestResolver {
+    resolve: ImageGenConfigFn,
+}
+
 fn resolver_for(
     model: pi_ai::Model,
     api_key: Option<String>,
     base_url: Option<String>,
-) -> ImageGenConfigFn {
-    Arc::new(move |_spec: Option<String>| {
+) -> TestResolver {
+    let resolve: ImageGenConfigFn = Arc::new(move |_spec: Option<String>| {
         let model = model.clone();
         let api_key = api_key.clone();
         let base_url = base_url.clone();
@@ -165,28 +166,239 @@ fn resolver_for(
                 model,
                 base_url,
                 api_key,
+                env: std::collections::HashMap::new(),
             })
         })
-    })
+    });
+    TestResolver { resolve }
 }
 
-fn tool_for(cwd: &Path, resolver: Option<ImageGenConfigFn>) -> AgentTool {
-    generate_image_tool_for_workspace(
-        crate::WorkspaceRoots::for_tool_factory(&cwd.to_string_lossy()),
-        resolver,
+struct ImageToolFixture {
+    _agent: tempfile::TempDir,
+    _sessions: tempfile::TempDir,
+    _application: crate::Application,
+    _faux: pi_ai::providers::FauxProviderRegistration,
+    tool: AgentTool,
+}
+
+struct PolicyFsFixture {
+    _agent: tempfile::TempDir,
+    _sessions: tempfile::TempDir,
+    _application: crate::Application,
+    _faux: pi_ai::providers::FauxProviderRegistration,
+    fs: Arc<crate::fs::PolicyFs>,
+}
+
+fn unique_faux_model(
+    image_generation: bool,
+    base_url: Option<String>,
+) -> (pi_ai::Model, pi_ai::providers::FauxProviderRegistration) {
+    let suffix = uuid::Uuid::new_v4().to_string();
+    let api = format!("image-fixture-{suffix}");
+    let provider = format!("image-fixture-{suffix}");
+    let model = pi_ai::Model {
+        id: format!("image-fixture-{suffix}"),
+        api: api.clone(),
+        provider: provider.clone(),
+        base_url: base_url.unwrap_or_default(),
+        image_generation,
+        ..pi_ai::Model::default()
+    };
+    let faux = pi_ai::providers::register_faux_provider(pi_ai::providers::FauxProviderOptions {
+        api,
+        provider,
+        models: vec![model.clone()],
+        chunk_size: 1,
+    });
+    (model, faux)
+}
+
+async fn tool_for(cwd: &Path, resolver: Option<TestResolver>) -> ImageToolFixture {
+    let resolver = resolver.map(|resolver| resolver.resolve);
+    // The session model is deliberately non-image-capable. The tool's explicit
+    // resolver owns the image endpoint/model contract; making the session model
+    // image-capable would stage a second, unrelated HTTP requirement.
+    let (model, faux) = unique_faux_model(false, None);
+    let workspace = crate::WorkspaceRoots::new(cwd, Vec::<PathBuf>::new()).expect("workspace");
+    let agent = tempfile::tempdir().expect("agent dir");
+    let sessions_root = tempfile::tempdir().expect("sessions root");
+    let session_dir = sessions_root.path().join("active");
+    std::fs::create_dir(&session_dir).expect("session dir");
+    std::fs::write(
+        agent.path().join("settings.json"),
+        r#"{"sandbox":{"mode":"danger-full-access"}}"#,
     )
+    .expect("sandbox settings");
+    let mut resource_options = crate::ResourceManagerOptions::new(cwd);
+    resource_options.agent_dir = agent.path().to_path_buf();
+    resource_options.project_trust_override = Some(true);
+    resource_options.disable_extensions = true;
+    resource_options.disable_skills = true;
+    resource_options.disable_prompt_templates = true;
+    resource_options.disable_themes = true;
+    resource_options.disable_context_files = true;
+    let resources = crate::ResourceManager::new(resource_options).expect("resources");
+    let session = crate::Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
+        crate::SessionOptions {
+            model,
+            cwd: cwd.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: pi_agent::ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+            auth_manager: None,
+        },
+        Vec::new(),
+        crate::ToolSelection::default(),
+        crate::ResourceDiscovery::Disabled,
+        workspace.clone(),
+        None,
+    )
+    .expect("session");
+    session.set_session_dir(session_dir);
+    session
+        .attach_resources(resources)
+        .await
+        .expect("attach resources");
+    let application = crate::Application::from_runtime_candidate(
+        crate::ApplicationRuntimeCandidate::new(session),
+    )
+    .await
+    .expect("publish image tool application");
+    let tool = generate_image_tool_for_workspace_with_generation(
+        workspace,
+        resolver,
+        application.generation_capture_fn(),
+    );
+    ImageToolFixture {
+        _agent: agent,
+        _sessions: sessions_root,
+        _application: application,
+        _faux: faux,
+        tool,
+    }
+}
+
+async fn policy_fs(cwd: &Path) -> PolicyFsFixture {
+    policy_fs_with_mode_result(cwd, r#"{"sandbox":{"mode":"danger-full-access"}}"#)
+        .await
+        .expect("publish policy filesystem application")
+}
+
+async fn policy_fs_with_mode(cwd: &Path, settings_json: &str) -> PolicyFsFixture {
+    policy_fs_with_mode_result(cwd, settings_json)
+        .await
+        .expect("publish policy filesystem application")
+}
+
+/// Confined-mode fixture behind the trusted-launcher gate (mirror of
+/// `sandbox_smoke::confined_bootstrap`): confined bootstrap authenticates the
+/// bubblewrap launcher, so without a trusted launcher (bwrap >= 0.10) the
+/// build fails with a `launcher`-named error and the confinement test must
+/// skip rather than silently degrade. Any other failure is a real defect and
+/// panics.
+async fn confined_policy_fs(cwd: &Path) -> Option<PolicyFsFixture> {
+    match policy_fs_with_mode_result(cwd, r#"{"sandbox":{"mode":"workspace-write"}}"#).await {
+        Ok(fixture) => Some(fixture),
+        Err(error) => {
+            let message = format!("{error:#}");
+            if message.contains("launcher") {
+                eprintln!(
+                    "skipping live confinement test: trusted sandbox launcher unavailable ({message})"
+                );
+                None
+            } else {
+                panic!("confined fixture failed beyond an unavailable launcher: {message}");
+            }
+        }
+    }
+}
+
+async fn policy_fs_with_mode_result(
+    cwd: &Path,
+    settings_json: &str,
+) -> anyhow::Result<PolicyFsFixture> {
+    let workspace = crate::WorkspaceRoots::new(cwd, Vec::<PathBuf>::new()).expect("workspace");
+    let agent = tempfile::tempdir().expect("agent dir");
+    let sessions_root = tempfile::tempdir().expect("sessions root");
+    let session_dir = sessions_root.path().join("active");
+    std::fs::create_dir(&session_dir).expect("session dir");
+    std::fs::write(agent.path().join("settings.json"), settings_json).expect("sandbox settings");
+    let mut resource_options = crate::ResourceManagerOptions::new(cwd);
+    resource_options.agent_dir = agent.path().to_path_buf();
+    resource_options.project_trust_override = Some(true);
+    resource_options.disable_extensions = true;
+    resource_options.disable_skills = true;
+    resource_options.disable_prompt_templates = true;
+    resource_options.disable_themes = true;
+    resource_options.disable_context_files = true;
+    let resources = crate::ResourceManager::new(resource_options).expect("resources");
+    let (model, faux) = unique_faux_model(false, None);
+    let session = crate::Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
+        crate::SessionOptions {
+            model,
+            cwd: cwd.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: pi_agent::ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+            auth_manager: None,
+        },
+        Vec::new(),
+        crate::ToolSelection::default(),
+        crate::ResourceDiscovery::Disabled,
+        workspace,
+        None,
+    )
+    .expect("session");
+    session.set_session_dir(session_dir);
+    session
+        .attach_resources(resources)
+        .await
+        .expect("attach resources");
+    let application = crate::Application::from_runtime_candidate(
+        crate::ApplicationRuntimeCandidate::new(session),
+    )
+    .await?;
+    let fs = application
+        .capture_generation()
+        .sandbox()
+        .fs()
+        .confined()
+        .expect("confined filesystem")
+        .clone();
+    Ok(PolicyFsFixture {
+        _agent: agent,
+        _sessions: sessions_root,
+        _application: application,
+        _faux: faux,
+        fs,
+    })
 }
 
 #[tokio::test]
 async fn request_shape_base_join_bearer_and_body() {
-    let (address, captured) =
-        spawn_mock(json_data_response(&[ONE_PX_PNG_B64]), "200 OK").await;
+    let (address, captured) = spawn_mock(json_data_response(&[ONE_PX_PNG_B64]), "200 OK").await;
     let cwd = tmpdir();
     let model = image_model(format!("http://{address}/v1"), true);
-    let tool = tool_for(
+    let fixture = tool_for(
         &cwd,
         Some(resolver_for(model, Some("sk-image-test".into()), None)),
-    );
+    )
+    .await;
+    let tool = &fixture.tool;
 
     let result = (tool.execute)(make_ctx(json!({
         "prompt": "a red png",
@@ -202,7 +414,10 @@ async fn request_shape_base_join_bearer_and_body() {
     assert!(text.contains("Prompt: a red png"), "{text}");
 
     let request = captured.lock().expect("request lock").clone();
-    assert!(request.starts_with("POST /v1/images/generations "), "{request}");
+    assert!(
+        request.starts_with("POST /v1/images/generations "),
+        "{request}"
+    );
     let lowered = request.to_ascii_lowercase();
     assert!(
         lowered.contains("authorization: bearer sk-image-test"),
@@ -234,7 +449,12 @@ async fn saves_multiple_images_and_bounds_n() {
     .await;
     let cwd = tmpdir();
     let model = image_model(format!("http://{address}/v1"), true);
-    let tool = tool_for(&cwd, Some(resolver_for(model, Some("sk-image-test".into()), None)));
+    let fixture = tool_for(
+        &cwd,
+        Some(resolver_for(model, Some("sk-image-test".into()), None)),
+    )
+    .await;
+    let tool = &fixture.tool;
 
     let result = (tool.execute)(make_ctx(json!({
         "prompt": "two red pngs",
@@ -248,24 +468,26 @@ async fn saves_multiple_images_and_bounds_n() {
     assert!(text.contains("images/image-1.png"), "{text}");
     assert!(text.contains("images/image-2.png"), "{text}");
     assert!(cwd.join("images/image-1.png").exists(), "first image saved");
-    assert!(cwd.join("images/image-2.png").exists(), "second image saved");
+    assert!(
+        cwd.join("images/image-2.png").exists(),
+        "second image saved"
+    );
     let _ = captured;
 
     // n above the bound is rejected before any network call.
-    let tool = tool_for(&cwd, None);
+    let fixture = tool_for(&cwd, None).await;
+    let tool = &fixture.tool;
     let error = (tool.execute)(make_ctx(json!({ "prompt": "x", "n": 5 })))
         .await
         .expect_err("n=5 must fail");
-    assert!(
-        error.to_string().contains("between 1 and 4"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("between 1 and 4"), "{error}");
 }
 
 #[tokio::test]
 async fn size_whitelist_is_enforced() {
     let cwd = tmpdir();
-    let tool = tool_for(&cwd, None);
+    let fixture = tool_for(&cwd, None).await;
+    let tool = &fixture.tool;
     let error = (tool.execute)(make_ctx(json!({
         "prompt": "a red png",
         "size": "512x1024",
@@ -279,14 +501,17 @@ async fn size_whitelist_is_enforced() {
 #[tokio::test]
 async fn prompt_bounds_are_enforced() {
     let cwd = tmpdir();
-    let tool = tool_for(&cwd, None);
+    let fixture = tool_for(&cwd, None).await;
+    let tool = &fixture.tool;
     let error = (tool.execute)(make_ctx(json!({
         "prompt": "a".repeat(MAX_IMAGE_GEN_PROMPT_CHARS + 1),
     })))
     .await
     .expect_err("oversized prompt must fail");
     assert!(
-        error.to_string().contains("exceeding the generate_image limit"),
+        error
+            .to_string()
+            .contains("exceeding the generate_image limit"),
         "{error}"
     );
 
@@ -300,32 +525,38 @@ async fn prompt_bounds_are_enforced() {
 async fn model_without_image_capability_errors_actionably() {
     let cwd = tmpdir();
     let model = image_model("http://127.0.0.1:1/v1".into(), false);
-    let tool = tool_for(
+    let fixture = tool_for(
         &cwd,
         Some(resolver_for(model, Some("sk-image-test".into()), None)),
-    );
+    )
+    .await;
+    let tool = &fixture.tool;
     let error = (tool.execute)(make_ctx(json!({ "prompt": "a red png" })))
         .await
         .expect_err("non-image model must fail");
     let message = error.to_string();
-    assert!(message.contains("does not support image generation"), "{message}");
+    assert!(
+        message.contains("does not support image generation"),
+        "{message}"
+    );
     assert!(message.contains("images.genModel"), "{message}");
 }
 
 #[tokio::test]
 async fn gen_base_url_override_wins_over_model_base() {
-    let (address, captured) =
-        spawn_mock(json_data_response(&[ONE_PX_PNG_B64]), "200 OK").await;
+    let (address, captured) = spawn_mock(json_data_response(&[ONE_PX_PNG_B64]), "200 OK").await;
     let cwd = tmpdir();
     let model = image_model("http://ignored.invalid/v1".into(), true);
-    let tool = tool_for(
+    let fixture = tool_for(
         &cwd,
         Some(resolver_for(
             model,
             Some("sk-image-test".into()),
             Some(format!("http://{address}/custom/v1")),
         )),
-    );
+    )
+    .await;
+    let tool = &fixture.tool;
 
     (tool.execute)(make_ctx(json!({ "prompt": "a red png" })))
         .await
@@ -349,10 +580,12 @@ async fn errors_redact_the_api_key() {
     .await;
     let cwd = tmpdir();
     let model = image_model(format!("http://{address}/v1"), true);
-    let tool = tool_for(
+    let fixture = tool_for(
         &cwd,
         Some(resolver_for(model, Some("sk-image-test".into()), None)),
-    );
+    )
+    .await;
+    let tool = &fixture.tool;
     let error = (tool.execute)(make_ctx(json!({ "prompt": "a red png" })))
         .await
         .expect_err("server error must fail");
@@ -370,10 +603,12 @@ async fn workspace_escape_is_rejected() {
     // A valid image-capable config so the run reaches the path containment
     // check (the escape must fail before any network call).
     let model = image_model("http://127.0.0.1:1/v1".into(), true);
-    let tool = tool_for(
+    let fixture = tool_for(
         &cwd,
         Some(resolver_for(model, Some("sk-image-test".into()), None)),
-    );
+    )
+    .await;
+    let tool = &fixture.tool;
     let error = (tool.execute)(make_ctx(json!({
         "prompt": "a red png",
         "path": "../outside.png",
@@ -385,11 +620,13 @@ async fn workspace_escape_is_rejected() {
         message.contains("outside") || message.to_ascii_lowercase().contains("workspace"),
         "{message}"
     );
-    assert!(!std::path::Path::new(&cwd)
-        .parent()
-        .unwrap()
-        .join("outside.png")
-        .exists());
+    assert!(
+        !std::path::Path::new(&cwd)
+            .parent()
+            .unwrap()
+            .join("outside.png")
+            .exists()
+    );
 }
 
 #[tokio::test]
@@ -397,10 +634,12 @@ async fn explicit_file_path_with_mismatched_extension_is_rejected() {
     let (address, _) = spawn_mock(json_data_response(&[ONE_PX_PNG_B64]), "200 OK").await;
     let cwd = tmpdir();
     let model = image_model(format!("http://{address}/v1"), true);
-    let tool = tool_for(
+    let fixture = tool_for(
         &cwd,
         Some(resolver_for(model, Some("sk-image-test".into()), None)),
-    );
+    )
+    .await;
+    let tool = &fixture.tool;
     let error = (tool.execute)(make_ctx(json!({
         "prompt": "a red png",
         "path": "art.jpg",
@@ -417,10 +656,12 @@ async fn explicit_file_path_saves_at_that_path() {
     let (address, _) = spawn_mock(json_data_response(&[ONE_PX_PNG_B64]), "200 OK").await;
     let cwd = tmpdir();
     let model = image_model(format!("http://{address}/v1"), true);
-    let tool = tool_for(
+    let fixture = tool_for(
         &cwd,
         Some(resolver_for(model, Some("sk-image-test".into()), None)),
-    );
+    )
+    .await;
+    let tool = &fixture.tool;
     let result = (tool.execute)(make_ctx(json!({
         "prompt": "a red png",
         "path": "art/hero.png",
@@ -439,15 +680,15 @@ async fn standalone_tool_falls_back_to_turn_model() {
     // proves the turn model was picked up.
     let cwd = tmpdir();
     let model = image_model("http://127.0.0.1:1/v1".into(), true);
-    let tool = tool_for(&cwd, None);
-    let error = (tool.execute)(make_ctx_with_model(
-        json!({ "prompt": "a red png" }),
-        model,
-    ))
-    .await
-    .expect_err("missing api key must fail");
+    let fixture = tool_for(&cwd, None).await;
+    let tool = &fixture.tool;
+    let error = (tool.execute)(make_ctx_with_model(json!({ "prompt": "a red png" }), model))
+        .await
+        .expect_err("missing api key must fail");
     assert!(
-        error.to_string().contains("No API key for provider: test-images"),
+        error
+            .to_string()
+            .contains("No API key for provider: test-images"),
         "{error}"
     );
 }
@@ -462,22 +703,29 @@ async fn revised_prompt_is_echoed_bounded() {
     .await;
     let cwd = tmpdir();
     let model = image_model(format!("http://{address}/v1"), true);
-    let tool = tool_for(
+    let fixture = tool_for(
         &cwd,
         Some(resolver_for(model, Some("sk-image-test".into()), None)),
-    );
+    )
+    .await;
+    let tool = &fixture.tool;
     let result = (tool.execute)(make_ctx(json!({ "prompt": "a red png" })))
         .await
         .expect("generation");
     let text = text_of(&result);
-    assert!(text.contains("revised prompt: a red png, high quality"), "{text}");
+    assert!(
+        text.contains("revised prompt: a red png, high quality"),
+        "{text}"
+    );
 }
 
-#[test]
-fn save_target_names_files_by_count() {
+#[tokio::test]
+async fn save_target_names_files_by_count() {
     let cwd = tmpdir();
     let workspace = crate::WorkspaceRoots::for_tool_factory(&cwd.to_string_lossy());
-    let target = SaveTarget::new(&workspace, "").expect("default target");
+    let fixture = policy_fs(&cwd).await;
+    let fs = &fixture.fs;
+    let target = SaveTarget::new(&workspace, "", Some(fs)).expect("default target");
     let format = ImageFormat::Png;
     assert_eq!(
         target.resolve(format, 1, 0).unwrap().file_name().unwrap(),
@@ -488,346 +736,457 @@ fn save_target_names_files_by_count() {
         "image-2.png"
     );
 }
-    /// Returns a mock response with `count` copies of the 1x1 PNG.
-    fn json_data_response_n(count: usize) -> String {
-        let data: Vec<Value> = (0..count)
-            .map(|_| json!({ "b64_json": ONE_PX_PNG_B64 }))
-            .collect();
-        json!({ "data": data }).to_string()
-    }
+/// Returns a mock response with `count` copies of the 1x1 PNG.
+fn json_data_response_n(count: usize) -> String {
+    let data: Vec<Value> = (0..count)
+        .map(|_| json!({ "b64_json": ONE_PX_PNG_B64 }))
+        .collect();
+    json!({ "data": data }).to_string()
+}
 
-    #[tokio::test]
-    async fn prompt_at_exactly_the_bound_is_accepted() {
-        // A prompt of exactly MAX_IMAGE_GEN_PROMPT_CHARS characters must pass
-        // the bound check (boundary: one more would fail). This defends the
-        // `>` vs `>=` choice in the tool's prompt gate.
-        let (address, _) = spawn_mock(json_data_response_n(1), "200 OK").await;
-        let cwd = tmpdir();
-        let model = image_model(format!("http://{address}/v1"), true);
-        let tool = tool_for(
-            &cwd,
-            Some(resolver_for(model, Some("sk-image-test".into()), None)),
-        );
-        let prompt = "a".repeat(MAX_IMAGE_GEN_PROMPT_CHARS);
-        let result = (tool.execute)(make_ctx(json!({ "prompt": prompt })))
-            .await
-            .expect("boundary prompt accepted");
-        assert!(text_of(&result).contains("Generated 1 image(s)"), "{}", text_of(&result));
-    }
-
-    #[tokio::test]
-    async fn n_at_exactly_four_is_accepted() {
-        // n=4 is the upper bound and must be accepted; one more (n=5) is
-        // rejected. This defends the `> MAX_IMAGE_GEN_N` boundary.
-        let (address, _) = spawn_mock(json_data_response_n(4), "200 OK").await;
-        let cwd = tmpdir();
-        let model = image_model(format!("http://{address}/v1"), true);
-        let tool = tool_for(
-            &cwd,
-            Some(resolver_for(model, Some("sk-image-test".into()), None)),
-        );
-        let result = (tool.execute)(make_ctx(json!({ "prompt": "x", "n": 4 })))
-            .await
-            .expect("n=4 accepted");
-        let text = text_of(&result);
-        assert!(text.contains("Generated 4 image(s)"), "{text}");
-        for i in 1..=4 {
-            assert!(cwd.join(format!("images/image-{i}.png")).exists(), "image {i} saved");
-        }
-    }
-
-    #[tokio::test]
-    async fn capability_gate_creates_no_file_before_erroring() {
-        // A model without image_generation must error before any filesystem
-        // write — the default image directory is not created.
-        let cwd = tmpdir();
-        let model = image_model("http://127.0.0.1:1/v1".into(), false);
-        let tool = tool_for(
-            &cwd,
-            Some(resolver_for(model, Some("sk-image-test".into()), None)),
-        );
-        let error = (tool.execute)(make_ctx(json!({ "prompt": "a red png" })))
-            .await
-            .expect_err("non-image model must fail");
-        assert!(error.to_string().contains("does not support image generation"), "{error}");
-        // The save target is resolved AFTER the capability gate, so no
-        // `images` directory is created on a capability refusal.
-        assert!(!cwd.join("images").exists(), "images dir created despite capability refusal");
-    }
-
-    #[tokio::test]
-    async fn multiple_images_with_single_file_path_is_rejected() {
-        // Requesting n>1 while naming a single image file is a contradiction
-        // the tool must catch before any network call.
-        let cwd = tmpdir();
-        let model = image_model("http://127.0.0.1:1/v1".into(), true);
-        let tool = tool_for(
-            &cwd,
-            Some(resolver_for(model, Some("sk-image-test".into()), None)),
-        );
-        let error = (tool.execute)(make_ctx(json!({
-            "prompt": "a red png",
-            "n": 2,
-            "path": "single.png",
-        })))
+#[tokio::test]
+async fn prompt_at_exactly_the_bound_is_accepted() {
+    // A prompt of exactly MAX_IMAGE_GEN_PROMPT_CHARS characters must pass
+    // the bound check (boundary: one more would fail). This defends the
+    // `>` vs `>=` choice in the tool's prompt gate.
+    let (address, _) = spawn_mock(json_data_response_n(1), "200 OK").await;
+    let cwd = tmpdir();
+    let model = image_model(format!("http://{address}/v1"), true);
+    let fixture = tool_for(
+        &cwd,
+        Some(resolver_for(model, Some("sk-image-test".into()), None)),
+    )
+    .await;
+    let tool = &fixture.tool;
+    let prompt = "a".repeat(MAX_IMAGE_GEN_PROMPT_CHARS);
+    let result = (tool.execute)(make_ctx(json!({ "prompt": prompt })))
         .await
-        .expect_err("n>1 with file path must fail");
-        assert!(error.to_string().contains("single image file"), "{error}");
-        assert!(error.to_string().contains("n=2"), "{error}");
-        assert!(!cwd.join("single.png").exists());
-    }
+        .expect("boundary prompt accepted");
+    assert!(
+        text_of(&result).contains("Generated 1 image(s)"),
+        "{}",
+        text_of(&result)
+    );
+}
 
-    #[tokio::test]
-    async fn explicit_directory_path_saves_multiple_images() {
-        // A non-extension `path` is treated as a directory; multiple images
-        // save into it as image-1.png / image-2.png (the Dir resolve branch).
-        let (address, _) = spawn_mock(json_data_response_n(2), "200 OK").await;
-        let cwd = tmpdir();
-        let model = image_model(format!("http://{address}/v1"), true);
-        let tool = tool_for(
-            &cwd,
-            Some(resolver_for(model, Some("sk-image-test".into()), None)),
-        );
-        let result = (tool.execute)(make_ctx(json!({
-            "prompt": "two pngs",
-            "n": 2,
-            "path": "out",
-        })))
+#[tokio::test]
+async fn n_at_exactly_four_is_accepted() {
+    // n=4 is the upper bound and must be accepted; one more (n=5) is
+    // rejected. This defends the `> MAX_IMAGE_GEN_N` boundary.
+    let (address, _) = spawn_mock(json_data_response_n(4), "200 OK").await;
+    let cwd = tmpdir();
+    let model = image_model(format!("http://{address}/v1"), true);
+    let fixture = tool_for(
+        &cwd,
+        Some(resolver_for(model, Some("sk-image-test".into()), None)),
+    )
+    .await;
+    let tool = &fixture.tool;
+    let result = (tool.execute)(make_ctx(json!({ "prompt": "x", "n": 4 })))
         .await
-        .expect("generation into directory");
-        let text = text_of(&result);
-        assert!(text.contains("out/image-1.png"), "{text}");
-        assert!(text.contains("out/image-2.png"), "{text}");
-        assert!(cwd.join("out/image-1.png").exists());
-        assert!(cwd.join("out/image-2.png").exists());
-    }
-
-    #[tokio::test]
-    async fn corrupt_image_data_is_rejected_and_not_saved() {
-        // The endpoint returns valid base64 that decodes to non-image bytes;
-        // the inspect_image pre-check rejects it and nothing is written.
-        let garbage = base64::engine::general_purpose::STANDARD
-            .decode("aGVsbG8gd29ybGQ=") // "hello world"
-            .expect("decode fixture");
-        let b64_garbage = base64::engine::general_purpose::STANDARD.encode(&garbage);
-        let (address, _) = spawn_mock(json_data_response(&[&b64_garbage]), "200 OK").await;
-        let cwd = tmpdir();
-        let model = image_model(format!("http://{address}/v1"), true);
-        let tool = tool_for(
-            &cwd,
-            Some(resolver_for(model, Some("sk-image-test".into()), None)),
+        .expect("n=4 accepted");
+    let text = text_of(&result);
+    assert!(text.contains("Generated 4 image(s)"), "{text}");
+    for i in 1..=4 {
+        assert!(
+            cwd.join(format!("images/image-{i}.png")).exists(),
+            "image {i} saved"
         );
-        let error = (tool.execute)(make_ctx(json!({ "prompt": "a red png" })))
-            .await
-            .expect_err("corrupt image must fail");
-        assert!(error.to_string().contains("not a supported image"), "{error}");
-        // The save target directory is created eagerly before the network
-        // call (by design), but no image file is written — the inspect_image
-        // pre-check rejects the corrupt bytes before saving.
-        assert!(!cwd.join("images/image.png").exists(), "corrupt image was saved");
     }
+}
 
-    #[tokio::test]
-    async fn explicit_file_path_mismatch_on_jpeg_extension_is_rejected() {
-        // A .jpeg extension must map to the "jpg" canonical name and still
-        // mismatch a PNG payload — defending the jpeg→jpg normalization.
-        let (address, _) = spawn_mock(json_data_response(&[ONE_PX_PNG_B64]), "200 OK").await;
-        let cwd = tmpdir();
-        let model = image_model(format!("http://{address}/v1"), true);
-        let tool = tool_for(
-            &cwd,
-            Some(resolver_for(model, Some("sk-image-test".into()), None)),
-        );
-        let error = (tool.execute)(make_ctx(json!({
-            "prompt": "a red png",
-            "path": "shot.jpeg",
-        })))
+#[tokio::test]
+async fn capability_gate_creates_no_file_before_erroring() {
+    // A model without image_generation must error before any filesystem
+    // write — the default image directory is not created.
+    let cwd = tmpdir();
+    let model = image_model("http://127.0.0.1:1/v1".into(), false);
+    let fixture = tool_for(
+        &cwd,
+        Some(resolver_for(model, Some("sk-image-test".into()), None)),
+    )
+    .await;
+    let tool = &fixture.tool;
+    let error = (tool.execute)(make_ctx(json!({ "prompt": "a red png" })))
         .await
-        .expect_err("jpeg/png mismatch must fail");
-        assert!(error.to_string().contains("returned a png image"), "{error}");
-        assert!(!cwd.join("shot.jpeg").exists());
-    }
+        .expect_err("non-image model must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("does not support image generation"),
+        "{error}"
+    );
+    // The save target is resolved AFTER the capability gate, so no
+    // `images` directory is created on a capability refusal.
+    assert!(
+        !cwd.join("images").exists(),
+        "images dir created despite capability refusal"
+    );
+}
 
-    #[test]
-    fn has_image_extension_recognizes_all_whitelisted_extensions() {
-        for ext in ["png", "jpg", "jpeg", "webp", "gif", "bmp", "PNG", "JPG"] {
-            assert!(has_image_extension(&format!("x.{ext}")), "{ext} should be recognized");
-        }
-        // Non-image extensions and bare names are not image files.
-        assert!(!has_image_extension("readme.txt"));
-        assert!(!has_image_extension("noext"));
-        assert!(!has_image_extension(""));
-    }
+#[tokio::test]
+async fn multiple_images_with_single_file_path_is_rejected() {
+    // Requesting n>1 while naming a single image file is a contradiction
+    // the tool must catch before any network call.
+    let cwd = tmpdir();
+    let model = image_model("http://127.0.0.1:1/v1".into(), true);
+    let fixture = tool_for(
+        &cwd,
+        Some(resolver_for(model, Some("sk-image-test".into()), None)),
+    )
+    .await;
+    let tool = &fixture.tool;
+    let error = (tool.execute)(make_ctx(json!({
+        "prompt": "a red png",
+        "n": 2,
+        "path": "single.png",
+    })))
+    .await
+    .expect_err("n>1 with file path must fail");
+    assert!(error.to_string().contains("single image file"), "{error}");
+    assert!(error.to_string().contains("n=2"), "{error}");
+    assert!(!cwd.join("single.png").exists());
+}
 
-    #[test]
-    fn bounded_echo_truncates_long_prompt_with_marker() {
-        let short = "hi";
-        assert_eq!(bounded_echo(short), "hi");
-        let long = "x".repeat(MAX_PROMPT_ECHO_CHARS + 10);
-        let echoed = bounded_echo(&long);
-        assert_eq!(echoed.len(), MAX_PROMPT_ECHO_CHARS + 3, "{}", echoed.len());
-        assert!(echoed.ends_with("..."), "{echoed}");
-    }
+#[tokio::test]
+async fn explicit_directory_path_saves_multiple_images() {
+    // A non-extension `path` is treated as a directory; multiple images
+    // save into it as image-1.png / image-2.png (the Dir resolve branch).
+    let (address, _) = spawn_mock(json_data_response_n(2), "200 OK").await;
+    let cwd = tmpdir();
+    let model = image_model(format!("http://{address}/v1"), true);
+    let fixture = tool_for(
+        &cwd,
+        Some(resolver_for(model, Some("sk-image-test".into()), None)),
+    )
+    .await;
+    let tool = &fixture.tool;
+    let result = (tool.execute)(make_ctx(json!({
+        "prompt": "two pngs",
+        "n": 2,
+        "path": "out",
+    })))
+    .await
+    .expect("generation into directory");
+    let text = text_of(&result);
+    assert!(text.contains("out/image-1.png"), "{text}");
+    assert!(text.contains("out/image-2.png"), "{text}");
+    assert!(cwd.join("out/image-1.png").exists());
+    assert!(cwd.join("out/image-2.png").exists());
+}
 
-    #[test]
-    fn format_extension_covers_supported_and_rejects_unknown() {
-        assert_eq!(format_extension(ImageFormat::Png), Some("png"));
-        assert_eq!(format_extension(ImageFormat::Jpeg), Some("jpg"));
-        assert_eq!(format_extension(ImageFormat::Gif), Some("gif"));
-        assert_eq!(format_extension(ImageFormat::Bmp), Some("bmp"));
-        assert_eq!(format_extension(ImageFormat::WebP), Some("webp"));
-        // A format outside the save whitelist (e.g. TIFF) has no extension,
-        // so the saved file would never be mislabeled.
-        assert_eq!(format_extension(ImageFormat::Tiff), None);
-    }
-
-    #[test]
-    fn inspect_image_rejects_non_image_bytes() {
-        let error = inspect_image(b"not an image at all").expect_err("non-image rejected");
-        assert!(error.to_string().contains("format"), "{error}");
-    }
-
-    #[test]
-    fn save_target_file_rejects_format_extension_mismatch() {
-        let cwd = tmpdir();
-        let workspace = crate::WorkspaceRoots::for_tool_factory(&cwd.to_string_lossy());
-        let target = SaveTarget::new(&workspace, "out.png").expect("file target");
-        // PNG matches; JPEG does not.
-        assert!(target.resolve(ImageFormat::Png, 1, 0).is_ok());
-        let error = target.resolve(ImageFormat::Jpeg, 1, 0).expect_err("mismatch");
-        assert!(error.to_string().contains("returned a jpg image"), "{error}");
-    }
-
-    #[test]
-    fn display_path_strips_workspace_prefix_for_relative_output() {
-        let cwd = tmpdir();
-        let workspace = crate::WorkspaceRoots::for_tool_factory(&cwd.to_string_lossy());
-        let abs = cwd.join("images").join("image.png");
-        assert_eq!(display_path(&workspace, &abs), "images/image.png");
-        // An absolute path outside the workspace is reported verbatim.
-        let outside = std::env::temp_dir().join("elsewhere.png");
-        assert_eq!(display_path(&workspace, &outside), outside.to_string_lossy());
-    }
-
-    #[test]
-    fn save_target_empty_path_creates_default_images_dir() {
-        let cwd = tmpdir();
-        let workspace = crate::WorkspaceRoots::for_tool_factory(&cwd.to_string_lossy());
-        let target = SaveTarget::new(&workspace, "").expect("default dir");
-        assert!(cwd.join("images").exists(), "default images dir created");
-        assert!(matches!(target, SaveTarget::Dir(_)));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn save_target_rejects_default_images_symlink_escaping_workspace() {
-        // A pre-existing `images` symlink pointing outside the workspace
-        // must be rejected by the default-path resolution (it goes through
-        // resolve_scoped_path like any explicit path), never followed.
-        let cwd = tmpdir();
-        let outside = tmpdir();
-        std::os::unix::fs::symlink(&outside, cwd.join("images")).expect("symlink images");
-        let workspace = crate::WorkspaceRoots::for_tool_factory(&cwd.to_string_lossy());
-        let error = SaveTarget::new(&workspace, "")
-            .expect_err("default images symlink escaping the workspace must fail");
-        let message = error.to_string();
-        assert!(
-            message.contains("escapes") || message.to_ascii_lowercase().contains("workspace"),
-            "{message}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn default_save_rejects_parent_symlink_swap_before_write() {
-        // The default `images` directory is validated before the network
-        // call; a hostile swap of that directory for a symlink to outside
-        // (done by the mock while the request is in flight) must be caught
-        // at write time, and nothing may land outside the workspace.
-        let cwd = tmpdir();
-        let outside = tmpdir();
-        let outside_clone = outside.clone();
-        let cwd_clone = cwd.clone();
-        let (address, _) = spawn_mock_swapping_images(&cwd_clone, &outside_clone, "200 OK").await;
-        let model = image_model(format!("http://{address}/v1"), true);
-        let tool = tool_for(
-            &cwd,
-            Some(resolver_for(model, Some("sk-image-test".into()), None)),
-        );
-        let error = (tool.execute)(make_ctx(json!({ "prompt": "a red png" })))
-            .await
-            .expect_err("symlink swap before write must fail");
-        let message = error.to_string();
-        assert!(
-            message.contains("outside the workspace") || message.contains("symlink"),
-            "{message}"
-        );
-        assert!(
-            outside.read_dir().expect("outside dir").next().is_none(),
-            "image bytes leaked outside the workspace: {}",
-            outside.display()
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn default_save_rejects_symlink_at_final_target() {
-        // The final image file itself is a symlink to an outside location:
-        // the write must refuse it (the O_NOFOLLOW guard) instead of
-        // following the link.
-        let cwd = tmpdir();
-        let outside = tmpdir();
-        let outside_file = outside.join("victim.png");
-        std::fs::write(&outside_file, b"original").expect("outside victim");
-        std::fs::create_dir_all(cwd.join("images")).expect("images dir");
-        std::os::unix::fs::symlink(&outside_file, cwd.join("images").join("image.png"))
-            .expect("symlink final target");
-        let (address, _) = spawn_mock(json_data_response(&[ONE_PX_PNG_B64]), "200 OK").await;
-        let model = image_model(format!("http://{address}/v1"), true);
-        let tool = tool_for(
-            &cwd,
-            Some(resolver_for(model, Some("sk-image-test".into()), None)),
-        );
-        let error = (tool.execute)(make_ctx(json!({ "prompt": "a red png" })))
-            .await
-            .expect_err("symlink at the final target must fail");
-        assert!(error.to_string().contains("symlink"), "{error}");
-        assert_eq!(
-            std::fs::read(&outside_file).expect("victim unchanged"),
-            b"original",
-            "the symlinked file must not be overwritten"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn explicit_path_rejects_parent_symlink_swap_before_write() {
-        // Same guard for an explicit single-file path whose parent directory
-        // is swapped for an escaping symlink while the request is in flight.
-        let cwd = tmpdir();
-        let outside = tmpdir();
-        let outside_clone = outside.clone();
-        let cwd_clone = cwd.clone();
-        let (address, _) = spawn_mock_swapping_images(&cwd_clone, &outside_clone, "200 OK").await;
-        let model = image_model(format!("http://{address}/v1"), true);
-        let tool = tool_for(
-            &cwd,
-            Some(resolver_for(model, Some("sk-image-test".into()), None)),
-        );
-        let error = (tool.execute)(make_ctx(json!({
-            "prompt": "a red png",
-            "path": "images/shot.png",
-        })))
+#[tokio::test]
+async fn corrupt_image_data_is_rejected_and_not_saved() {
+    // The endpoint returns valid base64 that decodes to non-image bytes;
+    // the inspect_image pre-check rejects it and nothing is written.
+    let garbage = base64::engine::general_purpose::STANDARD
+        .decode("aGVsbG8gd29ybGQ=") // "hello world"
+        .expect("decode fixture");
+    let b64_garbage = base64::engine::general_purpose::STANDARD.encode(&garbage);
+    let (address, _) = spawn_mock(json_data_response(&[&b64_garbage]), "200 OK").await;
+    let cwd = tmpdir();
+    let model = image_model(format!("http://{address}/v1"), true);
+    let fixture = tool_for(
+        &cwd,
+        Some(resolver_for(model, Some("sk-image-test".into()), None)),
+    )
+    .await;
+    let tool = &fixture.tool;
+    let error = (tool.execute)(make_ctx(json!({ "prompt": "a red png" })))
         .await
-        .expect_err("parent swap before write must fail");
-        let message = error.to_string();
+        .expect_err("corrupt image must fail");
+    assert!(
+        error.to_string().contains("not a supported image"),
+        "{error}"
+    );
+    // The save target directory is created eagerly before the network
+    // call (by design), but no image file is written — the inspect_image
+    // pre-check rejects the corrupt bytes before saving.
+    assert!(
+        !cwd.join("images/image.png").exists(),
+        "corrupt image was saved"
+    );
+}
+
+#[tokio::test]
+async fn explicit_file_path_mismatch_on_jpeg_extension_is_rejected() {
+    // A .jpeg extension must map to the "jpg" canonical name and still
+    // mismatch a PNG payload — defending the jpeg→jpg normalization.
+    let (address, _) = spawn_mock(json_data_response(&[ONE_PX_PNG_B64]), "200 OK").await;
+    let cwd = tmpdir();
+    let model = image_model(format!("http://{address}/v1"), true);
+    let fixture = tool_for(
+        &cwd,
+        Some(resolver_for(model, Some("sk-image-test".into()), None)),
+    )
+    .await;
+    let tool = &fixture.tool;
+    let error = (tool.execute)(make_ctx(json!({
+        "prompt": "a red png",
+        "path": "shot.jpeg",
+    })))
+    .await
+    .expect_err("jpeg/png mismatch must fail");
+    assert!(
+        error.to_string().contains("returned a png image"),
+        "{error}"
+    );
+    assert!(!cwd.join("shot.jpeg").exists());
+}
+
+#[test]
+fn has_image_extension_recognizes_all_whitelisted_extensions() {
+    for ext in ["png", "jpg", "jpeg", "webp", "gif", "bmp", "PNG", "JPG"] {
         assert!(
-            message.contains("outside the workspace") || message.contains("symlink"),
-            "{message}"
-        );
-        assert!(
-            outside.read_dir().expect("outside dir").next().is_none(),
-            "image bytes leaked outside the workspace: {}",
-            outside.display()
+            has_image_extension(&format!("x.{ext}")),
+            "{ext} should be recognized"
         );
     }
+    // Non-image extensions and bare names are not image files.
+    assert!(!has_image_extension("readme.txt"));
+    assert!(!has_image_extension("noext"));
+    assert!(!has_image_extension(""));
+}
+
+#[test]
+fn bounded_echo_truncates_long_prompt_with_marker() {
+    let short = "hi";
+    assert_eq!(bounded_echo(short), "hi");
+    let long = "x".repeat(MAX_PROMPT_ECHO_CHARS + 10);
+    let echoed = bounded_echo(&long);
+    assert_eq!(echoed.len(), MAX_PROMPT_ECHO_CHARS + 3, "{}", echoed.len());
+    assert!(echoed.ends_with("..."), "{echoed}");
+}
+
+#[test]
+fn format_extension_covers_supported_and_rejects_unknown() {
+    assert_eq!(format_extension(ImageFormat::Png), Some("png"));
+    assert_eq!(format_extension(ImageFormat::Jpeg), Some("jpg"));
+    assert_eq!(format_extension(ImageFormat::Gif), Some("gif"));
+    assert_eq!(format_extension(ImageFormat::Bmp), Some("bmp"));
+    assert_eq!(format_extension(ImageFormat::WebP), Some("webp"));
+    // A format outside the save whitelist (e.g. TIFF) has no extension,
+    // so the saved file would never be mislabeled.
+    assert_eq!(format_extension(ImageFormat::Tiff), None);
+}
+
+#[test]
+fn inspect_image_rejects_non_image_bytes() {
+    let error = inspect_image(b"not an image at all").expect_err("non-image rejected");
+    assert!(error.to_string().contains("format"), "{error}");
+}
+
+#[tokio::test]
+async fn save_target_file_rejects_format_extension_mismatch() {
+    let cwd = tmpdir();
+    let workspace = crate::WorkspaceRoots::for_tool_factory(&cwd.to_string_lossy());
+    let fixture = policy_fs(&cwd).await;
+    let fs = &fixture.fs;
+    let target = SaveTarget::new(&workspace, "out.png", Some(fs)).expect("file target");
+    // PNG matches; JPEG does not.
+    assert!(target.resolve(ImageFormat::Png, 1, 0).is_ok());
+    let error = target
+        .resolve(ImageFormat::Jpeg, 1, 0)
+        .expect_err("mismatch");
+    assert!(
+        error.to_string().contains("returned a jpg image"),
+        "{error}"
+    );
+}
+
+#[test]
+fn display_path_strips_workspace_prefix_for_relative_output() {
+    let cwd = tmpdir();
+    let workspace = crate::WorkspaceRoots::for_tool_factory(&cwd.to_string_lossy());
+    let abs = cwd.join("images").join("image.png");
+    assert_eq!(display_path(&workspace, &abs), "images/image.png");
+    // An absolute path outside the workspace is reported verbatim.
+    let outside = std::env::temp_dir().join("elsewhere.png");
+    assert_eq!(
+        display_path(&workspace, &outside),
+        outside.to_string_lossy()
+    );
+}
+
+#[tokio::test]
+async fn save_target_empty_path_creates_default_images_dir() {
+    let cwd = tmpdir();
+    let workspace = crate::WorkspaceRoots::for_tool_factory(&cwd.to_string_lossy());
+    let fixture = policy_fs(&cwd).await;
+    let fs = &fixture.fs;
+    let target = SaveTarget::new(&workspace, "", Some(fs)).expect("default dir");
+    assert!(cwd.join("images").exists(), "default images dir created");
+    assert!(matches!(target, SaveTarget::Dir(_)));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn save_target_rejects_default_images_symlink_escaping_workspace() {
+    // A pre-existing `images` symlink pointing outside the workspace
+    // must be rejected by the default-path resolution (it goes through
+    // resolve_scoped_path like any explicit path), never followed.
+    let cwd = tmpdir();
+    let outside = tmpdir();
+    std::os::unix::fs::symlink(&outside, cwd.join("images")).expect("symlink images");
+    let workspace = crate::WorkspaceRoots::for_tool_factory(&cwd.to_string_lossy());
+    let fixture = policy_fs(&cwd).await;
+    let fs = &fixture.fs;
+    let error = SaveTarget::new(&workspace, "", Some(fs))
+        .expect_err("default images symlink escaping the workspace must fail");
+    let message = error.to_string();
+    assert!(
+        message.contains("escapes")
+            || message.to_ascii_lowercase().contains("workspace")
+            || message.contains("FilesystemLoop"),
+        "{message}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn default_save_rejects_parent_symlink_swap_before_write() {
+    // The default `images` directory is validated before the network
+    // call; a hostile swap of that directory for a symlink to outside
+    // (done by the mock while the request is in flight) must be caught
+    // at write time, and nothing may land outside the workspace.
+    let cwd = tmpdir();
+    let outside = tmpdir();
+    let outside_clone = outside.clone();
+    let cwd_clone = cwd.clone();
+    let (address, _) = spawn_mock_swapping_images(&cwd_clone, &outside_clone, "200 OK").await;
+    let model = image_model(format!("http://{address}/v1"), true);
+    let fixture = tool_for(
+        &cwd,
+        Some(resolver_for(model, Some("sk-image-test".into()), None)),
+    )
+    .await;
+    let tool = &fixture.tool;
+    let error = (tool.execute)(make_ctx(json!({ "prompt": "a red png" })))
+        .await
+        .expect_err("symlink swap before write must fail");
+    let message = error.to_string();
+    assert!(
+        message.contains("outside the workspace")
+            || message.contains("symlink")
+            || message.contains("FilesystemLoop"),
+        "{message}"
+    );
+    assert!(
+        outside.read_dir().expect("outside dir").next().is_none(),
+        "image bytes leaked outside the workspace: {}",
+        outside.display()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn default_save_rejects_symlink_at_final_target() {
+    // The final image file itself is a symlink to an outside location:
+    // the write must refuse it (the O_NOFOLLOW guard) instead of
+    // following the link.
+    let cwd = tmpdir();
+    let outside = tmpdir();
+    let outside_file = outside.join("victim.png");
+    std::fs::write(&outside_file, b"original").expect("outside victim");
+    std::fs::create_dir_all(cwd.join("images")).expect("images dir");
+    std::os::unix::fs::symlink(&outside_file, cwd.join("images").join("image.png"))
+        .expect("symlink final target");
+    let (address, _) = spawn_mock(json_data_response(&[ONE_PX_PNG_B64]), "200 OK").await;
+    let model = image_model(format!("http://{address}/v1"), true);
+    let fixture = tool_for(
+        &cwd,
+        Some(resolver_for(model, Some("sk-image-test".into()), None)),
+    )
+    .await;
+    let tool = &fixture.tool;
+    let error = (tool.execute)(make_ctx(json!({ "prompt": "a red png" })))
+        .await
+        .expect_err("symlink at the final target must fail");
+    let message = error.to_string();
+    assert!(
+        message.contains("symlink") || message.contains("entry type is unsupported"),
+        "{message}"
+    );
+    assert_eq!(
+        std::fs::read(&outside_file).expect("victim unchanged"),
+        b"original",
+        "the symlinked file must not be overwritten"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn explicit_path_rejects_parent_symlink_swap_before_write() {
+    // Same guard for an explicit single-file path whose parent directory
+    // is swapped for an escaping symlink while the request is in flight.
+    let cwd = tmpdir();
+    let outside = tmpdir();
+    let outside_clone = outside.clone();
+    let cwd_clone = cwd.clone();
+    let (address, _) = spawn_mock_swapping_images(&cwd_clone, &outside_clone, "200 OK").await;
+    let model = image_model(format!("http://{address}/v1"), true);
+    let fixture = tool_for(
+        &cwd,
+        Some(resolver_for(model, Some("sk-image-test".into()), None)),
+    )
+    .await;
+    let tool = &fixture.tool;
+    let error = (tool.execute)(make_ctx(json!({
+        "prompt": "a red png",
+        "path": "images/shot.png",
+    })))
+    .await
+    .expect_err("parent swap before write must fail");
+    let message = error.to_string();
+    assert!(
+        message.contains("outside the workspace")
+            || message.contains("symlink")
+            || message.contains("FilesystemLoop"),
+        "{message}"
+    );
+    assert!(
+        outside.read_dir().expect("outside dir").next().is_none(),
+        "image bytes leaked outside the workspace: {}",
+        outside.display()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn danger_policy_fs_reads_outside_cwd() {
+    // `danger-full-access` is genuine ambient host filesystem authority:
+    // a file outside the session cwd is reachable through the retained
+    // capability, not just the cwd. The cwd root and the ambient
+    // filesystem-root fallback are both retained; the ambient root covers
+    // the outside path.
+    let cwd = tmpdir();
+    let outside = tmpdir();
+    std::fs::write(outside.join("ambient.txt"), b"ambient").expect("outside file");
+    let fixture = policy_fs(&cwd).await;
+    let fs = &fixture.fs;
+    let bytes = fs
+        .read_bounded(&outside.join("ambient.txt"), 64)
+        .expect("danger PolicyFs reads outside cwd");
+    assert_eq!(&bytes, b"ambient");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn confined_policy_fs_denies_outside_cwd() {
+    // `workspace-write` stays cwd-scoped: an outside-cwd path fails closed
+    // with the typed capability error (no ambient root is opened).
+    let cwd = tmpdir();
+    let outside = tmpdir();
+    std::fs::write(outside.join("secret.txt"), b"secret").expect("outside file");
+    let Some(fixture) = confined_policy_fs(&cwd).await else {
+        return;
+    };
+    let fs = &fixture.fs;
+    let error = fs
+        .read_bounded(&outside.join("secret.txt"), 64)
+        .expect_err("confined PolicyFs must deny outside cwd");
+    assert!(
+        matches!(error, crate::fs::FsError::OutsideCapability),
+        "expected OutsideCapability, got {error:?}"
+    );
+}

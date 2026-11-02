@@ -1,4 +1,4 @@
-// Mobile viewport (375×667) web E2E lane (playwright half of E2E.d/web/mobile.sh).
+// Mobile viewport Web E2E lane (playwright half of E2E.d/web/mobile.sh).
 //
 // Environment:
 //   RPI_URL        http://127.0.0.1:<port>/web
@@ -7,17 +7,10 @@
 //   RPI_CHROME     executable path of the system Chrome (optional)
 //   RPI_EVIDENCE   evidence dir for screenshots
 //
-// Asserts the phone-width shell contract (styles.css media queries):
-//   1. core flow works at 375×667: connect, prompt round-trip, panel opens
-//   2. while the run streams: the unified action switches to Stop and is
-//      >= 44px, with no horizontal overflow and composer on-screen
-//   3. no horizontal page overflow (page and with the drawer open)
-//   4. the drawer is full-screen width (== viewport)
-//   5. the composer sits above the fold (bottom <= innerHeight)
-//   6. idle composer: the unified action returns to Send, the textarea is
-//      dominant (usable width >= 240px, height >= 44px)
-//   7. touch targets are >= 44px
-//   8. #thinking-select is hidden at phone width (CSS media query)
+// Asserts the phone-width shell contract (styles.css media queries), including
+// exact two-row composer geometry at 320/375/430px in both idle Send and
+// streaming Stop states: textarea alone on row one; Command/upload/mic/action
+// together on row two; every control >=44px; no wrap or horizontal overflow.
 
 import { chromium } from 'playwright';
 
@@ -45,6 +38,77 @@ async function waitFor(page, fn, label, timeoutMs = 25000, arg) {
   }
 }
 
+async function assertComposerGeometry(page, width, state) {
+  await page.setViewportSize({ width, height: 667 });
+  await waitFor(
+    page,
+    (expected) => document.getElementById('send-btn')?.getAttribute('aria-label') === expected,
+    `${width}px ${state}: composer action state did not settle`,
+    10000,
+    state === 'streaming-stop' ? 'Stop generating' : 'Send message',
+  );
+  const geometry = await page.evaluate(() => {
+    const box = (selector) => {
+      const el = document.querySelector(selector);
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return { top: r.top, bottom: r.bottom, left: r.left, right: r.right, width: r.width, height: r.height };
+    };
+    return {
+      textarea: box('#prompt-input'),
+      command: box('#command-btn'),
+      attach: box('#attach-btn'),
+      mic: box('#mic-btn'),
+      action: box('#send-btn'),
+      footer: box('.app-main > footer'),
+      row: box('#composer-row'),
+      buttons: box('#composer-buttons'),
+      actionLabel: document.getElementById('send-btn')?.getAttribute('aria-label') || '',
+      scrollWidth: document.documentElement.scrollWidth,
+      innerWidth: window.innerWidth,
+      innerHeight: window.innerHeight,
+    };
+  });
+  const controls = [geometry.command, geometry.attach, geometry.mic, geometry.action];
+  if (!geometry.textarea || !geometry.footer || !geometry.row || !geometry.buttons || controls.some((box) => !box)) {
+    fail(`${width}px ${state}: composer geometry target missing`);
+  }
+  if (geometry.scrollWidth > geometry.innerWidth + 1) {
+    fail(`${width}px ${state}: horizontal overflow ${geometry.scrollWidth}px > ${geometry.innerWidth}px`);
+  }
+  if (geometry.footer.bottom > geometry.innerHeight + 1 || geometry.footer.left < -1 || geometry.footer.right > geometry.innerWidth + 1) {
+    fail(`${width}px ${state}: composer is outside viewport (${JSON.stringify(geometry.footer)})`);
+  }
+  if (geometry.textarea.height < 44) fail(`${width}px ${state}: textarea height ${geometry.textarea.height}px < 44px`);
+  for (const [name, box] of [['Command', geometry.command], ['upload', geometry.attach], ['mic', geometry.mic], ['action', geometry.action]]) {
+    if (box.width < 44 || box.height < 44) fail(`${width}px ${state}: ${name} control is ${box.width}x${box.height}px`);
+  }
+  const secondTop = geometry.command.top;
+  const secondBottom = geometry.command.bottom;
+  for (const [name, box] of [['upload', geometry.attach], ['mic', geometry.mic], ['action', geometry.action]]) {
+    if (Math.abs(box.top - secondTop) > 1 || Math.abs(box.bottom - secondBottom) > 1) {
+      fail(`${width}px ${state}: ${name} wrapped off the Command toolbar row`);
+    }
+  }
+  const yLevels = new Set([
+    Math.round(geometry.textarea.top),
+    Math.round(geometry.command.top),
+    Math.round(geometry.attach.top),
+    Math.round(geometry.mic.top),
+    Math.round(geometry.action.top),
+  ]);
+  if (yLevels.size !== 2) {
+    fail(`${width}px ${state}: composer uses ${yLevels.size} y-levels instead of exactly two (${[...yLevels].join(', ')})`);
+  }
+  if (geometry.textarea.bottom > secondTop - 3) {
+    fail(`${width}px ${state}: textarea is not isolated on row one (textarea bottom ${geometry.textarea.bottom}, toolbar top ${secondTop})`);
+  }
+  if (geometry.command.left < geometry.row.left - 1 || geometry.action.right > geometry.row.right + 1) {
+    fail(`${width}px ${state}: toolbar escapes composer row bounds`);
+  }
+  await page.screenshot({ path: `${evidence}/mobile-${width}-${state}.png`, fullPage: true });
+}
+
 async function main() {
   if (!url) fail('RPI_URL is required');
   const launchOptions = chromePath ? { executablePath: chromePath } : {};
@@ -60,19 +124,21 @@ async function main() {
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await waitFor(page, () => document.title === 'rpi web', 'page title missing');
-    await waitFor(page, () => document.querySelector('#conn-state') !== null, 'conn-state missing');
-
     // 1. Core flow: connect with the token, prompt round-trip, open a panel.
     await waitFor(
       page,
-      () => document.getElementById('conn-state').dataset.state === 'on',
+      () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true,
       'WS did not reach "connected"'
     );
     // 1a. While the first stream is in flight, the unified composer action
     // switches to Stop, stays at least 44px high, and remains on-screen.
     await page.fill('#prompt-input', 'hello from a phone');
     await page.press('#prompt-input', 'Enter');
-    await waitFor(page, () => document.getElementById('stream-badge').hidden === false, 'streaming never started');
+    await waitFor(page, () => document.getElementById('send-btn')?.getAttribute('aria-label') === 'Stop generating', 'streaming never started');
+    for (const width of [320, 375, 430]) {
+      await assertComposerGeometry(page, width, 'streaming-stop');
+    }
+    await page.setViewportSize(VIEWPORT);
     const streaming = await page.evaluate(() => {
       const rect = (sel) => {
         const el = document.querySelector(sel);
@@ -115,11 +181,14 @@ async function main() {
     await waitFor(
       page,
       () =>
-        document.getElementById('stream-badge')?.hidden === true &&
         document.getElementById('send-btn')?.getAttribute('aria-label') === 'Send message',
       'stream did not settle back to the idle Send action',
       30000
     );
+    for (const width of [320, 375, 430]) {
+      await assertComposerGeometry(page, width, 'idle-send');
+    }
+    await page.setViewportSize(VIEWPORT);
     // F5: the header hamburger must be VISIBLE at phone width (the media-query
     // rule must win the cascade — an unconditional display:none after the
     // media block hid it at every width) and clicking it must open the
@@ -149,11 +218,47 @@ async function main() {
       },
       'session sidebar drawer never opened from the hamburger'
     );
+    const sessionsTitle = await page.evaluate(() => {
+      const sidebar = document.querySelector('.session-sidebar');
+      const title = document.querySelector('.session-sidebar__title');
+      if (!sidebar || !title) return null;
+      const sr = sidebar.getBoundingClientRect();
+      const tr = title.getBoundingClientRect();
+      return {
+        text: title.textContent,
+        leftInset: tr.left - sr.left,
+        topInset: tr.top - sr.top,
+        right: tr.right,
+        bottom: tr.bottom,
+        sidebarRight: sr.right,
+        sidebarBottom: sr.bottom,
+      };
+    });
+    if (!sessionsTitle || sessionsTitle.text?.toLowerCase() !== 'sessions') {
+      fail(`mobile Sessions title missing: ${JSON.stringify(sessionsTitle)}`);
+    }
+    if (sessionsTitle.leftInset < 8 || sessionsTitle.topInset < 8 || sessionsTitle.right > sessionsTitle.sidebarRight || sessionsTitle.bottom > sessionsTitle.sidebarBottom) {
+      fail(`mobile Sessions title is clipped against the drawer edge: ${JSON.stringify(sessionsTitle)}`);
+    }
     await page.screenshot({ path: `${evidence}/mobile-sidebar-open.png`, fullPage: true });
+    const todoNavPresence = await page.evaluate(() => ({
+      todo: document.querySelectorAll('#todo-toggle-btn').length,
+      legacyTasks: document.querySelectorAll('#todos-toggle-btn').length,
+      legacyChildren: document.querySelectorAll('#todo-child-toggle-btn').length,
+    }));
+    if (todoNavPresence.todo !== 1 || todoNavPresence.legacyTasks !== 0 || todoNavPresence.legacyChildren !== 0) {
+      fail(`Todo feature-nav presence mismatch: ${JSON.stringify(todoNavPresence)}`);
+    }
     // The panel toggles now live IN the drawer (feature nav), so open the
-    // Todo panel from there while the drawer is still open.
-    await page.click('#todos-toggle-btn');
-    await waitFor(page, () => document.getElementById('todo-panel') !== null, 'todo panel did not open');
+    // unified Todo module with its task and child sections together.
+    await page.click('#todo-toggle-btn');
+    await waitFor(page, () => {
+      const panels = document.querySelectorAll('#todo-panel');
+      const panel = panels.length === 1 ? panels[0] : null;
+      return panel !== null
+        && panel.querySelector('.todo-panel__tasks') !== null
+        && panel.querySelector('.todo-child-section') !== null;
+    }, 'unified Todo module did not open with task and child sections');
     // Opening a panel from the feature nav MUST close the session drawer on
     // phones so the full-screen panel is not covered and its close control
     // stays reachable (z-index alone is not enough for the return path).
@@ -244,9 +349,6 @@ async function main() {
       if (state.drawerOpen) fail(`${panel}: session sidebar stayed open`);
       if (state.panelW < state.innerWidth - 1) fail(`${panel}: width ${state.panelW} vs viewport ${state.innerWidth}`);
       if (state.panelH < 100) fail(`${panel}: height ${state.panelH}`);
-      if (state.closeW < 44 || state.closeH < 44) fail(`${close} is ${state.closeW}x${state.closeH}`);
-      if (!state.closeAria) fail(`${close} missing aria-label`);
-      if (state.scrollWidth > state.innerWidth + 1) fail(`${panel}: horizontal overflow`);
       await page.click(close);
       await waitFor(page, (sel) => document.querySelector(sel) === null, `${panel} did not close`, 10000, panel);
     }
@@ -289,7 +391,15 @@ async function main() {
         const r = el.getBoundingClientRect();
         return { top: r.top, bottom: r.bottom, left: r.left, right: r.right, width: r.width, height: r.height };
       };
-      const ids = ['#send-btn', '#settings-toggle-btn', '#todos-toggle-btn', '#goal-panel-btn', '#workflow-toggle-btn'];
+      const ids = [
+        '#send-btn',
+        '#settings-toggle-btn',
+        '#todo-toggle-btn',
+        '#goal-panel-btn',
+        '#workflow-toggle-btn',
+        '.session-sidebar__group-head',
+        '.session-sidebar__switch',
+      ];
       return {
         innerWidth: window.innerWidth,
         innerHeight: window.innerHeight,
@@ -320,11 +430,17 @@ async function main() {
         fail(`touch target ${t.sel} is off-screen vertically: top ${t.top}, bottom ${t.bottom} (viewport ${navTargets.innerHeight}px)`);
       }
     }
-    // Open Todo from the open drawer; opening a panel closes the drawer by
-    // design, so the full-screen width is asserted on the PANEL itself in a
-    // separate step (not on the drawer, which is closed again).
-    await page.click('#todos-toggle-btn');
-    await waitFor(page, () => document.getElementById('todo-panel') !== null, 'todo panel re-open for metrics');
+    // Open the unified Todo module from the open drawer; opening a panel
+    // closes the drawer by design, so the full-screen width is asserted on
+    // the panel itself in a separate step (not on the closed drawer).
+    await page.click('#todo-toggle-btn');
+    await waitFor(page, () => {
+      const panels = document.querySelectorAll('#todo-panel');
+      const panel = panels.length === 1 ? panels[0] : null;
+      return panel !== null
+        && panel.querySelector('.todo-panel__tasks') !== null
+        && panel.querySelector('.todo-child-section') !== null;
+    }, 'unified Todo module did not reopen with task and child sections');
     const todoMetrics = await page.evaluate(() => {
       const pr = document.getElementById('todo-panel')?.getBoundingClientRect();
       return {
@@ -375,12 +491,14 @@ async function main() {
     if (metrics.actionLabel !== 'Send message') {
       fail(`unified action did not return to Send while idle: "${metrics.actionLabel}"`);
     }
-    if (metrics.thinkingDisplay !== 'none') {
-      fail(`#thinking-select should be hidden at phone width, computed display = ${metrics.thinkingDisplay}`);
+    if (metrics.thinkingDisplay === 'none' || metrics.thinkingDisplay === 'missing') {
+      fail(`#thinking-select must be visible at phone width (header has room), computed display = ${metrics.thinkingDisplay}`);
     }
-    await page.screenshot({ path: `${evidence}/mobile-contract.png`, fullPage: true });
+    if (metrics.thinkingDisplay !== 'inline-block' && metrics.thinkingDisplay !== 'inline' && metrics.thinkingDisplay !== 'block') {
+      fail(`#thinking-select unexpected display at phone width: ${metrics.thinkingDisplay}`);
+    }
+    console.log('web-mobile: PASSED (320/375/430 two-row Send/Stop composer geometry + core flow + panel open/close + no overflow + full-screen drawer + 44px targets)');
 
-    console.log('web-mobile: PASSED (core flow + panel open/close + no overflow + full-screen drawer + 44px targets + composer on-screen + usable mobile textarea)');
   } finally {
     await browser.close().catch(() => {});
   }

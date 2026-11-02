@@ -6,7 +6,7 @@
 //! proof that the envelope path never invokes the summarizer. Unknown flags
 //! are rejected with typed usage on stderr.
 //!
-//! No live credentials or network: `PI_OFFLINE=1` with the built-in
+//! No live credentials or network: `RPI_OFFLINE=1` with the built-in
 //! `faux/faux-1` model and an isolated temp HOME.
 
 use std::io::Read;
@@ -61,8 +61,8 @@ fn run_repl(home: &Path, cwd: &Path, stdin: &str) -> (bool, String, String) {
         .arg(cwd)
         .env("HOME", home)
         .env("USERPROFILE", home)
-        .env("PI_OFFLINE", "1")
-        .env("PI_SKIP_VERSION_CHECK", "1")
+        .env("RPI_OFFLINE", "1")
+        .env("RPI_SKIP_VERSION_CHECK", "1")
         .env("PI_FAUX_RESPONSE", FAUX_PROSE)
         .env_remove("PI_PROFILE")
         .stdin(Stdio::piped())

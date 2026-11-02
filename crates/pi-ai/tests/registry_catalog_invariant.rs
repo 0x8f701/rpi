@@ -4,12 +4,11 @@
 
 use std::collections::BTreeSet;
 
-use pi_ai::*;
 use pi_ai::providers::{
-    models_from_config, register_builtins, RadiusCatalog, RadiusCatalogSnapshot,
-    RadiusGatewayConfig, RadiusGatewayModel,
+    RadiusCatalog, RadiusCatalogSnapshot, RadiusGatewayConfig, RadiusGatewayModel,
+    models_from_config, register_builtins,
 };
-
+use pi_ai::*;
 
 fn registered_apis() -> BTreeSet<String> {
     register_builtins();
@@ -46,7 +45,11 @@ fn known_api_constants_are_centralized_with_expected_values() {
         KNOWN_CATALOG_APIS.len(),
         "KNOWN_CATALOG_APIS contains duplicates"
     );
-    assert_eq!(KNOWN_CATALOG_APIS.len(), 12, "expected exactly 12 known catalog APIs");
+    assert_eq!(
+        KNOWN_CATALOG_APIS.len(),
+        12,
+        "expected exactly 12 known catalog APIs"
+    );
 }
 
 #[test]
@@ -102,7 +105,6 @@ fn unknown_api_returns_none_clearly() {
         "unknown API must return None, not a silent fallback"
     );
 }
-
 
 #[test]
 fn all_known_catalog_apis_are_registered() {
@@ -163,11 +165,13 @@ fn radius_models_installed_only_after_valid_restore() {
 
     let catalog = RadiusCatalog::new(provider, "https://radius.pi.dev").expect("catalog");
     catalog
-        .restore_snapshot(RadiusCatalogSnapshot { models, checked_at: Some(42) })
+        .restore_snapshot(RadiusCatalogSnapshot {
+            models,
+            checked_at: Some(42),
+        })
         .expect("valid restore");
 
-    let installed =
-        get_model(provider, "dynamic").expect("dynamic model installed after restore");
+    let installed = get_model(provider, "dynamic").expect("dynamic model installed after restore");
     assert_eq!(installed.api, API_PI_MESSAGES);
     assert_eq!(installed.provider, provider);
 

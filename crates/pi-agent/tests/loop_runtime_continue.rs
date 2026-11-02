@@ -8,11 +8,13 @@
 
 use std::{
     collections::VecDeque,
+    fs::{self, OpenOptions},
+    io::Write,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Result;
@@ -55,10 +57,14 @@ fn assistant(content: Vec<ContentBlock>, stop_reason: StopReason) -> AssistantMe
 }
 
 fn call(id: &str, name: &str) -> ContentBlock {
+    call_with_arguments(id, name, json!({}))
+}
+
+fn call_with_arguments(id: &str, name: &str, arguments: serde_json::Value) -> ContentBlock {
     ContentBlock::ToolCall(ToolCall {
         id: id.into(),
         name: name.into(),
-        arguments: json!({}),
+        arguments,
         thought_signature: None,
     })
 }
@@ -253,6 +259,227 @@ async fn continue_accepts_user_last_context() {
             .any(|event| matches!(event, AgentEvent::ToolExecutionEnd { .. })),
         "no tools were requested, so no tool end events should appear"
     );
+}
+
+#[tokio::test]
+async fn output_limit_tool_call_settles_without_execution() {
+    let executions = Arc::new(AtomicUsize::new(0));
+    let observed = executions.clone();
+    let tool = AgentTool::new("write", "write", Schema::default(), move |_| {
+        let observed = observed.clone();
+        async move {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Ok(AgentToolResult::text("unexpected execution"))
+        }
+    });
+    let stream = scripted(vec![
+        assistant(vec![call("write-call", "write")], StopReason::Length),
+        assistant(vec![ContentBlock::text("recovered")], StopReason::Stop),
+    ]);
+    let context = AgentContext {
+        system_prompt: String::new(),
+        messages: vec![Message::user_text("write the file", 0)],
+        tools: vec![tool],
+    };
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (_controller, abort) = AbortController::new();
+
+    run_agent_loop_continue(
+        context,
+        AgentLoopConfig::default(),
+        recording_sink(log.clone()),
+        stream,
+        abort,
+    )
+    .await
+    .expect("the model loop should recover after the rejected call");
+
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    let events = log.lock();
+    assert!(events.iter().any(|event| matches!(event,
+        AgentEvent::ToolExecutionEnd { tool_call_id, is_error: true, .. }
+            if tool_call_id == "write-call"
+    )));
+    assert!(events.iter().any(|event| matches!(event,
+        AgentEvent::TurnEnd { tool_results, .. }
+            if tool_results.iter().any(|message| message.tool_call_id == "write-call" && message.is_error)
+    )));
+}
+
+#[tokio::test]
+async fn output_limit_write_recovers_through_bounded_chunks() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock after Unix epoch")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "pi-agent-write-recovery-{}-{unique}.txt",
+        std::process::id()
+    ));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let observed_executions = executions.clone();
+    let expected_path = path.clone();
+    let write = AgentTool::new(
+        "write",
+        "write",
+        Schema::object_ordered(vec![
+            ("path".to_owned(), Schema::string(), true),
+            ("content".to_owned(), Schema::string(), true),
+            (
+                "append".to_owned(),
+                Schema {
+                    schema_type: Some(json!("boolean")),
+                    ..Schema::default()
+                },
+                true,
+            ),
+        ]),
+        move |context| {
+            let observed_executions = observed_executions.clone();
+            let expected_path = expected_path.clone();
+            async move {
+                observed_executions.fetch_add(1, Ordering::SeqCst);
+                let actual_path = context
+                    .arguments
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("validated path");
+                assert_eq!(std::path::Path::new(actual_path), expected_path);
+                let content = context
+                    .arguments
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("validated content");
+                let append = context
+                    .arguments
+                    .get("append")
+                    .and_then(serde_json::Value::as_bool)
+                    .expect("validated append");
+                let mut output = OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .append(append)
+                    .truncate(!append)
+                    .open(&expected_path)?;
+                output.write_all(content.as_bytes())?;
+                Ok(AgentToolResult::text("chunk written"))
+            }
+        },
+    );
+    let path_arg = path.to_string_lossy().into_owned();
+    let stream = scripted(vec![
+        assistant(
+            vec![call_with_arguments(
+                "oversized-write",
+                "write",
+                json!({ "path": path_arg, "content": "must not execute", "append": false }),
+            )],
+            StopReason::Length,
+        ),
+        assistant(
+            vec![call_with_arguments(
+                "write-first-chunk",
+                "write",
+                json!({ "path": path_arg, "content": "bounded-", "append": false }),
+            )],
+            StopReason::ToolUse,
+        ),
+        assistant(
+            vec![call_with_arguments(
+                "write-second-chunk",
+                "write",
+                json!({ "path": path_arg, "content": "content\n", "append": true }),
+            )],
+            StopReason::ToolUse,
+        ),
+        assistant(vec![ContentBlock::text("recovered")], StopReason::Stop),
+    ]);
+    let context = AgentContext {
+        system_prompt: String::new(),
+        messages: vec![Message::user_text("write the file", 0)],
+        tools: vec![write],
+    };
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (_controller, abort) = AbortController::new();
+
+    run_agent_loop_continue(
+        context,
+        AgentLoopConfig::default(),
+        recording_sink(log.clone()),
+        stream,
+        abort,
+    )
+    .await
+    .expect("the model loop should recover through bounded writes");
+
+    assert_eq!(executions.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        fs::read(&path).expect("completed file"),
+        b"bounded-content\n"
+    );
+    let events = log.lock();
+    assert!(events.iter().any(|event| matches!(event,
+        AgentEvent::ToolExecutionEnd { tool_call_id, is_error: true, .. }
+            if tool_call_id == "oversized-write"
+    )));
+    for tool_call_id in ["write-first-chunk", "write-second-chunk"] {
+        assert!(events.iter().any(|event| matches!(event,
+            AgentEvent::ToolExecutionEnd { tool_call_id: id, is_error: false, .. }
+                if id == tool_call_id
+        )));
+    }
+    drop(events);
+    fs::remove_file(&path).expect("remove completed file");
+}
+
+#[tokio::test]
+async fn missing_required_command_settles_as_schema_error_without_execution() {
+    let executions = Arc::new(AtomicUsize::new(0));
+    let observed = executions.clone();
+    let command = AgentTool::new(
+        "bash",
+        "bash",
+        Schema::object_ordered(vec![("command".to_owned(), Schema::string(), true)]),
+        move |_| {
+            let observed = observed.clone();
+            async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Ok(AgentToolResult::text("unexpected execution"))
+            }
+        },
+    );
+    let stream = scripted(vec![
+        assistant(vec![call("command-call", "bash")], StopReason::ToolUse),
+        assistant(vec![ContentBlock::text("recovered")], StopReason::Stop),
+    ]);
+    let context = AgentContext {
+        system_prompt: String::new(),
+        messages: vec![Message::user_text("run command", 0)],
+        tools: vec![command],
+    };
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (_controller, abort) = AbortController::new();
+
+    run_agent_loop_continue(
+        context,
+        AgentLoopConfig::default(),
+        recording_sink(log.clone()),
+        stream,
+        abort,
+    )
+    .await
+    .expect("the model loop should continue after the schema error");
+
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    let events = log.lock();
+    assert!(events.iter().any(|event| matches!(event,
+        AgentEvent::ToolExecutionEnd { tool_call_id, is_error: true, .. }
+            if tool_call_id == "command-call"
+    )));
+    assert!(events.iter().any(|event| matches!(event,
+        AgentEvent::TurnEnd { tool_results, .. }
+            if tool_results.iter().any(|message| message.tool_call_id == "command-call" && message.is_error)
+    )));
 }
 
 #[tokio::test]

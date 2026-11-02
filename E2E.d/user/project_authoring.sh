@@ -87,7 +87,7 @@ EOF
     tmux new-session -d -s "$session" -x 150 -y 44 -c "$ws" \
         "env HOME='$root/home' USERPROFILE='$root/home' \
 PI_CODING_AGENT_DIR='$root/home/.pi/agent' \
-PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 \
+RPI_OFFLINE=1 RPI_SKIP_VERSION_CHECK=1 \
 PATH='$toolchain_bin:${PATH:-/usr/bin:/bin}' \
 TERM=xterm-256color \
 '$RPI_BIN' --offline --model user-project-authoring/mock --api-key user-mock-key; printf '===TUI-DONE-project-authoring===\n'"

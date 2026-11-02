@@ -1,6 +1,7 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { App } from './App';
+import { ChatApp } from './chat/ChatApp';
 import { CollabGuestView } from './CollabGuestView';
 import { parseCollabLocation, COLLAB_PATH_PREFIX } from './collab';
 import './styles.css';
@@ -27,7 +28,11 @@ function renderApp(): void {
   }
   createRoot(root).render(
     <StrictMode>
-      {isCollabRoute ? <CollabGuestView link={collabLink} /> : <App />}
+      {isCollabRoute
+        ? <CollabGuestView link={collabLink} />
+        : window.location.pathname === '/chat'
+          ? <ChatApp />
+          : <App />}
     </StrictMode>
   );
 }

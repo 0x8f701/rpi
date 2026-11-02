@@ -25,20 +25,28 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 fn definition() -> AgentDefinition {
-    AgentDefinition { name: "task".to_owned(),
-    description: "background task".to_owned(),
-    system_prompt: "complete the assignment".to_owned(),
-    tools: Some(Vec::new()),
-    autoload_skills: Vec::new(),
-    model: None,
-    thinking_level: Some(ThinkingLevel::Off),
-    max_turns: None,
-    max_tool_calls: None,
-    timeout_secs: None,
-    disallowed_tools: Vec::new(),
-    capability_ceiling: None,
-    source: AgentDefinitionSource::Bundled,
-    path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None }
+    AgentDefinition {
+        name: "task".to_owned(),
+        description: "background task".to_owned(),
+        system_prompt: "complete the assignment".to_owned(),
+        tools: Some(Vec::new()),
+        autoload_skills: Vec::new(),
+        model: None,
+        thinking_level: Some(ThinkingLevel::Off),
+        max_turns: None,
+        max_tool_calls: None,
+        timeout_secs: None,
+        disallowed_tools: Vec::new(),
+        capability_ceiling: None,
+        source: AgentDefinitionSource::Bundled,
+        path: None,
+        trusted: true,
+        kind: pi_coding::AgentDefinitionKind::Agent,
+        personality: None,
+        soft_budget: None,
+        knowledge_roots: Vec::new(),
+        user_proxy: false,
+    }
 }
 
 struct ControlledRuntime {
@@ -123,13 +131,12 @@ fn controlled_runtime(
                 after_tool_call: None,
                 stream_fn: Some(stream_fn),
                 auth_resolver: None,
+                auth_manager: None,
             })
         })
     });
-    let mut config = OrchestrationConfig::new(
-        AgentCatalog::from_agents(vec![definition()]),
-        artifact_dir,
-    );
+    let mut config =
+        OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition()]), artifact_dir);
     config.max_concurrency = max_concurrency;
     config.mailbox_capacity = mailbox_capacity;
     config.idle_ttl = idle_ttl;
@@ -165,15 +172,11 @@ fn context(id: &str, arguments: Value) -> ToolCallContext {
         on_update: Arc::new(|_| {}),
         abort,
         model: None,
+        approval_token: None,
     }
 }
 
-async fn wait_for_count(
-    count: &AtomicUsize,
-    notify: &Notify,
-    expected: usize,
-    description: &str,
-) {
+async fn wait_for_count(count: &AtomicUsize, notify: &Notify, expected: usize, description: &str) {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let notified = notify.notified();
@@ -276,28 +279,40 @@ async fn main_supervises_two_children_with_irc_cancel_and_park() {
     let running_jobs: Vec<JobSnapshot> =
         serde_json::from_value(jobs_result.details["jobs"].clone()).expect("running snapshots");
     assert_eq!(running_jobs.len(), 2);
-    assert!(running_jobs.iter().all(|job| job.status == JobStatus::Running));
+    assert!(
+        running_jobs
+            .iter()
+            .all(|job| job.status == JobStatus::Running)
+    );
     assert_eq!(controlled.peak.load(Ordering::SeqCst), 2);
 
-    // 3) Inter-agent IRC while both are running: Woken means the active child
-    // bridge accepted delivery; durable removal follows asynchronous steering.
-    let alpha_to_beta = controlled.runtime.send("Alpha", "Beta", "alpha-to-beta", None);
+    // 3) Inter-agent IRC while both are running: the active child bridge wakes
+    // Beta, while Main has no child delivery bridge and truthfully queues mail.
+    let alpha_to_beta = controlled
+        .runtime
+        .send("Alpha", "Beta", "alpha-to-beta", None);
     assert_eq!(alpha_to_beta.len(), 1);
     assert_eq!(alpha_to_beta[0].outcome, DeliveryOutcome::Woken);
     assert!(alpha_to_beta[0].error.is_none());
     let beta_to_main = controlled
         .runtime
         .send("Beta", "Main", "beta-status-update", None);
-    assert_eq!(beta_to_main[0].outcome, DeliveryOutcome::Woken);
+    assert_eq!(beta_to_main[0].outcome, DeliveryOutcome::Queued);
     assert!(beta_to_main[0].error.is_none());
 
     // Mail to Main must remain queued and must not be drained by job wait.
     // Beta may still show the accepted message until its active bridge acknowledges it.
-    assert_eq!(controlled.runtime.inbox("Main", true).len(), 1);
-    let beta_pending = controlled.runtime.inbox("Beta", true);
-    assert!(beta_pending.is_empty() || (beta_pending.len() == 1
-        && beta_pending[0].from == "Alpha"
-        && beta_pending[0].body == "alpha-to-beta"));
+    assert_eq!(
+        controlled.runtime.inbox("Main", true).expect("inbox").len(),
+        1
+    );
+    let beta_pending = controlled.runtime.inbox("Beta", true).expect("inbox");
+    assert!(
+        beta_pending.is_empty()
+            || (beta_pending.len() == 1
+                && beta_pending[0].from == "Alpha"
+                && beta_pending[0].body == "alpha-to-beta")
+    );
 
     // 4) hub wait on Alpha must not return while Alpha is still running, and
     //    must not consume Main's unrelated mailbox message.
@@ -312,7 +327,7 @@ async fn main_supervises_two_children_with_irc_cancel_and_park() {
         "hub wait returned before Alpha settled"
     );
     assert_eq!(
-        controlled.runtime.inbox("Main", true).len(),
+        controlled.runtime.inbox("Main", true).expect("inbox").len(),
         1,
         "job wait must not drain mailbox"
     );
@@ -351,7 +366,7 @@ async fn main_supervises_two_children_with_irc_cancel_and_park() {
     assert_eq!(alpha_still[0].status, JobStatus::Running);
 
     // Main mailbox still holds the Beta status update (wait/cancel did not eat it).
-    let main_peek = controlled.runtime.inbox("Main", true);
+    let main_peek = controlled.runtime.inbox("Main", true).expect("inbox");
     assert_eq!(main_peek.len(), 1);
     assert_eq!(main_peek[0].from, "Beta");
     assert_eq!(main_peek[0].body, "beta-status-update");
@@ -371,12 +386,10 @@ async fn main_supervises_two_children_with_irc_cancel_and_park() {
     );
     assert!(alpha_jobs.iter().any(|job| {
         job.id == alpha_job
-            && job
-                .result
-                .as_ref()
-                .is_some_and(|result| {
-                    result.output == format!("supervised result\n\n{}", pi_coding::MISSING_YIELD_WARNING)
-                })
+            && job.result.as_ref().is_some_and(|result| {
+                result.output
+                    == format!("supervised result\n\n{}", pi_coding::MISSING_YIELD_WARNING)
+            })
     }));
 
     // Retained job table: Alpha completed, Beta cancelled.
@@ -402,18 +415,27 @@ async fn main_supervises_two_children_with_irc_cancel_and_park() {
     assert_eq!(beta.status, JobStatus::Cancelled);
 
     // Drain Main inbox explicitly; prove prior waits left it intact until now.
-    let inbox = (hub.execute)(context("main-inbox", json!({ "op": "inbox", "peek": false })))
-        .await
-        .expect("main inbox");
+    let inbox = (hub.execute)(context(
+        "main-inbox",
+        json!({ "op": "inbox", "peek": false }),
+    ))
+    .await
+    .expect("main inbox");
     let messages: Vec<Value> =
         serde_json::from_value(inbox.details["messages"].clone()).expect("messages");
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0]["from"], "Beta");
     assert_eq!(messages[0]["body"], "beta-status-update");
-    assert!(controlled.runtime.inbox("Main", true).is_empty());
+    assert!(
+        controlled
+            .runtime
+            .inbox("Main", true)
+            .expect("inbox")
+            .is_empty()
+    );
 
-    // 7) Roster via hub list — Alpha idle, Beta aborted. The earlier IRC was
-    // accepted by Beta's active Session and is acknowledged before settlement.
+    // 7) Roster via hub list — Alpha idle, Beta aborted. Cancellation returns
+    // Beta's handed-off but unprocessed IRC message to its canonical mailbox.
     let list = (hub.execute)(context("main-list", json!({ "op": "list" })))
         .await
         .expect("hub list");
@@ -428,7 +450,10 @@ async fn main_supervises_two_children_with_irc_cancel_and_park() {
         .expect("beta peer");
     assert_eq!(alpha_peer["status"], "idle");
     assert_eq!(beta_peer["status"], "aborted");
-    assert!(controlled.runtime.inbox("Beta", true).is_empty());
+    let restored_beta = controlled.runtime.inbox("Beta", true).expect("inbox");
+    assert_eq!(restored_beta.len(), 1);
+    assert_eq!(restored_beta[0].from, "Alpha");
+    assert_eq!(restored_beta[0].body, "alpha-to-beta");
 
     // 8) Parked delivery is truthful: mail queues without claiming execution revival.
     // Status stays Parked because no live session resumes.
@@ -458,20 +483,21 @@ async fn main_supervises_two_children_with_irc_cancel_and_park() {
     );
     // Mailbox capacity is 2: first parked message occupies one slot.
     assert_eq!(
-        controlled
-            .runtime
-            .send("Main", "Alpha", "second", None)[0]
-            .outcome,
+        controlled.runtime.send("Main", "Alpha", "second", None)[0].outcome,
         DeliveryOutcome::Queued
+    );
+    assert_eq!(
+        controlled.runtime.send("Main", "Alpha", "overflow", None)[0].outcome,
+        DeliveryOutcome::Failed
     );
     assert_eq!(
         controlled
             .runtime
-            .send("Main", "Alpha", "overflow", None)[0]
-            .outcome,
-        DeliveryOutcome::Failed
+            .inbox("Alpha", true)
+            .expect("inbox")
+            .len(),
+        2
     );
-    assert_eq!(controlled.runtime.inbox("Alpha", true).len(), 2);
     assert_eq!(
         controlled
             .runtime
@@ -494,7 +520,10 @@ async fn main_supervises_two_children_with_irc_cancel_and_park() {
             .all(|peer| peer.id != "Alpha" && peer.id != "Beta")
     );
     assert_eq!(
-        other.runtime.send("Main", "Alpha", "cross-group leak", None)[0].outcome,
+        other
+            .runtime
+            .send("Main", "Alpha", "cross-group leak", None)[0]
+            .outcome,
         DeliveryOutcome::Failed
     );
     other.runtime.shutdown().await;
@@ -569,8 +598,7 @@ async fn owner_shutdown_cancels_inflight_and_clears_roster() {
             let jobs: Vec<JobSnapshot> =
                 serde_json::from_value(result.details["jobs"].clone()).unwrap_or_default();
             assert!(
-                jobs.is_empty()
-                    || jobs.iter().all(|job| job.status.is_settled()),
+                jobs.is_empty() || jobs.iter().all(|job| job.status.is_settled()),
                 "post-shutdown wait must not report running jobs: {jobs:?}"
             );
         }

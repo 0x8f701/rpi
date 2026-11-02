@@ -8,20 +8,28 @@ use pi_coding::{
 };
 
 fn definition() -> AgentDefinition {
-    AgentDefinition { name: "task".to_owned(),
-    description: "usage test agent".to_owned(),
-    system_prompt: "Return the requested result.".to_owned(),
-    tools: Some(Vec::new()),
-    autoload_skills: Vec::new(),
-    model: None,
-    thinking_level: Some(ThinkingLevel::Off),
-    max_turns: None,
-    max_tool_calls: None,
-    timeout_secs: None,
-    disallowed_tools: Vec::new(),
-    capability_ceiling: None,
-    source: AgentDefinitionSource::Bundled,
-    path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None }
+    AgentDefinition {
+        name: "task".to_owned(),
+        description: "usage test agent".to_owned(),
+        system_prompt: "Return the requested result.".to_owned(),
+        tools: Some(Vec::new()),
+        autoload_skills: Vec::new(),
+        model: None,
+        thinking_level: Some(ThinkingLevel::Off),
+        max_turns: None,
+        max_tool_calls: None,
+        timeout_secs: None,
+        disallowed_tools: Vec::new(),
+        capability_ceiling: None,
+        source: AgentDefinitionSource::Bundled,
+        path: None,
+        trusted: true,
+        kind: pi_coding::AgentDefinitionKind::Agent,
+        personality: None,
+        soft_budget: None,
+        knowledge_roots: Vec::new(),
+        user_proxy: false,
+    }
 }
 
 #[tokio::test]
@@ -77,11 +85,15 @@ async fn completed_child_usage_is_preserved_in_result_and_job_snapshot() {
                 after_tool_call: None,
                 stream_fn: Some(stream_fn),
                 auth_resolver: None,
+                auth_manager: None,
             })
         })
     });
     let runtime = OrchestrationRuntime::new(
-        OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition()]), artifacts.path()),
+        OrchestrationConfig::new(
+            AgentCatalog::from_agents(vec![definition()]),
+            artifacts.path(),
+        ),
         factory,
     )
     .expect("runtime");

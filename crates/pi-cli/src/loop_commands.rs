@@ -3,15 +3,22 @@ use pi_coding::{Application, LoopCreateRequest, LoopUpdateRequest};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InteractiveLoopCommand {
-    Create { interval: String, prompt: String },
+    Create {
+        interval: String,
+        prompt: String,
+    },
     List,
     Update {
         task_id: String,
         interval: Option<String>,
         prompt: Option<String>,
     },
-    Delete { task_id: String },
-    Cancel { task_id: String },
+    Delete {
+        task_id: String,
+    },
+    Cancel {
+        task_id: String,
+    },
 }
 
 pub fn parse_interactive_loop_command(
@@ -259,7 +266,8 @@ mod tests {
         // Subcommand usage errors surface the canonical /loop syntax.
         let err = parse_interactive_loop_command("loop", Some("update abc123")).unwrap_err();
         assert!(
-            err.to_string().contains("usage: /loop update <id> [interval] [prompt]"),
+            err.to_string()
+                .contains("usage: /loop update <id> [interval] [prompt]"),
             "loop update usage: {err:#}"
         );
         assert!(parse_interactive_loop_command("loop", Some("list extra")).is_err());

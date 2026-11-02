@@ -8,8 +8,8 @@ use tokio::net::TcpListener;
 
 use pi_cli::models_config::{
     clear_runtime_api_key, filter_models_for_resolved_auth_async, load_custom_models_from,
-    load_radius_catalog_from, resolve_auth_json_path, resolve_model_request_auth,
-    resolve_model_request_auth_async, set_runtime_api_key,
+    resolve_auth_json_path, resolve_model_request_auth, resolve_model_request_auth_async,
+    restore_radius_catalog_from, set_runtime_api_key,
 };
 use tempfile::TempDir;
 use tokio::sync::Mutex as AsyncMutex;
@@ -123,7 +123,7 @@ async fn explicit_radius_store_restores_offline_catalog() {
     )
     .expect("write Radius store");
 
-    let restored = load_radius_catalog_from(&store_path, false)
+    let restored = restore_radius_catalog_from(&store_path)
         .await
         .expect("load offline Radius catalog")
         .expect("stored Radius catalog");
@@ -145,7 +145,7 @@ async fn malformed_optional_radius_store_is_quarantined_once() {
     fs::write(&store_path, b"{}").expect("write malformed optional store");
 
     assert!(
-        load_radius_catalog_from(&store_path, false)
+        restore_radius_catalog_from(&store_path)
             .await
             .expect("malformed optional store is recoverable")
             .is_none()
@@ -154,12 +154,15 @@ async fn malformed_optional_radius_store_is_quarantined_once() {
     let quarantined = fs::read_dir(directory.path())
         .expect("read store directory")
         .map(|entry| entry.expect("directory entry").file_name())
-        .filter(|name| name.to_string_lossy().starts_with("models-store.json.invalid-"))
+        .filter(|name| {
+            name.to_string_lossy()
+                .starts_with("models-store.json.invalid-")
+        })
         .count();
     assert_eq!(quarantined, 1, "one quarantined cache is retained");
 
     assert!(
-        load_radius_catalog_from(&store_path, false)
+        restore_radius_catalog_from(&store_path)
             .await
             .expect("subsequent launch stays quiet")
             .is_none()
@@ -190,7 +193,10 @@ fn config_templates_cover_literal_and_escape_boundaries() {
     let model = pi_ai::get_model("template-boundaries", "model").expect("registered model");
     let env = HashMap::from([("TOKEN".to_owned(), "value".to_owned())]);
     let auth = resolve_model_request_auth(&model, None, Some(&env)).expect("resolve template");
-    assert_eq!(auth.api_key, "prefix-value-value-$-!-$-${1bad}-${UNCLOSED-$?");
+    assert_eq!(
+        auth.api_key,
+        "prefix-value-value-$-!-$-${1bad}-${UNCLOSED-$?"
+    );
 }
 
 #[test]
@@ -560,11 +566,15 @@ fn empty_final_header_value_is_dropped() {
     );
     load_custom_models_from(&path).expect("load config");
     let model = pi_ai::get_model("blank-header", "model").expect("registered model");
-    let auth = resolve_model_request_auth(&model, None, Some(&HashMap::new()))
-        .expect("resolve auth");
-    assert!(!auth.headers.keys().any(|name| name.eq_ignore_ascii_case("x-optional")));
+    let auth =
+        resolve_model_request_auth(&model, None, Some(&HashMap::new())).expect("resolve auth");
+    assert!(
+        !auth
+            .headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("x-optional"))
+    );
 }
-
 
 #[test]
 fn missing_file_reverts_custom_models_and_builtin_overrides() {
@@ -751,7 +761,10 @@ async fn malformed_reload_preserves_previous_sibling_oauth_path() {
         .await
         .expect("preserved sibling OAuth resolution");
     assert_eq!(auth.api_key, "stable-test-token");
-    assert_eq!(auth.available_model_ids.as_deref(), Some(&["gpt-5.4".to_owned()][..]));
+    assert_eq!(
+        auth.available_model_ids.as_deref(),
+        Some(&["gpt-5.4".to_owned()][..])
+    );
     let debug = format!("{auth:?}");
     assert!(!debug.contains("stable-test-token"));
     assert!(!debug.contains("gpt-5.4"));
@@ -775,7 +788,10 @@ async fn explicit_config_uses_sibling_oauth_metadata_without_global_fallback() {
         .await
         .expect("resolve sibling OAuth credential");
     assert_eq!(auth.api_key, "test-copilot-token");
-    assert_eq!(auth.available_model_ids.as_deref(), Some(&["gpt-5.4".to_owned()][..]));
+    assert_eq!(
+        auth.available_model_ids.as_deref(),
+        Some(&["gpt-5.4".to_owned()][..])
+    );
     let debug = format!("{auth:?}");
     assert!(!debug.contains("test-copilot-token"));
     assert!(!debug.contains("gpt-5.4"));
@@ -785,9 +801,21 @@ async fn explicit_config_uses_sibling_oauth_metadata_without_global_fallback() {
         pi_ai::get_model("openai", "gpt-5.4").expect("non-Copilot model"),
     ];
     let filtered = filter_models_for_resolved_auth_async(models, Some(&HashMap::new())).await;
-    assert!(filtered.iter().any(|candidate| candidate.provider == "github-copilot" && candidate.id == "gpt-5.4"));
-    assert!(!filtered.iter().any(|candidate| candidate.provider == "github-copilot" && candidate.id == "gpt-5.5"));
-    assert!(filtered.iter().any(|candidate| candidate.provider == "openai"));
+    assert!(
+        filtered
+            .iter()
+            .any(|candidate| candidate.provider == "github-copilot" && candidate.id == "gpt-5.4")
+    );
+    assert!(
+        !filtered
+            .iter()
+            .any(|candidate| candidate.provider == "github-copilot" && candidate.id == "gpt-5.5")
+    );
+    assert!(
+        filtered
+            .iter()
+            .any(|candidate| candidate.provider == "openai")
+    );
 }
 
 #[test]
@@ -861,12 +889,16 @@ fn models_and_auth_files_enforce_exact_bounded_reads_atomically() {
     let mut oversized_models = models_secret.as_bytes().to_vec();
     oversized_models.resize(LIMIT + 1, b' ');
     fs::write(&models_path, oversized_models).expect("write oversized models config");
-    let models_error = load_custom_models_from(&models_path).expect_err("oversized models rejected");
+    let models_error =
+        load_custom_models_from(&models_path).expect_err("oversized models rejected");
     let models_message = format!("{models_error:#}");
     assert!(models_message.contains("models.json"));
     assert!(models_message.contains("exceeds"));
     assert!(!models_message.contains(models_secret));
-    assert_eq!(pi_ai::get_model("custom", "model"), Some(stable_model.clone()));
+    assert_eq!(
+        pi_ai::get_model("custom", "model"),
+        Some(stable_model.clone())
+    );
     assert_eq!(
         resolve_model_request_auth(&stable_model, None, Some(&HashMap::new()))
             .expect("stable auth after oversized models")
@@ -885,7 +917,10 @@ fn models_and_auth_files_enforce_exact_bounded_reads_atomically() {
     assert!(auth_message.contains("auth.json"));
     assert!(auth_message.contains("exceeds"));
     assert!(!auth_message.contains(auth_secret));
-    assert_eq!(pi_ai::get_model("custom", "model"), Some(stable_model.clone()));
+    assert_eq!(
+        pi_ai::get_model("custom", "model"),
+        Some(stable_model.clone())
+    );
     assert_eq!(
         resolve_model_request_auth(&stable_model, None, Some(&HashMap::new()))
             .expect("stable auth after oversized auth")

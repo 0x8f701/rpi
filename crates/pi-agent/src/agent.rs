@@ -21,8 +21,9 @@ use tokio::sync::{Mutex, Notify, RwLock};
 use crate::{
     AbortController, AbortSignal, AfterToolCallFn, AgentContext, AgentEvent, AgentLoopConfig,
     AgentMessage, AgentTool, BeforeAgentStartContext, BeforeAgentStartFn, BeforeToolCallFn,
-    ConvertToLlmFn, GetApiKeyFn, Listener, PrepareNextTurnFn, QueueMode, ShouldStopAfterTurnFn,
-    StreamFn, ThinkingLevel, ToolExecutionMode, TransformContextFn, TransformMessageFn,
+    ConvertToLlmFn, GetApiKeyFn, Listener, PrepareNextTurnFn, QueueMode, RestoreMessagesFn,
+    ShouldStopAfterTurnFn, StreamFn, ThinkingLevel, ToolExecutionMode, TransformContextFn,
+    TransformMessageFn,
     queue::PendingQueue, run_agent_loop, run_agent_loop_continue,
 };
 
@@ -65,6 +66,7 @@ pub struct AgentOptions {
     pub stream_fn: StreamFn,
     pub get_api_key: Option<GetApiKeyFn>,
     pub before_tool_call: Option<BeforeToolCallFn>,
+    pub approve_tool_call: Option<BeforeToolCallFn>,
     pub after_tool_call: Option<AfterToolCallFn>,
     pub prepare_next_turn: Option<PrepareNextTurnFn>,
     pub steering_mode: QueueMode,
@@ -86,6 +88,7 @@ impl Default for AgentOptions {
             }),
             get_api_key: None,
             before_tool_call: None,
+            approve_tool_call: None,
             after_tool_call: None,
             prepare_next_turn: None,
             steering_mode: QueueMode::OneAtATime,
@@ -120,6 +123,7 @@ struct Inner {
     transform_message: StdRwLock<Option<TransformMessageFn>>,
     transform_context: StdRwLock<Option<TransformContextFn>>,
     before_tool_call: StdRwLock<Option<BeforeToolCallFn>>,
+    approve_tool_call: StdRwLock<Option<BeforeToolCallFn>>,
     after_tool_call: StdRwLock<Option<AfterToolCallFn>>,
     /// Optional per-turn stop hook consulted by the agent loop after each
     /// assistant turn. When it returns true the run ends cleanly after the
@@ -260,6 +264,7 @@ impl Agent {
                 transform_message: StdRwLock::new(options.transform_message.clone()),
                 transform_context: StdRwLock::new(options.transform_context.clone()),
                 before_tool_call: StdRwLock::new(options.before_tool_call.clone()),
+                approve_tool_call: StdRwLock::new(options.approve_tool_call.clone()),
                 after_tool_call: StdRwLock::new(options.after_tool_call.clone()),
                 should_stop_after_turn: StdRwLock::new(None),
                 options,
@@ -285,7 +290,13 @@ impl Agent {
 
     /// Returns the provider session identifier used for the next model turn.
     pub async fn session_id(&self) -> Option<String> {
-        self.inner.stream_options.read().await.stream.session_id.clone()
+        self.inner
+            .stream_options
+            .read()
+            .await
+            .stream
+            .session_id
+            .clone()
     }
 
     pub async fn set_session_id(&self, session_id: Option<String>) {
@@ -294,7 +305,12 @@ impl Agent {
 
     /// Returns per-level thinking budgets used for the next model turn.
     pub async fn thinking_budgets(&self) -> Option<ThinkingBudgets> {
-        self.inner.stream_options.read().await.thinking_budgets.clone()
+        self.inner
+            .stream_options
+            .read()
+            .await
+            .thinking_budgets
+            .clone()
     }
 
     pub async fn set_thinking_budgets(&self, budgets: Option<ThinkingBudgets>) {
@@ -331,7 +347,13 @@ impl Agent {
 
     /// Returns the synchronous payload hook used for the next model turn.
     pub async fn on_payload(&self) -> Option<PayloadHook> {
-        self.inner.stream_options.read().await.stream.on_payload.clone()
+        self.inner
+            .stream_options
+            .read()
+            .await
+            .stream
+            .on_payload
+            .clone()
     }
 
     pub async fn set_on_payload(&self, hook: Option<PayloadHook>) {
@@ -340,7 +362,13 @@ impl Agent {
 
     /// Returns the synchronous response hook used for the next model turn.
     pub async fn on_response(&self) -> Option<ResponseHook> {
-        self.inner.stream_options.read().await.stream.on_response.clone()
+        self.inner
+            .stream_options
+            .read()
+            .await
+            .stream
+            .on_response
+            .clone()
     }
 
     pub async fn set_on_response(&self, hook: Option<ResponseHook>) {
@@ -428,6 +456,20 @@ impl Agent {
     pub fn set_before_tool_call(&self, hook: Option<BeforeToolCallFn>) {
         *self.inner.before_tool_call.write() = hook;
     }
+
+    #[must_use]
+    pub fn approve_tool_call(&self) -> Option<BeforeToolCallFn> {
+        self.inner.approve_tool_call.read().clone()
+    }
+
+    pub fn set_approve_tool_call(&self, hook: Option<BeforeToolCallFn>) {
+        *self.inner.approve_tool_call.write() = hook;
+    }
+    #[must_use]
+    pub fn after_tool_call(&self) -> Option<AfterToolCallFn> {
+        self.inner.after_tool_call.read().clone()
+    }
+
 
     pub fn set_after_tool_call(&self, hook: Option<AfterToolCallFn>) {
         *self.inner.after_tool_call.write() = hook;
@@ -533,6 +575,14 @@ impl Agent {
         (steering.drain_all(), follow_up.drain_all())
     }
 
+    pub async fn drain_steering_messages(&self) -> Vec<AgentMessage> {
+        self.inner.steering.lock().await.drain_all()
+    }
+
+    pub async fn remove_steering_at(&self, index: usize) -> Option<AgentMessage> {
+        self.inner.steering.lock().await.remove_at(index)
+    }
+
     pub async fn steer(&self, message: AgentMessage) {
         self.inner.steering.lock().await.enqueue(message);
     }
@@ -576,6 +626,11 @@ impl Agent {
     }
 
     pub async fn reset(&self) {
+        // Drain-and-restore: reset must never silently consume acknowledged
+        // steering/follow-up messages. Drain before clearing the state, then
+        // re-enqueue at the queue head (original FIFO order) once the reset is
+        // done, so the messages are delivered against the fresh state.
+        let (steering, follow_up) = self.drain_queued_messages().await;
         let mut state = self.inner.state.write().await;
         state.messages.clear();
         state.is_streaming = false;
@@ -583,7 +638,8 @@ impl Agent {
         state.pending_tool_calls.clear();
         state.error_message = None;
         drop(state);
-        self.clear_all_queues().await;
+        self.inner.steering.lock().await.enqueue_front(steering);
+        self.inner.follow_up.lock().await.enqueue_front(follow_up);
     }
 
     pub async fn prompt(&self, text: impl Into<String>) -> Result<()> {
@@ -631,7 +687,26 @@ impl Agent {
                 return Err(anyhow!("Cannot continue from message role: assistant"));
             }
             let mut context = self.context_snapshot().await;
-            let drained = self.prepare_agent_start(drained, &mut context).await?;
+            // The drained messages already left the queue; if the prepare step
+            // (production: the before_agent_start hook) fails, re-enqueue them
+            // at the head in their original FIFO order so a failed hook never
+            // silently consumes acknowledged steering. The clone is paid only
+            // when a hook is installed — without one the prepare is infallible.
+            let hooked = self.inner.before_agent_start.read().is_some();
+            let original = if hooked { Some(drained.clone()) } else { None };
+            let drained = match self.prepare_agent_start(drained, &mut context).await {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    if let Some(original) = original {
+                        if drained_steering {
+                            self.inner.steering.lock().await.enqueue_front(original);
+                        } else {
+                            self.inner.follow_up.lock().await.enqueue_front(original);
+                        }
+                    }
+                    return Err(error);
+                }
+            };
             let mut config = self.loop_config().await;
             config.skip_initial_steering = drained_steering;
             let emit = self.event_sink();
@@ -802,6 +877,7 @@ impl Agent {
             transform_context: self.inner.transform_context.read().clone(),
             get_api_key: self.inner.options.get_api_key.clone(),
             before_tool_call: self.inner.before_tool_call.read().clone(),
+            approve_tool_call: self.inner.approve_tool_call.read().clone(),
             after_tool_call: self.inner.after_tool_call.read().clone(),
             should_stop_after_turn: self.inner.should_stop_after_turn.read().clone(),
             prepare_next_turn: self.inner.options.prepare_next_turn.clone(),
@@ -813,6 +889,14 @@ impl Agent {
                 let inner = follow_up_inner.clone();
                 Box::pin(async move { inner.follow_up.lock().await.drain() })
             })),
+            restore_steering_messages: Some(restore_pending_messages(
+                self.inner.clone(),
+                false,
+            )),
+            restore_follow_up_messages: Some(restore_pending_messages(
+                self.inner.clone(),
+                true,
+            )),
             ..AgentLoopConfig::default()
         }
     }
@@ -839,7 +923,9 @@ impl Agent {
                 "message_end replacement must preserve the original message role"
             ));
         }
-        Ok(AgentEvent::MessageEnd { message: transformed })
+        Ok(AgentEvent::MessageEnd {
+            message: transformed,
+        })
     }
 
     async fn process_event(&self, event: AgentEvent) -> Result<()> {
@@ -1020,9 +1106,8 @@ mod before_tool_call_getter_tests {
     fn getter_returns_current_hook_and_tracks_replacement() {
         let agent = Agent::new(AgentOptions::default());
         assert!(agent.before_tool_call().is_none());
-        let hook: BeforeToolCallFn = Arc::new(|_| {
-            Box::pin(async { Ok(BeforeToolCallResult::default()) })
-        });
+        let hook: BeforeToolCallFn =
+            Arc::new(|_| Box::pin(async { Ok(BeforeToolCallResult::default()) }));
         agent.set_before_tool_call(Some(hook.clone()));
         let current = agent.before_tool_call().expect("current hook");
         assert!(Arc::ptr_eq(&current, &hook));
@@ -1072,6 +1157,40 @@ async fn release_claim_owned(inner: &Arc<Inner>, generation: u64) {
     let active = active.take().expect("owned run present");
     active.controller.abort();
     inner.idle.notify_waiters();
+}
+
+/// Restores drained-but-undelivered pending messages to the head of the
+/// steering or follow-up queue, preserving their relative FIFO order.
+///
+/// If the run already committed the FIRST restored message to the agent state
+/// (a listener failed after the `MessageEnd` state write), delivering it again
+/// would duplicate it, so it is dropped from the restore batch; the remaining
+/// messages were never emitted and must return to the queue.
+fn restore_pending_messages(inner: Arc<Inner>, follow_up: bool) -> RestoreMessagesFn {
+    Arc::new(move |messages| {
+        let inner = inner.clone();
+        Box::pin(async move {
+            let mut messages = messages;
+            if messages.is_empty() {
+                return;
+            }
+            let committed = {
+                let state = inner.state.read().await;
+                state.messages.last() == messages.first()
+            };
+            if committed {
+                messages.remove(0);
+            }
+            if messages.is_empty() {
+                return;
+            }
+            if follow_up {
+                inner.follow_up.lock().await.enqueue_front(messages);
+            } else {
+                inner.steering.lock().await.enqueue_front(messages);
+            }
+        })
+    })
 }
 
 fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {

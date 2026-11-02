@@ -131,8 +131,9 @@ fn read_document(path: &Path) -> Result<StoreDocument> {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(StoreDocument::default()),
         Err(error) => {
-            return Err(error)
-                .with_context(|| format!("reading Radius catalog store metadata {}", path.display()));
+            return Err(error).with_context(|| {
+                format!("reading Radius catalog store metadata {}", path.display())
+            });
         }
     };
     if !metadata.is_file() {
@@ -196,10 +197,7 @@ fn quarantine_document_locked(path: &Path) -> Result<PathBuf> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("models-store.json");
-    let quarantine = parent.join(format!(
-        "{file_name}.invalid-{}",
-        Uuid::new_v4().simple()
-    ));
+    let quarantine = parent.join(format!("{file_name}.invalid-{}", Uuid::new_v4().simple()));
     fs::rename(path, &quarantine).with_context(|| {
         format!(
             "quarantining invalid Radius catalog store {} as {}",
@@ -209,7 +207,12 @@ fn quarantine_document_locked(path: &Path) -> Result<PathBuf> {
     })?;
     File::open(parent)
         .and_then(|directory| directory.sync_all())
-        .with_context(|| format!("syncing Radius catalog store directory {}", parent.display()))?;
+        .with_context(|| {
+            format!(
+                "syncing Radius catalog store directory {}",
+                parent.display()
+            )
+        })?;
     Ok(quarantine)
 }
 
@@ -218,9 +221,14 @@ fn write_document_atomic(path: &Path, document: &StoreDocument) -> Result<()> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)
-        .with_context(|| format!("creating Radius catalog store directory {}", parent.display()))?;
-    let mut bytes = serde_json::to_vec_pretty(document).context("serializing Radius catalog store")?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "creating Radius catalog store directory {}",
+            parent.display()
+        )
+    })?;
+    let mut bytes =
+        serde_json::to_vec_pretty(document).context("serializing Radius catalog store")?;
     bytes.push(b'\n');
     if bytes.len() as u64 > MAX_STORE_BYTES {
         bail!("Radius catalog store exceeds {MAX_STORE_BYTES} bytes")
@@ -229,10 +237,7 @@ fn write_document_atomic(path: &Path, document: &StoreDocument) -> Result<()> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("models-store.json");
-    let temporary = parent.join(format!(
-        ".{file_name}.{}.tmp",
-        Uuid::new_v4().simple()
-    ));
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4().simple()));
     let result = (|| -> Result<()> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -241,13 +246,24 @@ fn write_document_atomic(path: &Path, document: &StoreDocument) -> Result<()> {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut file = options
-            .open(&temporary)
-            .with_context(|| format!("creating temporary Radius catalog store {}", temporary.display()))?;
-        file.write_all(&bytes)
-            .with_context(|| format!("writing temporary Radius catalog store {}", temporary.display()))?;
-        file.sync_all()
-            .with_context(|| format!("syncing temporary Radius catalog store {}", temporary.display()))?;
+        let mut file = options.open(&temporary).with_context(|| {
+            format!(
+                "creating temporary Radius catalog store {}",
+                temporary.display()
+            )
+        })?;
+        file.write_all(&bytes).with_context(|| {
+            format!(
+                "writing temporary Radius catalog store {}",
+                temporary.display()
+            )
+        })?;
+        file.sync_all().with_context(|| {
+            format!(
+                "syncing temporary Radius catalog store {}",
+                temporary.display()
+            )
+        })?;
         drop(file);
         fs::rename(&temporary, path).with_context(|| {
             format!(
@@ -258,7 +274,12 @@ fn write_document_atomic(path: &Path, document: &StoreDocument) -> Result<()> {
         })?;
         File::open(parent)
             .and_then(|directory| directory.sync_all())
-            .with_context(|| format!("syncing Radius catalog store directory {}", parent.display()))?;
+            .with_context(|| {
+                format!(
+                    "syncing Radius catalog store directory {}",
+                    parent.display()
+                )
+            })?;
         Ok(())
     })();
     if result.is_err() {
@@ -281,8 +302,12 @@ impl<'a> StoreLock<'a> {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating Radius catalog store directory {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "creating Radius catalog store directory {}",
+                parent.display()
+            )
+        })?;
         let file_name = store_path
             .file_name()
             .and_then(|name| name.to_str())

@@ -1,5 +1,7 @@
 use super::AnalysisMode;
-use super::inline::{InlineStyleRange, StyledText, append_styled, parse_inline, shifted_styles, wrap_inline};
+use super::inline::{
+    InlineStyleRange, StyledText, append_styled, parse_inline, shifted_styles, wrap_inline,
+};
 use super::text::display_width;
 
 const MAX_TABLE_COLUMNS: usize = 32;
@@ -49,7 +51,13 @@ pub fn layout_table(table: &TableBlock, available_width: usize) -> Option<TableL
         style: super::inline::InlineStyle::TableBorder,
     }]);
     lines.push(top);
-    append_row(&mut lines, &mut inline_styles, &table.headers, &widths, &table.alignments);
+    append_row(
+        &mut lines,
+        &mut inline_styles,
+        &table.headers,
+        &widths,
+        &table.alignments,
+    );
     let middle = border('├', '┼', '┤', &widths);
     inline_styles.push(vec![InlineStyleRange {
         range: 0..middle.len(),
@@ -57,7 +65,13 @@ pub fn layout_table(table: &TableBlock, available_width: usize) -> Option<TableL
     }]);
     lines.push(middle);
     for row in &table.rows {
-        append_row(&mut lines, &mut inline_styles, row, &widths, &table.alignments);
+        append_row(
+            &mut lines,
+            &mut inline_styles,
+            row,
+            &widths,
+            &table.alignments,
+        );
     }
     let bottom = border('└', '┴', '┘', &widths);
     inline_styles.push(vec![InlineStyleRange {
@@ -148,10 +162,7 @@ fn allocate_widths(table: &TableBlock, available_width: usize) -> Option<Vec<usi
         }
     }
     if preferred.iter().sum::<usize>() <= content_budget {
-        let mut widths = preferred;
-        let remaining = content_budget - widths.iter().sum::<usize>();
-        distribute_evenly(&mut widths, remaining);
-        return Some(widths);
+        return Some(preferred);
     }
     let weights = demand.into_iter().map(integer_sqrt).collect::<Vec<_>>();
     let mut widths = vec![1usize; columns];
@@ -169,18 +180,6 @@ fn allocate_widths(table: &TableBlock, available_width: usize) -> Option<Vec<usi
         remaining -= 1;
     }
     Some(widths)
-}
-
-fn distribute_evenly(widths: &mut [usize], mut remaining: usize) {
-    while remaining > 0 {
-        for width in &mut *widths {
-            if remaining == 0 {
-                return;
-            }
-            *width += 1;
-            remaining -= 1;
-        }
-    }
 }
 
 fn integer_sqrt(value: usize) -> usize {
@@ -223,7 +222,11 @@ fn append_row(
         }];
         for (column, width) in widths.iter().enumerate() {
             let text = parsed[column].get(line).cloned().unwrap_or_default();
-            let aligned = align_styled(text, *width, alignments.get(column).copied().unwrap_or_default());
+            let aligned = align_styled(
+                text,
+                *width,
+                alignments.get(column).copied().unwrap_or_default(),
+            );
             rendered.push(' ');
             styles.extend(shifted_styles(&aligned.styles, rendered.len()));
             rendered.push_str(&aligned.text);
@@ -262,7 +265,11 @@ fn border(left: char, joint: char, right: char, widths: &[usize]) -> String {
     rendered.push(left);
     for (index, width) in widths.iter().enumerate() {
         rendered.extend(std::iter::repeat_n('─', width + 2));
-        rendered.push(if index + 1 == widths.len() { right } else { joint });
+        rendered.push(if index + 1 == widths.len() {
+            right
+        } else {
+            joint
+        });
     }
     rendered
 }
@@ -300,7 +307,11 @@ fn parse_pipe_row(line: &str) -> Option<Vec<String>> {
     // Drop a leading unescaped `|` and a trailing unescaped `|` when present.
     // Both ends are byte indices into `trimmed`; never form a body range with
     // start > end (e.g. a lone `|` would otherwise become 1..0 and panic).
-    let start = if trimmed.starts_with('|') { '|'.len_utf8() } else { 0 };
+    let start = if trimmed.starts_with('|') {
+        '|'.len_utf8()
+    } else {
+        0
+    };
     let end = match trimmed.char_indices().next_back() {
         Some((index, '|')) if index >= start && !is_escaped(trimmed, index) => index,
         _ => trimmed.len(),
@@ -497,7 +508,11 @@ mod tests {
         };
         let layout = layout_table(&comparison, 88).expect("three-column layout");
         assert_eq!(layout.width, 88);
-        assert!(layout.column_widths.iter().all(|width| *width >= 17), "{:?}", layout.column_widths);
+        assert!(
+            layout.column_widths.iter().all(|width| *width >= 17),
+            "{:?}",
+            layout.column_widths
+        );
         assert!(layout.lines.iter().all(|line| display_width(line) <= 88));
     }
 
@@ -512,16 +527,49 @@ mod tests {
         };
         let layout = layout_table(&table, 40).expect("layout");
         for (line, ranges) in layout.lines.iter().zip(&layout.inline_styles) {
-            for (offset, character) in line.char_indices().filter(|(_, character)| "┌┬┐├┼┤│└┴┘─".contains(*character)) {
-                assert!(ranges.iter().any(|styled| {
-                    styled.style == super::super::inline::InlineStyle::TableBorder
-                        && styled.range.start <= offset
-                        && styled.range.end >= offset + character.len_utf8()
-                }), "missing border style for {character:?} in {line:?}: {ranges:?}");
+            for (offset, character) in line
+                .char_indices()
+                .filter(|(_, character)| "┌┬┐├┼┤│└┴┘─".contains(*character))
+            {
+                assert!(
+                    ranges.iter().any(|styled| {
+                        styled.style == super::super::inline::InlineStyle::TableBorder
+                            && styled.range.start <= offset
+                            && styled.range.end >= offset + character.len_utf8()
+                    }),
+                    "missing border style for {character:?} in {line:?}: {ranges:?}"
+                );
             }
         }
-        assert!(layout.inline_styles.iter().flatten().any(|styled| styled.style == super::super::inline::InlineStyle::Bold));
-        assert!(layout.inline_styles.iter().flatten().any(|styled| styled.style == super::super::inline::InlineStyle::Code));
+        assert!(
+            layout
+                .inline_styles
+                .iter()
+                .flatten()
+                .any(|styled| styled.style == super::super::inline::InlineStyle::Bold)
+        );
+        assert!(
+            layout
+                .inline_styles
+                .iter()
+                .flatten()
+                .any(|styled| styled.style == super::super::inline::InlineStyle::Code)
+        );
+    }
+
+    #[test]
+    fn short_table_shrinks_to_natural_content_width() {
+        let table = TableBlock {
+            headers: vec!["Field".to_owned(), "Value".to_owned()],
+            alignments: vec![TableAlignment::Left; 2],
+            rows: vec![vec!["ok".to_owned(), "yes".to_owned()]],
+            source_lines: Vec::new(),
+            line: 1,
+        };
+        let layout = layout_table(&table, 120).expect("layout");
+        assert_eq!(layout.column_widths, vec![5, 5]);
+        assert_eq!(layout.width, 17);
+        assert!(layout.lines.iter().all(|line| display_width(line) == 17));
     }
 
     #[test]
@@ -531,8 +579,7 @@ mod tests {
             "| :--- | :---: | ---: |",
             "| a | b | c |",
         ];
-        let (table, next) =
-            parse_table_at(&lines, 0, AnalysisMode::Complete).expect("valid table");
+        let (table, next) = parse_table_at(&lines, 0, AnalysisMode::Complete).expect("valid table");
         assert_eq!(next, 3);
         assert_eq!(table.headers, vec!["left", "mid", "right"]);
         assert_eq!(
@@ -543,6 +590,9 @@ mod tests {
                 TableAlignment::Right
             ]
         );
-        assert_eq!(table.rows, vec![vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]]);
+        assert_eq!(
+            table.rows,
+            vec![vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]]
+        );
     }
 }

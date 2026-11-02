@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -7,26 +8,95 @@ use pi_agent::{AbortController, ThinkingLevel, ToolCallContext};
 use pi_ai::providers::{FauxProviderOptions, FauxResponse, register_faux_provider};
 use pi_ai::{ContentBlock, Message, Model, SimpleStreamOptions, StopReason, ToolCall};
 use pi_coding::{
-    AgentCatalog, AgentDefinition, AgentDefinitionSource, AgentDiscoveryOptions, AgentStatus,
-    ChildSessionFactory, OrchestrationConfig, OrchestrationRuntime, Session, SessionOptions,
-    TaskItem,
+    AgentCatalog, AgentDefinition, AgentDefinitionSource, AgentStatus, Application,
+    ApplicationRuntimeCandidate, ChildSessionFactory, OrchestrationConfig, OrchestrationRuntime,
+    ResourceDiscovery, ResourceManager, ResourceManagerOptions, Session, SessionOptions, TaskItem,
+    WorkspaceRoots,
 };
 
+/// Danger-full-access sandbox skips the launcher probe (no bubblewrap
+/// dependency), so a hermetic Application bootstrap succeeds on every host.
+/// Mirrors the fixture in `application_generation.rs`.
+const HERMETIC_DANGER_SETTINGS: &str = r#"{"sandbox":{"mode":"danger-full-access"}}"#;
+
+/// Writes a hermetic agent home with danger-full-access sandbox settings and
+/// returns it; the resource manager picks up `settings.json` from this dir.
+fn hermetic_agent_home(root: &std::path::Path) -> std::path::PathBuf {
+    let agent_dir = root.join("agent-home");
+    std::fs::create_dir_all(&agent_dir).expect("hermetic agent dir");
+    std::fs::write(agent_dir.join("settings.json"), HERMETIC_DANGER_SETTINGS)
+        .expect("hermetic settings");
+    agent_dir
+}
+
+/// Builds a hermetic resource manager rooted at `cwd` with all discovery
+/// disabled except `context_files` (callers that need AGENTS.md discovery pass
+/// `include_context_files = true`). The agent home carries danger-full-access
+/// settings so the sandbox bootstrap skips the launcher probe on any host.
+fn hermetic_resources(
+    cwd: &std::path::Path,
+    include_context_files: bool,
+    project_trust_override: bool,
+) -> (ResourceManager, tempfile::TempDir) {
+    // The agent store must sit outside the project boundary. A directory under
+    // `cwd` is rejected with "agent resource root resolves inside the project
+    // boundary".
+    let agent_root = tempfile::tempdir().expect("hermetic agent root");
+    let agent_dir = hermetic_agent_home(agent_root.path());
+    let mut options = ResourceManagerOptions::new(cwd);
+    options.agent_dir = agent_dir;
+    options.disable_extensions = true;
+    options.disable_skills = true;
+    options.disable_prompt_templates = true;
+    options.disable_themes = true;
+    options.disable_context_files = !include_context_files;
+    if project_trust_override {
+        options.project_trust_override = Some(true);
+    }
+    let manager = ResourceManager::new(options).expect("hermetic resources");
+    (manager, agent_root)
+}
+
+/// Creates a hermetic session directory under `root` and returns it.
+fn hermetic_session_dir(root: &std::path::Path) -> std::path::PathBuf {
+    let dir = root.join("sessions");
+    std::fs::create_dir_all(&dir).expect("hermetic session dir");
+    dir
+}
+
+/// Publishes a hermetic Application generation for `session` (danger-full-access
+/// sandbox, no extensions) so the session's governed tools and child snapshots
+/// carry a live application generation. The caller must keep the returned
+/// `Application` alive for as long as governed tools/children are used.
+async fn publish_hermetic_application(session: Session) -> Application {
+    Application::from_runtime_candidate(ApplicationRuntimeCandidate::new(session))
+        .await
+        .expect("hermetic application bootstrap")
+}
+
 fn definition(name: &str) -> AgentDefinition {
-    AgentDefinition { name: name.to_owned(),
-    description: format!("{name} description"),
-    system_prompt: format!("{name} prompt"),
-    tools: Some(Vec::new()),
-    autoload_skills: Vec::new(),
-    model: None,
-    thinking_level: Some(ThinkingLevel::Off),
-    max_turns: None,
-    max_tool_calls: None,
-    timeout_secs: None,
-    disallowed_tools: Vec::new(),
-    capability_ceiling: None,
-    source: AgentDefinitionSource::Bundled,
-    path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None }
+    AgentDefinition {
+        name: name.to_owned(),
+        description: format!("{name} description"),
+        system_prompt: format!("{name} prompt"),
+        tools: Some(Vec::new()),
+        autoload_skills: Vec::new(),
+        model: None,
+        thinking_level: Some(ThinkingLevel::Off),
+        max_turns: None,
+        max_tool_calls: None,
+        timeout_secs: None,
+        disallowed_tools: Vec::new(),
+        capability_ceiling: None,
+        source: AgentDefinitionSource::Bundled,
+        path: None,
+        trusted: true,
+        kind: pi_coding::AgentDefinitionKind::Agent,
+        personality: None,
+        soft_budget: None,
+        knowledge_roots: Vec::new(),
+        user_proxy: false,
+    }
 }
 
 fn faux_factory(
@@ -54,6 +124,7 @@ fn faux_factory(
                 after_tool_call: None,
                 stream_fn: None,
                 auth_resolver: None,
+                auth_manager: None,
             })
         })
     })
@@ -112,6 +183,7 @@ fn faux_factory_with_wait_readiness(
                 after_tool_call: None,
                 stream_fn: None,
                 auth_resolver: None,
+                auth_manager: None,
             })
         })
     })
@@ -168,10 +240,10 @@ fn discovery_is_first_wins_and_project_trust_gated() {
     let root = tempfile::tempdir().expect("root");
     let cwd = root.path().join("project");
     let agent_dir = root.path().join("agent");
-    std::fs::create_dir_all(cwd.join(".pi/agents")).expect("project agents");
+    std::fs::create_dir_all(cwd.join(".rpi/agents")).expect("project agents");
     std::fs::create_dir_all(agent_dir.join("agents")).expect("user agents");
     std::fs::write(
-        cwd.join(".pi/agents/task.md"),
+        cwd.join(".rpi/agents/task.md"),
         "---\nname: task\ndescription: project\nautoloadSkills: [rust]\n---\nproject prompt",
     )
     .expect("project definition");
@@ -186,15 +258,36 @@ fn discovery_is_first_wins_and_project_trust_gated() {
     )
     .expect("review definition");
 
-    let mut options = AgentDiscoveryOptions::new(&cwd, &agent_dir);
-    let untrusted = AgentCatalog::discover(&options).expect("untrusted catalog");
-    assert_eq!(untrusted.get("task").expect("task").description, "user");
-    assert!(untrusted.get("review").is_some());
-    assert!(untrusted.agents().iter().all(|agent| agent.trusted));
+    let discover = |project_trusted: bool| {
+        let mut resource_options = pi_coding::ResourceManagerOptions::new(&cwd);
+        resource_options.agent_dir = agent_dir.clone();
+        resource_options.project_trust_override = Some(project_trusted);
+        resource_options.disable_extensions = true;
+        resource_options.disable_skills = true;
+        resource_options.disable_prompt_templates = true;
+        resource_options.disable_themes = true;
+        resource_options.disable_context_files = true;
+        pi_coding::ResourceManager::new(resource_options)
+            .expect("fixture resources")
+            .snapshot()
+    };
 
-    options.project_trusted = true;
-    let trusted = AgentCatalog::discover(&options).expect("trusted catalog");
-    let task = trusted.get("task").expect("project task");
+    let untrusted = discover(false);
+    let untrusted_task = untrusted
+        .agents
+        .iter()
+        .find(|agent| agent.name == "task")
+        .expect("task");
+    assert_eq!(untrusted_task.description, "user");
+    assert!(untrusted.agents.iter().any(|agent| agent.name == "review"));
+    assert!(untrusted.agents.iter().all(|agent| agent.trusted));
+
+    let trusted = discover(true);
+    let task = trusted
+        .agents
+        .iter()
+        .find(|agent| agent.name == "task")
+        .expect("project task");
     assert_eq!(task.description, "project");
     assert_eq!(task.autoload_skills, vec!["rust"]);
     assert_eq!(task.source, AgentDefinitionSource::Project);
@@ -277,17 +370,25 @@ async fn orchestration_ignores_unknown_tools_without_blocking_any_agents() {
     // The unknown-tool warnings fire once per (agent, tool) — the architect
     // has two unknown names, so exactly two messages, each naming the agent.
     let warnings = runtime.unknown_tool_warnings();
-    assert_eq!(warnings.len(), 2, "one warning per unknown tool: {warnings:?}");
+    assert_eq!(
+        warnings.len(),
+        2,
+        "one warning per unknown tool: {warnings:?}"
+    );
     assert!(
         warnings.iter().all(|warning| warning.contains("architect")),
         "{warnings:?}"
     );
     assert!(
-        warnings.iter().any(|warning| warning.contains("unsupported_child_tool")),
+        warnings
+            .iter()
+            .any(|warning| warning.contains("unsupported_child_tool")),
         "{warnings:?}"
     );
     assert!(
-        warnings.iter().any(|warning| warning.contains("yield_output")),
+        warnings
+            .iter()
+            .any(|warning| warning.contains("yield_output")),
         "{warnings:?}"
     );
     // Repeated spawns do not re-warn: still exactly two entries.
@@ -344,8 +445,20 @@ async fn user_task_spawns_child_that_invokes_configured_glob() {
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: None,
+        auth_manager: None,
     })
     .expect("parent");
+    parent.set_session_dir(hermetic_session_dir(root.path()));
+    // Publish a hermetic danger-full-access Application generation so the
+    // child inherits a governed generation capture: its `glob` tool reads
+    // through the sandbox filesystem authority (host fs under danger mode)
+    // instead of fail-closing with "glob requires an application generation".
+    let (parent_resources, _parent_agent_home) = hermetic_resources(root.path(), false, false);
+    parent
+        .attach_resources(parent_resources)
+        .await
+        .expect("attach parent resources");
+    let _parent_application = publish_hermetic_application(parent.clone()).await;
     let mut agent = definition("task");
     agent.tools = Some(vec!["glob".to_owned()]);
     let mut config = OrchestrationConfig::new(
@@ -375,6 +488,7 @@ async fn user_task_spawns_child_that_invokes_configured_glob() {
         on_update: Arc::new(|_| {}),
         abort,
         model: None,
+        approval_token: None,
     })
     .await
     .expect("user-triggered task spawn");
@@ -398,10 +512,9 @@ async fn user_task_spawns_child_that_invokes_configured_glob() {
     let history = runtime
         .resolve_history_reference("GlobChild")
         .expect("history path");
-    let messages: Vec<Message> = serde_json::from_slice(
-        &std::fs::read(history).expect("read child history"),
-    )
-    .expect("parse child history");
+    let messages: Vec<Message> =
+        serde_json::from_slice(&std::fs::read(history).expect("read child history"))
+            .expect("parse child history");
     let glob_result = messages.iter().find_map(|message| match message {
         Message::ToolResult(result) if result.tool_name == "glob" => Some(result),
         _ => None,
@@ -458,22 +571,45 @@ async fn real_task_children_route_main_alpha_beta_main_through_owned_hub_tools()
         let registration = register_faux_provider(FauxProviderOptions {
             api: api.clone(),
             provider: provider.clone(),
-            models: vec![Model { id, api, provider, ..model.clone() }],
+            models: vec![Model {
+                id,
+                api,
+                provider,
+                ..model.clone()
+            }],
             chunk_size: 64,
         });
         registration.set_responses(responses);
         registration
     };
-    let alpha_registration = register("alpha", vec![
-        hub_tool_call("alpha-wait-main", serde_json::json!({"op":"wait","from":"Main","timeoutMs":2000})),
-        hub_tool_call("alpha-send-beta", serde_json::json!({"op":"send","to":"Beta","message":ALPHA_TO_BETA})),
-        FauxResponse::text("Alpha relayed through its owned hub tool"),
-    ]);
-    let beta_registration = register("beta", vec![
-        hub_tool_call("beta-wait-alpha", serde_json::json!({"op":"wait","from":"Alpha","timeoutMs":2000})),
-        hub_tool_call("beta-send-main", serde_json::json!({"op":"send","to":"Main","message":BETA_TO_MAIN})),
-        FauxResponse::text("Beta relayed through its owned hub tool"),
-    ]);
+    let alpha_registration = register(
+        "alpha",
+        vec![
+            hub_tool_call(
+                "alpha-wait-main",
+                serde_json::json!({"op":"wait","from":"Main","timeoutMs":2000}),
+            ),
+            hub_tool_call(
+                "alpha-send-beta",
+                serde_json::json!({"op":"send","to":"Beta","message":ALPHA_TO_BETA}),
+            ),
+            FauxResponse::text("Alpha relayed through its owned hub tool"),
+        ],
+    );
+    let beta_registration = register(
+        "beta",
+        vec![
+            hub_tool_call(
+                "beta-wait-alpha",
+                serde_json::json!({"op":"wait","from":"Alpha","timeoutMs":2000}),
+            ),
+            hub_tool_call(
+                "beta-send-main",
+                serde_json::json!({"op":"send","to":"Main","message":BETA_TO_MAIN}),
+            ),
+            FauxResponse::text("Beta relayed through its owned hub tool"),
+        ],
+    );
     let mut alpha_definition = definition("alpha");
     alpha_definition.model = Some(vec![format!("{}-alpha", model.id)]);
     let mut beta_definition = definition("beta");
@@ -495,13 +631,33 @@ async fn real_task_children_route_main_alpha_beta_main_through_owned_hub_tools()
     config.mailbox_capacity = 8;
     config.max_recursion_depth = 2;
     config.parent_model = model;
-    let runtime = OrchestrationRuntime::new(config, faux_factory_with_wait_readiness(Arc::new(Mutex::new(registrations)), Arc::new(Mutex::new(wait_readiness)))).expect("runtime");
+    let runtime = OrchestrationRuntime::new(
+        config,
+        faux_factory_with_wait_readiness(
+            Arc::new(Mutex::new(registrations)),
+            Arc::new(Mutex::new(wait_readiness)),
+        ),
+    )
+    .expect("runtime");
     let tools = runtime.agent_tools("Main", 0);
-    let task = tools.iter().find(|tool| tool.name == "task").expect("task tool");
-    let hub = tools.iter().find(|tool| tool.name == "hub").expect("hub tool");
+    let task = tools
+        .iter()
+        .find(|tool| tool.name == "task")
+        .expect("task tool");
+    let hub = tools
+        .iter()
+        .find(|tool| tool.name == "hub")
+        .expect("hub tool");
     let context = |id: &str, arguments| {
         let (_, abort) = AbortController::new();
-        ToolCallContext { tool_call_id: id.to_owned(), arguments, on_update: Arc::new(|_| {}), abort, model: None }
+        ToolCallContext {
+            tool_call_id: id.to_owned(),
+            arguments,
+            on_update: Arc::new(|_| {}),
+            abort,
+            model: None,
+            approval_token: None,
+        }
     };
     let spawned = tokio::time::timeout(
         std::time::Duration::from_millis(500),
@@ -513,26 +669,44 @@ async fn real_task_children_route_main_alpha_beta_main_through_owned_hub_tools()
             ]
         }))),
     ).await.expect("task returns before children settle").expect("spawn children");
-    let mut spawns: Vec<pi_coding::TaskSpawn> = serde_json::from_value(spawned.details).expect("spawn details");
+    let mut spawns: Vec<pi_coding::TaskSpawn> =
+        serde_json::from_value(spawned.details).expect("spawn details");
     spawns.sort_by_key(|spawn| spawn.index);
-    assert_eq!((spawns[0].agent_id.as_str(), spawns[1].agent_id.as_str()), ("Alpha", "Beta"));
+    assert_eq!(
+        (spawns[0].agent_id.as_str(), spawns[1].agent_id.as_str()),
+        ("Alpha", "Beta")
+    );
     assert_ne!(spawns[0].job_id, spawns[1].job_id);
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         tokio::join!(alpha_wait_ready.notified(), beta_wait_ready.notified());
     })
     .await
     .expect("both children register hub wait before Main sends");
-    let main_send = (hub.execute)(context("main-send-alpha", serde_json::json!({"op":"send","to":"Alpha","message":MAIN_TO_ALPHA}))).await.expect("Main sends Alpha");
+    let main_send = (hub.execute)(context(
+        "main-send-alpha",
+        serde_json::json!({"op":"send","to":"Alpha","message":MAIN_TO_ALPHA}),
+    ))
+    .await
+    .expect("Main sends Alpha");
     assert_eq!(main_send.details["receipts"][0]["to"], "Alpha");
     assert_ne!(main_send.details["receipts"][0]["outcome"], "failed");
     let reply = tokio::time::timeout(
         std::time::Duration::from_secs(3),
-        (hub.execute)(context("main-wait-beta", serde_json::json!({"op":"wait","from":"Beta","timeoutMs":2500}))),
-    ).await.expect("bounded Beta wait").expect("Main waits through hub");
+        (hub.execute)(context(
+            "main-wait-beta",
+            serde_json::json!({"op":"wait","from":"Beta","timeoutMs":2500}),
+        )),
+    )
+    .await
+    .expect("bounded Beta wait")
+    .expect("Main waits through hub");
     assert_eq!(reply.details["message"]["from"], "Beta");
     assert_eq!(reply.details["message"]["to"], "Main");
     assert_eq!(reply.details["message"]["body"], BETA_TO_MAIN);
-    let job_ids = spawns.iter().map(|spawn| spawn.job_id.clone()).collect::<Vec<_>>();
+    let job_ids = spawns
+        .iter()
+        .map(|spawn| spawn.job_id.clone())
+        .collect::<Vec<_>>();
     let jobs = tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop {
             let jobs = runtime.jobs(Some(&job_ids));
@@ -541,28 +715,58 @@ async fn real_task_children_route_main_alpha_beta_main_through_owned_hub_tools()
             }
             tokio::task::yield_now().await;
         }
-    }).await.expect("both jobs settle");
-    assert!(jobs.iter().all(|job| job.status == pi_coding::JobStatus::Completed));
+    })
+    .await
+    .expect("both jobs settle");
+    assert!(
+        jobs.iter()
+            .all(|job| job.status == pi_coding::JobStatus::Completed)
+    );
     let history = |id: &str| -> Vec<Message> {
-        serde_json::from_slice(&std::fs::read(runtime.resolve_history_reference(id).expect("history path")).expect("read history")).expect("parse history")
+        serde_json::from_slice(
+            &std::fs::read(runtime.resolve_history_reference(id).expect("history path"))
+                .expect("read history"),
+        )
+        .expect("parse history")
     };
     let alpha_history = history("Alpha");
     let beta_history = history("Beta");
     fn hub_results(messages: &[Message]) -> Vec<&pi_ai::ToolResultMessage> {
-        messages.iter().filter_map(|message| match message {
-            Message::ToolResult(result) if result.tool_name == "hub" => Some(result),
-            _ => None,
-        }).collect()
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::ToolResult(result) if result.tool_name == "hub" => Some(result),
+                _ => None,
+            })
+            .collect()
     }
     let alpha_hub = hub_results(&alpha_history);
     let beta_hub = hub_results(&beta_history);
     assert_eq!(alpha_hub.len(), 2);
-    assert_eq!(alpha_hub[0].details.as_ref().expect("Alpha wait details")["message"]["from"], "Main");
-    assert_eq!(alpha_hub[0].details.as_ref().expect("Alpha wait details")["message"]["body"], MAIN_TO_ALPHA);
-    assert_eq!(alpha_hub[1].details.as_ref().expect("Alpha send details")["receipts"][0]["to"], "Beta");
-    assert_eq!(beta_hub[0].details.as_ref().expect("Beta wait details")["message"]["from"], "Alpha");
-    assert_eq!(beta_hub[0].details.as_ref().expect("Beta wait details")["message"]["body"], ALPHA_TO_BETA);
-    assert_eq!(beta_hub[1].details.as_ref().expect("Beta send details")["receipts"][0]["to"], "Main");
+    assert_eq!(
+        alpha_hub[0].details.as_ref().expect("Alpha wait details")["message"]["from"],
+        "Main"
+    );
+    assert_eq!(
+        alpha_hub[0].details.as_ref().expect("Alpha wait details")["message"]["body"],
+        MAIN_TO_ALPHA
+    );
+    assert_eq!(
+        alpha_hub[1].details.as_ref().expect("Alpha send details")["receipts"][0]["to"],
+        "Beta"
+    );
+    assert_eq!(
+        beta_hub[0].details.as_ref().expect("Beta wait details")["message"]["from"],
+        "Alpha"
+    );
+    assert_eq!(
+        beta_hub[0].details.as_ref().expect("Beta wait details")["message"]["body"],
+        ALPHA_TO_BETA
+    );
+    assert_eq!(
+        beta_hub[1].details.as_ref().expect("Beta send details")["receipts"][0]["to"],
+        "Main"
+    );
     // The model still receives the parent/peer body via the tool-result text
     // (`format!("[{}] {}: {}", id, from, body)`), and the typed `details`
     // carries the same body — but no control/wait-interrupt prose is generated.
@@ -592,9 +796,9 @@ async fn real_task_children_route_main_alpha_beta_main_through_owned_hub_tools()
         alpha_hub[0].details.as_ref().expect("Alpha wait details")["message"]["body"],
         MAIN_TO_ALPHA
     );
-    assert!(runtime.inbox("Alpha", true).is_empty());
-    assert!(runtime.inbox("Beta", true).is_empty());
-    assert!(runtime.inbox("Main", true).is_empty());
+    assert!(runtime.inbox("Alpha", true).expect("inbox").is_empty());
+    assert!(runtime.inbox("Beta", true).expect("inbox").is_empty());
+    assert!(runtime.inbox("Main", true).expect("inbox").is_empty());
     runtime.shutdown().await;
     alpha_registration.unregister();
     beta_registration.unregister();
@@ -615,12 +819,19 @@ async fn selector_settings_choose_the_deterministic_matching_agent() {
         min_score: 0,
         ..pi_coding::SelectorSettings::default()
     });
-    let runtime = OrchestrationRuntime::new(config, Arc::new(|_| {
-        Box::pin(async { panic!("selector test must not create a child") })
-    }))
+    let runtime = OrchestrationRuntime::new(
+        config,
+        Arc::new(|_| Box::pin(async { panic!("selector test must not create a child") })),
+    )
     .expect("runtime");
-    assert_eq!(runtime.select_agent("review this security patch", None), "reviewer");
-    assert_eq!(runtime.select_agent("review this security patch", Some("task")), "task");
+    assert_eq!(
+        runtime.select_agent("review this security patch", None),
+        "reviewer"
+    );
+    assert_eq!(
+        runtime.select_agent("review this security patch", Some("task")),
+        "task"
+    );
     runtime.shutdown().await;
 }
 
@@ -646,32 +857,141 @@ async fn parent_factory_disables_ambient_discovery_and_forbidden_child_tools() {
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: None,
+        auth_manager: None,
     })
     .expect("parent");
     let mut child_definition = definition("child");
-    child_definition.tools = Some(vec!["read".to_owned(), "todo".to_owned(), "process".to_owned(), "task".to_owned(), "hub".to_owned(), "goal".to_owned()]);
-    let child = OrchestrationRuntime::child_factory_from_session(&parent)(pi_coding::ChildSessionRequest {
-        child_id: "Child".to_owned(),
-        parent_id: "Main".to_owned(),
-        max_tools_per_agent: 16,
-        depth: 1,
-        definition: child_definition,
-        assignment: "inspect".to_owned(),
-        system_prompt: "child".to_owned(),
-        requested_tool_names: Some(vec!["read".to_owned(), "todo".to_owned(), "process".to_owned(), "task".to_owned(), "hub".to_owned(), "goal".to_owned()]),
-        orchestration_tools: Vec::new(),
-        thinking_level: None,
-        model: parent.model().unwrap_or_default(),
-        yield_state: Arc::new(pi_coding::YieldState::default()),
-    output_schema: None,
-    schema_mode: None,
-    })
-    .await
-    .expect("child");
+    child_definition.tools = Some(vec![
+        "read".to_owned(),
+        "todo".to_owned(),
+        "process".to_owned(),
+        "task".to_owned(),
+        "hub".to_owned(),
+        "goal".to_owned(),
+    ]);
+    let child =
+        OrchestrationRuntime::child_factory_from_session(&parent)(pi_coding::ChildSessionRequest {
+            child_id: "Child".to_owned(),
+            parent_id: "Main".to_owned(),
+            max_tools_per_agent: 16,
+            depth: 1,
+            definition: child_definition,
+            assignment: "inspect".to_owned(),
+            system_prompt: "child".to_owned(),
+            requested_tool_names: Some(vec![
+                "read".to_owned(),
+                "todo".to_owned(),
+                "process".to_owned(),
+                "task".to_owned(),
+                "hub".to_owned(),
+                "goal".to_owned(),
+            ]),
+            orchestration_tools: Vec::new(),
+            persona_skill_store: None,
+            persona_skills: Arc::new(Vec::new()),
+            shared_skills: Arc::new(Vec::new()),
+            thinking_level: None,
+            model: parent.model().unwrap_or_default(),
+            resolved_model_sequence: Vec::new(),
+            resolved_model_selected_index: 0,
+            yield_state: Arc::new(pi_coding::YieldState::default()),
+            output_schema: None,
+            schema_mode: None,
+        })
+        .await
+        .expect("child");
     // Orchestration plumbing is auto-provided: todo/process/task/hub/goal are
     // never ambient-discovered, and the child-only `yield` tool is appended.
     assert_eq!(child.get_active_tool_names(), vec!["read", "yield"]);
-    assert!(child.select_for_request("local skill").await.skills.is_empty());
+    assert!(
+        child
+            .select_for_request("local skill")
+            .await
+            .skills
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn new_children_inherit_parent_validated_context_snapshot() {
+    let root = tempfile::tempdir().expect("root");
+    std::fs::write(root.path().join("AGENTS.md"), "first rules").expect("first context");
+    // The sandbox HTTP authority staging requires a resolvable model, so
+    // register a hermetic faux provider and use its model for the parent.
+    let context_suffix = uuid::Uuid::now_v7().to_string();
+    let context_model = Model {
+        id: format!("context-parent-{context_suffix}"),
+        name: "Context Parent".to_owned(),
+        api: format!("context-parent-api-{context_suffix}"),
+        provider: format!("context-parent-provider-{context_suffix}"),
+        ..Model::default()
+    };
+    let _context_registration = register_faux_provider(FauxProviderOptions {
+        api: context_model.api.clone(),
+        provider: context_model.provider.clone(),
+        models: vec![context_model.clone()],
+        chunk_size: 1,
+    });
+    let parent = Session::new(SessionOptions {
+        model: context_model,
+        cwd: root.path().to_path_buf(),
+        system_prompt: String::new(),
+        thinking_level: ThinkingLevel::Off,
+        api_key: String::new(),
+        compaction: None,
+        stream_options: Default::default(),
+        tools: Some(Vec::new()),
+        before_tool_call: None,
+        after_tool_call: None,
+        stream_fn: None,
+        auth_resolver: None,
+        auth_manager: None,
+    })
+    .expect("parent");
+    parent.set_session_dir(hermetic_session_dir(root.path()));
+    // Hermetic danger-full-access sandbox + trusted project context files so
+    // the parent publishes a governed Application generation and AGENTS.md
+    // discovery stays deterministic across hosts (no bubblewrap probe).
+    let (resources, _agent_home) = hermetic_resources(root.path(), true, true);
+    parent
+        .attach_resources(resources)
+        .await
+        .expect("attach resources");
+    let application = publish_hermetic_application(parent.clone()).await;
+    let factory = OrchestrationRuntime::child_factory_from_session(&parent);
+    let child_request = |name: &str| pi_coding::ChildSessionRequest {
+        child_id: name.to_owned(),
+        parent_id: "Main".to_owned(),
+        max_tools_per_agent: 16,
+        depth: 1,
+        definition: definition("child"),
+        assignment: "inspect".to_owned(),
+        system_prompt: "child role".to_owned(),
+        requested_tool_names: Some(Vec::new()),
+        orchestration_tools: Vec::new(),
+        persona_skill_store: None,
+        persona_skills: Arc::new(Vec::new()),
+        shared_skills: Arc::new(Vec::new()),
+        thinking_level: None,
+        model: parent.model().unwrap_or_default(),
+        resolved_model_sequence: Vec::new(),
+        resolved_model_selected_index: 0,
+        yield_state: Arc::new(pi_coding::YieldState::default()),
+        output_schema: None,
+        schema_mode: None,
+    };
+    let first = factory(child_request("First")).await.expect("first child");
+    assert!(first.system_prompt().await.contains("first rules"));
+
+    std::fs::write(root.path().join("AGENTS.md"), "second rules").expect("second context");
+    application.reload().await.expect("reload parent resources");
+    assert!(first.system_prompt().await.contains("first rules"));
+    assert!(!first.system_prompt().await.contains("second rules"));
+    let second = factory(child_request("Second"))
+        .await
+        .expect("second child");
+    assert!(second.system_prompt().await.contains("second rules"));
+    assert!(!second.system_prompt().await.contains("first rules"));
 }
 
 #[tokio::test]
@@ -715,10 +1035,11 @@ async fn child_factory_resolves_auth_for_a_different_provider() {
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: Some(resolver),
+        auth_manager: None,
     })
     .expect("parent");
-    let child = OrchestrationRuntime::child_factory_from_session(&parent)(
-        pi_coding::ChildSessionRequest {
+    let child =
+        OrchestrationRuntime::child_factory_from_session(&parent)(pi_coding::ChildSessionRequest {
             child_id: "Child".to_owned(),
             parent_id: "Main".to_owned(),
             max_tools_per_agent: 16,
@@ -728,15 +1049,19 @@ async fn child_factory_resolves_auth_for_a_different_provider() {
             system_prompt: "child".to_owned(),
             requested_tool_names: Some(Vec::new()),
             orchestration_tools: Vec::new(),
+            persona_skill_store: None,
+            persona_skills: Arc::new(Vec::new()),
+            shared_skills: Arc::new(Vec::new()),
             thinking_level: None,
             model: child_model.clone(),
+            resolved_model_sequence: Vec::new(),
+            resolved_model_selected_index: 0,
             yield_state: Arc::new(pi_coding::YieldState::default()),
-        output_schema: None,
-        schema_mode: None,
-        },
-    )
-    .await
-    .expect("child");
+            output_schema: None,
+            schema_mode: None,
+        })
+        .await
+        .expect("child");
     assert_eq!(child.current_api_key(), "child-secret");
     assert_eq!(resolved_models.lock().as_slice(), &[child_model]);
 }
@@ -763,6 +1088,7 @@ async fn child_factory_rejects_cross_provider_reuse_without_auth_resolver() {
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: None,
+        auth_manager: None,
     })
     .expect("parent");
     let error = match OrchestrationRuntime::child_factory_from_session(&parent)(
@@ -776,6 +1102,9 @@ async fn child_factory_rejects_cross_provider_reuse_without_auth_resolver() {
             system_prompt: "child".to_owned(),
             requested_tool_names: Some(Vec::new()),
             orchestration_tools: Vec::new(),
+            persona_skill_store: None,
+            persona_skills: Arc::new(Vec::new()),
+            shared_skills: Arc::new(Vec::new()),
             thinking_level: None,
             model: Model {
                 id: "child-model".to_owned(),
@@ -784,9 +1113,11 @@ async fn child_factory_rejects_cross_provider_reuse_without_auth_resolver() {
                 provider: "child-provider".to_owned(),
                 ..Model::default()
             },
+            resolved_model_sequence: Vec::new(),
+            resolved_model_selected_index: 0,
             yield_state: Arc::new(pi_coding::YieldState::default()),
-        output_schema: None,
-        schema_mode: None,
+            output_schema: None,
+            schema_mode: None,
         },
     )
     .await
@@ -799,7 +1130,9 @@ async fn child_factory_rejects_cross_provider_reuse_without_auth_resolver() {
 
 #[test]
 fn orchestration_settings_are_explicitly_off_by_default() {
-    let runtime = pi_coding::Settings::default().runtime_settings().expect("runtime settings");
+    let runtime = pi_coding::Settings::default()
+        .runtime_settings()
+        .expect("runtime settings");
     assert!(!runtime.orchestration_enabled);
     assert!(!runtime.process_tool_enabled);
     // The todo tool is on by default (OMP parity); `orchestration.todo: false`
@@ -845,6 +1178,7 @@ async fn batch_results_are_correlated_and_artifacts_resolve() {
                 after_tool_call: None,
                 stream_fn: Some(stream_fn),
                 auth_resolver: None,
+                auth_manager: None,
             })
         })
     });
@@ -912,24 +1246,83 @@ async fn batch_results_are_correlated_and_artifacts_resolve() {
                 .is_file()
         );
         assert_eq!(
-            runtime.resolve_read_uri(&result.artifact_ref).expect("artifact URI"),
-            runtime.resolve_agent_reference(&result.id).expect("agent ref")
+            runtime
+                .resolve_read_uri(&result.artifact_ref)
+                .expect("artifact URI"),
+            runtime
+                .resolve_agent_reference(&result.id)
+                .expect("agent ref")
         );
         assert_eq!(
-            runtime.resolve_read_uri(&result.history_ref).expect("history URI"),
-            runtime.resolve_history_reference(&result.id).expect("history ref")
+            runtime
+                .resolve_read_uri(&result.history_ref)
+                .expect("history URI"),
+            runtime
+                .resolve_history_reference(&result.id)
+                .expect("history ref")
         );
         assert_eq!(result.artifact_uri, format!("artifact://{}", result.id));
         assert_eq!(
-            runtime.resolve_read_uri(&result.artifact_uri).expect("artifact alias"),
-            runtime.resolve_agent_reference(&result.id).expect("agent ref")
+            runtime
+                .resolve_read_uri(&result.artifact_uri)
+                .expect("artifact alias"),
+            runtime
+                .resolve_agent_reference(&result.id)
+                .expect("agent ref")
         );
     }
-    let read = pi_coding::read_tool_with_resolver(
-        artifacts.path().to_str().expect("artifact cwd"),
-        None,
+    // Obtain a governed `read` tool through a hermetic Application generation
+    // (danger-full-access sandbox) whose session carries the runtime's
+    // `read_uri_resolver`, so reading `artifact://` URIs goes through the
+    // retained sandbox filesystem authority instead of the raw no-generation
+    // read tool that fail-closes after the sandbox authority cutover.
+    let read_suffix = uuid::Uuid::now_v7().to_string();
+    let read_model = Model {
+        id: format!("batch-read-{read_suffix}"),
+        name: "Batch Read".to_owned(),
+        api: format!("batch-read-api-{read_suffix}"),
+        provider: format!("batch-read-provider-{read_suffix}"),
+        ..Model::default()
+    };
+    let _read_registration = register_faux_provider(FauxProviderOptions {
+        api: read_model.api.clone(),
+        provider: read_model.provider.clone(),
+        models: vec![read_model.clone()],
+        chunk_size: 1,
+    });
+    let read_session = Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
+        SessionOptions {
+            model: read_model,
+            cwd: artifacts.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: None,
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+            auth_manager: None,
+        },
+        Vec::new(),
+        Default::default(),
+        ResourceDiscovery::Disabled,
+        WorkspaceRoots::new(artifacts.path(), Vec::<PathBuf>::new()).expect("read workspace"),
         Some(runtime.read_uri_resolver()),
-    );
+    )
+    .expect("read session");
+    read_session.set_session_dir(hermetic_session_dir(artifacts.path()));
+    let (read_resources, _read_agent_home) = hermetic_resources(artifacts.path(), false, false);
+    read_session
+        .attach_resources(read_resources)
+        .await
+        .expect("attach read resources");
+    let read_application = publish_hermetic_application(read_session).await;
+    let read = read_application
+        .get_tool_definition("read")
+        .expect("governed read tool");
     let (_, read_abort) = AbortController::new();
     let read_result = (read.execute)(pi_agent::ToolCallContext {
         tool_call_id: "read-artifact".to_owned(),
@@ -937,6 +1330,7 @@ async fn batch_results_are_correlated_and_artifacts_resolve() {
         on_update: Arc::new(|_| {}),
         abort: read_abort,
         model: None,
+        approval_token: None,
     })
     .await
     .expect("read artifact URI");
@@ -951,7 +1345,7 @@ async fn batch_results_are_correlated_and_artifacts_resolve() {
         runtime.send("First", "Second", "peer result", None)[0].outcome,
         pi_coding::DeliveryOutcome::Queued
     );
-    let sibling_inbox = runtime.inbox("Second", false);
+    let sibling_inbox = runtime.inbox("Second", false).expect("inbox");
     assert_eq!(sibling_inbox.len(), 1);
     assert_eq!(sibling_inbox[0].from, "First");
     assert_eq!(sibling_inbox[0].body, "peer result");
@@ -1017,6 +1411,7 @@ async fn batch_never_exceeds_configured_concurrency() {
                 after_tool_call: None,
                 stream_fn: Some(stream_fn),
                 auth_resolver: None,
+                auth_manager: None,
             })
         })
     });
@@ -1099,10 +1494,19 @@ async fn mailbox_cap_wait_and_peer_roster_are_enforced() {
     // previous Woken receipt was the fake-wake lie, not a delivery. (The
     // active-running Woken contract is covered by
     // `running_target_reports_woken_while_bridge_active`.)
-    assert_eq!(runtime.send("Main", "Worker", "one", None)[0].outcome, pi_coding::DeliveryOutcome::Queued);
-    assert_eq!(runtime.send("Main", "Worker", "two", None)[0].outcome, pi_coding::DeliveryOutcome::Queued);
-    assert_eq!(runtime.send("Main", "Worker", "three", None)[0].outcome, pi_coding::DeliveryOutcome::Failed);
-    let inbox = runtime.inbox("Worker", true);
+    assert_eq!(
+        runtime.send("Main", "Worker", "one", None)[0].outcome,
+        pi_coding::DeliveryOutcome::Queued
+    );
+    assert_eq!(
+        runtime.send("Main", "Worker", "two", None)[0].outcome,
+        pi_coding::DeliveryOutcome::Queued
+    );
+    assert_eq!(
+        runtime.send("Main", "Worker", "three", None)[0].outcome,
+        pi_coding::DeliveryOutcome::Failed
+    );
+    let inbox = runtime.inbox("Worker", true).expect("inbox");
     assert_eq!(inbox.len(), 2);
     assert_eq!(inbox[0].body, "one");
     assert_eq!(inbox[1].body, "two");
@@ -1121,7 +1525,10 @@ async fn mailbox_cap_wait_and_peer_roster_are_enforced() {
             .expect("message")
     });
     tokio::task::yield_now().await;
-    assert_eq!(runtime.send("Worker", "Main", "hello main", None)[0].outcome, pi_coding::DeliveryOutcome::Woken);
+    assert_eq!(
+        runtime.send("Worker", "Main", "hello main", None)[0].outcome,
+        pi_coding::DeliveryOutcome::Processed
+    );
     assert_eq!(waiter.await.expect("wait join").body, "hello main");
     let peers = runtime.list("Worker");
     assert!(peers.iter().any(|peer| peer.id == "Main"));
@@ -1216,6 +1623,7 @@ async fn cancellation_aborts_a_running_child() {
                 after_tool_call: None,
                 stream_fn: Some(stream_fn),
                 auth_resolver: None,
+                auth_manager: None,
             })
         })
     });
@@ -1309,6 +1717,7 @@ async fn dropping_runtime_owner_cancels_children() {
                 after_tool_call: None,
                 stream_fn: Some(stream_fn),
                 auth_resolver: None,
+                auth_manager: None,
             })
         })
     });
@@ -1412,6 +1821,7 @@ fn hanging_factory() -> (
                 after_tool_call: None,
                 stream_fn: Some(stream_fn),
                 auth_resolver: None,
+                auth_manager: None,
             })
         })
     });
@@ -1457,8 +1867,8 @@ fn single_child_runtime(
     let mut by_id = HashMap::new();
     by_id.insert(child_id.to_owned(), registration.clone());
     let factory = faux_factory(Arc::new(parking_lot::Mutex::new(by_id)));
-    let runtime = OrchestrationRuntime::new(config_with_ttl(artifacts, idle_ttl), factory)
-        .expect("runtime");
+    let runtime =
+        OrchestrationRuntime::new(config_with_ttl(artifacts, idle_ttl), factory).expect("runtime");
     (runtime, registration)
 }
 
@@ -1575,6 +1985,7 @@ async fn running_child_observes_mid_run_steering_exactly_once() {
                 after_tool_call: None,
                 stream_fn: Some(stream_fn),
                 auth_resolver: None,
+                auth_manager: None,
             })
         })
     });
@@ -1611,7 +2022,10 @@ async fn running_child_observes_mid_run_steering_exactly_once() {
     let results = run.await.expect("run join").expect("run result");
     assert_eq!(
         results[0].output,
-        format!("urgent instruction followed\n\n{}", pi_coding::MISSING_YIELD_WARNING)
+        format!(
+            "urgent instruction followed\n\n{}",
+            pi_coding::MISSING_YIELD_WARNING
+        )
     );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     let captured = contexts.lock();
@@ -1620,8 +2034,12 @@ async fn running_child_observes_mid_run_steering_exactly_once() {
         .into_iter()
         .filter(|text| text.contains("URGENT: replace the original plan"))
         .collect::<Vec<_>>();
-    assert_eq!(steering.len(), 1, "steering must reach provider exactly once");
-    assert!(runtime.inbox("Steered", true).is_empty());
+    assert_eq!(
+        steering.len(),
+        1,
+        "steering must reach provider exactly once"
+    );
+    assert!(runtime.inbox("Steered", true).expect("inbox").is_empty());
     runtime.shutdown().await;
 }
 
@@ -1657,7 +2075,7 @@ async fn cancellation_race_does_not_report_or_deliver_fake_wake() {
     assert_eq!(results[0].status, AgentStatus::Aborted);
     assert_ne!(receipt.outcome, pi_coding::DeliveryOutcome::Woken);
     if receipt.outcome == pi_coding::DeliveryOutcome::Queued {
-        assert_eq!(runtime.inbox("Race", false).len(), 1);
+        assert_eq!(runtime.inbox("Race", false).expect("inbox").len(), 1);
     } else {
         assert_eq!(receipt.outcome, pi_coding::DeliveryOutcome::Failed);
     }
@@ -1730,6 +2148,7 @@ async fn concurrent_send_run_end_race_retains_message_exactly_once() {
                 after_tool_call: None,
                 stream_fn: Some(stream_fn),
                 auth_resolver: None,
+                auth_manager: None,
             })
         })
     });
@@ -1769,7 +2188,7 @@ async fn concurrent_send_run_end_race_retains_message_exactly_once() {
             .into_iter()
             .any(|text| text.contains("raced at run end"))
     });
-    let inbox_len = runtime.inbox("Race", true).len();
+    let inbox_len = runtime.inbox("Race", true).expect("inbox").len();
     match inbox_len {
         0 => assert!(
             processed,
@@ -1788,8 +2207,8 @@ async fn concurrent_send_run_end_race_retains_message_exactly_once() {
 async fn delivery_outcomes_queued_woken_parked_failed() {
     let artifacts = tempfile::tempdir().expect("artifacts");
     let (factory, started, release) = hanging_factory();
-    let runtime =
-        OrchestrationRuntime::new(config_with_ttl(artifacts.path(), None), factory).expect("runtime");
+    let runtime = OrchestrationRuntime::new(config_with_ttl(artifacts.path(), None), factory)
+        .expect("runtime");
     let (_, abort) = AbortController::new();
     let runner = runtime.clone();
     let run = tokio::spawn(async move {
@@ -1833,7 +2252,7 @@ async fn delivery_outcomes_queued_woken_parked_failed() {
         runtime.send("Main", "Runner", "after completion", None)[0].outcome,
         pi_coding::DeliveryOutcome::Queued,
     );
-    assert_eq!(runtime.inbox("Runner", true).len(), 1);
+    assert_eq!(runtime.inbox("Runner", true).expect("inbox").len(), 1);
 
     // A parked registry entry has no live execution to revive. Delivery is
     // retained for a future explicit resume and the status remains truthful.
@@ -1857,8 +2276,8 @@ async fn delivery_outcomes_queued_woken_parked_failed() {
 
     // Failed: aborted target.
     let (factory2, started2, _release2) = hanging_factory();
-    let runtime2 =
-        OrchestrationRuntime::new(config_with_ttl(artifacts.path(), None), factory2).expect("runtime2");
+    let runtime2 = OrchestrationRuntime::new(config_with_ttl(artifacts.path(), None), factory2)
+        .expect("runtime2");
     let (_, abort2) = AbortController::new();
     let runner2 = runtime2.clone();
     let run2 = tokio::spawn(async move {
@@ -1897,15 +2316,18 @@ async fn delivery_outcomes_queued_woken_parked_failed() {
 #[tokio::test]
 async fn waiter_is_one_shot_and_mailbox_stays_bounded() {
     let artifacts = tempfile::tempdir().expect("artifacts");
-    let runtime = OrchestrationRuntime::new(
-        config_with_ttl(artifacts.path(), None),
-        Arc::new(|_request| Box::pin(async { unreachable!("no child session expected") })),
-    )
-    .expect("runtime");
+    let (runtime, registration) =
+        single_child_runtime(artifacts.path(), "Worker", FauxResponse::text("done"), None);
+    run_one_child(&runtime, "Worker").await;
     let waiter_runtime = runtime.clone();
     let waiter = tokio::spawn(async move {
         waiter_runtime
-            .wait_message("Main", Some("Worker"), Some(std::time::Duration::from_secs(5)), None)
+            .wait_message(
+                "Main",
+                Some("Worker"),
+                Some(std::time::Duration::from_secs(5)),
+                None,
+            )
             .await
             .expect("wait")
             .expect("one message claimed")
@@ -1915,23 +2337,31 @@ async fn waiter_is_one_shot_and_mailbox_stays_bounded() {
     for index in 0..3 {
         receipts.push(runtime.send("Worker", "Main", &format!("burst-{index}"), None)[0].clone());
     }
-    assert_eq!(receipts[0].outcome, pi_coding::DeliveryOutcome::Woken);
+    assert_eq!(receipts[0].outcome, pi_coding::DeliveryOutcome::Processed);
     assert_eq!(receipts[1].outcome, pi_coding::DeliveryOutcome::Queued);
     assert_eq!(receipts[2].outcome, pi_coding::DeliveryOutcome::Queued);
     let claimed = waiter.await.expect("waiter join");
     assert!(claimed.body.starts_with("burst-"), "{}", claimed.body);
-    let inbox = runtime.inbox("Main", true);
+    let inbox = runtime.inbox("Main", true).expect("inbox");
     assert_eq!(
         inbox.len(),
         2,
         "the one-shot waiter must leave the remaining messages mailbox-bounded"
     );
-    let mut bodies = inbox.iter().map(|message| message.body.clone()).collect::<Vec<_>>();
+    let mut bodies = inbox
+        .iter()
+        .map(|message| message.body.clone())
+        .collect::<Vec<_>>();
     bodies.push(claimed.body);
     bodies.sort();
     bodies.dedup();
-    assert_eq!(bodies.len(), 3, "each message must be delivered exactly once");
+    assert_eq!(
+        bodies.len(),
+        3,
+        "each message must be delivered exactly once"
+    );
     runtime.shutdown().await;
+    registration.unregister();
 }
 
 #[tokio::test]
@@ -2008,9 +2438,15 @@ async fn parked_agent_delivery_retains_registry_refs_without_claiming_revival() 
         .find(|peer| peer.id == "Survivor")
         .expect("survivor listed after parked delivery");
     assert_eq!(still_parked.status, AgentStatus::Parked);
-    assert_eq!(still_parked.artifact_ref.as_deref(), Some("agent://Survivor"));
-    assert_eq!(still_parked.history_ref.as_deref(), Some(history_ref.as_str()));
-    let inbox = runtime.inbox("Survivor", false);
+    assert_eq!(
+        still_parked.artifact_ref.as_deref(),
+        Some("agent://Survivor")
+    );
+    assert_eq!(
+        still_parked.history_ref.as_deref(),
+        Some(history_ref.as_str())
+    );
+    let inbox = runtime.inbox("Survivor", false).expect("inbox");
     assert_eq!(inbox.len(), 1);
     assert_eq!(inbox[0].body, "retain until resume");
     assert!(
@@ -2065,7 +2501,7 @@ async fn mailbox_bound_remains_enforced_for_parked_agent() {
         runtime.send("Main", "Worker", "three", None)[0].outcome,
         pi_coding::DeliveryOutcome::Failed,
     );
-    assert_eq!(runtime.inbox("Worker", true).len(), 2);
+    assert_eq!(runtime.inbox("Worker", true).expect("inbox").len(), 2);
     runtime.shutdown().await;
     registration.unregister();
 }
@@ -2125,17 +2561,15 @@ async fn group_bound_resolver_keeps_same_agent_artifacts_unique_and_stale_safe()
                 after_tool_call: None,
                 stream_fn: Some(stream_fn),
                 auth_resolver: None,
+                auth_manager: None,
             })
         })
     });
     let runtime_a =
         OrchestrationRuntime::new(config_with_ttl(artifacts.path(), None), factory.clone())
             .expect("runtime_a");
-    let runtime_b = OrchestrationRuntime::new(
-        config_with_ttl(artifacts.path(), None),
-        factory,
-    )
-    .expect("runtime_b");
+    let runtime_b = OrchestrationRuntime::new(config_with_ttl(artifacts.path(), None), factory)
+        .expect("runtime_b");
 
     let (_, abort_a) = AbortController::new();
     let result_a = runtime_a
@@ -2192,7 +2626,9 @@ async fn group_bound_resolver_keeps_same_agent_artifacts_unique_and_stale_safe()
         format!("runtime b\n\n{}", pi_coding::MISSING_YIELD_WARNING)
     );
     assert_eq!(
-        stale_resolver("artifact://Shared").expect("group-bound resolver"),
+        stale_resolver
+            .resolve_display_path("artifact://Shared")
+            .expect("group-bound resolver"),
         path_a,
     );
     assert_eq!(
@@ -2203,7 +2639,11 @@ async fn group_bound_resolver_keeps_same_agent_artifacts_unique_and_stale_safe()
     );
 
     runtime_a.shutdown().await;
-    assert!(stale_resolver("artifact://Shared").is_err());
+    assert!(
+        stale_resolver
+            .resolve_display_path("artifact://Shared")
+            .is_err()
+    );
     assert_eq!(
         runtime_b
             .resolve_read_uri("artifact://Shared")
@@ -2234,7 +2674,6 @@ async fn main_agent_cannot_be_parked() {
     runtime.shutdown().await;
 }
 
-
 #[tokio::test]
 async fn disabled_agent_prevents_spawn_with_actionable_error() {
     let artifacts = tempfile::tempdir().expect("artifacts");
@@ -2247,8 +2686,8 @@ async fn disabled_agent_prevents_spawn_with_actionable_error() {
         pi_coding::AgentRuntimeSettings {
             enabled: Some(false),
             model: None,
-                tools: None,
-            },
+            tools: None,
+        },
     );
     let runtime = OrchestrationRuntime::new(
         config,
@@ -2275,10 +2714,12 @@ async fn disabled_agent_prevents_spawn_with_actionable_error() {
     let message = error.to_string();
     assert!(message.contains("disabled"), "{message}");
     assert!(message.contains("task"), "{message}");
-    assert!(message.contains("/agents") || message.contains("settings.agents"), "{message}");
+    assert!(
+        message.contains("/agents") || message.contains("settings.agents"),
+        "{message}"
+    );
     runtime.shutdown().await;
 }
-
 
 #[tokio::test]
 async fn agent_model_override_changes_child_session_model() {
@@ -2309,6 +2750,7 @@ async fn agent_model_override_changes_child_session_model() {
                 after_tool_call: None,
                 stream_fn: None,
                 auth_resolver: None,
+                auth_manager: None,
             })
         })
     });
@@ -2395,6 +2837,7 @@ async fn live_parent_model_provider_changes_fallback_between_spawns() {
                 after_tool_call: None,
                 stream_fn: None,
                 auth_resolver: None,
+                auth_manager: None,
             })
         })
     });
@@ -2507,16 +2950,20 @@ async fn public_events_report_queued_running_terminal_and_parked_truthfully() {
             match job.status {
                 pi_coding::JobStatus::Queued => {
                     queued = true;
-                    assert_eq!(job.description.as_deref(), Some("summarize secret [REDACTED]"));
+                    assert_eq!(
+                        job.description.as_deref(),
+                        Some("summarize secret [REDACTED]")
+                    );
                 }
                 pi_coding::JobStatus::Running => running = true,
                 pi_coding::JobStatus::Completed => {
                     completed = true;
                     assert_eq!(
-                        job.result
-                            .as_ref()
-                            .map(|result| result.output.clone()),
-                        Some(format!("event result\n\n{}", pi_coding::MISSING_YIELD_WARNING))
+                        job.result.as_ref().map(|result| result.output.clone()),
+                        Some(format!(
+                            "event result\n\n{}",
+                            pi_coding::MISSING_YIELD_WARNING
+                        ))
                     );
                 }
                 pi_coding::JobStatus::Failed | pi_coding::JobStatus::Cancelled => {}

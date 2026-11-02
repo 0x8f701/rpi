@@ -4,37 +4,46 @@ use pi_agent::ThinkingLevel;
 use pi_ai::Model;
 use pi_ai::providers::{FauxProviderOptions, register_faux_provider};
 use pi_coding::{
-    Application, ResourceManager, ResourceManagerOptions, Session, SessionOptions, SettingsScope,
-    SettingSource,
+    Application, ApplicationRuntimeCandidate, ResourceDiscovery, ResourceManager,
+    ResourceManagerOptions, Session, SessionOptions, SettingSource, SettingsScope, ToolSelection,
 };
-/// Per-process isolated native session root so `start_new_recording()` never
-/// writes into the real `~/.pi/agent/sessions` tree (Web sidebar source).
-fn test_sessions_root() -> std::path::PathBuf {
-    static ROOT: std::sync::LazyLock<tempfile::TempDir> = std::sync::LazyLock::new(|| {
-        tempfile::tempdir().expect("test sessions root")
-    });
-    ROOT.path().to_path_buf()
+
+/// Published-generation hermetic layout: writable workspace is a child of the
+/// temp root, while agent configuration and SessionStore live as siblings so
+/// `agentDir` is never inside a writable workspace root.
+fn hermetic_layout() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let root = tempfile::tempdir().expect("root");
+    let cwd = root.path().join("workspace");
+    let agent_dir = root.path().join("agent");
+    let session_dir = root.path().join("sessions");
+    fs::create_dir_all(&cwd).expect("workspace");
+    fs::create_dir_all(&agent_dir).expect("agent");
+    fs::create_dir_all(agent_dir.join("agents")).expect("agents");
+    fs::create_dir_all(&session_dir).expect("sessions");
+    (root, cwd, agent_dir, session_dir)
 }
 
 #[tokio::test]
-async fn real_enable_model_thinking_and_legacy_migration_persist() {
-    let root = tempfile::tempdir().expect("root");
-    let agent_dir = root.path().join("agent-home");
-    fs::create_dir_all(agent_dir.join("agents")).expect("agents");
+async fn real_enable_model_thinking_and_agent_settings_persist() {
+    let (_root, cwd, agent_dir, session_dir) = hermetic_layout();
     fs::write(
         agent_dir.join("settings.json"),
         r#"{
+          "sandbox": {"mode": "danger-full-access"},
           "orchestration": {"tasks": true, "process": true, "todo": true, "maxConcurrency": 1},
-          "subagents": {
-            "agentOverrides": {
-              "reviewer": {
-                "enabled": true,
-                "model": "openai/gpt-4.1",
-                "tools": ["read"]
-              }
-            },
-            "keepMe": {"x": 1}
-          }
+          "agents": {
+            "reviewer": {
+              "enabled": true,
+              "model": "openai/gpt-4.1",
+              "tools": ["read"]
+            }
+          },
+          "subagents": {"keepMe": {"x": 1}}
         }"#,
     )
     .expect("settings");
@@ -70,7 +79,7 @@ async fn real_enable_model_thinking_and_legacy_migration_persist() {
         chunk_size: 1,
     });
 
-    let mut options = ResourceManagerOptions::new(root.path());
+    let mut options = ResourceManagerOptions::new(&cwd);
     options.agent_dir = agent_dir.clone();
     options.disable_extensions = true;
     options.disable_skills = true;
@@ -79,31 +88,40 @@ async fn real_enable_model_thinking_and_legacy_migration_persist() {
     options.disable_context_files = true;
     let resources = ResourceManager::new(options).expect("resources");
 
-    let settings = resources.settings_manager().settings();
-    let migrated = settings.agent_settings("reviewer").expect("migrated");
-    assert_eq!(migrated.enabled, Some(true));
-    assert_eq!(migrated.model.as_deref(), Some("openai/gpt-4.1"));
+    let settings = resources
+        .settings_manager()
+        .expect("settings manager")
+        .settings();
+    let seeded = settings.agent_settings("reviewer").expect("seeded override");
+    assert_eq!(seeded.enabled, Some(true));
+    assert_eq!(seeded.model.as_deref(), Some("openai/gpt-4.1"));
     assert_eq!(
-        migrated.tools.as_deref(),
+        seeded.tools.as_deref(),
         Some(["read".to_owned()].as_slice())
     );
 
-    let session = Session::new(SessionOptions {
-        model: reasoning.clone(),
-        cwd: root.path().to_path_buf(),
-        system_prompt: String::new(),
-        thinking_level: ThinkingLevel::Off,
-        api_key: String::new(),
-        compaction: None,
-        stream_options: Default::default(),
-        tools: Some(Vec::new()),
-        before_tool_call: None,
-        after_tool_call: None,
-        stream_fn: None,
-        auth_resolver: None,
-    })
+    let session = Session::new_with_additional_tools_filtered_and_discovery(
+        SessionOptions {
+            model: reasoning.clone(),
+            cwd,
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+            auth_manager: None,
+        },
+        Vec::new(),
+        ToolSelection::default(),
+        ResourceDiscovery::Disabled,
+    )
     .expect("session");
-    session.set_session_dir(test_sessions_root());
+    session.set_session_dir(session_dir);
     session
         .start_new_recording()
         .expect("start agent config recording");
@@ -111,11 +129,15 @@ async fn real_enable_model_thinking_and_legacy_migration_persist() {
         .attach_resources(resources.clone())
         .await
         .expect("attach");
-    let application = Application::new(session).await;
+    let application =
+        Application::from_runtime_candidate(ApplicationRuntimeCandidate::new(session))
+            .await
+            .expect("publish application");
     application.reload().await.expect("reload");
 
     resources
         .settings_manager()
+        .expect("settings manager")
         .update_global(|settings| {
             settings.agents.insert(
                 "reviewer".into(),

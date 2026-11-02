@@ -14,18 +14,26 @@
 //! `fail_closed: true`, in which case the tool is blocked (or the trust
 //! decision denied) instead.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use pi_sandbox::{SpawnFamily, StdioMode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use crate::settings::{HookConfig, HookEvent};
+use crate::application::generation::{GenerationCaptureFn, GenerationProvenance};
+use crate::process::{
+    GovernedChild, authorize_candidate_spawn, authorize_spawn, launch_authorized_pipe,
+};
+use crate::sandbox::{CredentialAudience, RawSpawnRequest, SandboxGeneration, SpawnAuthorization};
+use crate::{HookConfig, HookEvent};
 
 pub const HOOK_DEFAULT_TIMEOUT_MS: u64 = 5_000;
 pub const HOOK_MAX_TIMEOUT_MS: u64 = 60_000;
@@ -43,12 +51,18 @@ pub struct HookDecision {
 impl HookDecision {
     #[must_use]
     pub fn allow() -> Self {
-        Self { block: false, reason: None }
+        Self {
+            block: false,
+            reason: None,
+        }
     }
 
     #[must_use]
     pub fn block(reason: impl Into<String>) -> Self {
-        Self { block: true, reason: Some(reason.into()) }
+        Self {
+            block: true,
+            reason: Some(reason.into()),
+        }
     }
 }
 
@@ -76,6 +90,17 @@ struct HostHooksInner {
     entries: Vec<HookConfig>,
     cwd: PathBuf,
     session_id: String,
+    authority: HookProcessAuthority,
+}
+
+enum HookProcessAuthority {
+    Published(GenerationCaptureFn),
+    Candidate {
+        sandbox: Arc<SandboxGeneration>,
+        provenance: Arc<GenerationProvenance>,
+        auth_manager: Option<Arc<crate::AuthManager>>,
+    },
+    Host,
 }
 
 impl std::fmt::Debug for HostHooks {
@@ -91,12 +116,61 @@ impl std::fmt::Debug for HostHooks {
 
 impl HostHooks {
     #[must_use]
-    pub fn new(entries: Vec<HookConfig>, cwd: PathBuf, session_id: impl Into<String>) -> Self {
+    pub(crate) fn new(
+        entries: Vec<HookConfig>,
+        cwd: PathBuf,
+        session_id: impl Into<String>,
+        capture_generation: GenerationCaptureFn,
+    ) -> Self {
+        Self::with_authority(
+            entries,
+            cwd,
+            session_id,
+            HookProcessAuthority::Published(capture_generation),
+        )
+    }
+
+    pub(crate) fn new_candidate(
+        entries: Vec<HookConfig>,
+        cwd: PathBuf,
+        session_id: impl Into<String>,
+        sandbox: Arc<SandboxGeneration>,
+        provenance: Arc<GenerationProvenance>,
+        auth_manager: Option<Arc<crate::AuthManager>>,
+    ) -> Self {
+        Self::with_authority(
+            entries,
+            cwd,
+            session_id,
+            HookProcessAuthority::Candidate {
+                sandbox,
+                provenance,
+                auth_manager,
+            },
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn new_host(
+        entries: Vec<HookConfig>,
+        cwd: PathBuf,
+        session_id: impl Into<String>,
+    ) -> Self {
+        Self::with_authority(entries, cwd, session_id, HookProcessAuthority::Host)
+    }
+
+    fn with_authority(
+        entries: Vec<HookConfig>,
+        cwd: PathBuf,
+        session_id: impl Into<String>,
+        authority: HookProcessAuthority,
+    ) -> Self {
         Self {
             inner: Arc::new(HostHooksInner {
                 entries,
                 cwd,
                 session_id: session_id.into(),
+                authority,
             }),
         }
     }
@@ -118,8 +192,8 @@ impl HostHooks {
 
     /// Fire every enabled hook registered for `event`, in declaration order.
     ///
-    /// `subject` is matched against each entry's `matcher` (exact or
-    /// substring). A block decision short-circuits the remaining entries.
+    /// `subject` is matched against each entry's `matcher` (exact string).
+    /// A block decision short-circuits the remaining entries.
     pub async fn fire(
         &self,
         event: HookEvent,
@@ -162,7 +236,6 @@ impl HostHooks {
             if let Some(matcher) = entry.matcher.as_deref()
                 && let Some(subject) = subject
                 && subject != matcher
-                && !subject.contains(matcher)
             {
                 continue;
             }
@@ -184,70 +257,132 @@ impl HostHooks {
             .timeout_ms
             .unwrap_or(HOOK_DEFAULT_TIMEOUT_MS)
             .min(HOOK_MAX_TIMEOUT_MS);
-        let mut command = Command::new(&program);
-        command.args(&entry.command[1..]);
-        command.current_dir(&self.inner.cwd);
-        command.stdin(Stdio::piped());
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::null());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.as_std_mut().process_group(0);
+        if matches!(self.inner.authority, HookProcessAuthority::Host) {
+            return self
+                .run_host_one(entry, payload, &program, event_name, timeout_ms)
+                .await;
         }
-        let mut child = match spawn_with_etxtbsy_retry(&mut command, &program, event_name).await {
+        let mut child = match spawn_with_etxtbsy_retry(
+            &self.inner.authority,
+            &entry.command,
+            &self.inner.cwd,
+            timeout_ms,
+            &program,
+            event_name,
+        )
+        .await
+        {
             Ok(child) => child,
             Err(error) => {
                 eprintln!("hooks: failed to spawn {program:?} for {event_name}: {error}");
-                return self.failure_decision(entry, &program);
+                return self.spawn_failure_decision(entry, &program, &error);
             }
         };
-        let pid = child.id();
         let payload_json = serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_owned());
-        // Everything (stdin write, stdout read, wait) runs inside the timeout so
-        // a hook that never reads stdin and runs forever still gets killed.
         let outcome = timeout(Duration::from_millis(timeout_ms), async {
-            if let Some(mut stdin) = child.stdin.take() {
+            if let Some(mut stdin) = child.take_stdin() {
                 let write = stdin.write_all(payload_json.as_bytes()).await;
-                // Drop stdin so the hook observes EOF once it has consumed the
-                // payload (or a blocking hook never returns).
                 drop(stdin);
                 if let Err(error) = write
                     && error.kind() != std::io::ErrorKind::BrokenPipe
                 {
-                    return Err(error);
+                    return Err(anyhow::Error::from(error));
                 }
-                // Broken pipe means the hook exited without reading stdin; its
-                // exit status and stdout are still meaningful, so continue.
             }
-            let stdout = child.stdout.take();
-            let output = match stdout {
+            let output = match child.take_stdout() {
                 Some(stdout) => read_capped(stdout, HOOK_OUTPUT_CAP_BYTES).await,
                 None => Vec::new(),
             };
             let status = child.wait().await?;
-            Ok::<_, std::io::Error>((status, output))
+            Ok::<_, anyhow::Error>((status, output))
         })
         .await;
         match outcome {
-            Ok(Ok((status, output))) => {
-                if !status.success() {
-                    eprintln!("hooks: {program:?} for {event_name} exited with {status}");
-                    return self.failure_decision(entry, &program);
-                }
-                self.parse_response(entry, &program, &output)
+            Ok(Ok((0, output))) => self.parse_response(entry, &program, &output),
+            Ok(Ok((status, _))) => {
+                eprintln!("hooks: {program:?} for {event_name} exited with status {status}");
+                self.failure_decision(entry, &program)
             }
             Ok(Err(error)) => {
                 eprintln!("hooks: {program:?} for {event_name} failed: {error}");
-                kill_process_group(pid);
+                let _ = child.signal(crate::ProcessSignal::Sigkill);
                 let _ = child.wait().await;
                 self.failure_decision(entry, &program)
             }
-            Err(_elapsed) => {
-                eprintln!("hooks: {program:?} for {event_name} timed out after {timeout_ms}ms; killed");
-                kill_process_group(pid);
+            Err(_) => {
+                eprintln!(
+                    "hooks: {program:?} for {event_name} timed out after {timeout_ms}ms; killed"
+                );
+                let _ = child.signal(crate::ProcessSignal::Sigkill);
                 let _ = child.wait().await;
                 self.failure_decision(entry, &program)
+            }
+        }
+    }
+
+    async fn run_host_one(
+        &self,
+        entry: &HookConfig,
+        payload: &Value,
+        program: &str,
+        event_name: &str,
+        timeout_ms: u64,
+    ) -> HookDecision {
+        let mut command = Command::new(program);
+        command
+            .args(entry.command.iter().skip(1))
+            .current_dir(&self.inner.cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                eprintln!("hooks: failed to spawn {program:?} for {event_name}: {error}");
+                return self.failure_decision(entry, program);
+            }
+        };
+        let payload_json = serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_owned());
+        let outcome = timeout(Duration::from_millis(timeout_ms), async {
+            if let Some(mut stdin) = child.stdin.take() {
+                let write = stdin.write_all(payload_json.as_bytes()).await;
+                drop(stdin);
+                if let Err(error) = write
+                    && error.kind() != std::io::ErrorKind::BrokenPipe
+                {
+                    return Err(anyhow::Error::from(error));
+                }
+            }
+            let output = match child.stdout.take() {
+                Some(stdout) => read_capped(stdout, HOOK_OUTPUT_CAP_BYTES).await,
+                None => Vec::new(),
+            };
+            let status = child.wait().await?;
+            Ok::<_, anyhow::Error>((status, output))
+        })
+        .await;
+        match outcome {
+            Ok(Ok((status, output))) if status.success() => {
+                self.parse_response(entry, program, &output)
+            }
+            Ok(Ok((status, _))) => {
+                eprintln!("hooks: {program:?} for {event_name} exited with status {status}");
+                self.failure_decision(entry, program)
+            }
+            Ok(Err(error)) => {
+                eprintln!("hooks: {program:?} for {event_name} failed: {error}");
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                self.failure_decision(entry, program)
+            }
+            Err(_) => {
+                eprintln!(
+                    "hooks: {program:?} for {event_name} timed out after {timeout_ms}ms; killed"
+                );
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                self.failure_decision(entry, program)
             }
         }
     }
@@ -282,6 +417,26 @@ impl HostHooks {
                 );
                 self.failure_decision(entry, program)
             }
+        }
+    }
+
+    fn spawn_failure_decision(
+        &self,
+        entry: &HookConfig,
+        program: &str,
+        error: &crate::process::SpawnError,
+    ) -> HookDecision {
+        if is_blocking_event(entry.event) && entry.fail_closed == Some(true) {
+            let detail = match error {
+                crate::process::SpawnError::Sandbox(error) => format!(": {error}"),
+                _ => String::new(),
+            };
+            HookDecision::block(format!(
+                "host hook {program:?} failed to spawn for {} (failClosed){detail}",
+                entry.event.as_str()
+            ))
+        } else {
+            HookDecision::allow()
         }
     }
 
@@ -335,12 +490,7 @@ fn build_payload(
 /// whether the path is new to the trust store. The `path`/`decision`/`isNew`
 /// triple matches the `trust_decision` extension event payload so both
 /// surfaces observe one spelling (see [`crate::trust::TrustDecisionObservation`]).
-fn build_trust_payload(
-    inner: &HostHooksInner,
-    path: &str,
-    decision: &str,
-    is_new: bool,
-) -> Value {
+fn build_trust_payload(inner: &HostHooksInner, path: &str, decision: &str, is_new: bool) -> Value {
     let mut payload = build_envelope(inner, HookEvent::PreTrustDecision);
     payload.insert("subject".to_owned(), Value::String(path.to_owned()));
     payload.insert("path".to_owned(), Value::String(path.to_owned()));
@@ -358,7 +508,10 @@ fn build_envelope(inner: &HostHooksInner, event: HookEvent) -> Map<String, Value
         "cwd".to_owned(),
         Value::String(inner.cwd.to_string_lossy().into_owned()),
     );
-    payload.insert("sessionId".to_owned(), Value::String(inner.session_id.clone()));
+    payload.insert(
+        "sessionId".to_owned(),
+        Value::String(inner.session_id.clone()),
+    );
     payload.insert(
         "timestamp".to_owned(),
         Value::Number(serde_json::Number::from(pi_ai::now_millis())),
@@ -403,60 +556,123 @@ async fn read_capped(mut reader: impl AsyncRead + Unpin, cap: usize) -> Vec<u8> 
     output
 }
 
-/// Spawn a hook command, retrying briefly on `ETXTBSY`.
-///
-/// A hook executable that was just written to disk can transiently hit
-/// "Text file busy" while the kernel settles the file's open-for-write state
-/// (observed on overlay/tmp filesystems under parallel test load). The
-/// executable itself is already closed by then, so a short retry resolves it.
-pub(crate) async fn spawn_with_etxtbsy_retry(
-    command: &mut Command,
+async fn spawn_with_etxtbsy_retry(
+    authority: &HookProcessAuthority,
+    argv: &[String],
+    cwd: &std::path::Path,
+    timeout_ms: u64,
     program: &str,
     event_name: &str,
-) -> std::io::Result<tokio::process::Child> {
+) -> Result<GovernedChild, crate::process::SpawnError> {
+    enum RetainedAuthority {
+        Published(Arc<crate::application::generation::ApplicationGeneration>),
+        Candidate {
+            sandbox: Arc<SandboxGeneration>,
+            provenance: Arc<GenerationProvenance>,
+            auth_manager: Option<Arc<crate::AuthManager>>,
+        },
+    }
+    let authority = match authority {
+        HookProcessAuthority::Published(capture_generation) => RetainedAuthority::Published(
+            capture_generation().map_err(|_| crate::process::SpawnError::GenerationMismatch)?,
+        ),
+        HookProcessAuthority::Candidate {
+            sandbox,
+            provenance,
+            auth_manager,
+        } => RetainedAuthority::Candidate {
+            sandbox: sandbox.clone(),
+            provenance: provenance.clone(),
+            auth_manager: auth_manager.clone(),
+        },
+        HookProcessAuthority::Host => {
+            return Err(crate::process::SpawnError::GenerationMismatch);
+        }
+    };
     let mut attempts = 0u32;
     loop {
-        match command.spawn() {
-            Ok(child) => return Ok(child),
+        let authorized = match &authority {
+            RetainedAuthority::Published(generation) => {
+                let request =
+                    hook_spawn_request(generation.sandbox().clone(), argv, cwd, timeout_ms)?;
+                authorize_spawn(generation.clone(), request).await?
+            }
+            RetainedAuthority::Candidate {
+                sandbox,
+                provenance,
+                auth_manager,
+            } => {
+                let request = hook_spawn_request(sandbox.clone(), argv, cwd, timeout_ms)?;
+                authorize_candidate_spawn(
+                    sandbox.clone(),
+                    provenance.clone(),
+                    auth_manager.as_deref(),
+                    request,
+                )
+                .await?
+            }
+        };
+        match launch_authorized_pipe(authorized) {
+            Ok(mut child) => {
+                if let Some(stderr) = child.take_stderr() {
+                    tokio::spawn(async move {
+                        let _ = read_capped(stderr, 0).await;
+                    });
+                }
+                return Ok(child);
+            }
             Err(error) if retryable_etxtbsy(&error) => {
                 attempts += 1;
                 if attempts >= 5 {
-                    return Err(error);
+                    return Err(crate::process::SpawnError::Sandbox(error));
                 }
                 eprintln!(
                     "hooks: {program:?} for {event_name} hit ETXTBSY (attempt {attempts}); retrying"
                 );
                 tokio::time::sleep(Duration::from_millis(10 * u64::from(attempts))).await;
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(crate::process::SpawnError::Sandbox(error)),
         }
     }
 }
 
-/// Detect `ETXTBSY` (Text file busy, os error 26) from a spawn error. Uses the
-/// raw OS error because `ErrorKind` is `Uncategorized` for unclassified errno
-/// values.
-pub(crate) fn retryable_etxtbsy(error: &std::io::Error) -> bool {
-    #[cfg(unix)]
-    {
-        error.raw_os_error() == Some(nix::errno::Errno::ETXTBSY as i32)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = error;
-        false
-    }
+fn hook_spawn_request(
+    sandbox: Arc<SandboxGeneration>,
+    argv: &[String],
+    cwd: &std::path::Path,
+    timeout_ms: u64,
+) -> Result<RawSpawnRequest, crate::process::SpawnError> {
+    Ok(RawSpawnRequest {
+        authorization: SpawnAuthorization::Captured(sandbox),
+        family: SpawnFamily::Hook,
+        audience: CredentialAudience::new_spawn_family(SpawnFamily::Hook)?,
+        argv: argv.iter().map(OsString::from).collect(),
+        cwd: cwd.to_path_buf(),
+        requested_env: BTreeMap::new(),
+        requested_grants: BTreeSet::new(),
+        stdio: StdioMode::Piped,
+        terminal_size: None,
+        timeout_ms: Some(timeout_ms),
+        target_fd_mappings: Vec::new(),
+        #[cfg(unix)]
+        owned_target_fd_mappings: Vec::new(),
+        #[cfg(unix)]
+        mount_sources: Vec::new(),
+        #[cfg(unix)]
+        retained_executable: None,
+        #[cfg(unix)]
+        retained_working_directory: None,
+    })
 }
 
-fn kill_process_group(pid: Option<u32>) {
-    #[cfg(unix)]
-    if let Some(pid) = pid {
-        use nix::sys::signal::{Signal, killpg};
-        use nix::unistd::Pid;
-        let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
-    }
-    #[cfg(not(unix))]
-    let _ = pid;
+pub(crate) fn retryable_etxtbsy(error: &pi_sandbox::SandboxError) -> bool {
+    matches!(
+        error,
+        pi_sandbox::SandboxError::System {
+            raw_os_error: Some(code),
+            ..
+        } if *code == nix::errno::Errno::ETXTBSY as i32
+    )
 }
 
 #[cfg(test)]
@@ -483,8 +699,27 @@ mod tests {
         }
     }
 
-    fn hooks(entries: Vec<HookConfig>) -> HostHooks {
-        HostHooks::new(entries, std::env::current_dir().expect("cwd"), "hook-test-session")
+    struct HookFixture {
+        hooks: HostHooks,
+        _root: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for HookFixture {
+        type Target = HostHooks;
+
+        fn deref(&self) -> &Self::Target {
+            &self.hooks
+        }
+    }
+
+    async fn hooks(entries: Vec<HookConfig>) -> HookFixture {
+        let root = tempfile::tempdir().expect("hook fixture root");
+        let cwd = root.path().join("workspace");
+        std::fs::create_dir_all(&cwd).expect("hook workspace");
+        HookFixture {
+            hooks: HostHooks::new_host(entries, cwd, "hook-test-session"),
+            _root: root,
+        }
     }
 
     /// Write an executable fixture hook into a temp dir (returned so the
@@ -521,7 +756,8 @@ echo "{\"decision\":\"block\",\"reason\":\"stdin said $event\"}"
             &[&script_path],
             None,
             false,
-        )]);
+        )])
+        .await;
         let decision = hooks
             .fire(
                 HookEvent::PreToolCall,
@@ -544,10 +780,8 @@ echo "{\"decision\":\"block\",\"reason\":\"stdin said $event\"}"
         let (script_path, _dir) = write_hook("#!/bin/sh\nsleep 30\n");
         let mut entry = hook_config(HookEvent::PreToolCall, &[&script_path], None, false);
         entry.timeout_ms = Some(100);
-        let hooks = hooks(vec![entry]);
-        let decision = hooks
-            .fire(HookEvent::PreToolCall, Some("read"), None)
-            .await;
+        let hooks = hooks(vec![entry]).await;
+        let decision = hooks.fire(HookEvent::PreToolCall, Some("read"), None).await;
         assert!(!decision.block, "timeout must fail open by default");
     }
 
@@ -556,13 +790,14 @@ echo "{\"decision\":\"block\",\"reason\":\"stdin said $event\"}"
         let (script_path, _dir) = write_hook("#!/bin/sh\nsleep 30\n");
         let mut entry = hook_config(HookEvent::PreToolCall, &[&script_path], None, true);
         entry.timeout_ms = Some(100);
-        let hooks = hooks(vec![entry]);
-        let decision = hooks
-            .fire(HookEvent::PreToolCall, Some("read"), None)
-            .await;
+        let hooks = hooks(vec![entry]).await;
+        let decision = hooks.fire(HookEvent::PreToolCall, Some("read"), None).await;
         assert!(decision.block, "failClosed must block on timeout");
         assert!(
-            decision.reason.as_deref().is_some_and(|reason| reason.contains("failClosed")),
+            decision
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("failClosed")),
             "reason: {:?}",
             decision.reason
         );
@@ -576,7 +811,8 @@ echo "{\"decision\":\"block\",\"reason\":\"stdin said $event\"}"
             &[missing],
             None,
             false,
-        )]);
+        )])
+        .await;
         let decision = open.fire(HookEvent::PreToolCall, Some("read"), None).await;
         assert!(!decision.block, "spawn failure must fail open by default");
 
@@ -585,41 +821,50 @@ echo "{\"decision\":\"block\",\"reason\":\"stdin said $event\"}"
             &[missing],
             None,
             true,
-        )]);
-        let decision = closed.fire(HookEvent::PreToolCall, Some("read"), None).await;
+        )])
+        .await;
+        let decision = closed
+            .fire(HookEvent::PreToolCall, Some("read"), None)
+            .await;
         assert!(decision.block, "failClosed must block on spawn failure");
     }
 
     #[tokio::test]
     async fn nonzero_exit_fails_open_by_default() {
-        let (script_path, _dir) = write_hook("#!/bin/sh\necho '{\"decision\":\"block\"}'\nexit 3\n");
+        let (script_path, _dir) =
+            write_hook("#!/bin/sh\necho '{\"decision\":\"block\"}'\nexit 3\n");
         let hooks = hooks(vec![hook_config(
             HookEvent::PreToolCall,
             &[&script_path],
             None,
             false,
-        )]);
+        )])
+        .await;
         let decision = hooks.fire(HookEvent::PreToolCall, Some("read"), None).await;
         assert!(!decision.block, "non-zero exit must fail open");
     }
 
     #[tokio::test]
     async fn matcher_filters_entries_by_subject() {
-        let (script_path, _dir) = write_hook("#!/bin/sh\necho '{\"decision\":\"block\",\"reason\":\"matched\"}'\n");
-        // Substring match on the subject: blocks `read`-family tools only.
+        let (script_path, _dir) =
+            write_hook("#!/bin/sh\necho '{\"decision\":\"block\",\"reason\":\"matched\"}'\n");
         let hooks = hooks(vec![hook_config(
             HookEvent::PreToolCall,
             &[&script_path],
             Some("read"),
             false,
-        )]);
-        let decision = hooks
-            .fire(HookEvent::PreToolCall, Some("bash"), None)
-            .await;
+        )])
+        .await;
+        let decision = hooks.fire(HookEvent::PreToolCall, Some("bash"), None).await;
         assert!(!decision.block, "bash must not match matcher \"read\"");
         let decision = hooks
-            .fire(HookEvent::PreToolCall, Some("read"), None)
+            .fire(HookEvent::PreToolCall, Some("read_file"), None)
             .await;
+        assert!(
+            !decision.block,
+            "read_file must not match matcher \"read\""
+        );
+        let decision = hooks.fire(HookEvent::PreToolCall, Some("read"), None).await;
         assert!(decision.block, "read must match matcher \"read\"");
     }
 
@@ -629,22 +874,22 @@ echo "{\"decision\":\"block\",\"reason\":\"stdin said $event\"}"
         // Exit 7 would fail closed if the entry ran; `enabled: false` must skip it.
         let mut entry = hook_config(HookEvent::PreToolCall, &[&script_path], None, true);
         entry.enabled = Some(false);
-        let hooks = hooks(vec![entry]);
-        let decision = hooks
-            .fire(HookEvent::PreToolCall, Some("read"), None)
-            .await;
+        let hooks = hooks(vec![entry]).await;
+        let decision = hooks.fire(HookEvent::PreToolCall, Some("read"), None).await;
         assert!(!decision.block, "disabled entry must not fire");
     }
 
     #[tokio::test]
     async fn post_tool_call_is_advisory_even_when_blocking() {
-        let (script_path, _dir) = write_hook("#!/bin/sh\necho '{\"decision\":\"block\",\"reason\":\"ignored\"}'\n");
+        let (script_path, _dir) =
+            write_hook("#!/bin/sh\necho '{\"decision\":\"block\",\"reason\":\"ignored\"}'\n");
         let hooks = hooks(vec![hook_config(
             HookEvent::PostToolCall,
             &[&script_path],
             None,
             false,
-        )]);
+        )])
+        .await;
         let decision = hooks
             .fire(
                 HookEvent::PostToolCall,
@@ -662,13 +907,15 @@ echo "{\"decision\":\"block\",\"reason\":\"stdin said $event\"}"
 
     #[tokio::test]
     async fn stdout_cap_drains_overflow_without_hanging() {
-        let (script_path, _dir) = write_hook("#!/bin/sh\nhead -c 200000 /dev/zero | tr '\\0' 'x'\n");
+        let (script_path, _dir) =
+            write_hook("#!/bin/sh\nhead -c 200000 /dev/zero | tr '\\0' 'x'\n");
         let hooks = hooks(vec![hook_config(
             HookEvent::PreToolCall,
             &[&script_path],
             None,
             false,
-        )]);
+        )])
+        .await;
         let decision = hooks.fire(HookEvent::PreToolCall, Some("read"), None).await;
         assert!(!decision.block, "invalid JSON after cap must fail open");
     }
@@ -689,7 +936,8 @@ echo "{\"decision\":\"block\",\"reason\":\"stdin said $event\"}"
             enabled: None,
             fail_closed: None,
             extra: Map::new(),
-        }]);
+        }])
+        .await;
         let decision = hooks
             .fire(
                 HookEvent::PreToolCall,
@@ -709,7 +957,12 @@ echo "{\"decision\":\"block\",\"reason\":\"stdin said $event\"}"
         assert_eq!(parsed["subject"], "read");
         assert_eq!(parsed["toolName"], "read");
         assert_eq!(parsed["sessionId"], "hook-test-session");
-        assert!(parsed["arguments"].as_str().unwrap().contains("\"path\":\"a.txt\""));
+        assert!(
+            parsed["arguments"]
+                .as_str()
+                .unwrap()
+                .contains("\"path\":\"a.txt\"")
+        );
         assert!(parsed["timestamp"].as_i64().is_some());
     }
 
@@ -717,21 +970,30 @@ echo "{\"decision\":\"block\",\"reason\":\"stdin said $event\"}"
     async fn write_payload_survives_pipe_backpressure() {
         // A hook that reads stdin slowly must still receive the payload and
         // EOF before the timeout.
-        let (script_path, _dir) = write_hook("#!/bin/sh\nwhile IFS= read -r chunk; do :; done\necho '{\"decision\":\"allow\"}'\n");
+        let (script_path, _dir) = write_hook(
+            "#!/bin/sh\nwhile IFS= read -r chunk; do :; done\necho '{\"decision\":\"allow\"}'\n",
+        );
         let hooks = hooks(vec![hook_config(
             HookEvent::PreToolCall,
             &[&script_path],
             None,
             false,
-        )]);
+        )])
+        .await;
         let decision = hooks.fire(HookEvent::PreToolCall, Some("read"), None).await;
         assert!(!decision.block);
     }
 
     #[tokio::test]
     async fn event_serialization_uses_snake_case() {
-        assert_eq!(serde_json::to_string(&HookEvent::PreToolCall).unwrap(), "\"pre_tool_call\"");
-        assert_eq!(serde_json::to_string(&HookEvent::SessionEnd).unwrap(), "\"session_end\"");
+        assert_eq!(
+            serde_json::to_string(&HookEvent::PreToolCall).unwrap(),
+            "\"pre_tool_call\""
+        );
+        assert_eq!(
+            serde_json::to_string(&HookEvent::SessionEnd).unwrap(),
+            "\"session_end\""
+        );
         assert_eq!(HookEvent::TurnStart.as_str(), "turn_start");
     }
 
@@ -739,12 +1001,8 @@ echo "{\"decision\":\"block\",\"reason\":\"stdin said $event\"}"
     async fn payload_has_no_env_secrets() {
         // The payload must only contain the documented fields; the full env is
         // not serialized into it.
-        let inner = HostHooksInner {
-            entries: Vec::new(),
-            cwd: PathBuf::from("/tmp"),
-            session_id: "s".to_owned(),
-        };
-        let payload = build_payload(&inner, HookEvent::SessionStart, None, None);
+        let hooks = hooks(Vec::new()).await;
+        let payload = build_payload(&hooks.inner, HookEvent::SessionStart, None, None);
         let object = payload.as_object().expect("object");
         assert_eq!(object.len(), 4);
         assert!(object.contains_key("event"));
@@ -770,7 +1028,8 @@ echo "{\"decision\":\"block\",\"reason\":\"stdin said $event\"}"
             &[&script_path],
             None,
             false,
-        )]);
+        )])
+        .await;
         let decision = hooks
             .fire_trust_decision("/tmp/project", "trusted", true)
             .await;
@@ -784,7 +1043,7 @@ echo "{\"decision\":\"block\",\"reason\":\"stdin said $event\"}"
         let (script_path, _dir) = write_hook("#!/bin/sh\nsleep 30\n");
         let mut open = hook_config(HookEvent::PreTrustDecision, &[&script_path], None, false);
         open.timeout_ms = Some(100);
-        let open_hooks = hooks(vec![open]);
+        let open_hooks = hooks(vec![open]).await;
         let decision = open_hooks
             .fire_trust_decision("/tmp/project", "ask", true)
             .await;
@@ -793,7 +1052,7 @@ echo "{\"decision\":\"block\",\"reason\":\"stdin said $event\"}"
         let (script_path, _dir) = write_hook("#!/bin/sh\nsleep 30\n");
         let mut closed = hook_config(HookEvent::PreTrustDecision, &[&script_path], None, true);
         closed.timeout_ms = Some(100);
-        let closed_hooks = hooks(vec![closed]);
+        let closed_hooks = hooks(vec![closed]).await;
         let decision = closed_hooks
             .fire_trust_decision("/tmp/project", "ask", true)
             .await;
@@ -824,7 +1083,8 @@ echo "{\"decision\":\"block\",\"reason\":\"stdin said $event\"}"
             enabled: None,
             fail_closed: None,
             extra: Map::new(),
-        }]);
+        }])
+        .await;
         let decision = hooks
             .fire_trust_decision("/tmp/project", "untrusted", false)
             .await;
@@ -848,7 +1108,8 @@ echo "{\"decision\":\"block\",\"reason\":\"stdin said $event\"}"
             &[&script_path],
             None,
             false,
-        )]);
+        )])
+        .await;
         let decision = hooks
             .fire_trust_decision("/tmp/project", "trusted", false)
             .await;
@@ -863,22 +1124,41 @@ echo "{\"decision\":\"block\",\"reason\":\"stdin said $event\"}"
             &[&script_path],
             Some("other"),
             false,
-        )]);
+        )])
+        .await;
         let decision = unmatched
-            .fire_trust_decision("/tmp/project", "trusted", true)
+            .fire_trust_decision("<workspace>/project", "trusted", true)
             .await;
         assert!(!decision.block, "path must not match matcher \"other\"");
 
         let matched = hooks(vec![hook_config(
             HookEvent::PreTrustDecision,
             &[&script_path],
+            Some("<workspace>/project"),
+            false,
+        )])
+        .await;
+        let decision = matched
+            .fire_trust_decision("<workspace>/project", "trusted", true)
+            .await;
+        assert!(
+            decision.block,
+            "path must match matcher \"<workspace>/project\""
+        );
+        let substring = hooks(vec![hook_config(
+            HookEvent::PreTrustDecision,
+            &[&script_path],
             Some("project"),
             false,
-        )]);
-        let decision = matched
-            .fire_trust_decision("/tmp/project", "trusted", true)
+        )])
+        .await;
+        let decision = substring
+            .fire_trust_decision("<workspace>/project", "trusted", true)
             .await;
-        assert!(decision.block, "path must match matcher \"project\"");
+        assert!(
+            !decision.block,
+            "canonical path must not match a path-segment substring"
+        );
     }
 
     #[tokio::test]
@@ -889,7 +1169,8 @@ echo "{\"decision\":\"block\",\"reason\":\"stdin said $event\"}"
             &[missing],
             None,
             false,
-        )]);
+        )])
+        .await;
         let decision = open
             .fire_trust_decision("/tmp/project", "trusted", true)
             .await;
@@ -900,7 +1181,8 @@ echo "{\"decision\":\"block\",\"reason\":\"stdin said $event\"}"
             &[missing],
             None,
             true,
-        )]);
+        )])
+        .await;
         let decision = closed
             .fire_trust_decision("/tmp/project", "trusted", true)
             .await;

@@ -1,90 +1,18 @@
-use std::ffi::OsStr;
 use std::fs::Metadata;
-use std::io::{ErrorKind, Read};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
-use std::process::{ChildStderr, Command, Stdio};
-use std::thread;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::SandboxError;
+use serde::{Deserialize, Serialize};
 
-const BWRAP_PROGRAM: &str = "bwrap";
-const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(20);
-const PROBE_STDERR_LIMIT: usize = 64 * 1024;
-const SYSTEM_TRUST_ROOT: &str = "/";
-const SYSTEM_TRUST_UID: u32 = 0;
-const USER_NAMESPACE_FAILURES: [&str; 4] = [
-    "loopback: Failed RTM_NEWADDR",
-    "loopback: Failed RTM_NEWLINK",
-    "setting up uid map: Permission denied",
-    "No permissions to create a new namespace",
-];
+use crate::{LauncherKind, LauncherTrustFailure, SandboxError, SandboxIoOperation};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ProbeOutcome {
-    Available,
-    UntrustedExecutable { message: String },
-    UserNamespacesUnavailable { stderr: String },
-    Exited { code: Option<i32>, stderr: String },
-    TimedOut { stderr: String },
-    SpawnFailed { message: String },
-    WaitFailed { message: String, stderr: String },
-}
+const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
-impl ProbeOutcome {
-    #[must_use]
-    pub const fn is_available(&self) -> bool {
-        matches!(self, Self::Available)
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct TrustedExecutable {
-    path: PathBuf,
-    trust: TrustPolicy,
-    identity: ExecutableIdentity,
-}
-
-impl TrustedExecutable {
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub(crate) fn revalidate(&self) -> bool {
-        trusted_executable(&self.path, &self.trust, None).is_some_and(|current| {
-            current.path == self.path && current.identity == self.identity
-        })
-    }
-}
-
-#[derive(Clone, Debug)]
-struct TrustPolicy {
-    root: PathBuf,
-    owner_uid: u32,
-}
-
-impl TrustPolicy {
-    fn system() -> Option<Self> {
-        Self::new(Path::new(SYSTEM_TRUST_ROOT), SYSTEM_TRUST_UID)
-    }
-
-    fn new(root: &Path, owner_uid: u32) -> Option<Self> {
-        if !root.is_absolute() {
-            return None;
-        }
-        let root = std::fs::canonicalize(root).ok()?;
-        let metadata = std::fs::symlink_metadata(&root).ok()?;
-        (metadata.is_dir() && metadata_is_secure(&metadata, owner_uid)).then_some(Self {
-            root,
-            owner_uid,
-        })
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ExecutableIdentity {
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ExecutableIdentity {
     device: u64,
     inode: u64,
     mode: u32,
@@ -97,8 +25,8 @@ struct ExecutableIdentity {
     changed_nanoseconds: i64,
 }
 
-impl From<&Metadata> for ExecutableIdentity {
-    fn from(metadata: &Metadata) -> Self {
+impl ExecutableIdentity {
+    fn from_metadata(metadata: &Metadata) -> Self {
         Self {
             device: metadata.dev(),
             inode: metadata.ino(),
@@ -112,321 +40,424 @@ impl From<&Metadata> for ExecutableIdentity {
             changed_nanoseconds: metadata.ctime_nsec(),
         }
     }
-}
 
-pub fn find_system_bwrap(search_path: Option<&OsStr>, cwd: &Path) -> Option<PathBuf> {
-    discover_system_bwrap(search_path, cwd).map(|executable| executable.path)
-}
-
-pub(crate) fn discover_system_bwrap(
-    search_path: Option<&OsStr>,
-    cwd: &Path,
-) -> Option<TrustedExecutable> {
-    discover_bwrap_with_trust(search_path, cwd, TrustPolicy::system()?)
-}
-
-fn discover_bwrap_with_trust(
-    search_path: Option<&OsStr>,
-    cwd: &Path,
-    trust: TrustPolicy,
-) -> Option<TrustedExecutable> {
-    let search_path = search_path?;
-    let cwd = std::fs::canonicalize(cwd).ok()?;
-    std::env::split_paths(search_path).find_map(|directory| {
-        if !source_path_is_trusted(&directory, &trust) {
-            return None;
+    pub(crate) fn from_fd(descriptor: RawFd) -> Result<Self, SandboxError> {
+        let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe_fstat(descriptor, status.as_mut_ptr()) != 0 {
+            return Err(SandboxError::from_io(
+                SandboxIoOperation::InspectDescriptor,
+                &std::io::Error::last_os_error(),
+            ));
         }
-        trusted_executable(&directory.join(BWRAP_PROGRAM), &trust, Some(&cwd))
+        let status = unsafe_assume_stat(status);
+        Ok(Self {
+            device: status.st_dev as u64,
+            inode: status.st_ino as u64,
+            mode: status.st_mode,
+            owner_uid: status.st_uid,
+            owner_gid: status.st_gid,
+            size: status.st_size as u64,
+            modified_seconds: status.st_mtime,
+            modified_nanoseconds: status.st_mtime_nsec,
+            changed_seconds: status.st_ctime,
+            changed_nanoseconds: status.st_ctime_nsec,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(device: u64, inode: u64) -> Self {
+        Self {
+            device,
+            inode,
+            mode: libc::S_IFREG | 0o755,
+            owner_uid: 0,
+            owner_gid: 0,
+            size: 1,
+            modified_seconds: 0,
+            modified_nanoseconds: 0,
+            changed_seconds: 0,
+            changed_nanoseconds: 0,
+        }
+    }
+    pub(crate) fn matches_fd(self, descriptor: RawFd) -> Result<bool, SandboxError> {
+        self.matches_fd_with_owner_view(descriptor, IdentityOwnerView::Host)
+    }
+
+    pub(crate) fn matches_fd_in_user_namespace(
+        self,
+        descriptor: RawFd,
+    ) -> Result<bool, SandboxError> {
+        self.matches_fd_with_owner_view(descriptor, IdentityOwnerView::UserNamespace)
+    }
+
+    fn matches_fd_with_owner_view(
+        self,
+        descriptor: RawFd,
+        owner_view: IdentityOwnerView,
+    ) -> Result<bool, SandboxError> {
+        let current = Self::from_fd(descriptor)?;
+        Ok(self.device == current.device
+            && self.inode == current.inode
+            && self.mode == current.mode
+            && ownership_matches(self.owner_uid, current.owner_uid, owner_view)
+            && ownership_matches(self.owner_gid, current.owner_gid, owner_view)
+            && self.size == current.size
+            && self.modified_seconds == current.modified_seconds
+            && self.modified_nanoseconds == current.modified_nanoseconds)
+    }
+
+    /// Content-agnostic directory identity: a directory keeps the same identity across
+    /// entry additions/removals (mtime/size change), so only the stable inode/device,
+    /// mode, and ownership are compared. A replaced directory (different inode) fails.
+    pub(crate) fn directory_matches_fd(self, descriptor: RawFd) -> Result<bool, SandboxError> {
+        self.directory_matches_fd_with_owner_view(descriptor, IdentityOwnerView::Host)
+    }
+
+    pub(crate) fn directory_matches_fd_in_user_namespace(
+        self,
+        descriptor: RawFd,
+    ) -> Result<bool, SandboxError> {
+        self.directory_matches_fd_with_owner_view(descriptor, IdentityOwnerView::UserNamespace)
+    }
+
+    fn directory_matches_fd_with_owner_view(
+        self,
+        descriptor: RawFd,
+        owner_view: IdentityOwnerView,
+    ) -> Result<bool, SandboxError> {
+        let current = Self::from_fd(descriptor)?;
+        Ok(self.device == current.device
+            && self.inode == current.inode
+            && (self.mode & libc::S_IFMT) == (current.mode & libc::S_IFMT)
+            && ownership_matches(self.owner_uid, current.owner_uid, owner_view)
+            && ownership_matches(self.owner_gid, current.owner_gid, owner_view))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum IdentityOwnerView {
+    Host,
+    UserNamespace,
+}
+
+fn ownership_matches(expected: u32, current: u32, owner_view: IdentityOwnerView) -> bool {
+    expected == current
+        || (matches!(owner_view, IdentityOwnerView::UserNamespace)
+            && expected == 0
+            && current == 65_534)
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::{IdentityOwnerView, ownership_matches};
+
+    #[test]
+    fn user_namespace_ownership_matches_root_overflow_only() {
+        assert!(ownership_matches(
+            0,
+            65_534,
+            IdentityOwnerView::UserNamespace
+        ));
+        assert!(ownership_matches(
+            1_000,
+            1_000,
+            IdentityOwnerView::UserNamespace
+        ));
+        assert!(!ownership_matches(
+            1_000,
+            65_534,
+            IdentityOwnerView::UserNamespace
+        ));
+        assert!(!ownership_matches(
+            0,
+            1_000,
+            IdentityOwnerView::UserNamespace
+        ));
+    }
+
+    #[test]
+    fn host_ownership_requires_an_exact_match() {
+        assert!(ownership_matches(0, 0, IdentityOwnerView::Host));
+        assert!(ownership_matches(1_000, 1_000, IdentityOwnerView::Host));
+        assert!(!ownership_matches(0, 65_534, IdentityOwnerView::Host));
+    }
+}
+
+pub(crate) struct TrustedExecutable {
+    executable: OwnedFd,
+    identity: ExecutableIdentity,
+    launcher: LauncherKind,
+}
+
+impl TrustedExecutable {
+    pub(crate) fn try_clone_fd(&self) -> Result<OwnedFd, SandboxError> {
+        duplicate_fd(self.executable.as_raw_fd())
+    }
+
+    pub(crate) fn try_clone(&self) -> Result<Self, SandboxError> {
+        Ok(Self {
+            executable: self.try_clone_fd()?,
+            identity: self.identity,
+            launcher: self.launcher,
+        })
+    }
+
+    pub(crate) const fn identity(&self) -> ExecutableIdentity {
+        self.identity
+    }
+
+    pub(crate) fn revalidate(&self) -> Result<(), SandboxError> {
+        if self.identity.matches_fd(self.executable.as_raw_fd())? {
+            Ok(())
+        } else {
+            Err(SandboxError::LauncherChanged {
+                launcher: self.launcher,
+            })
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn probe_trusted_bwrap() -> Result<TrustedExecutable, SandboxError> {
+    let candidate = ["/usr/bin/bwrap", "/bin/bwrap"]
+        .into_iter()
+        .find(|path| Path::new(path).exists())
+        .ok_or(SandboxError::LauncherUnavailable {
+            launcher: LauncherKind::Bubblewrap,
+        })?;
+    let executable = open_trusted(candidate, LauncherKind::Bubblewrap)?;
+    executable.revalidate()?;
+    let child = Command::new(candidate)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| SandboxError::from_io(SandboxIoOperation::ProbeLauncher, &error))?;
+    let output = run_bounded(child, LauncherKind::Bubblewrap)?;
+    let version = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .find_map(parse_version)
+        .ok_or(SandboxError::LauncherUntrusted {
+            launcher: LauncherKind::Bubblewrap,
+            failure: LauncherTrustFailure::ProbeRejected,
+        })?;
+    const REQUIRED_BWRAP_VERSION: (u32, u32, u32) = (0, 10, 0);
+    if version < REQUIRED_BWRAP_VERSION {
+        return Err(SandboxError::LauncherUntrusted {
+            launcher: LauncherKind::Bubblewrap,
+            failure: LauncherTrustFailure::VersionTooOld {
+                found: version,
+                required: REQUIRED_BWRAP_VERSION,
+            },
+        });
+    }
+    executable.revalidate()?;
+    Ok(executable)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn probe_sandbox_exec() -> Result<TrustedExecutable, SandboxError> {
+    let candidate = "/usr/bin/sandbox-exec";
+    let executable = open_trusted(candidate, LauncherKind::SandboxExec)?;
+    let child = Command::new(candidate)
+        .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| SandboxError::from_io(SandboxIoOperation::ProbeLauncher, &error))?;
+    let output = run_bounded(child, LauncherKind::SandboxExec)?;
+    if !output.status.success() {
+        return Err(SandboxError::LauncherUntrusted {
+            launcher: LauncherKind::SandboxExec,
+            failure: LauncherTrustFailure::ProbeRejected,
+        });
+    }
+    executable.revalidate()?;
+    Ok(executable)
+}
+
+fn open_trusted(path: &str, launcher: LauncherKind) -> Result<TrustedExecutable, SandboxError> {
+    validate_ancestors(Path::new(path), launcher)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| SandboxError::from_io(SandboxIoOperation::OpenExecutable, &error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| SandboxError::from_io(SandboxIoOperation::InspectDescriptor, &error))?;
+    if !metadata.is_file() || metadata.mode() & 0o111 == 0 {
+        return Err(SandboxError::LauncherUntrusted {
+            launcher,
+            failure: LauncherTrustFailure::NotRegular,
+        });
+    }
+    if metadata.uid() != 0 {
+        return Err(SandboxError::LauncherUntrusted {
+            launcher,
+            failure: LauncherTrustFailure::WrongOwner,
+        });
+    }
+    if metadata.mode() & 0o022 != 0 {
+        return Err(SandboxError::LauncherUntrusted {
+            launcher,
+            failure: LauncherTrustFailure::WritableByGroupOrOther,
+        });
+    }
+    Ok(TrustedExecutable {
+        identity: ExecutableIdentity::from_metadata(&metadata),
+        executable: file.into(),
+        launcher,
     })
 }
 
-pub fn probe_bwrap(path: &Path, timeout: Duration) -> ProbeOutcome {
-    let Some(trust) = TrustPolicy::system() else {
-        return untrusted_outcome(path);
-    };
-    let Some(executable) = trusted_executable(path, &trust, None) else {
-        return untrusted_outcome(path);
-    };
-    probe_trusted_bwrap(&executable, timeout)
+fn validate_ancestors(path: &Path, launcher: LauncherKind) -> Result<(), SandboxError> {
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|error| SandboxError::from_io(SandboxIoOperation::OpenExecutable, &error))?;
+    let mut current = canonical.parent();
+    while let Some(ancestor) = current {
+        let metadata = std::fs::symlink_metadata(ancestor).map_err(|error| {
+            SandboxError::from_io(SandboxIoOperation::InspectDescriptor, &error)
+        })?;
+        if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+            return Err(SandboxError::LauncherUntrusted {
+                launcher,
+                failure: LauncherTrustFailure::UnsafeAncestor,
+            });
+        }
+        current = ancestor.parent();
+    }
+    Ok(())
 }
 
-pub(crate) fn probe_trusted_bwrap(
-    executable: &TrustedExecutable,
-    timeout: Duration,
-) -> ProbeOutcome {
-    if !executable.revalidate() {
-        return untrusted_outcome(executable.path());
-    }
-    let mut child = match Command::new(executable.path())
-        .args([
-            "--unshare-user",
-            "--unshare-net",
-            "--ro-bind",
-            "/",
-            "/",
-            "--perms",
-            "000",
-            "--tmpfs",
-            "/tmp",
-            "/bin/true",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) => {
-            return ProbeOutcome::SpawnFailed {
-                message: error.to_string(),
-            };
-        }
-    };
-    let mut stderr = match child.stderr.take() {
-        Some(stderr) => stderr,
-        None => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return ProbeOutcome::WaitFailed {
-                message: "probe stderr pipe was unavailable".to_owned(),
-                stderr: String::new(),
-            };
-        }
-    };
-    if let Err(error) = set_nonblocking(&stderr) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return ProbeOutcome::WaitFailed {
-            message: error.to_string(),
-            stderr: String::new(),
-        };
-    }
+fn parse_version(value: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = value.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor, patch))
+}
 
-    let deadline = Instant::now() + timeout;
-    let mut stderr_bytes = Vec::new();
+fn run_bounded(
+    mut child: std::process::Child,
+    launcher: LauncherKind,
+) -> Result<std::process::Output, SandboxError> {
+    let deadline = Instant::now() + PROBE_TIMEOUT;
     loop {
-        drain_stderr(&mut stderr, &mut stderr_bytes);
         match child.try_wait() {
-            Ok(Some(status)) => {
-                drain_stderr(&mut stderr, &mut stderr_bytes);
-                let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
-                if status.success() {
-                    return ProbeOutcome::Available;
-                }
-                if USER_NAMESPACE_FAILURES
-                    .iter()
-                    .any(|failure| stderr.contains(failure))
-                {
-                    return ProbeOutcome::UserNamespacesUnavailable { stderr };
-                }
-                return ProbeOutcome::Exited {
-                    code: status.code(),
-                    stderr,
-                };
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|error| SandboxError::from_io(SandboxIoOperation::WaitChild, &error));
             }
-            Ok(None) if Instant::now() < deadline => {
-                thread::sleep(PROBE_POLL_INTERVAL);
-            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                drain_stderr(&mut stderr, &mut stderr_bytes);
-                return ProbeOutcome::TimedOut {
-                    stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
-                };
+                return Err(SandboxError::LauncherUntrusted {
+                    launcher,
+                    failure: LauncherTrustFailure::ProbeTimedOut,
+                });
             }
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                drain_stderr(&mut stderr, &mut stderr_bytes);
-                return ProbeOutcome::WaitFailed {
-                    message: error.to_string(),
-                    stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
-                };
+                return Err(SandboxError::from_io(SandboxIoOperation::WaitChild, &error));
             }
         }
     }
 }
 
-fn trusted_executable(
+pub(crate) fn open_pinned_executable(
     path: &Path,
-    trust: &TrustPolicy,
-    rejected_tree: Option<&Path>,
-) -> Option<TrustedExecutable> {
-    if !source_path_is_trusted(path, trust) {
-        return None;
+) -> Result<(OwnedFd, ExecutableIdentity), SandboxError> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| SandboxError::from_io(SandboxIoOperation::OpenExecutable, &error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| SandboxError::from_io(SandboxIoOperation::InspectDescriptor, &error))?;
+    if !metadata.is_file() || metadata.mode() & 0o111 == 0 {
+        return Err(SandboxError::from_io(
+            SandboxIoOperation::OpenExecutable,
+            &std::io::Error::from_raw_os_error(libc::EACCES),
+        ));
     }
-    let path = std::fs::canonicalize(path).ok()?;
-    if !path.is_absolute()
-        || !path.starts_with(&trust.root)
-        || rejected_tree.is_some_and(|tree| path.starts_with(tree))
-        || !canonical_path_is_trusted(&path, trust)
-    {
-        return None;
+    let identity = ExecutableIdentity::from_metadata(&metadata);
+    Ok((file.into(), identity))
+}
+
+pub(crate) fn duplicate_fd(descriptor: RawFd) -> Result<OwnedFd, SandboxError> {
+    let duplicated = unsafe_fcntl_dupfd_cloexec(descriptor, 7);
+    if duplicated < 0 {
+        return Err(SandboxError::from_io(
+            SandboxIoOperation::DuplicateDescriptor,
+            &std::io::Error::last_os_error(),
+        ));
     }
-    let metadata = std::fs::metadata(&path).ok()?;
-    if !metadata.is_file()
-        || metadata.mode() & 0o111 == 0
-        || !metadata_is_secure(&metadata, trust.owner_uid)
-    {
-        return None;
-    }
-    let identity = ExecutableIdentity::from(&metadata);
-    Some(TrustedExecutable {
-        path,
-        trust: trust.clone(),
-        identity,
-    })
-}
-
-fn source_path_is_trusted(path: &Path, trust: &TrustPolicy) -> bool {
-    if !path.is_absolute() || !path.starts_with(&trust.root) {
-        return false;
-    }
-    path_chain_is_trusted(path, trust, true)
-}
-
-fn canonical_path_is_trusted(path: &Path, trust: &TrustPolicy) -> bool {
-    path_chain_is_trusted(path, trust, false)
-}
-
-fn path_chain_is_trusted(path: &Path, trust: &TrustPolicy, allow_symlinks: bool) -> bool {
-    let mut current = path;
-    loop {
-        let Ok(metadata) = std::fs::symlink_metadata(current) else {
-            return false;
-        };
-        if (!allow_symlinks && metadata.file_type().is_symlink())
-            || !metadata_is_secure(&metadata, trust.owner_uid)
-        {
-            return false;
-        }
-        // The configured root is the trust anchor: validate the root itself,
-        // but not ancestors outside its boundary. The system root is `/`, so
-        // production policy still validates the complete filesystem chain.
-        if current == trust.root {
-            return true;
-        }
-        let Some(parent) = current.parent() else {
-            return false;
-        };
-        if !parent.starts_with(&trust.root) {
-            return false;
-        }
-        current = parent;
-    }
-}
-
-fn metadata_is_secure(metadata: &Metadata, owner_uid: u32) -> bool {
-    metadata.uid() == owner_uid
-        && (metadata.file_type().is_symlink() || metadata.mode() & 0o022 == 0)
-}
-
-fn untrusted_outcome(path: &Path) -> ProbeOutcome {
-    ProbeOutcome::UntrustedExecutable {
-        message: format!(
-            "bubblewrap executable is not a canonical, securely owned executable in a trusted path: {}",
-            path.display()
-        ),
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn find_system_bwrap_with_trust(
-    search_path: Option<&OsStr>,
-    cwd: &Path,
-    trusted_root: &Path,
-    owner_uid: u32,
-) -> Option<PathBuf> {
-    discover_bwrap_with_trust(
-        search_path,
-        cwd,
-        TrustPolicy::new(trusted_root, owner_uid)?,
-    )
-    .map(|executable| executable.path)
-}
-
-#[cfg(test)]
-pub(crate) fn discover_bwrap_with_trust_for_test(
-    search_path: Option<&OsStr>,
-    cwd: &Path,
-    trusted_root: &Path,
-    owner_uid: u32,
-) -> Option<TrustedExecutable> {
-    discover_bwrap_with_trust(
-        search_path,
-        cwd,
-        TrustPolicy::new(trusted_root, owner_uid)?,
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn probe_bwrap_with_trust(
-    path: &Path,
-    trusted_root: &Path,
-    owner_uid: u32,
-    timeout: Duration,
-) -> ProbeOutcome {
-    let Some(trust) = TrustPolicy::new(trusted_root, owner_uid) else {
-        return untrusted_outcome(path);
-    };
-    let Some(executable) = trusted_executable(path, &trust, None) else {
-        return untrusted_outcome(path);
-    };
-    probe_trusted_bwrap(&executable, timeout)
-}
-
-#[must_use]
-pub fn proc_version_indicates_wsl1(proc_version: &str) -> bool {
-    let proc_version = proc_version.to_ascii_lowercase();
-    let mut remaining = proc_version.as_str();
-    while let Some(marker) = remaining.find("wsl") {
-        let version_start = marker + "wsl".len();
-        let version_digits = remaining[version_start..]
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect::<String>();
-        if let Ok(version) = version_digits.parse::<u32>() {
-            return version == 1;
-        }
-        remaining = &remaining[version_start..];
-    }
-    proc_version.contains("microsoft") && !proc_version.contains("microsoft-standard")
-}
-
-fn drain_stderr(stderr: &mut ChildStderr, bytes: &mut Vec<u8>) {
-    let mut buffer = [0_u8; 4096];
-    loop {
-        match stderr.read(&mut buffer) {
-            Ok(0) => return,
-            Ok(read) => {
-                let remaining = PROBE_STDERR_LIMIT.saturating_sub(bytes.len());
-                bytes.extend_from_slice(&buffer[..read.min(remaining)]);
-            }
-            Err(error) if error.kind() == ErrorKind::WouldBlock => return,
-            Err(_) => return,
-        }
-    }
+    Ok(unsafe_owned_fd(duplicated))
 }
 
 #[allow(unsafe_code)]
-fn set_nonblocking(stderr: &ChildStderr) -> Result<(), SandboxError> {
-    // SAFETY: fcntl reads and updates flags for a live owned pipe descriptor.
-    // No pointer is passed and the descriptor remains owned by ChildStderr.
-    let flags = unsafe { libc::fcntl(stderr.as_raw_fd(), libc::F_GETFL) };
-    if flags < 0 {
-        return Err(SandboxError::System(std::io::Error::last_os_error()));
+fn unsafe_fstat(descriptor: RawFd, status: *mut libc::stat) -> i32 {
+    unsafe { libc::fstat(descriptor, status) }
+}
+
+#[allow(unsafe_code)]
+fn unsafe_assume_stat(status: std::mem::MaybeUninit<libc::stat>) -> libc::stat {
+    unsafe { status.assume_init() }
+}
+
+#[allow(unsafe_code)]
+fn unsafe_fcntl_dupfd_cloexec(descriptor: RawFd, minimum: RawFd) -> RawFd {
+    unsafe { libc::fcntl(descriptor, libc::F_DUPFD_CLOEXEC, minimum) }
+}
+
+#[allow(unsafe_code)]
+fn unsafe_owned_fd(descriptor: RawFd) -> OwnedFd {
+    unsafe { OwnedFd::from_raw_fd(descriptor) }
+}
+
+pub(crate) fn duplicate_fd_at_least(
+    descriptor: RawFd,
+    minimum: RawFd,
+) -> Result<OwnedFd, SandboxError> {
+    let duplicated = unsafe_fcntl_dupfd_cloexec(descriptor, minimum);
+    if duplicated < 0 {
+        return Err(SandboxError::from_io(
+            SandboxIoOperation::DuplicateDescriptor,
+            &std::io::Error::last_os_error(),
+        ));
     }
-    // SAFETY: flags came from F_GETFL for the same live descriptor; O_NONBLOCK
-    // is the only bit added.
-    let result = unsafe {
-        libc::fcntl(
-            stderr.as_raw_fd(),
-            libc::F_SETFL,
-            flags | libc::O_NONBLOCK,
-        )
-    };
-    if result < 0 {
-        return Err(SandboxError::System(std::io::Error::last_os_error()));
+    Ok(unsafe_owned_fd(duplicated))
+}
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use super::*;
+
+    #[test]
+    fn exec_uses_opened_bwrap_identity() {
+        let directory = tempfile::tempdir().expect("directory");
+        let path = directory.path().join("launcher");
+        let mut file = File::create(&path).expect("create");
+        file.write_all(b"#!/bin/sh\nexit 0\n").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("permissions");
+        let (descriptor, identity) = open_pinned_executable(&path).expect("open");
+        std::fs::remove_file(&path).expect("remove");
+        File::create(&path).expect("replace");
+        assert!(
+            identity
+                .matches_fd(descriptor.as_raw_fd())
+                .expect("inspect")
+        );
     }
-    Ok(())
 }

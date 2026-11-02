@@ -1,16 +1,18 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use ::http::HeaderMap;
 use anyhow::{Result, anyhow, bail};
 use futures_util::FutureExt;
-use reqwest::{Response, Url, header::HeaderMap};
+use reqwest::Url;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 
 use super::common::{
-    apply_provider_headers, apply_provider_request, client, consume_sse, headers_map,
-    insert_header, insert_header_map, is_aborted, notify_response, send_with_retry,
+    apply_provider_headers, apply_provider_request, build_request, client, consume_sse,
+    headers_map, insert_header, insert_header_map, is_aborted, notify_response, null_default_vec,
+    send_with_retry,
 };
 use crate::*;
 
@@ -117,6 +119,11 @@ pub fn register_mistral() {
             stream: native,
             stream_simple: simple,
             generate_image: None,
+            resolve_http_authorities: Arc::new(|model, options| {
+                let url = mistral_chat_url(model, options)?;
+                let (authority, _) = resolve_http_endpoint(url.as_str())?;
+                Ok(std::collections::BTreeSet::from([authority]))
+            }),
         },
         None,
     );
@@ -129,6 +136,8 @@ async fn run_mistral_stream(
     options: &MistralOptions,
     output: &mut AssistantMessage,
 ) -> Result<()> {
+    // The governed HTTP/SSE transport is the only provider transport; the
+    // removed WebSocket modes no longer exist as selectable values.
     let api_key = mistral_api_key(model, &options.stream)?;
     let payload = apply_provider_request(
         build_mistral_payload(model, context, options)?,
@@ -143,14 +152,25 @@ async fn run_mistral_stream(
         &options.stream,
     )
     .await?;
-    let http = client(&options.stream)?;
+    client(&options.stream)?;
+    let payload = serde_json::to_vec(&payload)?;
     let response = send_with_retry(&options.stream, || {
-        http.post(url.clone())
-            .headers(headers.clone())
-            .json(&payload)
+        build_request(
+            &options.stream,
+            HttpMethod::Post,
+            url.as_str(),
+            &headers,
+            payload.clone(),
+        )
     })
     .await?;
-    notify_response(&options.stream, &response, model).await?;
+    notify_response(
+        &options.stream,
+        response.status(),
+        response.headers().clone(),
+        model,
+    )
+    .await?;
     if !response.status().is_success() {
         return Err(anyhow!(
             mistral_error_body(response, &options.stream).await?
@@ -665,7 +685,7 @@ struct MistralChoice {
 #[derive(Debug, Deserialize, Default)]
 struct MistralDelta {
     content: Option<Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default_vec")]
     tool_calls: Vec<MistralToolDelta>,
 }
 
@@ -1103,16 +1123,10 @@ fn close_partial_json(input: &str) -> Option<String> {
     Some(candidate)
 }
 
-async fn mistral_error_body(response: Response, options: &StreamOptions) -> Result<String> {
+async fn mistral_error_body(response: HttpResponse, _options: &StreamOptions) -> Result<String> {
     let status = response.status().as_u16();
-    let body = match &options.abort_signal {
-        Some(token) => tokio::select! {
-            biased;
-            _ = token.clone().cancelled_owned() => return Err(anyhow!("Request was aborted")),
-            body = response.text() => body.unwrap_or_default(),
-        },
-        None => response.text().await.unwrap_or_default(),
-    };
+    let body = crate::collect_response_body(response).await?;
+    let body = String::from_utf8_lossy(&body);
     let body = body.trim();
     if body.is_empty() {
         Ok(format!("Mistral API error ({status})"))
@@ -1235,6 +1249,28 @@ mod tests {
     fn request_json(request: &str) -> Value {
         let (_, body) = request.split_once("\r\n\r\n").expect("request body");
         serde_json::from_str(body).expect("json request")
+    }
+
+    /// Answers with an HTTP error whose body stream fails mid-read, so the
+    /// provider must propagate the collection failure instead of swallowing it.
+    struct FailingBodyExecutor;
+
+    impl crate::HttpExecutor for FailingBodyExecutor {
+        fn execute<'a>(
+            &'a self,
+            _request: HttpRequest,
+        ) -> futures_util::future::BoxFuture<'a, anyhow::Result<HttpResponse>> {
+            async move {
+                let stream =
+                    futures_util::stream::iter(vec![Err(anyhow!("simulated body read failure"))]);
+                Ok(HttpResponse::new(
+                    ::http::StatusCode::BAD_REQUEST,
+                    ::http::HeaderMap::new(),
+                    Box::pin(stream),
+                ))
+            }
+            .boxed()
+        }
     }
 
     #[test]
@@ -1399,6 +1435,32 @@ mod tests {
         assert!(!uses_reasoning_effort(&prompt_model));
     }
 
+    /// Regression for the intermittent streaming error
+    /// `invalid type: null, expected a sequence`: Mistral-compatible chunk
+    /// deltas always carry `tool_calls` and emit an explicit `null` on
+    /// text-only chunks. The optional delta sequence now maps `null` to the
+    /// same empty `Vec` as absence; malformed non-array values stay rejected.
+    #[test]
+    fn null_tool_calls_delta_decodes_to_empty_and_scalars_reject() {
+        let chunk: MistralChunk = serde_json::from_str(
+            r#"{"id":"chat-1","choices":[{"delta":{"content":[{"type":"text","text":"hi"}],"tool_calls":null}}]}"#,
+        )
+        .expect("null tool_calls must decode like an absent field");
+        assert!(
+            chunk.choices[0].delta.tool_calls.is_empty(),
+            "null tool_calls -> empty"
+        );
+
+        let error = serde_json::from_str::<MistralChunk>(
+            r#"{"choices":[{"delta":{"tool_calls":"not-an-array"}}]}"#,
+        )
+        .expect_err("scalar tool_calls must reject");
+        assert!(
+            error.to_string().contains("expected a sequence"),
+            "scalar tool_calls must fail as a sequence: {error}"
+        );
+    }
+
     #[tokio::test]
     async fn stream_fixture_maps_text_thinking_tool_usage_and_headers() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -1429,6 +1491,7 @@ mod tests {
                 stream: StreamOptions {
                     api_key: Some("sk-test".into()),
                     session_id: Some("session-1".into()),
+                    http_executor: Some(crate::http::test_http_executor()),
                     ..StreamOptions::default()
                 },
                 ..MistralOptions::default()
@@ -1526,6 +1589,7 @@ mod tests {
                         "AUTHORIZATION".into(),
                         "Bearer caller-secret".into(),
                     )]),
+                    http_executor: Some(crate::http::test_http_executor()),
                     ..StreamOptions::default()
                 },
                 ..MistralOptions::default()
@@ -1573,6 +1637,7 @@ mod tests {
                 stream: StreamOptions {
                     api_key: Some("key".into()),
                     max_retries: 1,
+                    http_executor: Some(crate::http::test_http_executor()),
                     ..StreamOptions::default()
                 },
                 ..MistralOptions::default()
@@ -1603,6 +1668,7 @@ mod tests {
             MistralOptions {
                 stream: StreamOptions {
                     api_key: Some("sk-secret".into()),
+                    http_executor: Some(crate::http::test_http_executor()),
                     ..StreamOptions::default()
                 },
                 ..MistralOptions::default()
@@ -1617,6 +1683,69 @@ mod tests {
         assert!(message.starts_with("Mistral API error (400): {\"detail\":\"[REDACTED]:"));
         assert!(message.contains("... [truncated 123 chars]"), "{message}");
         assert!(!message.contains("sk-secret"));
+    }
+
+    #[tokio::test]
+    async fn auto_transport_executes_governed_sse() {
+        // `Auto` (the runtime default transport) must resolve to the governed
+        // HTTP/SSE path: the request goes through the governed executor and
+        // completes normally, exactly like `Sse`.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let _ = read_request(&mut socket).await;
+            let body = "data: {\"id\":\"auto-1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.expect("write");
+        });
+        let events = stream_mistral(
+            model(format!("http://{address}")),
+            Context::default(),
+            MistralOptions {
+                stream: StreamOptions {
+                    api_key: Some("sk-test".into()),
+                    transport: Transport::Auto,
+                    http_executor: Some(crate::http::test_http_executor()),
+                    ..StreamOptions::default()
+                },
+                ..MistralOptions::default()
+            },
+        )
+        .await;
+        while events.next().await.is_some() {}
+        assert_eq!(
+            events.result().await.expect("result").stop_reason,
+            StopReason::Stop
+        );
+    }
+
+    #[tokio::test]
+    async fn error_body_collection_failure_propagates() {
+        // A body stream that errors mid-read must surface the collection
+        // failure instead of silently degrading into an empty error body.
+        let executor: crate::SharedHttpExecutor = Arc::new(FailingBodyExecutor);
+        let events = stream_mistral(
+            model("https://api.example.com".into()),
+            Context::default(),
+            MistralOptions {
+                stream: StreamOptions {
+                    api_key: Some("sk-test".into()),
+                    http_executor: Some(executor),
+                    ..StreamOptions::default()
+                },
+                ..MistralOptions::default()
+            },
+        )
+        .await;
+        while events.next().await.is_some() {}
+        let output = events.result().await.expect("stream result");
+        assert_eq!(output.stop_reason, StopReason::Error);
+        let message = output.error_message.expect("error message");
+        assert!(message.contains("simulated body read failure"), "{message}");
     }
 
     #[tokio::test]
@@ -1650,6 +1779,7 @@ mod tests {
                 stream: StreamOptions {
                     api_key: Some("key".into()),
                     abort_signal: Some(token.clone()),
+                    http_executor: Some(crate::http::test_http_executor()),
                     ..StreamOptions::default()
                 },
                 ..MistralOptions::default()

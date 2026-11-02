@@ -13,11 +13,17 @@ export default function (pi) {
   }));
 
   pi.on("context", (event) => ({
-    messages: [...(Array.isArray(event.messages) ? event.messages : []), {
-      role: "user",
-      content: [{ type: "text", text: "fixture-context" }],
-      timestamp: 17,
-    }],
+    messages: [
+      ...(Array.isArray(event.messages) ? event.messages : []).map((message) => ({
+        ...message,
+        timestamp: 17,
+      })),
+      {
+        role: "user",
+        content: [{ type: "text", text: "fixture-context" }],
+        timestamp: 17,
+      },
+    ],
   }));
 
   pi.on("before_provider_request", (event) => ({
@@ -48,6 +54,7 @@ export default function (pi) {
     message: {
       ...(typeof event.message === "object" && event.message !== null ? event.message : {}),
       content: [{ type: "text", text: "fixture-message" }],
+      timestamp: 19,
     },
   }));
 

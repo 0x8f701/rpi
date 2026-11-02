@@ -13,12 +13,11 @@
 //
 // Asserts (regression guard for App.tsx onModelChange/onThinkingChange):
 //   1. #model-select lists both models and reflects the current model
-//   2. switching the model (set_model) round-trips: get_state reflects the
-//      new provider/id in the select
-//   3. #thinking-select is enabled for the reasoning model and switchable
-//      (set_thinking_level) — the select reflects the new level
-//   4. the session still round-trips after the switches (request 1 = slow
-//      stream completes)
+//   2. switching during a slow response changes only the next-turn model:
+//      the active turn keeps its captured old model and completes normally,
+//      while the header select shows the newly chosen model
+//   3. the next prompt runs after the model cutover
+//   4. #thinking-select remains enabled and switchable on the new model
 
 import { chromium } from 'playwright';
 
@@ -59,11 +58,9 @@ async function main() {
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await waitFor(page, () => document.title === 'rpi web', 'page title missing');
-    await waitFor(page, () => document.querySelector('#conn-state') !== null, 'conn-state missing');
-
     await waitFor(
       page,
-      () => document.getElementById('conn-state').dataset.state === 'on',
+      () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true,
       'WS did not reach "connected"'
     );
 
@@ -82,16 +79,49 @@ async function main() {
       fail(`current model should be user-steering/mock, got "${initialModel}"`);
     }
 
-    // 2. Model switch round-trips through set_model + get_state.
+    // 2. Start request 1 on the original model, then switch while the response
+    // is visibly streaming. The backend captures the turn model at admission;
+    // App.tsx must project mock-2 as a next-turn setting without retargeting
+    // the in-flight response.
+    await page.fill('#prompt-input', 'switch models while this response streams');
+    await page.press('#prompt-input', 'Enter');
+    await waitFor(
+      page,
+      () => document.body.textContent.includes('steer-1-'),
+      'slow response never rendered its first streamed chunk',
+      30000
+    );
     await page.selectOption('#model-select', 'user-steering/mock-2');
     await waitFor(
       page,
       () => document.getElementById('model-select')?.value === 'user-steering/mock-2',
-      'model switch never reflected in the select'
+      'mid-stream model switch never updated the header select to the chosen model'
     );
-    await page.screenshot({ path: `${evidence}/switch-model.png`, fullPage: true });
+    await page.screenshot({ path: `${evidence}/switch-model-mid-stream.png`, fullPage: true });
+    await waitFor(
+      page,
+      (tail) => document.body.textContent.includes(tail)
+        && document.getElementById('send-btn')?.getAttribute('aria-label') === 'Send message',
+      'old-model in-flight response did not complete after the switch',
+      30000,
+      slowTail
+    );
+    const selectedAfterSettle = await page.evaluate(() => document.getElementById('model-select')?.value);
+    if (selectedAfterSettle !== 'user-steering/mock-2') fail(`header select left the next-turn model after settle: ${selectedAfterSettle}`);
 
-    // 3. The reasoning model exposes switchable thinking levels.
+    // 3. Request 2 is admitted after the model cutover and must still
+    // round-trip on the now-current mock-2 runtime.
+    await page.fill('#prompt-input', 'hello on the next-turn model');
+    await page.press('#prompt-input', 'Enter');
+    await waitFor(
+      page,
+      () => document.body.textContent.includes('steering-followup-reply'),
+      'next-turn prompt never round-tripped on the selected model',
+      30000
+    );
+
+    // 4. The reasoning model exposes switchable thinking levels after the
+    // mid-stream model cutover.
     await waitFor(
       page,
       () => {
@@ -112,18 +142,7 @@ async function main() {
     );
     await page.screenshot({ path: `${evidence}/switch-thinking.png`, fullPage: true });
 
-    // 4. The session still round-trips after the switches.
-    await page.fill('#prompt-input', 'hello after the switches');
-    await page.press('#prompt-input', 'Enter');
-    await waitFor(
-      page,
-      (tail) => document.body.textContent.includes(tail),
-      'post-switch prompt never round-tripped',
-      30000,
-      slowTail
-    );
-
-    console.log('web-switch: PASSED (model select lists + set_model round-trip; thinking level set_thinking_level round-trip; post-switch round-trip)');
+    console.log('web-switch: PASSED (mid-stream model cutover keeps current turn on old model, next turn uses selected model, thinking level round-trips)');
   } finally {
     await browser.close().catch(() => {});
   }

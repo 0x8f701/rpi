@@ -116,6 +116,9 @@ actions! {
     TreeFilterAll,
     TreeFilterCycleForward,
     TreeFilterCycleBackward,
+    /// Open the read-only file viewer, seeded from workspace path candidates
+    /// in the rendered transcript (or reopen the last viewer state).
+    FileViewerOpen,
     /// Hold-to-talk microphone capture while `/live` mode is on: press
     /// starts recording, release transcribes into the composer draft.
     LivePtt,
@@ -202,11 +205,11 @@ impl Action {
             "app.tree.filter.cycleBackward" => Self::TreeFilterCycleBackward,
             "app.live.ptt" | "live_ptt" => Self::LivePtt,
             "app.extensions.overlayToggleFocus" => Self::ExtensionOverlayToggleFocus,
+            "app.file.viewerOpen" => Self::FileViewerOpen,
 
             _ => return None,
         })
     }
-
 
     /// Human-readable action label for `/hotkeys` and overlay help.
     #[must_use]
@@ -283,6 +286,7 @@ impl Action {
             Self::TreeFilterCycleBackward => "Cycle filter backward",
             Self::LivePtt => "Hold to talk (live voice)",
             Self::ExtensionOverlayToggleFocus => "Toggle extension overlay focus",
+            Self::FileViewerOpen => "Open file viewer",
         }
     }
 
@@ -360,6 +364,7 @@ impl Action {
             Self::TreeFilterCycleForward => "app.tree.filter.cycleForward",
             Self::TreeFilterCycleBackward => "app.tree.filter.cycleBackward",
             Self::LivePtt => "app.live.ptt",
+            Self::FileViewerOpen => "app.file.viewerOpen",
             Self::ExtensionOverlayToggleFocus => "app.extensions.overlayToggleFocus",
         }
     }
@@ -435,11 +440,11 @@ impl Action {
             | Self::TreeFilterAll
             | Self::TreeFilterCycleForward
             | Self::TreeFilterCycleBackward => Some("Session tree"),
+            Self::FileViewerOpen => Some("Application"),
             Self::LivePtt | Self::ExtensionOverlayToggleFocus => Some("Application"),
         }
     }
 }
-
 
 /// One titled group of active keybinding rows for `/hotkeys`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -556,6 +561,7 @@ pub const VALID_ACTION_NAMES: &[&str] = &[
     "app.tree.filter.cycleForward",
     "app.tree.filter.cycleBackward",
     "app.live.ptt",
+    "app.file.viewerOpen",
     "app.extensions.overlayToggleFocus",
 ];
 
@@ -623,7 +629,11 @@ impl KeyBindingsManager {
     /// reuse chords across mutually exclusive panels.
     pub fn resolve(&self, key: &KeyEvent) -> Option<Action> {
         let chord = normalize_key(key)?;
-        self.active.get(&chord)?.iter().copied().find(|action| !is_selector_action(*action))
+        self.active
+            .get(&chord)?
+            .iter()
+            .copied()
+            .find(|action| !is_selector_action(*action))
     }
 
     /// Resolves only within the caller's active UI scope. This intentionally
@@ -713,7 +723,11 @@ impl KeyBindingsManager {
                 .collect::<Vec<_>>();
             chords.sort();
             if let Some(chord) = chords.first() {
-                parts.push(format!("{} {}", format_chord_display(chord), action.label()));
+                parts.push(format!(
+                    "{} {}",
+                    format_chord_display(chord),
+                    action.label()
+                ));
             }
         }
         parts.join(" · ")
@@ -829,6 +843,7 @@ fn default_bindings() -> HashMap<String, Vec<Action>> {
         ("ctrl+a", Action::TreeFilterAll),
         ("ctrl+space", Action::LivePtt),
         ("alt+/", Action::ExtensionOverlayToggleFocus),
+        ("alt+o", Action::FileViewerOpen),
     ];
     for (chord, action) in defaults {
         map.entry((*chord).to_owned()).or_default().push(*action);
@@ -870,7 +885,9 @@ fn load_file(path: &PathBuf) -> Result<Vec<(Action, Vec<String>)>, String> {
     validate_entries(entries)
 }
 
-fn validate_entries(entries: Vec<(String, Vec<String>)>) -> Result<Vec<(Action, Vec<String>)>, String> {
+fn validate_entries(
+    entries: Vec<(String, Vec<String>)>,
+) -> Result<Vec<(Action, Vec<String>)>, String> {
     let mut overrides = Vec::new();
     let mut claimed = HashMap::<String, String>::new();
     let mut errors = Vec::new();
@@ -1158,8 +1175,7 @@ mod tests {
         // round-trips back to the exact canonical name, so no alias or stale
         // entry can hide in the registry.
         for name in VALID_ACTION_NAMES {
-            let action = Action::from_name(name)
-                .expect("registry name must be dispatchable");
+            let action = Action::from_name(name).expect("registry name must be dispatchable");
             assert_eq!(
                 action.config_name(),
                 *name,
@@ -1264,16 +1280,51 @@ mod tests {
         }
 
         let tree_cases = [
-            (KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL), Some(Action::Quit), Action::TreeFilterDefault),
-            (KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL), Some(Action::ThinkingToggle), Action::TreeFilterNoTools),
-            (KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL), Some(Action::ToolsExpand), Action::TreeFilterCycleForward),
-            (KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL | KeyModifiers::SHIFT), None, Action::TreeFilterCycleBackward),
-            (KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL), Some(Action::EditorClear), Action::TreeFilterUserOnly),
-            (KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL), Some(Action::ModelSelect), Action::TreeFilterLabeledOnly),
-            (KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL), Some(Action::EditorHome), Action::TreeFilterAll),
+            (
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+                Some(Action::Quit),
+                Action::TreeFilterDefault,
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+                Some(Action::ThinkingToggle),
+                Action::TreeFilterNoTools,
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+                Some(Action::ToolsExpand),
+                Action::TreeFilterCycleForward,
+            ),
+            (
+                KeyEvent::new(
+                    KeyCode::Char('o'),
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                ),
+                None,
+                Action::TreeFilterCycleBackward,
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+                Some(Action::EditorClear),
+                Action::TreeFilterUserOnly,
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+                Some(Action::ModelSelect),
+                Action::TreeFilterLabeledOnly,
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+                Some(Action::EditorHome),
+                Action::TreeFilterAll,
+            ),
         ];
         for (key, global, contextual) in tree_cases {
-            assert_eq!(bindings.resolve(&key), global, "global precedence for {contextual:?}");
+            assert_eq!(
+                bindings.resolve(&key),
+                global,
+                "global precedence for {contextual:?}"
+            );
             assert_eq!(bindings.resolve_in(&key, &[contextual]), Some(contextual));
         }
     }
@@ -1290,7 +1341,10 @@ mod tests {
             bindings.resolve(&KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
             Some(Action::EditorWordLeft)
         );
-        assert_eq!(bindings.resolve(&KeyEvent::new(KeyCode::Left, KeyModifiers::ALT)), None);
+        assert_eq!(
+            bindings.resolve(&KeyEvent::new(KeyCode::Left, KeyModifiers::ALT)),
+            None
+        );
 
         let before = bindings.bindings().clone();
         let mut invalid = BTreeMap::new();

@@ -1,0 +1,17 @@
+{
+  "name": "rpi-desktop",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Electron desktop shell for the rpi listener's /web and /chat client",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "electron .",
+    "test": "node test/helpers.test.mjs && node --test test/server.test.mjs test/native-actions.test.mjs test/login.test.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "electron": "^44",
+    "typescript": "^5.7.2"
+  }
+}

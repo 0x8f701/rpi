@@ -7,8 +7,8 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use super::common::{
-    apply_provider_headers, apply_provider_request, client, consume_sse, error_body, fail,
-    notify_response, send_with_retry,
+    apply_provider_headers, apply_provider_request, build_request, client, consume_sse, error_body,
+    fail, notify_response, send_with_retry,
 };
 use crate::*;
 
@@ -146,15 +146,25 @@ async fn run_google_stream(
         &options.stream,
     )
     .await?;
-    let http = client(&options.stream)?;
+    client(&options.stream)?;
+    let payload = serde_json::to_vec(&payload)?;
     let response = send_with_retry(&options.stream, || {
-        let request = http
-            .post(&url)
-            .json(&payload);
-        apply_google_request_headers(request, &request_headers)
+        build_request(
+            &options.stream,
+            HttpMethod::Post,
+            &url,
+            &request_headers,
+            payload.clone(),
+        )
     })
     .await?;
-    notify_response(&options.stream, &response, model).await?;
+    notify_response(
+        &options.stream,
+        response.status(),
+        response.headers().clone(),
+        model,
+    )
+    .await?;
     if !response.status().is_success() {
         return Err(anyhow!(
             error_body("Google", response, &options.stream).await?
@@ -767,15 +777,6 @@ fn insert_header_case_insensitive(headers: &mut HashMap<String, String>, name: &
     headers.insert(name.to_owned(), value.to_owned());
 }
 
-/// Apply the pre-built effective header map once via HeaderMap insert/replace
-/// semantics (not RequestBuilder `.header` append).
-fn apply_google_request_headers(
-    builder: reqwest::RequestBuilder,
-    headers: &reqwest::header::HeaderMap,
-) -> reqwest::RequestBuilder {
-    builder.headers(headers.clone())
-}
-
 fn google_thinking_level<'a>(effort: &'a str, model_id: &str) -> Option<&'a str> {
     if is_gemini_3_pro(model_id) {
         return match effort {
@@ -1088,6 +1089,21 @@ pub fn register_google() {
             stream: native,
             stream_simple: simple,
             generate_image: None,
+            resolve_http_authorities: std::sync::Arc::new(|model, options| {
+                let configured = if model.base_url.trim().is_empty() {
+                    GOOGLE_DEFAULT_BASE_URL
+                } else {
+                    model.base_url.as_str()
+                };
+                let base = resolve_base_url(configured, &options.env)?;
+                let url = format!(
+                    "{}/models/{}:streamGenerateContent?alt=sse",
+                    base.trim_end_matches('/'),
+                    model.id
+                );
+                let (authority, _) = resolve_http_endpoint(&url)?;
+                Ok(std::collections::BTreeSet::from([authority]))
+            }),
         },
         None,
     );
@@ -1631,7 +1647,7 @@ mod tests {
         assert_eq!(normalize_tool_call_id("already-ok_12"), "already-ok_12");
     }
 
-    fn header_values(request: &reqwest::Request, name: &str) -> Vec<String> {
+    fn header_values(request: &crate::http::TestHttpRequest, name: &str) -> Vec<String> {
         request
             .headers()
             .get_all(name)
@@ -1644,17 +1660,13 @@ mod tests {
         model: &Model,
         options: &StreamOptions,
         api_key: &str,
-    ) -> reqwest::Request {
+    ) -> crate::http::TestHttpRequest {
         let headers = google_request_headers(model, options, api_key).expect("valid headers");
-        apply_google_request_headers(
-            client(options)
-                .expect("client")
-                .post("http://example.test/models/m:streamGenerateContent?alt=sse")
-                .header("content-type", "application/json"),
+        crate::http::test_http_request(
+            HttpMethod::Post,
+            "http://example.test/models/m:streamGenerateContent?alt=sse",
             &headers,
         )
-        .build()
-        .expect("request")
     }
 
     #[test]
@@ -1912,6 +1924,7 @@ mod tests {
             GoogleOptions {
                 stream: StreamOptions {
                     api_key: Some("test-key".into()),
+                    http_executor: Some(crate::http::test_http_executor()),
                     ..StreamOptions::default()
                 },
                 thinking: None,

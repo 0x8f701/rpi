@@ -1,3 +1,5 @@
+import { redactSecrets } from './redact';
+
 // One-pass ANSI SGR parser for untrusted terminal text (web mirror of
 // crates/pi-cli/src/ansi.rs — same grammar, same palette, same plain-text
 // projection). Tool/bash output often carries SGR styling (`\x1b[96m…\x1b[0m`)
@@ -303,13 +305,18 @@ export function parseAnsi(text: string): AnsiRun[] {
 }
 
 /** Plain-text projection of [`parseAnsi`]: exactly the visible text with
- *  every ESC/control sequence removed and tabs expanded. `ansiToPlainText(
- *  redactSecrets(text))` is what the clipboard copy writes — text only, no
- *  escape sequences. */
+ *  every ESC/control sequence removed and tabs expanded. Clipboard copy
+ *  writes [`redactedClipboardText`] — parse plain first, then redact. */
 export function ansiToPlainText(text: string): string {
   let plain = '';
   for (const run of parseAnsi(text)) {
     plain += run.text;
   }
   return plain;
+}
+
+/** Clipboard payload: parse ANSI to plain text first, then redact secrets
+ *  so a credential split across an SGR boundary still becomes `[REDACTED]`. */
+export function redactedClipboardText(text: string): string {
+  return redactSecrets(ansiToPlainText(text));
 }

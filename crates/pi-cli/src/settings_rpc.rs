@@ -33,12 +33,19 @@ impl SettingsRpcState {
         application.settings_catalog_snapshot()
     }
 
-    pub fn search(application: &Application, query: &str) -> Result<Vec<pi_coding::SettingValueView>> {
+    pub fn search(
+        application: &Application,
+        query: &str,
+    ) -> Result<Vec<pi_coding::SettingValueView>> {
         let manager = application.settings_manager()?;
         Ok(SettingsCatalog::search(&manager, query))
     }
 
-    pub fn open(&self, application: &Application, scope: SettingsScope) -> Result<SettingsDraftSnapshot> {
+    pub fn open(
+        &self,
+        application: &Application,
+        scope: SettingsScope,
+    ) -> Result<SettingsDraftSnapshot> {
         let draft = application.settings_draft(scope)?;
         let id = Uuid::now_v7().to_string();
         let snapshot = snapshot(&id, &draft)?;
@@ -129,11 +136,15 @@ mod tests {
 
     use super::*;
 
-    fn manager() -> (tempfile::TempDir, tempfile::TempDir, pi_coding::SettingsManager) {
+    fn manager() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        pi_coding::SettingsManager,
+    ) {
         let agent = tempfile::tempdir().expect("agent");
         let cwd = tempfile::tempdir().expect("cwd");
-        let manager = pi_coding::SettingsManager::load_phase_one(cwd.path(), agent.path())
-            .expect("manager");
+        let manager =
+            pi_coding::SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("manager");
         (agent, cwd, manager)
     }
 
@@ -142,15 +153,21 @@ mod tests {
         let (_agent, _cwd, manager) = manager();
         let state = SettingsRpcState::default();
         let id = Uuid::now_v7().to_string();
-        state
-            .drafts
-            .lock()
-            .insert(id.clone(), manager.settings_draft(SettingsScope::Global).expect("draft"));
+        state.drafts.lock().insert(
+            id.clone(),
+            manager
+                .settings_draft(SettingsScope::Global)
+                .expect("draft"),
+        );
         let updated = state
             .set(&id, "compaction.enabled", json!(false))
             .expect("typed set");
         assert!(updated.dirty);
-        assert!(state.set(&id, "compaction.enabled", json!("false")).is_err());
+        assert!(
+            state
+                .set(&id, "compaction.enabled", json!("false"))
+                .is_err()
+        );
         state.validate(&id).expect("valid draft");
         state.cancel(&id).expect("cancel");
         assert!(state.get(&id).is_err());
@@ -158,9 +175,13 @@ mod tests {
         let stale_id = Uuid::now_v7().to_string();
         state.drafts.lock().insert(
             stale_id.clone(),
-            manager.settings_draft(SettingsScope::Global).expect("stale draft"),
+            manager
+                .settings_draft(SettingsScope::Global)
+                .expect("stale draft"),
         );
-        state.set(&stale_id, "theme", json!("stale")).expect("stage stale");
+        state
+            .set(&stale_id, "theme", json!("stale"))
+            .expect("stage stale");
         manager
             .update_global(|settings| settings.quiet_startup = Some(true))
             .expect("concurrent write");
@@ -176,18 +197,49 @@ mod tests {
             r#"{"apiKey":"never-leak","future":{"nested":7}}"#,
         )
         .expect("settings");
-        let manager = pi_coding::SettingsManager::load_phase_one(cwd.path(), agent.path())
-            .expect("reload");
+        let manager =
+            pi_coding::SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("reload");
         let secret = SettingsCatalog::search(&manager, "apiKey").remove(0);
         let encoded = serde_json::to_string(&secret).expect("secret json");
         assert!(!encoded.contains("never-leak"));
-        let mut draft = manager.settings_draft(SettingsScope::Global).expect("draft");
+        let mut draft = manager
+            .settings_draft(SettingsScope::Global)
+            .expect("draft");
         draft.set("theme", json!("new")).expect("theme");
         draft.apply(&manager).expect("apply");
-        let saved: Value = serde_json::from_slice(
-            &fs::read(agent.path().join("settings.json")).expect("saved"),
-        )
-        .expect("json");
+        let saved: Value =
+            serde_json::from_slice(&fs::read(agent.path().join("settings.json")).expect("saved"))
+                .expect("json");
         assert_eq!(saved["future"]["nested"], 7);
+    }
+
+    #[test]
+    fn snapshots_expose_only_approved_sandbox_catalog_keys() {
+        let (_agent, _cwd, manager) = manager();
+        let keys = SettingsCatalog::inspect(&manager)
+            .values
+            .into_iter()
+            .map(|view| view.definition.key)
+            .collect::<Vec<_>>();
+        for key in [
+            "sandbox.mode",
+            "sandbox.network",
+            "sandbox.readOnlyRoots",
+            "sandbox.writableRoots",
+            "sandbox.deniedPaths",
+            "sandbox.hostHttp",
+            "sandbox.credentialGrants",
+            "sandbox.credentialGrantDefinitions",
+            "sandbox.limits",
+        ] {
+            assert!(keys.contains(&key), "missing {key}");
+        }
+        for legacy in [
+            "sandbox.enabled",
+            "sandbox.readOnly",
+            "sandbox.allowedPaths",
+        ] {
+            assert!(!keys.contains(&legacy), "legacy key leaked: {legacy}");
+        }
     }
 }

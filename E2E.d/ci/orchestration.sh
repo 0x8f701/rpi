@@ -11,11 +11,12 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 . "$SCRIPT_DIR/../lib/orchestration_fixtures.sh"
 
 # Release gates require the pinned 1.88.0 toolchain. Never bare `cargo test`.
+# Always `--release`: debug-profile results are not product evidence.
 CARGO_E2E=(cargo +1.88.0)
 
 list_scenarios() {
     printf '%s\n' \
-        'orchestration.rpc - goal details, todo readiness/blocked projection, supervised process RPC' \
+        'orchestration.rpc - goal details, todo readiness/waiting projection, supervised process RPC' \
         'orchestration.rust - cargo +1.88.0 existing todo_dag_execution + NL/IRC/image/ps' \
         'orchestration.tmux - hard Subagents-only + Goal//ps//goal exact; separate Todo layout' \
         'orchestration.run - rpc + rust + tmux umbrella'
@@ -42,13 +43,13 @@ from pathlib import Path
 summary = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 required = {
     "goal-details",
-    "todo-ready-roots-and-blocked-join",
+    "todo-ready-roots-and-waiting-join",
     "todo-exact-task-ids",
     "todo-exact-task-id-completion",
     "todo-dependent-after-roots",
     "todo-open-work-remains-after-partial",
     "todo-open-work-remains",
-    "todo-blocked-only-projection",
+    "todo-dependency-waiting-projection",
     "todo-all-terminal-no-ready",
     "process-list-contains-supervised",
     "process-stopped-and-cleaned",
@@ -70,8 +71,8 @@ if goal["tokensUsed"] != 42 or goal["tokenBudget"] != 1000 or goal["activeTimeSe
 todo = summary.get("todoInitial") or {}
 if not (todo.get("rootAReady") and todo.get("rootBReady") and not todo.get("joinReady")):
     raise SystemExit(f"todo initial readiness contract failed: {todo!r}")
-if set(todo.get("joinBlockedBy") or []) != {"root-a", "root-b"}:
-    raise SystemExit(f"todo blockedBy contract failed: {todo!r}")
+if set(todo.get("joinWaitingOn") or []) != {"root-a", "root-b"}:
+    raise SystemExit(f"todo waitingOn contract failed: {todo!r}")
 if set(todo.get("exactIds") or []) != {"join", "root-a", "root-b"}:
     raise SystemExit(f"todo exact ids contract failed: {todo!r}")
 after = summary.get("todoAfterRoots") or {}
@@ -104,50 +105,56 @@ run_orchestration_rust() {
         printf 'todo_lifecycle_contracts=ready_roots_overlap,todo_task_id_completion,failed_cancelled_open\n'
 
         # Exact NL agent mention → Subagents job cards; skill-only does not spawn.
-        (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test -p pi-cli --test nl_exact_agent_spawn --locked -- --nocapture)
+        (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test --release -p pi-cli --test nl_exact_agent_spawn --locked -- --nocapture)
 
         # Routing contracts: Have researcher vs Use research.
-        (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test -p pi-coding --test routing_contracts --locked -- --nocapture)
+        (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test --release -p pi-coding --test routing_contracts --locked -- --nocapture)
 
-        # Todo tool DAG lifecycle (readiness / blockedBy projection).
-        (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test -p pi-coding --test todo_dag_lifecycle --locked -- --nocapture)
+        # Todo tool DAG lifecycle (readiness / waitingOn projection).
+        (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test --release -p pi-coding --test todo_dag_lifecycle --locked -- --nocapture)
 
         # ---- Authoritative Todo DAG coordinator (existing tests only; fail closed) ----
         # Full binary first so additions are never silently dropped from CI.
-        (cd "$REPO_ROOT" && run_with_timeout 360 "${CARGO_E2E[@]}" test -p pi-coding --test todo_dag_execution --locked -- --nocapture)
+        (cd "$REPO_ROOT" && run_with_timeout 360 "${CARGO_E2E[@]}" test --release -p pi-coding --test todo_dag_execution --locked -- --nocapture)
 
         # 1) Multiple ready roots overlap; join waits; exact todoTaskId ownership/completion.
-        (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test -p pi-coding --test todo_dag_execution \
+        (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test --release -p pi-coding --test todo_dag_execution \
             two_ready_roots_overlap_and_join_waits_for_both_before_three_of_three --locked -- --nocapture)
 
-        # 2) Failed/cancelled owners leave tasks open; reconcile idempotent; Blocked status.
-        (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test -p pi-coding --test todo_dag_execution \
+        # 2) Failed/cancelled owners leave tasks open; reconcile idempotent; Failed status.
+        (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test --release -p pi-coding --test todo_dag_execution \
             failed_and_cancelled_owners_stay_open_and_terminal_reconciliation_is_idempotent --locked -- --nocapture)
 
         # Goal details formatter (Objective/Status/Tokens/Time).
-        (cd "$REPO_ROOT" && run_with_timeout 240 "${CARGO_E2E[@]}" test -p pi-cli formats_empty_goal_details_for_overlay --locked -- --nocapture)
+        (cd "$REPO_ROOT" && run_with_timeout 240 "${CARGO_E2E[@]}" test --release -p pi-cli formats_empty_goal_details_for_overlay --locked -- --nocapture)
 
         # IRC presentation both directions: named sender→recipient, separate body,
         # no raw XML (human renderer + TUI MessageDelivered path).
-        (cd "$REPO_ROOT" && run_with_timeout 240 "${CARGO_E2E[@]}" test -p pi-cli orchestration_irc_renders_named_label_body_reply --locked -- --nocapture)
-        (cd "$REPO_ROOT" && run_with_timeout 240 "${CARGO_E2E[@]}" test -p pi-cli message_delivered_event_renders_once_and_dedupes_custom_message --locked -- --nocapture)
+        (cd "$REPO_ROOT" && run_with_timeout 240 "${CARGO_E2E[@]}" test --release -p pi-cli orchestration_irc_renders_named_label_body_reply --locked -- --nocapture)
+        (cd "$REPO_ROOT" && run_with_timeout 240 "${CARGO_E2E[@]}" test --release -p pi-cli message_delivered_event_renders_once_and_dedupes_custom_message --locked -- --nocapture)
 
         # Runtime bidirectional IRC while supervised (Main↔child / peer).
-        (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test -p pi-coding --test orchestration_supervision main_supervises_two_children_with_irc --locked -- --nocapture)
+        (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test --release -p pi-coding --test orchestration_supervision main_supervises_two_children_with_irc --locked -- --nocapture)
 
         # Authoritative real task + identity-bound child hub AgentTool chain.
-        (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test -p pi-coding --test orchestration \
+        (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test --release -p pi-coding --test orchestration \
             real_task_children_route_main_alpha_beta_main_through_owned_hub_tools --locked -- --nocapture)
 
+        # Durable orchestration records and application authority resume from
+        # validated policy and credential-registry snapshots. Whole targets are
+        # fail-closed so newly added schema/reconstruction cases stay covered.
+        (cd "$REPO_ROOT" && run_with_timeout 360 "${CARGO_E2E[@]}" test --release -p pi-coding --test durable_orchestration_e2e --locked -- --nocapture)
+        (cd "$REPO_ROOT" && run_with_timeout 360 "${CARGO_E2E[@]}" test --release -p pi-coding --test application_generation --locked -- --nocapture)
+
         # Image placeholder [Image #N, WIDTHxHEIGHT].
-        (cd "$REPO_ROOT" && run_with_timeout 240 "${CARGO_E2E[@]}" test -p pi-cli clipboard_png_fixture_attaches_one_image --locked -- --nocapture)
+        (cd "$REPO_ROOT" && run_with_timeout 240 "${CARGO_E2E[@]}" test --release -p pi-cli clipboard_png_fixture_attaches_one_image --locked -- --nocapture)
 
         # Stale Todo panel after tree/fork/keyboard-new: replace_transcript must
         # refresh todo_phases from the application (not leave prior DAG chrome).
-        (cd "$REPO_ROOT" && run_with_timeout 240 "${CARGO_E2E[@]}" test -p pi-cli replace_transcript_refreshes_todo_phases_from_application --locked -- --nocapture)
+        (cd "$REPO_ROOT" && run_with_timeout 240 "${CARGO_E2E[@]}" test --release -p pi-cli replace_transcript_refreshes_todo_phases_from_application --locked -- --nocapture)
 
         # Supervised process /ps PTY (unix-only module).
-        (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test -p pi-cli --test process_ps_pty --locked -- --nocapture)
+        (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test --release -p pi-cli --test process_ps_pty --locked -- --nocapture)
     } >"$logf" 2>&1 || {
         tail -n 200 "$logf" >&2 || true
         fail "orchestration.rust cargo +1.88.0 gates failed (see $logf)"
@@ -162,6 +169,8 @@ run_orchestration_rust() {
     assert_file_contains "$logf" "real_task_children_route_main_alpha_beta_main_through_owned_hub_tools"
     assert_file_contains "$logf" "message_delivered_event_renders_once"
     assert_file_contains "$logf" "replace_transcript_refreshes_todo_phases"
+    assert_file_contains "$logf" "durable_resume_errors_preserve_all_domains"
+    assert_file_contains "$logf" "durable_resume_reconstructs_exact_generation_before_child_restore"
     printf 'orchestration.rust passed\nlog=%s\n' "$logf"
 }
 
@@ -180,16 +189,39 @@ run_orchestration_tmux() {
 
     printf 'orchestration-workspace\n' >"$root/workspace/README.e2e"
 
+    local port_file="$root/mock-port.txt" port deadline
+    python3 "$E2E_DIR/lib/user_mock_server.py" --scenario orchestration --port-file "$port_file" \
+        >"$evidence/mock-server.log" 2>&1 &
+    register_pid $!
+    deadline=$((SECONDS + 15))
+    while [ ! -s "$port_file" ] && [ "$SECONDS" -lt "$deadline" ]; do sleep 0.2; done
+    [ -s "$port_file" ] || fail "orchestration.tmux: mock server did not write its port file"
+    port="$(cat "$port_file")"
+    mkdir -p "$root/home/.pi/agent"
+    cat >"$root/home/.pi/agent/models.json" <<EOF
+{
+  "providers": {
+    "user-orchestration": {
+      "baseUrl": "http://127.0.0.1:$port",
+      "api": "openai-completions",
+      "models": [
+        { "id": "mock", "name": "Orchestration Mock", "contextWindow": 32768, "maxTokens": 2048 }
+      ]
+    }
+  }
+}
+EOF
+
     tmux new-session -d -s "$session" -x 120 -y 40 -c "$root/workspace" \
         "env HOME='$root/home' USERPROFILE='$root/home' \
 PI_CODING_AGENT_DIR='$root/home/.pi/agent' \
-PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 \
-PI_FAUX_RESPONSE='deterministic-orchestration-reply' \
+RPI_OFFLINE=1 RPI_SKIP_VERSION_CHECK=1 \
 TERM=xterm-256color \
-'$RPI_BIN' --offline --model faux/faux-1"
+'$RPI_BIN' --offline --model user-orchestration/mock --api-key user-mock-key"
 
     # First paint.
     tmux_wait_for "$session" 20 'Ready' >"$evidence/boot.txt" || true
+    tmux_wait_for "$session" 20 'user-orchestration/mock' >"$evidence/boot-model.txt" || true
     sleep 1
 
     # --- Exact /goal input (no duplication) ---
@@ -245,7 +277,7 @@ TERM=xterm-256color \
 
     tmux send-keys -t "$session":0 -l 'Have researcher study this'
     tmux send-keys -t "$session":0 Enter
-    if ! tmux_wait_for "$session" 25 'Task 1 agents' 'researcher' >"$evidence/subagents-exact.txt"; then
+    if ! tmux_wait_for "$session" 25 'Task 1 agent' 'researcher' >"$evidence/subagents-exact.txt"; then
         tmux capture-pane -p -S -2000 -t "$session":0 >"$evidence/subagents-exact.txt"
         fail "HARD: compact agent card with researcher not observed after exact NL spawn"
     fi
@@ -277,12 +309,17 @@ TERM=xterm-256color \
         --workspace "$root/hub-workspace" \
         --evidence "$evidence/hub-tui" \
         >"$evidence/hub-tui-result.json"
-    assert_file_contains "$evidence/hub-tui/tui.txt" \
+    assert_file_contains "$evidence/hub-tui/transcript.txt" \
         'IRC ⟵ Beta' 'beta-to-main-tmux' \
-        'Alpha (Alpha) · completed' 'Beta (Beta) · completed'
-    assert_file_lacks "$evidence/hub-tui/tui.txt" '<orchestration-message'
+        '✓ Hub jobs · complete' '✓ Hub agents · complete' \
+        'Hub wait · timed out · no message arrived'
+    assert_file_lacks "$evidence/hub-tui/transcript.txt" '<orchestration-message'
+    assert_file_contains "$evidence/hub-tui/jobs-overlay.txt" \
+        '2 completed' 'completed Alpha' 'completed Beta'
+    assert_file_lacks "$evidence/hub-tui/jobs-overlay.txt" '<orchestration-message'
     assert_file_contains "$evidence/hub-tui/assertions.json" \
-        'alpha-child-owned-hub-wait-send' 'beta-child-owned-hub-wait-send'
+        'alpha-child-owned-hub-wait-send' 'beta-child-owned-hub-wait-send' \
+        'typed-irc-frame-shape' 'no-premature-orchestration-shutdown'
 
     # --- Dense Todo pressure at the reported 120x40 size ---
     run_with_timeout 45 python3 "$E2E_DIR/lib/run_todo_tui_campaign.py" \
@@ -349,6 +386,136 @@ TERM=xterm-256color \
     printf 'orchestration.tmux passed\nevidence=%s\n' "$evidence"
 }
 
+run_bubblewrap_probe() {
+    require_cmd bwrap
+    require_cmd python3
+    python3 - <<'PY'
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+
+bwrap = shutil.which("bwrap")
+if bwrap is None:
+    raise SystemExit("bubblewrap probe: bwrap is unavailable")
+bwrap = str(Path(bwrap).resolve())
+version = subprocess.run(
+    [bwrap, "--version"],
+    check=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+).stdout.strip()
+if version != "bubblewrap 0.10.0":
+    raise SystemExit(f"bubblewrap probe: expected bubblewrap 0.10.0, got {version!r}")
+
+with tempfile.TemporaryDirectory(prefix="rpi-bwrap-probe-") as temporary:
+    root = Path(temporary)
+    readonly = root / "readonly.txt"
+    readonly.write_text("readonly-sentinel\n", encoding="utf-8")
+    writable = root / "writable"
+    writable.mkdir()
+    original = root / "original-secret.txt"
+    original.write_text("original-secret-sentinel\n", encoding="utf-8")
+    mask = root / "mask"
+    mask.write_bytes(b"")
+    mask.chmod(0)
+
+    opened = []
+    def open_path(path, directory=False, path_only=False):
+        flags = os.O_PATH | os.O_CLOEXEC if path_only else os.O_RDONLY | os.O_CLOEXEC
+        if directory:
+            flags |= os.O_DIRECTORY
+        fd = os.open(path, flags)
+        opened.append(fd)
+        return fd
+
+    launcher_fd = open_path(bwrap)
+    mounts = []
+    for source, destination in (("/usr", "/usr"), ("/bin", "/bin"), ("/lib", "/lib")):
+        mounts.append((open_path(source, directory=True), destination, "--ro-bind-fd"))
+    if Path("/lib64").exists():
+        mounts.append((open_path("/lib64", directory=True), "/lib64", "--ro-bind-fd"))
+    mounts.extend([
+        (open_path(readonly), "/probe/readonly.txt", "--ro-bind-fd"),
+        (open_path(writable, directory=True), "/probe/writable", "--bind-fd"),
+        (open_path(original), "/masked/secret", "--ro-bind-fd"),
+        (open_path(mask, path_only=True), "/masked/secret", "--ro-bind-fd"),
+    ])
+
+    transports = {
+        20: "request",
+        21: "status",
+        22: "current",
+        23: "target",
+        24: "sentinel",
+    }
+    for target_fd, payload in transports.items():
+        path = root / f"transport-{target_fd}"
+        path.write_text(payload + "\n", encoding="utf-8")
+        source_fd = open_path(path)
+        os.dup2(source_fd, target_fd, inheritable=True)
+        opened.append(target_fd)
+
+    unrelated_path = root / "unrelated"
+    unrelated_path.write_text("must-not-cross-exec\n", encoding="utf-8")
+    unrelated_source = open_path(unrelated_path)
+    os.dup2(unrelated_source, 25, inheritable=False)
+    opened.append(25)
+
+    mount_fds = " ".join(str(fd) for fd, _, _ in mounts)
+    transport_rows = " ".join(f"{fd}:{payload}" for fd, payload in transports.items())
+    command = f'''
+IFS= read -r value < /probe/readonly.txt
+[ "$value" = readonly-sentinel ]
+printf '%s\n' writable-proof > /probe/writable/created.txt
+[ ! -s /masked/secret ]
+for fd in {mount_fds}; do
+    [ ! -e "/proc/self/fd/$fd" ] || exit 41
+done
+for row in {transport_rows}; do
+    fd=${{row%%:*}}
+    expected=${{row#*:}}
+    [ -e "/proc/self/fd/$fd" ] || exit 42
+    actual=$(cat "/proc/self/fd/$fd")
+    [ "$actual" = "$expected" ] || exit 43
+done
+[ ! -e /proc/self/fd/25 ] || exit 44
+'''
+
+    argv = [
+        f"/proc/self/fd/{launcher_fd}",
+        "--die-with-parent",
+        "--unshare-user",
+        "--unshare-pid",
+        "--proc", "/proc",
+        "--clearenv",
+        "--setenv", "PATH", "/usr/bin:/bin",
+    ]
+    for fd, destination, option in mounts:
+        argv.extend((option, str(fd), destination))
+    argv.extend(("--", "/bin/sh", "-ceu", command))
+
+    inherited = (launcher_fd, *(fd for fd, _, _ in mounts), *transports.keys())
+    try:
+        subprocess.run(argv, check=True, pass_fds=inherited)
+    finally:
+        for fd in reversed(opened):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    if (writable / "created.txt").read_text(encoding="utf-8") != "writable-proof\n":
+        raise SystemExit("bubblewrap probe: writable directory FD bind did not reach the host source")
+    if original.read_text(encoding="utf-8") != "original-secret-sentinel\n":
+        raise SystemExit("bubblewrap probe: masking changed the original source")
+
+print("sandbox.bubblewrap-probe passed")
+PY
+}
+
 run_all() {
     prepare_roots
     run_orchestration_rpc
@@ -366,6 +533,7 @@ case "${1:-list}" in
     rpc) prepare_roots; run_orchestration_rpc; printf 'orchestration.rpc passed\nevidence=%s\n' "$EVIDENCE_ROOT" ;;
     rust) prepare_roots; run_orchestration_rust ;;
     tmux) prepare_roots; run_orchestration_tmux ;;
+    __bubblewrap-fd-probe) run_bubblewrap_probe ;;
     run) run_all ;;
     *) fail "usage: $0 [list|--dry-run|run|rpc|rust|tmux]" ;;
 esac

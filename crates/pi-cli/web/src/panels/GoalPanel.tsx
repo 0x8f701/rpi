@@ -10,7 +10,7 @@
 //
 // EVERY model-derived string passes through safeText() before display.
 
-import { FormEvent, useState } from 'react';
+import { FormEvent, useRef, useState } from 'react';
 import { safeText } from '../redact';
 
 export type GoalLifecycle = 'active' | 'paused' | 'completed' | 'dropped';
@@ -104,21 +104,27 @@ export function GoalPanel({ state, journal, sendCommand, onChanged, onClose }: G
   const [pinText, setPinText] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const busyRef = useRef(false);
 
   const goal = state?.current ?? null;
   const lifecycle: GoalLifecycle | null = goal ? goal.lifecycle : null;
   const pins = goal?.pins ?? [];
   const usage = goal?.usage;
 
-  const run = async (command: Record<string, unknown>) => {
+  const run = async (command: Record<string, unknown>): Promise<boolean> => {
+    if (busyRef.current) return false;
+    busyRef.current = true;
     setBusy(true);
     setError('');
     try {
       await sendCommand(command);
       onChanged();
+      return true;
     } catch (err) {
       setError((err as Error).message || 'command failed');
+      return false;
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   };
@@ -126,25 +132,29 @@ export function GoalPanel({ state, journal, sendCommand, onChanged, onClose }: G
   const onCreate = (e: FormEvent) => {
     e.preventDefault();
     const text = objective.trim();
-    if (!text || busy) return;
-    const parsed = budget.trim() === '' ? undefined : Number(budget.trim());
+    if (!text || busyRef.current) return;
+    const rawBudget = budget;
+    const parsed = rawBudget.trim() === '' ? undefined : Number(rawBudget.trim());
     const tokenBudget = parsed === undefined || Number.isNaN(parsed) ? undefined : Math.max(1, Math.floor(parsed));
-    setObjective('');
-    setBudget('');
-    run({ type: 'goal_create', objective: text, ...(tokenBudget !== undefined ? { tokenBudget } : {}) }).catch(() => {});
+    void run({ type: 'goal_create', objective: text, ...(tokenBudget !== undefined ? { tokenBudget } : {}) }).then((done) => {
+      if (!done) return;
+      setObjective((current) => current.trim() === text ? '' : current);
+      setBudget((current) => current === rawBudget ? '' : current);
+    });
   };
 
   const onPin = (e: FormEvent) => {
     e.preventDefault();
     const text = pinText.trim();
-    if (!text || busy || pins.length >= MAX_GOAL_PINS) return;
-    setPinText('');
-    run({ type: 'goal_pin', text }).catch(() => {});
+    if (!text || busyRef.current || pins.length >= MAX_GOAL_PINS) return;
+    void run({ type: 'goal_pin', text }).then((done) => {
+      if (done) setPinText((current) => current.trim() === text ? '' : current);
+    });
   };
 
   const onUnpin = (index: number) => {
-    if (busy) return;
-    run({ type: 'goal_unpin', index }).catch(() => {});
+    if (busyRef.current) return;
+    void run({ type: 'goal_unpin', index });
   };
 
   const budgetLine = goal

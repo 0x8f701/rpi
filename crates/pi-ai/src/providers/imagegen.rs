@@ -27,11 +27,11 @@ use super::common::{
     client, error_body, insert_header, insert_header_map, is_aborted, send_with_retry,
 };
 use crate::{
-    API_IMAGE_GEN, API_OPENROUTER_IMAGES, ApiProvider, Context, GeneratedImage, ImageGenFn,
-    IMAGE_GEN_SIZES, ImageGenerationOptions, ImageGenerationResult,
+    API_IMAGE_GEN, API_OPENROUTER_IMAGES, ApiProvider, Context, GeneratedImage, HttpMethod,
+    HttpResponse, IMAGE_GEN_SIZES, ImageGenFn, ImageGenerationOptions, ImageGenerationResult,
     MAX_IMAGE_GEN_DECODED_BYTES, MAX_IMAGE_GEN_N, MAX_IMAGE_GEN_PROMPT_CHARS,
     MAX_IMAGE_GEN_RESPONSE_BYTES, Model, SimpleStreamOptions, StreamOptions, error_stream,
-    register_api_provider, resolve_base_url,
+    register_api_provider, resolve_base_url, resolve_http_endpoint,
 };
 
 /// `{base}/images/generations` — the OpenAI-compatible endpoint joined onto
@@ -39,6 +39,33 @@ use crate::{
 /// it, mirroring `{base}/chat/completions`).
 fn images_url(base_url: &str) -> String {
     format!("{}/images/generations", base_url.trim_end_matches('/'))
+}
+
+pub fn resolve_image_generation_http_endpoint(
+    model: &Model,
+    base_url: Option<&str>,
+    env: &std::collections::HashMap<String, String>,
+) -> Result<(crate::ResolvedHttpAuthority, String)> {
+    let base_url = base_url
+        .map(str::trim)
+        .filter(|base| !base.is_empty())
+        .unwrap_or_else(|| model.base_url.trim());
+    if base_url.is_empty() {
+        return Err(anyhow!(
+            "No image-generation endpoint configured for model {:?}: the model has no baseUrl. Set the model's baseUrl or configure settings images.genBaseUrl.",
+            model.id
+        ));
+    }
+    let base = resolve_base_url(base_url, env)?;
+    resolve_http_endpoint(&images_url(&base))
+}
+
+pub fn resolve_image_generation_http_authority(
+    model: &Model,
+    base_url: Option<&str>,
+    env: &std::collections::HashMap<String, String>,
+) -> Result<crate::ResolvedHttpAuthority> {
+    resolve_image_generation_http_endpoint(model, base_url, env).map(|(authority, _)| authority)
 }
 
 /// Registers the OpenAI-compatible image-generation providers for
@@ -53,9 +80,8 @@ fn image_gen_provider(api: &str) -> ApiProvider {
     let generate = image_gen_fn();
     let stream = {
         let api = api.to_string();
-        let message = format!(
-            "api {api} is an image-generation endpoint; chat streaming is not supported"
-        );
+        let message =
+            format!("api {api} is an image-generation endpoint; chat streaming is not supported");
         Arc::new(move |model: Model, _ctx: Context, _opts: StreamOptions| {
             let message = message.clone();
             async move { error_stream(&model, message).await }.boxed()
@@ -63,19 +89,25 @@ fn image_gen_provider(api: &str) -> ApiProvider {
     };
     let stream_simple = {
         let api = api.to_string();
-        let message = format!(
-            "api {api} is an image-generation endpoint; chat streaming is not supported"
-        );
-        Arc::new(move |model: Model, _ctx: Context, _opts: SimpleStreamOptions| {
-            let message = message.clone();
-            async move { error_stream(&model, message).await }.boxed()
-        })
+        let message =
+            format!("api {api} is an image-generation endpoint; chat streaming is not supported");
+        Arc::new(
+            move |model: Model, _ctx: Context, _opts: SimpleStreamOptions| {
+                let message = message.clone();
+                async move { error_stream(&model, message).await }.boxed()
+            },
+        )
     };
     ApiProvider {
         api: api.to_string(),
         stream,
         stream_simple,
         generate_image: Some(generate),
+        resolve_http_authorities: Arc::new(|model, options| {
+            Ok(std::collections::BTreeSet::from([
+                resolve_image_generation_http_authority(model, None, &options.env)?,
+            ]))
+        }),
     }
 }
 
@@ -187,12 +219,12 @@ fn redact_key(message: &str, api_key: &str) -> String {
 /// Reads a response body up to `max_bytes`, abort-aware. A hostile or runaway
 /// payload is rejected without exhausting memory.
 async fn read_capped(
-    response: reqwest::Response,
+    response: HttpResponse,
     options: &StreamOptions,
     max_bytes: u64,
 ) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    let mut stream = response.bytes_stream();
+    let mut stream = response.into_body();
     loop {
         let chunk = match &options.abort_signal {
             Some(token) => tokio::select! {
@@ -226,21 +258,8 @@ pub async fn generate_image_openai_compatible(
 ) -> Result<ImageGenerationResult> {
     validate_options(&options)?;
 
-    let base_url = options
-        .base_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|b| !b.is_empty())
-        .unwrap_or_else(|| model.base_url.trim());
-    if base_url.is_empty() {
-        return Err(anyhow!(
-            "No image-generation endpoint configured for model \"{}\": the model has no \
-             baseUrl. Set the model's baseUrl or configure settings images.genBaseUrl.",
-            model.id
-        ));
-    }
-    let resolved_base = resolve_base_url(base_url, &options.env)?;
-    let url = images_url(&resolved_base);
+    let (authority, path_and_query) =
+        resolve_image_generation_http_endpoint(&model, options.base_url.as_deref(), &options.env)?;
 
     let api_key = options
         .api_key
@@ -268,19 +287,29 @@ pub async fn generate_image_openai_compatible(
         max_retry_delay_ms: options.max_retry_delay_ms,
         env: options.env.clone(),
         abort_signal: options.abort_signal.clone(),
+        http_executor: options.http_executor.clone(),
         ..StreamOptions::default()
     };
-    let http = client(&stream_options)?;
+    client(&stream_options)?;
     let headers = build_request_headers(&model, &options, api_key)?;
     let payload_body = Value::Object(payload).to_string();
     let response = send_with_retry(&stream_options, || {
-        http.post(&url)
-            .headers(headers.clone())
-            .body(payload_body.clone())
+        crate::HttpRequest::new(
+            HttpMethod::Post,
+            authority.clone(),
+            path_and_query.clone(),
+            crate::header_pairs(&headers),
+            payload_body.as_bytes().to_vec(),
+            stream_options
+                .timeout_ms
+                .filter(|timeout| *timeout > 0)
+                .unwrap_or(crate::DEFAULT_HTTP_ATTEMPT_TIMEOUT_MS),
+            MAX_IMAGE_GEN_RESPONSE_BYTES,
+            stream_options.abort_signal.clone(),
+        )
     })
     .await
     .map_err(|error| anyhow!(redact_key(&error.to_string(), api_key)))?;
-
     if !response.status().is_success() {
         let message = error_body("Image generation", response, &stream_options).await?;
         return Err(anyhow!(redact_key(&message, api_key)));
@@ -297,9 +326,7 @@ pub async fn generate_image_openai_compatible(
     for item in parsed.data {
         let b64 = item.b64_json.trim();
         if b64.is_empty() {
-            return Err(anyhow!(
-                "Image generation returned an image with no data."
-            ));
+            return Err(anyhow!("Image generation returned an image with no data."));
         }
         if !decoded_within_cap(b64) {
             return Err(anyhow!(
@@ -336,13 +363,14 @@ struct ImageGenData {
 
 /// A real 1x1 transparent PNG, used by tests as a valid `b64_json` payload.
 #[cfg(test)]
-const ONE_PX_PNG_B64: &str =
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+const ONE_PX_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SimpleStreamFn, SimpleStreamOptions, StreamFn, StreamOptions, unregister_api_providers};
+    use crate::{
+        SimpleStreamFn, SimpleStreamOptions, StreamFn, StreamOptions, unregister_api_providers,
+    };
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -363,15 +391,13 @@ mod tests {
         ImageGenerationOptions {
             prompt: prompt.to_owned(),
             api_key: Some(["s", "k-image-test"].concat()),
+            http_executor: Some(crate::http::test_http_executor()),
             ..ImageGenerationOptions::default()
         }
     }
 
     /// Serves one HTTP response for one request; captures the raw request.
-    async fn spawn_mock(
-        response_body: String,
-        status: &str,
-    ) -> (String, Arc<Mutex<String>>) {
+    async fn spawn_mock(response_body: String, status: &str) -> (String, Arc<Mutex<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock server");
@@ -395,15 +421,17 @@ mod tests {
                     break;
                 }
             }
-            *request.lock().expect("request lock") =
-                String::from_utf8_lossy(&buffer).into_owned();
+            *request.lock().expect("request lock") = String::from_utf8_lossy(&buffer).into_owned();
             let body = response_body.clone();
             let response = format!(
                 "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                 body.len(),
                 body
             );
-            socket.write_all(response.as_bytes()).await.expect("write response");
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
         });
         (address.to_string(), captured)
     }
@@ -430,11 +458,17 @@ mod tests {
         assert!(!result.images[0].data.is_empty());
 
         let request = captured.lock().expect("request lock").clone();
-        assert!(request.starts_with("POST /v1/images/generations "), "{request}");
+        assert!(
+            request.starts_with("POST /v1/images/generations "),
+            "{request}"
+        );
         let lowered = request.to_ascii_lowercase();
         let expected_auth = ["authorization: bearer s", "k-image-test"].concat();
         assert!(lowered.contains(&expected_auth), "{request}");
-        assert!(lowered.contains("content-type: application/json"), "{request}");
+        assert!(
+            lowered.contains("content-type: application/json"),
+            "{request}"
+        );
         let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
         let parsed: serde_json::Value = serde_json::from_str(body).expect("json body");
         assert_eq!(parsed["model"], "image-model");
@@ -507,7 +541,10 @@ mod tests {
         let error = generate_image_openai_compatible(model, options)
             .await
             .expect_err("missing key must fail");
-        assert!(error.to_string().contains("No API key for provider"), "{error}");
+        assert!(
+            error.to_string().contains("No API key for provider"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -516,10 +553,7 @@ mod tests {
         let error = generate_image_openai_compatible(model, options("a red png"))
             .await
             .expect_err("empty base must fail");
-        assert!(
-            error.to_string().contains("images.genBaseUrl"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("images.genBaseUrl"), "{error}");
     }
 
     #[tokio::test]
@@ -548,7 +582,9 @@ mod tests {
                 .await
                 .expect_err("out-of-range n must fail");
             assert!(
-                error.to_string().contains(&format!("between 1 and {MAX_IMAGE_GEN_N}")),
+                error
+                    .to_string()
+                    .contains(&format!("between 1 and {MAX_IMAGE_GEN_N}")),
                 "{error}"
             );
         }
@@ -562,7 +598,10 @@ mod tests {
         let error = generate_image_openai_compatible(model, options)
             .await
             .expect_err("non-square size must fail");
-        assert!(error.to_string().contains("Unsupported image size"), "{error}");
+        assert!(
+            error.to_string().contains("Unsupported image size"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -575,13 +614,22 @@ mod tests {
     #[tokio::test]
     async fn response_body_cap_is_enforced() {
         let (address, _) = spawn_mock("x".repeat(4096), "200 OK").await;
-        let http = client(&StreamOptions::default()).expect("client");
-        let response = http
-            .get(format!("http://{address}/anything"))
-            .send()
-            .await
-            .expect("mock fetch");
-        let error = read_capped(response, &StreamOptions::default(), 1024)
+        let options = StreamOptions {
+            http_executor: Some(crate::http::test_http_executor()),
+            ..StreamOptions::default()
+        };
+        let executor = client(&options).expect("client");
+        let request = crate::request_from_url(
+            HttpMethod::Get,
+            &format!("http://{address}/anything"),
+            &http::HeaderMap::new(),
+            Vec::new(),
+            &options,
+            4096,
+        )
+        .expect("mock request");
+        let response = executor.execute(request).await.expect("mock fetch");
+        let error = read_capped(response, &options, 1024)
             .await
             .expect_err("oversized body must fail");
         assert!(error.to_string().contains("limit"), "{error}");
@@ -627,18 +675,17 @@ mod tests {
         // registry tests cannot interfere): `generate_image` must refuse it
         // with an actionable error instead of silently dispatching.
         let api = "test-chat-only-provider";
-        let stream: StreamFn = Arc::new(|_, _, _| {
-            async { crate::new_assistant_message_event_stream() }.boxed()
-        });
-        let simple: SimpleStreamFn = Arc::new(|_, _, _| {
-            async { crate::new_assistant_message_event_stream() }.boxed()
-        });
+        let stream: StreamFn =
+            Arc::new(|_, _, _| async { crate::new_assistant_message_event_stream() }.boxed());
+        let simple: SimpleStreamFn =
+            Arc::new(|_, _, _| async { crate::new_assistant_message_event_stream() }.boxed());
         register_api_provider(
             ApiProvider {
                 api: api.into(),
                 stream,
                 stream_simple: simple,
                 generate_image: None,
+                resolve_http_authorities: Arc::new(|_, _| Ok(std::collections::BTreeSet::new())),
             },
             Some("imagegen-test-source".into()),
         );
@@ -652,7 +699,9 @@ mod tests {
             .await
             .expect_err("chat-only provider must refuse image generation");
         assert!(
-            error.to_string().contains("does not support image generation"),
+            error
+                .to_string()
+                .contains("does not support image generation"),
             "{error}"
         );
         unregister_api_providers("imagegen-test-source");
@@ -741,8 +790,14 @@ mod tests {
             "auth failed for [REDACTED]"
         );
         // An empty/whitespace-only key leaves the message untouched.
-        assert_eq!(redact_key("auth failed for nothing", ""), "auth failed for nothing");
-        assert_eq!(redact_key("auth failed for nothing", "   "), "auth failed for nothing");
+        assert_eq!(
+            redact_key("auth failed for nothing", ""),
+            "auth failed for nothing"
+        );
+        assert_eq!(
+            redact_key("auth failed for nothing", "   "),
+            "auth failed for nothing"
+        );
     }
 
     #[test]
@@ -780,23 +835,30 @@ mod tests {
 
     #[tokio::test]
     async fn model_and_option_headers_are_applied_in_order() {
-        let (address, captured) =
-            spawn_mock(json_response(serde_json::json!([{ "b64_json": ONE_PX_PNG_B64 }])), "200 OK")
-                .await;
+        let (address, captured) = spawn_mock(
+            json_response(serde_json::json!([{ "b64_json": ONE_PX_PNG_B64 }])),
+            "200 OK",
+        )
+        .await;
         let mut model = model(API_IMAGE_GEN, format!("http://{address}/v1"));
         let mut model_headers = std::collections::HashMap::new();
         model_headers.insert("X-Model-Header".to_string(), "model-value".to_string());
         model.headers = Some(model_headers);
         let mut options = options("a red png");
         // Per-call headers (later wins) are applied after model headers.
-        options.headers.insert("X-Option-Header".into(), "option-value".into());
+        options
+            .headers
+            .insert("X-Option-Header".into(), "option-value".into());
         generate_image_openai_compatible(model, options)
             .await
             .expect("generation");
         let request = captured.lock().expect("request lock").clone();
         let lowered = request.to_ascii_lowercase();
         assert!(lowered.contains("x-model-header: model-value"), "{request}");
-        assert!(lowered.contains("x-option-header: option-value"), "{request}");
+        assert!(
+            lowered.contains("x-option-header: option-value"),
+            "{request}"
+        );
     }
 
     #[tokio::test]
@@ -816,7 +878,10 @@ mod tests {
         let result = stream.result().await.expect("error result");
         assert_eq!(result.stop_reason, crate::StopReason::Error);
         assert!(
-            result.error_message.as_deref().is_some_and(|m| m.contains("image-generation endpoint")),
+            result
+                .error_message
+                .as_deref()
+                .is_some_and(|m| m.contains("image-generation endpoint")),
             "{:?}",
             result.error_message
         );
@@ -831,8 +896,11 @@ mod tests {
         // A base64 string that decodes over the 128 MiB cap is rejected by
         // the pre-check, before the decoder allocates the full buffer.
         let huge_b64 = "A".repeat(((MAX_IMAGE_GEN_DECODED_BYTES as usize / 3) * 4) + 16);
-        let (address, _) = spawn_mock(json_response(serde_json::json!([{ "b64_json": huge_b64 }])), "200 OK")
-            .await;
+        let (address, _) = spawn_mock(
+            json_response(serde_json::json!([{ "b64_json": huge_b64 }])),
+            "200 OK",
+        )
+        .await;
         let model = model(API_IMAGE_GEN, format!("http://{address}/v1"));
         let error = generate_image_openai_compatible(model, options("a red png"))
             .await
@@ -842,7 +910,11 @@ mod tests {
 
     #[tokio::test]
     async fn empty_b64_json_data_is_rejected() {
-        let (address, _) = spawn_mock(json_response(serde_json::json!([{ "b64_json": "" }])), "200 OK").await;
+        let (address, _) = spawn_mock(
+            json_response(serde_json::json!([{ "b64_json": "" }])),
+            "200 OK",
+        )
+        .await;
         let model = model(API_IMAGE_GEN, format!("http://{address}/v1"));
         let error = generate_image_openai_compatible(model, options("a red png"))
             .await
@@ -852,8 +924,11 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_base64_is_rejected_with_decode_error() {
-        let (address, _) =
-            spawn_mock(json_response(serde_json::json!([{ "b64_json": "!!!not-base64!!!" }])), "200 OK").await;
+        let (address, _) = spawn_mock(
+            json_response(serde_json::json!([{ "b64_json": "!!!not-base64!!!" }])),
+            "200 OK",
+        )
+        .await;
         let model = model(API_IMAGE_GEN, format!("http://{address}/v1"));
         let error = generate_image_openai_compatible(model, options("a red png"))
             .await

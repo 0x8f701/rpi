@@ -15,7 +15,7 @@
 //! is rejected before any body bytes are read or allocated, so a hostile or
 //! corrupted peer can never drive a multi-gigabyte allocation.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 
@@ -92,9 +92,7 @@ pub async fn read_message(
     let length = content_length
         .ok_or_else(|| anyhow!("{protocol} message missing Content-Length header"))?;
     if length > max_body_bytes {
-        bail!(
-            "{protocol} message body of {length} bytes exceeds the {max_body_bytes}-byte limit"
-        );
+        bail!("{protocol} message body of {length} bytes exceeds the {max_body_bytes}-byte limit");
     }
     let mut body = vec![0u8; length];
     reader
@@ -145,8 +143,12 @@ mod tests {
         payload.extend(encode_message(&json!({"seq":1,"type":"request","command":"a"})).unwrap());
         payload.extend(encode_message(&json!({"seq":2,"type":"request","command":"b"})).unwrap());
         let mut reader = BufReader::new(&payload[..]);
-        let first = read_message("DAP", &mut reader, DEFAULT_MAX_MESSAGE_BYTES).await.unwrap();
-        let second = read_message("DAP", &mut reader, DEFAULT_MAX_MESSAGE_BYTES).await.unwrap();
+        let first = read_message("DAP", &mut reader, DEFAULT_MAX_MESSAGE_BYTES)
+            .await
+            .unwrap();
+        let second = read_message("DAP", &mut reader, DEFAULT_MAX_MESSAGE_BYTES)
+            .await
+            .unwrap();
         assert_eq!(first["seq"], 1);
         assert_eq!(second["seq"], 2);
         assert_eq!(first["command"], "a");
@@ -162,7 +164,9 @@ mod tests {
             body
         );
         let mut reader = BufReader::new(payload.as_bytes());
-        let message = read_message("DAP", &mut reader, DEFAULT_MAX_MESSAGE_BYTES).await.unwrap();
+        let message = read_message("DAP", &mut reader, DEFAULT_MAX_MESSAGE_BYTES)
+            .await
+            .unwrap();
         assert_eq!(message["seq"], 9);
         assert_eq!(message["success"], true);
     }
@@ -172,10 +176,16 @@ mod tests {
         // The protocol label is threaded into error wording.
         let payload = format!("{}\r\n\r\n{{}}", "\n".repeat(MAX_JUNK_HEADER_LINES + 1));
         let mut reader = BufReader::new(payload.as_bytes());
-        let err = read_message("DAP", &mut reader, DEFAULT_MAX_MESSAGE_BYTES).await.unwrap_err().to_string();
+        let err = read_message("DAP", &mut reader, DEFAULT_MAX_MESSAGE_BYTES)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("Content-Length"), "{err}");
         let mut reader = BufReader::new(payload.as_bytes());
-        let err = read_message("MCP", &mut reader, DEFAULT_MAX_MESSAGE_BYTES).await.unwrap_err().to_string();
+        let err = read_message("MCP", &mut reader, DEFAULT_MAX_MESSAGE_BYTES)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("MCP message"), "{err}");
     }
 
@@ -188,7 +198,9 @@ mod tests {
             body
         );
         let mut reader = BufReader::new(payload.as_bytes());
-        let message = read_message("DAP", &mut reader, DEFAULT_MAX_MESSAGE_BYTES).await.unwrap();
+        let message = read_message("DAP", &mut reader, DEFAULT_MAX_MESSAGE_BYTES)
+            .await
+            .unwrap();
         assert_eq!(message["seq"], 7);
         assert_eq!(message["event"], "stopped");
     }
@@ -196,7 +208,10 @@ mod tests {
     #[tokio::test]
     async fn read_message_reports_eof() {
         let mut reader = BufReader::new(&b""[..]);
-        let err = read_message("DAP", &mut reader, DEFAULT_MAX_MESSAGE_BYTES).await.unwrap_err().to_string();
+        let err = read_message("DAP", &mut reader, DEFAULT_MAX_MESSAGE_BYTES)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("closed"), "{err}");
     }
 
@@ -205,7 +220,9 @@ mod tests {
         let body = r#"{"seq":1,"type":"event","event":"output","body":{"output":"héllo 世界"}}"#;
         let payload = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
         let mut reader = BufReader::new(payload.as_bytes());
-        let message = read_message("DAP", &mut reader, DEFAULT_MAX_MESSAGE_BYTES).await.unwrap();
+        let message = read_message("DAP", &mut reader, DEFAULT_MAX_MESSAGE_BYTES)
+            .await
+            .unwrap();
         assert_eq!(message["body"]["output"], "héllo 世界");
     }
 
@@ -245,8 +262,12 @@ mod tests {
             data: std::io::Cursor::new(payload),
             chunk: 3,
         });
-        let first = read_message("LSP", &mut reader, DEFAULT_MAX_MESSAGE_BYTES).await.unwrap();
-        let second = read_message("LSP", &mut reader, DEFAULT_MAX_MESSAGE_BYTES).await.unwrap();
+        let first = read_message("LSP", &mut reader, DEFAULT_MAX_MESSAGE_BYTES)
+            .await
+            .unwrap();
+        let second = read_message("LSP", &mut reader, DEFAULT_MAX_MESSAGE_BYTES)
+            .await
+            .unwrap();
         assert_eq!(first["seq"], 1);
         assert_eq!(first["command"], "a");
         assert_eq!(second["seq"], 2);
@@ -260,7 +281,10 @@ mod tests {
         for value in ["nope", "-5", "1.5", ""] {
             let payload = format!("Content-Length: {value}\r\n\r\n{{}}");
             let mut reader = BufReader::new(payload.as_bytes());
-            let err = read_message("MCP", &mut reader, DEFAULT_MAX_MESSAGE_BYTES).await.unwrap_err().to_string();
+            let err = read_message("MCP", &mut reader, DEFAULT_MAX_MESSAGE_BYTES)
+                .await
+                .unwrap_err()
+                .to_string();
             assert!(
                 err.contains("invalid Content-Length header value"),
                 "value {value:?}: {err}"
@@ -276,7 +300,10 @@ mod tests {
         let body = r#"{"seq":1,"type":"event","event":"stopped"}"#;
         let payload = format!("Content-Length: 1000\r\n\r\n{}", body);
         let mut reader = BufReader::new(payload.as_bytes());
-        let err = read_message("DAP", &mut reader, DEFAULT_MAX_MESSAGE_BYTES).await.unwrap_err().to_string();
+        let err = read_message("DAP", &mut reader, DEFAULT_MAX_MESSAGE_BYTES)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("reading DAP message body"), "{err}");
     }
 
@@ -312,10 +339,7 @@ mod tests {
     async fn read_message_rejects_body_over_default_cap() {
         // The default cap used by the LSP/MCP/DAP clients is enforced too:
         // one byte over the cap fails fast with the contextual error.
-        let payload = format!(
-            "Content-Length: {}\r\n\r\n",
-            DEFAULT_MAX_MESSAGE_BYTES + 1
-        );
+        let payload = format!("Content-Length: {}\r\n\r\n", DEFAULT_MAX_MESSAGE_BYTES + 1);
         let mut reader = BufReader::new(payload.as_bytes());
         let err = read_message("MCP", &mut reader, DEFAULT_MAX_MESSAGE_BYTES)
             .await

@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // Focused realtime sideband/data-channel regression for src/realtime.ts — the
 // pure session config, live-mode normalization, input-transcript
-// classification/extraction, and error-parsing rules shared by App.tsx's
-// WebRTC realtime flow. Run through `npm run build`, which bundles this file
-// with esbuild into a disposable Node module before executing the assertions.
+// classification/extraction, error-parsing rules, and captured-session owner
+// binding for create/stop RPCs shared by App.tsx's WebRTC realtime flow. Run
+// through `npm run build`, which bundles this file with esbuild into a
+// disposable Node module before executing the assertions.
 //
 // Exit codes: 0 = every assertion held; 1 = a regression.
 //
@@ -17,11 +18,29 @@ import {
   normalizeLiveMode,
   isRealtimeLiveMode,
   classifyInputTranscriptEvent,
+  inputTranscriptDeltaText,
+  inputTranscriptSegmentText,
+  delegationCreatedText,
   finalTranscriptText,
   nextInputTranscriptCommit,
+  planRealtimeDelegation,
+  planRealtimeFinal,
+  reduceRealtimeVoiceFrame,
+  reducePendingVoiceFlush,
+  parseRealtimeChannelFrames,
+  unwrapRealtimeFrame,
+  decodeRealtimeChannelData,
+  isRealtimeHandoffType,
+  isIgnorableTranscriptFinal,
+  userFinalUtterance,
+  realtimeDelegationLabel,
   realtimeErrorMessage,
   classifyRealtimeConnectionState,
   waitForIceGatheringComplete,
+  realtimeCreateCallCommand,
+  realtimeStopCommand,
+  shouldCommitRealtimeTranscript,
+  shouldStopRealtimeOnSessionSwitch,
 } from '../src/realtime.ts';
 const failures = [];
 let ran = 0;
@@ -30,29 +49,22 @@ function check(name, cond, detail) {
   if (!cond) failures.push(`${name}${detail ? `: ${detail}` : ''}`);
 }
 
-// ---- buildRealtimeSessionConfig: exact V1 "quicksilver" shape (data-channel session.update) ----
+// ---- buildRealtimeSessionConfig: exact frameless v3 session.update shape ----
 {
   const session = buildRealtimeSessionConfig('gpt-realtime-1.5', 'sol');
-  check('session.type == quicksilver', session.type === 'quicksilver', JSON.stringify(session));
-  check('session.model propagated', session.model === 'gpt-realtime-1.5');
-  check('session.audio.input.format.type == audio/pcm', session.audio.input.format.type === 'audio/pcm');
-  check('session.audio.input.format.rate == 24000 (number)', session.audio.input.format.rate === 24000 && typeof session.audio.input.format.rate === 'number');
+  check('session.instructions empty', session.instructions === '');
   check('session.audio.output.voice propagated', session.audio.output.voice === 'sol');
-  // The session.update frame wraps this model-bearing session object verbatim.
-  // It is data-channel-only: the Rust create-call POST session is a strict
-  // subset WITHOUT `model`, which Codex realtime rejects with 400.
+  check('session.delegation.type client', session.delegation.type === 'client');
   const frame = { type: 'session.update', session };
   check('session.update frame type', frame.type === 'session.update');
   check('session.update frame carries the full nested session object', frame.session === session);
-  // The legacy bug shape ({model, voice} at the session top level) must NOT be
-  // produced — voice nests under audio.output, and there is no top-level voice.
-  check('no top-level voice on session (voice nests under audio.output)', !('voice' in session));
-  check('session has audio.input + audio.output nesting', 'input' in session.audio && 'output' in session.audio);
-  // The session object must NOT carry an `id` (the official client strips it).
+  check('session.update omits model', !('model' in frame.session));
+  check('session.update omits legacy quicksilver type', !('type' in session));
+  check('session.update omits rejected audio input config', !('input' in session.audio));
+  check('no top-level voice on session', !('voice' in session));
   check('session carries no id', !('id' in session));
-  // Different configured values propagate (no hardcoding).
   const other = buildRealtimeSessionConfig('gpt-4o-realtime', 'marin');
-  check('other model/voice propagate', other.model === 'gpt-4o-realtime' && other.audio.output.voice === 'marin' && other.audio.input.format.rate === 24000);
+  check('other voice propagates without model', other.audio.output.voice === 'marin' && !('model' in other));
 }
 
 // ---- normalizeLiveMode: trim + ASCII lowercase ----
@@ -98,8 +110,150 @@ function check(name, cond, detail) {
   check('response.output_audio.delta is NOT user input', classifyInputTranscriptEvent('response.output_audio.delta') === null);
   check('delegation.created is NOT user input', classifyInputTranscriptEvent('delegation.created') === null);
   check('error is NOT user input', classifyInputTranscriptEvent('error') === null);
+  // GA v3 input-transcription events: segment is interim (preview only),
+  // failed is an error surface (toast, never commits), delta/final aliases.
+  check('input_audio_transcription.segment is interim segment', classifyInputTranscriptEvent('conversation.item.input_audio_transcription.segment') === 'segment');
+  check('input_audio_transcription.failed is failure', classifyInputTranscriptEvent('conversation.item.input_audio_transcription.failed') === 'failed');
+  check('transcription.failed alias is failure', classifyInputTranscriptEvent('transcription.failed') === 'failed');
+  check('output_audio_transcript.done is NOT user input', classifyInputTranscriptEvent('response.output_audio_transcript.done') === null);
+  check('input_audio_buffer.speech_started is NOT user input', classifyInputTranscriptEvent('input_audio_buffer.speech_started') === null);
+  // Codex FRAMELESS protocol (relayed verbatim by CLIProxyAPI over
+  // oai-events): interim deltas and the authoritative turn final.
+  check('input_transcript.added is input segment (frameless full item.text)', classifyInputTranscriptEvent('input_transcript.added') === 'segment');
+  check('turn.done is input final (frameless)', classifyInputTranscriptEvent('turn.done') === 'final');
+  check('output_transcript.added is NOT user input', classifyInputTranscriptEvent('output_transcript.added') === null);
+  check('session.updated is NOT user input', classifyInputTranscriptEvent('session.updated') === null);
   check('unknown type is NOT user input', classifyInputTranscriptEvent('garbage.event') === null);
   check('empty type is NOT user input', classifyInputTranscriptEvent('') === null);
+}
+
+// ---- REAL WIRE SHAPES (Codex frameless-bidi, relayed byte-for-byte by
+// CLIProxyAPI over oai-events — internal/client/codex/live/media.go). These
+// fixtures are the authoritative upstream shapes; the extractors MUST read
+// them. ----
+{
+  // delegation.created: the spoken command rides item.content[] input_text
+  // entries — there is NO `delegation` field (openai/codex
+  // protocol_frameless_bidi_tests.rs fixture).
+  const framelessDelegation = {
+    type: 'delegation.created',
+    offset_ms: 1000,
+    item: {
+      id: 'handoff-123',
+      type: 'delegation',
+      target: 'client',
+      content: [{ type: 'input_text', text: 'check the weather' }],
+    },
+  };
+  check('frameless delegation.created extracts item.content input_text', delegationCreatedText(framelessDelegation) === 'check the weather');
+  check('frameless delegation text plans a delivery', planRealtimeDelegation('A', 'A', delegationCreatedText(framelessDelegation), '').deliver === true);
+  // Multiple input_text entries concatenate (Codex collects the array).
+  check('frameless delegation concatenates input_text entries', delegationCreatedText({ type: 'delegation.created', item: { type: 'delegation', target: 'client', content: [{ type: 'input_text', text: 'fix ' }, { type: 'input_text', text: 'parser.rs' }] } }) === 'fix parser.rs');
+  // Non-input_text content entries are ignored.
+  check('frameless delegation ignores non-input_text content', delegationCreatedText({ type: 'delegation.created', item: { type: 'delegation', target: 'client', content: [{ type: 'output_text', text: 'nope' }] } }) === '');
+  // Id-only delegation: no content, no text — the caller must surface a
+  // failure toast instead of silently dropping.
+  check('id-only frameless delegation extracts empty', delegationCreatedText({ type: 'delegation.created', item: { id: 'handoff-9', type: 'delegation', target: 'client' } }) === '');
+  // Legacy wrapped shapes remain supported.
+  check('legacy raw-string delegation still extracts', delegationCreatedText({ type: 'delegation.created', delegation: 'legacy command' }) === 'legacy command');
+  check('legacy description delegation still extracts', delegationCreatedText({ type: 'delegation.created', delegation: { description: 'desc command' } }) === 'desc command');
+  check('legacy task delegation still extracts', delegationCreatedText({ type: 'delegation.created', delegation: { task: 'task command' } }) === 'task command');
+  // turn.done: the final transcript nests under turn and is ROLE-GATED.
+  check('frameless turn.done (user) extracts turn.transcript', finalTranscriptText({ type: 'turn.done', turn: { id: 't1', role: 'user', transcript: 'deploy now' } }) === 'deploy now');
+  check('frameless turn.done (assistant) NEVER extracts as input', finalTranscriptText({ type: 'turn.done', turn: { id: 't2', role: 'assistant', transcript: 'sure thing' } }) === '');
+  // input_transcript.added: the live interim text nests under item.text.
+  check('frameless input_transcript.added extracts item.text', inputTranscriptDeltaText({ type: 'input_transcript.added', item: { id: 'i1', type: 'input_transcript', text: 'hello' } }) === 'hello');
+  check('frameless input_transcript.added empty without text', inputTranscriptDeltaText({ type: 'input_transcript.added', item: { id: 'i2', type: 'input_transcript' } }) === '');
+  check('segment extractor reads item.text too', inputTranscriptSegmentText({ type: 'input_transcript.added', item: { text: 'full interim' } }) === 'full interim');
+  check('item.input_transcript is read when content is empty',
+    delegationCreatedText({ type: 'delegation.created', item: { type: 'delegation', target: 'client', input_transcript: 'from item field' } }) === 'from item field');
+  check('V1 conversation.handoff.requested extracts top-level input_transcript',
+    delegationCreatedText({ type: 'conversation.handoff.requested', input_transcript: 'delegate this' }) === 'delegate this');
+  check('handoff type aliases both count',
+    isRealtimeHandoffType('delegation.created') && isRealtimeHandoffType('conversation.handoff.requested')
+      && !isRealtimeHandoffType('turn.done'));
+}
+
+{
+  const ownerCtx = (overlay, pendingText = '') => ({
+    owner: 'A', current: 'A', overlay, lastCommitted: '', pendingText,
+  });
+  check('assistant turn.done is ignorable as a user final',
+    isIgnorableTranscriptFinal({ type: 'turn.done', turn: { role: 'assistant', transcript: 'sure' } }) === true);
+  check('user turn.done is not ignorable',
+    isIgnorableTranscriptFinal({ type: 'turn.done', turn: { role: 'user', transcript: 'go' } }) === false);
+  check('empty user turn.done uses overlay as the utterance',
+    userFinalUtterance({ type: 'turn.done', turn: { role: 'user' } }, '  run the tests  ') === 'run the tests');
+
+  const growing1 = reduceRealtimeVoiceFrame(
+    { type: 'input_transcript.added', item: { text: 'run the' } },
+    ownerCtx(''),
+  );
+  check('input_transcript.added replaces overlay with full item.text',
+    growing1.kind === 'overlay' && growing1.text === 'run the');
+  const growing2 = reduceRealtimeVoiceFrame(
+    { type: 'input_transcript.added', item: { text: 'run the tests' } },
+    ownerCtx(growing1.kind === 'overlay' ? growing1.text : ''),
+  );
+  check('a later input_transcript.added does not append the previous overlay',
+    growing2.kind === 'overlay' && growing2.text === 'run the tests');
+
+  const parked = reduceRealtimeVoiceFrame(
+    {
+      type: 'delegation.created',
+      item: { id: 'h1', type: 'delegation', target: 'client', content: [{ type: 'input_text', text: 'run the tests' }] },
+    },
+    ownerCtx('run the tests'),
+  );
+  check('delegation.created parks instead of submitting immediately',
+    parked.kind === 'park' && parked.text === 'run the tests');
+
+  const assistantDone = reduceRealtimeVoiceFrame(
+    { type: 'turn.done', turn: { role: 'assistant', transcript: 'working on it' } },
+    ownerCtx('run the tests', 'run the tests'),
+  );
+  check('assistant turn.done during a parked utterance DELIVERS the spoken text (does not drop it)',
+    assistantDone.kind === 'deliver' && assistantDone.text === 'run the tests' && assistantDone.cancelPending === true);
+
+  const idleAssistant = reduceRealtimeVoiceFrame(
+    { type: 'turn.done', turn: { role: 'assistant', transcript: 'hello' } },
+    ownerCtx('', ''),
+  );
+  check('assistant turn.done with no overlay and no pending is a no-op',
+    idleAssistant.kind === 'noop');
+
+  const emptyUserDone = reduceRealtimeVoiceFrame(
+    { type: 'turn.done', turn: { role: 'user' } },
+    ownerCtx('fix parser.rs', ''),
+  );
+  check('empty user turn.done delivers the overlay as the chat prompt',
+    emptyUserDone.kind === 'deliver' && emptyUserDone.text === 'fix parser.rs');
+
+  const v1Handoff = reduceRealtimeVoiceFrame(
+    { type: 'conversation.handoff.requested', input_transcript: 'legacy handoff' },
+    ownerCtx(''),
+  );
+  check('V1 conversation.handoff.requested parks the input_transcript',
+    v1Handoff.kind === 'park' && v1Handoff.text === 'legacy handoff');
+
+  const bytes = new TextEncoder().encode(JSON.stringify({
+    type: 'event',
+    event: { type: 'input_transcript.added', item: { text: 'from binary' } },
+  }));
+  const parsed = parseRealtimeChannelFrames(bytes);
+  check('channel JSON unwraps nested event frames',
+    unwrapRealtimeFrame({ type: 'event', event: { type: 'delegation.created' } })?.type === 'delegation.created');
+  check('channel ArrayBuffer decodes to the nested frame',
+    parsed.length === 1 && parsed[0].type === 'input_transcript.added');
+  check('channel string data still parses',
+    decodeRealtimeChannelData('{"type":"error"}') === '{"type":"error"}');
+
+  const flush = reducePendingVoiceFlush({ owner: 'A', text: 'short' }, 'a much longer preview', 'A', '');
+  check('pending flush delivers the richer overlay',
+    flush.kind === 'deliver' && flush.text === 'a much longer preview');
+  const emptyFlush = reducePendingVoiceFlush({ owner: 'A', text: '' }, '   ', 'A', '');
+  check('pending flush with no text is empty-handoff',
+    emptyFlush.kind === 'empty-handoff');
 }
 
 // ---- finalTranscriptText: extracts the authoritative final text ----
@@ -110,6 +264,7 @@ function check(name, cond, detail) {
   check('finalTranscriptText reads item.transcript (completed)', finalTranscriptText({ type: 'conversation.item.input_audio_transcription.completed', item: { transcript: 'nested final' } }) === 'nested final');
   check('finalTranscriptText reads item.content fallback', finalTranscriptText({ type: 'conversation.item.input_audio_transcription.completed', item: { content: 'nested content' } }) === 'nested content');
   check('finalTranscriptText empty when no text', finalTranscriptText({ type: 'conversation.input_transcript.done' }) === '');
+  check('finalTranscriptText reads completed top-level transcript', finalTranscriptText({ type: 'conversation.item.input_audio_transcription.completed', transcript: 'ga final' }) === 'ga final');
   check('finalTranscriptText trims', finalTranscriptText({ transcript: '  spaced  ' }) === 'spaced');
 }
 
@@ -123,6 +278,10 @@ function check(name, cond, detail) {
   // both carrying the same final text — the second must not double-commit.
   check('duplicate final deduped (two V1 variants, same utterance)', nextInputTranscriptCommit('hello world', 'hello world') === '');
   check('different utterance still commits', nextInputTranscriptCommit('second turn', 'hello world') === 'second turn');
+  // The GA failed event nests its detail under `error`; the same bounded
+  // extractor that serves `error` frames must render it.
+  check('failed event surfaces nested error message', realtimeErrorMessage({ type: 'conversation.item.input_audio_transcription.failed', error: { message: 'asr unavailable', code: 'asr_error' } }) === 'realtime error [asr_error]: asr unavailable');
+  check('failed event without detail uses bounded default', realtimeErrorMessage({ type: 'transcription.failed' }) === 'realtime session error');
   check('trim before compare + return', nextInputTranscriptCommit('  hello world  ', '') === 'hello world');
   check('trimmed duplicate deduped', nextInputTranscriptCommit('  hello world  ', 'hello world') === '');
 }
@@ -379,6 +538,176 @@ function check(name, cond, detail) {
   check('timeout fallback resolves when scheduler fires', timedOut === true);
   // Default bound is the documented 5s reference-client gather window.
   check('default gather timeout is 5000ms', REALTIME_ICE_GATHER_TIMEOUT_MS === 5000);
+}
+
+// ---- captured owner: A realtime start -> switch B -> stop/cleanup ----
+{
+  // Call starts on A; the owner is captured then. ICE gather is async, so a
+  // switch to B before POST (or before stop) must still create/stop A's
+  // runtime. Prior code read sessionIdRef.current at fire time, so create
+  // leaked onto B and stop tore down B's runtime.
+  const owner = 'A';
+  let current = 'A';
+  current = 'B';
+  const create = realtimeCreateCallCommand(owner, 'v=0');
+  const stop = realtimeStopCommand(owner);
+  check('create type is realtime_create_call', create.type === 'realtime_create_call');
+  check('stop type is realtime_stop', stop.type === 'realtime_stop');
+  check('A start -> switch B: create stays on A', create.sessionId === 'A');
+  check('A start -> switch B: create does not target B', create.sessionId !== current);
+  check('A start -> switch B: create offer is the captured SDP', create.sdpOffer === 'v=0');
+  check('A start -> switch B: stop stays on A', stop.sessionId === 'A');
+  check('A start -> switch B: stop does not target B', stop.sessionId !== current);
+  check(
+    'A start -> switch B: late realtime transcript not committed to B',
+    shouldCommitRealtimeTranscript(owner, current) === false,
+  );
+  check('same-session realtime still commits', shouldCommitRealtimeTranscript(owner, 'A') === true);
+  check('empty realtime owner never commits', shouldCommitRealtimeTranscript('', 'A') === false);
+  check('null realtime owner never commits', shouldCommitRealtimeTranscript(null, 'A') === false);
+
+  check(
+    'A call -> switch B stops the whole A realtime surface',
+    shouldStopRealtimeOnSessionSwitch(owner, 'A', 'B') === true,
+  );
+  check(
+    'stopped A channel cannot project A deltas or delegations onto B',
+    shouldStopRealtimeOnSessionSwitch(owner, 'A', 'B')
+      && shouldCommitRealtimeTranscript(owner, 'B') === false,
+  );
+  check('same-session refresh keeps A call', shouldStopRealtimeOnSessionSwitch(owner, 'A', 'A') === false);
+  check('unowned realtime never triggers another session teardown', shouldStopRealtimeOnSessionSwitch('', 'A', 'B') === false);
+}
+
+// ---- planRealtimeFinal: voice commits to the owner composer, dropped on owner mismatch ----
+{
+  const owner = 'A';
+  const delivered = planRealtimeFinal(owner, 'A', 'run the tests', '');
+  check('completed transcript commits', delivered.commit === 'run the tests');
+  check('completed transcript delivers on the owner session', delivered.deliver === true);
+  const duplicate = planRealtimeFinal(owner, 'A', 'run the tests', 'run the tests');
+  check('duplicate final neither commits nor delivers', duplicate.commit === '' && duplicate.deliver === false);
+  const empty = planRealtimeFinal(owner, 'A', '   ', '');
+  check('empty final never delivers', empty.commit === '' && empty.deliver === false);
+  const mismatched = planRealtimeFinal(owner, 'B', 'late utterance from A', '');
+  check('owner mismatch drops the transcript (no deliver, no draft write)',
+    mismatched.commit === 'late utterance from A' && mismatched.deliver === false);
+  const unowned = planRealtimeFinal(null, 'A', 'orphan utterance', '');
+  check('unowned transcript never delivers', unowned.deliver === false);
+  const second = planRealtimeFinal(owner, 'A', 'second turn', 'run the tests');
+  check('a second utterance still commits and delivers', second.commit === 'second turn' && second.deliver === true);
+}
+
+// ---- realtimeDelegationLabel: no prefix/placeholder duplication ----
+{
+  check('delegation text renders with the prefix', realtimeDelegationLabel('spawned 3 runners') === 'delegation created: spawned 3 runners');
+  check('empty delegation renders the meaningful fallback', realtimeDelegationLabel('') === 'Voice: delegation started (see Activity)');
+  check('whitespace delegation renders the fallback', realtimeDelegationLabel('   ') === 'Voice: delegation started (see Activity)');
+  check('absent delegation renders nothing (no overlay row)', realtimeDelegationLabel(null) === null && realtimeDelegationLabel(undefined) === null);
+  check('placeholder is never prefixed', !realtimeDelegationLabel('').includes('Delegation created'));
+}
+
+{
+  const { readFileSync } = await import('node:fs');
+  const { dirname, join } = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const appSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../src/App.tsx'), 'utf8');
+  check('App voice frames dispatch through reduceRealtimeVoiceFrame',
+    appSource.includes('reduceRealtimeVoiceFrame(frame,'));
+  check('App pending flush dispatches through reducePendingVoiceFlush',
+    appSource.includes('reducePendingVoiceFlush('));
+  check('App data-channel messages parse via parseRealtimeChannelFrames',
+    appSource.includes('parseRealtimeChannelFrames(event.data)'));
+  check('App treats binary data-channel payloads as ArrayBuffer',
+    appSource.includes("dcArg.binaryType = 'arraybuffer'"));
+  check('delivered voice commits through submitVoicePrompt',
+    appSource.includes('submitVoicePrompt(action.text)'));
+  check('delivered voice does not auto-submit the composer',
+    !appSource.includes('realtimeSubmitRef'));
+}
+
+// ---- planRealtimeDelegation: dedup anchor lifecycle (audited contract) ----
+// The caller ANCHORS lastCommitted at the delivered text on every successful
+// delivery, and CLEARS it in the delta/segment branches (every new utterance
+// opens with one). So: the V1 dual-final variants of ONE utterance dedup,
+// the final+delegation pair of ONE utterance dedup, and every distinct
+// utterance delivers exactly once (cross-utterance prefix DELIVERS).
+{
+  const owner = 'A';
+  // Delegation-only utterance: no transcript final ever arrives — the
+  // delegation text IS the command and delivers exactly once.
+  const solo = planRealtimeDelegation(owner, 'A', 'spin up three runners', '');
+  check('delegation-only utterance delivers exactly once',
+    solo.commit === 'spin up three runners' && solo.deliver === true);
+  // Cross-utterance prefix: u1 'fix the failing tests' anchored lastCommitted;
+  // u2 delegation 'fix the failing tests in the auth module' prefix-matches
+  // u1 but is a DIFFERENT utterance (its delta cleared the anchor in the
+  // live path; here we simulate a stale anchor) → must DELIVER anyway.
+  const cross = planRealtimeDelegation(owner, 'A', 'fix the failing tests in the auth module', 'fix the failing tests');
+  check('cross-utterance prefix match DELIVERS (not silently dropped)',
+    cross.commit === 'fix the failing tests in the auth module' && cross.deliver === true);
+  const reversedCross = planRealtimeDelegation(owner, 'A', 'fix the failing tests', 'fix the failing tests in the auth module');
+  check('reversed cross-utterance prefix also DELIVERS', reversedCross.deliver === true);
+  // Same-utterance dedup pairs (the anchor holds WITHIN one utterance):
+  // V1 dual-final — two final variants of the same utterance.
+  const dualFinal = planRealtimeFinal(owner, 'A', 'spin up three runners', 'spin up three runners');
+  check('dual-final same-utterance variant is deduped',
+    dualFinal.commit === '' && dualFinal.deliver === false);
+  // Final + delegation pair — the delegation of an utterance whose final
+  // already delivered.
+  const finalThenDelegation = planRealtimeDelegation(owner, 'A', 'spin up three runners', 'spin up three runners');
+  check('final+delegation same-utterance pair is deduped', finalThenDelegation.deliver === false);
+  // Exact same-utterance delegation re-fire: still deduped.
+  const sameFire = planRealtimeDelegation(owner, 'A', 'spin up three runners', 'spin up three runners');
+  check('exact same-utterance re-fire is deduped', sameFire.deliver === false);
+  // Different utterance still delivers.
+  const different = planRealtimeDelegation(owner, 'A', 'totally different command', 'unrelated earlier text');
+  check('an unrelated delegation still delivers', different.deliver === true);
+  // Owner-switch drops it entirely.
+  const switched = planRealtimeDelegation(owner, 'B', 'late delegation from A', '');
+  check('owner-switch drops the delegation (no deliver, no draft write)',
+    switched.deliver === false);
+  // PREVIEW FALLBACK (round-7.5 live defect): an id-only delegation.created
+  // carries no description/task, but the user's words already streamed into
+  // the accumulated transcript preview. The preview delivers as the command.
+  const fromPreview = planRealtimeDelegation(owner, 'A', '', '', '  run the deploy pipeline  ');
+  check('id-only delegation with a non-empty preview delivers the preview',
+    fromPreview.commit === 'run the deploy pipeline' && fromPreview.deliver === true);
+  // Description wins over the preview when both exist.
+  const descWins = planRealtimeDelegation(owner, 'A', 'spin up three runners', '', 'unrelated partial preview');
+  check('description/task text wins over the accumulated preview',
+    descWins.commit === 'spin up three runners' && descWins.deliver === true);
+  // Both empty → nothing delivers (overlay-only).
+  const bothEmpty = planRealtimeDelegation(owner, 'A', '', '', '   ');
+  check('delegation with no text and an empty preview delivers nothing',
+    bothEmpty.commit === '' && bothEmpty.deliver === false);
+  // Dedup still applies to the preview-delivered text: a final of the same
+  // utterance (the anchor already holds the preview text) never re-delivers.
+  const previewDedup = planRealtimeDelegation(owner, 'A', '', 'run the deploy pipeline', 'run the deploy pipeline');
+  check('preview delivery dedups against the shared anchor', previewDedup.deliver === false);
+  // Empty/whitespace text has nothing to send — overlay/Activity only.
+  const blank = planRealtimeDelegation(owner, 'A', '   ', '');
+  check('empty delegation text never delivers to chat', blank.commit === '' && blank.deliver === false);
+}
+
+{
+  const { readFileSync } = await import('node:fs');
+  const { dirname, join } = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const appSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../src/App.tsx'), 'utf8');
+  check('App parks handoff text and arms REALTIME_DELEGATION_QUIESCENCE_MS',
+    appSource.includes("pendingDelegationRef.current = { owner: action.owner, text: action.text }")
+      && appSource.includes('REALTIME_DELEGATION_QUIESCENCE_MS'));
+  check('the quiescence delivery surfaces a FAILURE toast when no text ever arrives (never silent)',
+    appSource.includes("toast('Voice delegation carried no transcribed text — not delivered', true);"));
+  check('delegation flush toasts a draft, not a started agent',
+    appSource.includes('Voice draft ready:')
+      && !appSource.includes('Voice delegation started:'));
+  check('the realtime STOP path cancels the pending delegation (session switch / call stop drop it)',
+    appSource.includes('setRealtimeDelegation(null);\n      cancelPendingDelegationRef.current();'));
+  check('overlay writes clear the dedup anchor for a new utterance',
+    appSource.includes("case 'overlay':")
+      && appSource.includes("lastCommittedTranscriptRef.current = '';"));
 }
 
 console.log(`\nrealtime.test: ${ran} assertions, ${failures.length} failure(s)`);

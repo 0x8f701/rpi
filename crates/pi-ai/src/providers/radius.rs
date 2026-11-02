@@ -1,8 +1,8 @@
-use crate::{
-    API_PI_MESSAGES, Model, ModelCost, RadiusCatalogStore, ThinkingLevelMap, now_millis,
-    replace_dynamic_models,
-};
 use super::common;
+use crate::{
+    API_PI_MESSAGES, HttpMethod, HttpResponse, Model, ModelCost, RadiusCatalogStore,
+    SharedHttpExecutor, ThinkingLevelMap, now_millis, replace_dynamic_models,
+};
 use anyhow::{Result, anyhow};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -89,17 +89,11 @@ fn refresh_headers(
 }
 
 async fn read_config_body(
-    response: reqwest::Response,
+    response: HttpResponse,
     abort_signal: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<Vec<u8>> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_RADIUS_CONFIG_BODY_BYTES as u64)
-    {
-        return Err(anyhow!("Radius config response exceeds {MAX_RADIUS_CONFIG_BODY_BYTES} bytes"));
-    }
     let mut body = Vec::new();
-    let mut chunks = response.bytes_stream();
+    let mut chunks = response.into_body();
     loop {
         let next = match abort_signal {
             Some(token) => tokio::select! {
@@ -112,7 +106,9 @@ async fn read_config_body(
         let Some(chunk) = next else { break };
         let chunk = chunk?;
         if body.len().saturating_add(chunk.len()) > MAX_RADIUS_CONFIG_BODY_BYTES {
-            return Err(anyhow!("Radius config response exceeds {MAX_RADIUS_CONFIG_BODY_BYTES} bytes"));
+            return Err(anyhow!(
+                "Radius config response exceeds {MAX_RADIUS_CONFIG_BODY_BYTES} bytes"
+            ));
         }
         body.extend_from_slice(&chunk);
     }
@@ -191,6 +187,7 @@ impl RadiusCatalog {
     pub async fn refresh(
         &self,
         api_key: &str,
+        http_executor: SharedHttpExecutor,
         options: RadiusRefreshOptions,
     ) -> Result<RadiusCatalogSnapshot> {
         if api_key.trim().is_empty() {
@@ -213,13 +210,21 @@ impl RadiusCatalog {
             max_retries: options.max_retries,
             max_retry_delay_ms: options.max_retry_delay_ms,
             abort_signal: options.abort_signal.clone(),
+            http_executor: Some(http_executor),
             ..Default::default()
         };
-        let client = common::client(&stream)?;
+        common::client(&stream)?;
         let url = format!("{}/v1/config", self.gateway);
         let headers = refresh_headers(&options.headers, api_key)?;
         let response = common::send_with_retry(&stream, || {
-            client.get(&url).headers(headers.clone())
+            crate::request_from_url(
+                HttpMethod::Get,
+                &url,
+                &headers,
+                Vec::new(),
+                &stream,
+                MAX_RADIUS_CONFIG_BODY_BYTES as u64,
+            )
         })
         .await
         .map_err(|e| anyhow!(redact(&e.to_string(), api_key, &options.headers)))?;
@@ -241,7 +246,10 @@ impl RadiusCatalog {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        replace_dynamic_models(&format!("radius:{}", self.provider_id), snapshot.models.clone())?;
+        replace_dynamic_models(
+            &format!("radius:{}", self.provider_id),
+            snapshot.models.clone(),
+        )?;
         state.snapshot = snapshot.clone();
         Ok(snapshot)
     }
@@ -402,7 +410,11 @@ fn redact(message: &str, secret: &str, headers: &HashMap<String, String>) -> Str
             let value = value.trim();
             if !value.is_empty() {
                 secrets.push(value.to_owned());
-                if let Some(token) = value.strip_prefix("Bearer ").map(str::trim).filter(|token| !token.is_empty()) {
+                if let Some(token) = value
+                    .strip_prefix("Bearer ")
+                    .map(str::trim)
+                    .filter(|token| !token.is_empty())
+                {
                     secrets.push(token.to_owned());
                 }
             }
@@ -410,14 +422,16 @@ fn redact(message: &str, secret: &str, headers: &HashMap<String, String>) -> Str
     }
     secrets.sort_by_key(|value| std::cmp::Reverse(value.len()));
     secrets.dedup();
-    secrets.into_iter().fold(message.to_owned(), |sanitized, secret| {
-        if secret.is_empty() {
-            sanitized
-        } else {
-            let sanitized = sanitized.replace(&format!("Bearer {secret}"), "Bearer [REDACTED]");
-            sanitized.replace(&secret, "[REDACTED]")
-        }
-    })
+    secrets
+        .into_iter()
+        .fold(message.to_owned(), |sanitized, secret| {
+            if secret.is_empty() {
+                sanitized
+            } else {
+                let sanitized = sanitized.replace(&format!("Bearer {secret}"), "Bearer [REDACTED]");
+                sanitized.replace(&secret, "[REDACTED]")
+            }
+        })
 }
 #[cfg(test)]
 mod tests {

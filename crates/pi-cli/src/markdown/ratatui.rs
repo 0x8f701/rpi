@@ -143,7 +143,21 @@ pub fn to_ratatui(
                         .style(style);
                 }
                 if !line.inline_styles.is_empty() {
-                    return styled_ranges(&line.text, &line.inline_styles, style, styles).style(style);
+                    return styled_ranges(&line.text, &line.inline_styles, style, styles)
+                        .style(style);
+                }
+                if matches!(line.role, LineRole::MermaidNode | LineRole::MermaidEdge)
+                    && let Some(body) = line.text.strip_prefix("│ ")
+                {
+                    // Mermaid card body rows carry their left gutter as
+                    // literal `│ ` text; style that prefix with the border
+                    // role so all four sides of the card share one border
+                    // treatment (never the base/white node color).
+                    return Line::from(vec![
+                        Span::styled("│ ", styles.mermaid_border),
+                        Span::styled(body.to_owned(), style),
+                    ])
+                    .style(style);
                 }
                 Line::from(vec![Span::styled(line.text.clone(), style)]).style(style)
             })
@@ -475,7 +489,13 @@ fn lex_shell(source: &str, styles: MarkdownRatatuiStyles, spans: &mut Vec<Span<'
                 }
             } else {
                 take_while(&chars, &mut index, |c| {
-                    c.is_ascii_alphanumeric() || c == '_' || c == '?' || c == '!' || c == '#' || c == '@' || c == '*'
+                    c.is_ascii_alphanumeric()
+                        || c == '_'
+                        || c == '?'
+                        || c == '!'
+                        || c == '#'
+                        || c == '@'
+                        || c == '*'
                 });
             }
             push_styled(
@@ -491,8 +511,21 @@ fn lex_shell(source: &str, styles: MarkdownRatatuiStyles, spans: &mut Vec<Span<'
         if !is_shell_flag_start(&chars, index)
             && matches!(
                 ch,
-                '|' | '&' | ';' | '<' | '>' | '!' | '=' | '(' | ')' | '+' | '*' | '/' | '%' | '^'
-                    | '~' | '?'
+                '|' | '&'
+                    | ';'
+                    | '<'
+                    | '>'
+                    | '!'
+                    | '='
+                    | '('
+                    | ')'
+                    | '+'
+                    | '*'
+                    | '/'
+                    | '%'
+                    | '^'
+                    | '~'
+                    | '?'
             )
         {
             index += 1;
@@ -584,7 +617,9 @@ fn lex_json(source: &str, styles: MarkdownRatatuiStyles, spans: &mut Vec<Span<'s
                 styles.syntax_comment,
             );
             break;
-        } else if ch.is_ascii_digit() || (ch == '-' && index + 1 < chars.len() && chars[index + 1].is_ascii_digit()) {
+        } else if ch.is_ascii_digit()
+            || (ch == '-' && index + 1 < chars.len() && chars[index + 1].is_ascii_digit())
+        {
             if ch == '-' {
                 index += 1;
             }
@@ -618,15 +653,97 @@ fn lex_json(source: &str, styles: MarkdownRatatuiStyles, spans: &mut Vec<Span<'s
 
 fn lex_rust_like(source: &str, styles: MarkdownRatatuiStyles, spans: &mut Vec<Span<'static>>) {
     const KEYWORDS: &[&str] = &[
-        "as", "async", "await", "break", "const", "continue", "crate", "def", "else", "enum",
-        "false", "fn", "for", "from", "if", "impl", "import", "in", "let", "loop", "match", "mod",
-        "move", "mut", "null", "pub", "ref", "return", "self", "Self", "static", "struct", "super",
-        "trait", "true", "type", "unsafe", "use", "where", "while", "yield", "class", "function",
-        "var", "val", "interface", "package", "new", "this", "typeof", "instanceof", "switch",
-        "case", "default", "try", "catch", "finally", "throw", "throws", "extends", "implements",
-        "public", "private", "protected", "void", "None", "Some", "Ok", "Err", "and", "or", "not",
-        "is", "lambda", "with", "pass", "raise", "except", "elif", "global", "nonlocal", "assert",
-        "del", "nil", "func", "defer", "go", "chan", "select", "map", "range",
+        "as",
+        "async",
+        "await",
+        "break",
+        "const",
+        "continue",
+        "crate",
+        "def",
+        "else",
+        "enum",
+        "false",
+        "fn",
+        "for",
+        "from",
+        "if",
+        "impl",
+        "import",
+        "in",
+        "let",
+        "loop",
+        "match",
+        "mod",
+        "move",
+        "mut",
+        "null",
+        "pub",
+        "ref",
+        "return",
+        "self",
+        "Self",
+        "static",
+        "struct",
+        "super",
+        "trait",
+        "true",
+        "type",
+        "unsafe",
+        "use",
+        "where",
+        "while",
+        "yield",
+        "class",
+        "function",
+        "var",
+        "val",
+        "interface",
+        "package",
+        "new",
+        "this",
+        "typeof",
+        "instanceof",
+        "switch",
+        "case",
+        "default",
+        "try",
+        "catch",
+        "finally",
+        "throw",
+        "throws",
+        "extends",
+        "implements",
+        "public",
+        "private",
+        "protected",
+        "void",
+        "None",
+        "Some",
+        "Ok",
+        "Err",
+        "and",
+        "or",
+        "not",
+        "is",
+        "lambda",
+        "with",
+        "pass",
+        "raise",
+        "except",
+        "elif",
+        "global",
+        "nonlocal",
+        "assert",
+        "del",
+        "nil",
+        "func",
+        "defer",
+        "go",
+        "chan",
+        "select",
+        "map",
+        "range",
     ];
     const PRIMITIVE_TYPES: &[&str] = &[
         "bool", "boolean", "string", "str", "char", "usize", "isize", "u8", "u16", "u32", "u64",
@@ -771,7 +888,10 @@ pub fn render_ratatui_markdown(
         width: usize::from(width.max(1)),
         ..MarkdownRenderOptions::default()
     };
-    to_ratatui(&pi_coding::markdown::render_markdown(source, &options), styles)
+    to_ratatui(
+        &pi_coding::markdown::render_markdown(source, &options),
+        styles,
+    )
 }
 
 /// Render bounded in-progress Markdown at `width` and convert it to Ratatui lines.
@@ -809,10 +929,7 @@ impl StreamingRatatuiMarkdownRenderer {
     }
 
     #[must_use]
-    pub fn with_options(
-        mut options: MarkdownRenderOptions,
-        styles: MarkdownRatatuiStyles,
-    ) -> Self {
+    pub fn with_options(mut options: MarkdownRenderOptions, styles: MarkdownRatatuiStyles) -> Self {
         options.width = options.width.max(1);
         Self {
             renderer: StreamingMarkdownRenderer::new(options),
@@ -843,7 +960,10 @@ mod tests {
     use std::collections::BTreeSet;
 
     fn line_text(line: &Line<'_>) -> String {
-        line.spans.iter().map(|span| span.content.as_ref()).collect()
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 
     fn color_key(color: Color) -> u32 {
@@ -903,7 +1023,9 @@ mod tests {
             mermaid_border: Style::default().fg(Color::LightMagenta),
             mermaid_node: Style::default().fg(Color::LightGreen),
             mermaid_edge: Style::default().fg(Color::LightBlue),
-            diagnostic: Style::default().fg(Color::Red).add_modifier(Modifier::ITALIC),
+            diagnostic: Style::default()
+                .fg(Color::Red)
+                .add_modifier(Modifier::ITALIC),
             thematic_break: Style::default().fg(Color::Gray),
         };
         let roles = [
@@ -962,8 +1084,16 @@ mod tests {
             tui.lines.iter().map(line_text).collect::<Vec<_>>(),
             neutral.plain_lines()
         );
-        assert!(tui.lines.iter().any(|line| line_text(line).contains("┌─ mermaid · flowchart")));
-        assert!(tui.lines.iter().any(|line| line_text(line).contains("source fallback")));
+        assert!(
+            tui.lines
+                .iter()
+                .any(|line| line_text(line).contains("┌─ mermaid · flowchart"))
+        );
+        assert!(
+            tui.lines
+                .iter()
+                .any(|line| line_text(line).contains("source fallback"))
+        );
         assert_eq!(tui.diagnostics, neutral.diagnostics);
     }
 
@@ -980,7 +1110,10 @@ mod tests {
         streaming.push_str(" tail\n\n| a | b |\n| --- | --- |\n| 1 | 2 |");
         let second = streaming.output();
         assert_eq!(
-            second.lines[..prefix.len()].iter().map(line_text).collect::<Vec<_>>(),
+            second.lines[..prefix.len()]
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>(),
             prefix
         );
         let source = "# Stable\n\nmutable tail\n\n| a | b |\n| --- | --- |\n| 1 | 2 |";
@@ -1005,10 +1138,8 @@ mod tests {
             ..MarkdownRenderOptions::default()
         };
         let neutral = pi_coding::markdown::render_markdown_streaming(source, &options);
-        let mut renderer = StreamingRatatuiMarkdownRenderer::new(
-            32,
-            MarkdownRatatuiStyles::default(),
-        );
+        let mut renderer =
+            StreamingRatatuiMarkdownRenderer::new(32, MarkdownRatatuiStyles::default());
         for chunk in [
             "# Stable\n\n- [x] done\n  2. next\n\n| Name |",
             " Stat |\n| --- | --- |\n",
@@ -1022,8 +1153,16 @@ mod tests {
             neutral.plain_lines()
         );
         assert_eq!(tui.diagnostics, neutral.diagnostics);
-        assert!(tui.lines.iter().any(|line| line_text(line).contains("flowchart TD")));
-        assert!(!tui.lines.iter().any(|line| line_text(line).contains("mermaid · flowchart")));
+        assert!(
+            tui.lines
+                .iter()
+                .any(|line| line_text(line).contains("flowchart TD"))
+        );
+        assert!(
+            !tui.lines
+                .iter()
+                .any(|line| line_text(line).contains("mermaid · flowchart"))
+        );
     }
 
     #[test]
@@ -1051,7 +1190,10 @@ mod tests {
                 .filter_map(|span| span.style.fg)
                 .map(color_key)
                 .collect::<BTreeSet<_>>();
-            assert!(colors.len() >= 3, "expected semantic token colors: {colors:?}");
+            assert!(
+                colors.len() >= 3,
+                "expected semantic token colors: {colors:?}"
+            );
         }
     }
 
@@ -1118,26 +1260,41 @@ mod tests {
         output.lines[1..total - 1].iter().collect()
     }
 
-
     fn span_fg(line: &Line<'_>, needle: &str) -> Option<Color> {
         line.spans.iter().find_map(|span| {
-            (span.content.as_ref() == needle).then_some(span.style.fg).flatten()
+            (span.content.as_ref() == needle)
+                .then_some(span.style.fg)
+                .flatten()
         })
     }
 
     #[test]
     fn shell_sample_preserves_text_and_distinct_token_styles() {
         let styles = distinct_syntax_styles();
-        let source = "```bash\n# list project\nls -la ./src | grep -E 'main' && echo \"done $HOME\"\n```";
+        let source =
+            "```bash\n# list project\nls -la ./src | grep -E 'main' && echo \"done $HOME\"\n```";
         let width = 72u16;
         let output = render_ratatui_markdown(source, width, styles);
         let plain = output.lines.iter().map(line_text).collect::<Vec<_>>();
         assert!(plain.iter().any(|line| line.contains("╭── code · bash")));
-        assert!(plain.iter().any(|line| line.starts_with("╰") && line.ends_with("╯")));
-        assert!(output.lines.iter().all(|line| line.width() <= usize::from(width)));
+        assert!(
+            plain
+                .iter()
+                .any(|line| line.starts_with("╰") && line.ends_with("╯"))
+        );
+        assert!(
+            output
+                .lines
+                .iter()
+                .all(|line| line.width() <= usize::from(width))
+        );
 
         for line in &output.lines {
-            let joined: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
+            let joined: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
             assert_eq!(joined, line_text(line));
         }
 
@@ -1154,8 +1311,10 @@ mod tests {
             .iter()
             .find(|line| line_text(line).contains("ls -la"))
             .expect("command line");
-        let expected_command =
-            format!("│ ls -la ./src | grep -E 'main' && echo \"done $HOME\"{} │", " ".repeat(18));
+        let expected_command = format!(
+            "│ ls -la ./src | grep -E 'main' && echo \"done $HOME\"{} │",
+            " ".repeat(18)
+        );
         assert_eq!(line_text(command), expected_command);
         assert_eq!(span_fg(command, "ls"), Some(Color::Green));
         assert_eq!(span_fg(command, "-la"), Some(Color::Blue));
@@ -1190,10 +1349,11 @@ mod tests {
             width,
             styles,
         );
-        assert!(rust
-            .lines
-            .iter()
-            .any(|line| line_text(line).contains("╭── code · rust")));
+        assert!(
+            rust.lines
+                .iter()
+                .any(|line| line_text(line).contains("╭── code · rust"))
+        );
         let rust_body = code_body_lines(&rust);
         let comment = rust_body
             .iter()
@@ -1204,8 +1364,7 @@ mod tests {
             .iter()
             .find(|line| line_text(line).contains("let count"))
             .expect("rust stmt");
-        let expected_stmt =
-            format!("│ let count: usize = parse(\"42\");{} │", " ".repeat(45));
+        let expected_stmt = format!("│ let count: usize = parse(\"42\");{} │", " ".repeat(45));
         assert_eq!(line_text(stmt), expected_stmt);
         assert_eq!(span_fg(stmt, "let"), Some(Color::Blue));
         assert_eq!(span_fg(stmt, "count"), Some(Color::LightCyan));
@@ -1219,16 +1378,19 @@ mod tests {
             width,
             styles,
         );
-        assert!(json
-            .lines
-            .iter()
-            .any(|line| line_text(line).contains("╭── code · json")));
+        assert!(
+            json.lines
+                .iter()
+                .any(|line| line_text(line).contains("╭── code · json"))
+        );
         let json_line = code_body_lines(&json)
             .into_iter()
             .find(|line| line_text(line).contains("ready"))
             .expect("json body");
-        let expected_json =
-            format!("│ {{\"ready\": true, \"count\": 42, \"msg\": \"hi\"}}{} │", " ".repeat(35));
+        let expected_json = format!(
+            "│ {{\"ready\": true, \"count\": 42, \"msg\": \"hi\"}}{} │",
+            " ".repeat(35)
+        );
         assert_eq!(line_text(json_line), expected_json);
         assert_eq!(span_fg(json_line, "\"ready\""), Some(Color::LightCyan));
         assert_eq!(span_fg(json_line, "true"), Some(Color::Blue));
@@ -1237,12 +1399,18 @@ mod tests {
         assert_eq!(span_fg(json_line, "{"), Some(Color::Gray));
 
         for output in [&rust, &json] {
-            assert!(output
-                .lines
-                .iter()
-                .all(|line| line.width() <= usize::from(width)));
+            assert!(
+                output
+                    .lines
+                    .iter()
+                    .all(|line| line.width() <= usize::from(width))
+            );
             for line in &output.lines {
-                let joined: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
+                let joined: String = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect();
                 assert_eq!(joined, line_text(line));
             }
         }
@@ -1254,14 +1422,18 @@ mod tests {
         let width = 40u16;
         let source = "```text\n// not a real comment lexer target\nAthína/emoji 😀 and café\n```";
         let output = render_ratatui_markdown(source, width, styles);
-        assert!(output
-            .lines
-            .iter()
-            .any(|line| line_text(line).contains("╭── code · text")));
-        assert!(output
-            .lines
-            .iter()
-            .all(|line| line.width() <= usize::from(width)));
+        assert!(
+            output
+                .lines
+                .iter()
+                .any(|line| line_text(line).contains("╭── code · text"))
+        );
+        assert!(
+            output
+                .lines
+                .iter()
+                .all(|line| line.width() <= usize::from(width))
+        );
         let body = code_body_lines(&output);
         let unicode = body
             .iter()
@@ -1282,20 +1454,23 @@ mod tests {
             render_ratatui_markdown("```sh\necho hi\n```", 48, MarkdownRatatuiStyles::default());
         let plain = output.lines.iter().map(line_text).collect::<Vec<_>>();
         let expected_top = format!("╭── code · sh ──{}╮", "─".repeat(31));
-        assert_eq!(plain.first().map(String::as_str), Some(expected_top.as_str()));
+        assert_eq!(
+            plain.first().map(String::as_str),
+            Some(expected_top.as_str())
+        );
         let expected_bottom = format!("╰{}╯", "─".repeat(46));
         assert!(plain.last().is_some_and(|line| *line == expected_bottom));
         let expected_body = format!("│ echo hi{} │", " ".repeat(37));
         assert_eq!(
-            plain.iter().find(|line| line.contains("echo")).map(String::as_str),
+            plain
+                .iter()
+                .find(|line| line.contains("echo"))
+                .map(String::as_str),
             Some(expected_body.as_str())
         );
         let empty = render_ratatui_markdown("```rust\n```", 32, MarkdownRatatuiStyles::default());
         let empty_plain = empty.lines.iter().map(line_text).collect::<Vec<_>>();
-        let expected_empty = format!(
-            "╭── code · rust ──{}╮",
-            "─".repeat(13)
-        );
+        let expected_empty = format!("╭── code · rust ──{}╮", "─".repeat(13));
         assert_eq!(
             empty_plain,
             vec![
@@ -1313,8 +1488,7 @@ mod tests {
         // side-bordered body rows, and a temporary bottom carrying the
         // unclosed marker — while a closed fence keeps the plain bottom.
         let styles = MarkdownRatatuiStyles::default();
-        let streaming =
-            render_ratatui_markdown_streaming("```json\n{\"a\":1}", 48, styles);
+        let streaming = render_ratatui_markdown_streaming("```json\n{\"a\":1}", 48, styles);
         let plain = streaming.lines.iter().map(line_text).collect::<Vec<_>>();
         assert!(
             plain.iter().any(|line| line.starts_with("╭── code · json")),
@@ -1355,7 +1529,6 @@ mod tests {
         assert!(closed.diagnostics.is_empty());
     }
 
-
     #[test]
     fn emphasis_and_repeated_code_project_exact_semantic_spans() {
         let styles = MarkdownRatatuiStyles {
@@ -1368,7 +1541,10 @@ mod tests {
             styles,
         );
         let line = &output.lines[0];
-        assert_eq!(line_text(line), "plain bold and italic plus same same and same same");
+        assert_eq!(
+            line_text(line),
+            "plain bold and italic plus same same and same same"
+        );
         assert!(line.spans.iter().any(|span| {
             span.content == "bold" && span.style.add_modifier.contains(Modifier::BOLD)
         }));
@@ -1404,21 +1580,24 @@ mod tests {
         assert!(text.iter().all(|line| !line.contains('`')));
         assert!(output.lines.iter().all(|line| line.width() <= 34));
         assert!(output.lines.iter().any(|line| {
-            line.spans
-                .iter()
-                .any(|span| span.style.fg == Some(Color::LightRed) && span.content.contains("https"))
+            line.spans.iter().any(|span| {
+                span.style.fg == Some(Color::LightRed) && span.content.contains("https")
+            })
         }));
-        assert!(text
-            .iter()
-            .filter(|line| line.starts_with('│'))
-            .all(|line| line.ends_with('│')));
+        assert!(
+            text.iter()
+                .filter(|line| line.starts_with('│'))
+                .all(|line| line.ends_with('│'))
+        );
     }
 
     #[test]
     fn table_borders_use_one_style_while_content_semantics_survive() {
         let styles = MarkdownRatatuiStyles {
             table_border: Style::default().fg(Color::DarkGray),
-            table_header: Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            table_header: Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
             table_body: Style::default().fg(Color::White),
             inline_code: Style::default().fg(Color::LightRed),
             ..MarkdownRatatuiStyles::default()
@@ -1429,22 +1608,42 @@ mod tests {
 
         for line in &output.lines {
             for span in &line.spans {
-                if span.content.chars().any(|character| "┌┬┐├┼┤│└┴┘─".contains(character)) {
+                if span
+                    .content
+                    .chars()
+                    .any(|character| "┌┬┐├┼┤│└┴┘─".contains(character))
+                {
                     assert_eq!(span.style.fg, Some(Color::DarkGray), "{span:?}");
                 }
             }
         }
-        assert!(output.lines.iter().flat_map(|line| &line.spans).any(|span| {
-            span.content == "Document"
-                && span.style.fg == Some(Color::Yellow)
-                && span.style.add_modifier.contains(Modifier::BOLD)
-        }));
-        assert!(output.lines.iter().flat_map(|line| &line.spans).any(|span| {
-            span.content.contains("semantic") && span.style.fg == Some(Color::LightRed)
-        }));
-        assert!(output.lines.iter().flat_map(|line| &line.spans).any(|span| {
-            span.content == "Guide" && span.style.fg == Some(Color::White)
-        }));
+        assert!(
+            output
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| {
+                    span.content == "Document"
+                        && span.style.fg == Some(Color::Yellow)
+                        && span.style.add_modifier.contains(Modifier::BOLD)
+                })
+        );
+        assert!(
+            output
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| {
+                    span.content.contains("semantic") && span.style.fg == Some(Color::LightRed)
+                })
+        );
+        assert!(
+            output
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| { span.content == "Guide" && span.style.fg == Some(Color::White) })
+        );
     }
 
     #[test]
@@ -1490,22 +1689,35 @@ X[User] --> A\n\
         assert_eq!(text, neutral.plain_lines());
         assert_eq!(tui.diagnostics, neutral.diagnostics);
         assert!(neutral.diagnostics.is_empty());
+        // Class diagram renders as 1 card; the flowchart splits into 2
+        // numbered panels at width 48 — 3 cards and 3 footers total.
         assert_eq!(
-            text.iter().filter(|line| line.contains("┌─ mermaid ·")).count(),
-            2
+            text.iter()
+                .filter(|line| line.contains("┌─ mermaid ·"))
+                .count(),
+            3,
+            "{text:?}"
         );
-        assert!(text.iter().any(|line| line.contains("┌─ mermaid · classDiagram")));
-        assert!(text.iter().any(|line| line.contains("┌─ mermaid · flowchart")));
+        assert!(
+            text.iter()
+                .any(|line| line.contains("┌─ mermaid · classDiagram"))
+        );
+        assert!(
+            text.iter()
+                .any(|line| line.contains("┌─ mermaid · flowchart"))
+        );
         assert!(text.iter().all(|line| !line.contains("source fallback")));
         assert!(text.iter().any(|line| line.contains("via context")));
-        assert!(text
-            .iter()
-            .any(|line| line.contains("subgraph records · SessionRecord types")));
+        assert!(
+            text.iter()
+                .any(|line| line.contains("subgraph records · SessionRecord types"))
+        );
         assert_eq!(
             text.iter()
                 .filter(|line| line.starts_with("└─") && !line.contains('┘'))
                 .count(),
-            2
+            3,
+            "{text:?}"
         );
     }
 
@@ -1523,7 +1735,11 @@ X[User] --> A\n\
         // rendered-span level rather than by grepping source.
         let theme = crate::theme::DARK;
         let border = theme.tool_card_border;
-        assert_ne!(border, Color::Reset, "table border token must be a real RGB");
+        assert_ne!(
+            border,
+            Color::Reset,
+            "table border token must be a real RGB"
+        );
         assert_ne!(
             border, theme.md_code_block_border,
             "table border must use the visible card frame color, not the dim md_code_block_border"
@@ -1532,7 +1748,9 @@ X[User] --> A\n\
             text: Style::default().fg(theme.text),
             heading_2: Style::default().fg(theme.md_heading),
             table_border: Style::default().fg(border),
-            table_header: Style::default().fg(theme.md_heading).add_modifier(Modifier::BOLD),
+            table_header: Style::default()
+                .fg(theme.md_heading)
+                .add_modifier(Modifier::BOLD),
             table_body: Style::default().fg(theme.text),
             ..MarkdownRatatuiStyles::default()
         };
@@ -1553,7 +1771,10 @@ X[User] --> A\n\
 
         // (1) Width bound — balanced wrapping, no row clips past the budget.
         assert!(
-            output.lines.iter().all(|line| line.width() <= usize::from(width)),
+            output
+                .lines
+                .iter()
+                .all(|line| line.width() <= usize::from(width)),
             "every table row must fit within {width}: {:?}",
             output.lines.iter().map(line_text).collect::<Vec<_>>()
         );
@@ -1573,7 +1794,10 @@ X[User] --> A\n\
                 }
             }
         }
-        assert!(!border_colors.is_empty(), "source must render at least one border glyph");
+        assert!(
+            !border_colors.is_empty(),
+            "source must render at least one border glyph"
+        );
         assert_eq!(
             border_colors.len(),
             1,
@@ -1588,8 +1812,154 @@ X[User] --> A\n\
             .flat_map(|line| line.spans.iter())
             .map(|span| span.content.as_ref())
             .collect();
-        for needle in ["Field", "toolTitle", "Document", "Role", "Guide", "semantic", "default"] {
-            assert!(plain.contains(needle), "column content {needle:?} must survive wrapping: {plain}");
+        for needle in [
+            "Field",
+            "toolTitle",
+            "Document",
+            "Role",
+            "Guide",
+            "semantic",
+            "default",
+        ] {
+            assert!(
+                plain.contains(needle),
+                "column content {needle:?} must survive wrapping: {plain}"
+            );
         }
+    }
+    #[test]
+    fn mermaid_card_gutter_uses_border_color_in_ansi_output() {
+        // User-reported: successful mermaid cards rendered the `│ ` left
+        // gutter in the node/body color (white) while the `┌─` header and
+        // `└─` footer used the card border token — a uniquely white left
+        // border. One consistent border treatment on every side. Proven at
+        // two surfaces: (1) the styled spans, and (2) real ANSI output from
+        // the crossterm backend — rows split on MoveTo sequences, stripped
+        // for structure, then the SGR foreground of each gutter cell must
+        // equal the SGR foreground of the header border glyph.
+        let theme = crate::theme::DARK;
+        let border = theme.tool_card_border;
+        let styles = crate::tui::markdown_ratatui_styles(theme, theme.text);
+        let output = render_ratatui_markdown("```mermaid\nflowchart LR\nA --> B\n```", 48, styles);
+        assert!(output.diagnostics.is_empty());
+
+        // (1) Styled spans: the gutter is its own border-colored span.
+        let body = output
+            .lines
+            .iter()
+            .find(|line| line_text(line).starts_with("│ "))
+            .expect("card body row");
+        assert_eq!(body.spans[0].content.as_ref(), "│ ", "{:?}", body.spans);
+        assert_eq!(body.spans[0].style.fg, Some(border), "{:?}", body.spans);
+        let header = output
+            .lines
+            .iter()
+            .find(|line| line_text(line).starts_with("┌─ mermaid"))
+            .expect("card header");
+        assert_eq!(header.spans[0].style.fg, Some(border), "{:?}", header.spans);
+
+        // (2) Real ANSI capture: rows split on MoveTo (the diff stream has
+        // no newlines), then stripped per row for structure and colored for
+        // SGR equality.
+        let mut bytes = Vec::new();
+        {
+            let mut terminal = ratatui::Terminal::with_options(
+                ratatui::backend::CrosstermBackend::new(&mut bytes),
+                ratatui::TerminalOptions {
+                    viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 48, 24)),
+                },
+            )
+            .expect("terminal");
+            terminal
+                .draw(|frame| {
+                    use ratatui::widgets::{Paragraph, Widget};
+                    Paragraph::new(output.text()).render(frame.area(), frame.buffer_mut());
+                })
+                .expect("draw");
+        }
+        let ansi = String::from_utf8(bytes).expect("ANSI bytes");
+        let rows = split_ansi_rows(&ansi);
+        let strip = |row: &str| crate::ansi::ansi_plain_text(row);
+        assert!(
+            rows.iter()
+                .any(|row| strip(row).contains("┌─ mermaid · flowchart")),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|row| strip(row).contains("┌─────┐")),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|row| strip(row).trim_end() == "└─"),
+            "{rows:#?}"
+        );
+        let body_rows: Vec<&String> = rows
+            .iter()
+            .filter(|row| strip(row).starts_with("│ "))
+            .collect();
+        assert!(!body_rows.is_empty(), "{rows:#?}");
+        let border_fg = crate::ansi::parse_ansi_runs(&ansi)
+            .iter()
+            .find(|run| run.text.contains("mermaid ·"))
+            .map(|run| run.fg)
+            .expect("header border run");
+        assert_ne!(
+            border_fg,
+            Some(theme.text),
+            "header must not use the body color"
+        );
+        for (index, row) in body_rows.iter().enumerate() {
+            let fg = crate::ansi::parse_ansi_runs(row)
+                .first()
+                .map(|run| run.fg)
+                .unwrap_or_else(|| panic!("no styled run in row {row:?}"));
+            if index == 0 {
+                // Crossterm inherits the header's unchanged border SGR, so
+                // the first body row may parse with no explicit foreground.
+                assert!(
+                    fg.is_none() || fg == border_fg,
+                    "left gutter must match the border color, not the body color: {row:?}"
+                );
+            } else {
+                assert_eq!(
+                    fg, border_fg,
+                    "left gutter must match the border color, not the body color: {row:?}"
+                );
+            }
+        }
+    }
+
+    /// Splits a crossterm diff stream into rows at every cursor-move (`CSI …
+    /// H`) sequence, keeping the escape bytes so per-row SGR parsing works.
+    fn split_ansi_rows(ansi: &str) -> Vec<String> {
+        let mut rows = Vec::new();
+        let mut current = String::new();
+        let mut characters = ansi.chars().peekable();
+        while let Some(character) = characters.next() {
+            if character == '\u{1b}' && characters.peek() == Some(&'[') {
+                // Capture the full CSI; a cursor-move (final byte `H`)
+                // starts a new row.
+                let mut sequence = String::from("\u{1b}[");
+                characters.next();
+                let mut final_byte = '\0';
+                for value in characters.by_ref() {
+                    sequence.push(value);
+                    if ('\u{40}'..='\u{7e}').contains(&value) {
+                        final_byte = value;
+                        break;
+                    }
+                }
+                if final_byte == 'H' {
+                    rows.push(std::mem::take(&mut current));
+                }
+                current.push_str(&sequence);
+            } else {
+                current.push(character);
+            }
+        }
+        if !current.is_empty() {
+            rows.push(current);
+        }
+        rows
     }
 }

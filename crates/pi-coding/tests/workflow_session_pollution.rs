@@ -131,6 +131,8 @@ fn definition() -> AgentDefinition {
         kind: pi_coding::AgentDefinitionKind::Agent,
         personality: None,
         soft_budget: None,
+        knowledge_roots: Vec::new(),
+        user_proxy: false,
     }
 }
 
@@ -138,9 +140,8 @@ fn definition() -> AgentDefinition {
 /// test owns its own root (its own process) so the before/after enumeration
 /// is exclusive to this test — parallel-safe via `LazyLock`.
 fn test_sessions_root() -> PathBuf {
-    static ROOT: std::sync::LazyLock<tempfile::TempDir> = std::sync::LazyLock::new(|| {
-        tempfile::tempdir().expect("test sessions root")
-    });
+    static ROOT: std::sync::LazyLock<tempfile::TempDir> =
+        std::sync::LazyLock::new(|| tempfile::tempdir().expect("test sessions root"));
     ROOT.path().to_path_buf()
 }
 
@@ -169,33 +170,40 @@ impl ApplicationRuntimeFactory for TestFactory {
             options.cwd = cwd.path().to_path_buf();
             options.tools = None;
             let workspace = WorkspaceRoots::new(cwd.path(), Vec::<PathBuf>::new())?;
-            let session = Session::new_with_todo_additional_tools_filtered_discovery_workspace_and_uri(
-                options,
-                Vec::new(),
-                Default::default(),
-                pi_coding::ResourceDiscovery::Disabled,
-                workspace,
-                None,
-            )?;
+            let session =
+                Session::new_with_todo_additional_tools_filtered_discovery_workspace_and_uri(
+                    options,
+                    Vec::new(),
+                    Default::default(),
+                    pi_coding::ResourceDiscovery::Disabled,
+                    workspace,
+                    None,
+                    true,
+                )?;
             session.set_session_dir(test_sessions_root());
             session.start_new_recording()?;
-            let artifacts = std::env::temp_dir()
-                .join(format!("pi-workflow-test-artifacts-{}", uuid::Uuid::now_v7()));
-            let mut config = OrchestrationConfig::new(
-                AgentCatalog::from_agents(vec![definition()]),
-                artifacts,
-            );
+            let artifacts = std::env::temp_dir().join(format!(
+                "pi-workflow-test-artifacts-{}",
+                uuid::Uuid::now_v7()
+            ));
+            let mut config =
+                OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition()]), artifacts);
             config.parent_model = snapshot.model.clone();
             config.max_concurrency = pi_coding::DEFAULT_MAX_CONCURRENCY;
             config.idle_ttl = None;
-            let orchestration =
-                OrchestrationRuntime::new(config, OrchestrationRuntime::child_factory_from_snapshot(snapshot))?;
+            let orchestration = OrchestrationRuntime::new(
+                config,
+                OrchestrationRuntime::child_factory_from_snapshot(snapshot),
+            )?;
             Ok(ApplicationRuntimeCandidate::new(session).with_orchestration(orchestration))
         })
     }
 }
 
-fn parent_session(repo: &Path, responses: Vec<FauxResponse>) -> (Session, FauxProviderRegistration) {
+fn parent_session(
+    repo: &Path,
+    responses: Vec<FauxResponse>,
+) -> (Session, FauxProviderRegistration) {
     let suffix = uuid::Uuid::now_v7().to_string();
     let model = Model {
         id: format!("workflow-pollution-{suffix}"),
@@ -224,6 +232,7 @@ fn parent_session(repo: &Path, responses: Vec<FauxResponse>) -> (Session, FauxPr
         after_tool_call: None,
         stream_fn: None,
         auth_resolver: None,
+        auth_manager: None,
     })
     .expect("session");
     session.set_session_dir(test_sessions_root());
@@ -320,7 +329,9 @@ fn session_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -353,7 +364,12 @@ async fn workflow_producer_sessions_never_enter_default_store() {
         })
         .await
         .expect("workflow creation must succeed");
-    let completed = wait_status(&application, &created.workflow_id, WorkflowStatus::Completed).await;
+    let completed = wait_status(
+        &application,
+        &created.workflow_id,
+        WorkflowStatus::Completed,
+    )
+    .await;
     assert_eq!(completed.status, WorkflowStatus::Completed);
 
     // Non-vacuous: the run must have produced session records (a supervisor
@@ -407,7 +423,10 @@ async fn workflow_producer_sessions_never_enter_default_store() {
             Some(3),
             "produced session is not version 3: {path:?}"
         );
-        let cwd = header.get("cwd").and_then(serde_json::Value::as_str).expect("session cwd");
+        let cwd = header
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .expect("session cwd");
         assert!(
             Path::new(cwd).starts_with(&sandbox),
             "produced session cwd escapes the test sandbox: {cwd:?} (sandbox: {sandbox:?})"

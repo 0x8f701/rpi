@@ -1,5 +1,7 @@
 use anyhow::{Result, anyhow, bail};
-use pi_coding::{Application, Goal, GoalActivationOutcome, GoalLifecycle, GoalPauseReason, GoalState};
+use pi_coding::{
+    Application, Goal, GoalActivationOutcome, GoalLifecycle, GoalPauseReason, GoalState,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InteractiveGoalCommand {
@@ -20,7 +22,6 @@ pub enum InteractiveGoalCommand {
         index: usize,
     },
 }
-
 
 pub fn parse_interactive_goal_command(argument: Option<&str>) -> Result<InteractiveGoalCommand> {
     let argument = argument.unwrap_or_default().trim();
@@ -62,9 +63,14 @@ pub fn parse_interactive_goal_command(argument: Option<&str>) -> Result<Interact
     }
 }
 
-fn no_trailing<'a>(mut parts: impl Iterator<Item = &'a str>, command: InteractiveGoalCommand) -> Result<InteractiveGoalCommand> {
+fn no_trailing<'a>(
+    mut parts: impl Iterator<Item = &'a str>,
+    command: InteractiveGoalCommand,
+) -> Result<InteractiveGoalCommand> {
     if parts.next().is_some() {
-        bail!("usage: /goal [show|inspect|create [--tokens N] <objective>|pause|resume|complete|drop|pin <text>|pins|unpin <index>]");
+        bail!(
+            "usage: /goal [show|inspect|create [--tokens N] <objective>|pause|resume|complete|drop|pin <text>|pins|unpin <index>]"
+        );
     }
     Ok(command)
 }
@@ -271,7 +277,8 @@ mod tests {
     #[test]
     fn parses_goal_pin_pins_and_unpin_commands() {
         assert_eq!(
-            parse_interactive_goal_command(Some("pin keep the release checklist in scope")).unwrap(),
+            parse_interactive_goal_command(Some("pin keep the release checklist in scope"))
+                .unwrap(),
             InteractiveGoalCommand::Pin {
                 text: "keep the release checklist in scope".to_owned(),
             }
@@ -288,12 +295,30 @@ mod tests {
             parse_interactive_goal_command(Some("unpin 7")).unwrap(),
             InteractiveGoalCommand::Unpin { index: 7 }
         );
-        assert!(parse_interactive_goal_command(Some("pin")).is_err(), "pin needs text");
-        assert!(parse_interactive_goal_command(Some("pin   ")).is_err(), "pin needs text");
-        assert!(parse_interactive_goal_command(Some("unpin")).is_err(), "unpin needs an index");
-        assert!(parse_interactive_goal_command(Some("unpin nope")).is_err(), "unpin index must be a number");
-        assert!(parse_interactive_goal_command(Some("unpin 0 extra")).is_err(), "unpin takes one index");
-        assert!(parse_interactive_goal_command(Some("pins extra")).is_err(), "pins takes no arguments");
+        assert!(
+            parse_interactive_goal_command(Some("pin")).is_err(),
+            "pin needs text"
+        );
+        assert!(
+            parse_interactive_goal_command(Some("pin   ")).is_err(),
+            "pin needs text"
+        );
+        assert!(
+            parse_interactive_goal_command(Some("unpin")).is_err(),
+            "unpin needs an index"
+        );
+        assert!(
+            parse_interactive_goal_command(Some("unpin nope")).is_err(),
+            "unpin index must be a number"
+        );
+        assert!(
+            parse_interactive_goal_command(Some("unpin 0 extra")).is_err(),
+            "unpin takes one index"
+        );
+        assert!(
+            parse_interactive_goal_command(Some("pins extra")).is_err(),
+            "pins takes no arguments"
+        );
     }
 
     #[test]
@@ -319,18 +344,27 @@ mod tests {
         let details = format_goal_details(&state);
         assert!(details.contains("Pins:"), "{details}");
         assert!(details.contains("  1. follow the checklist"), "{details}");
-        assert!(details.contains("  2. reference the omp style"), "{details}");
+        assert!(
+            details.contains("  2. reference the omp style"),
+            "{details}"
+        );
 
         state.current.as_mut().expect("goal").pins.clear();
         assert_eq!(format_goal_pins(&state), "no pins");
-        assert!(!format_goal_details(&state).contains("Pins:"), "empty pins must not render a Pins section");
+        assert!(
+            !format_goal_details(&state).contains("Pins:"),
+            "empty pins must not render a Pins section"
+        );
         assert_eq!(format_goal_pins(&GoalState::default()), "no goal");
     }
 
     #[test]
     fn formats_empty_goal_details_for_overlay() {
         let details = format_goal_details(&GoalState::default());
-        assert_eq!(details, "No goal is active. Choose Create goal to set an objective.");
+        assert_eq!(
+            details,
+            "No goal is active. Choose Create goal to set an objective."
+        );
     }
 
     #[test]
@@ -362,16 +396,31 @@ mod tests {
         let safety = state("resume_safety");
         let safety_line = format_goal_state(&safety);
         let safety_details = format_goal_details(&safety);
-        assert!(safety_line.contains("session resumed; run /goal resume"), "{safety_line}");
-        assert!(safety_details.contains("session resumed; run /goal resume"), "{safety_details}");
+        assert!(
+            safety_line.contains("session resumed; run /goal resume"),
+            "{safety_line}"
+        );
+        assert!(
+            safety_details.contains("session resumed; run /goal resume"),
+            "{safety_details}"
+        );
 
         // Budget-exhausted pause: clearly exhausted and not resumable.
         let exhausted = state("budget_exhausted");
         let exhausted_line = format_goal_state(&exhausted);
         let exhausted_details = format_goal_details(&exhausted);
-        assert!(exhausted_line.contains("budget exhausted; cannot resume"), "{exhausted_line}");
-        assert!(exhausted_details.contains("budget exhausted; cannot resume"), "{exhausted_details}");
-        assert!(!exhausted_line.contains("run /goal resume"), "{exhausted_line}");
+        assert!(
+            exhausted_line.contains("budget exhausted; cannot resume"),
+            "{exhausted_line}"
+        );
+        assert!(
+            exhausted_details.contains("budget exhausted; cannot resume"),
+            "{exhausted_details}"
+        );
+        assert!(
+            !exhausted_line.contains("run /goal resume"),
+            "{exhausted_line}"
+        );
 
         // Active goals keep the plain lifecycle label.
         let active: GoalState = serde_json::from_value(serde_json::json!({

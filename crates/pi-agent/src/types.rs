@@ -25,17 +25,135 @@ pub type ConvertToLlmFn = Arc<dyn Fn(Vec<AgentMessage>) -> Result<Vec<Message>> 
 pub type TransformContextFn = Arc<
     dyn Fn(Vec<AgentMessage>, AbortSignal) -> BoxFuture<Result<Vec<AgentMessage>>> + Send + Sync,
 >;
-pub type BeforeAgentStartFn = Arc<
-    dyn Fn(BeforeAgentStartContext) -> BoxFuture<Result<BeforeAgentStartResult>> + Send + Sync,
->;
-pub type TransformMessageFn = Arc<
-    dyn Fn(AgentMessage, AbortSignal) -> BoxFuture<Result<AgentMessage>> + Send + Sync,
->;
+pub type BeforeAgentStartFn =
+    Arc<dyn Fn(BeforeAgentStartContext) -> BoxFuture<Result<BeforeAgentStartResult>> + Send + Sync>;
+pub type TransformMessageFn =
+    Arc<dyn Fn(AgentMessage, AbortSignal) -> BoxFuture<Result<AgentMessage>> + Send + Sync>;
 pub type GetApiKeyFn = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 pub type BeforeToolCallFn =
     Arc<dyn Fn(BeforeToolCallContext) -> BoxFuture<Result<BeforeToolCallResult>> + Send + Sync>;
 pub type AfterToolCallFn =
     Arc<dyn Fn(AfterToolCallContext) -> BoxFuture<Result<AfterToolCallResult>> + Send + Sync>;
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
+pub struct ToolApprovalId([u8; 16]);
+
+impl ToolApprovalId {
+    pub fn from_uuid_v7_bytes(bytes: [u8; 16]) -> anyhow::Result<Self> {
+        if bytes[6] >> 4 != 7 || bytes[8] >> 6 != 2 {
+            return Err(anyhow::anyhow!("tool approval id must be UUIDv7"));
+        }
+        Ok(Self(bytes))
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
+pub struct ToolApprovalDigest([u8; 32]);
+
+impl ToolApprovalDigest {
+    #[must_use]
+    pub const fn from_sha256(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
+pub struct ToolCallApprovalToken {
+    id: ToolApprovalId,
+    digest: ToolApprovalDigest,
+}
+
+impl ToolCallApprovalToken {
+    #[must_use]
+    pub const fn new(id: ToolApprovalId, digest: ToolApprovalDigest) -> Self {
+        Self { id, digest }
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> ToolApprovalId {
+        self.id
+    }
+
+    #[must_use]
+    pub const fn digest(&self) -> ToolApprovalDigest {
+        self.digest
+    }
+}
+
+pub type IssueToolApprovalFn =
+    Box<dyn FnOnce() -> BoxFuture<anyhow::Result<ToolCallApprovalToken>> + Send + 'static>;
+
+#[derive(Clone)]
+pub struct ToolApprovalRequest {
+    pub summary: ToolApprovalSummary,
+    issue: Arc<parking_lot::Mutex<Option<IssueToolApprovalFn>>>,
+}
+
+impl ToolApprovalRequest {
+    #[must_use]
+    pub fn new(summary: ToolApprovalSummary, issue: IssueToolApprovalFn) -> Self {
+        Self {
+            summary,
+            issue: Arc::new(parking_lot::Mutex::new(Some(issue))),
+        }
+    }
+
+    pub async fn issue(&self) -> anyhow::Result<ToolCallApprovalToken> {
+        let issue = self
+            .issue
+            .lock()
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("tool approval request already issued"))?;
+        issue().await
+    }
+}
+
+impl std::fmt::Debug for ToolApprovalRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let issued = self.issue.lock().is_none();
+        formatter
+            .debug_struct("ToolApprovalRequest")
+            .field("summary", &self.summary)
+            .field("issued", &issued)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolApprovalSummary {
+    pub family: String,
+    pub executable: String,
+    pub argument_count: u32,
+    pub working_directory: String,
+    pub credential_audience: Option<String>,
+    pub requested_credential_count: u32,
+    pub target_fds: Vec<ToolApprovalTargetFdSummary>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ToolApprovalTargetFdSummary {
+    pub target_fd: u32,
+    pub direction: ToolApprovalFdDirection,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolApprovalFdDirection {
+    ParentReads,
+    ParentWrites,
+}
+
+pub type PrepareToolApprovalFn =
+    Arc<dyn Fn(Value) -> BoxFuture<anyhow::Result<Option<ToolApprovalRequest>>> + Send + Sync>;
 
 #[must_use]
 pub fn compose_before_tool_call(
@@ -62,6 +180,7 @@ pub fn compose_before_tool_call(
                     block: second_result.block,
                     reason: second_result.reason.or(first_result.reason),
                     arguments: second_result.arguments.or(first_result.arguments),
+                    approval_token: None,
                 })
             })
         })),
@@ -92,6 +211,7 @@ mod before_tool_call_composition_tests {
                 messages: Vec::new(),
                 tools: Vec::new(),
             },
+            approval_request: None,
         }
     }
 
@@ -105,6 +225,7 @@ mod before_tool_call_composition_tests {
                     block: true,
                     reason: Some("denied".to_owned()),
                     arguments: None,
+                    approval_token: None,
                 })
             })
         });
@@ -112,8 +233,7 @@ mod before_tool_call_composition_tests {
             second_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(BeforeToolCallResult::default()) })
         });
-        let result = compose_before_tool_call(Some(first), Some(second))
-            .unwrap()(context())
+        let result = compose_before_tool_call(Some(first), Some(second)).unwrap()(context())
             .await
             .unwrap();
         assert!(result.block);
@@ -124,6 +244,11 @@ pub type ShouldStopAfterTurnFn = Arc<dyn Fn(&ShouldStopAfterTurnContext) -> bool
 pub type PrepareNextTurnFn =
     Arc<dyn Fn(&ShouldStopAfterTurnContext) -> Option<AgentLoopTurnUpdate> + Send + Sync>;
 pub type MessageQueueFn = Arc<dyn Fn() -> BoxFuture<Vec<AgentMessage>> + Send + Sync>;
+/// Restores drained-but-undelivered pending messages to the head of a pending
+/// queue, preserving FIFO order. Invoked by the run loop when a drained
+/// steering/follow-up message fails to deliver, so the message leaves the
+/// pending queue only when it is recorded or returns to the queue.
+pub type RestoreMessagesFn = Arc<dyn Fn(Vec<AgentMessage>) -> BoxFuture<()> + Send + Sync>;
 pub type EventSink = Arc<dyn Fn(AgentEvent) -> BoxFuture<Result<()>> + Send + Sync>;
 pub type Listener = Arc<dyn Fn(AgentEvent, AbortSignal) -> BoxFuture<Result<()>> + Send + Sync>;
 
@@ -182,7 +307,11 @@ mod approval_mode_tests {
             (ApprovalMode::Ask, ToolCapability::Write, true),
             (ApprovalMode::Ask, ToolCapability::Exec, true),
         ] {
-            assert_eq!(mode.requires_approval(capability), asks, "{mode:?} {capability:?}");
+            assert_eq!(
+                mode.requires_approval(capability),
+                asks,
+                "{mode:?} {capability:?}"
+            );
         }
     }
 
@@ -259,6 +388,7 @@ pub struct ToolCallContext {
     pub abort: AbortSignal,
     /// Model selected for the current turn. Manual/standalone tool calls may omit it.
     pub model: Option<Model>,
+    pub approval_token: Option<ToolCallApprovalToken>,
 }
 
 #[derive(Clone)]
@@ -272,6 +402,7 @@ pub struct AgentTool {
     pub prepare_arguments: Option<PrepareArgumentsFn>,
     pub prompt_guidelines: Vec<String>,
     pub constrained_sampling: Option<pi_ai::ConstrainedSampling>,
+    pub prepare_approval: Option<PrepareToolApprovalFn>,
     pub execute: ToolExecuteFn,
 }
 
@@ -313,6 +444,7 @@ impl AgentTool {
             prepare_arguments: None,
             prompt_guidelines: Vec::new(),
             constrained_sampling: None,
+            prepare_approval: None,
             execute: Arc::new(move |context| Box::pin(execute(context))),
         }
     }
@@ -341,6 +473,18 @@ impl AgentTool {
         F: Fn(Value) -> Result<Value> + Send + Sync + 'static,
     {
         self.prepare_arguments = Some(Arc::new(prepare));
+        self
+    }
+
+    #[must_use]
+    pub fn with_prepare_approval<F>(mut self, prepare: F) -> Self
+    where
+        F: Fn(Value) -> BoxFuture<anyhow::Result<Option<ToolApprovalRequest>>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.prepare_approval = Some(Arc::new(prepare));
         self
     }
 
@@ -444,7 +588,10 @@ mod ask_tool_tests {
         assert_eq!(schema.required, vec!["question".to_owned()]);
         assert_eq!(schema.property_order, vec!["question".to_owned()]);
         assert_eq!(schema.properties.len(), 1);
-        let question = schema.properties.get("question").expect("question property");
+        let question = schema
+            .properties
+            .get("question")
+            .expect("question property");
         assert_eq!(question.schema_type, Some(serde_json::json!("string")));
         assert!(question.description.is_some());
     }
@@ -473,6 +620,7 @@ mod ask_tool_tests {
             on_update: Arc::new(|_| {}),
             abort,
             model: None,
+            approval_token: None,
         })
         .await
         .expect("execute");
@@ -493,6 +641,7 @@ mod ask_tool_tests {
                 on_update: Arc::new(|_| {}),
                 abort,
                 model: None,
+                approval_token: None,
             })
             .await
             .expect_err("missing question must reject");
@@ -517,7 +666,10 @@ mod agent_tool_capability_tests {
     #[test]
     fn generic_agent_tools_default_to_exec_without_name_heuristics() {
         assert_eq!(tool_named("read").capability, ToolCapability::Exec);
-        assert_eq!(tool_named("unknown_custom_tool").capability, ToolCapability::Exec);
+        assert_eq!(
+            tool_named("unknown_custom_tool").capability,
+            ToolCapability::Exec
+        );
     }
 
     #[test]
@@ -535,7 +687,10 @@ mod agent_tool_capability_tests {
             (ToolCapability::Exec, "\"exec\""),
         ] {
             assert_eq!(serde_json::to_string(&capability).unwrap(), wire);
-            assert_eq!(serde_json::from_str::<ToolCapability>(wire).unwrap(), capability);
+            assert_eq!(
+                serde_json::from_str::<ToolCapability>(wire).unwrap(),
+                capability
+            );
         }
         assert!(serde_json::from_str::<ToolCapability>("\"READ\"").is_err());
         assert!(serde_json::from_str::<ToolCapability>("\"network\"").is_err());
@@ -567,6 +722,7 @@ pub struct BeforeToolCallContext {
     pub tool_call: ToolCall,
     pub arguments: Value,
     pub context: AgentContext,
+    pub approval_request: Option<ToolApprovalRequest>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -574,6 +730,7 @@ pub struct BeforeToolCallResult {
     pub block: bool,
     pub reason: Option<String>,
     pub arguments: Option<Value>,
+    pub approval_token: Option<ToolCallApprovalToken>,
 }
 
 #[derive(Clone, Debug)]
@@ -621,6 +778,9 @@ pub struct AgentLoopConfig {
     pub transform_context: Option<TransformContextFn>,
     pub get_api_key: Option<GetApiKeyFn>,
     pub before_tool_call: Option<BeforeToolCallFn>,
+    pub approve_tool_call: Option<BeforeToolCallFn>,
+    pub restore_steering_messages: Option<RestoreMessagesFn>,
+    pub restore_follow_up_messages: Option<RestoreMessagesFn>,
     pub after_tool_call: Option<AfterToolCallFn>,
     pub should_stop_after_turn: Option<ShouldStopAfterTurnFn>,
     pub prepare_next_turn: Option<PrepareNextTurnFn>,

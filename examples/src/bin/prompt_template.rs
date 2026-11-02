@@ -31,8 +31,8 @@ fn main() {
         skills: vec![Skill {
             name: "rust-review".to_owned(),
             description: "Review Rust code for idioms and safety.".to_owned(),
-            file_path: "<workspace>/.pi/skills/rust-review/SKILL.md".to_owned(),
-            base_dir: "<workspace>/.pi/skills/rust-review".to_owned(),
+            file_path: "<workspace>/.rpi/skills/rust-review/SKILL.md".to_owned(),
+            base_dir: "<workspace>/.rpi/skills/rust-review".to_owned(),
             globs: Vec::new(),
             always_apply: false,
             hidden: false,

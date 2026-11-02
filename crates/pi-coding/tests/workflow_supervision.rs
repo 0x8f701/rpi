@@ -8,12 +8,13 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use pi_coding::{
     ApplicationEvent, JobSnapshot, JobStatus, MailboxMessage, OrchestrationConcurrencyGate,
-    OrchestrationEvent, PlanningTurnOutcome, TodoApplyResult, TodoDagExecutionOutcome,
-    TodoDagExecutionStatus, TodoItem, TodoOp, TodoPhase, TodoState, TodoStatus, TodoStorage,
-    WorkflowJobSnapshot, WorkflowRuntimeScope, WorkflowStatus, WorkflowSupervisor,
-    WorkflowSupervisorActivityKind, WorkflowSupervisorBackend, WorkflowSupervisorContract,
-    WorkflowSupervisorTodoObservation,
+    OrchestrationEvent, PlannerIdentity, PlanningTurnOutcome, TodoApplyResult,
+    TodoDagExecutionOutcome, TodoDagExecutionStatus, TodoItem, TodoOp, TodoPhase, TodoState,
+    TodoStatus, TodoStorage, WorkflowJobSnapshot, WorkflowRuntimeScope, WorkflowStatus,
+    WorkflowSupervisor, WorkflowSupervisorActivityKind, WorkflowSupervisorBackend,
+    WorkflowSupervisorContract, WorkflowSupervisorTodoObservation,
 };
+
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -65,6 +66,7 @@ struct FakeState {
     dag_status: TodoDagExecutionStatus,
     jobs: Vec<WorkflowJobSnapshot>,
     irc: Vec<MailboxMessage>,
+    projection_error: Option<String>,
     prompt: Option<String>,
     steers: Vec<String>,
     cancelled: Vec<String>,
@@ -81,15 +83,22 @@ struct FakeState {
     /// (None = crate default).
     planning_deadline: Option<Duration>,
     /// Whether a non-progress abort (pause) was requested while a prompt was
-    /// in flight (observable effect of the P1-2 detection / P0-1 deadline).
+    /// in flight (observable effect of non-progress detection and the planning deadline).
     aborted_while_prompting: bool,
     prompt_gate: Option<PromptGate>,
     /// Number of DAG reconciliations the supervisor triggered. Lets tests
     /// assert that soft-budget partial worker results never re-arm the DAG.
     reconcile_count: usize,
-    /// Task ids the last reconciliation would have spawned as newly ready
-    /// (dependencies satisfied, task still pending).
     last_spawned_task_ids: Vec<String>,
+    /// Planner identity stamped onto empty-plan failures.
+    planner_model_id: String,
+    planner_category: String,
+    /// Ordering log: "persist:{n}" then "prompt" to prove persist precedes
+    /// the planner call.
+    planning_order: Vec<String>,
+    persist_fail: bool,
+
+
 }
 
 impl FakeBackend {
@@ -107,6 +116,7 @@ impl FakeBackend {
                 },
                 dag_status: TodoDagExecutionStatus::Dormant,
                 jobs: Vec::new(),
+                projection_error: None,
                 irc: Vec::new(),
                 prompt: None,
                 steers: Vec::new(),
@@ -121,6 +131,13 @@ impl FakeBackend {
                 prompt_gate: None,
                 reconcile_count: 0,
                 last_spawned_task_ids: Vec::new(),
+                planner_model_id: String::new(),
+                planner_category: String::new(),
+                planning_order: Vec::new(),
+                persist_fail: false,
+
+
+
             })),
         }
     }
@@ -169,6 +186,10 @@ impl FakeBackend {
         ));
     }
 
+    fn set_projection_error(&self, message: impl Into<String>) {
+        self.state.lock().projection_error = Some(message.into());
+    }
+
     fn state(&self) -> parking_lot::MutexGuard<'_, FakeState> {
         self.state.lock()
     }
@@ -194,8 +215,16 @@ impl WorkflowSupervisorBackend for FakeBackend {
             .collect()
     }
 
-    fn inbox(&self, _agent_id: &str, _peek: bool) -> Vec<MailboxMessage> {
-        self.state.lock().irc.clone()
+    fn inbox(&self, _agent_id: &str, _peek: bool) -> Result<Vec<MailboxMessage>> {
+        Ok(self.state.lock().irc.clone())
+    }
+
+    fn delivered_messages(&self) -> Result<Vec<MailboxMessage>> {
+        let state = self.state.lock();
+        if let Some(error) = state.projection_error.as_deref() {
+            anyhow::bail!(error.to_owned());
+        }
+        Ok(state.irc.clone())
     }
 
     fn active_workflow_job_ids(&self, workflow_id: &str, generation: u64) -> Vec<String> {
@@ -221,6 +250,7 @@ impl WorkflowSupervisorBackend for FakeBackend {
     async fn prompt_supervisor(&self, prompt: String) -> Result<PlanningTurnOutcome> {
         let gate = {
             let mut state = self.state.lock();
+            state.planning_order.push("prompt".to_owned());
             state.prompt = Some(prompt);
             state.prompt_count += 1;
             if let Some((count, tasks)) = state.populate_tasks_after_prompt.clone()
@@ -241,15 +271,17 @@ impl WorkflowSupervisorBackend for FakeBackend {
             gate.signal_started();
             gate.release.cancelled().await;
         }
-        // Re-read the scripted outcome once the prompt settles.
         let outcome = self
             .state
             .lock()
             .prompt_outcomes
             .pop_front()
             .unwrap_or(PlanningTurnOutcome::Completed);
+
+
         Ok(outcome)
     }
+
 
     async fn steer_supervisor(&self, message: String) -> Result<()> {
         self.state.lock().steers.push(message);
@@ -262,6 +294,26 @@ impl WorkflowSupervisorBackend for FakeBackend {
             .planning_deadline
             .unwrap_or(Duration::from_secs(90))
     }
+
+    fn planner_identity(&self) -> PlannerIdentity {
+        let state = self.state.lock();
+        PlannerIdentity::sanitized(
+            state.planner_model_id.clone(),
+            state.planner_category.clone(),
+        )
+    }
+
+    async fn persist_planning_attempt(&self, count: u8) -> Result<()> {
+        let mut state = self.state.lock();
+
+        if state.persist_fail {
+            anyhow::bail!("planning attempt persistence is not configured");
+        }
+        state.planning_order.push(format!("persist:{count}"));
+        Ok(())
+    }
+
+
 
     fn apply_todo(&self, op: TodoOp) -> Result<TodoApplyResult> {
         let mut state = self.state.lock();
@@ -350,6 +402,7 @@ impl WorkflowSupervisorBackend for FakeBackend {
             .collect();
         Ok(TodoDagExecutionOutcome {
             status: state.dag_status,
+            failure_reason: None,
             spawns: Vec::new(),
         })
     }
@@ -359,6 +412,7 @@ impl WorkflowSupervisorBackend for FakeBackend {
         state.dag_status = TodoDagExecutionStatus::Active;
         Ok(TodoDagExecutionOutcome {
             status: TodoDagExecutionStatus::Active,
+            failure_reason: None,
             spawns: Vec::new(),
         })
     }
@@ -376,6 +430,7 @@ impl WorkflowSupervisorBackend for FakeBackend {
         state.dag_status = TodoDagExecutionStatus::Active;
         Ok(TodoDagExecutionOutcome {
             status: TodoDagExecutionStatus::Active,
+            failure_reason: None,
             spawns: Vec::new(),
         })
     }
@@ -409,7 +464,7 @@ fn task(id: &str) -> TodoItem {
         status: TodoStatus::Pending,
         depends_on: Vec::new(),
         ready: true,
-        blocked_by: Vec::new(),
+        waiting_on: Vec::new(),
         agent: None,
     }
 }
@@ -488,26 +543,47 @@ fn soft_budget_job(
 #[tokio::test]
 async fn two_supervisors_coexist_and_route_irc_without_cross_workflow_mutation() {
     let global = OrchestrationConcurrencyGate::new(3).expect("global gate");
-    let alpha_backend = Arc::new(FakeBackend::new(2, vec![task("same-task")]));
-    let beta_backend = Arc::new(FakeBackend::new(2, vec![task("same-task")]));
-    let alpha = WorkflowSupervisor::spawn(contract("alpha", 1), alpha_backend.clone(), global.clone())
-        .expect("alpha");
-    let beta = WorkflowSupervisor::spawn(contract("beta", 1), beta_backend.clone(), global)
-        .expect("beta");
+    let alpha_backend = Arc::new(FakeBackend::new(2, Vec::new()));
+    let beta_backend = Arc::new(FakeBackend::new(2, Vec::new()));
+    alpha_backend.state().populate_tasks_after_prompt = Some((1, vec![task("same-task")]));
+    beta_backend.state().populate_tasks_after_prompt = Some((1, vec![task("same-task")]));
+    let alpha =
+        WorkflowSupervisor::spawn(contract("alpha", 1), alpha_backend.clone(), global.clone())
+            .expect("alpha");
+    let beta =
+        WorkflowSupervisor::spawn(contract("beta", 1), beta_backend.clone(), global).expect("beta");
 
     alpha.start().await.expect("start alpha");
     beta.start().await.expect("start beta");
     assert_eq!(alpha.projection().status, WorkflowStatus::Running);
     assert_eq!(beta.projection().status, WorkflowStatus::Running);
-    assert!(alpha_backend.state().prompt.as_deref().is_some_and(|prompt| {
-        prompt.contains("workflow alpha") && prompt.contains("todoTaskId")
-    }));
-    assert!(beta_backend.state().prompt.as_deref().is_some_and(|prompt| {
-        prompt.contains("workflow beta") && prompt.contains("todoTaskId")
-    }));
+    assert!(
+        alpha_backend
+            .state()
+            .prompt
+            .as_deref()
+            .is_some_and(|prompt| {
+                prompt.contains("workflow alpha") && prompt.contains("todoTaskId")
+            })
+    );
+    assert!(
+        beta_backend
+            .state()
+            .prompt
+            .as_deref()
+            .is_some_and(|prompt| {
+                prompt.contains("workflow beta") && prompt.contains("todoTaskId")
+            })
+    );
 
-    alpha.steer("Main directive for alpha").await.expect("steer alpha");
-    assert_eq!(alpha_backend.state().steers, vec!["Main directive for alpha"]);
+    alpha
+        .steer("Main directive for alpha")
+        .await
+        .expect("steer alpha");
+    assert_eq!(
+        alpha_backend.state().steers,
+        vec!["Main directive for alpha"]
+    );
     assert!(beta_backend.state().steers.is_empty());
 
     beta_backend.set_task_status("same-task", TodoStatus::Completed);
@@ -526,21 +602,23 @@ async fn two_supervisors_coexist_and_route_irc_without_cross_workflow_mutation()
         .await
         .expect("foreign event ignored");
     assert_eq!(alpha.projection().status, WorkflowStatus::Running);
-    assert_eq!(alpha.projection().todo.phases[0].tasks[0].status, TodoStatus::Pending);
+    assert_eq!(
+        alpha.projection().todo.phases[0].tasks[0].status,
+        TodoStatus::Pending
+    );
 
-    beta
-        .observe_application_event(
+    beta.observe_application_event(
+        1,
+        job_event(workflow_job(
+            "beta",
             1,
-            job_event(workflow_job(
-                "beta",
-                1,
-                "same-task",
-                "beta-job",
-                JobStatus::Completed,
-            )),
-        )
-        .await
-        .expect("beta terminal");
+            "same-task",
+            "beta-job",
+            JobStatus::Completed,
+        )),
+    )
+    .await
+    .expect("beta terminal");
     assert_eq!(beta.projection().status, WorkflowStatus::Completed);
 }
 
@@ -575,13 +653,21 @@ async fn stale_generation_duplicate_terminal_is_idempotent_and_preserves_open_to
         .await
         .expect("duplicate stale ignored");
 
-    assert_eq!(supervisor.projection().status, WorkflowStatus::Running);
-    assert_eq!(supervisor.projection().todo.phases[0].tasks[0].status, TodoStatus::Pending);
+    assert_eq!(
+        supervisor.projection().todo.phases[0].tasks[0].status,
+        TodoStatus::Pending
+    );
 }
 
 #[tokio::test]
 async fn empty_planning_fails_after_one_bounded_reprompt() {
+
     let backend = Arc::new(FakeBackend::new(2, Vec::new()));
+    {
+        let mut state = backend.state();
+        state.planner_model_id = "planner-empty".to_owned();
+        state.planner_category = "test-api".to_owned();
+    }
     let supervisor = WorkflowSupervisor::spawn(
         contract("empty-planning", 3),
         backend.clone(),
@@ -590,36 +676,90 @@ async fn empty_planning_fails_after_one_bounded_reprompt() {
     .expect("supervisor");
     supervisor.start().await.expect("start");
 
-    // The initial planning turn produced no Todo tasks: the supervisor gets
-    // exactly ONE bounded re-prompt and then fails with an actionable
-    // message instead of sitting in Planning forever.
+    // The initial planning turn produced no typed Todo plan: the supervisor
+    // gets exactly ONE bounded re-prompt and then fails with a stable
+    // message naming the planner identity, never sitting in Planning.
     let projection = supervisor.projection();
     assert_eq!(projection.status, WorkflowStatus::Failed);
+    let failure = projection.failure.as_deref().expect("empty-plan failure");
     assert!(
-        projection
+        failure.contains("planning produced no tasks"),
+        "failure must be actionable, got {failure:?}"
+    );
+    assert!(
+        failure.contains("no typed Todo plan was committed"),
+        "failure must name the missing typed plan, got {failure:?}"
+    );
+    assert!(
+        failure.contains("model planner-empty (test-api)"),
+        "failure must stamp planner identity, got {failure:?}"
+    );
+    assert!(
+        !failure.contains("complete empty-planning"),
+        "failure must not include user/objective text, got {failure:?}"
+    );
+    assert_eq!(
+        backend.state().prompt_count,
+        2,
+        "exactly one bounded re-prompt"
+    );
+    assert_eq!(
+        backend.state().planning_order,
+        vec![
+            "persist:1".to_owned(),
+            "prompt".to_owned(),
+            "persist:2".to_owned(),
+            "prompt".to_owned(),
+        ],
+        "each planner call must be preceded by a durable persist acknowledgement"
+    );
+    let last_prompt = backend.state().prompt.clone().expect("replan prompt");
+    assert!(
+        last_prompt.contains("produced no typed Todo plan"),
+        "the last prompt must be the replan continuation: {last_prompt}"
+    );
+    assert!(
+        last_prompt.contains("committed todo init"),
+        "the replan prompt must name the missing typed plan: {last_prompt}"
+    );
+    assert!(
+        last_prompt.contains("call the todo tool now with op=init"),
+        "the replan prompt must command todo init: {last_prompt}"
+    );
+    assert!(
+        !last_prompt.contains("complete empty-planning"),
+        "the replan prompt must not restate the user objective: {last_prompt}"
+    );
+}
+
+#[tokio::test]
+async fn empty_planning_failure_is_deterministic_for_the_same_planner() {
+    async fn fail_once() -> String {
+        let backend = Arc::new(FakeBackend::new(2, Vec::new()));
+        {
+            let mut state = backend.state();
+            state.planner_model_id = "same-planner".to_owned();
+            state.planner_category = "same-api".to_owned();
+        }
+        let supervisor = WorkflowSupervisor::spawn(
+            contract("empty-planning-a", 3),
+            backend,
+            OrchestrationConcurrencyGate::new(2).expect("global gate"),
+        )
+        .expect("supervisor");
+        supervisor.start().await.expect("start");
+        supervisor
+            .projection()
             .failure
-            .as_deref()
-            .is_some_and(|message| message.contains("planning produced no tasks")),
-        "failure must be actionable, got {:?}",
-        projection.failure
+            .expect("empty-plan failure")
+    }
+    let first = fail_once().await;
+    let second = fail_once().await;
+    assert_eq!(
+        first, second,
+        "identical empty-plan runs must fail with the same message"
     );
-    assert_eq!(backend.state().prompt_count, 2, "exactly one bounded re-prompt");
-    assert!(
-        backend
-            .state()
-            .prompt
-            .as_deref()
-            .is_some_and(|prompt| prompt.contains("produced no Todo tasks")),
-        "the last prompt must be the replan continuation"
-    );
-    assert!(
-        backend
-            .state()
-            .prompt
-            .as_deref()
-            .is_some_and(|prompt| prompt.contains("call the todo tool")),
-        "the replan prompt must command the todo tool"
-    );
+    assert!(first.contains("model same-planner (same-api)"), "{first}");
 }
 
 #[tokio::test]
@@ -634,7 +774,11 @@ async fn replan_prompt_can_still_produce_tasks_and_workflow_runs() {
     .expect("supervisor");
     supervisor.start().await.expect("start");
 
-    assert_eq!(backend.state().prompt_count, 2, "initial + one bounded re-prompt");
+    assert_eq!(
+        backend.state().prompt_count,
+        2,
+        "initial + one bounded re-prompt"
+    );
     assert_eq!(supervisor.projection().status, WorkflowStatus::Running);
     assert_eq!(
         supervisor.projection().todo.phases[0].tasks[0].id,
@@ -643,8 +787,38 @@ async fn replan_prompt_can_still_produce_tasks_and_workflow_runs() {
 }
 
 #[tokio::test]
+async fn empty_plan_on_first_pass_does_not_invent_tasks_from_prose() {
+    let backend = Arc::new(FakeBackend::new(2, Vec::new()));
+    backend
+        .state()
+        .prompt_outcomes
+        .push_back(PlanningTurnOutcome::Completed);
+    backend
+        .state()
+        .prompt_outcomes
+        .push_back(PlanningTurnOutcome::Completed);
+    let supervisor = WorkflowSupervisor::spawn(
+        contract("no-invent", 3),
+        backend.clone(),
+        OrchestrationConcurrencyGate::new(2).expect("global gate"),
+    )
+    .expect("supervisor");
+    supervisor.start().await.expect("start");
+    let projection = supervisor.projection();
+    assert_eq!(projection.status, WorkflowStatus::Failed);
+    assert!(
+        projection.todo.phases.iter().all(|phase| phase.tasks.is_empty()),
+        "planning must never invent tasks from prose, got {:?}",
+        projection.todo
+    );
+    assert_eq!(backend.state().prompt_count, 2);
+}
+
+
+#[tokio::test]
 async fn paused_with_tasks_resumes_without_reprompting_and_empty_paused_resume_fails_bounded() {
-    let backend = Arc::new(FakeBackend::new(2, vec![task("open")]));
+    let backend = Arc::new(FakeBackend::new(2, Vec::new()));
+    backend.state().populate_tasks_after_prompt = Some((1, vec![task("open")]));
     let supervisor = WorkflowSupervisor::spawn(
         contract("paused-resume", 3),
         backend.clone(),
@@ -657,7 +831,11 @@ async fn paused_with_tasks_resumes_without_reprompting_and_empty_paused_resume_f
 
     supervisor.resume().await.expect("resume");
     assert_eq!(backend.state().resume_count, 1);
-    assert_eq!(backend.state().prompt_count, 1, "resume with tasks must not re-prompt");
+    assert_eq!(
+        backend.state().prompt_count,
+        1,
+        "resume with tasks must not re-prompt"
+    );
     assert_eq!(supervisor.projection().status, WorkflowStatus::Running);
 
     // A Paused workflow with no Todo tasks continues the bounded planning
@@ -668,7 +846,9 @@ async fn paused_with_tasks_resumes_without_reprompting_and_empty_paused_resume_f
         empty.clone(),
         OrchestrationConcurrencyGate::new(2).expect("global gate"),
         WorkflowStatus::Paused,
+        0,
     )
+
     .expect("empty supervisor");
     assert_eq!(empty_supervisor.projection().status, WorkflowStatus::Paused);
     empty_supervisor.resume().await.expect("resume empty");
@@ -719,8 +899,17 @@ async fn pause_stops_actor_waves_resume_reuses_backend_and_cancel_drains_exact_j
     assert_eq!(cancelled, vec!["owned-running"]);
     assert_eq!(backend.state().cancelled, vec!["owned-running"]);
     assert_eq!(supervisor.projection().status, WorkflowStatus::Cancelled);
-    assert_eq!(backend.state().todo.phases[0].tasks[1].status, TodoStatus::Pending);
-    assert!(supervisor.cancel().await.expect("duplicate cancel").is_empty());
+    assert_eq!(
+        backend.state().todo.phases[0].tasks[1].status,
+        TodoStatus::Pending
+    );
+    assert!(
+        supervisor
+            .cancel()
+            .await
+            .expect("duplicate cancel")
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -731,7 +920,9 @@ async fn restored_paused_supervisor_does_not_prompt_or_spawn_until_resume() {
         backend.clone(),
         OrchestrationConcurrencyGate::new(2).expect("global gate"),
         WorkflowStatus::Paused,
+        0,
     )
+
     .expect("restored supervisor");
     assert_eq!(supervisor.projection().status, WorkflowStatus::Paused);
     assert!(backend.state().prompt.is_none());
@@ -747,7 +938,9 @@ async fn restored_paused_supervisor_does_not_prompt_or_spawn_until_resume() {
         Arc::new(FakeBackend::new(2, vec![task("open")])),
         OrchestrationConcurrencyGate::new(2).expect("terminal gate"),
         WorkflowStatus::Completed,
+        0,
     );
+
     assert!(terminal.is_err());
 }
 
@@ -775,10 +968,39 @@ async fn supervisor_failure_preserves_open_todo_and_terminal_completion_is_exact
     assert_eq!(failed.failure.as_deref(), Some("supervisor crashed"));
     assert_eq!(failed.todo.phases[0].tasks[0].status, TodoStatus::Pending);
 
+    let projection_backend = Arc::new(FakeBackend::new(2, vec![task("projection-open")]));
+    let projection_supervisor = WorkflowSupervisor::spawn(
+        contract("projection-error", 4),
+        projection_backend.clone(),
+        OrchestrationConcurrencyGate::new(2).expect("projection gate"),
+    )
+    .expect("projection supervisor");
+    projection_supervisor
+        .start()
+        .await
+        .expect("projection start");
+    projection_backend.set_projection_error("IRC projection unavailable");
+    projection_supervisor
+        .observe_application_event(
+            4,
+            ApplicationEvent::RunFailed {
+                message: "supervisor terminal failure".to_owned(),
+            },
+        )
+        .await
+        .expect("projection failure handled");
+    let projection_failed = projection_supervisor.projection();
+    assert_eq!(projection_failed.status, WorkflowStatus::Failed);
+    assert_eq!(
+        projection_failed.failure.as_deref(),
+        Some("supervisor terminal failure"),
+        "a transient detail projection error must not overwrite the authoritative workflow failure"
+    );
+
     // Execution-supervision under the plan/execution split: a completed
     // worker job for a workflow-owned Todo task makes the SUPERVISOR mark the
     // task Done (the DAG coordinator must never forge workflow-owned
-    // completion — BUG-3), which settles the DAG and completes the workflow.
+    // completion), which settles the DAG and completes the workflow.
     let complete_backend = Arc::new(FakeBackend::new(2, vec![task("complete")]));
     let complete = WorkflowSupervisor::spawn(
         contract("complete", 1),
@@ -847,7 +1069,10 @@ async fn soft_budget_completed_worker_job_keeps_todo_open_and_dependents_wait() 
     // Completed job for the same task still closes it and spawns dependents.
     let backend = Arc::new(FakeBackend::new(
         2,
-        vec![task("partial"), task_with_deps("dependent", vec!["partial"])],
+        vec![
+            task("partial"),
+            task_with_deps("dependent", vec!["partial"]),
+        ],
     ));
     let supervisor = WorkflowSupervisor::spawn(
         contract("soft-budget", 1),
@@ -877,7 +1102,8 @@ async fn soft_budget_completed_worker_job_keeps_todo_open_and_dependents_wait() 
         "soft-budget partial work must stay open for the parent's decision"
     );
     assert_eq!(
-        backend.state().reconcile_count, 0,
+        backend.state().reconcile_count,
+        0,
         "a partial worker result must never re-arm the DAG"
     );
     assert!(
@@ -948,6 +1174,8 @@ async fn planning_turn_plan_commit_ends_planning_while_run_continues() {
             ApplicationEvent::TodoUpdated {
                 phases: mid_plan_phases,
                 completed_tasks: Vec::new(),
+                execution_status: TodoDagExecutionStatus::Active,
+                failure_reason: None,
             },
         )
         .await
@@ -958,7 +1186,7 @@ async fn planning_turn_plan_commit_ends_planning_while_run_continues() {
         "Todo created mid-planning must be visible before the turn ends"
     );
 
-    // P0-2: the first successful `todo init` commits the plan and ends
+    // The first successful `todo init` commits the plan and ends
     // planning — the workflow leaves Planning (and the DAG is preserved)
     // immediately, even while the model's run continues.
     supervisor
@@ -1029,7 +1257,11 @@ async fn cancel_during_blocked_planning_interrupts_and_settles_cancelled() {
         .expect("cancel must not wait for the blocked prompt")
         .expect("cancel ok");
     assert_eq!(supervisor.projection().status, WorkflowStatus::Cancelled);
-    assert_eq!(backend.state().pause_count, 1, "the in-flight prompt must be aborted");
+    assert_eq!(
+        backend.state().pause_count,
+        1,
+        "the in-flight prompt must be aborted"
+    );
 
     // Releasing the gate settles the abandoned turn; the workflow stays
     // Cancelled — never re-plans, never clobbers back to Planning.
@@ -1040,7 +1272,8 @@ async fn cancel_during_blocked_planning_interrupts_and_settles_cancelled() {
         .expect("start ok");
     assert_eq!(supervisor.projection().status, WorkflowStatus::Cancelled);
     assert_eq!(
-        backend.state().prompt_count, 1,
+        backend.state().prompt_count,
+        1,
         "a cancelled workflow must never re-prompt"
     );
 }
@@ -1089,14 +1322,31 @@ async fn activity_feed_tracks_thinking_tool_and_irc_and_is_generation_gated() {
         .expect("irc activity");
 
     let projection = supervisor.projection();
-    assert_eq!(projection.activity.len(), 3, "thinking + tool + irc entries");
-    assert_eq!(projection.activity[0].kind, WorkflowSupervisorActivityKind::Thinking);
+    assert_eq!(
+        projection.activity.len(),
+        3,
+        "thinking + tool + irc entries"
+    );
+    assert_eq!(
+        projection.activity[0].kind,
+        WorkflowSupervisorActivityKind::Thinking
+    );
     assert_eq!(projection.activity[0].text, "weigh options");
-    assert_eq!(projection.activity[1].kind, WorkflowSupervisorActivityKind::Tool);
+    assert_eq!(
+        projection.activity[1].kind,
+        WorkflowSupervisorActivityKind::Tool
+    );
     assert_eq!(projection.activity[1].text, "read tools.rs");
-    assert_eq!(projection.activity[2].kind, WorkflowSupervisorActivityKind::Irc);
+    assert_eq!(
+        projection.activity[2].kind,
+        WorkflowSupervisorActivityKind::Irc
+    );
     assert_eq!(projection.activity[2].text, "still investigating");
-    assert_eq!(projection.irc.len(), 1, "IRC stays in the inbox projection too");
+    assert_eq!(
+        projection.irc.len(),
+        1,
+        "IRC stays in the inbox projection too"
+    );
 
     // Foreign generations are rejected (never occupy command capacity).
     supervisor
@@ -1114,39 +1364,118 @@ async fn restored_planning_continues_automatically_and_runs() {
         backend.clone(),
         OrchestrationConcurrencyGate::new(2).expect("global gate"),
         WorkflowStatus::Planning,
+        1,
     )
     .expect("restored planning");
     assert_eq!(supervisor.projection().status, WorkflowStatus::Planning);
-    assert!(backend.state().prompt.is_none(), "restore itself must not prompt");
+    assert!(
+        backend.state().prompt.is_none(),
+        "restore itself must not prompt"
+    );
 
-    supervisor.continue_restored().await.expect("restore continuation");
+    supervisor
+        .continue_restored()
+        .await
+        .expect("restore continuation");
     assert_eq!(
         backend.state().prompt_count,
-        1,
-        "restored planning continues with the planning prompt"
+        0,
+        "restored Planning with a persisted Todo DAG must arm without planner prompts"
     );
     assert_eq!(supervisor.projection().status, WorkflowStatus::Running);
-    assert_eq!(supervisor.projection().todo.phases[0].tasks[0].id, "open");
 }
 
 #[tokio::test]
 async fn restored_empty_planning_fails_bounded_instead_of_freezing() {
+
     let backend = Arc::new(FakeBackend::new(2, Vec::new()));
     let supervisor = WorkflowSupervisor::spawn_restored(
         contract("restored-empty", 8),
         backend.clone(),
         OrchestrationConcurrencyGate::new(2).expect("global gate"),
         WorkflowStatus::Planning,
+        1,
     )
     .expect("restored planning");
-    supervisor.continue_restored().await.expect("restore continuation");
+    supervisor
+        .continue_restored()
+        .await
+        .expect("restore continuation");
     assert_eq!(
         supervisor.projection().status,
         WorkflowStatus::Failed,
         "restored empty planning must not freeze in Planning"
     );
-    assert_eq!(backend.state().prompt_count, 2);
+    assert_eq!(
+        backend.state().prompt_count,
+
+        1,
+        "restored empty Planning has already consumed the initial pass"
+    );
+    assert_eq!(
+        backend.state().planning_order,
+        vec!["persist:2".to_owned(), "prompt".to_owned()],
+        "persist acknowledgement must precede the remaining planner prompt"
+    );
 }
+
+#[tokio::test]
+async fn persist_failure_fails_planning_without_calling_the_model() {
+    let backend = Arc::new(FakeBackend::new(2, Vec::new()));
+    backend.state().persist_fail = true;
+    let supervisor = WorkflowSupervisor::spawn(
+        contract("persist-fail", 3),
+        backend.clone(),
+        OrchestrationConcurrencyGate::new(2).expect("global gate"),
+    )
+    .expect("supervisor");
+    supervisor.start().await.expect("start");
+    let projection = supervisor.projection();
+    assert_eq!(projection.status, WorkflowStatus::Failed);
+    assert_eq!(backend.state().prompt_count, 0);
+    assert!(
+        backend.state().planning_order.is_empty(),
+        "persist failure must never reach the planner, got {:?}",
+        backend.state().planning_order
+    );
+    assert!(
+        projection
+            .failure
+            .as_deref()
+            .is_some_and(|message| message.contains("planning attempt persistence is not configured")),
+        "failure must name persist, got {:?}",
+        projection.failure
+    );
+}
+
+#[tokio::test]
+async fn restored_count_two_fails_without_invoking_the_planner() {
+    let backend = Arc::new(FakeBackend::new(2, Vec::new()));
+    let supervisor = WorkflowSupervisor::spawn_restored(
+        contract("restored-exhausted", 8),
+        backend.clone(),
+        OrchestrationConcurrencyGate::new(2).expect("global gate"),
+        WorkflowStatus::Planning,
+        2,
+    )
+    .expect("restored exhausted planning");
+    supervisor
+        .continue_restored()
+        .await
+        .expect("restore continuation");
+    assert_eq!(supervisor.projection().status, WorkflowStatus::Failed);
+    assert_eq!(
+        backend.state().prompt_count,
+        0,
+        "a durable count of two has already spent both planning prompts"
+    );
+    assert!(
+        backend.state().planning_order.is_empty(),
+        "exhausted restore must not persist or prompt, got {:?}",
+        backend.state().planning_order
+    );
+}
+
 
 #[tokio::test]
 async fn restored_running_rearms_dag_execution_and_resume_acts_from_planning_and_running() {
@@ -1157,16 +1486,25 @@ async fn restored_running_rearms_dag_execution_and_resume_acts_from_planning_and
         backend.clone(),
         OrchestrationConcurrencyGate::new(2).expect("global gate"),
         WorkflowStatus::Running,
+        0,
     )
+
     .expect("restored running");
     assert_eq!(supervisor.projection().status, WorkflowStatus::Running);
-    supervisor.continue_restored().await.expect("restore continuation");
+    supervisor
+        .continue_restored()
+        .await
+        .expect("restore continuation");
     assert_eq!(
         backend.state().dag_status,
         TodoDagExecutionStatus::Active,
         "restored Running must execute the Todo DAG over stored tasks"
     );
-    assert_eq!(backend.state().prompt_count, 0, "Running continuation must not re-prompt");
+    assert_eq!(
+        backend.state().prompt_count,
+        0,
+        "Running continuation must not re-prompt"
+    );
     assert_eq!(supervisor.projection().status, WorkflowStatus::Running);
 
     // /workflow resume is effective for restored Planning.
@@ -1176,11 +1514,20 @@ async fn restored_running_rearms_dag_execution_and_resume_acts_from_planning_and
         planning.clone(),
         OrchestrationConcurrencyGate::new(2).expect("global gate"),
         WorkflowStatus::Planning,
+        1,
     )
+
     .expect("restored planning");
-    planning_supervisor.resume().await.expect("resume from planning");
-    assert_eq!(planning.state().prompt_count, 1);
-    assert_eq!(planning_supervisor.projection().status, WorkflowStatus::Running);
+    planning_supervisor
+        .resume()
+        .await
+        .expect("resume from planning");
+    assert_eq!(planning.state().prompt_count, 0);
+
+    assert_eq!(
+        planning_supervisor.projection().status,
+        WorkflowStatus::Running
+    );
 
     // /workflow resume is effective for restored Running.
     let running = Arc::new(FakeBackend::new(2, vec![task("open")]));
@@ -1189,22 +1536,30 @@ async fn restored_running_rearms_dag_execution_and_resume_acts_from_planning_and
         running.clone(),
         OrchestrationConcurrencyGate::new(2).expect("global gate"),
         WorkflowStatus::Running,
+        0,
     )
+
     .expect("restored running");
-    running_supervisor.resume().await.expect("resume from running");
+    running_supervisor
+        .resume()
+        .await
+        .expect("resume from running");
     assert_eq!(
         running.state().dag_status,
         TodoDagExecutionStatus::Active,
         "resume from Running must re-arm the Todo DAG"
     );
-    assert_eq!(running_supervisor.projection().status, WorkflowStatus::Running);
+    assert_eq!(
+        running_supervisor.projection().status,
+        WorkflowStatus::Running
+    );
 }
 
 #[tokio::test]
 async fn planning_budget_reached_preserves_committed_dag_and_runs() {
     // A provider that exhausts the planning budget AFTER committing a valid
     // DAG: the workflow must preserve the DAG, arm DAG execution, and move to
-    // Running instead of failing (P0-1).
+    // Running instead of failing.
     let backend = Arc::new(FakeBackend::new(2, vec![task("committed-root")]));
     backend
         .state()
@@ -1235,9 +1590,9 @@ async fn planning_budget_reached_preserves_committed_dag_and_runs() {
 
 #[tokio::test]
 async fn planning_budget_reached_without_tasks_fails_with_bound_name() {
-    // A provider that exhausts the planning budget WITHOUT committing any
-    // tasks: the workflow fails with an actionable reason naming the bound
-    // (P0-1), never lingering in Planning.
+    // A provider that exhausts the planning budget without committing any
+    // tasks: the workflow fails with an actionable reason naming the bound,
+    // never lingering in Planning.
     let backend = Arc::new(FakeBackend::new(2, Vec::new()));
     backend
         .state()
@@ -1269,8 +1624,9 @@ async fn planning_budget_reached_without_tasks_fails_with_bound_name() {
 async fn planning_wall_clock_deadline_aborts_and_settles_from_todo_state() {
     // With tasks: an unresponsive provider (the prompt never returns) is
     // aborted by the wall-clock deadline; the committed DAG is preserved and
-    // armed, and the workflow runs (P0-1).
-    let with_tasks = Arc::new(FakeBackend::new(2, vec![task("deadline-root")]));
+    // armed, and the workflow runs.
+    let with_tasks = Arc::new(FakeBackend::new(2, Vec::new()));
+    with_tasks.state().populate_tasks_after_prompt = Some((1, vec![task("deadline-root")]));
     with_tasks.state().planning_deadline = Some(Duration::from_millis(150));
     with_tasks.state().prompt_gate = Some(PromptGate::new());
     let with_tasks_supervisor = WorkflowSupervisor::spawn(
@@ -1414,7 +1770,7 @@ async fn planning_non_progress_detection_aborts_after_identical_failed_ops() {
     // Three identical failed Todo operations (same op + target IDs + error
     // prefix) with no Todo-state change: the session doom-loop detector would
     // catch this too, but the semantic detector must terminate planning with
-    // an actionable reason (P1-2).
+    // an actionable reason.
     let backend = Arc::new(FakeBackend::new(2, Vec::new()));
     backend.state().prompt_gate = Some(PromptGate::new());
     let supervisor = WorkflowSupervisor::spawn(
@@ -1468,7 +1824,7 @@ async fn planning_non_progress_detection_aborts_after_identical_failed_ops() {
 async fn planning_non_progress_detection_trips_on_varying_failed_ids() {
     // Six failed Todo corrections with VARYING target IDs/error text (which
     // the session identical-error detector cannot see) and no Todo-state
-    // change: the semantic detector still terminates planning (P1-2).
+    // change: the semantic detector still terminates planning.
     let backend = Arc::new(FakeBackend::new(2, Vec::new()));
     backend.state().prompt_gate = Some(PromptGate::new());
     let supervisor = WorkflowSupervisor::spawn(
@@ -1519,8 +1875,8 @@ async fn planning_non_progress_detection_trips_on_varying_failed_ids() {
 #[tokio::test]
 async fn planning_non_progress_tolerates_legit_init_and_mutations() {
     // A legitimate init + successful dependency sequence changes the
-    // canonical Todo state on every call: the semantic detector must NOT trip
-    // (P1-2) — Todo-state progress is the decisive signal.
+    // canonical Todo state on every call: the semantic detector must not trip;
+    // Todo-state progress is the decisive signal.
     let backend = Arc::new(FakeBackend::new(2, Vec::new()));
     let gate = PromptGate::new();
     backend.state().prompt_gate = Some(gate.clone());
@@ -1579,7 +1935,8 @@ async fn planning_non_progress_tolerates_legit_init_and_mutations() {
         "legitimate progress must never trip non-progress detection"
     );
     assert_eq!(
-        backend.state().prompt_count, 1,
+        backend.state().prompt_count,
+        1,
         "legitimate planning must not be aborted or re-prompted"
     );
 }
@@ -1608,5 +1965,8 @@ async fn plan_committed_outcome_arms_dag_and_runs() {
         TodoDagExecutionStatus::Active,
         "a committed plan must arm Todo DAG execution"
     );
-    assert_eq!(supervisor.projection().todo.phases[0].tasks[0].id, "committed");
+    assert_eq!(
+        supervisor.projection().todo.phases[0].tasks[0].id,
+        "committed"
+    );
 }

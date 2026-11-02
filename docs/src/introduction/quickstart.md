@@ -1,189 +1,63 @@
 # Quick start
 
-## First-run workflow
+## Configure a provider
 
-1. **Install** `rpi`:
-   ```sh
-   curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/master/install.sh | sh
-   ```
-   See [`install.md`](install.md) for Windows, pinned binary releases, manual
-   archive verification, and rollback behavior.
-
-2. **Verify** the binary:
-   ```sh
-   rpi --version
-   ```
-
-3. **Configure one provider credential**. For example:
-   ```sh
-   rpi login anthropic
-   ```
-   For non-interactive or CI use, set the provider-specific environment variable
-   to a redacted credential value. Do not export placeholder values. For other
-   providers, `auth.json`, `models.json`, and precedence rules, see
-   [`authentication.md`](../user-guide/authentication.md).
-
-4. **Run a non-interactive task** to confirm the end-to-end path:
-   ```sh
-   rpi --print -m anthropic/claude-sonnet-4-5 "List the Rust files in this directory"
-   ```
-
-5. **Start an interactive session**:
-   ```sh
-   rpi -m anthropic/claude-sonnet-4-5
-   ```
-   The CLI opens the normal-screen inline TUI when both stdin and stdout are
-   terminals; otherwise it uses the line REPL. See [`cli-modes.md`](../user-guide/cli-modes.md)
-   for every flag, subcommand, and slash command.
-
-## Non-interactive print mode
+After [installation](install.md), inspect setup and configure a model provider:
 
 ```sh
-rpi --print "Explain this crate" -m anthropic/claude-sonnet-4-5
-
-# Or stream events as JSON lines for tooling
-rpi --mode json -m openai/gpt-5.5 "List all unfinished task markers in src/"
-```
-
-Positional prompts initialize the interactive session on a terminal and select
-print mode when stdin or stdout is not a terminal. `--listen` is a separate
-headless Web-only service and rejects positional prompts; submit Web prompts
-through `/web`, `/ws`, or `/rpc`. Use `--print` when a script must be
-non-interactive:
-
-```sh
-rpi -m openai/gpt-5.5 "Review this repository"
-```
-
-## Interactive session
-
-```sh
-rpi -m anthropic/claude-sonnet-4-5
-```
-
-- If both `stdin` and `stdout` are terminals, you get the normal-screen inline TUI.
-- Otherwise you get the line REPL (`> ` prompt).
-
-In both modes you can type a message or use slash commands. Type `/help` for the
-23 primary commands, including `/workflow`, `/code-review`, `/btw`, `/skill`,
-and `/live`. The Web composer exposes its supported command surface through the
-button left of the input. Model and thinking-level switches work as slash
-commands in the line REPL; the TUI uses `/model` plus keybindings such as
-`Ctrl+L` and `Ctrl+T`.
-
-## Switch models and reasoning level
-
-In the line REPL:
-
-```
-/model openai/gpt-5.5
-/think high
-```
-
-From the shell you can set the initial model and thinking level:
-
-```sh
-rpi -m openai/gpt-5.5 --think high --print "Refactor this function"
-```
-
-See [`models.md`](../user-guide/models.md) for model-spec syntax and custom providers.
-
-## Manage sessions
-
-```sh
-# List native Pi sessions for the current directory
-rpi sessions
-
-# Resume the newest native Pi session for this directory
-rpi --continue
-
-# Resume a native or foreign session by path, exact id, or prefix
-rpi --resume rollout-abc123.jsonl
-rpi --resume abc123
-```
-
-In the interactive TUI and line REPL, `/resume` and `/sessions` open a
-current-cwd-scoped unified catalog with `[source]` badges for native Pi, OMP,
-Codex, Claude, Grok/Hyper, and Droid sessions. Selecting a foreign session
-imports it once into the effective native session root; later resumes reuse
-the converted file. Foreign source files cannot be renamed or deleted from the
-selector, but native and imported JSONL files can be. `--continue` stays
-native-only and resumes the newest native Pi session for the directory.
-
-Sessions are stored as append-only JSONL files under `<agent-dir>/sessions/`.
-See [`cli-modes.md`](../user-guide/cli-modes.md#session-resume-and-import) for path encoding,
-import details, and selector management rules.
-
-## Discover models
-
-```sh
-rpi models
-rpi models claude
-rpi models openai
-```
-
-The filter is case-sensitive and matches against provider name or model id.
-
-## Log in
-
-```sh
+rpi setup
 rpi login
-rpi login anthropic
+rpi models
 ```
 
-`login` stores credentials in `auth.json`. `logout` removes them. For
-non-interactive configuration, use `auth.json` or environment variables (see
-[`authentication.md`](../user-guide/authentication.md)).
+Login can ask you to select a provider. Model listing reflects configured credentials, not just every identifier known to the application. Keep keys out of shell history and shared files.
 
-## Export or share a session
+## Start in a project
+
+From an existing project directory:
 
 ```sh
-# Export a session file to a self-contained HTML file
-rpi export <agent-dir>/sessions/--<workspace>--/timestamp_id.jsonl
-
-# Export the current branch as JSONL for later resume
-rpi export session.jsonl --jsonl --output backup.jsonl
+rpi
 ```
 
-In the TUI or REPL, `/share` creates a secret GitHub gist via the `gh` CLI.
-See [`export-share.md`](../reference/export-share.md) for formats and sharing.
+Use the model selector to choose an available provider/model and enter a concrete request. Ctrl+L opens the terminal model selector. Enter submits; Shift+Enter or Ctrl+J inserts a newline; Esc is the keyboard Stop action.
 
-## Use a local model
+`rpi -C DIR` selects an existing working directory. CLI startup does not create a missing directory. Review project trust before admitting project-local settings, extensions, skills, or prompt templates.
+
+## Noninteractive work
 
 ```sh
-rpi llama configure http://127.0.0.1:8080
-rpi -m llama.cpp/<model-id> --print "Hello"
+rpi --print "Explain the project structure without editing files"
+rpi --mode json "List the main modules"
 ```
 
-See [`local-llama.md`](../reference/local-llama.md) for router setup and GGUF downloads.
+Use `--model PROVIDER/MODEL` to select an explicit available model. Noninteractive prompts use the same tools and authority boundaries as interactive work; asking for read-only work is not a substitute for a confined read-only policy.
 
-## Manage packages
+## Continue a conversation
 
 ```sh
-rpi install git:github.com/owner/pi-my-tools
-rpi list
-rpi update --extensions
+rpi --continue
+rpi sessions
 ```
 
-Project packages need a trusted project. See [`settings-trust.md`](../reference/settings-trust.md)
-and [`packages.md`](../reference/packages.md).
+`--continue` selects the most recent session for this directory. `--resume PATH_OR_ID` selects a specific native or supported foreign session. [Session recovery](../user-guide/session-recovery.md) explains import, rewind, checkpoints, and export.
 
-## Configure loaded resources
+## Browser interface
 
 ```sh
-# Open an interactive selector for enabled extensions/skills/prompts/themes
-rpi config
-
-# Scope the selector to project-local settings
-rpi config --local
+rpi --listen 127.0.0.1:8543
 ```
 
-Project scope is refused unless the project is trusted. See [`packages.md`](../reference/packages.md)
-for the package/resource model.
+Open the printed HTTPS address. The listener runs without the terminal interface and remains alive independently of standard input. Use the pairing URL or token card when authentication is required; protect the pairing URL as a credential.
+
+The Web client includes separate Loop and Processes panels. Loop schedules recurring prompts; Processes runs supervised commands in the session working directory. Files offers Source/Preview views with safe Markdown and sandboxed HTML previews.
 
 ## Next steps
 
-- Read [`cli-modes.md`](../user-guide/cli-modes.md) for the full command surface.
-- Read [`settings-trust.md`](../reference/settings-trust.md) to configure defaults in
-  `settings.json`.
-- Read [`models.md`](../user-guide/models.md) to add custom providers or local models.
+- [CLI modes](../user-guide/cli-modes.md): arguments and command families.
+- [TUI](../user-guide/tui.md): bindings and panels.
+- [Web](../user-guide/web.md): pairing, files, loops, and processes.
+- [Settings and trust](../reference/settings-trust.md): configuration and authority.
+- [Security](../reference/security.md): confinement and rendering boundaries.
+
+Steering queue cancellation is still being integrated on the Rust side; Web queue previews do not imply a stable scoped-cancellation or recovery contract.

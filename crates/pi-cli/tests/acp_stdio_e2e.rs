@@ -86,8 +86,8 @@ impl AcpProbe {
         cmd.env_clear();
         cmd.env("HOME", home);
         cmd.env("PATH", std::env::var("PATH").unwrap_or_default());
-        cmd.env("PI_OFFLINE", "1");
-        cmd.env("PI_SKIP_VERSION_CHECK", "1");
+        cmd.env("RPI_OFFLINE", "1");
+        cmd.env("RPI_SKIP_VERSION_CHECK", "1");
         cmd.env("PI_FAUX_RESPONSE", FAUX_REPLY);
         cmd.arg("--model");
         cmd.arg("faux/faux-1");
@@ -95,6 +95,8 @@ impl AcpProbe {
         cmd.arg("acp-e2e-key");
         cmd.arg("--session-dir");
         cmd.arg(session_dir);
+        cmd.arg("--tools");
+        cmd.arg("read,hub");
         cmd.arg("agent");
         cmd.arg("stdio");
         cmd.current_dir(cwd);
@@ -228,10 +230,7 @@ fn recorded_session_contains(root: &Path, needle: &str) -> bool {
                 if walk(&path, needle) {
                     return true;
                 }
-            } else if path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                == Some("jsonl")
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
                 && let Ok(body) = std::fs::read_to_string(&path)
                 && body.contains(needle)
             {
@@ -275,7 +274,10 @@ fn acp_stdio_full_round_trip_and_records_session() {
         .as_str()
         .expect("session id")
         .to_owned();
-    assert!(session_id.starts_with("sess_"), "session id prefix: {session_id}");
+    assert!(
+        session_id.starts_with("sess_"),
+        "session id prefix: {session_id}"
+    );
 
     let (response, notifications) = acp.request(
         "session/prompt",
@@ -289,10 +291,16 @@ fn acp_stdio_full_round_trip_and_records_session() {
         "prompt result: {response}"
     );
     let text = AcpProbe::joined_agent_text(&notifications);
-    assert_eq!(text, FAUX_REPLY, "assistant text must stream the faux reply");
+    assert_eq!(
+        text, FAUX_REPLY,
+        "assistant text must stream the faux reply"
+    );
 
     let (response, _) = acp.request("session/close", json!({ "sessionId": session_id }));
-    assert!(response.get("result").is_some(), "session/close: {response}");
+    assert!(
+        response.get("result").is_some(),
+        "session/close: {response}"
+    );
 
     acp.finish();
 
@@ -301,6 +309,196 @@ fn acp_stdio_full_round_trip_and_records_session() {
         "the ACP conversation must be recorded to the session store under {:?}",
         session_dir.path()
     );
+}
+
+/// Contract: the real `rpi agent stdio` binary accepts the framed ACP Todo
+/// child subset. In particular, the historical `todo_child_create` request
+/// id=4 is a typed create result rather than JSON-RPC `METHOD_NOT_FOUND`, and
+/// subsequent framed list/status/select/add-task/send/hub-send/stop/archive
+/// calls preserve the session/parent/child identities, revisions, and receipt
+/// shapes owned by the session Application authority.
+#[test]
+fn acp_stdio_framed_todo_child_round_trip() {
+    let home = TempDir::new().expect("home");
+    let cwd = TempDir::new().expect("cwd");
+    let session_dir = TempDir::new().expect("session dir");
+    let mut acp = AcpProbe::spawn(home.path(), cwd.path(), session_dir.path());
+
+    let (response, _) = acp.request(
+        "initialize",
+        json!({ "protocolVersion": 1, "clientCapabilities": {} }),
+    );
+    assert!(response.get("result").is_some(), "initialize: {response}");
+    let (response, _) = acp.request("authenticate", json!({ "methodId": "rpi-auth" }));
+    assert!(response.get("result").is_some(), "authenticate: {response}");
+    let (response, _) = acp.request(
+        "session/new",
+        json!({ "cwd": cwd.path().to_str().expect("cwd"), "mcpServers": [] }),
+    );
+    let session_id = response["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+
+    let (created, notifications) = acp.request(
+        "todo_child_create",
+        json!({ "sessionId": session_id, "label": "stdio-framed-child" }),
+    );
+    assert!(
+        notifications.is_empty(),
+        "Todo calls must not stream notifications"
+    );
+    assert_eq!(created["id"], 4, "historical probe request id");
+    assert_ne!(
+        created["error"]["code"], -32601,
+        "METHOD_NOT_FOUND regression: {created}"
+    );
+    let parent_session_id = created["result"]["identity"]["parentSessionId"]
+        .as_str()
+        .expect("parentSessionId")
+        .to_owned();
+    let child_session_id = created["result"]["identity"]["childSessionId"]
+        .as_str()
+        .expect("childSessionId")
+        .to_owned();
+    let initial_revision = created["result"]["snapshot"]["revision"]
+        .as_u64()
+        .expect("initial revision");
+    assert_eq!(
+        created["result"]["snapshot"]["parentSessionId"],
+        parent_session_id
+    );
+    assert_eq!(
+        created["result"]["snapshot"]["childSessionId"],
+        child_session_id
+    );
+
+    let (listed, _) = acp.request(
+        "todo_child_list",
+        json!({ "sessionId": session_id, "parentSessionId": parent_session_id }),
+    );
+    assert_eq!(
+        listed["result"].as_array().map(Vec::len),
+        Some(1),
+        "list: {listed}"
+    );
+    assert_eq!(listed["result"][0]["childSessionId"], child_session_id);
+
+    let (selected, _) = acp.request(
+        "todo_child_select",
+        json!({
+            "sessionId": session_id,
+            "parentSessionId": parent_session_id,
+            "childSessionId": child_session_id,
+        }),
+    );
+    assert_eq!(selected["result"], json!({}), "select: {selected}");
+
+    let (added, _) = acp.request(
+        "todo_child_add_task",
+        json!({
+            "sessionId": session_id,
+            "parentSessionId": parent_session_id,
+            "childSessionId": child_session_id,
+            "content": "stdio framed task",
+            "expectedRevision": initial_revision,
+        }),
+    );
+    assert!(
+        added["result"]["revision"]
+            .as_u64()
+            .is_some_and(|revision| revision > initial_revision),
+        "add_task revision: {added}"
+    );
+    assert_eq!(added["result"]["task"]["content"], "stdio framed task");
+
+    let (sent, _) = acp.request(
+        "todo_child_send",
+        json!({
+            "sessionId": session_id,
+            "parentSessionId": parent_session_id,
+            "message": "stdio framed work",
+        }),
+    );
+    assert_eq!(sent["result"]["parentSessionId"], parent_session_id);
+    assert_eq!(sent["result"]["childSessionId"], child_session_id);
+    assert!(
+        sent["result"]["messageId"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+
+    let (hub, _) = acp.request(
+        "todo_child_hub_send",
+        json!({
+            "sessionId": session_id,
+            "parentSessionId": parent_session_id,
+            "childSessionId": child_session_id,
+            "to": "Main",
+            "body": "stdio framed hub",
+        }),
+    );
+    assert_eq!(
+        hub["result"].as_array().map(Vec::len),
+        Some(1),
+        "hub send: {hub}"
+    );
+    assert_eq!(hub["result"][0]["to"], "Main");
+    assert!(
+        hub["result"][0]["outcome"].is_string(),
+        "typed hub receipt: {hub}"
+    );
+
+    let (status, _) = acp.request(
+        "todo_child_status",
+        json!({
+            "sessionId": session_id,
+            "parentSessionId": parent_session_id,
+            "childSessionId": child_session_id,
+        }),
+    );
+    assert_eq!(status["result"]["parentSessionId"], parent_session_id);
+    assert_eq!(status["result"]["childSessionId"], child_session_id);
+    assert!(
+        status["result"]["revision"].as_u64().is_some(),
+        "status revision: {status}"
+    );
+
+    let (stopped, _) = acp.request(
+        "todo_child_stop",
+        json!({
+            "sessionId": session_id,
+            "parentSessionId": parent_session_id,
+            "childSessionId": child_session_id,
+        }),
+    );
+    assert_eq!(stopped["result"]["status"], "stopped", "stop: {stopped}");
+
+    let (archived, _) = acp.request(
+        "todo_child_archive",
+        json!({
+            "sessionId": session_id,
+            "parentSessionId": parent_session_id,
+            "childSessionId": child_session_id,
+        }),
+    );
+    assert_eq!(archived["result"], json!({}), "archive: {archived}");
+    let (listed, _) = acp.request(
+        "todo_child_list",
+        json!({ "sessionId": session_id, "parentSessionId": parent_session_id }),
+    );
+    assert_eq!(
+        listed["result"],
+        json!([]),
+        "archive removes child: {listed}"
+    );
+
+    let (response, _) = acp.request("session/close", json!({ "sessionId": session_id }));
+    assert!(
+        response.get("result").is_some(),
+        "session/close: {response}"
+    );
+    acp.finish();
 }
 
 /// Contract: prompting a session that was never opened fails with the typed
@@ -333,7 +531,10 @@ fn acp_stdio_unknown_session_fails_typed_and_connection_recovers() {
     );
 
     let (response, _) = acp.request("authenticate", json!({ "methodId": "rpi-auth" }));
-    assert!(response.get("result").is_some(), "connection recovers: {response}");
+    assert!(
+        response.get("result").is_some(),
+        "connection recovers: {response}"
+    );
 
     acp.finish();
 }
@@ -366,7 +567,11 @@ fn acp_stdio_parse_error_answered_and_connection_recovers() {
         .frames
         .recv_timeout(ACP_TIMEOUT)
         .expect("parse error response");
-    assert_eq!(message["id"], Value::Null, "parse errors carry a null id: {message}");
+    assert_eq!(
+        message["id"],
+        Value::Null,
+        "parse errors carry a null id: {message}"
+    );
     assert_eq!(
         message["error"]["code"], -32700,
         "parse errors use the JSON-RPC parse error code: {message}"
@@ -377,7 +582,10 @@ fn acp_stdio_parse_error_answered_and_connection_recovers() {
         "initialize",
         json!({ "protocolVersion": 1, "clientCapabilities": {} }),
     );
-    assert!(response.get("result").is_some(), "initialize after parse error: {response}");
+    assert!(
+        response.get("result").is_some(),
+        "initialize after parse error: {response}"
+    );
 
     acp.finish();
 }
@@ -399,8 +607,8 @@ fn acp_serve_gates_connections_with_token_subprotocol() {
     cmd.env_clear();
     cmd.env("HOME", home.path());
     cmd.env("PATH", std::env::var("PATH").unwrap_or_default());
-    cmd.env("PI_OFFLINE", "1");
-    cmd.env("PI_SKIP_VERSION_CHECK", "1");
+    cmd.env("RPI_OFFLINE", "1");
+    cmd.env("RPI_SKIP_VERSION_CHECK", "1");
     cmd.arg("--model");
     cmd.arg("faux/faux-1");
     cmd.arg("--api-key");
@@ -495,7 +703,11 @@ fn acp_serve_gates_connections_with_token_subprotocol() {
             );
             match tokio_tungstenite::connect_async(request).await {
                 Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
-                    assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED, "wrong token");
+                    assert_eq!(
+                        response.status(),
+                        http::StatusCode::UNAUTHORIZED,
+                        "wrong token"
+                    );
                 }
                 other => panic!("wrong token must be refused, got {other:?}"),
             }
@@ -508,7 +720,11 @@ fn acp_serve_gates_connections_with_token_subprotocol() {
             );
             match tokio_tungstenite::connect_async(request).await {
                 Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
-                    assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED, "browser origin");
+                    assert_eq!(
+                        response.status(),
+                        http::StatusCode::UNAUTHORIZED,
+                        "browser origin"
+                    );
                 }
                 other => panic!("browser origin must be refused, got {other:?}"),
             }

@@ -44,11 +44,10 @@ check('remainingToBottom above the bottom is positive', remainingToBottom(30, 10
 check('remainingToBottom overscroll is negative', remainingToBottom(90, 100, 20) === -10);
 
 // ---- isPinned: threshold boundary (PIN_TOLERANCE_PX is EXCLUSIVE) ----
-check('PIN_TOLERANCE_PX == 80', PIN_TOLERANCE_PX === 80);
-check('exactly at the tolerance is NOT pinned', !isPinned(0, 100, 20)); // remaining 80
-check('one px inside the tolerance is pinned', isPinned(1, 100, 20)); // remaining 79
-check('one px outside the tolerance is NOT pinned', !isPinned(0, 100, 18)); // remaining 82
-check('at the bottom exactly is pinned', isPinned(80, 100, 20)); // remaining 0
+check('PIN_TOLERANCE_PX == 1', PIN_TOLERANCE_PX === 1);
+check('exactly at the tolerance is NOT pinned', !isPinned(0, 21, 20)); // remaining 1
+check('at the bottom exactly is pinned', isPinned(1, 21, 20)); // remaining 0
+check('one px outside the tolerance is NOT pinned', !isPinned(0, 22, 20)); // remaining 2
 check('custom tolerance is honored', isPinned(50, 100, 20, 40) && !isPinned(50, 100, 20, 20)); // remaining 30
 check('zero tolerance pins only strictly below the boundary', !isPinned(80, 100, 20, 0) && isPinned(81, 100, 20, 0));
 
@@ -80,13 +79,27 @@ check('zero tolerance pins only strictly below the boundary', !isPinned(80, 100,
   ctrl.followIfPinned(t);
   // Final markdown replaces the streaming node. The browser clamps scrollTop
   // and emits scroll before ResizeObserver; this must not be mistaken for a
-  // deliberate user scroll-away.
+  // deliberate user scroll-away (live scrollTop is still at the old bottom).
   t.scrollHeight = 760;
   t.scrollTop = 380;
   ctrl.onScroll(t);
   check('layout-induced scroll while pinned follows new bottom immediately', t.scrollTop === 760, `scrollTop=${t.scrollTop}`);
   t.scrollHeight = 820;
   check('layout-induced scroll preserves pinned state for later growth', ctrl.handleResize(t) === true && t.scrollTop === 820, `scrollTop=${t.scrollTop}`);
+}
+
+// ---- user scroll-away in the same event as content growth ----
+{
+  const ctrl = createScrollPin();
+  const t = el(380, 400, 20);
+  ctrl.followIfPinned(t);
+  t.scrollHeight = 760;
+  t.scrollTop = 200;
+  ctrl.onScroll(t);
+  check('scroll-away during growth does not write scrollTop', t.scrollTop === 200, `scrollTop=${t.scrollTop}`);
+  check('scroll-away during growth unpins', ctrl.followIfPinned(t) === false, `scrollTop=${t.scrollTop}`);
+  t.scrollHeight = 820;
+  check('later followIfPinned is a no-op after growth unpin', ctrl.followIfPinned(t) === false && t.scrollTop === 200, `scrollTop=${t.scrollTop}`);
 }
 
 // ---- unpin + freeze: a viewport scrolled away is NEVER moved again ----
@@ -204,6 +217,75 @@ check('zero tolerance pins only strictly below the boundary', !isPinned(80, 100,
   t.scrollHeight = 420;
   check('lifecycle: post-switch growth glues', ctrl.followIfPinned(t) === true && t.scrollTop === 420, `scrollTop=${t.scrollTop}`);
 }
+
+// ---- adoptUnpinned: a restored follow=false view re-arms the controller ----
+// App's pin controller is GLOBAL across session switches. A fast switch back
+// to a session saved scrolled-away restores its reading position with a plain
+// scrollTop write (applyRestoredViewport), while the controller still carries
+// the previous session's pinned=true from its follow-restore. Without
+// adoption, the very next geometry change (the surface swap, the re-created
+// observer's initial callback, an open fold's growth) snaps the restored view
+// to the bottom and destroys the retained reading position.
+{
+  const ctrl = createScrollPin();
+  const t = el(380, 400, 20);
+  ctrl.followIfPinned(t); // previous session's follow-restore leaves pinned=true
+  // The switch flips the displayed surface: scrollHeight changes (different
+  // window content + one open fold), and the restore writes the saved middle.
+  t.scrollHeight = 500;
+  t.scrollTop = 220;
+  check('adoptUnpinned reports the re-arm', ctrl.adoptUnpinned(t) === true);
+  check('adoptUnpinned freezes the controller at the restored position WITHOUT writing scrollTop', t.scrollTop === 220, `scrollTop=${t.scrollTop}`);
+  // The restore's OWN programmatic scroll event arrives with the adopted
+  // scrollTop (and the swapped surface's new scrollHeight): it must not
+  // re-classify pin state.
+  t.scrollHeight = 620;
+  ctrl.onScroll(t);
+  check('programmatic echo event left the controller explicitly unpinned', ctrl.handleResize(t) === false && t.scrollTop === 220, `scrollTop=${t.scrollTop}`);
+  t.scrollHeight = 700;
+  check('adopted unpinned controller freezes on later content growth', ctrl.followIfPinned(t) === false && t.scrollTop === 220, `scrollTop=${t.scrollTop}`);
+  // A scroll event with a DIFFERENT scrollTop (a genuine user scroll) ends
+  // the programmatic-echo window and re-derives pin state normally.
+  t.scrollTop = 680; // 700 - 20: back at the bottom
+  ctrl.onScroll(t);
+  t.scrollHeight = 760;
+  check('adopted controller still re-pins on a genuine return', ctrl.followIfPinned(t) === true && t.scrollTop === 760, `scrollTop=${t.scrollTop}`);
+  check('adoptUnpinned(null) is a no-op', ctrl.adoptUnpinned(null) === false);
+  // Without adoption the same sequence snaps: pinned survives the switch and
+  // the observer callback destroys the restored position (the regression the
+  // adoption removes).
+  const stale = createScrollPin();
+  const s = el(380, 400, 20);
+  stale.followIfPinned(s);
+  s.scrollHeight = 500;
+  s.scrollTop = 220;
+  s.scrollHeight = 620;
+  check('stale pinned controller snaps the restored view on the swap (the bug adoption removes)', stale.handleResize(s) === true && s.scrollTop === 620, `scrollTop=${s.scrollTop}`);
+}
+
+// ---- NEAR-BOTTOM non-follow restore: the saved follow=false is AUTHORITATIVE ----
+// Remaining 0 is pinned; remaining 1 is already a scroll-away. A restored
+// follow=false view 1px above the bottom must NOT re-pin from geometry:
+// adoptUnpinned pins=false explicitly, the programmatic echo event cannot
+// re-classify, and later growth never snaps.
+{
+  const ctrl = createScrollPin();
+  const t = el(0, 100, 20);
+  ctrl.forcePin(t);
+  t.scrollHeight = 500;
+  t.scrollTop = 479;
+  check('near-bottom adoptUnpinned is still explicitly unpinned', ctrl.adoptUnpinned(t) === true && t.scrollTop === 479, `scrollTop=${t.scrollTop}`);
+  ctrl.onScroll(t);
+  t.scrollHeight = 560;
+  check('near-bottom non-follow restore never re-pins on the echo event', ctrl.followIfPinned(t) === false && t.scrollTop === 479, `scrollTop=${t.scrollTop}`);
+  check('near-bottom non-follow restore freezes on later growth', ctrl.handleResize(t) === false && t.scrollTop === 479, `scrollTop=${t.scrollTop}`);
+  t.scrollTop = 540;
+  ctrl.onScroll(t);
+  t.scrollHeight = 620;
+  check('near-bottom adopted controller re-pins on a genuine bottom return', ctrl.followIfPinned(t) === true && t.scrollTop === 620, `scrollTop=${t.scrollTop}`);
+}
+
+
 
 console.log(`\nscrollPin.test: ${ran} assertions, ${failures.length} failure(s)`);
 if (failures.length) {

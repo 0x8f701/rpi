@@ -33,11 +33,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{
     connect_async_with_config,
-    tungstenite::{
-        Message as WsMessage,
-        client::IntoClientRequest,
-        protocol::WebSocketConfig,
-    },
+    tungstenite::{Message as WsMessage, client::IntoClientRequest, protocol::WebSocketConfig},
 };
 
 /// `Sec-WebSocket-Protocol` prefix for collab guest authentication.
@@ -77,7 +73,10 @@ impl CollabGuestSink for PrintingGuestSink {
     fn on_snapshot(&mut self, snapshot: Value) {
         let entries = snapshot["entries"].as_array().map_or(0, Vec::len);
         let truncated = snapshot["truncated"].as_bool().unwrap_or(false);
-        println!("[collab] history ({entries} entries{})", if truncated { ", truncated" } else { "" });
+        println!(
+            "[collab] history ({entries} entries{})",
+            if truncated { ", truncated" } else { "" }
+        );
         for entry in snapshot["entries"].as_array().into_iter().flatten() {
             if let Some(text) = entry["message"]["content"]
                 .as_array()
@@ -200,9 +199,10 @@ pub fn spawn_guest(
     let (commands_tx, commands_rx) = mpsc::channel::<GuestCommand>(16);
     let role = link.secret.role;
     let room_id = link.room_id.clone();
-    let task = tokio::spawn(async move {
-        run_guest(&link, &original_link, commands_rx, sink.as_mut()).await
-    });
+    let task =
+        tokio::spawn(
+            async move { run_guest(&link, &original_link, commands_rx, sink.as_mut()).await },
+        );
     CollabGuestHandle {
         role,
         room_id,
@@ -250,16 +250,10 @@ struct Connection {
 
 impl Connection {
     fn new(link: &CollabLink, epoch: [u8; pi_coding::collab::EPOCH_LEN]) -> Result<Self> {
-        let s2c_key = derive_connection_key(
-            &link.secret.key,
-            &epoch,
-            FrameDirection::ServerToClient,
-        )?;
-        let c2s_key = derive_connection_key(
-            &link.secret.key,
-            &epoch,
-            FrameDirection::ClientToServer,
-        )?;
+        let s2c_key =
+            derive_connection_key(&link.secret.key, &epoch, FrameDirection::ServerToClient)?;
+        let c2s_key =
+            derive_connection_key(&link.secret.key, &epoch, FrameDirection::ClientToServer)?;
         Ok(Self {
             epoch,
             s2c_key,
@@ -396,12 +390,8 @@ async fn run_connection(
 }
 
 /// Validate the plaintext hello and return the issued epoch.
-fn parse_hello(
-    text: &str,
-    link: &CollabLink,
-) -> Result<[u8; pi_coding::collab::EPOCH_LEN]> {
-    let hello: Value =
-        serde_json::from_str(text).map_err(|_| anyhow!("malformed collab hello"))?;
+fn parse_hello(text: &str, link: &CollabLink) -> Result<[u8; pi_coding::collab::EPOCH_LEN]> {
+    let hello: Value = serde_json::from_str(text).map_err(|_| anyhow!("malformed collab hello"))?;
     if hello["type"] != "hello" {
         bail!("expected a collab hello message");
     }
@@ -426,7 +416,10 @@ fn parse_hello(
         .decode(epoch_b64)
         .map_err(|_| anyhow!("collab hello epoch is not valid base64url"))?;
     let epoch: [u8; pi_coding::collab::EPOCH_LEN] = epoch_bytes.try_into().map_err(|_| {
-        anyhow!("collab hello epoch must decode to exactly {} bytes", pi_coding::collab::EPOCH_LEN)
+        anyhow!(
+            "collab hello epoch must decode to exactly {} bytes",
+            pi_coding::collab::EPOCH_LEN
+        )
     })?;
     Ok(epoch)
 }
@@ -439,8 +432,8 @@ async fn handle_inbound_frame(
     frame: &[u8],
     sink: &mut dyn CollabGuestSink,
 ) -> Result<()> {
-    let (epoch, direction, seq, _body) = parse_frame_header(frame)
-        .ok_or_else(|| anyhow!("collab frame has a malformed header"))?;
+    let (epoch, direction, seq, _body) =
+        parse_frame_header(frame).ok_or_else(|| anyhow!("collab frame has a malformed header"))?;
     if epoch != conn.epoch || direction != FrameDirection::ServerToClient {
         bail!("collab frame header does not match this connection");
     }
@@ -456,7 +449,9 @@ async fn handle_inbound_frame(
         frame,
     )
     .map_err(|_| anyhow!("collab frame authentication failed"))?;
-    conn.receive.accept(seq).map_err(|error| anyhow!("collab receive window: {error:?}"))?;
+    conn.receive
+        .accept(seq)
+        .map_err(|error| anyhow!("collab receive window: {error:?}"))?;
     let payload: Value =
         serde_json::from_slice(&plaintext).map_err(|_| anyhow!("collab payload is not JSON"))?;
     match payload["type"].as_str() {
@@ -538,7 +533,8 @@ mod tests {
             ws_url_from_link(&http).expect("http link"),
             "ws://127.0.0.1:4321/collab/ws/roomA"
         );
-        let https = pi_coding::collab::format_link("https://collab.example:8443", "roomB", &control);
+        let https =
+            pi_coding::collab::format_link("https://collab.example:8443", "roomB", &control);
         assert_eq!(
             ws_url_from_link(&https).expect("https link"),
             "wss://collab.example:8443/collab/ws/roomB"
@@ -607,7 +603,8 @@ mod tests {
         bad_epoch["epoch"] = json!("!!!");
         assert!(parse_hello(&bad_epoch.to_string(), &link).is_err());
         let mut short_epoch = good.clone();
-        short_epoch["epoch"] = json!(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 4]));
+        short_epoch["epoch"] =
+            json!(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 4]));
         assert!(parse_hello(&short_epoch.to_string(), &link).is_err());
     }
 

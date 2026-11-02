@@ -1,35 +1,28 @@
-// Todo DAG panel — phases → tasks with status bullets, dependency
-// edges, readiness, per-task detail, and mutations via the `todo_op` RPC
-// (flattened pi_coding::TodoOp: {"type":"todo_op","op":"append",...}).
-//
-// Wire shapes mirror pi-coding (serde camelCase) — see crates/pi-coding/src/todo.rs.
+// Unified Todo page — ordinary DAG tasks (phases → tasks via `todo_op`) and
+// embedded durable child sessions. Wire shapes mirror pi-coding (serde
+// camelCase) — see crates/pi-coding/src/todo.rs.
 // EVERY model-derived string passes through redactSecrets() before display.
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import { TodoChildPanel } from './TodoChildPanel';
 import { safeText } from '../redact';
+import {
+  normalizeTodoNavigation,
+  type TodoExecutionStatus,
+  type TodoFailureReason,
+  type TodoNavigationState,
+  type TodoPhase,
+  type TodoStatus,
+} from './todoPanelState';
 
-export type TodoStatus = 'pending' | 'in_progress' | 'completed' | 'abandoned';
-
-export interface TodoBlockedReason {
-  taskId: string;
-  content: string;
-  status: TodoStatus;
-}
-
-export interface TodoTask {
-  id: string;
-  content: string;
-  status: TodoStatus;
-  dependsOn?: string[];
-  ready?: boolean;
-  blockedBy?: TodoBlockedReason[];
-  agent?: string | null;
-}
-
-export interface TodoPhase {
-  name: string;
-  tasks: TodoTask[];
-}
+export type {
+  TodoWaitingOn,
+  TodoNavigationState,
+  TodoPhase,
+  TodoSessionSnapshot,
+  TodoStatus,
+  TodoTask,
+} from './todoPanelState';
 
 /** Flattened `pi_coding::TodoOp` wire shape (serde tag = "op"). */
 export interface TodoOpPayload {
@@ -37,9 +30,15 @@ export interface TodoOpPayload {
   [key: string]: unknown;
 }
 
-interface TodoPanelProps {
+export interface TodoPanelProps {
   phases: TodoPhase[];
+  executionStatus: TodoExecutionStatus;
+  failureReason: TodoFailureReason | null;
+  navigation?: TodoNavigationState;
+  onNavigationChange?: (navigation: TodoNavigationState) => void;
   onOp: (op: TodoOpPayload) => void;
+  parentSessionId: string;
+  sendCommand: (command: Record<string, unknown>, bubbleId?: string) => Promise<unknown>;
   onClose: () => void;
 }
 
@@ -71,12 +70,12 @@ interface TaskCounts {
   total: number;
   open: number;
   active: number;
-  blocked: number;
+  waiting: number;
   completed: number;
 }
 
 function countTasks(phases: TodoPhase[]): TaskCounts {
-  const counts: TaskCounts = { total: 0, open: 0, active: 0, blocked: 0, completed: 0 };
+  const counts: TaskCounts = { total: 0, open: 0, active: 0, waiting: 0, completed: 0 };
   for (const phase of phases) {
     for (const task of phase.tasks) {
       counts.total += 1;
@@ -84,7 +83,7 @@ function countTasks(phases: TodoPhase[]): TaskCounts {
       if (isOpen(task.status)) {
         counts.open += 1;
         if (task.status === 'in_progress') counts.active += 1;
-        if (task.blockedBy && task.blockedBy.length > 0) counts.blocked += 1;
+        if (task.waitingOn && task.waitingOn.length > 0) counts.waiting += 1;
       }
     }
   }
@@ -100,12 +99,39 @@ function taskContentById(phases: TodoPhase[], id: string): string {
   return id;
 }
 
-export function TodoPanel({ phases, onOp, onClose }: TodoPanelProps) {
+export function TodoPanel({
+  phases,
+  executionStatus,
+  failureReason,
+  navigation,
+  onNavigationChange,
+  onOp,
+  parentSessionId,
+  sendCommand,
+  onClose,
+}: TodoPanelProps) {
   const [addPhase, setAddPhase] = useState('');
   const [addContent, setAddContent] = useState('');
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [localNavigation, setLocalNavigation] = useState<TodoNavigationState>({ selectedTaskId: null });
+  const activeNavigation = navigation ?? localNavigation;
+  const selectedId = activeNavigation.selectedTaskId;
   const [editingDeps, setEditingDeps] = useState(false);
   const [depChoice, setDepChoice] = useState('');
+
+  const updateNavigation = (next: TodoNavigationState) => {
+    if (navigation === undefined) setLocalNavigation(next);
+    onNavigationChange?.(next);
+  };
+
+  useEffect(() => {
+    if (!activeNavigation.selectedTaskId) return;
+    const exists = phases.some((phase) => phase.tasks.some((task) => task.id === activeNavigation.selectedTaskId));
+    if (exists) return;
+    const next = normalizeTodoNavigation(activeNavigation, phases);
+    if (navigation === undefined) setLocalNavigation(next);
+    onNavigationChange?.(next);
+  }, [activeNavigation, navigation, onNavigationChange, phases]);
+
 
   const counts = useMemo(() => countTasks(phases), [phases]);
 
@@ -150,26 +176,33 @@ export function TodoPanel({ phases, onOp, onClose }: TodoPanelProps) {
   };
 
   const selectTask = (id: string) => {
-    setSelectedId(id);
+    updateNavigation({ selectedTaskId: id });
     setEditingDeps(false);
     setDepChoice('');
   };
 
   return (
-    <aside id="todo-panel" className="todo-panel" aria-label="Todo DAG panel">
+    <aside id="todo-panel" className="todo-panel" aria-label="Todo panel">
       <div className="todo-panel__head">
-        <span className="todo-panel__title">Todos</span>
-        <span className="todo-panel__counts" id="todo-counts" title="open · active · blocked · completed">
+        <span className="todo-panel__title">Todo</span>
+        <span className="todo-panel__counts" id="todo-counts" title="open · active · waiting · completed">
           <span className="todo-panel__counts-item">{counts.open} open</span> ·{' '}
           <span className="todo-panel__counts-item">{counts.active} active</span> ·{' '}
-          <span className="todo-panel__counts-item">{counts.blocked} blocked</span> ·{' '}
+          <span className="todo-panel__counts-item">{counts.waiting} waiting</span> ·{' '}
           <span className="todo-panel__counts-item">{counts.completed} done</span>
         </span>
-        <button id="todo-close-btn" type="button" className="todo-panel__close" title="Close todos panel" aria-label="Close todos panel" onClick={onClose}>
+        <button id="todo-close-btn" type="button" className="todo-panel__close" title="Close Todo module" aria-label="Close Todo module" onClick={onClose}>
           ×
         </button>
       </div>
-
+      {executionStatus === 'failed' && failureReason && (
+        <div className="todo-panel__failure" role="alert">
+          <strong>Executor failed</strong>
+          <span>{safeText(failureReason.message)}</span>
+        </div>
+      )}
+      <section className="todo-panel__tasks" aria-labelledby="todo-tasks-heading">
+        <h3 id="todo-tasks-heading" className="todo-panel__section-heading">Tasks</h3>
       <div className="todo-panel__add">
         <input
           id="todo-add-phase"
@@ -204,6 +237,7 @@ export function TodoPanel({ phases, onOp, onClose }: TodoPanelProps) {
         </button>
       </div>
 
+
       <div className="todo-panel__phases">
         {phases.length === 0 && (
           <div className="todo-panel__empty">
@@ -224,7 +258,7 @@ export function TodoPanel({ phases, onOp, onClose }: TodoPanelProps) {
               </h4>
               <ul className="todo-phase__tasks">
                 {phase.tasks.map((task) => {
-                  const blocked = isOpen(task.status) && (task.blockedBy?.length ?? 0) > 0;
+                  const waiting = isOpen(task.status) && (task.waitingOn?.length ?? 0) > 0;
                   const isSelected = task.id === selectedId;
                   return (
                     <li
@@ -243,9 +277,9 @@ export function TodoPanel({ phases, onOp, onClose }: TodoPanelProps) {
                       <span className="todo-task__content" title={safeText(task.content)}>
                         {safeText(task.content)}
                       </span>
-                      {blocked && (
-                        <span className="todo-task__blocked" title="blocked by unfinished dependencies">
-                          ⛔
+                      {waiting && (
+                        <span className="todo-task__waiting" title="waiting on unfinished dependencies">
+                          dependencies
                         </span>
                       )}
                       {task.status === 'completed' || task.status === 'abandoned' ? (
@@ -288,7 +322,7 @@ export function TodoPanel({ phases, onOp, onClose }: TodoPanelProps) {
         <div className="todo-detail" id="todo-detail" data-task-id={selected.task.id}>
           <div className="todo-detail__head">
             <span className="todo-detail__title">Task detail</span>
-            <button type="button" className="todo-panel__close" title="Clear selection" onClick={() => setSelectedId(null)}>
+            <button type="button" className="todo-panel__close" title="Clear selection" onClick={() => updateNavigation({ selectedTaskId: null })}>
               ×
             </button>
           </div>
@@ -372,19 +406,19 @@ export function TodoPanel({ phases, onOp, onClose }: TodoPanelProps) {
             )}
           </div>
 
-          {selected.task.blockedBy && selected.task.blockedBy.length > 0 && (
+          {selected.task.waitingOn && selected.task.waitingOn.length > 0 && (
             <div className="todo-detail__section">
               <div className="todo-detail__section-head">
-                <span>blocked by</span>
+                <span>waiting on</span>
               </div>
               <ul className="todo-detail__deps">
-                {selected.task.blockedBy.map((b) => (
-                  <li key={b.taskId}>
-                    <span className="todo-detail__dep-label" title={safeText(b.taskId)}>
-                      {safeText(b.content)}
+                {selected.task.waitingOn.map((dependency) => (
+                  <li key={dependency.taskId}>
+                    <span className="todo-detail__dep-label" title={safeText(dependency.taskId)}>
+                      {safeText(dependency.content)}
                     </span>
-                    <span className={`todo-detail__dep-status todo-detail__status--${b.status}`}>
-                      {STATUS_LABEL[b.status]}
+                    <span className={`todo-detail__dep-status todo-detail__status--${dependency.status}`}>
+                      {STATUS_LABEL[dependency.status]}
                     </span>
                   </li>
                 ))}
@@ -405,6 +439,8 @@ export function TodoPanel({ phases, onOp, onClose }: TodoPanelProps) {
           </div>
         </div>
       )}
+      </section>
+      <TodoChildPanel parentSessionId={parentSessionId} sendCommand={sendCommand} />
     </aside>
   );
 }

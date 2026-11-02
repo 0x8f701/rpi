@@ -289,8 +289,8 @@ class RpcClient:
             "LANG": os.environ.get("LANG", "C.UTF-8"),
             "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
             "PI_CODING_AGENT_DIR": str(Path(home) / ".pi" / "agent"),
-            "PI_OFFLINE": "1",
-            "PI_SKIP_VERSION_CHECK": "1",
+            "RPI_OFFLINE": "1",
+            "RPI_SKIP_VERSION_CHECK": "1",
             "TERM": "xterm-256color",
         }
         stderr.parent.mkdir(parents=True, exist_ok=True)

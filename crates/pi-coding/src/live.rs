@@ -265,7 +265,8 @@ pub fn parse_wav_capture(wav: &[u8]) -> Result<AudioCapture> {
     let mut data_len: Option<usize> = None;
     while offset + 8 <= wav.len() {
         let id = &wav[offset..offset + 4];
-        let size = u32::from_le_bytes(wav[offset + 4..offset + 8].try_into().expect("4 bytes")) as usize;
+        let size =
+            u32::from_le_bytes(wav[offset + 4..offset + 8].try_into().expect("4 bytes")) as usize;
         let body = offset + 8;
         let end = body
             .checked_add(size)
@@ -285,8 +286,10 @@ pub fn parse_wav_capture(wav: &[u8]) -> Result<AudioCapture> {
                 }
                 let format = u16::from_le_bytes([wav[body], wav[body + 1]]);
                 let channels = u16::from_le_bytes([wav[body + 2], wav[body + 3]]);
-                let sample_rate = u32::from_le_bytes(wav[body + 4..body + 8].try_into().expect("4 bytes"));
-                let byte_rate = u32::from_le_bytes(wav[body + 8..body + 12].try_into().expect("4 bytes"));
+                let sample_rate =
+                    u32::from_le_bytes(wav[body + 4..body + 8].try_into().expect("4 bytes"));
+                let byte_rate =
+                    u32::from_le_bytes(wav[body + 8..body + 12].try_into().expect("4 bytes"));
                 let block_align = u16::from_le_bytes([wav[body + 12], wav[body + 13]]);
                 let bits = u16::from_le_bytes([wav[body + 14], wav[body + 15]]);
                 fmt = Some((format, channels, sample_rate, byte_rate, block_align, bits));
@@ -350,9 +353,7 @@ pub fn parse_wav_capture(wav: &[u8]) -> Result<AudioCapture> {
         bail!("audio has an empty data chunk");
     }
     if data_len % usize::from(block_align) != 0 {
-        bail!(
-            "audio data length {data_len} is not aligned to the {block_align}-byte block align"
-        );
+        bail!("audio data length {data_len} is not aligned to the {block_align}-byte block align");
     }
     let duration = Duration::from_secs_f64(data_len as f64 / f64::from(byte_rate));
     if duration > MAX_RECORDING_DURATION {
@@ -470,7 +471,8 @@ impl AudioBuffer {
         let capacity = Self::max_samples();
         if chunk.len() >= capacity {
             self.samples.clear();
-            self.samples.extend_from_slice(&chunk[chunk.len() - capacity..]);
+            self.samples
+                .extend_from_slice(&chunk[chunk.len() - capacity..]);
             return;
         }
         let overflow = self
@@ -633,7 +635,8 @@ impl MultipartBody {
     }
 
     fn push_field(&mut self, name: &str, value: &str) {
-        self.bytes.extend_from_slice(format!("--{}\r\n", self.boundary).as_bytes());
+        self.bytes
+            .extend_from_slice(format!("--{}\r\n", self.boundary).as_bytes());
         self.bytes.extend_from_slice(
             format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
         );
@@ -642,38 +645,101 @@ impl MultipartBody {
     }
 
     fn push_file(&mut self, name: &str, filename: &str, content_type: &str, content: &[u8]) {
-        self.bytes.extend_from_slice(format!("--{}\r\n", self.boundary).as_bytes());
+        self.bytes
+            .extend_from_slice(format!("--{}\r\n", self.boundary).as_bytes());
         self.bytes.extend_from_slice(
-            format!("Content-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\n").as_bytes(),
+            format!("Content-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\n")
+                .as_bytes(),
         );
-        self.bytes.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
+        self.bytes
+            .extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
         self.bytes.extend_from_slice(content);
         self.bytes.extend_from_slice(b"\r\n");
     }
 
     fn finish(mut self) -> (String, Vec<u8>) {
-        self.bytes.extend_from_slice(format!("--{}--\r\n", self.boundary).as_bytes());
+        self.bytes
+            .extend_from_slice(format!("--{}--\r\n", self.boundary).as_bytes());
         (self.boundary, self.bytes)
     }
+}
+
+/// Resolves the configured `language` setting to the multipart `language`
+/// value, or `None` to omit the field:
+///
+/// - `None` and empty/whitespace-only values → `None` (field omitted);
+/// - the literal `auto`, matched case-insensitively after trimming → the
+///   process locale normalized into a language tag, or `None` when the
+///   locale yields no usable language;
+/// - any other value → the trimmed value, passed through unchanged (never
+///   normalized).
+///
+/// Locale precedence follows the POSIX standard for the active locale:
+/// `LC_ALL`, then `LC_MESSAGES`, then `LANG`; the first non-empty value
+/// wins. A POSIX locale (`language[_territory][.codeset][@modifier]`) is
+/// normalized by stripping its codeset and modifier suffixes and mapping `_`
+/// to `-`, so `fr_FR.UTF-8` resolves to `fr-FR`. The `C`/`POSIX` locales
+/// (including `C.UTF-8`) and an environment with no non-empty locale resolve
+/// to `None`, omitting the field.
+///
+/// `lookup` abstracts environment access (`transcribe` supplies
+/// `std::env::var`) so tests exercise precedence and normalization with a
+/// supplied lookup instead of mutating the process-wide environment, which
+/// would race under parallel test execution.
+fn resolve_stt_language(
+    configured: Option<&str>,
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> Option<String> {
+    let Some(value) = configured else {
+        return None;
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if !value.eq_ignore_ascii_case("auto") {
+        return Some(value.to_owned());
+    }
+    for key in ["LC_ALL", "LC_MESSAGES", "LANG"] {
+        let Some(raw) = lookup(key) else {
+            continue;
+        };
+        let locale = raw.trim();
+        if locale.is_empty() {
+            continue;
+        }
+        let normalized = locale
+            .split(['.', '@'])
+            .next()
+            .expect("non-empty locale")
+            .replace('_', "-");
+        if normalized.is_empty()
+            || normalized.eq_ignore_ascii_case("C")
+            || normalized.eq_ignore_ascii_case("POSIX")
+        {
+            return None;
+        }
+        return Some(normalized);
+    }
+    None
 }
 
 /// HTTP client for `POST {base}/v1/audio/transcriptions`.
 #[derive(Clone)]
 pub struct SttClient {
-    http: reqwest::Client,
+    executor: pi_ai::SharedHttpExecutor,
 }
 
 impl SttClient {
-    pub fn new() -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .timeout(STT_REQUEST_TIMEOUT)
-            .build()
-            .context("building STT HTTP client")?;
-        Ok(Self { http })
+    pub fn new_with_executor(executor: pi_ai::SharedHttpExecutor) -> Self {
+        Self { executor }
     }
 
     /// Transcribes an in-memory WAV through the configured endpoint and
-    /// returns the transcript text. Errors are actionable and redacted: the
+    /// returns the transcript text. The multipart `language` field is omitted
+    /// when unset or empty, passed through unchanged for an explicit value,
+    /// and resolved from the process locale for the `auto` sentinel (see
+    /// [`resolve_stt_language`]). Errors are actionable and redacted: the
     /// bearer key is never included, and server-echoed secrets are scrubbed.
     pub async fn transcribe(
         &self,
@@ -685,48 +751,39 @@ impl SttClient {
         let mut body = MultipartBody::new();
         body.push_file("file", AUDIO_FILENAME, "audio/wav", &capture.wav);
         body.push_field("model", &settings.stt_model);
-        if let Some(language) = settings.language.as_deref().filter(|value| !value.trim().is_empty()) {
-            body.push_field("language", language);
+        if let Some(language) =
+            resolve_stt_language(settings.language.as_deref(), |key| std::env::var(key).ok())
+        {
+            body.push_field("language", &language);
         }
         let (boundary, bytes) = body.finish();
-        let mut response = self
-            .http
-            .post(&url)
-            .header(
-                reqwest::header::CONTENT_TYPE,
-                format!("multipart/form-data; boundary={boundary}"),
-            )
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", settings.stt_api_key))
-            .body(bytes)
-            .send()
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_str(&format!("multipart/form-data; boundary={boundary}"))?,
+        );
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_str(&format!("Bearer {}", settings.stt_api_key))?,
+        );
+        let request = pi_ai::request_from_url(
+            pi_ai::HttpMethod::Post,
+            &url,
+            &headers,
+            bytes,
+            &pi_ai::StreamOptions {
+                timeout_ms: Some(STT_REQUEST_TIMEOUT.as_millis() as u64),
+                ..Default::default()
+            },
+            STT_MAX_RESPONSE_BYTES as u64,
+        )?;
+        let response = self
+            .executor
+            .execute(request)
             .await
             .context("STT request failed")?;
         let status = response.status();
-        // Bound the response BEFORE reading: a Content-Length declared over
-        // the cap fails immediately, and the body is otherwise streamed in
-        // chunks with a hard byte cap so a hostile endpoint can never
-        // allocate unbounded memory or project an oversized transcript into
-        // the RPC frame / composer.
-        if let Some(length) = response.content_length() {
-            if length > STT_MAX_RESPONSE_BYTES as u64 {
-                bail!(
-                    "STT response of {length} bytes exceeds the {STT_MAX_RESPONSE_BYTES}-byte cap"
-                );
-            }
-        }
-        let mut bytes = Vec::with_capacity(1024);
-        loop {
-            let chunk = response.chunk().await.context("reading STT response body")?;
-            let Some(chunk) = chunk else {
-                break;
-            };
-            if bytes.len().saturating_add(chunk.len()) > STT_MAX_RESPONSE_BYTES {
-                bail!(
-                    "STT response exceeds the {STT_MAX_RESPONSE_BYTES}-byte cap"
-                );
-            }
-            bytes.extend_from_slice(&chunk);
-        }
+        let bytes = pi_ai::collect_response_body(response).await?;
         let text = String::from_utf8_lossy(&bytes);
         if !status.is_success() {
             // The endpoint URL is deliberately NOT echoed (the browser must
@@ -770,7 +827,11 @@ fn parse_transcript_response(body: &str) -> Result<String> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|text| !text.is_empty())
-        .map(|text| text.chars().take(STT_MAX_TRANSCRIPT_CHARS).collect::<String>())
+        .map(|text| {
+            text.chars()
+                .take(STT_MAX_TRANSCRIPT_CHARS)
+                .collect::<String>()
+        })
         .ok_or_else(|| {
             anyhow!(
                 "STT endpoint response had no `text` field: {}",
@@ -908,24 +969,63 @@ pub async fn run_ptt_session(
 /// the voice model; rpi's generic STT cannot, so the bridge detects the
 /// intent client-side from the transcript text.
 pub const DELEGATION_VERBS: &[&str] = &[
-    "implement", "fix", "add", "test", "refactor", "write", "create",
-    "update", "change", "remove", "delete", "debug", "repair", "migrate",
-    "optimize", "rewrite", "extend", "port",
+    "implement",
+    "fix",
+    "add",
+    "test",
+    "refactor",
+    "write",
+    "create",
+    "update",
+    "change",
+    "remove",
+    "delete",
+    "debug",
+    "repair",
+    "migrate",
+    "optimize",
+    "rewrite",
+    "extend",
+    "port",
 ];
 
 /// Code-domain nouns that pair with a verb to mark a delegation candidate.
 const DELEGATION_CODE_WORDS: &[&str] = &[
-    "function", "class", "struct", "enum", "trait", "module", "crate", "api",
-    "endpoint", "cli", "library", "package", "dependency", "import", "build",
-    "bug", "crash", "panic", "error", "test", "code", "script", "config",
-    "schema", "database", "server", "client", "implementation", "interface",
+    "function",
+    "class",
+    "struct",
+    "enum",
+    "trait",
+    "module",
+    "crate",
+    "api",
+    "endpoint",
+    "cli",
+    "library",
+    "package",
+    "dependency",
+    "import",
+    "build",
+    "bug",
+    "crash",
+    "panic",
+    "error",
+    "test",
+    "code",
+    "script",
+    "config",
+    "schema",
+    "database",
+    "server",
+    "client",
+    "implementation",
+    "interface",
 ];
 
 /// File-extension signals (with the leading dot) that mark code-domain text.
 const DELEGATION_EXTENSIONS: &[&str] = &[
-    ".rs", ".py", ".ts", ".js", ".go", ".c", ".cpp", ".h", ".java", ".rb",
-    ".php", ".toml", ".json", ".yaml", ".yml", ".md", ".sh", ".sql", ".html",
-    ".css", ".lock",
+    ".rs", ".py", ".ts", ".js", ".go", ".c", ".cpp", ".h", ".java", ".rb", ".php", ".toml",
+    ".json", ".yaml", ".yml", ".md", ".sh", ".sql", ".html", ".css", ".lock",
 ];
 
 /// True when `text` reads like a coding task worth delegating to the bound
@@ -957,9 +1057,9 @@ pub fn is_delegation_candidate(text: &str) -> bool {
 /// "test" is both a verb and a code noun, so "test the microphone" must not
 /// read as a coding task while "test the function" and "add tests" do.
 fn has_code_signal(lower: &str, verb_position: usize) -> bool {
-    let word_signal = DELEGATION_CODE_WORDS.iter().any(|word| {
-        find_code_word(lower, word).is_some_and(|position| position != verb_position)
-    });
+    let word_signal = DELEGATION_CODE_WORDS
+        .iter()
+        .any(|word| find_code_word(lower, word).is_some_and(|position| position != verb_position));
     word_signal
         || DELEGATION_EXTENSIONS
             .iter()
@@ -1035,9 +1135,9 @@ pub(crate) mod cpal_backend {
     impl CpalCapture {
         pub fn open() -> Result<Self> {
             let host = cpal::default_host();
-            let device = host
-                .default_input_device()
-                .ok_or_else(|| anyhow!("No microphone found — connect a microphone and try again"))?;
+            let device = host.default_input_device().ok_or_else(|| {
+                anyhow!("No microphone found — connect a microphone and try again")
+            })?;
             let default_config = device
                 .default_input_config()
                 .context("reading default microphone format")?;
@@ -1081,7 +1181,10 @@ pub(crate) mod cpal_backend {
                 }
             }
             let Some(stream) = stream else {
-                return Err(anyhow!("Could not open the microphone: {}", errors.join("; ")));
+                return Err(anyhow!(
+                    "Could not open the microphone: {}",
+                    errors.join("; ")
+                ));
             };
             stream.play().context("starting microphone capture")?;
             Ok(Self { stream, chunks: rx })
@@ -1130,8 +1233,9 @@ pub(crate) mod cpal_backend {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
 
-    use futures_util::future;
+    use futures_util::{FutureExt as _, future, stream};
     use tokio::sync::mpsc;
 
     use super::*;
@@ -1208,7 +1312,10 @@ mod tests {
         for scheme in ["ws", "wss"] {
             let s = settings(&format!("{scheme}://stt.example/v1"));
             let error = validate_live_settings(&s).unwrap_err().to_string();
-            assert!(error.contains("http"), "ws scheme rejected for {scheme}: {error}");
+            assert!(
+                error.contains("http"),
+                "ws scheme rejected for {scheme}: {error}"
+            );
             assert!(error.contains("audio/transcriptions"), "{error}");
         }
     }
@@ -1229,9 +1336,18 @@ mod tests {
         };
         let error = validate_live_settings(&s).unwrap_err().to_string();
         assert!(error.contains("realtime"), "{error}");
-        assert!(error.contains("rpi --listen 127.0.0.1:8080"), "must give a valid listen command: {error}");
-        assert!(error.contains("/web"), "must point at the /web page: {error}");
-        assert!(!error.contains("/live page"), "must not reference a /live web page: {error}");
+        assert!(
+            error.contains("rpi --listen 127.0.0.1:8080"),
+            "must give a valid listen command: {error}"
+        );
+        assert!(
+            error.contains("/web"),
+            "must point at the /web page: {error}"
+        );
+        assert!(
+            !error.contains("/live page"),
+            "must not reference a /live web page: {error}"
+        );
         assert!(
             !error.contains("sttBaseUrl"),
             "realtime must not misreport a missing sttBaseUrl: {error}"
@@ -1511,7 +1627,10 @@ mod tests {
         wav.extend_from_slice(&4u32.to_le_bytes());
         wav.extend_from_slice(&[0u8; 4]);
         let error = parse_wav_capture(&wav).expect_err("must reject duplicate data");
-        assert!(error.to_string().contains("multiple data chunks"), "{error}");
+        assert!(
+            error.to_string().contains("multiple data chunks"),
+            "{error}"
+        );
 
         // Two fmt chunks: the second must not override the first.
         let mut wav = Vec::new();
@@ -1696,9 +1815,9 @@ mod tests {
         let mut machine = LiveMachine::new();
         machine.press();
         assert!(!machine.watchdog_fires(Instant::now() + Duration::from_secs(9)));
-        assert!(machine.watchdog_fires(
-            Instant::now() + NO_SPEECH_TIMEOUT + Duration::from_millis(1)
-        ));
+        assert!(
+            machine.watchdog_fires(Instant::now() + NO_SPEECH_TIMEOUT + Duration::from_millis(1))
+        );
         let outcome = machine.watchdog_fire();
         assert!(matches!(
             outcome,
@@ -1744,65 +1863,143 @@ mod tests {
     // STT client against a mock HTTP server
     // ------------------------------------------------------------------
 
-    /// Serves one request on a dedicated blocking thread (deterministic in
-    /// tests — no tokio task scheduling involved); `assert_request` inspects
-    /// the raw HTTP/1.1 request head, path, and body, then replies with
-    /// `response`.
-    fn serve_once(
-        assert_request: impl FnOnce(String, String, Vec<u8>) + Send + 'static,
-        response: Vec<u8>,
-    ) -> String {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let address = listener.local_addr().expect("address");
-        std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().expect("accept");
-            // Phase 1: read the header section (ASCII) up to the terminator.
-            let mut request: Vec<u8> = Vec::new();
-            let mut buffer = [0u8; 4096];
-            let header_end = loop {
-                if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
-                    break position + 4;
-                }
-                let read = socket.read(&mut buffer).expect("read");
-                if read == 0 {
-                    break 0;
-                }
-                request.extend_from_slice(&buffer[..read]);
-            };
-            let head = String::from_utf8_lossy(&request[..header_end]).into_owned();
-            let content_length = head
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().expect("content length"))
-                })
-                .unwrap_or(0);
-            // Phase 2: read exactly content-length raw body bytes (the WAV is
-            // binary; it must never go through a UTF-8 lossy conversion).
-            while request.len() < header_end.saturating_add(content_length) {
-                let read = socket.read(&mut buffer).expect("read body");
-                if read == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buffer[..read]);
-            }
-            let path = head.split(' ').nth(1).unwrap_or("").to_owned();
-            assert_request(head, path, request[header_end..].to_vec());
-            socket.write_all(&response).expect("respond");
-        });
-        format!("http://{address}")
+    #[derive(Debug)]
+    struct RecordedHttpRequest {
+        path_and_query: String,
+        headers: http::HeaderMap,
+        body: Vec<u8>,
     }
 
-    /// Builds a JSON HTTP/1.1 response with a correct Content-Length (the
-    /// literal fixtures were hand-miscounted and mis-framed the response).
-    fn http_response(status: &str, body: &str) -> Vec<u8> {
-        format!(
-            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        )
-        .into_bytes()
+    enum TestHttpOutcome {
+        Response(TestHttpResponse),
+        Failure,
+    }
+
+    struct TestHttpResponse {
+        status: http::StatusCode,
+        headers: http::HeaderMap,
+        chunks: Vec<Vec<u8>>,
+    }
+
+    #[derive(Clone)]
+    struct TestHttpExecutor {
+        outcomes: Arc<Mutex<VecDeque<TestHttpOutcome>>>,
+        requests: Arc<Mutex<Vec<RecordedHttpRequest>>>,
+    }
+
+    impl pi_ai::HttpExecutor for TestHttpExecutor {
+        fn execute<'a>(
+            &'a self,
+            request: pi_ai::HttpRequest,
+        ) -> futures_util::future::BoxFuture<'a, Result<pi_ai::HttpResponse>> {
+            async move {
+                let parts = request.into_parts();
+                let bound = parts.max_response_bytes.get();
+                self.requests
+                    .lock()
+                    .expect("request lock")
+                    .push(RecordedHttpRequest {
+                        path_and_query: parts.path_and_query,
+                        headers: parts.headers.into_iter().collect(),
+                        body: parts.body,
+                    });
+                let outcome = self
+                    .outcomes
+                    .lock()
+                    .expect("outcome lock")
+                    .pop_front()
+                    .ok_or_else(|| anyhow!("unexpected test HTTP request"))?;
+                match outcome {
+                    TestHttpOutcome::Failure => {
+                        Err(anyhow!("deterministic test transport failure"))
+                    }
+                    TestHttpOutcome::Response(response) => {
+                        let declared_oversize = response
+                            .headers
+                            .get(http::header::CONTENT_LENGTH)
+                            .and_then(|value| value.to_str().ok())
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .is_some_and(|length| length > bound);
+                        let streamed_bytes = response
+                            .chunks
+                            .iter()
+                            .try_fold(0_u64, |total, chunk| total.checked_add(chunk.len() as u64));
+                        let chunks: Vec<Result<Vec<u8>>> = if declared_oversize
+                            || streamed_bytes.is_none_or(|total| total > bound)
+                        {
+                            vec![Err(anyhow!(
+                                "test HTTP response exceeds the {bound}-byte limit"
+                            ))]
+                        } else {
+                            response.chunks.into_iter().map(Ok).collect()
+                        };
+                        Ok(pi_ai::HttpResponse::new(
+                            response.status,
+                            response.headers,
+                            Box::pin(stream::iter(chunks)),
+                        ))
+                    }
+                }
+            }
+            .boxed()
+        }
+    }
+
+    fn test_client(outcome: TestHttpOutcome) -> (SttClient, Arc<Mutex<Vec<RecordedHttpRequest>>>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let executor = TestHttpExecutor {
+            outcomes: Arc::new(Mutex::new(VecDeque::from([outcome]))),
+            requests: requests.clone(),
+        };
+        (SttClient::new_with_executor(Arc::new(executor)), requests)
+    }
+
+    fn unused_test_client() -> SttClient {
+        SttClient::new_with_executor(Arc::new(TestHttpExecutor {
+            outcomes: Arc::new(Mutex::new(VecDeque::new())),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        }))
+    }
+
+    fn http_response(status: &str, body: impl Into<Vec<u8>>) -> TestHttpOutcome {
+        let body = body.into();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from_str(&body.len().to_string()).expect("content length"),
+        );
+        TestHttpOutcome::Response(TestHttpResponse {
+            status: status
+                .split_whitespace()
+                .next()
+                .expect("HTTP status code")
+                .parse()
+                .expect("HTTP status"),
+            headers,
+            chunks: vec![body],
+        })
+    }
+
+    fn response_without_content_length(status: &str, body: Vec<u8>) -> TestHttpOutcome {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/plain"),
+        );
+        TestHttpOutcome::Response(TestHttpResponse {
+            status: status
+                .split_whitespace()
+                .next()
+                .expect("HTTP status code")
+                .parse()
+                .expect("HTTP status"),
+            headers,
+            chunks: vec![body],
+        })
     }
 
     fn wav_fixture() -> AudioCapture {
@@ -1818,102 +2015,279 @@ mod tests {
 
     #[tokio::test]
     async fn stt_client_sends_expected_multipart_shape() {
-        let base = serve_once(
-            |head, path, body| {
-                // The boundary must be read from the original-case head: the
-                // body preserves the boundary's case, so lowercasing first
-                // would break the terminating-boundary match below.
-                let boundary = head
-                    .lines()
-                    .find_map(|line| {
-                        line.strip_prefix("content-type: multipart/form-data; boundary=")
-                            .map(str::trim)
-                    })
-                    .expect("multipart content type");
-                let head = head.to_ascii_lowercase();
-                assert_eq!(path, "/v1/audio/transcriptions", "base URL join");
-                assert!(
-                    head.contains("authorization: bearer test-live-key"),
-                    "bearer header: {head}"
-                );
-                let body = String::from_utf8_lossy(&body).to_owned();
-                assert!(
-                    body.contains("name=\"file\"; filename=\"audio.wav\""),
-                    "file part: {body}"
-                );
-                assert!(body.contains("name=\"model\""), "model part: {body}");
-                assert!(body.contains("whisper-1"), "model value: {body}");
-                assert!(!body.contains("name=\"language\""), "no language when unset");
-                assert!(body.contains("RIFF"), "wav bytes embedded: {body}");
-                assert!(
-                    body.contains(&format!("--{boundary}--")),
-                    "terminating boundary; boundary={boundary}; received body: {body}"
-                );
-            },
-            http_response("200 OK", r#"{"text":"hello world"}"#),
-        );
-        let settings = settings(&base);
-        let client = SttClient::new().expect("client");
+        let (client, requests) = test_client(http_response("200 OK", r#"{"text":"hello world"}"#));
+        let configured = settings("http://stt.test");
         let text = client
-            .transcribe(&settings, &wav_fixture())
+            .transcribe(&configured, &wav_fixture())
             .await
             .expect("transcribe");
         assert_eq!(text, "hello world");
+
+        let requests = requests.lock().expect("requests");
+        let request = requests.first().expect("STT request");
+        assert_eq!(
+            request.path_and_query, "/v1/audio/transcriptions",
+            "base URL join"
+        );
+        assert_eq!(
+            request
+                .headers
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer test-live-key"),
+            "bearer header"
+        );
+        let content_type = request
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .expect("multipart content type");
+        let boundary = content_type
+            .strip_prefix("multipart/form-data; boundary=")
+            .expect("multipart boundary");
+        let body = String::from_utf8_lossy(&request.body);
+        assert!(
+            body.contains("name=\"file\"; filename=\"audio.wav\""),
+            "file part: {body}"
+        );
+        assert!(body.contains("name=\"model\""), "model part: {body}");
+        assert!(body.contains("whisper-1"), "model value: {body}");
+        assert!(
+            !body.contains("name=\"language\""),
+            "no language when unset"
+        );
+        assert!(body.contains("RIFF"), "wav bytes embedded: {body}");
+        assert!(
+            body.contains(&format!("--{boundary}--")),
+            "terminating boundary; boundary={boundary}; received body: {body}"
+        );
     }
 
     #[tokio::test]
     async fn stt_client_includes_language_when_configured() {
-        let base = serve_once(
-            |_head, _path, body| {
-                let body = String::from_utf8_lossy(&body).to_owned();
-                assert!(body.contains("name=\"language\""), "language part: {body}");
-                assert!(body.contains("en-US"), "language value: {body}");
-            },
-            http_response("200 OK", r#"{"text":"translated"}"#),
-        );
-        let mut configured = settings(&base);
+        let (client, requests) = test_client(http_response("200 OK", r#"{"text":"translated"}"#));
+        let mut configured = settings("http://stt.test");
         configured.language = Some("en-US".to_owned());
-        let client = SttClient::new().expect("client");
         let text = client
             .transcribe(&configured, &wav_fixture())
             .await
             .expect("transcribe");
         assert_eq!(text, "translated");
+        let requests = requests.lock().expect("requests");
+        let body = String::from_utf8_lossy(&requests.first().expect("STT request").body);
+        assert!(body.contains("name=\"language\""), "language part: {body}");
+        assert!(body.contains("en-US"), "language value: {body}");
+    }
+
+    // ------------------------------------------------------------------
+    // STT `language` field: `auto` locale resolution + explicit pass-through
+    // ------------------------------------------------------------------
+
+    /// Maps a name→value table into the `lookup` the resolver consumes, so
+    /// locale precedence/normalization is exercised with a supplied lookup
+    /// instead of mutating the process-wide environment (which would race
+    /// under parallel test execution).
+    fn env_lookup<'a>(
+        entries: &'a [(&'a str, &'a str)],
+    ) -> impl FnMut(&str) -> Option<String> + 'a {
+        let entries: Vec<(&str, &str)> = entries.to_vec();
+        move |key| {
+            entries
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| (*value).to_owned())
+        }
+    }
+
+    #[test]
+    fn stt_language_resolves_auto_with_lc_all_over_lc_messages_over_lang() {
+        assert_eq!(
+            resolve_stt_language(
+                Some("auto"),
+                &mut env_lookup(&[
+                    ("LC_ALL", "fr_FR.UTF-8"),
+                    ("LC_MESSAGES", "de_DE.UTF-8"),
+                    ("LANG", "en_US.UTF-8"),
+                ]),
+            )
+            .as_deref(),
+            Some("fr-FR"),
+            "LC_ALL wins over LC_MESSAGES and LANG"
+        );
+    }
+
+    #[test]
+    fn stt_language_skips_empty_locale_values_in_precedence_order() {
+        assert_eq!(
+            resolve_stt_language(
+                Some("auto"),
+                &mut env_lookup(&[("LC_ALL", "  "), ("LC_MESSAGES", "de_DE.UTF-8")]),
+            )
+            .as_deref(),
+            Some("de-DE"),
+            "empty LC_ALL falls through to LC_MESSAGES"
+        );
+        assert_eq!(
+            resolve_stt_language(
+                Some("auto"),
+                &mut env_lookup(&[("LC_ALL", ""), ("LC_MESSAGES", ""), ("LANG", "en_US.UTF-8")]),
+            )
+            .as_deref(),
+            Some("en-US"),
+            "empty LC_ALL and LC_MESSAGES fall through to LANG"
+        );
+    }
+
+    #[test]
+    fn stt_language_normalizes_posix_locale_codeset_and_modifier() {
+        assert_eq!(
+            resolve_stt_language(Some("auto"), &mut env_lookup(&[("LANG", "fr_FR.UTF-8")]))
+                .as_deref(),
+            Some("fr-FR"),
+            "`_` becomes `-` and the codeset is stripped"
+        );
+        assert_eq!(
+            resolve_stt_language(
+                Some("auto"),
+                &mut env_lookup(&[("LANG", "de_DE.UTF-8@euro")])
+            )
+            .as_deref(),
+            Some("de-DE"),
+            "codeset and modifier are both stripped"
+        );
+    }
+
+    #[test]
+    fn stt_language_omits_c_posix_and_unavailable_locales() {
+        for locale in ["C", "POSIX", "C.UTF-8"] {
+            assert_eq!(
+                resolve_stt_language(Some("auto"), &mut env_lookup(&[("LANG", locale)])),
+                None,
+                "locale {locale:?} must omit the language field"
+            );
+        }
+        assert_eq!(
+            resolve_stt_language(Some("auto"), &mut env_lookup(&[])),
+            None,
+            "no non-empty locale in the environment omits the field"
+        );
+    }
+
+    #[test]
+    fn stt_language_matches_auto_case_insensitively_after_trim() {
+        for value in ["auto", "AUTO", " Auto ", "AuTo"] {
+            assert_eq!(
+                resolve_stt_language(Some(value), &mut env_lookup(&[("LANG", "fr_FR.UTF-8")]))
+                    .as_deref(),
+                Some("fr-FR"),
+                "sentinel {value:?} must resolve from the locale"
+            );
+        }
+    }
+
+    #[test]
+    fn stt_language_passes_explicit_values_through_trimmed_and_unnormalized() {
+        assert_eq!(
+            resolve_stt_language(Some("en-US"), &mut env_lookup(&[("LANG", "fr_FR.UTF-8")]))
+                .as_deref(),
+            Some("en-US"),
+            "explicit value ignores the locale"
+        );
+        assert_eq!(
+            resolve_stt_language(Some("  zh-CN  "), &mut env_lookup(&[])).as_deref(),
+            Some("zh-CN"),
+            "explicit value is trimmed but otherwise unchanged"
+        );
+        assert_eq!(
+            resolve_stt_language(Some("fr_FR"), &mut env_lookup(&[("LANG", "en_US.UTF-8")]))
+                .as_deref(),
+            Some("fr_FR"),
+            "explicit POSIX-style value is NOT normalized"
+        );
+    }
+
+    #[test]
+    fn stt_language_omits_none_and_empty_values() {
+        for value in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                resolve_stt_language(value, &mut env_lookup(&[("LANG", "fr_FR.UTF-8")])),
+                None,
+                "{value:?} must omit the language field"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stt_client_passes_explicit_language_through_trimmed_and_omits_empty() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let executor = TestHttpExecutor {
+            outcomes: Arc::new(Mutex::new(VecDeque::from([
+                http_response("200 OK", r#"{"text":"one"}"#),
+                http_response("200 OK", r#"{"text":"two"}"#),
+            ]))),
+            requests: requests.clone(),
+        };
+        let client = SttClient::new_with_executor(Arc::new(executor));
+
+        let mut configured = settings("http://stt.test");
+        configured.language = Some("  zh-CN  ".to_owned());
+        client
+            .transcribe(&configured, &wav_fixture())
+            .await
+            .expect("transcribe");
+        {
+            let requests = requests.lock().expect("requests");
+            let body = String::from_utf8_lossy(&requests[0].body);
+            assert!(body.contains("name=\"language\""), "language part: {body}");
+            assert!(
+                body.contains("Content-Disposition: form-data; name=\"language\"\r\n\r\nzh-CN\r\n"),
+                "explicit value trimmed on the wire: {body}"
+            );
+        }
+
+        configured.language = Some("   ".to_owned());
+        client
+            .transcribe(&configured, &wav_fixture())
+            .await
+            .expect("transcribe");
+        {
+            let requests = requests.lock().expect("requests");
+            let body = String::from_utf8_lossy(&requests[1].body);
+            assert!(
+                !body.contains("name=\"language\""),
+                "whitespace-only language must be omitted: {body}"
+            );
+        }
     }
 
     #[tokio::test]
     async fn stt_client_surfaces_http_errors_actionably() {
-        let base = serve_once(
-            |_head, _path, _body| {},
-            http_response("401 Unauthorized", r#"{"error":{"message":"invalid api key"}}"#),
-        );
-        let client = SttClient::new().expect("client");
+        let (client, _) = test_client(http_response(
+            "401 Unauthorized",
+            r#"{"error":{"message":"invalid api key"}}"#,
+        ));
         let error = client
-            .transcribe(&settings(&base), &wav_fixture())
+            .transcribe(&settings("http://stt.test"), &wav_fixture())
             .await
             .unwrap_err()
             .to_string();
         assert!(error.contains("401"), "{error}");
-        // The endpoint URL/port never leaks into the error (the browser must
-        // not learn where the STT endpoint lives).
-        assert!(!error.contains("127.0.0.1"), "{error}");
+        assert!(!error.contains("stt.test"), "{error}");
         assert!(!error.contains("/v1/audio/transcriptions"), "{error}");
     }
 
     #[tokio::test]
     async fn stt_client_transport_failure_never_echoes_endpoint() {
-        // A connection failure against a closed port: the error is the fixed
-        // "STT request failed" — no base URL, port, or path.
-        let base = "http://127.0.0.1:1";
-        let client = SttClient::new().expect("client");
+        let base = "http://private-stt.test:4444";
+        let (client, _) = test_client(TestHttpOutcome::Failure);
         let error = client
             .transcribe(&settings(base), &wav_fixture())
             .await
             .unwrap_err()
             .to_string();
         assert!(error.contains("STT request failed"), "{error}");
-        assert!(!error.contains("127.0.0.1"), "{error}");
-        assert!(!error.contains(":1"), "{error}");
+        assert!(!error.contains("private-stt.test"), "{error}");
+        assert!(!error.contains(":4444"), "{error}");
         assert!(!error.contains("/v1/audio/transcriptions"), "{error}");
         assert!(!error.contains("Bearer"), "{error}");
     }
@@ -1922,14 +2296,9 @@ mod tests {
     async fn stt_client_redacts_secrets_echoed_by_server() {
         let secret = ["s", "k-", "echoed-live-key-1234567890abcdef"].concat();
         let json = format!(r#"{{"error":{{"message":"bad key {secret}"}}}}"#);
-        let response = format!(
-            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{json}",
-            json.len()
-        );
-        let base = serve_once(|_head, _path, _body| {}, response.into_bytes());
-        let client = SttClient::new().expect("client");
+        let (client, _) = test_client(http_response("500 Internal Server Error", json));
         let error = client
-            .transcribe(&settings(&base), &wav_fixture())
+            .transcribe(&settings("http://stt.test"), &wav_fixture())
             .await
             .unwrap_err()
             .to_string();
@@ -1947,7 +2316,7 @@ mod tests {
             allow_insecure: false,
             ..settings
         };
-        let client = SttClient::new().expect("client");
+        let client = unused_test_client();
         let error = client
             .transcribe(&settings, &wav_fixture())
             .await
@@ -1963,14 +2332,9 @@ mod tests {
         // the error must carry at most STT_ERROR_SNIPPET_CHARS chars of body
         // and the key must be scrubbed (redaction before truncation).
         let long = format!("{} {secret} {}", "x".repeat(200), "y".repeat(500)) + &"z".repeat(1200);
-        let response = format!(
-            "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{long}",
-            long.len()
-        );
-        let base = serve_once(|_head, _path, _body| {}, response.into_bytes());
-        let client = SttClient::new().expect("client");
+        let (client, _) = test_client(http_response("502 Bad Gateway", long));
         let error = client
-            .transcribe(&settings(&base), &wav_fixture())
+            .transcribe(&settings("http://stt.test"), &wav_fixture())
             .await
             .unwrap_err()
             .to_string();
@@ -1978,59 +2342,64 @@ mod tests {
         assert!(!error.contains(secret.as_str()), "key leaked: {error}");
         assert!(error.contains("[REDACTED]"), "redaction marker: {error}");
         assert!(!error.contains("127.0.0.1"), "endpoint leaked: {error}");
-        assert!(!error.contains("/v1/audio/transcriptions"), "endpoint path leaked: {error}");
+        assert!(
+            !error.contains("/v1/audio/transcriptions"),
+            "endpoint path leaked: {error}"
+        );
         // The echoed body snippet is bounded by the shared constant.
         let snippet = error
             .split("Bad Gateway: ")
             .nth(1)
             .map(|part| part.chars().count())
             .unwrap_or(usize::MAX);
-        assert!(snippet <= STT_ERROR_SNIPPET_CHARS, "{error} ({snippet} chars)");
+        assert!(
+            snippet <= STT_ERROR_SNIPPET_CHARS,
+            "{error} ({snippet} chars)"
+        );
     }
 
     #[tokio::test]
     async fn stt_client_bounds_non_json_error_body() {
         // A long non-JSON success body must be bounded in the parse error.
         let long = "not json ".repeat(200);
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{long}",
-            long.len()
-        );
-        let base = serve_once(|_head, _path, _body| {}, response.into_bytes());
-        let client = SttClient::new().expect("client");
+        let (client, _) = test_client(http_response("200 OK", long));
         let error = client
-            .transcribe(&settings(&base), &wav_fixture())
+            .transcribe(&settings("http://stt.test"), &wav_fixture())
             .await
             .unwrap_err()
             .to_string();
         assert!(error.contains("non-JSON"), "{error}");
         assert!(!error.contains("127.0.0.1"), "endpoint leaked: {error}");
-        assert!(!error.contains("/v1/audio/transcriptions"), "endpoint path leaked: {error}");
+        assert!(
+            !error.contains("/v1/audio/transcriptions"),
+            "endpoint path leaked: {error}"
+        );
         let snippet = error
             .split("non-JSON response: ")
             .nth(1)
             .map(|part| part.chars().count())
             .unwrap_or(usize::MAX);
-        assert!(snippet <= STT_ERROR_SNIPPET_CHARS, "{error} ({snippet} chars)");
+        assert!(
+            snippet <= STT_ERROR_SNIPPET_CHARS,
+            "{error} ({snippet} chars)"
+        );
     }
 
     #[tokio::test]
     async fn stt_client_bounds_oversized_response_by_content_length() {
         // A Content-Length declared over the cap fails BEFORE any body read.
         let long = "x".repeat(STT_MAX_RESPONSE_BYTES + 4096);
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{long}",
-            long.len()
-        );
-        let base = serve_once(|_head, _path, _body| {}, response.into_bytes());
-        let client = SttClient::new().expect("client");
+        let (client, _) = test_client(http_response("200 OK", long));
         let error = client
-            .transcribe(&settings(&base), &wav_fixture())
+            .transcribe(&settings("http://stt.test"), &wav_fixture())
             .await
             .unwrap_err()
             .to_string();
         assert!(error.contains("exceeds the"), "{error}");
-        assert!(error.contains(&STT_MAX_RESPONSE_BYTES.to_string()), "{error}");
+        assert!(
+            error.contains(&STT_MAX_RESPONSE_BYTES.to_string()),
+            "{error}"
+        );
         assert!(!error.contains("Bearer"), "{error}");
         assert!(!error.contains("127.0.0.1"), "endpoint leaked: {error}");
     }
@@ -2040,13 +2409,9 @@ mod tests {
         // Without a Content-Length the body is streamed with the byte cap;
         // an oversized body trips the chunked bound instead of allocating.
         let long = "y".repeat(STT_MAX_RESPONSE_BYTES + 4096);
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{long}"
-        );
-        let base = serve_once(|_head, _path, _body| {}, response.into_bytes());
-        let client = SttClient::new().expect("client");
+        let (client, _) = test_client(response_without_content_length("200 OK", long.into_bytes()));
         let error = client
-            .transcribe(&settings(&base), &wav_fixture())
+            .transcribe(&settings("http://stt.test"), &wav_fixture())
             .await
             .unwrap_err()
             .to_string();
@@ -2061,18 +2426,20 @@ mod tests {
         // truncated to the bound for the RPC/DOM — never passed through whole.
         let text = "t".repeat(STT_MAX_TRANSCRIPT_CHARS + 1000);
         let body = format!(r#"{{"text":"{text}"}}"#);
-        assert!(body.len() <= STT_MAX_RESPONSE_BYTES, "fixture must fit the body cap");
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
+        assert!(
+            body.len() <= STT_MAX_RESPONSE_BYTES,
+            "fixture must fit the body cap"
         );
-        let base = serve_once(|_head, _path, _body| {}, response.into_bytes());
-        let client = SttClient::new().expect("client");
+        let (client, _) = test_client(http_response("200 OK", body));
         let transcript = client
-            .transcribe(&settings(&base), &wav_fixture())
+            .transcribe(&settings("http://stt.test"), &wav_fixture())
             .await
             .expect("transcribe ok");
-        assert_eq!(transcript.chars().count(), STT_MAX_TRANSCRIPT_CHARS, "{transcript:?}");
+        assert_eq!(
+            transcript.chars().count(),
+            STT_MAX_TRANSCRIPT_CHARS,
+            "{transcript:?}"
+        );
     }
 
     #[test]
@@ -2129,15 +2496,10 @@ mod tests {
 
     #[tokio::test]
     async fn session_press_release_transcribes_to_draft_event() {
-        // Mock STT server answering the session's transcribe call.
-        let base = serve_once(
-            |_head, _path, _body| {},
-            http_response("200 OK", r#"{"text":"press release"}"#),
-        );
-        let settings = settings(&base);
+        let (stt, _) = test_client(http_response("200 OK", r#"{"text":"press release"}"#));
+        let settings = settings("http://stt.test");
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let stt = SttClient::new().expect("client");
         let mut chunks = VecDeque::new();
         chunks.push_back(speech_chunk());
         chunks.push_back(speech_chunk());
@@ -2175,7 +2537,7 @@ mod tests {
         let settings = settings("https://stt.invalid");
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let stt = SttClient::new().expect("client");
+        let stt = unused_test_client();
         let task = tokio::spawn(run_ptt_session(
             settings,
             stt,
@@ -2209,7 +2571,7 @@ mod tests {
         let settings = settings("https://stt.invalid");
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let stt = SttClient::new().expect("client");
+        let stt = unused_test_client();
         let task = tokio::spawn(run_ptt_session(
             settings,
             stt,
@@ -2296,7 +2658,10 @@ mod tests {
         assert!(!is_delegation_candidate("implement"));
         assert!(!is_delegation_candidate("fix the kitchen sink"));
         // Verbs must match as whole words, not substrings.
-        assert!(!is_delegation_candidate("the unfixed draft"), "no whole-word verb");
+        assert!(
+            !is_delegation_candidate("the unfixed draft"),
+            "no whole-word verb"
+        );
         assert!(
             is_delegation_candidate("fix the module"),
             "code word carries the signal"

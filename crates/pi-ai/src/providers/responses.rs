@@ -181,7 +181,10 @@ pub fn responses_chain_previous_id(session_id: &str) -> Option<String> {
 /// results before each model call, so the trailing slice is never the whole
 /// transcript once a chain exists.
 fn chained_input_messages(messages: &[Message]) -> &[Message] {
-    match messages.iter().rposition(|m| matches!(m, Message::Assistant(_))) {
+    match messages
+        .iter()
+        .rposition(|m| matches!(m, Message::Assistant(_)))
+    {
         Some(last_assistant) => &messages[last_assistant + 1..],
         None => messages,
     }
@@ -200,6 +203,11 @@ pub fn register_openai_responses() {
                 async move { stream_simple_openai_responses(m, c, o) }.boxed()
             }),
             generate_image: None,
+            resolve_http_authorities: Arc::new(|model, options| {
+                let base = responses_base_url(model, options)?;
+                let (authority, _) = resolve_http_endpoint(&format!("{base}/responses"))?;
+                Ok(std::collections::BTreeSet::from([authority]))
+            }),
         },
         None,
     );
@@ -354,22 +362,28 @@ pub fn stream_openai_responses(
                 return;
             }
         };
-        let http = match common::client(&opts.stream) {
-            Ok(c) => c,
+        if let Err(e) = common::client(&opts.stream) {
+            common::fail(&s, out, e.to_string(), false).await;
+            return;
+        }
+
+        let request_headers = match responses_request_headers(&model, &ctx, &opts.stream, key) {
+            Ok(headers) => {
+                match common::apply_provider_headers(headers, &model, &opts.stream).await {
+                    Ok(headers) => headers,
+                    Err(e) => {
+                        common::fail(&s, out, e.to_string(), false).await;
+                        return;
+                    }
+                }
+            }
             Err(e) => {
                 common::fail(&s, out, e.to_string(), false).await;
                 return;
             }
         };
-
-        let request_headers = match responses_request_headers(&model, &ctx, &opts.stream, key) {
-            Ok(headers) => match common::apply_provider_headers(headers, &model, &opts.stream).await {
-                Ok(headers) => headers,
-                Err(e) => {
-                    common::fail(&s, out, e.to_string(), false).await;
-                    return;
-                }
-            },
+        let payload = match serde_json::to_vec(&body) {
+            Ok(payload) => payload,
             Err(e) => {
                 common::fail(&s, out, e.to_string(), false).await;
                 return;
@@ -378,7 +392,13 @@ pub fn stream_openai_responses(
         let model_ref = &model;
         let opts_ref = &opts.stream;
         let resp = match common::send_with_retry(&opts.stream, || {
-            http.post(&url).json(&body).headers(request_headers.clone())
+            common::build_request(
+                &opts.stream,
+                HttpMethod::Post,
+                &url,
+                &request_headers,
+                payload.clone(),
+            )
         })
         .await
         {
@@ -389,7 +409,10 @@ pub fn stream_openai_responses(
                 return;
             }
         };
-        if let Err(e) = common::notify_response(&opts.stream, &resp, &model).await {
+        if let Err(e) =
+            common::notify_response(&opts.stream, resp.status(), resp.headers().clone(), &model)
+                .await
+        {
             note_chain_failure();
             common::fail(&s, out, e.to_string(), false).await;
             return;
@@ -954,8 +977,14 @@ fn convert_tools(
             continue;
         }
         let strict = resolve_json_schema_strict_sampling(t, compat.supports_strict_mode)?;
-        let params: Value = serde_json::to_value(&t.parameters)
+        let mut params: Value = serde_json::to_value(&t.parameters)
             .unwrap_or_else(|_| json!({ "type": "object", "properties": {} }));
+        if strict {
+            // Same strict dialect rule as chat-completions tools (see common):
+            // rewrite JSON-Schema type unions into the anyOf encoding OpenAI
+            // strict validation accepts.
+            super::common::openai_strict_schema_dialect(&mut params);
+        }
         let mut tool = serde_json::Map::new();
         tool.insert("type".into(), json!("function"));
         tool.insert("name".into(), json!(t.name));
@@ -2365,7 +2394,9 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
             for _ in 0..expected {
-                let Ok((mut sock, _)) = listener.accept() else { break };
+                let Ok((mut sock, _)) = listener.accept() else {
+                    break;
+                };
                 sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
                 let mut buf = Vec::new();
                 let mut tmp = [0u8; 4096];
@@ -2442,6 +2473,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
         let opts = OpenAIResponsesOptions {
             stream: StreamOptions {
                 api_key: Some("sk".into()),
+                http_executor: Some(crate::http::test_http_executor()),
                 ..StreamOptions::default()
             },
             reasoning_effort: Some("medium".into()),
@@ -2606,7 +2638,10 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
         assert_eq!(input[0]["content"][0]["text"], "turn two");
         // A chained request must store the response server-side: the provider
         // rejects previous_response_id on the stateless (store:false) path.
-        assert_eq!(body["store"], true, "chained request must store the response");
+        assert_eq!(
+            body["store"], true,
+            "chained request must store the response"
+        );
 
         // Initial turn with the opt-in enabled but no stored id yet: no
         // previous_response_id is sent, but the response is still stored so
@@ -2614,7 +2649,10 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
         reset_responses_chain(session_id);
         let body = build_responses_params(&model, &req, &opts).expect("params");
         assert!(body.get("previous_response_id").is_none());
-        assert_eq!(body["store"], true, "the response seeding the chain must be stored");
+        assert_eq!(
+            body["store"], true,
+            "the response seeding the chain must be stored"
+        );
 
         // Opt-in off (default): full history, no chaining params, stateless.
         let opts = OpenAIResponsesOptions {
@@ -2629,10 +2667,17 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
         assert!(body.get("previous_response_id").is_none());
         assert!(body.get("instructions").is_none());
         let input = body["input"].as_array().expect("input array");
-        assert_eq!(input.len(), 4, "developer + user + assistant + user: {input:?}");
+        assert_eq!(
+            input.len(),
+            4,
+            "developer + user + assistant + user: {input:?}"
+        );
         assert_eq!(input[0]["role"], "developer");
         assert_eq!(input[0]["content"], "be terse");
-        assert_eq!(body["store"], false, "stateless mode must not store responses");
+        assert_eq!(
+            body["store"], false,
+            "stateless mode must not store responses"
+        );
         reset_responses_chain(session_id);
     }
 
@@ -2665,6 +2710,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
             stream: StreamOptions {
                 api_key: Some("sk".into()),
                 session_id: Some(session_id.into()),
+                http_executor: Some(crate::http::test_http_executor()),
                 ..StreamOptions::default()
             },
             responses_stateful_chain: true,
@@ -2688,7 +2734,10 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
         let body: Value = serde_json::from_str(&cap.body).expect("body is json");
         assert_eq!(body["previous_response_id"], "resp_turn_one");
         assert_eq!(body["instructions"], "be terse");
-        assert_eq!(body["store"], true, "chained request must store the response");
+        assert_eq!(
+            body["store"], true,
+            "chained request must store the response"
+        );
         let input = body["input"].as_array().expect("input array");
         assert_eq!(input.len(), 1, "only the new user turn: {input:?}");
         assert_eq!(input[0]["role"], "user");
@@ -2707,20 +2756,31 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
         let url = spawn_chain_contract_mock(2, statuses.clone(), captured.clone());
 
         // Hand-built request simulating what the pre-fix client sent (a chain
-        // with store:false): the provider must reject it.
-        let client = reqwest::Client::new();
-        let rejected = client
-            .post(format!("{url}/responses"))
-            .json(&json!({
-                "model": "gpt-5",
-                "previous_response_id": "resp_missing",
-                "input": [{"role": "user", "content": [{"type": "input_text", "text": "next"}]}],
-                "stream": true,
-                "store": false,
-            }))
-            .send()
-            .await
-            .expect("raw request");
+        // with store:false): the provider must reject it. Route it through the
+        // same transport-neutral executor contract as provider requests.
+        let raw_options = StreamOptions {
+            http_executor: Some(crate::http::test_http_executor()),
+            ..StreamOptions::default()
+        };
+        let raw_body = serde_json::to_vec(&json!({
+            "model": "gpt-5",
+            "previous_response_id": "resp_missing",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "next"}]}],
+            "stream": true,
+            "store": false,
+        }))
+        .expect("raw request body");
+        let rejected = common::send_with_retry(&raw_options, || {
+            common::build_request(
+                &raw_options,
+                HttpMethod::Post,
+                &format!("{url}/responses"),
+                &HeaderMap::new(),
+                raw_body.clone(),
+            )
+        })
+        .await
+        .expect("raw request");
         assert_eq!(
             rejected.status().as_u16(),
             400,
@@ -2750,6 +2810,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
             stream: StreamOptions {
                 api_key: Some("sk".into()),
                 session_id: Some(session_id.into()),
+                http_executor: Some(crate::http::test_http_executor()),
                 ..StreamOptions::default()
             },
             responses_stateful_chain: true,
@@ -2768,7 +2829,10 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
         let bodies = captured.lock().unwrap();
         let body: Value = serde_json::from_str(&bodies[0].body).expect("body is json");
         assert_eq!(body["previous_response_id"], "resp_turn_one");
-        assert_eq!(body["store"], true, "chained request must store the response");
+        assert_eq!(
+            body["store"], true,
+            "chained request must store the response"
+        );
         assert_eq!(*statuses.lock().unwrap(), vec![400, 200]);
         reset_responses_chain(session_id);
     }
@@ -2869,6 +2933,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
             stream: StreamOptions {
                 api_key: Some("sk".into()),
                 session_id: Some(session_id.into()),
+                http_executor: Some(crate::http::test_http_executor()),
                 ..StreamOptions::default()
             },
             responses_stateful_chain: true,
@@ -2877,7 +2942,10 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
         let stream = stream_openai_responses(model, req, opts);
         let final_msg = stream.result().await.expect("final message");
         while stream.next().await.is_some() {}
-        assert!(final_msg.error_message.is_some(), "500 must surface an error");
+        assert!(
+            final_msg.error_message.is_some(),
+            "500 must surface an error"
+        );
         assert_eq!(responses_chain(session_id).consecutive_failures, 1);
         // Still below the threshold: the chain survives one failure.
         assert_eq!(
@@ -2927,7 +2995,11 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
         assert!(!chains.contains_key("sess-0"));
         assert!(chains.contains_key("sess-64"));
         assert_eq!(
-            chains.get("sess-new").unwrap().previous_response_id.as_deref(),
+            chains
+                .get("sess-new")
+                .unwrap()
+                .previous_response_id
+                .as_deref(),
             Some("resp_new")
         );
     }
@@ -2989,6 +3061,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
                     api_key: Some("sk".into()),
                     session_id: Some(session_id.into()),
                     abort_signal: Some(token.clone()),
+                    http_executor: Some(crate::http::test_http_executor()),
                     ..StreamOptions::default()
                 },
                 responses_stateful_chain: true,
@@ -3170,12 +3243,8 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
         let headers =
             responses_request_headers(&model, &Context::default(), &options, "provider-key")
                 .expect("headers");
-        let request = common::client(&options)
-            .expect("client")
-            .get("http://example.test")
-            .headers(headers)
-            .build()
-            .expect("request");
+        let request =
+            crate::http::test_http_request(HttpMethod::Get, "http://example.test", &headers);
         assert_eq!(request.headers().get_all("authorization").iter().count(), 1);
         assert_eq!(
             request
@@ -3245,12 +3314,8 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
         let headers =
             responses_request_headers(&model, &Context::default(), &options, "gateway-key")
                 .expect("headers");
-        let request = common::client(&options)
-            .expect("client")
-            .get("http://example.test")
-            .headers(headers)
-            .build()
-            .expect("request");
+        let request =
+            crate::http::test_http_request(HttpMethod::Get, "http://example.test", &headers);
         assert_eq!(
             request
                 .headers()
@@ -3312,12 +3377,8 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
         let options = StreamOptions::default();
         let headers = responses_request_headers(&model, &context, &options, "copilot-token")
             .expect("headers");
-        let request = common::client(&options)
-            .expect("client")
-            .get("http://example.test")
-            .headers(headers)
-            .build()
-            .expect("request");
+        let request =
+            crate::http::test_http_request(HttpMethod::Get, "http://example.test", &headers);
         assert_eq!(
             request
                 .headers()
@@ -3822,7 +3883,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
             headers
                 .get("x-opencode-client")
                 .and_then(|value| value.to_str().ok()),
-        Some("rpi")
+            Some("rpi")
         );
         assert_eq!(
             headers
@@ -4382,6 +4443,111 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
             error.to_string(),
             "Tool \"query\" requires JSON-schema constrained sampling, but strict tools are unsupported."
         );
+    }
+
+    #[test]
+    fn responses_strict_payload_requires_nullable_nested_optional_properties() {
+        let string_item = Schema {
+            schema_type: Some(json!("string")),
+            ..Schema::default()
+        };
+        let nullable_array = || Schema {
+            schema_type: Some(json!("array")),
+            items: Some(Box::new(string_item.clone())),
+            nullable: true,
+            ..Schema::default()
+        };
+        let phase = Schema {
+            schema_type: Some(json!("object")),
+            properties: HashMap::from([
+                (
+                    "phase".into(),
+                    Schema {
+                        schema_type: Some(json!("string")),
+                        ..Schema::default()
+                    },
+                ),
+                ("items".into(), nullable_array()),
+                (
+                    "agents".into(),
+                    Schema {
+                        schema_type: Some(json!("array")),
+                        items: Some(Box::new(string_item)),
+                        min_items: Some(1),
+                        ..Schema::default()
+                    },
+                ),
+            ]),
+            required: vec!["phase".into(), "items".into()],
+            additional_properties: Some(json!(false)),
+            ..Schema::default()
+        };
+        let tool = ToolDefinition {
+            name: "todo".into(),
+            description: "todo".into(),
+            parameters: Schema {
+                schema_type: Some(json!("object")),
+                properties: HashMap::from([
+                    (
+                        "op".into(),
+                        Schema {
+                            schema_type: Some(json!("string")),
+                            ..Schema::default()
+                        },
+                    ),
+                    (
+                        "list".into(),
+                        Schema {
+                            schema_type: Some(json!("array")),
+                            items: Some(Box::new(phase)),
+                            nullable: true,
+                            ..Schema::default()
+                        },
+                    ),
+                ]),
+                required: vec!["op".into(), "list".into()],
+                additional_properties: Some(json!(false)),
+                ..Schema::default()
+            },
+            constrained_sampling: Some(ConstrainedSampling::json_schema(
+                ConstrainedSamplingStrictness::Prefer,
+            )),
+        };
+        let model = constrained_response_model(json!({"supportsStrictMode": true}));
+        let tools = convert_tools(&[&tool], &get_responses_compat(&model), false)
+            .expect("responses strict payload");
+        let phase = &tools[0]["parameters"]["properties"]["list"]["anyOf"][0]["items"];
+        let required = phase["required"].as_array().expect("nested required");
+        assert!(required.iter().any(|entry| entry == "agents"));
+        let agents = &phase["properties"]["agents"];
+        assert_eq!(agents["anyOf"][0]["type"], json!("array"));
+        assert_eq!(agents["anyOf"][0]["minItems"], json!(1));
+        assert_eq!(agents["anyOf"][1]["type"], json!("null"));
+    }
+
+    #[test]
+    fn responses_non_strict_tools_keep_standard_type_unions() {
+        let tool = ToolDefinition {
+            name: "probe".into(),
+            description: "probe".into(),
+            parameters: Schema {
+                schema_type: Some(json!("array")),
+                items: Some(Box::new(Schema {
+                    schema_type: Some(json!("string")),
+                    ..Schema::default()
+                })),
+                nullable: true,
+                ..Schema::default()
+            },
+            constrained_sampling: None,
+        };
+        let model = constrained_response_model(json!({"supportsStrictMode": true}));
+        let tools = convert_tools(&[&tool], &get_responses_compat(&model), false)
+            .expect("non-strict responses payload");
+        let field = &tools[0]["parameters"];
+        assert_eq!(field["type"], json!(["array", "null"]));
+        assert!(field.get("anyOf").is_none());
+        assert!(tools[0].get("strict").is_none() || tools[0]["strict"] == json!(false));
     }
 
     #[test]

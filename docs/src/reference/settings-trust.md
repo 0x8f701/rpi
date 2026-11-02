@@ -1,298 +1,43 @@
-# Settings, configuration, and trust
+# Settings, trust, and atomic generations
 
-## Configuration directory
+Settings load in global and project scopes. The project layer is admitted through project trust; locating a project configuration file does not authorize executing its resources.
 
-The runtime resolves the agent configuration directory (`<agent-dir>`) in this
-order:
+## Files and effective values
 
-1. `PI_CODING_AGENT_DIR` environment variable.
-2. The platform home directory (`HOME` on Unix, `USERPROFILE` on Windows) with
-   `/.pi/agent` appended.
+Within each scope, `settings.toml` takes precedence over `settings.json` when present. File extension determines parsing: `.toml` selects TOML; other settings paths use JSON. Writes target the file the loader selects. Unknown fields are retained in typed extra fields rather than silently dropped.
 
-Source: `crates/pi-coding/src/resources.rs` (`agent_dir_path` and resource discovery).
+The effective runtime view recursively expands `$NAME` and `${NAME}` in string values. Keys and non-string values are unchanged. Missing environment names remain literal and produce diagnostics. Credential grant definitions and Model Context Protocol credential-grant references stay literal authority identifiers.
 
-Within `<agent-dir>` the CLI reads:
+Persisted layers retain the original references: editing settings does not write expanded secrets back to disk. Settings writes use a same-directory temporary file and atomic replacement with owner-only permissions.
 
-- `settings.json` — global startup defaults and operational settings.
-- `models.json` — custom providers and model overrides.
-- `auth.json` — stored provider credentials.
-- `trust.json` — persisted project trust decisions.
-- `sessions/` — native Pi v3 JSONL session files.
-- `skills/`, `prompts/`, `themes/` — global resources.
-
-Project-local resources are loaded from `<workspace>/.pi/` only when that project
-is trusted. Source: `crates/pi-coding/src/resource_manager.rs` (`ResourcePaths::discover_from_agent_dir`).
-
-## Project trust
-
-By default, `rpi` asks before loading project-local `.pi` resources (skills,
-prompts, themes, keybindings, extensions, agents, and package settings). Trust
-decisions are stored in `<agent-dir>/trust.json`, versioned as
-`TRUST_STORE_VERSION = 1`, and scoped to the canonical project path. The
-resolver walks parent directories, so a decision at `<workspace>` covers
-`<workspace>/sub-project`.
-
-Source: `crates/pi-coding/src/trust.rs` (`TrustStore`, `TrustResolution`, and `apply_trust_hook_outcomes`).
-
-Default behavior is controlled by `settings.json`:
-
-```json
-{
-  "defaultProjectTrust": "ask"
-}
-```
-
-Allowed values:
-
-- `"ask"` — prompt for trust in interactive modes; treat as untrusted in
-  headless modes (default).
-- `"always"` — trust every project with a `.pi` directory without asking.
-- `"never"` — never trust project-local resources.
-
-One-run overrides:
+## Inspect and change
 
 ```sh
-rpi -a "hello"           # --approve: trust this project's .pi for this run
-rpi --no-approve "hello" # refuse project .pi for this run
+rpi config list
+rpi config get retry.maxRetries
+rpi config set retry.maxRetries 3
+rpi config reset retry.maxRetries
+rpi reload
 ```
 
-Headless modes (`--print`, `--mode json`, `--mode rpc`) never prompt. In
-headless mode an unset or `"ask"` decision is treated as untrusted, so use
-`--approve` when you need project resources. If the project has no `.pi`
-directory, it is implicitly trusted.
+Settings commands accept `--scope global|project` and `--json`. `config list --category CATEGORY` filters the catalog. Typed values are validated; arrays and objects are JSON values.
 
-Source: `crates/pi-coding/src/trust.rs` (`TrustDecision` defaults) and `crates/pi-cli/src/args.rs` (`--approve` / `--no-approve`).
+The terminal `/settings` surface supports inspect/list, search, set, reset, validate, apply, and cancel. Its scope switches are `--global` and `--project`. The Web settings panel uses the same catalog and draft/apply authority rather than writing an independent settings store.
 
-## `settings.json`
+## Trust
 
-Global settings live at `<agent-dir>/settings.json`. Project settings live at
-`<workspace>/.pi/settings.json` and are merged on top of global settings when
-trusted. Unknown fields are retained across merges so other product modules can
-use them.
+`--approve` accepts project-local resources for the current run; `--no-approve` refuses them. Stored project trust and host trust hooks participate in resource admission. These choices are separate from host tool approval mode (`yolo`, `write`, or `ask`).
 
-Source: `crates/pi-coding/src/settings.rs` (`RuntimeSettingsSnapshot` and settings merge logic).
+Do not use a project file to authorize itself. A denial must not be upgraded by a project extension. Host `pre_trust_decision` hooks execute before admitting project extensions; see [hooks](hooks.md).
 
-```json
-{
-  "defaultProvider": "openai",
-  "defaultModel": "openai/gpt-5",
-  "defaultThinkingLevel": "medium",
-  "defaultProjectTrust": "ask",
-  "theme": "dark",
-  "compaction": {
-    "enabled": true,
-    "reserveTokens": 8192,
-    "keepRecentTokens": 4096
-  },
-  "terminal": {
-    "showImages": true,
-    "imageWidthCells": 80,
-    "clearOnShrink": false,
-    "showTerminalProgress": true
-  },
-  "images": {
-    "autoResize": true,
-    "blockImages": false
-  },
-  "retry": {
-    "enabled": true,
-    "maxRetries": 3,
-    "baseDelayMs": 2000,
-    "provider": {
-      "timeoutMs": 60000,
-      "maxRetries": 3,
-      "maxRetryDelayMs": 60000
-    }
-  },
-  "transport": "auto",
-  "timeoutMs": 60000,
-  "maxRetryDelayMs": 60000,
-  "temperature": 0.7,
-  "maxTokens": 4096,
-  "cacheRetention": "short",
-  "thinkingBudgets": {
-    "minimal": 1024,
-    "low": 2048,
-    "medium": 4096,
-    "high": 8192
-  },
-  "scopedModels": ["openai/*", "anthropic/*"],
-  "branchSummary": {
-    "reserveTokens": 16384,
-    "skipPrompt": false
-  },
-  "keybindings": {
-    "toggleTheme": "ctrl+t"
-  },
-  "quietStartup": false,
-  "showThinking": true,
-  "exposeSessionEnvironment": true,
-  "doubleEscapeAction": "tree",
-  "orchestration": {
-    "process": false,
-    "tasks": false,
-    "todo": false,
-    "maxConcurrency": 8,
-    "maxRecursionDepth": 8,
-    "mailboxCapacity": 1000,
-    "maxToolsPerAgent": 16
-  },
-  "packages": [
-    "git:github.com/owner/pi-my-tools",
-    { "source": "./my-pi-tools", "extensions": ["*"] }
-  ],
-  "extensions": ["ext-id"],
-  "skills": ["rust-review"],
-  "prompts": ["custom-prompt"],
-  "themes": ["solarized"]
-}
-```
+## Atomic runtime publication
 
-### Known fields
+An application generation groups resource, tool, extension, orchestration, runtime, and security state under one nonzero revision and provenance. Construction rejects mismatched revisions or provenance. Reload prepares a new generation from an existing revision instead of independently swapping each subsystem.
 
-| Field | Purpose |
-|-------|---------|
-| `defaultProvider` | Default provider id used when no model flag is given. |
-| `defaultModel` | Default model id used when no `--model` is given. |
-| `defaultThinkingLevel` | Default reasoning level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). |
-| `defaultProjectTrust` | `"ask"`, `"always"`, or `"never"`. |
-| `approvalMode` | Global host tool policy: `yolo` allows all tools, `write` confirms Exec, and `ask` confirms every tool call. Project settings cannot override it. |
-| `steeringMode` | Steering queue mode (`all` or `one-at-a-time`). |
-| `followUpMode` | Follow-up queue mode (`all` or `one-at-a-time`). |
-| `sessionDir` | Override the session storage directory. |
-| `sessionImportSources` | Allowed session import sources (`omp`, `codex`, `claude`, `grok`, `droid`). |
-| `sessionTtlDays` | Startup session TTL pruning age in days (default 30; must be > 0). |
-| `authScope` | Active credential scope label; `PI_AUTH_SCOPE` overrides it at runtime. |
-| `theme` | Initial TUI theme name. |
-| `compaction` | Context compaction limits (`enabled`, `reserveTokens`, `keepRecentTokens`). |
-| `terminal` | Legacy TUI rendering options (`showImages`, `imageWidthCells`, `clearOnShrink`, `showTerminalProgress`). |
-| `images` | Image display options (`autoResize`, `blockImages`) plus generation overrides (`genModel`, `genBaseUrl`, `genApiKey`). |
-| `retry` | Retry policy (`enabled`, `maxRetries`, `baseDelayMs`, plus optional `provider` overrides). |
-| `autoRetry`, `maxRetries`, `baseDelayMs` | Top-level legacy aliases for the same retry fields. |
-| `transport` | Stream transport (`auto`, `sse`, `web-socket`, `web-socket-cached`). |
-| `timeoutMs` | HTTP/stream timeout. |
-| `httpIdleTimeoutMs` | Idle HTTP connection timeout. |
-| `websocketConnectTimeoutMs` | WebSocket connect timeout. |
-| `maxRetryDelayMs` | Maximum delay between retries. |
-| `temperature` | Sampling temperature, finite and `0..=2`. |
-| `maxTokens` | Maximum tokens per model request. |
-| `cacheRetention` | Cache retention (`none`, `short`, `long`). |
-| `responsesStatefulChain` | Opt-in stateful turn chaining for OpenAI Responses API models (default `false`); see [`configuration-profiles.md`](configuration-profiles.md). |
-| `thinkingBudgets` | Per-level token budgets (`minimal`, `low`, `medium`, `high`). |
-| `scopedModels` / `enabledModels` | Alias for the same model-pattern allowlist. |
-| `branchSummary` | Branch-summary token reserve and `skipPrompt`. |
-| `keybindings` | Action-to-chord map (value is a string or array of strings). |
-| `quietStartup` | Suppress non-essential startup messages. |
-| `showThinking` / `hideThinkingBlock` | Control whether thinking blocks are shown. |
-| `showImages`, `imageWidthCells`, `autoResizeImages` | Top-level legacy aliases for terminal/image options. |
-| `exposeSessionEnvironment` | Forward session environment to tools. |
-| `doubleEscapeAction` | TUI action on double-escape (`fork`, `tree`, `none`). |
-| `orchestration` | Orchestration tool gates, concurrency limits, workflow isolation, and soft budgets (see [`orchestration.md`](../user-guide/orchestration.md) and [`workflows.md`](../user-guide/workflows.md)). |
-| `selector` | Optional model-selector thresholds (advanced). |
-| `agents` | Per-agent runtime settings (`settings.agents.<name>.enabled/model/tools`); see [`orchestration.md`](../user-guide/orchestration.md). |
-| `packages` | Local/git package sources to install/load. |
-| `extensions`, `skills`, `prompts`, `themes` | Resource names to load from configured packages and discovered paths. |
-| `sandbox` | Opt-in Linux filesystem sandbox for bash (`enabled`, `network`, `allowedPaths`, `deniedPaths`, `readOnly`); see [`sandbox-isolation.md`](sandbox-isolation.md). |
-| `live` | Voice configuration (`enabled`, `mode`, `sttBaseUrl`, `sttApiKey`, `sttModel`, `realtimeBaseUrl`, `realtimeApiKey`, `realtimeModel`, `voice`, `language`, `allowInsecure`); see [`live.md`](../user-guide/live.md). |
-| `visionModel` | Model spec used to describe images when the active chat model does not support image input. The delegation shares the main prompt, steering, and follow-up context; a misconfigured `visionModel` (unresolvable or not image-capable) fails with an error instead of silently dropping images. |
-| `memory` | Memory backend (`backend`: `local`/`hindsight`/`off`; Hindsight HTTP endpoint/token, plaintext opt-in, bank/scoping, recall policy, injection, and per-operation timeouts); see [`memory.md`](memory.md). |
-| `hooks` | Host hooks: external commands observing/gating session events; see [`hooks.md`](hooks.md). |
-| `permissionRules` | Path-level permission rules evaluated before the approval mode; see [`security.md`](security.md). |
-| `mcpServers` | MCP servers for the `mcp` tool (`name`, `transport`, `command`/`args`/`env`, `url`, `disabled`); see [`mcp.md`](mcp.md). |
+A settings file edit and an effective runtime change are not identical events. Inspect the catalog's behavior and the apply result for the affected key. Failed validation is not permission to partially publish a candidate configuration.
 
-Source: `crates/pi-coding/src/settings.rs` (`Settings`, `LiveSettings`, `LiveRuntimeSettings`, `SettingsCatalog`, and known-field definitions).
+## Safety
 
-### Supported operational settings coverage
+Secret catalog fields are redacted in views and are not ordinary round-trippable editor values. Never persist a redacted display value over a real credential. Protect global and project configuration files and review resource changes before granting trust.
 
-The following keys are the supported operational settings coverage used by the
-runtime. Any other field may exist but is either a startup default, a resource
-list, or module-specific configuration.
-
-| Setting | Applied by |
-|---------|------------|
-| `approvalMode` | `session_run_blueprint` host approval hook |
-| `steeringMode` | `steering_mode` |
-| `followUpMode` | `follow_up_mode` |
-| `retry` | `retry_settings` / `apply_session_options` |
-| `compaction` | `apply_session_options` |
-| `transport` | `apply_session_options` |
-| `timeoutMs` | `apply_session_options` |
-| `maxRetryDelayMs` | `apply_session_options` |
-| `temperature` | `apply_session_options` |
-| `maxTokens` | `apply_session_options` |
-| `cacheRetention` | `apply_session_options` |
-| `thinkingBudgets` | `apply_session_options` |
-| `scopedModels` | `scoped_model_patterns` |
-| `enabledModels` | `scoped_model_patterns` (legacy alias) |
-| `terminal` | `tui_runtime` |
-| `images` | `tui_runtime` |
-| `theme` | `tui_runtime` / resource validation |
-| `keybindings` | `tui_runtime` |
-| `branchSummary` | `branch_summary_settings` |
-| `quietStartup` | `tui_runtime` |
-| `hideThinkingBlock` | `tui_runtime` |
-| `showThinking` | `tui_runtime` |
-| `exposeSessionEnvironment` | `expose_session_environment` |
-| `doubleEscapeAction` | `tui_runtime` |
-| `orchestration` | orchestration tool gates |
-
-Source: `crates/pi-coding/src/settings.rs` (`SUPPORTED_SETTINGS_COVERAGE`).
-
-## Model and thinking-level precedence
-
-When the CLI starts without an explicit model:
-
-1. `--model` / `-m` flag.
-2. Resumed session's saved model (when `--resume` or `--continue` is used).
-3. `settings.json` `defaultModel`.
-4. First authenticated model in the catalog.
-
-Thinking level precedence:
-
-1. `--think` flag.
-2. Thinking level parsed from a `:level` model suffix (`anthropic/claude-sonnet-4-5:high`).
-3. Resumed session's saved thinking level.
-4. `settings.json` `defaultThinkingLevel`.
-5. `medium`.
-
-The final level is clamped to the resolved model's supported levels.
-
-## Live reload semantics
-
-Configuration and resources are loaded into an atomic snapshot.
-
-- `rpi reload` validates the current settings/resource graph and prints a
-  structured snapshot, including `generation`, `trust`, discovered resources, and
-  diagnostics. It always runs headlessly and emits JSON.
-- `SettingsManager::reload()` re-reads global settings and, when the project is
-  trusted, project settings, then recomputes the effective snapshot.
-- `ResourceManager::stage_reload()` builds a new candidate snapshot without
-  replacing the active one. `commit_reload()` swaps the active snapshot only
-  after validation succeeds; any error leaves the previous generation in place.
-- Interactive TUI `/reload` and REPL `reload` call the same stage-and-commit
-  path, so malformed files never silently replace a working configuration.
-- Settings writes performed through `update_global` or `update_project` are
-  atomic (temp file + `fs::rename` + directory sync). Session-only overrides
-  via `apply_overrides` are never persisted.
-
-Source: `crates/pi-cli/src/commands.rs` (`reload` command), `crates/pi-coding/src/settings.rs` (`SettingsManager::reload`), and `crates/pi-coding/src/resource_manager.rs` (`stage_reload` / `commit_reload`).
-
-## Trust boundaries
-
-- No project-local configuration is loaded unless the project is trusted. Use
-  `-a`/`--approve` or set `defaultProjectTrust` explicitly.
-- `approvalMode` is a global safety policy and is rejected in project `.pi/settings.json`; `--approval-mode` is the explicit one-run override. It is independent of `--approve`/`--no-approve`, which control only project resource trust.
-- Interactive approval runs before the existing host hook and extension reducer. Headless modes fail closed whenever the selected policy requires confirmation.
-- Bash tool commands run in the configured working directory (`--cwd`).
-- API keys are never printed in error messages or logs.
-- `models.json` and `auth.json` values may contain `$VAR` / `${VAR}` templates,
-  which are expanded from the current process environment or an explicit `env`
-  map. Command-valued values (`!command`) are rejected.
-
-## Custom config path for tests or isolation
-
-```sh
-export PI_CODING_AGENT_DIR="<workspace>/.my-pi-config"
-mkdir -p "$PI_CODING_AGENT_DIR"
-rpi --print "hello"
-```
+See [profiles](configuration-profiles.md), [environment variables](environment-variables.md), and [sandbox confinement](sandbox-isolation.md).

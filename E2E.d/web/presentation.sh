@@ -37,7 +37,7 @@ main() {
     case "${1:-run}" in
         list|--list|--dry-run)
             printf '%s\n' \
-                'web-presentation - tool-card presentation (Command/process/write/read titles, two-line clamp, no raw args, success-green/failure-red border), process equal width + .op error, thinking streaming-visible/final-hidden, composer equal height (desktop+mobile), durable bashExecution, session provider grouping + search, inline image render, video controls/preload/no-autoplay, hostile media rejected (PLAYWRIGHT-ONLY, hard-fail)'
+                'web-presentation - tool-card presentation (Command/process/write/read titles, two-line clamp, no raw args, success-green/failure-red border), process equal width + .op error, thinking streaming-visible/final-fold, composer equal height (desktop+mobile), durable bashExecution, session provider grouping + search, inline image render, video controls/preload/no-autoplay, hostile media rejected (PLAYWRIGHT-ONLY, hard-fail)'
             return 0
             ;;
         run|all) ;;
@@ -60,7 +60,7 @@ main() {
     # must be registered so the process tool_calls execute, not error as
     # "Tool process not found"). No sessionImportSources → Web default
     # NativePi+OMP+Codex+Grok discovery.
-    cat >"$root/home/.pi/agent/settings.json" <<EOF
+    cat >"$root/home/.rpi/settings.json" <<EOF
 {
   "orchestration": {
     "tasks": true,
@@ -125,12 +125,23 @@ ebml_header = b"\x1a\x45\xdf\xa3" + vint_one(len(children)) + children
     " width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\"/></svg>\n",
     encoding="utf-8",
 )
+# Oversized-grep fixture: one >64 MiB real-text file between two small
+# matches. Fixed-width newline-terminated rows place the needle past the old
+# whole-file read cap without sparse holes or NUL bytes.
+(ws / "early.txt").write_text("needle early\n", encoding="utf-8")
+huge_path = ws / "huge.txt"
+row = ("x" * 4095 + "\n").encode("ascii")
+with open(huge_path, "wb") as huge:
+    for _ in range((64 * 1024 * 1024) // len(row) + 2):
+        huge.write(row)
+    huge.write(b"needle huge\n")
+(ws / "later.txt").write_text("needle later\n", encoding="utf-8")
 
 # Foreign + native sessions under the isolated HOME (mirrors
 # SessionCatalog::from_env discovery): one native rpi row + OMP + Codex + Grok
 # so the sidebar shows exactly the rpi/Codex/Grok/OMP provider groups.
 import datetime, json
-agent = home / ".pi" / "agent"
+agent = home / ".rpi"
 sessions_root = agent / "sessions"
 def encoded(path: str) -> str:
     s = path[1:] if path.startswith("/") else path

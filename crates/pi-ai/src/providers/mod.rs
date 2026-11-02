@@ -13,6 +13,8 @@ mod radius;
 mod responses;
 mod vertex;
 
+pub use common::openai_strict_schema_dialect;
+
 pub use anthropic::*;
 pub use azure_responses::*;
 pub use bedrock::*;

@@ -13,10 +13,13 @@
 #   P1  Session panel: backend cwd/project fields = project A
 #   P2  switching to the project-B row activates backend cwd B (panel
 #       project/cwd/session-file fields all flip to B)
-#   P3  New session inherits B's cwd and its file lives under B's ENCODED
-#       default session directory (browser-visible path + sidebar row)
-#   P4  on-disk proof: exactly one new session file under B's encoded dir
-#       (header cwd == B) and NO new file under A's dir
+#   P3  New session requires an explicitly typed directory: empty input
+#       keeps New disabled with zero new_session frames; typing project A
+#       from the B source creates the target under A's ENCODED default
+#       session directory (browser-visible path + sidebar row) while B
+#       stays the untouched source
+#   P4  on-disk proof: exactly one new session file under A's encoded dir
+#       (header cwd == A) and NO new file under B's dir beyond the seed
 #
 # The lane FAILS (non-zero) whenever playwright/chromium cannot be used —
 # RPI_WEB_FORCE_PLAYWRIGHT is irrelevant here because there is no fallback.
@@ -38,7 +41,7 @@ main() {
     case "${1:-run}" in
         list|--list|--dry-run)
             printf '%s\n' \
-                'web-projects - all-project native session catalog + cross-project New-session storage: seeded A/B sessions listed as two sidebar project subgroups under the rpi provider, project-B switch activates backend cwd B, New session persists under B encoded default dir, on-disk proof (PLAYWRIGHT-ONLY, hard-fail)'
+                'web-projects - all-project native session catalog + cross-project New-session storage: seeded A/B sessions listed as two sidebar project subgroups under the rpi provider, project-B switch activates backend cwd B, explicit-directory New session persists under the selected project encoded default dir, on-disk proof (PLAYWRIGHT-ONLY, hard-fail)'
             return 0
             ;;
         run|all) ;;
@@ -77,7 +80,7 @@ main() {
     # row = newest) deterministically lands on project A. The resolved
     # session directories are written to $evidence/seed-dirs.json for the
     # playwright env (single source of truth for the encoding).
-    python3 - "$root/home/.pi/agent/sessions" "$root/workspace" "$project_b" "$evidence" <<'PY'
+    python3 - "$root/home/.rpi/sessions" "$root/workspace" "$project_b" "$evidence" <<'PY'
 import datetime, json, os, pathlib, sys
 sessions_root = pathlib.Path(sys.argv[1])
 cwd_a = sys.argv[2]
@@ -127,17 +130,9 @@ PY
     session_dir_a="$(jq -r '.sessionDirA' "$evidence/seed-dirs.json")"
     session_dir_b="$(jq -r '.sessionDirB' "$evidence/seed-dirs.json")"
 
-    # Standalone runs serve the checked-in Web bundle from a fixture-local
-    # copy, so they exercise the frontend the repo ships even if the binary
-    # predates the current dist. Coverage runs instead inherit the
-    # instrumented RPI_WEB_DEV_DIR exported by coverage.sh; overriding it here
-    # would load a bundle without the inline source map and invalidate that
-    # lane's V8 payload.
-    if [ -z "${RPI_COVERAGE_DIR:-}" ]; then
-        mkdir -p "$root/web-dist"
-        cp "$REPO_ROOT/crates/pi-cli/web/dist/index.html" "$root/web-dist/index.html"
-        export RPI_WEB_DEV_DIR="$root/web-dist"
-    fi
+    # The suite has already built or verified one current-tree bundle. Keep
+    # coverage's instrumented bundle and the normal production bundle alike.
+
 
     port="$(MOCK_SCENARIO=sessions web_start_mock "$root" "$evidence")"
     web_spawn_rpi "$root" "$evidence" "$port"

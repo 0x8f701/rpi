@@ -1,49 +1,74 @@
-// Derived from OpenAI Codex under Apache-2.0 and modified for pi-rs.
-// Upstream commit 646f7c0a91b8e327d263335da68ae8ef212895ce; see `../NOTICE`.
-
 use std::collections::BTreeMap;
 
 use seccompiler::{
-    BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
-    SeccompFilter, SeccompRule, TargetArch, apply_filter,
+    BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch, apply_filter,
 };
 
-use crate::{NetworkMode, SandboxError};
+use crate::child::ChildPlatformEnforcement;
+use crate::{ArchitectureKind, HostPlatform, NetworkPolicy, SandboxError, SandboxIoOperation};
 
-pub fn apply_current_thread_restrictions(network: NetworkMode) -> Result<(), SandboxError> {
+pub(crate) struct CompiledChildFilter(BpfProgram);
+
+pub fn apply_current_thread_restrictions(network: NetworkPolicy) -> Result<(), SandboxError> {
     install_seccomp_current_thread(network)
+}
+
+pub fn install_seccomp_current_thread(network: NetworkPolicy) -> Result<(), SandboxError> {
+    let deny_network = match network {
+        NetworkPolicy::None => true,
+        NetworkPolicy::FullAccess => false,
+        NetworkPolicy::ProxyRouted => return Err(SandboxError::ProxyRoutedUnavailable),
+    };
+    apply_compiled_child_filter(&CompiledChildFilter(compile_filter(deny_network)?))
+}
+
+pub(crate) fn compile_child_filter(
+    enforcement: ChildPlatformEnforcement,
+) -> Result<Option<CompiledChildFilter>, SandboxError> {
+    let deny_network = match enforcement {
+        ChildPlatformEnforcement::LinuxNoNetwork => true,
+        ChildPlatformEnforcement::LinuxFullNetwork => false,
+        ChildPlatformEnforcement::MacosSeatbelt => return Ok(None),
+    };
+    Ok(Some(CompiledChildFilter(compile_filter(deny_network)?)))
+}
+
+pub(crate) fn apply_compiled_child_filter(
+    filter: &CompiledChildFilter,
+) -> Result<(), SandboxError> {
+    apply_filter(&filter.0).map_err(|_| {
+        SandboxError::from_io(
+            SandboxIoOperation::ApplySeccomp,
+            &std::io::Error::from_raw_os_error(libc::EPERM),
+        )
+    })
 }
 
 #[allow(unsafe_code)]
 pub fn set_no_new_privs_current_thread() -> Result<(), SandboxError> {
-    // SAFETY: PR_SET_NO_NEW_PRIVS takes integer arguments only. Setting it to 1
-    // is irreversible for this thread and is the required prerequisite before
-    // installing the inherited seccomp filter.
     let result = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
     if result != 0 {
-        return Err(SandboxError::System(std::io::Error::last_os_error()));
+        return Err(SandboxError::from_io(
+            SandboxIoOperation::ApplyNoNewPrivileges,
+            &std::io::Error::last_os_error(),
+        ));
     }
     Ok(())
 }
 
-// `apply_filter` sets no_new_privs itself, so finish every fallible build step first.
-pub fn install_seccomp_current_thread(network: NetworkMode) -> Result<(), SandboxError> {
-    install_seccomp_current_thread_with(network, target_architecture(), |program| {
-        apply_filter(program).map_err(|error| SandboxError::Seccomp(error.to_string()))
-    })
-}
-
-fn install_seccomp_current_thread_with(
-    network: NetworkMode,
-    architecture: Result<TargetArch, SandboxError>,
-    install: impl FnOnce(&BpfProgram) -> Result<(), SandboxError>,
-) -> Result<(), SandboxError> {
-    let program = compile_filter(network, architecture?)?;
-    install(&program)
+fn compile_filter(deny_network: bool) -> Result<BpfProgram, SandboxError> {
+    build_filter(deny_network, target_architecture()?)?
+        .try_into()
+        .map_err(|_| {
+            SandboxError::from_io(
+                SandboxIoOperation::ApplySeccomp,
+                &std::io::Error::from_raw_os_error(libc::EINVAL),
+            )
+        })
 }
 
 fn build_filter(
-    network: NetworkMode,
+    deny_network: bool,
     architecture: TargetArch,
 ) -> Result<SeccompFilter, SandboxError> {
     let mut rules = BTreeMap::new();
@@ -55,12 +80,31 @@ fn build_filter(
         libc::SYS_io_uring_enter,
         libc::SYS_io_uring_register,
     ] {
-        deny_syscall(&mut rules, syscall);
+        rules.insert(syscall, Vec::<SeccompRule>::new());
     }
-    match network {
-        NetworkMode::FullAccess => {}
-        NetworkMode::Restricted => append_restricted_network_rules(&mut rules)?,
-        NetworkMode::ProxyRouted => append_proxy_network_rules(&mut rules)?,
+    if deny_network {
+        for syscall in [
+            libc::SYS_socket,
+            libc::SYS_socketpair,
+            libc::SYS_connect,
+            libc::SYS_accept,
+            libc::SYS_accept4,
+            libc::SYS_bind,
+            libc::SYS_listen,
+            libc::SYS_getpeername,
+            libc::SYS_getsockname,
+            libc::SYS_shutdown,
+            libc::SYS_sendto,
+            libc::SYS_sendmsg,
+            libc::SYS_sendmmsg,
+            libc::SYS_recvfrom,
+            libc::SYS_recvmsg,
+            libc::SYS_recvmmsg,
+            libc::SYS_getsockopt,
+            libc::SYS_setsockopt,
+        ] {
+            rules.insert(syscall, Vec::<SeccompRule>::new());
+        }
     }
     SeccompFilter::new(
         rules,
@@ -68,72 +112,12 @@ fn build_filter(
         SeccompAction::Errno(libc::EPERM as u32),
         architecture,
     )
-    .map_err(|error| SandboxError::Seccomp(error.to_string()))
-}
-
-fn compile_filter(
-    network: NetworkMode,
-    architecture: TargetArch,
-) -> Result<BpfProgram, SandboxError> {
-    build_filter(network, architecture)?
-        .try_into()
-        .map_err(|error: seccompiler::BackendError| SandboxError::Seccomp(error.to_string()))
-}
-
-fn deny_syscall(rules: &mut BTreeMap<i64, Vec<SeccompRule>>, syscall: i64) {
-    rules.insert(syscall, Vec::new());
-}
-
-fn append_restricted_network_rules(
-    rules: &mut BTreeMap<i64, Vec<SeccompRule>>,
-) -> Result<(), SandboxError> {
-    for syscall in [
-        libc::SYS_connect,
-        libc::SYS_accept,
-        libc::SYS_accept4,
-        libc::SYS_bind,
-        libc::SYS_listen,
-        libc::SYS_getpeername,
-        libc::SYS_getsockname,
-        libc::SYS_shutdown,
-        libc::SYS_sendto,
-        libc::SYS_sendmmsg,
-        libc::SYS_recvmmsg,
-        libc::SYS_getsockopt,
-        libc::SYS_setsockopt,
-    ] {
-        deny_syscall(rules, syscall);
-    }
-    let deny_non_unix = SeccompRule::new(vec![condition_not_equal(libc::AF_UNIX)?])
-        .map_err(|error| SandboxError::Seccomp(error.to_string()))?;
-    rules.insert(libc::SYS_socket, vec![deny_non_unix.clone()]);
-    rules.insert(libc::SYS_socketpair, vec![deny_non_unix]);
-    Ok(())
-}
-
-fn append_proxy_network_rules(
-    rules: &mut BTreeMap<i64, Vec<SeccompRule>>,
-) -> Result<(), SandboxError> {
-    let deny_non_ip = SeccompRule::new(vec![
-        condition_not_equal(libc::AF_INET)?,
-        condition_not_equal(libc::AF_INET6)?,
-    ])
-    .map_err(|error| SandboxError::Seccomp(error.to_string()))?;
-    let deny_non_unix = SeccompRule::new(vec![condition_not_equal(libc::AF_UNIX)?])
-        .map_err(|error| SandboxError::Seccomp(error.to_string()))?;
-    rules.insert(libc::SYS_socket, vec![deny_non_ip]);
-    rules.insert(libc::SYS_socketpair, vec![deny_non_unix]);
-    Ok(())
-}
-
-fn condition_not_equal(value: i32) -> Result<SeccompCondition, SandboxError> {
-    SeccompCondition::new(
-        0,
-        SeccompCmpArgLen::Dword,
-        SeccompCmpOp::Ne,
-        value as u64,
-    )
-    .map_err(|error| SandboxError::Seccomp(error.to_string()))
+    .map_err(|_| {
+        SandboxError::from_io(
+            SandboxIoOperation::ApplySeccomp,
+            &std::io::Error::from_raw_os_error(libc::EINVAL),
+        )
+    })
 }
 
 fn target_architecture() -> Result<TargetArch, SandboxError> {
@@ -142,34 +126,41 @@ fn target_architecture() -> Result<TargetArch, SandboxError> {
     } else if cfg!(target_arch = "aarch64") {
         Ok(TargetArch::aarch64)
     } else {
-        Err(SandboxError::UnsupportedArchitecture)
+        Err(SandboxError::UnsupportedArchitecture {
+            platform: HostPlatform::Linux,
+            architecture: ArchitectureKind::Other,
+        })
     }
 }
 
-#[cfg(test)]
-pub(crate) fn compiled_filter(network: NetworkMode) -> Result<BpfProgram, SandboxError> {
-    compile_filter(network, target_architecture()?)
-}
-
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use std::cell::Cell;
-
     use super::*;
+    use crate::NetworkPolicy;
 
     #[test]
-    fn unsupported_architecture_fails_before_irreversible_install() {
-        let installer_called = Cell::new(false);
-        let result = install_seccomp_current_thread_with(
-            NetworkMode::Restricted,
-            Err(SandboxError::UnsupportedArchitecture),
-            |_| {
-                installer_called.set(true);
-                Ok(())
-            },
+    fn seccomp_filter_compiles_for_both_network_policies_and_rejects_proxy_routed() {
+        // Both enforceable policies must compile to a valid BPF program on
+        // the running architecture (the hosted E2E only exercises one).
+        let deny = compile_filter(true).expect("deny-network filter compiles");
+        let allow = compile_filter(false).expect("full-access filter compiles");
+        assert!(!deny.is_empty(), "deny program must contain instructions");
+        assert!(!allow.is_empty(), "allow program must contain instructions");
+        // The deny program is strictly larger: it carries the network-syscall
+        // rejection rules on top of the shared baseline.
+        assert!(
+            deny.len() > allow.len(),
+            "deny-network filter ({}) must exceed full-access ({})",
+            deny.len(),
+            allow.len()
         );
 
-        assert!(matches!(result, Err(SandboxError::UnsupportedArchitecture)));
-        assert!(!installer_called.get());
+        // ProxyRouted is not enforceable via raw seccomp: fail closed.
+        let error = install_seccomp_current_thread(NetworkPolicy::ProxyRouted)
+            .expect_err("proxy-routed must refuse seccomp enforcement");
+        assert!(
+            matches!(error, SandboxError::ProxyRoutedUnavailable),
+            "unexpected error: {error:?}"
+        );
     }
 }

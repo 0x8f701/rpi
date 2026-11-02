@@ -759,9 +759,13 @@ fn detect_cancelled(is_error: bool, content: &[ContentBlock], details: &Value) -
         || text.contains("tool call cancelled")
 }
 
-/// Compact one-line argument summary for titles. Secret-bearing keys are omitted.
+/// Compact one-line argument summary with an explicit budget: secret-bearing
+/// keys are omitted and secret-shaped text is scrubbed before any width cut.
+/// This is the single formatting implementation — tool-card title surfaces
+/// use the public 60-char [`compact_tool_arguments`]; the orchestration
+/// history producer passes its own row budget.
 #[must_use]
-pub fn compact_tool_arguments(arguments: &Value) -> String {
+pub(crate) fn compact_tool_arguments_with_budget(arguments: &Value, max_chars: usize) -> String {
     let redacted = redact_value(arguments);
     let preferred = ["command", "path", "pattern", "query", "file", "glob", "url"]
         .into_iter()
@@ -791,7 +795,13 @@ pub fn compact_tool_arguments(arguments: &Value) -> String {
         }
     };
 
-    truncate_chars(&raw, 60)
+    truncate_chars(&raw, max_chars)
+}
+
+/// Compact one-line argument summary for titles. Secret-bearing keys are omitted.
+#[must_use]
+pub fn compact_tool_arguments(arguments: &Value) -> String {
+    compact_tool_arguments_with_budget(arguments, 60)
 }
 
 #[must_use]
@@ -1312,7 +1322,10 @@ mod tests {
         }
 
         let debug = format!("{:?}", state.get("sec").unwrap());
-        assert!(!debug.contains(secret.as_str()), "Debug leaked secret: {debug}");
+        assert!(
+            !debug.contains(secret.as_str()),
+            "Debug leaked secret: {debug}"
+        );
         assert!(!debug.contains("hunter2"), "Debug leaked password: {debug}");
 
         let state_debug = format!("{state:?}");
@@ -1604,7 +1617,10 @@ mod tests {
             expanded.content_text
         );
         if let Some(err) = &expanded.error_message {
-            assert!(!err.contains(pat.as_str()), "error_message leaked PAT: {err}");
+            assert!(
+                !err.contains(pat.as_str()),
+                "error_message leaked PAT: {err}"
+            );
         }
         let debug = format!("{:?}", state.get("gh").unwrap());
         assert!(!debug.contains(pat.as_str()), "Debug leaked PAT: {debug}");

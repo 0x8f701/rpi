@@ -146,10 +146,9 @@ async function main() {
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await waitFor(page, () => document.title === 'rpi web', 'S1: page title missing');
-    await waitFor(page, () => document.getElementById('conn-state') !== null, 'S1: conn-state missing');
     await waitFor(
       page,
-      () => document.getElementById('conn-state').dataset.state === 'on',
+      () => document.getElementById('send-btn')?.hasAttribute('disabled') !== true,
       'S1: WS did not reach "connected"'
     );
 
@@ -159,9 +158,9 @@ async function main() {
       page,
       () => {
         const names = Array.from(document.querySelectorAll('.command-picker__option .command-picker__name')).map((el) => el.textContent.trim());
-        return names.includes('/compact') && names.includes('/skill') && names.includes('/code-review');
+        return names.includes('/compact') && names.includes('/skill') && names.includes('/review');
       },
-      'S1: picker did not list /compact /skill /code-review'
+      'S1: picker did not list /compact /skill /review'
     );
 
     // S2: REAL click on /skill drills into skills mode — and Skills STAYS

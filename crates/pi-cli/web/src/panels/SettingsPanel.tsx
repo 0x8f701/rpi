@@ -17,6 +17,9 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { safeText } from '../redact';
+import { applyPlantumlServerFromCatalog } from '../plantumlEncode';
+import type { McpServerSettingsWire, SandboxSettingsWire } from '../types';
+
 
 export interface SettingValueTypeWire {
   kind: string;
@@ -40,11 +43,11 @@ export interface SettingDefWire {
 
 export interface SettingValueViewWire {
   definition: SettingDefWire;
-  effectiveValue: unknown;
+  effectiveValue: unknown | SandboxSettingsWire | McpServerSettingsWire[];
   source: string;
-  globalValue?: unknown;
-  projectValue?: unknown;
-  sessionOverrideValue?: unknown;
+  globalValue?: unknown | SandboxSettingsWire | McpServerSettingsWire[];
+  projectValue?: unknown | SandboxSettingsWire | McpServerSettingsWire[];
+  sessionOverrideValue?: unknown | SandboxSettingsWire | McpServerSettingsWire[];
   editableGlobal: boolean;
   editableProject: boolean;
   redacted: boolean;
@@ -75,6 +78,14 @@ interface SettingsPanelProps {
   sendCommand: (command: Record<string, unknown>) => Promise<unknown>;
   /** Re-fetch get_state into the app shell after apply (runtime settings). */
   refreshState: () => Promise<unknown>;
+  /** True only once the App websocket is authoritative-ready (`connState ===
+   *  'on'`). While false — notably the `token_required` boot hold that
+   *  auto-opens this panel — the catalog auto-load, Refresh, and Edit stay
+   *  silent: `settings_inspect` / `settings_open_draft` would reject with
+   *  `not connected` and surface a bogus error banner. The Connection token
+   *  UI below stays fully usable; the first flip to true loads the catalog
+   *  exactly once. */
+  catalogEnabled: boolean;
   /** Current connection token (rpi-auth.<token> subprotocol). */
   token: string;
   /** Persist a new token for the current listener authority and reconnect. */
@@ -149,9 +160,8 @@ function parseTypedValue(kind: string, raw: string): { ok: boolean; value?: unkn
         if (kind === 'stringList' && (!Array.isArray(parsed) || parsed.some((item) => typeof item !== 'string'))) {
           return { ok: false, message: 'expected a JSON array of strings' };
         }
-        if (kind === 'array' && !Array.isArray(parsed)) return { ok: false, message: 'expected a JSON array' };
-        if (kind === 'object' && (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed))) {
-          return { ok: false, message: 'expected a JSON object' };
+        if (kind === 'object' && parsed !== null && (typeof parsed !== 'object' || Array.isArray(parsed))) {
+          return { ok: false, message: 'expected a JSON object or null' };
         }
         return { ok: true, value: parsed };
       } catch {
@@ -163,18 +173,225 @@ function parseTypedValue(kind: string, raw: string): { ok: boolean; value?: unkn
   }
 }
 
-export function SettingsPanel({ sendCommand, refreshState, token, onTokenChange, onClose }: SettingsPanelProps) {
+export interface SettingLocalDraft {
+  raw: string;
+  baseline: string;
+  dirty: boolean;
+  revision: number;
+}
+
+export type SettingLocalDrafts = Map<string, SettingLocalDraft>;
+
+export function settingValueToRaw(view: SettingValueViewWire, value: unknown): string {
+  const kind = view.definition.valueType.kind;
+  if (kind === 'string' || kind === 'enum') return typeof value === 'string' ? value : '';
+  if (kind === 'boolean') return value === true ? 'true' : 'false';
+  if (kind === 'integer' || kind === 'unsignedInteger' || kind === 'number') {
+    return typeof value === 'number' ? String(value) : '';
+  }
+  return value === undefined || value === null ? '' : JSON.stringify(value, null, 2);
+}
+
+export function reconcileSettingLocalDrafts(
+  current: SettingLocalDrafts,
+  values: Array<{ view: SettingValueViewWire; value: unknown }>,
+  replace = false,
+): SettingLocalDrafts {
+  const next = replace ? new Map<string, SettingLocalDraft>() : new Map(current);
+  for (const { view, value } of values) {
+    const key = view.definition.key;
+    const raw = settingValueToRaw(view, value);
+    const existing = next.get(key);
+    if (!existing || !existing.dirty) {
+      next.set(key, {
+        raw,
+        baseline: raw,
+        dirty: false,
+        revision: existing?.revision ?? 0,
+      });
+    }
+  }
+  return next;
+}
+
+export function editSettingLocalDraft(
+  current: SettingLocalDrafts,
+  key: string,
+  raw: string,
+  baseline: string,
+): SettingLocalDrafts {
+  const existing = current.get(key) ?? { raw: baseline, baseline, dirty: false, revision: 0 };
+  const next = new Map(current);
+  next.set(key, {
+    raw,
+    baseline: existing.baseline,
+    dirty: raw !== existing.baseline,
+    revision: existing.revision + 1,
+  });
+  return next;
+}
+
+
+export function stagedSettingKeys(
+  catalog: SettingsCatalogWire | null,
+  draftValues: Map<string, SettingValueViewWire>,
+): Set<string> {
+  const keys = new Set<string>();
+  for (const view of catalog?.values ?? []) {
+    const staged = draftValues.get(view.definition.key);
+    if (staged && settingValueToRaw(view, staged.effectiveValue) !== settingValueToRaw(view, view.effectiveValue)) {
+      keys.add(view.definition.key);
+    }
+  }
+  return keys;
+}
+
+export function mergeSettingSnapshotDrafts(
+  current: SettingLocalDrafts,
+  values: Array<{ view: SettingValueViewWire; value: unknown }>,
+  acknowledgedKey?: string,
+): SettingLocalDrafts {
+  const next = reconcileSettingLocalDrafts(current, values);
+  if (acknowledgedKey !== undefined) {
+    const acknowledged = values.find(({ view }) => view.definition.key === acknowledgedKey);
+    const local = next.get(acknowledgedKey);
+    if (acknowledged && local) {
+      const raw = settingValueToRaw(acknowledged.view, acknowledged.value);
+      if (local.raw === raw) next.set(acknowledgedKey, { ...local, baseline: raw, dirty: false });
+    }
+  }
+  return next;
+}
+
+export function dirtySettingKeys(drafts: SettingLocalDrafts): string[] {
+  return Array.from(drafts, ([key, draft]) => (draft.dirty ? key : null)).filter((key): key is string => key !== null);
+}
+
+export function shouldSubmitSettingEnter(
+  key: string,
+  isComposing: boolean,
+  multiline = false,
+  modified = false,
+): boolean {
+  return key === 'Enter' && !isComposing && (!multiline || modified);
+}
+
+export interface SettingRequestResult {
+  generation: number;
+  accepted: boolean;
+  ok: boolean;
+  data?: unknown;
+  error?: unknown;
+}
+
+interface PendingSettingRequest {
+  generation: number;
+  revision: number;
+  requestValue: string;
+  promise: Promise<SettingRequestResult>;
+}
+
+/** Per-key request gate: changed drafts and newer submissions supersede old replies. */
+export class SettingRequestGate {
+  private nextGeneration = 0;
+  private latestGeneration = 0;
+  private readonly epochByKey = new Map<string, number>();
+  private readonly pendingByKey = new Map<string, PendingSettingRequest>();
+
+  submit(
+    key: string,
+    revision: number,
+    requestValue: string,
+    getCurrentRevision: () => number | undefined,
+    run: () => Promise<unknown>,
+  ): Promise<SettingRequestResult> {
+    const pending = this.pendingByKey.get(key);
+    if (pending && pending.revision === revision && pending.requestValue === requestValue) {
+      return pending.promise;
+    }
+
+    const generation = ++this.nextGeneration;
+    const epoch = this.epochByKey.get(key) ?? 0;
+    this.latestGeneration = generation;
+    this.pendingByKey.clear();
+
+    let operation: Promise<unknown>;
+    try {
+      operation = run();
+    } catch (error) {
+      operation = Promise.reject(error);
+    }
+
+    const promise = operation
+      .then(
+        (data): SettingRequestResult => ({
+          generation,
+          accepted: this.isCurrent(key, generation, revision, epoch, getCurrentRevision),
+          ok: true,
+          data,
+        }),
+        (error): SettingRequestResult => ({
+          generation,
+          accepted: this.isCurrent(key, generation, revision, epoch, getCurrentRevision),
+          ok: false,
+          error,
+        }),
+      )
+      .finally(() => {
+        if (this.pendingByKey.get(key)?.generation === generation) this.pendingByKey.delete(key);
+      });
+
+    this.pendingByKey.set(key, { generation, revision, requestValue, promise });
+    return promise;
+  }
+
+  invalidate(key: string): void {
+    this.epochByKey.set(key, (this.epochByKey.get(key) ?? 0) + 1);
+    this.pendingByKey.delete(key);
+  }
+
+  invalidateAll(): void {
+    for (const key of this.pendingByKey.keys()) this.epochByKey.set(key, (this.epochByKey.get(key) ?? 0) + 1);
+    this.pendingByKey.clear();
+    this.latestGeneration = ++this.nextGeneration;
+  }
+
+  private isCurrent(
+    key: string,
+    generation: number,
+    revision: number,
+    epoch: number,
+    getCurrentRevision: () => number | undefined,
+  ): boolean {
+    return (
+      epoch === (this.epochByKey.get(key) ?? 0)
+      && this.latestGeneration === generation
+      && getCurrentRevision() === revision
+    );
+  }
+}
+
+export function SettingsPanel({ sendCommand, refreshState, catalogEnabled, token, onTokenChange, onClose }: SettingsPanelProps) {
   const [catalog, setCatalog] = useState<SettingsCatalogWire | null>(null);
   const [draftId, setDraftId] = useState<string | null>(null);
-  const [draftDirty, setDraftDirty] = useState(false);
   const [draftValues, setDraftValues] = useState<Map<string, SettingValueViewWire>>(new Map());
+  const [localDrafts, setLocalDrafts] = useState<SettingLocalDrafts>(new Map());
+  const localDraftsRef = useRef(localDrafts);
+  const requestGateRef = useRef(new SettingRequestGate());
   const [selectedCategory, setSelectedCategory] = useState('models');
   const [status, setStatus] = useState('');
   const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
   // Connection token draft: edited locally, committed via onTokenChange
   // (Save/Enter) so typing never reconnects mid-keystroke.
   const [tokenDraft, setTokenDraft] = useState(token);
   const mountedRef = useRef(true);
+
+  const updateLocalDrafts = useCallback((update: (current: SettingLocalDrafts) => SettingLocalDrafts) => {
+    const next = update(localDraftsRef.current);
+    localDraftsRef.current = next;
+    setLocalDrafts(next);
+  }, []);
 
   const loadCatalog = useCallback(async () => {
     const data = await sendCommand({ type: 'settings_inspect' });
@@ -182,6 +399,7 @@ export function SettingsPanel({ sendCommand, refreshState, token, onTokenChange,
     // Own RPC contract: SettingsCatalogSnapshot (rpc.rs settings_inspect).
     const snapshot = data as SettingsCatalogWire;
     setCatalog(snapshot);
+    applyPlantumlServerFromCatalog(snapshot);
     if (snapshot?.values && snapshot.values.length > 0) {
       const categories = new Set(snapshot.values.map((view) => view.definition.category));
       if (!categories.has(selectedCategory)) {
@@ -190,8 +408,23 @@ export function SettingsPanel({ sendCommand, refreshState, token, onTokenChange,
     }
   }, [selectedCategory]);
 
+  // Catalog auto-load, gated on catalogEnabled: the token_required boot hold
+  // auto-opens this panel with NO socket, and an unconditional
+  // settings_inspect here rejected with `not connected` and surfaced a
+  // persistent `catalog load failed: not connected` banner. While disabled
+  // nothing is sent and the status stays quiet; the FIRST flip to enabled
+  // (token saved, authoritative bootstrap done) loads the catalog exactly
+  // once. Manual Refresh (button, disabled while disabled) and the
+  // post-apply reload below are separate, deliberate calls.
+  const autoLoadedRef = useRef(false);
   useEffect(() => {
     mountedRef.current = true;
+    if (!catalogEnabled || autoLoadedRef.current) {
+      return () => {
+        mountedRef.current = false;
+      };
+    }
+    autoLoadedRef.current = true;
     loadCatalog().catch((err: Error) => {
       if (mountedRef.current) setStatus(`catalog load failed: ${safeText(err.message)}`);
     });
@@ -199,7 +432,7 @@ export function SettingsPanel({ sendCommand, refreshState, token, onTokenChange,
       mountedRef.current = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [catalogEnabled]);
 
   // Keep the draft in sync when the saved token changes elsewhere (boot
   // restore from localStorage, a commit from this panel after a reconnect).
@@ -207,86 +440,147 @@ export function SettingsPanel({ sendCommand, refreshState, token, onTokenChange,
     setTokenDraft(token);
   }, [token]);
 
-  const applyDraftSnapshot = useCallback((data: unknown) => {
+  const applyDraftSnapshot = useCallback((data: unknown, replaceLocalDrafts = false, acknowledgedKey?: string) => {
     const snapshot = data as DraftSnapshotWire;
     if (!snapshot?.draftId) return;
     setDraftId(snapshot.draftId);
-    setDraftDirty(snapshot.dirty === true);
+    const snapshotValues = Array.isArray(snapshot.values) ? snapshot.values : [];
     const values = new Map<string, SettingValueViewWire>();
-    for (const view of Array.isArray(snapshot.values) ? snapshot.values : []) {
-      values.set(view.definition.key, view);
-    }
+    for (const view of snapshotValues) values.set(view.definition.key, view);
     setDraftValues(values);
-  }, []);
+    updateLocalDrafts((current) => replaceLocalDrafts
+      ? reconcileSettingLocalDrafts(current, snapshotValues.map((view) => ({ view, value: view.effectiveValue })), true)
+      : mergeSettingSnapshotDrafts(current, snapshotValues.map((view) => ({ view, value: view.effectiveValue })), acknowledgedKey));
+  }, [updateLocalDrafts]);
 
   const openDraft = useCallback(async () => {
+    // Quiet no-op while the catalog gate is closed: no socket means
+    // settings_open_draft could only fail with a transport banner.
+    if (!catalogEnabled) return;
+    if (busyRef.current) return;
+    busyRef.current = true;
     setBusy(true);
     setStatus('');
     try {
       const data = await sendCommand({ type: 'settings_open_draft', scope: 'global' });
-      applyDraftSnapshot(data);
+      applyDraftSnapshot(data, true);
       setStatus('draft open — edits are staged until Apply');
     } catch (err) {
       setStatus(`open draft failed: ${safeText((err as Error).message)}`);
     } finally {
+      busyRef.current = false;
       if (mountedRef.current) setBusy(false);
     }
-  }, [applyDraftSnapshot, sendCommand]);
+  }, [applyDraftSnapshot, catalogEnabled, sendCommand]);
+
+  const editLocalDraft = useCallback((view: SettingValueViewWire, value: unknown, raw: string) => {
+    const key = view.definition.key;
+    requestGateRef.current.invalidate(key);
+    updateLocalDrafts((current) => editSettingLocalDraft(
+      current,
+      key,
+      raw,
+      settingValueToRaw(view, value),
+    ));
+  }, [updateLocalDrafts]);
 
   const commitEdit = useCallback(
-    async (key: string, raw: string) => {
-      if (!draftId) return;
+    async (key: string): Promise<boolean> => {
+      if (!draftId) return false;
       const def = catalog?.values.find((view) => view.definition.key === key)?.definition;
-      if (!def) return;
-      const parsed = parseTypedValue(def.valueType.kind, raw);
+      const local = localDraftsRef.current.get(key);
+      if (!def || !local?.dirty) return true;
+      const parsed = parseTypedValue(def.valueType.kind, local.raw);
       if (!parsed.ok) {
         setStatus(`${key}: ${parsed.message}`);
-        return;
+        return false;
       }
-      setBusy(true);
+
       setStatus('');
-      try {
-        const data = await sendCommand({ type: 'settings_set', draftId, key, value: parsed.value });
-        applyDraftSnapshot(data);
-      } catch (err) {
-        setStatus(`${key}: ${safeText((err as Error).message)}`);
-      } finally {
-        if (mountedRef.current) setBusy(false);
+      const submittedDraftId = draftId;
+      const revision = local.revision;
+      const raw = local.raw;
+      const result = await requestGateRef.current.submit(
+        key,
+        revision,
+        raw,
+        () => localDraftsRef.current.get(key)?.revision,
+        () => sendCommand({ type: 'settings_set', draftId: submittedDraftId, key, value: parsed.value }),
+      );
+      if (!mountedRef.current || draftId !== submittedDraftId) return false;
+      if (!result.accepted) return !localDraftsRef.current.get(key)?.dirty;
+      if (!result.ok) {
+        setStatus(`${key}: ${safeText((result.error as Error).message)}`);
+        return false;
       }
+      applyDraftSnapshot(result.data, false, key);
+      return true;
     },
     [applyDraftSnapshot, catalog, draftId, sendCommand]
   );
 
+  const submitLocalDrafts = useCallback(async (): Promise<boolean> => {
+    for (const key of dirtySettingKeys(localDraftsRef.current)) {
+      if (!await commitEdit(key)) return false;
+    }
+    return true;
+  }, [commitEdit]);
+
+  const commitOneEdit = useCallback((key: string) => {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    void commitEdit(key).finally(() => {
+      busyRef.current = false;
+      if (mountedRef.current) setBusy(false);
+    });
+  }, [commitEdit]);
+
   const commitReset = useCallback(
     async (key: string) => {
       if (!draftId) return;
+      if (busyRef.current) return;
+      busyRef.current = true;
+      requestGateRef.current.invalidateAll();
       setBusy(true);
       setStatus('');
       try {
         const data = await sendCommand({ type: 'settings_reset', draftId, key });
         applyDraftSnapshot(data);
+        const snapshot = data as DraftSnapshotWire;
+        const resetView = snapshot.values?.find((view) => view.definition.key === key);
+        if (resetView) {
+          updateLocalDrafts((current) => reconcileSettingLocalDrafts(
+            new Map(Array.from(current).filter(([draftKey]) => draftKey !== key)),
+            [{ view: resetView, value: resetView.effectiveValue }],
+          ));
+        }
         setStatus(`${key} reset to default`);
       } catch (err) {
         setStatus(`${key}: ${safeText((err as Error).message)}`);
       } finally {
+        busyRef.current = false;
         if (mountedRef.current) setBusy(false);
       }
     },
-    [applyDraftSnapshot, draftId, sendCommand]
+    [applyDraftSnapshot, draftId, sendCommand, updateLocalDrafts]
   );
 
   const applyDraft = useCallback(async () => {
-    if (!draftId) return;
+    if (!draftId || busyRef.current) return;
+    busyRef.current = true;
     setBusy(true);
     setStatus('');
     try {
+      if (!await submitLocalDrafts()) return;
       const data = await sendCommand({ type: 'settings_apply', draftId });
       const outcome = data as ApplyOutcomeWire;
       await refreshState();
       await loadCatalog();
+      requestGateRef.current.invalidateAll();
       setDraftId(null);
       setDraftValues(new Map());
-      setDraftDirty(false);
+      updateLocalDrafts(() => new Map());
       if (outcome?.restartRequired) {
         setStatus('settings applied — restart required');
       } else {
@@ -295,27 +589,32 @@ export function SettingsPanel({ sendCommand, refreshState, token, onTokenChange,
     } catch (err) {
       setStatus(`apply failed: ${safeText((err as Error).message)}`);
     } finally {
+      busyRef.current = false;
       if (mountedRef.current) setBusy(false);
     }
-  }, [draftId, loadCatalog, refreshState, sendCommand]);
+  }, [draftId, loadCatalog, refreshState, sendCommand, submitLocalDrafts, updateLocalDrafts]);
 
   const cancelDraft = useCallback(async () => {
     if (!draftId) return;
+    if (busyRef.current) return;
+    busyRef.current = true;
+    requestGateRef.current.invalidateAll();
     setBusy(true);
     setStatus('');
     try {
       await sendCommand({ type: 'settings_cancel', draftId });
       setDraftId(null);
       setDraftValues(new Map());
-      setDraftDirty(false);
+      updateLocalDrafts(() => new Map());
       await loadCatalog();
       setStatus('draft cancelled');
     } catch (err) {
       setStatus(`cancel failed: ${safeText((err as Error).message)}`);
     } finally {
+      busyRef.current = false;
       if (mountedRef.current) setBusy(false);
     }
-  }, [draftId, loadCatalog, sendCommand]);
+  }, [draftId, loadCatalog, sendCommand, updateLocalDrafts]);
 
   const grouped = useMemo(() => {
     const groups = new Map<string, SettingValueViewWire[]>();
@@ -332,6 +631,7 @@ export function SettingsPanel({ sendCommand, refreshState, token, onTokenChange,
   }, [catalog]);
 
   const activeCategory = grouped.find((group) => group.category === selectedCategory) || grouped[0];
+  const stagedKeys = useMemo(() => stagedSettingKeys(catalog, draftValues), [catalog, draftValues]);
 
   const valueOf = useCallback(
     (view: SettingValueViewWire): unknown => {
@@ -343,14 +643,20 @@ export function SettingsPanel({ sendCommand, refreshState, token, onTokenChange,
 
   return (
     <section id="settings-panel" className="panel" aria-label="Settings panel">
-      <header className="panel__head">
+      <div className="panel__head">
         <span className="panel__title">Settings</span>
         <span className="panel__hint">
           {draftId ? 'draft open — edits staged until Apply' : 'browse effective settings'}
         </span>
         {draftId ? (
           <>
-            <button id="settings-apply-btn" type="button" onClick={applyDraft} disabled={busy} title="Persist the staged draft">
+            <button
+              id="settings-apply-btn"
+              type="button"
+              onClick={applyDraft}
+              disabled={busy}
+              title="Stage local edits and persist the settings draft"
+            >
               Apply
             </button>
             <button id="settings-cancel-btn" type="button" onClick={cancelDraft} disabled={busy} title="Discard the staged draft">
@@ -358,17 +664,17 @@ export function SettingsPanel({ sendCommand, refreshState, token, onTokenChange,
             </button>
           </>
         ) : (
-          <button id="settings-edit-btn" type="button" onClick={openDraft} disabled={busy} title="Open a global-scope edit draft">
+          <button id="settings-edit-btn" type="button" onClick={openDraft} disabled={busy || !catalogEnabled} title="Open a global-scope edit draft">
             Edit settings
           </button>
         )}
-        <button id="settings-refresh-btn" type="button" onClick={() => loadCatalog().catch(() => {})} disabled={busy}>
+        <button id="settings-refresh-btn" type="button" onClick={() => loadCatalog().catch(() => {})} disabled={busy || !catalogEnabled}>
           Refresh
         </button>
         <button id="settings-close-btn" type="button" className="panel-close" onClick={onClose} title="Close panel" aria-label="Close settings panel">
           ✕
         </button>
-      </header>
+      </div>
 
       {status !== '' && (
         <div className={`panel__status${status.includes('failed') ? ' panel__status--error' : ''}`}>
@@ -440,21 +746,23 @@ export function SettingsPanel({ sendCommand, refreshState, token, onTokenChange,
             const secret = isSecretView(view);
             const editable = draftId !== null && view.editableGlobal && !secret;
             const value = valueOf(view);
+            const localDraft = localDrafts.get(def.key);
+            const raw = localDraft?.raw ?? settingValueToRaw(view, value);
             const rawDefault = def.defaultJson ? valueSummary(JSON.parse(def.defaultJson)) : '—';
             return (
               <div key={def.key} className="setting-row" data-setting-key={def.key}>
                 <div className="setting-row__head">
                   <span className="setting-row__key">{safeText(def.key)}</span>
-                  {draftDirty && <span className="setting-row__dirty">dirty</span>}
+                  {(stagedKeys.has(def.key) || localDraft?.dirty) && <span className="setting-row__dirty">dirty</span>}
                 </div>
                 <div className="setting-row__desc">{safeText(def.description)}</div>
                 <div className="setting-row__control">
                   <SettingControl
                     view={view}
-                    value={value}
+                    raw={raw}
                     editable={editable}
-                    busy={busy}
-                    onCommit={(raw) => commitEdit(def.key, raw)}
+                    onChange={(nextRaw) => editLocalDraft(view, value, nextRaw)}
+                    onCommit={() => commitOneEdit(def.key)}
                   />
                 </div>
                 <div className="setting-row__meta">
@@ -485,16 +793,22 @@ export function SettingsPanel({ sendCommand, refreshState, token, onTokenChange,
 
 interface SettingControlProps {
   view: SettingValueViewWire;
-  value: unknown;
+  raw: string;
   editable: boolean;
-  busy: boolean;
-  onCommit: (raw: string) => void;
+  onChange: (raw: string) => void;
+  onCommit: () => void;
 }
 
-function SettingControl({ view, value, editable, busy, onCommit }: SettingControlProps) {
+export function SettingControl({ view, raw, editable, onChange, onCommit }: SettingControlProps) {
   const def = view.definition;
   const kind = def.valueType.kind;
   const secret = isSecretView(view);
+  const commitOnEnter = (event: React.KeyboardEvent<HTMLInputElement | HTMLSelectElement>) => {
+    if (shouldSubmitSettingEnter(event.key, event.nativeEvent.isComposing)) {
+      event.preventDefault();
+      onCommit();
+    }
+  };
 
   if (secret) {
     return (
@@ -505,14 +819,15 @@ function SettingControl({ view, value, editable, busy, onCommit }: SettingContro
   }
 
   if (kind === 'boolean') {
-    const checked = value === true;
+    const checked = raw === 'true';
     return (
       <label className="setting-row__bool">
         <input
           type="checkbox"
-          checked={editable ? checked : Boolean(value)}
-          disabled={!editable || busy}
-          onChange={(e) => onCommit(String(e.target.checked))}
+          checked={checked}
+          disabled={!editable}
+          onChange={(event) => onChange(String(event.target.checked))}
+          onKeyDown={commitOnEnter}
         />
         <span>{checked ? 'enabled' : 'disabled'}</span>
       </label>
@@ -520,12 +835,12 @@ function SettingControl({ view, value, editable, busy, onCommit }: SettingContro
   }
 
   if (kind === 'enum') {
-    const current = typeof value === 'string' ? value : '';
     return (
       <select
-        value={current}
-        disabled={!editable || busy}
-        onChange={(e) => onCommit(e.target.value)}
+        value={raw}
+        disabled={!editable}
+        onChange={(event) => onChange(event.target.value)}
+        onKeyDown={commitOnEnter}
       >
         {(def.enumValues || []).map((option) => (
           <option key={option} value={option}>
@@ -537,43 +852,45 @@ function SettingControl({ view, value, editable, busy, onCommit }: SettingContro
   }
 
   if (kind === 'integer' || kind === 'unsignedInteger' || kind === 'number') {
-    const numberValue = typeof value === 'number' ? String(value) : '';
     return (
       <input
         type="number"
-        value={editable ? numberValue : numberValue}
-        disabled={!editable || busy}
+        value={raw}
+        disabled={!editable}
         placeholder={typeof def.valueType.min === 'number' ? `min ${def.valueType.min}` : ''}
-        onChange={(e) => onCommit(e.target.value)}
-        onBlur={(e) => onCommit(e.target.value)}
+        onChange={(event) => onChange(event.target.value)}
+        onKeyDown={commitOnEnter}
       />
     );
   }
 
   if (kind === 'string') {
-    const text = typeof value === 'string' ? value : '';
     return (
       <input
         type="text"
-        value={editable ? text : text}
-        disabled={!editable || busy}
+        value={raw}
+        disabled={!editable}
         placeholder={def.valueType.nonEmpty ? 'non-empty string' : 'string'}
-        onChange={(e) => onCommit(e.target.value)}
-        onBlur={(e) => onCommit(e.target.value)}
+        onChange={(event) => onChange(event.target.value)}
+        onKeyDown={commitOnEnter}
       />
     );
   }
 
-  // stringList / array / object: JSON text area.
-  const json = value === undefined || value === null ? '' : JSON.stringify(value, null, 2);
   return (
     <textarea
       className="setting-row__json"
       rows={4}
-      value={json}
-      disabled={!editable || busy}
+      value={raw}
+      disabled={!editable}
       spellCheck={false}
-      onBlur={(e) => onCommit(e.target.value)}
+      onChange={(event) => onChange(event.target.value)}
+      onKeyDown={(event) => {
+        if (shouldSubmitSettingEnter(event.key, event.nativeEvent.isComposing, true, event.ctrlKey || event.metaKey)) {
+          event.preventDefault();
+          onCommit();
+        }
+      }}
     />
   );
 }

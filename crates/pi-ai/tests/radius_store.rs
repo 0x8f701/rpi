@@ -7,6 +7,77 @@ use serde_json::{Value, json};
 use std::fs;
 use std::sync::{Arc, Barrier};
 use tempfile::TempDir;
+struct TestHttpExecutor {
+    client: reqwest::Client,
+}
+
+impl pi_ai::HttpExecutor for TestHttpExecutor {
+    fn execute<'a>(
+        &'a self,
+        request: pi_ai::HttpRequest,
+    ) -> futures_util::future::BoxFuture<'a, anyhow::Result<pi_ai::HttpResponse>> {
+        use futures_util::{FutureExt as _, StreamExt as _};
+        async move {
+            let parts = request.into_parts();
+            let host = match parts.authority.host() {
+                pi_ai::ResolvedHttpHost::Dns(host) => host.clone(),
+                pi_ai::ResolvedHttpHost::Ip(address) if address.is_ipv6() => format!("[{address}]"),
+                pi_ai::ResolvedHttpHost::Ip(address) => address.to_string(),
+            };
+            let scheme = match parts.authority.scheme() {
+                pi_ai::ResolvedHttpScheme::Http => "http",
+                pi_ai::ResolvedHttpScheme::Https => "https",
+            };
+            let url = format!(
+                "{scheme}://{host}:{}{}",
+                parts.authority.port(),
+                parts.path_and_query
+            );
+            let method = match parts.method {
+                pi_ai::HttpMethod::Get => reqwest::Method::GET,
+                pi_ai::HttpMethod::Post => reqwest::Method::POST,
+                pi_ai::HttpMethod::Put => reqwest::Method::PUT,
+                pi_ai::HttpMethod::Patch => reqwest::Method::PATCH,
+                pi_ai::HttpMethod::Delete => reqwest::Method::DELETE,
+            };
+            let mut builder = self
+                .client
+                .request(method, url)
+                .headers(parts.headers.into_iter().collect::<http::HeaderMap>());
+            if !parts.body.is_empty() {
+                builder = builder.body(parts.body);
+            }
+            let response = builder.send().await?;
+            let status = response.status();
+            let headers = response.headers().clone();
+            let bound = parts.max_response_bytes.get() as usize;
+            let mut received = 0_usize;
+            let body = response.bytes_stream().map(move |chunk| {
+                let chunk = chunk?.to_vec();
+                received = received.saturating_add(chunk.len());
+                if received > bound {
+                    Err(anyhow::anyhow!(
+                        "Radius config response exceeds {bound} bytes"
+                    ))
+                } else {
+                    Ok(chunk)
+                }
+            });
+            Ok(pi_ai::HttpResponse::new(status, headers, Box::pin(body)))
+        }
+        .boxed()
+    }
+}
+
+fn test_http_executor() -> pi_ai::SharedHttpExecutor {
+    Arc::new(TestHttpExecutor {
+        client: reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("test HTTP client"),
+    })
+}
 
 fn snapshot(provider: &str, id: &str, checked_at: i64) -> RadiusCatalogSnapshot {
     let config = RadiusGatewayConfig {
@@ -36,12 +107,17 @@ async fn successful_refresh_survives_a_fresh_catalog_instance_offline() {
     let directory = TempDir::new().expect("temporary store directory");
     let path = directory.path().join("models-store.json");
     let provider = "radius-persist-fixture";
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind gateway");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind gateway");
     let address = listener.local_addr().expect("gateway address");
     tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.expect("accept refresh");
         let mut request = [0_u8; 4096];
-        let count = socket.read(&mut request).await.expect("read refresh request");
+        let count = socket
+            .read(&mut request)
+            .await
+            .expect("read refresh request");
         assert!(String::from_utf8_lossy(&request[..count]).starts_with("GET /v1/config "));
         let body = serde_json::to_string(&RadiusGatewayConfig {
             base_url: "https://persisted.example.test/v1".into(),
@@ -69,12 +145,12 @@ async fn successful_refresh_survives_a_fresh_catalog_instance_offline() {
     let first = RadiusCatalog::with_store(provider, format!("http://{address}"), &path)
         .expect("first catalog");
     let stored = first
-        .refresh("secret", Default::default())
+        .refresh("secret", test_http_executor(), Default::default())
         .await
         .expect("successful refresh");
 
-    let fresh = RadiusCatalog::with_store(provider, DEFAULT_RADIUS_GATEWAY, &path)
-        .expect("fresh catalog");
+    let fresh =
+        RadiusCatalog::with_store(provider, DEFAULT_RADIUS_GATEWAY, &path).expect("fresh catalog");
     let restored = fresh
         .restore_stored_snapshot()
         .expect("restore stored snapshot")
@@ -89,8 +165,8 @@ fn corrupt_store_fails_closed_without_deleting_live_catalog() {
     let directory = TempDir::new().expect("temporary store directory");
     let path = directory.path().join("models-store.json");
     let provider = "radius-corrupt-store-fixture";
-    let catalog = RadiusCatalog::with_store(provider, DEFAULT_RADIUS_GATEWAY, &path)
-        .expect("catalog");
+    let catalog =
+        RadiusCatalog::with_store(provider, DEFAULT_RADIUS_GATEWAY, &path).expect("catalog");
     let live = snapshot(provider, "live", 7);
     catalog
         .restore_snapshot(live.clone())
@@ -107,8 +183,8 @@ fn optional_invalid_store_is_quarantined_once_and_preserves_live_catalog() {
     let directory = TempDir::new().expect("temporary store directory");
     let path = directory.path().join("models-store.json");
     let provider = "radius-optional-invalid-fixture";
-    let catalog = RadiusCatalog::with_store(provider, DEFAULT_RADIUS_GATEWAY, &path)
-        .expect("catalog");
+    let catalog =
+        RadiusCatalog::with_store(provider, DEFAULT_RADIUS_GATEWAY, &path).expect("catalog");
     let live = snapshot(provider, "live", 7);
     catalog
         .restore_snapshot(live.clone())
@@ -170,10 +246,13 @@ fn invalid_stored_model_is_never_registered() {
             }
         }
     });
-    fs::write(&path, serde_json::to_vec(&invalid).expect("serialize invalid store"))
-        .expect("write invalid store");
-    let catalog = RadiusCatalog::with_store(provider, DEFAULT_RADIUS_GATEWAY, &path)
-        .expect("catalog");
+    fs::write(
+        &path,
+        serde_json::to_vec(&invalid).expect("serialize invalid store"),
+    )
+    .expect("write invalid store");
+    let catalog =
+        RadiusCatalog::with_store(provider, DEFAULT_RADIUS_GATEWAY, &path).expect("catalog");
 
     assert!(catalog.restore_stored_snapshot().is_err());
     assert!(catalog.snapshot().models.is_empty());
@@ -186,10 +265,16 @@ fn writes_are_atomic_and_leave_no_temporary_files() {
     let path = directory.path().join("models-store.json");
     let store = RadiusCatalogStore::new(&path);
     store
-        .write("radius-atomic-one", &snapshot("radius-atomic-one", "one", 1))
+        .write(
+            "radius-atomic-one",
+            &snapshot("radius-atomic-one", "one", 1),
+        )
         .expect("first write");
     store
-        .write("radius-atomic-one", &snapshot("radius-atomic-one", "two", 2))
+        .write(
+            "radius-atomic-one",
+            &snapshot("radius-atomic-one", "two", 2),
+        )
         .expect("replacement write");
 
     let document: Value = serde_json::from_slice(&fs::read(&path).expect("read store"))
@@ -221,7 +306,10 @@ fn concurrent_provider_writes_preserve_both_entries() {
     let first = std::thread::spawn(move || {
         first_start.wait();
         RadiusCatalogStore::new(first_path)
-            .write("radius-concurrent-one", &snapshot("radius-concurrent-one", "one", 1))
+            .write(
+                "radius-concurrent-one",
+                &snapshot("radius-concurrent-one", "one", 1),
+            )
             .expect("write first provider");
     });
     let second_start = start.clone();
@@ -229,7 +317,10 @@ fn concurrent_provider_writes_preserve_both_entries() {
     let second = std::thread::spawn(move || {
         second_start.wait();
         RadiusCatalogStore::new(second_path)
-            .write("radius-concurrent-two", &snapshot("radius-concurrent-two", "two", 2))
+            .write(
+                "radius-concurrent-two",
+                &snapshot("radius-concurrent-two", "two", 2),
+            )
             .expect("write second provider");
     });
     start.wait();
@@ -266,12 +357,17 @@ async fn persistence_failure_rolls_back_in_memory_catalog() {
     let store_path = directory.path().join("models-store.json");
     fs::create_dir(&store_path).expect("make store path unusable as a file");
     let provider = "radius-write-failure-fixture";
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind gateway");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind gateway");
     let address = listener.local_addr().expect("gateway address");
     tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.expect("accept refresh");
         let mut request = [0_u8; 4096];
-        socket.read(&mut request).await.expect("read refresh request");
+        socket
+            .read(&mut request)
+            .await
+            .expect("read refresh request");
         let config = RadiusGatewayConfig {
             base_url: "https://new.example.test/v1".into(),
             models: vec![RadiusGatewayModel {
@@ -302,7 +398,12 @@ async fn persistence_failure_rolls_back_in_memory_catalog() {
         .restore_snapshot(stale.clone())
         .expect("install stale snapshot");
 
-    assert!(catalog.refresh("secret", Default::default()).await.is_err());
+    assert!(
+        catalog
+            .refresh("secret", test_http_executor(), Default::default())
+            .await
+            .is_err()
+    );
     assert_eq!(catalog.snapshot(), stale);
     assert!(get_model(provider, "stale").is_some());
     assert!(get_model(provider, "new").is_none());
@@ -314,6 +415,12 @@ fn unsupported_version_does_not_register_models() {
     let path = directory.path().join("models-store.json");
     fs::write(&path, br#"{"version":2,"providers":{}}"#).expect("write future store");
     let store = RadiusCatalogStore::new(&path);
-    let error = store.read("radius-version-fixture").expect_err("future version fails");
-    assert!(error.to_string().contains("unsupported Radius catalog store version"));
+    let error = store
+        .read("radius-version-fixture")
+        .expect_err("future version fails");
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported Radius catalog store version")
+    );
 }

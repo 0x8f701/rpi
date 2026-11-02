@@ -7,8 +7,10 @@ use std::path::{Component, Path, PathBuf};
 use super::SessionSourceKind;
 use super::helpers::make_absolute;
 
-
-pub(super) fn selected_sources(filters: &[SessionSourceKind], include_all_when_empty: bool) -> Vec<SessionSourceKind> {
+pub(super) fn selected_sources(
+    filters: &[SessionSourceKind],
+    include_all_when_empty: bool,
+) -> Vec<SessionSourceKind> {
     if filters.is_empty() {
         if include_all_when_empty {
             return SessionSourceKind::ALL.to_vec();
@@ -28,6 +30,7 @@ pub(super) fn matches_source_pattern(kind: SessionSourceKind, path: &Path) -> bo
     };
     match kind {
         SessionSourceKind::NativePi
+        | SessionSourceKind::Pi
         | SessionSourceKind::Omp
         | SessionSourceKind::Claude
         | SessionSourceKind::Droid => path.extension() == Some(OsStr::new("jsonl")),
@@ -52,7 +55,9 @@ pub(super) fn contains_component(path: &Path, root: &Path, name: &str) -> bool {
 pub(super) fn path_lexically_under_root(path: &Path, root: &Path) -> bool {
     let path = make_absolute(path.to_path_buf());
     let root = make_absolute(root.to_path_buf());
-    if path.components().any(|component| matches!(component, Component::ParentDir))
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
         || root
             .components()
             .any(|component| matches!(component, Component::ParentDir))
@@ -111,4 +116,3 @@ pub(super) fn path_under_depth(path: &Path, root: &Path, min: usize, max: usize)
     let depth = relative.components().count();
     (min..=max).contains(&depth)
 }
-

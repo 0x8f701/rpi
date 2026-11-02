@@ -279,7 +279,11 @@ mod tests {
     fn decoded_memory_boundary_is_explicit() {
         validate_dimensions(4_096, 4_096).expect("16M pixels stays within 128 MiB budget");
         let error = validate_dimensions(4_097, 4_096).expect_err("image above boundary rejected");
-        assert!(error.to_string().contains("128 MiB decoded-memory safety limit"));
+        assert!(
+            error
+                .to_string()
+                .contains("128 MiB decoded-memory safety limit")
+        );
     }
 
     #[test]

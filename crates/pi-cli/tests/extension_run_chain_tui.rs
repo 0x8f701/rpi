@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nix::pty::{openpty, Winsize};
+use nix::pty::{Winsize, openpty};
 use nix::sys::termios::Termios;
 use tempfile::TempDir;
 
@@ -61,8 +61,8 @@ export default function (pi) {
         .env("HOME", home.path())
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("TERM", "xterm-256color")
-        .env("PI_OFFLINE", "1")
-        .env("PI_SKIP_VERSION_CHECK", "1")
+        .env("RPI_OFFLINE", "1")
+        .env("RPI_SKIP_VERSION_CHECK", "1")
         .args([
             "--model",
             "faux/faux-1",

@@ -15,6 +15,28 @@ use serde_json::{Value, json};
 
 use super::*;
 
+struct AcpFauxRegistration(pi_ai::providers::FauxProviderRegistration);
+
+impl AcpFauxRegistration {
+    fn set_responses(&self, responses: Vec<FauxResponse>) {
+        self.0.set_responses(responses);
+    }
+}
+
+impl Drop for AcpFauxRegistration {
+    fn drop(&mut self) {
+        self.0.unregister();
+        pi_ai::replace_registered_models(
+            &self
+                .0
+                .model(None)
+                .map(|model| vec![(model.provider, model.id)])
+                .unwrap_or_default(),
+            Vec::new(),
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fake ACP client + hermetic server harness
 // ---------------------------------------------------------------------------
@@ -75,21 +97,34 @@ impl TestClient {
 /// Build the hermetic blueprint: temp agent dir, headless, Json extension
 /// mode, no interactive UI.
 fn test_blueprint(cli: &Cli, agent_dir: &Path) -> RunSessionBlueprint {
+    if !agent_dir.join("settings.json").exists() {
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+        )
+        .expect("isolated sandbox settings");
+    }
     let mut resource_options = ResourceManagerOptions::new(agent_dir);
     resource_options.agent_dir = agent_dir.to_path_buf();
     resource_options.headless = true;
+    resource_options.project_trust_override = Some(true);
+    resource_options.disable_extensions = true;
+    resource_options.disable_skills = true;
+    resource_options.disable_prompt_templates = true;
+    resource_options.disable_themes = true;
+    resource_options.disable_context_files = true;
     let mut blueprint = RunSessionBlueprint::from_cli(cli, resource_options, None);
     blueprint.set_extension_mode(ExtensionMode::Json);
     blueprint
 }
 
 /// Register a faux provider with a unique api and model id so concurrent
-/// tests never share a response queue or model-registry entry. Returns the
-/// registration (kept alive by the model registry for the test) and the
-/// resolvable model id (`faux-<tag>`).
-fn register_faux(tag: &str) -> (pi_ai::providers::FauxProviderRegistration, String) {
-    let api = format!("acp-{tag}-api-{}", Uuid::now_v7());
-    let model_id = format!("faux-{tag}");
+/// tests never share a response queue or model-registry entry. The guard removes
+/// both registrations when the test ends.
+fn register_faux(tag: &str) -> (AcpFauxRegistration, String) {
+    let unique = Uuid::now_v7();
+    let api = format!("acp-{tag}-api-{unique}");
+    let model_id = format!("faux-{tag}-{unique}");
     let mut model = Model::default();
     model.id = model_id.clone();
     model.name = "Faux Model".into();
@@ -97,24 +132,76 @@ fn register_faux(tag: &str) -> (pi_ai::providers::FauxProviderRegistration, Stri
     model.provider = "faux".into();
     model.base_url = "http://localhost:0".into();
     (
-        register_faux_provider(FauxProviderOptions {
+        AcpFauxRegistration(register_faux_provider(FauxProviderOptions {
             api,
             provider: "faux".into(),
             models: vec![model],
             chunk_size: 4,
-        }),
+        })),
         model_id,
     )
 }
 
 /// Spawn the in-process server and return the fake client plus the tempdir
 /// that holds the agent dir (must outlive the server).
-async fn spawn_server(cli: &Cli, agent_dir: &Path) -> (TestClient, tokio::task::JoinHandle<Result<()>>) {
+async fn spawn_server(
+    cli: &Cli,
+    agent_dir: &Path,
+) -> (TestClient, tokio::task::JoinHandle<Result<()>>) {
+    let spec = cli
+        .model
+        .as_deref()
+        .unwrap_or_else(|| panic!("ACP test CLI is missing --model"));
+    let (provider, id) = spec
+        .split_once('/')
+        .unwrap_or_else(|| panic!("ACP test model spec {spec:?} is missing provider/id"));
+    let model = pi_ai::get_model(provider, id).unwrap_or_else(|| {
+        panic!("registered faux provider unavailable: provider={provider} model={id}")
+    });
+    let stream_fn = pi_ai::get_api_provider(&model.api)
+        .unwrap_or_else(|| {
+            panic!(
+                "registered ACP faux provider unavailable: provider={provider} model={id} api={}",
+                model.api
+            )
+        })
+        .stream_simple;
+    spawn_server_with_stream(cli, agent_dir, stream_fn).await
+}
+
+async fn spawn_server_with_stream(
+    cli: &Cli,
+    workspace: &Path,
+    stream_fn: pi_agent::StreamFn,
+) -> (TestClient, tokio::task::JoinHandle<Result<()>>) {
+    let resource_agent = tempfile::tempdir().expect("ACP resource agent dir");
+    let source_settings = workspace.join("settings.json");
+    if source_settings.exists() {
+        std::fs::copy(
+            &source_settings,
+            resource_agent.path().join("settings.json"),
+        )
+        .expect("copy ACP test settings");
+    }
     let (client_tx, server_rx) = mpsc::channel(OUTBOUND_CHANNEL_CAPACITY);
     let (server_tx, client_rx) = mpsc::channel(INBOUND_CHANNEL_CAPACITY);
-    let blueprint = test_blueprint(cli, agent_dir);
-    let server = tokio::spawn(serve_connection(blueprint, cli.clone(), server_rx, server_tx));
-    (TestClient { tx: client_tx, rx: client_rx, next_id: 0 }, server)
+    let host = AcpHost::new(test_blueprint(cli, resource_agent.path())).expect("ACP host");
+    let cli = cli.clone();
+    let server = tokio::spawn(async move {
+        let _resource_agent = resource_agent;
+        let result =
+            serve_connection_with_stream(host.clone(), cli, server_rx, server_tx, stream_fn).await;
+        let shutdown = host.shutdown().await;
+        AcpServer::combine_results(result, shutdown)
+    });
+    (
+        TestClient {
+            tx: client_tx,
+            rx: client_rx,
+            next_id: 0,
+        },
+        server,
+    )
 }
 
 /// CLI flags shared by the round-trip tests: an explicit faux model (unique
@@ -128,6 +215,8 @@ fn test_cli(session_dir: &Path, model_id: &str) -> Cli {
         &format!("faux/{model_id}"),
         "--api-key",
         "acp-test-key",
+        "--tools",
+        "read",
         "--approval-mode",
         "ask",
         "--session-dir",
@@ -139,24 +228,39 @@ fn test_cli(session_dir: &Path, model_id: &str) -> Cli {
 /// Full handshake helper: initialize + authenticate + session/new.
 async fn connect(client: &mut TestClient, cwd: &Path) -> String {
     let (response, _) = client
-        .request("initialize", json!({ "protocolVersion": 1, "clientCapabilities": {} }))
+        .request(
+            "initialize",
+            json!({ "protocolVersion": 1, "clientCapabilities": {} }),
+        )
         .await;
-    assert!(response.get("result").is_some(), "initialize must succeed: {response}");
+    assert!(
+        response.get("result").is_some(),
+        "initialize must succeed: {response}"
+    );
     assert_eq!(TestClient::result(&response)["protocolVersion"], 1);
 
     let (response, _) = client
         .request("authenticate", json!({ "methodId": AUTH_METHOD_ID }))
         .await;
-    assert!(response.get("result").is_some(), "authenticate must succeed: {response}");
+    assert!(
+        response.get("result").is_some(),
+        "authenticate must succeed: {response}"
+    );
 
     let (response, _) = client
-        .request("session/new", json!({ "cwd": cwd.to_str().expect("cwd"), "mcpServers": [] }))
+        .request(
+            "session/new",
+            json!({ "cwd": cwd.to_str().expect("cwd"), "mcpServers": [] }),
+        )
         .await;
-    let session_id = TestClient::result(&response)["sessionId"]
+    let session_id = response["result"]["sessionId"]
         .as_str()
-        .expect("session id")
+        .unwrap_or_else(|| panic!("session id response: {response}"))
         .to_owned();
-    assert!(session_id.starts_with("sess_"), "session id prefix: {session_id}");
+    assert!(
+        session_id.starts_with("sess_"),
+        "session id prefix: {session_id}"
+    );
     session_id
 }
 
@@ -170,7 +274,9 @@ fn joined_agent_text(notifications: &[Value]) -> String {
                 && message["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
         })
         .filter_map(|message| {
-            message["params"]["update"]["content"]["text"].as_str().map(ToOwned::to_owned)
+            message["params"]["update"]["content"]["text"]
+                .as_str()
+                .map(ToOwned::to_owned)
         })
         .collect()
 }
@@ -183,22 +289,41 @@ fn joined_agent_text(notifications: &[Value]) -> String {
 async fn initialize_negotiates_version_capabilities_and_auth_methods() {
     let agent = tempfile::tempdir().expect("agent dir");
     let sessions = tempfile::tempdir().expect("sessions dir");
-    let model_id = format!("faux-init");
+    let (_registration, model_id) = register_faux("initialize");
     let cli = test_cli(sessions.path(), &model_id);
     let (mut client, server) = spawn_server(&cli, agent.path()).await;
 
     let (response, notifications) = client
-        .request("initialize", json!({ "protocolVersion": 1, "clientCapabilities": {} }))
+        .request(
+            "initialize",
+            json!({ "protocolVersion": 1, "clientCapabilities": {} }),
+        )
         .await;
-    assert!(notifications.is_empty(), "initialize must not stream notifications");
+    assert!(
+        notifications.is_empty(),
+        "initialize must not stream notifications"
+    );
     let result = TestClient::result(&response);
     assert_eq!(result["protocolVersion"], 1);
     assert_eq!(result["agentCapabilities"]["loadSession"], false);
-    assert_eq!(result["agentCapabilities"]["promptCapabilities"]["image"], true);
-    assert_eq!(result["agentCapabilities"]["promptCapabilities"]["audio"], false);
-    assert_eq!(result["agentCapabilities"]["sessionCapabilities"]["close"], json!({}));
+    assert_eq!(
+        result["agentCapabilities"]["promptCapabilities"]["image"],
+        true
+    );
+    assert_eq!(
+        result["agentCapabilities"]["promptCapabilities"]["audio"],
+        false
+    );
+    assert_eq!(
+        result["agentCapabilities"]["sessionCapabilities"]["close"],
+        json!({})
+    );
     assert_eq!(result["agentInfo"]["name"], "rpi");
-    assert!(result["authMethods"].as_array().is_some_and(|methods| !methods.is_empty()));
+    assert!(
+        result["authMethods"]
+            .as_array()
+            .is_some_and(|methods| !methods.is_empty())
+    );
 
     drop(client);
     server.await.expect("server join").expect("server ok");
@@ -208,7 +333,7 @@ async fn initialize_negotiates_version_capabilities_and_auth_methods() {
 async fn initialize_responds_with_our_version_when_client_version_is_unsupported() {
     let agent = tempfile::tempdir().expect("agent dir");
     let sessions = tempfile::tempdir().expect("sessions dir");
-    let model_id = format!("faux-version");
+    let (_registration, model_id) = register_faux("version");
     let cli = test_cli(sessions.path(), &model_id);
     let (mut client, server) = spawn_server(&cli, agent.path()).await;
 
@@ -223,7 +348,10 @@ async fn initialize_responds_with_our_version_when_client_version_is_unsupported
     }
     // Missing protocolVersion is also answered with our version.
     let (response, _) = client.request("initialize", json!({})).await;
-    assert_eq!(TestClient::result(&response)["protocolVersion"], PROTOCOL_VERSION);
+    assert_eq!(
+        TestClient::result(&response)["protocolVersion"],
+        PROTOCOL_VERSION
+    );
 
     drop(client);
     server.await.expect("server join").expect("server ok");
@@ -233,16 +361,21 @@ async fn initialize_responds_with_our_version_when_client_version_is_unsupported
 async fn authenticate_rejects_unknown_methods_and_logout_acknowledges() {
     let agent = tempfile::tempdir().expect("agent dir");
     let sessions = tempfile::tempdir().expect("sessions dir");
-    let model_id = format!("faux-auth");
+    let (_registration, model_id) = register_faux("auth");
     let cli = test_cli(sessions.path(), &model_id);
     let (mut client, server) = spawn_server(&cli, agent.path()).await;
 
-    let (response, _) = client.request("authenticate", json!({ "methodId": "nope" })).await;
+    let (response, _) = client
+        .request("authenticate", json!({ "methodId": "nope" }))
+        .await;
     assert_eq!(TestClient::error_code(&response), INVALID_PARAMS);
     let (response, _) = client.request("authenticate", json!({})).await;
     assert_eq!(TestClient::error_code(&response), INVALID_PARAMS);
     let (response, _) = client.request("logout", json!({})).await;
-    assert!(response.get("result").is_some(), "logout must succeed: {response}");
+    assert!(
+        response.get("result").is_some(),
+        "logout must succeed: {response}"
+    );
 
     drop(client);
     server.await.expect("server join").expect("server ok");
@@ -256,20 +389,27 @@ async fn authenticate_rejects_unknown_methods_and_logout_acknowledges() {
 async fn session_new_validates_cwd_and_rejects_unknown_sessions_in_prompt() {
     let agent = tempfile::tempdir().expect("agent dir");
     let sessions = tempfile::tempdir().expect("sessions dir");
-    let model_id = format!("faux-cwd");
+    let (_registration, model_id) = register_faux("cwd");
     let cli = test_cli(sessions.path(), &model_id);
     let (mut client, server) = spawn_server(&cli, agent.path()).await;
 
-    let (response, _) = client.request("initialize", json!({ "protocolVersion": 1 })).await;
+    let (response, _) = client
+        .request("initialize", json!({ "protocolVersion": 1 }))
+        .await;
     assert!(response.get("result").is_some(), "{response}");
 
     // Relative cwd is rejected.
-    let (response, _) = client.request("session/new", json!({ "cwd": "relative/path" })).await;
+    let (response, _) = client
+        .request("session/new", json!({ "cwd": "relative/path" }))
+        .await;
     assert_eq!(TestClient::error_code(&response), INVALID_PARAMS);
     // Missing directory is a resource-not-found error.
     let missing = agent.path().join("does-not-exist");
     let (response, _) = client
-        .request("session/new", json!({ "cwd": missing.to_str().expect("path") }))
+        .request(
+            "session/new",
+            json!({ "cwd": missing.to_str().expect("path") }),
+        )
         .await;
     assert_eq!(TestClient::error_code(&response), RESOURCE_NOT_FOUND);
     // mcpServers must be an array when present.
@@ -283,7 +423,10 @@ async fn session_new_validates_cwd_and_rejects_unknown_sessions_in_prompt() {
 
     // Prompting an unknown session is a resource-not-found error.
     let (response, _) = client
-        .request("session/prompt", json!({ "sessionId": "sess_missing", "prompt": [] }))
+        .request(
+            "session/prompt",
+            json!({ "sessionId": "sess_missing", "prompt": [] }),
+        )
         .await;
     assert_eq!(TestClient::error_code(&response), RESOURCE_NOT_FOUND);
 
@@ -299,6 +442,18 @@ async fn session_new_validates_cwd_and_rejects_unknown_sessions_in_prompt() {
 async fn session_new_fails_with_actionable_error_when_no_model_resolves() {
     let agent = tempfile::tempdir().expect("agent dir");
     let sessions = tempfile::tempdir().expect("sessions dir");
+    let (_transport_registration, transport_model_id) = register_faux("unresolved-transport");
+    let transport_model = pi_ai::get_model("faux", &transport_model_id).unwrap_or_else(|| {
+        panic!("registered transport faux model unavailable: model={transport_model_id}")
+    });
+    let stream_fn = pi_ai::get_api_provider(&transport_model.api)
+        .unwrap_or_else(|| {
+            panic!(
+                "registered ACP transport faux provider unavailable: model={} api={}",
+                transport_model.id, transport_model.api
+            )
+        })
+        .stream_simple;
     // An unresolvable model spec fails deterministically at session creation
     // (hermetic: no registered provider matches, so no credential probing).
     let cli = Cli::try_parse_from([
@@ -309,18 +464,24 @@ async fn session_new_fails_with_actionable_error_when_no_model_resolves() {
         sessions.path().to_str().expect("session dir"),
     ])
     .expect("parse cli");
-    let (mut client, server) = spawn_server(&cli, agent.path()).await;
+    let (mut client, server) = spawn_server_with_stream(&cli, agent.path(), stream_fn).await;
 
-    let (response, _) = client.request("initialize", json!({ "protocolVersion": 1 })).await;
+    let (response, _) = client
+        .request("initialize", json!({ "protocolVersion": 1 }))
+        .await;
     assert!(response.get("result").is_some(), "{response}");
     let (response, _) = client
-        .request("session/new", json!({ "cwd": agent.path().to_str().expect("cwd") }))
+        .request(
+            "session/new",
+            json!({ "cwd": agent.path().to_str().expect("cwd") }),
+        )
         .await;
     let error = &response["error"];
     assert!(
-        error.get("message").and_then(Value::as_str).is_some_and(|message| {
-            message.contains("definitely-not-a-real-provider/xyz")
-        }),
+        error
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| { message.contains("definitely-not-a-real-provider/xyz") }),
         "session/new must fail with the unresolved model named: {response}"
     );
 
@@ -353,25 +514,106 @@ async fn prompt_streams_assistant_text_and_returns_end_turn() {
     // The user message is echoed as one chunk.
     let user_chunks = notifications
         .iter()
-        .filter(|message| {
-            message["params"]["update"]["sessionUpdate"] == "user_message_chunk"
-        })
+        .filter(|message| message["params"]["update"]["sessionUpdate"] == "user_message_chunk")
         .collect::<Vec<_>>();
-    assert_eq!(user_chunks.len(), 1, "one user_message_chunk: {notifications:?}");
     assert_eq!(
-        user_chunks[0]["params"]["update"]["content"]["text"],
-        "hi there",
+        user_chunks.len(),
+        1,
+        "one user_message_chunk: {notifications:?}"
+    );
+    assert_eq!(
+        user_chunks[0]["params"]["update"]["content"]["text"], "hi there",
         "echoed prompt text"
     );
 
     // The assistant's response streams as agent_message_chunk deltas.
     let text = joined_agent_text(&notifications);
-    assert_eq!(text, "Hello ACP", "assistant text must stream through chunks");
+    assert_eq!(
+        text, "Hello ACP",
+        "assistant text must stream through chunks"
+    );
     assert!(
-        notifications.iter().any(|message| {
-            message["params"]["update"]["sessionUpdate"] == "usage_update"
-        }),
+        notifications
+            .iter()
+            .any(|message| { message["params"]["update"]["sessionUpdate"] == "usage_update" }),
         "a usage_update should be emitted after the turn"
+    );
+
+    drop(client);
+    server.await.expect("server join").expect("server ok");
+}
+
+#[tokio::test]
+async fn prompt_emits_typed_todo_route_and_returns_end_turn() {
+    let (_registration, model_id) = register_faux("todo-route");
+    let agent = tempfile::tempdir().expect("agent dir");
+    let sessions = tempfile::tempdir().expect("sessions dir");
+    std::fs::write(
+        agent.path().join("settings.json"),
+        r#"{
+            "sandbox":{"mode":"danger-full-access"},
+            "orchestration":{"process":true,"tasks":true,"todo":true},
+            "selector":{"autoMode":"auto"}
+        }"#,
+    )
+    .expect("auto routing settings");
+    let cli = test_cli(sessions.path(), &model_id);
+    let (mut client, server) = spawn_server(&cli, agent.path()).await;
+    let session_id = connect(&mut client, agent.path()).await;
+
+    let (response, notifications) = client
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "implement a parser in src/lib.rs" }]
+            }),
+        )
+        .await;
+    assert_eq!(TestClient::result(&response)["stopReason"], "end_turn");
+
+    let routed = notifications
+        .iter()
+        .filter(|message| {
+            message["method"] == "session/update"
+                && message["params"]["update"]["sessionUpdate"] == "todo_child_routed"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        routed.len(),
+        1,
+        "one typed Todo route update: {notifications:?}"
+    );
+    assert_eq!(routed[0]["params"]["sessionId"], session_id);
+    let receipt = &routed[0]["params"]["update"]["receipt"];
+    assert!(
+        receipt["id"].as_str().is_some_and(|id| !id.is_empty()),
+        "receipt id: {receipt}"
+    );
+    assert!(
+        receipt["parentSessionId"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "parent session id: {receipt}"
+    );
+    assert!(
+        receipt["childSessionId"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "child session id: {receipt}"
+    );
+    assert!(
+        receipt["messageId"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "message id: {receipt}"
+    );
+    assert_eq!(receipt["status"], "queued");
+    assert!(
+        notifications.iter().all(|message| {
+            message["params"]["update"]["sessionUpdate"] != "agent_message_chunk"
+        }),
+        "routed prompt must not start a parent model turn: {notifications:?}"
     );
 
     drop(client);
@@ -414,8 +656,13 @@ async fn prompt_embeds_images_and_resource_links() {
         .iter()
         .find(|message| message["params"]["update"]["sessionUpdate"] == "user_message_chunk")
         .expect("user echo");
-    let echoed = echo["params"]["update"]["content"]["text"].as_str().expect("echo text");
-    assert!(echoed.contains("embedded file contents"), "resource_link must be embedded: {echoed}");
+    let echoed = echo["params"]["update"]["content"]["text"]
+        .as_str()
+        .expect("echo text");
+    assert!(
+        echoed.contains("embedded file contents"),
+        "resource_link must be embedded: {echoed}"
+    );
 
     drop(client);
     server.await.expect("server join").expect("server ok");
@@ -427,12 +674,13 @@ async fn concurrent_prompt_on_same_session_is_rejected() {
     // turn is in flight must fail with INTERNAL_ERROR (and the first turn is
     // unaffected — it still completes normally after the client decides).
     let (registration, model_id) = register_faux("concurrent");
-    std::fs::write("/tmp/acp-concurrent.txt", "data").expect("notes file");
+    let agent = tempfile::tempdir().expect("agent dir");
+    let read_path = agent.path().join("concurrent.txt");
+    std::fs::write(&read_path, "data").expect("notes file");
     registration.set_responses(vec![
-        tool_call_response("call-x", "read", json!({ "path": "/tmp/acp-concurrent.txt" })),
+        tool_call_response("call-x", "read", json!({ "path": read_path })),
         FauxResponse::text("first turn done"),
     ]);
-    let agent = tempfile::tempdir().expect("agent dir");
     let sessions = tempfile::tempdir().expect("sessions dir");
     let cli = test_cli(sessions.path(), &model_id);
     let (mut client, server) = spawn_server(&cli, agent.path()).await;
@@ -478,7 +726,8 @@ async fn concurrent_prompt_on_same_session_is_rejected() {
         }
     };
     assert_eq!(
-        TestClient::result(&prompt_response)["stopReason"], "end_turn",
+        TestClient::result(&prompt_response)["stopReason"],
+        "end_turn",
         "first turn must complete: {prompt_response}"
     );
 
@@ -497,7 +746,10 @@ async fn prompt_without_content_or_with_audio_is_invalid() {
     let session_id = connect(&mut client, agent.path()).await;
 
     let (response, _) = client
-        .request("session/prompt", json!({ "sessionId": session_id, "prompt": [] }))
+        .request(
+            "session/prompt",
+            json!({ "sessionId": session_id, "prompt": [] }),
+        )
         .await;
     assert_eq!(TestClient::error_code(&response), INVALID_PARAMS);
     let (response, _) = client
@@ -531,10 +783,7 @@ async fn sequential_prompts_on_same_session_both_complete() {
     let (mut client, server) = spawn_server(&cli, agent.path()).await;
     let session_id = connect(&mut client, agent.path()).await;
 
-    for (prompt, expected) in [
-        ("first", "first turn"),
-        ("second", "second turn"),
-    ] {
+    for (prompt, expected) in [("first", "first turn"), ("second", "second turn")] {
         let (response, notifications) = client
             .request(
                 "session/prompt",
@@ -545,7 +794,8 @@ async fn sequential_prompts_on_same_session_both_complete() {
             )
             .await;
         assert_eq!(
-            TestClient::result(&response)["stopReason"], "end_turn",
+            TestClient::result(&response)["stopReason"],
+            "end_turn",
             "prompt {prompt:?} must complete: {response}"
         );
         assert_eq!(
@@ -599,7 +849,8 @@ async fn failed_prompt_releases_session_for_retry() {
         )
         .await;
     assert_eq!(
-        TestClient::result(&response)["stopReason"], "end_turn",
+        TestClient::result(&response)["stopReason"],
+        "end_turn",
         "the retry prompt must complete after the failure: {response}"
     );
     assert_eq!(joined_agent_text(&notifications), "recovered");
@@ -619,15 +870,16 @@ async fn failed_prompt_releases_session_for_retry() {
 #[tokio::test]
 async fn concurrent_sessions_keep_permission_requests_session_correct() {
     let (registration, model_id) = register_faux("two-sessions");
-    std::fs::write("/tmp/acp-two-sessions.txt", "data").expect("notes file");
+    let agent = tempfile::tempdir().expect("agent dir");
+    let read_path = agent.path().join("two-sessions.txt");
+    std::fs::write(&read_path, "data").expect("notes file");
     registration.set_responses(vec![
-        tool_call_response("call-a1", "read", json!({ "path": "/tmp/acp-two-sessions.txt" })),
-        tool_call_response("call-a2", "read", json!({ "path": "/tmp/acp-two-sessions.txt" })),
+        tool_call_response("call-a1", "read", json!({ "path": read_path })),
+        tool_call_response("call-a2", "read", json!({ "path": read_path })),
         FauxResponse::text("A done"),
-        tool_call_response("call-b1", "read", json!({ "path": "/tmp/acp-two-sessions.txt" })),
+        tool_call_response("call-b1", "read", json!({ "path": read_path })),
         FauxResponse::text("B done"),
     ]);
-    let agent = tempfile::tempdir().expect("agent dir");
     let sessions = tempfile::tempdir().expect("sessions dir");
     let cli = test_cli(sessions.path(), &model_id);
     let (mut client, server) = spawn_server(&cli, agent.path()).await;
@@ -691,7 +943,8 @@ async fn concurrent_sessions_keep_permission_requests_session_correct() {
         }
     };
     assert_eq!(
-        TestClient::result(&response_701)["stopReason"], "end_turn",
+        TestClient::result(&response_701)["stopReason"],
+        "end_turn",
         "B's text turn must complete: {response_701}"
     );
 
@@ -724,7 +977,8 @@ async fn concurrent_sessions_keep_permission_requests_session_correct() {
         }
     };
     assert_eq!(
-        TestClient::result(&response_700)["stopReason"], "end_turn",
+        TestClient::result(&response_700)["stopReason"],
+        "end_turn",
         "A's turn must complete after all tools are allowed: {response_700}"
     );
 
@@ -747,13 +1001,20 @@ async fn session_new_internal_errors_are_path_free_on_the_wire() {
         .expect("corrupt settings");
     let (mut client, server) = spawn_server(&cli, agent.path()).await;
 
-    let (response, _) = client.request("initialize", json!({ "protocolVersion": 1 })).await;
+    let (response, _) = client
+        .request("initialize", json!({ "protocolVersion": 1 }))
+        .await;
     assert!(response.get("result").is_some(), "{response}");
     let (response, _) = client
-        .request("session/new", json!({ "cwd": agent.path().to_str().expect("cwd") }))
+        .request(
+            "session/new",
+            json!({ "cwd": agent.path().to_str().expect("cwd") }),
+        )
         .await;
     assert_eq!(TestClient::error_code(&response), INTERNAL_ERROR);
-    let message = response["error"]["message"].as_str().expect("error message");
+    let message = response["error"]["message"]
+        .as_str()
+        .expect("error message");
     let agent_dir = agent.path().to_str().expect("agent dir");
     assert!(
         !message.contains(agent_dir),
@@ -785,9 +1046,7 @@ fn tool_call_response(id: &str, name: &str, arguments: Value) -> FauxResponse {
     }
 }
 
-async fn wait_for_permission_request(
-    client: &mut TestClient,
-) -> (Value, Value) {
+async fn wait_for_permission_request(client: &mut TestClient) -> (Value, Value) {
     loop {
         let message = client.next().await;
         if message.get("method") == Some(&json!("session/request_permission")) {
@@ -804,12 +1063,13 @@ async fn wait_for_permission_request(
 #[tokio::test]
 async fn permission_allow_executes_tool_and_continues_turn() {
     let (registration, model_id) = register_faux("permission-allow-2");
-    std::fs::write("/tmp/acp-perm-allow.txt", "read me").expect("notes file");
+    let agent = tempfile::tempdir().expect("agent dir");
+    let read_path = agent.path().join("permission-allow.txt");
+    std::fs::write(&read_path, "read me").expect("notes file");
     registration.set_responses(vec![
-        tool_call_response("call-a", "read", json!({ "path": "/tmp/acp-perm-allow.txt" })),
+        tool_call_response("call-a", "read", json!({ "path": read_path })),
         FauxResponse::text("finished reading"),
     ]);
-    let agent = tempfile::tempdir().expect("agent dir");
     let sessions = tempfile::tempdir().expect("sessions dir");
     let cli = test_cli(sessions.path(), &model_id);
     let (mut client, server) = spawn_server(&cli, agent.path()).await;
@@ -871,10 +1131,14 @@ async fn permission_allow_executes_tool_and_continues_turn() {
     }
     let prompt_response = prompt_response.expect("prompt response");
     assert_eq!(
-        TestClient::result(&prompt_response)["stopReason"], "end_turn",
+        TestClient::result(&prompt_response)["stopReason"],
+        "end_turn",
         "allow must not cancel the turn: {prompt_response}"
     );
-    assert!(saw_completed, "the allowed tool must report a tool_call_update");
+    assert!(
+        saw_completed,
+        "the allowed tool must report a tool_call_update"
+    );
 
     drop(client);
     server.await.expect("server join").expect("server ok");
@@ -883,11 +1147,12 @@ async fn permission_allow_executes_tool_and_continues_turn() {
 #[tokio::test]
 async fn permission_deny_blocks_tool_and_reports_failed() {
     let (registration, model_id) = register_faux("permission-deny");
+    let agent = tempfile::tempdir().expect("agent dir");
+    let denied_path = agent.path().join("permission-deny.txt");
     registration.set_responses(vec![
-        tool_call_response("call-b", "read", json!({ "path": "/tmp/acp-perm-deny.txt" })),
+        tool_call_response("call-b", "read", json!({ "path": denied_path })),
         FauxResponse::text("after denial"),
     ]);
-    let agent = tempfile::tempdir().expect("agent dir");
     let sessions = tempfile::tempdir().expect("sessions dir");
     let cli = test_cli(sessions.path(), &model_id);
     let (mut client, server) = spawn_server(&cli, agent.path()).await;
@@ -947,25 +1212,29 @@ async fn permission_rules_deny_and_allow_short_circuit_before_reverse_request() 
     // run, and neither may reach the client as a session/request_permission
     // reverse request.
     let (registration, model_id) = register_faux("rules");
-    std::fs::write("/tmp/acp-rules-deny.txt", "secret").expect("deny file");
-    std::fs::write("/tmp/acp-rules-allow.txt", "public").expect("allow file");
+    let agent = tempfile::tempdir().expect("agent dir");
+    let denied_path = agent.path().join("rules-deny.txt");
+    let allowed_path = agent.path().join("rules-allow.txt");
+    std::fs::write(&denied_path, "secret").expect("deny file");
+    std::fs::write(&allowed_path, "public").expect("allow file");
     registration.set_responses(vec![
-        tool_call_response("call-d", "read", json!({ "path": "/tmp/acp-rules-deny.txt" })),
-        tool_call_response("call-a", "read", json!({ "path": "/tmp/acp-rules-allow.txt" })),
+        tool_call_response("call-d", "read", json!({ "path": denied_path })),
+        tool_call_response("call-a", "read", json!({ "path": allowed_path })),
         FauxResponse::text("done"),
     ]);
-    let agent = tempfile::tempdir().expect("agent dir");
     let sessions = tempfile::tempdir().expect("sessions dir");
     // Global settings in the agent dir: one deny rule and one allow rule,
     // both for the read tool.
     std::fs::write(
         agent.path().join("settings.json"),
-        r#"{
+        json!({
+            "sandbox": { "mode": "danger-full-access" },
             "permissionRules": [
-                { "action": "deny", "path": "/tmp/acp-rules-deny.txt" },
-                { "action": "allow", "path": "/tmp/acp-rules-allow.txt" }
+                { "action": "deny", "path": denied_path },
+                { "action": "allow", "path": allowed_path }
             ]
-        }"#,
+        })
+        .to_string(),
     )
     .expect("write settings.json");
     let cli = test_cli(sessions.path(), &model_id);
@@ -1024,11 +1293,12 @@ async fn permission_rules_deny_and_allow_short_circuit_before_reverse_request() 
 #[tokio::test]
 async fn cancel_aborts_turn_and_resolves_pending_permission_as_cancelled() {
     let (registration, model_id) = register_faux("permission-cancel");
+    let agent = tempfile::tempdir().expect("agent dir");
+    let cancelled_path = agent.path().join("permission-cancel.txt");
     registration.set_responses(vec![
-        tool_call_response("call-c", "read", json!({ "path": "/tmp/acp-perm-cancel.txt" })),
+        tool_call_response("call-c", "read", json!({ "path": cancelled_path })),
         FauxResponse::text("should not be reached"),
     ]);
-    let agent = tempfile::tempdir().expect("agent dir");
     let sessions = tempfile::tempdir().expect("sessions dir");
     let cli = test_cli(sessions.path(), &model_id);
     let (mut client, server) = spawn_server(&cli, agent.path()).await;
@@ -1049,7 +1319,9 @@ async fn cancel_aborts_turn_and_resolves_pending_permission_as_cancelled() {
     let (permission_id, _) = wait_for_permission_request(&mut client).await;
 
     // Cancel the turn; the pending permission must resolve as cancelled.
-    client.notify("session/cancel", json!({ "sessionId": session_id })).await;
+    client
+        .notify("session/cancel", json!({ "sessionId": session_id }))
+        .await;
 
     let prompt_response = loop {
         let message = client.next().await;
@@ -1058,7 +1330,8 @@ async fn cancel_aborts_turn_and_resolves_pending_permission_as_cancelled() {
         }
     };
     assert_eq!(
-        TestClient::result(&prompt_response)["stopReason"], "cancelled",
+        TestClient::result(&prompt_response)["stopReason"],
+        "cancelled",
         "a cancelled turn must respond with stopReason cancelled: {prompt_response}"
     );
 
@@ -1073,6 +1346,367 @@ async fn cancel_aborts_turn_and_resolves_pending_permission_as_cancelled() {
 
     drop(client);
     server.await.expect("server join").expect("server ok");
+}
+
+#[tokio::test]
+async fn disconnect_resolves_pending_permission_before_joining_prompt_task() {
+    let (registration, model_id) = register_faux("permission-disconnect");
+    let agent = tempfile::tempdir().expect("agent dir");
+    let blocked_path = agent.path().join("permission-disconnect.txt");
+    registration.set_responses(vec![tool_call_response(
+        "call-disconnect",
+        "read",
+        json!({ "path": blocked_path }),
+    )]);
+    let sessions = tempfile::tempdir().expect("sessions dir");
+    let cli = test_cli(sessions.path(), &model_id);
+    let (mut client, server) = spawn_server(&cli, agent.path()).await;
+    let session_id = connect(&mut client, agent.path()).await;
+    client
+        .tx
+        .send(json!({
+            "jsonrpc": "2.0",
+            "id": 301,
+            "method": "session/prompt",
+            "params": { "sessionId": session_id, "prompt": [{ "type": "text", "text": "go" }] },
+        }))
+        .await
+        .expect("send prompt");
+    let _ = wait_for_permission_request(&mut client).await;
+    drop(client);
+    server.await.expect("server join").expect("server ok");
+}
+
+/// Contract: the framed ACP `todo_child_*` surface delegates every supported
+/// operation to the session-owned [`Application`] authority. Responses retain
+/// the RPC data contracts (identity, revisions, snapshots, Todo receipts, and
+/// hub receipts), stale revisions and foreign parent/child identities fail
+/// closed, and disconnecting one ACP connection leaves the shared host service
+/// usable by another connection.
+#[tokio::test]
+async fn framed_todo_child_ops_dispatch_through_session_application_and_isolate_parents() {
+    let (registration, model_id) = register_faux("framed-todo");
+    registration.set_responses(
+        (0..32)
+            .map(|i| FauxResponse::text(format!("todo child {i}")))
+            .collect(),
+    );
+    let agent = tempfile::tempdir().expect("agent dir");
+    let cwd = tempfile::tempdir().expect("cwd");
+    let sessions = tempfile::tempdir().expect("sessions dir");
+    let mut cli = test_cli(sessions.path(), &model_id);
+    cli.tools = Some(vec!["read".to_owned(), "hub".to_owned()]);
+    let spec = cli.model.as_deref().expect("ACP framed-todo test model");
+    let (provider, model_id) = spec.split_once('/').expect("provider/model spec");
+    let model = pi_ai::get_model(provider, model_id).expect("registered faux model");
+    let stream_fn = pi_ai::get_api_provider(&model.api)
+        .expect("registered faux provider")
+        .stream_simple;
+    let host = AcpHost::new(test_blueprint(&cli, agent.path())).expect("ACP host");
+    let (mut first, first_server) = spawn_connection_on_host(&host, &cli, stream_fn.clone()).await;
+    let (mut second, second_server) = spawn_connection_on_host(&host, &cli, stream_fn).await;
+    let first_session_id = connect(&mut first, cwd.path()).await;
+    let second_session_id = connect(&mut second, cwd.path()).await;
+
+    // `connect` used request ids 1-3, so this is the exact id=4 probe that
+    // previously returned METHOD_NOT_FOUND.
+    let (created, notifications) = first
+        .request(
+            "todo_child_create",
+            json!({ "sessionId": first_session_id, "label": "first-child" }),
+        )
+        .await;
+    assert!(
+        notifications.is_empty(),
+        "Todo dispatch must not emit ACP notifications"
+    );
+    assert_eq!(created["id"], 4, "todo_child_create must be request id 4");
+    assert!(
+        created.get("result").is_some(),
+        "todo_child_create id=4: {created}"
+    );
+    assert_ne!(created["error"]["code"], METHOD_NOT_FOUND);
+    let first_parent = created["result"]["identity"]["parentSessionId"]
+        .as_str()
+        .expect("first parentSessionId")
+        .to_owned();
+    let first_child = created["result"]["identity"]["childSessionId"]
+        .as_str()
+        .expect("first childSessionId")
+        .to_owned();
+    let initial_revision = created["result"]["snapshot"]["revision"]
+        .as_u64()
+        .expect("initial revision");
+    assert_eq!(
+        created["result"]["snapshot"]["parentSessionId"],
+        first_parent
+    );
+    assert_eq!(created["result"]["snapshot"]["childSessionId"], first_child);
+
+    let (listed, _) = first
+        .request(
+            "todo_child_list",
+            json!({ "sessionId": first_session_id, "parentSessionId": first_parent }),
+        )
+        .await;
+    assert_eq!(
+        listed["result"].as_array().map(Vec::len),
+        Some(1),
+        "list: {listed}"
+    );
+    assert_eq!(listed["result"][0]["childSessionId"], first_child);
+
+    let (selected, _) = first
+        .request(
+            "todo_child_select",
+            json!({
+                "sessionId": first_session_id,
+                "parentSessionId": first_parent,
+                "childSessionId": first_child,
+            }),
+        )
+        .await;
+    assert_eq!(selected["result"], json!({}), "select: {selected}");
+
+    let (added, _) = first
+        .request(
+            "todo_child_add_task",
+            json!({
+                "sessionId": first_session_id,
+                "parentSessionId": first_parent,
+                "childSessionId": first_child,
+                "content": "framed task",
+                "expectedRevision": initial_revision,
+            }),
+        )
+        .await;
+    let added_revision = added["result"]["revision"]
+        .as_u64()
+        .expect("added revision");
+    assert!(
+        added_revision > initial_revision,
+        "add_task revision: {added}"
+    );
+    assert_eq!(added["result"]["task"]["content"], "framed task");
+
+    let (stale, _) = first
+        .request(
+            "todo_child_add_task",
+            json!({
+                "sessionId": first_session_id,
+                "parentSessionId": first_parent,
+                "childSessionId": first_child,
+                "content": "must not be added",
+                "expectedRevision": initial_revision,
+            }),
+        )
+        .await;
+    assert_eq!(
+        TestClient::error_code(&stale),
+        INVALID_PARAMS,
+        "stale add: {stale}"
+    );
+    assert!(
+        stale["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("stale") && message.contains("revision")),
+        "stale revision must remain actionable: {stale}"
+    );
+
+    let (sent, _) = first
+        .request(
+            "todo_child_send",
+            json!({
+                "sessionId": first_session_id,
+                "parentSessionId": first_parent,
+                "message": "framed child work",
+            }),
+        )
+        .await;
+    assert_eq!(sent["result"]["parentSessionId"], first_parent);
+    assert_eq!(sent["result"]["childSessionId"], first_child);
+    assert!(
+        sent["result"]["id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert!(
+        sent["result"]["messageId"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+
+    let (hub, _) = first
+        .request(
+            "todo_child_hub_send",
+            json!({
+                "sessionId": first_session_id,
+                "parentSessionId": first_parent,
+                "childSessionId": first_child,
+                "to": "Main",
+                "body": "framed hub message",
+            }),
+        )
+        .await;
+    assert_eq!(
+        hub["result"].as_array().map(Vec::len),
+        Some(1),
+        "hub send: {hub}"
+    );
+    assert_eq!(hub["result"][0]["to"], "Main");
+    assert!(
+        hub["result"][0]["outcome"].is_string(),
+        "typed hub receipt: {hub}"
+    );
+    assert!(
+        hub["result"][0]["messageId"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()),
+        "hub receipt correlation id: {hub}"
+    );
+
+    let (status, _) = first
+        .request(
+            "todo_child_status",
+            json!({
+                "sessionId": first_session_id,
+                "parentSessionId": first_parent,
+                "childSessionId": first_child,
+            }),
+        )
+        .await;
+    assert_eq!(status["result"]["parentSessionId"], first_parent);
+    assert_eq!(status["result"]["childSessionId"], first_child);
+    assert!(
+        status["result"]["revision"].as_u64().is_some(),
+        "status revision: {status}"
+    );
+    assert_eq!(status["result"]["tasks"].as_array().map(Vec::len), Some(1));
+
+    let (second_created, _) = second
+        .request(
+            "todo_child_create",
+            json!({ "sessionId": second_session_id, "label": "second-child" }),
+        )
+        .await;
+    let second_parent = second_created["result"]["identity"]["parentSessionId"]
+        .as_str()
+        .expect("second parentSessionId")
+        .to_owned();
+    let second_child = second_created["result"]["identity"]["childSessionId"]
+        .as_str()
+        .expect("second childSessionId")
+        .to_owned();
+    assert_ne!(first_parent, second_parent);
+    assert_ne!(first_child, second_child);
+
+    let (wrong_parent, _) = second
+        .request(
+            "todo_child_status",
+            json!({
+                "sessionId": second_session_id,
+                "parentSessionId": first_parent,
+                "childSessionId": first_child,
+            }),
+        )
+        .await;
+    assert_eq!(TestClient::error_code(&wrong_parent), INVALID_PARAMS);
+    assert!(
+        wrong_parent["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("identity mismatch")),
+        "foreign parent must fail closed: {wrong_parent}"
+    );
+
+    let (wrong_child, _) = second
+        .request(
+            "todo_child_status",
+            json!({
+                "sessionId": second_session_id,
+                "parentSessionId": second_parent,
+                "childSessionId": first_child,
+            }),
+        )
+        .await;
+    assert_eq!(TestClient::error_code(&wrong_child), INVALID_PARAMS);
+    assert!(
+        wrong_child["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("does not exist")),
+        "foreign child must fail closed: {wrong_child}"
+    );
+
+    drop(first);
+    first_server
+        .await
+        .expect("first server join")
+        .expect("first server ok");
+
+    let (stopped, _) = second
+        .request(
+            "todo_child_stop",
+            json!({
+                "sessionId": second_session_id,
+                "parentSessionId": second_parent,
+                "childSessionId": second_child,
+            }),
+        )
+        .await;
+    assert_eq!(stopped["result"]["parentSessionId"], second_parent);
+    assert_eq!(stopped["result"]["childSessionId"], second_child);
+    assert_eq!(stopped["result"]["status"], "stopped");
+
+    let (archived, _) = second
+        .request(
+            "todo_child_archive",
+            json!({
+                "sessionId": second_session_id,
+                "parentSessionId": second_parent,
+                "childSessionId": second_child,
+            }),
+        )
+        .await;
+    assert_eq!(archived["result"], json!({}), "archive: {archived}");
+    let (empty, _) = second
+        .request(
+            "todo_child_list",
+            json!({ "sessionId": second_session_id, "parentSessionId": second_parent }),
+        )
+        .await;
+    assert_eq!(
+        empty["result"],
+        json!([]),
+        "archive removes manifest entry: {empty}"
+    );
+
+    drop(second);
+    second_server
+        .await
+        .expect("second server join")
+        .expect("second server ok");
+    host.shutdown().await.expect("host shutdown");
+}
+
+async fn spawn_connection_on_host(
+    host: &AcpHost,
+    cli: &Cli,
+    stream_fn: pi_agent::StreamFn,
+) -> (TestClient, tokio::task::JoinHandle<Result<()>>) {
+    let (client_tx, server_rx) = mpsc::channel(OUTBOUND_CHANNEL_CAPACITY);
+    let (server_tx, client_rx) = mpsc::channel(INBOUND_CHANNEL_CAPACITY);
+    let host = host.clone();
+    let cli = cli.clone();
+    let server = tokio::spawn(async move {
+        serve_connection_with_stream(host, cli, server_rx, server_tx, stream_fn).await
+    });
+    (
+        TestClient {
+            tx: client_tx,
+            rx: client_rx,
+            next_id: 0,
+        },
+        server,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1092,11 +1726,17 @@ async fn session_close_releases_the_session() {
     let (response, _) = client
         .request("session/close", json!({ "sessionId": session_id }))
         .await;
-    assert!(response.get("result").is_some(), "session/close must succeed: {response}");
+    assert!(
+        response.get("result").is_some(),
+        "session/close must succeed: {response}"
+    );
 
     // Prompting a closed session fails with resource-not-found.
     let (response, _) = client
-        .request("session/prompt", json!({ "sessionId": session_id, "prompt": [] }))
+        .request(
+            "session/prompt",
+            json!({ "sessionId": session_id, "prompt": [] }),
+        )
         .await;
     assert_eq!(TestClient::error_code(&response), RESOURCE_NOT_FOUND);
 
@@ -1121,7 +1761,10 @@ async fn session_cancel_as_request_acknowledges_and_validates() {
     let (response, _) = client
         .request("session/cancel", json!({ "sessionId": session_id }))
         .await;
-    assert!(response.get("result").is_some(), "cancel as request: {response}");
+    assert!(
+        response.get("result").is_some(),
+        "cancel as request: {response}"
+    );
 
     let (response, _) = client.request("session/cancel", json!({})).await;
     assert_eq!(TestClient::error_code(&response), INVALID_PARAMS);
@@ -1140,7 +1783,10 @@ async fn stdio_frames_round_trip_through_encode_and_pump() {
     let frame = pi_coding::tools::framing::encode_message(&body).expect("encode");
     let serialized = serde_json::to_vec(&body).expect("serialize");
     let header = format!("Content-Length: {}\r\n\r\n", serialized.len());
-    assert!(frame.starts_with(header.as_bytes()), "frame must start with the header");
+    assert!(
+        frame.starts_with(header.as_bytes()),
+        "frame must start with the header"
+    );
     assert_eq!(&frame[header.len()..], &serialized[..]);
 
     let (tx, mut rx) = mpsc::channel(4);
@@ -1178,7 +1824,10 @@ async fn stdio_reader_survives_parse_errors_but_stops_on_framing_errors() {
     assert_eq!(parse_error["error"]["code"], PARSE_ERROR);
     let third = rx.recv().await.expect("third frame");
     assert_eq!(third["id"], 3);
-    assert!(rx.recv().await.is_none(), "reader must close after the stream ends");
+    assert!(
+        rx.recv().await.is_none(),
+        "reader must close after the stream ends"
+    );
     drop(rx);
     reader.await.expect("reader join").expect("reader ok");
 
@@ -1195,9 +1844,72 @@ async fn stdio_reader_survives_parse_errors_but_stops_on_framing_errors() {
         tx,
         errors,
     ));
-    assert!(rx.recv().await.is_none(), "truncated frame must close the reader");
+    assert!(
+        rx.recv().await.is_none(),
+        "truncated frame must close the reader"
+    );
     drop(rx);
     reader.await.expect("reader join").expect("reader ok");
+}
+
+#[tokio::test]
+async fn stdio_reader_normal_eof_is_successful() {
+    let (tx, mut rx) = mpsc::channel(1);
+    let (outbound, _outbound_rx) = mpsc::channel(1);
+    let reader = tokio::spawn(read_stdio_frames(
+        std::io::Cursor::new(Vec::<u8>::new()),
+        tx,
+        outbound,
+    ));
+    joined_task_result(reader.await, "joining ACP stdio reader").expect("normal framed stdin EOF");
+    assert!(
+        rx.recv().await.is_none(),
+        "EOF must close the inbound channel"
+    );
+}
+
+#[tokio::test]
+async fn stdio_reader_join_failure_is_observable() {
+    let reader = tokio::spawn(std::future::pending::<Result<()>>());
+    reader.abort();
+    let error = joined_task_result(reader.await, "joining ACP stdio reader")
+        .expect_err("reader cancellation must be observable");
+    assert!(
+        error.to_string().contains("joining ACP stdio reader"),
+        "reader join context: {error:#}"
+    );
+}
+
+#[test]
+fn websocket_transport_result_propagates_read_and_write_errors() {
+    assert_eq!(
+        websocket_transport_result(Err(WsError::ConnectionClosed), "reading ACP WebSocket")
+            .expect("normal peer disconnect"),
+        false,
+        "normal disconnect must end the loop without an error"
+    );
+
+    let read_error = websocket_transport_result(
+        Err(WsError::Io(std::io::Error::other("injected read failure"))),
+        "reading ACP WebSocket",
+    )
+    .expect_err("read I/O failure must be observable");
+    assert!(
+        read_error.to_string().contains("reading ACP WebSocket"),
+        "read error context: {read_error:#}"
+    );
+
+    let write_error = websocket_transport_result(
+        Err(WsError::Io(std::io::Error::other("injected write failure"))),
+        "sending ACP WebSocket message",
+    )
+    .expect_err("write I/O failure must be observable");
+    assert!(
+        write_error
+            .to_string()
+            .contains("sending ACP WebSocket message"),
+        "write error context: {write_error:#}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1211,12 +1923,16 @@ async fn websocket_connection_serves_initialize() {
     let agent = tempfile::tempdir().expect("agent dir");
     let sessions = tempfile::tempdir().expect("sessions dir");
     let cli = test_cli(sessions.path(), &model_id);
-    let blueprint = test_blueprint(&cli, agent.path());
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind ws listener");
+    let host = AcpHost::new(test_blueprint(&cli, agent.path())).expect("ACP host");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ws listener");
     let address = listener.local_addr().expect("ws address");
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("accept ws");
-        handle_ws_connection(stream, blueprint, cli, None).await.expect("ws connection")
+        handle_ws_connection(stream, host, cli, None)
+            .await
+            .expect("ws connection")
     });
 
     use futures_util::StreamExt as _;
@@ -1224,7 +1940,9 @@ async fn websocket_connection_serves_initialize() {
     // A native client (no Origin header) is the tokenless-loopback case.
     let url = format!("ws://{address}/");
     let request = url.clone().into_client_request().expect("ws request");
-    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.expect("ws connect");
+    let (mut socket, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("ws connect");
 
     let id = json!(1);
     socket
@@ -1265,22 +1983,29 @@ async fn websocket_rejects_browser_origin_without_token_but_accepts_native() {
     let agent = tempfile::tempdir().expect("agent dir");
     let sessions = tempfile::tempdir().expect("sessions dir");
     let cli = test_cli(sessions.path(), &model_id);
-    let blueprint = test_blueprint(&cli, agent.path());
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind ws listener");
+    let host = AcpHost::new(test_blueprint(&cli, agent.path())).expect("ACP host");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ws listener");
     let address = listener.local_addr().expect("ws address");
     let server = tokio::spawn(async move {
         // First connection: a browser Origin must be refused (401) and the
         // handler returns without upgrading.
         let (stream, _) = listener.accept().await.expect("accept browser conn");
-        let _ = handle_ws_connection(stream, blueprint.clone(), cli.clone(), None).await;
+        let _ = handle_ws_connection(stream, host.clone(), cli.clone(), None).await;
         // Second connection: a native client must be served.
         let (stream, _) = listener.accept().await.expect("accept native conn");
-        handle_ws_connection(stream, blueprint, cli, None).await.expect("native ws connection")
+        handle_ws_connection(stream, host, cli, None)
+            .await
+            .expect("native ws connection")
     });
 
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
     let url = format!("ws://{address}/");
-    let mut browser = url.clone().into_client_request().expect("browser ws request");
+    let mut browser = url
+        .clone()
+        .into_client_request()
+        .expect("browser ws request");
     browser
         .headers_mut()
         .insert("Origin", http::HeaderValue::from_static("http://localhost"));
@@ -1295,8 +2020,13 @@ async fn websocket_rejects_browser_origin_without_token_but_accepts_native() {
         other => panic!("browser Origin must be rejected, got {other:?}"),
     }
 
-    let request = url.clone().into_client_request().expect("native ws request");
-    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.expect("native ws connect");
+    let request = url
+        .clone()
+        .into_client_request()
+        .expect("native ws request");
+    let (mut socket, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("native ws connect");
     socket
         .send(tokio_tungstenite::tungstenite::Message::Close(None))
         .await
@@ -1309,14 +2039,17 @@ async fn websocket_rejects_browser_origin_without_token_but_accepts_native() {
 /// wrong token, a missing subprotocol, and an unrelated subprotocol are all
 /// refused with 401; the `Authorization: Bearer` header path also works.
 #[tokio::test]
-async fn websocket_token_policy_accepts_valid_subprotocol_and_rejects_wrong_missing_and_bearerless() {
+async fn websocket_token_policy_accepts_valid_subprotocol_and_rejects_wrong_missing_and_bearerless()
+{
     let (registration, model_id) = register_faux("ws-token");
     registration.set_responses(vec![FauxResponse::text("ok")]);
     let agent = tempfile::tempdir().expect("agent dir");
     let sessions = tempfile::tempdir().expect("sessions dir");
     let cli = test_cli(sessions.path(), &model_id);
-    let blueprint = test_blueprint(&cli, agent.path());
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind ws listener");
+    let host = AcpHost::new(test_blueprint(&cli, agent.path())).expect("ACP host");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ws listener");
     let address = listener.local_addr().expect("ws address");
     let token: Option<Arc<[u8]>> = Some(Arc::from(&b"secret"[..]));
     let server = tokio::spawn(async move {
@@ -1324,11 +2057,11 @@ async fn websocket_token_policy_accepts_valid_subprotocol_and_rejects_wrong_miss
         // connection is handed to its own handler task.
         for _ in 0..5 {
             let (stream, _) = listener.accept().await.expect("accept ws conn");
-            let blueprint = blueprint.clone();
+            let host = host.clone();
             let cli = cli.clone();
             let token = token.clone();
             tokio::spawn(async move {
-                let _ = handle_ws_connection(stream, blueprint, cli, token).await;
+                let _ = handle_ws_connection(stream, host, cli, token).await;
             });
         }
     });
@@ -1338,13 +2071,13 @@ async fn websocket_token_policy_accepts_valid_subprotocol_and_rejects_wrong_miss
     let mut request = url.clone().into_client_request().expect("ws request");
 
     // Valid subprotocol: upgraded and the exact protocol is echoed.
-    request
-        .headers_mut()
-        .insert(
-            http::header::SEC_WEBSOCKET_PROTOCOL,
-            http::HeaderValue::from_static("rpi-auth.secret"),
-        );
-    let (mut socket, response) = tokio_tungstenite::connect_async(request).await.expect("valid token connect");
+    request.headers_mut().insert(
+        http::header::SEC_WEBSOCKET_PROTOCOL,
+        http::HeaderValue::from_static("rpi-auth.secret"),
+    );
+    let (mut socket, response) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("valid token connect");
     assert_eq!(
         response.headers().get(http::header::SEC_WEBSOCKET_PROTOCOL),
         Some(&http::HeaderValue::from_static("rpi-auth.secret")),
@@ -1357,15 +2090,17 @@ async fn websocket_token_policy_accepts_valid_subprotocol_and_rejects_wrong_miss
 
     // Wrong token: 401.
     let mut request = url.clone().into_client_request().expect("ws request");
-    request
-        .headers_mut()
-        .insert(
-            http::header::SEC_WEBSOCKET_PROTOCOL,
-            http::HeaderValue::from_static("rpi-auth.wrong"),
-        );
+    request.headers_mut().insert(
+        http::header::SEC_WEBSOCKET_PROTOCOL,
+        http::HeaderValue::from_static("rpi-auth.wrong"),
+    );
     match tokio_tungstenite::connect_async(request).await {
         Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
-            assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED, "wrong token must be rejected");
+            assert_eq!(
+                response.status(),
+                http::StatusCode::UNAUTHORIZED,
+                "wrong token must be rejected"
+            );
         }
         other => panic!("wrong token must be rejected, got {other:?}"),
     }
@@ -1374,32 +2109,41 @@ async fn websocket_token_policy_accepts_valid_subprotocol_and_rejects_wrong_miss
     let request = url.clone().into_client_request().expect("ws request");
     match tokio_tungstenite::connect_async(request).await {
         Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
-            assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED, "missing token must be rejected");
+            assert_eq!(
+                response.status(),
+                http::StatusCode::UNAUTHORIZED,
+                "missing token must be rejected"
+            );
         }
         other => panic!("missing token must be rejected, got {other:?}"),
     }
 
     // Unrelated subprotocol: 401.
     let mut request = url.clone().into_client_request().expect("ws request");
-    request
-        .headers_mut()
-        .insert(
-            http::header::SEC_WEBSOCKET_PROTOCOL,
-            http::HeaderValue::from_static("chat"),
-        );
+    request.headers_mut().insert(
+        http::header::SEC_WEBSOCKET_PROTOCOL,
+        http::HeaderValue::from_static("chat"),
+    );
     match tokio_tungstenite::connect_async(request).await {
         Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
-            assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED, "unrelated subprotocol must be rejected");
+            assert_eq!(
+                response.status(),
+                http::StatusCode::UNAUTHORIZED,
+                "unrelated subprotocol must be rejected"
+            );
         }
         other => panic!("unrelated subprotocol must be rejected, got {other:?}"),
     }
 
     // Bearer header path: accepted.
     let mut request = url.clone().into_client_request().expect("ws request");
-    request
-        .headers_mut()
-        .insert(http::header::AUTHORIZATION, http::HeaderValue::from_static("Bearer secret"));
-    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.expect("bearer connect");
+    request.headers_mut().insert(
+        http::header::AUTHORIZATION,
+        http::HeaderValue::from_static("Bearer secret"),
+    );
+    let (mut socket, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("bearer connect");
     socket
         .send(tokio_tungstenite::tungstenite::Message::Close(None))
         .await
@@ -1416,10 +2160,12 @@ async fn websocket_connection_cap_drops_saturated_connections() {
     let agent = tempfile::tempdir().expect("agent dir");
     let sessions = tempfile::tempdir().expect("sessions dir");
     let cli = test_cli(sessions.path(), &model_id);
-    let blueprint = test_blueprint(&cli, agent.path());
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind ws listener");
+    let host = AcpHost::new(test_blueprint(&cli, agent.path())).expect("ACP host");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ws listener");
     let address = listener.local_addr().expect("ws address");
-    let server = tokio::spawn(serve_ws(listener, blueprint, cli, None));
+    let server = tokio::spawn(serve_ws(listener, host, cli, None));
 
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
     let url = format!("ws://{address}/");
@@ -1438,7 +2184,9 @@ async fn websocket_connection_cap_drops_saturated_connections() {
         "a connection beyond the cap must be dropped"
     );
     for socket in &mut sockets {
-        let _ = socket.send(tokio_tungstenite::tungstenite::Message::Close(None)).await;
+        let _ = socket
+            .send(tokio_tungstenite::tungstenite::Message::Close(None))
+            .await;
     }
     server.abort();
     let _ = server.await;
@@ -1486,21 +2234,26 @@ async fn serve_refuses_non_loopback_even_with_token_file() {
 
 #[test]
 fn parse_prompt_blocks_handles_each_content_type() {
-    let dir = tempfile::tempdir().expect("dir");
-    std::fs::write(dir.path().join("f.txt"), "file text").expect("write file");
-    let link = format!("file://{}", dir.path().join("f.txt").display());
     let params = json!({
         "prompt": [
             { "type": "text", "text": "hello" },
             { "type": "image", "mimeType": "image/png", "data": "aGVsbG8=" },
             { "type": "resource", "resource": { "uri": "file:///x.txt", "text": "embedded" } },
-            { "type": "resource_link", "uri": link },
+            { "type": "resource_link", "uri": "file:///workspace/f.txt" },
         ],
     });
-    let (text, images) = parse_prompt_blocks(&params).expect("parse");
+    let (text, images) = parse_prompt_blocks(&params, |path, max_bytes| {
+        assert_eq!(path, Path::new("/workspace/f.txt"));
+        assert_eq!(max_bytes, MAX_EMBEDDED_RESOURCE_BYTES as u64 + 1);
+        Ok(b"file text".to_vec())
+    })
+    .expect("parse");
     assert!(text.contains("hello"));
     assert!(text.contains("embedded"), "resource text must be embedded");
-    assert!(text.contains("file text"), "resource_link must be read: {text}");
+    assert!(
+        text.contains("file text"),
+        "resource_link must be read: {text}"
+    );
     assert_eq!(images.len(), 1, "one image block");
     match &images[0] {
         ContentBlock::Image { data, mime_type } => {
@@ -1517,7 +2270,10 @@ fn file_uri_to_path_decodes_local_links() {
     let uri = "file:///workspace/a%20b.txt";
     assert_eq!(file_uri_to_path(uri), Some(absolute_path));
     assert_eq!(file_uri_to_path("https://example.com/x"), None);
-    assert_eq!(file_uri_to_path("file:///plain.txt"), Some(PathBuf::from("/plain.txt")));
+    assert_eq!(
+        file_uri_to_path("file:///plain.txt"),
+        Some(PathBuf::from("/plain.txt"))
+    );
 }
 
 #[test]
@@ -1594,16 +2350,18 @@ fn parse_incoming_rejects_malformed_messages() {
         INVALID_REQUEST
     );
     // Neither a method nor a result/error.
-    assert_eq!(
-        code(&json!({ "jsonrpc": "2.0", "id": 1 })),
-        INVALID_REQUEST
-    );
+    assert_eq!(code(&json!({ "jsonrpc": "2.0", "id": 1 })), INVALID_REQUEST);
 }
 
 #[test]
 fn strip_absolute_paths_removes_local_paths_but_keeps_messages() {
-    let absolute_path = Path::new("/").join("workspace").join(".pi/agent/settings.json");
-    let message = format!("Failed to parse settings.json\nFile: {}", absolute_path.display());
+    let absolute_path = Path::new("/")
+        .join("workspace")
+        .join(".pi/agent/settings.json");
+    let message = format!(
+        "Failed to parse settings.json\nFile: {}",
+        absolute_path.display()
+    );
     assert_eq!(
         strip_absolute_paths(&message),
         "Failed to parse settings.json File: <path>"

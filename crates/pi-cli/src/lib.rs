@@ -9,32 +9,39 @@ mod ansi;
 pub mod approval;
 pub mod args;
 pub mod auth_commands;
+mod auth_json;
 pub mod clipboard;
 pub mod code_review;
 pub mod code_review_panel;
+pub mod chat_sync;
+pub mod collab_commands;
+pub mod collab_guest;
 pub mod side_chat;
 pub mod side_chat_panel;
-pub mod collab_guest;
-pub mod collab_commands;
 
 pub mod commands;
+pub mod dependency_map;
 pub mod doctor;
 pub mod extension_ui;
 pub mod file_args;
+pub(crate) mod file_conversation;
 pub mod file_search;
-pub mod human_event_renderer;
+pub(crate) mod file_explorer;
+pub(crate) mod file_viewer;
 pub mod goal_commands;
+pub mod human_event_renderer;
 pub mod image_pipeline;
-pub mod job_card_adapter;
 pub mod interactive_commands;
+pub mod job_card_adapter;
+pub(crate) mod jobs_panel;
 pub mod keybindings;
 pub mod llama_commands;
 pub mod loop_commands;
 pub mod markdown;
 pub mod mcp_commands;
 pub mod models_config;
-pub mod orchestration_message;
 pub mod modes;
+pub mod orchestration_message;
 pub mod output;
 pub mod package_commands;
 pub mod package_config;
@@ -42,6 +49,7 @@ pub mod plugin_commands;
 pub mod process_commands;
 pub mod repl;
 pub mod resume_catalog;
+pub mod runner_identity;
 mod saved_session_selector;
 mod scoped_model_selector;
 pub mod self_update;
@@ -50,26 +58,41 @@ pub mod session_run_blueprint;
 pub mod settings_config;
 pub mod settings_panel;
 pub mod settings_rpc;
+pub mod team;
+mod team_commands;
 pub mod terminal_images;
-pub mod tool_card_adapter;
 pub mod theme;
-pub(crate) mod tree_panel;
-pub(crate) mod video_extract;
+mod todo_child_commands;
+mod todo_child_detail;
 pub mod todo_dag_panel;
 mod todo_dag_view;
+pub mod tool_card_adapter;
+pub(crate) mod tree_panel;
 pub mod tui;
+#[doc(hidden)]
+pub mod tui_test_support;
+pub(crate) mod video_extract;
+pub(crate) mod pdf_extract;
+pub(crate) mod tmux_file;
+
 pub(crate) mod web;
 pub mod workflow_commands;
-pub mod workflow_rpc;
 pub mod workflow_panel;
+pub mod workflow_rpc;
 
-use anyhow::{Context, Result};
+#[cfg(test)]
+pub(crate) mod test_support;
 
-pub use args::{AgentCommand, ApprovalModeArg, Cli, Command, CompletionShell, ConfigCommand, ConfigScopeArg, LlamaCommand, McpCommand, McpImportSourceArg, Mode, PluginCommand};
+use anyhow::{Context, Result, anyhow};
 
-/// Best-effort parent-process hardening, run once at CLI startup before any
-/// dispatch so a crash cannot leak in-memory secrets (sessions, API keys)
-/// through core dumps or same-user inspection.
+pub use args::{
+    AgentCommand, ApprovalModeArg, Cli, Command, CompletionShell, ConfigCommand, ConfigScopeArg,
+    LlamaCommand, McpCommand, McpImportSourceArg, Mode, PluginCommand,
+};
+
+/// Best-effort hardening for the normal CLI process, run once at startup so a
+/// crash cannot leak in-memory secrets (sessions, API keys) through core dumps
+/// or same-user inspection.
 ///
 /// - Linux: makes the process non-dumpable (`PR_SET_DUMPABLE=0`), denying
 ///   ptrace attach and `/proc/<pid>/mem` access, and sets `RLIMIT_CORE=0` so
@@ -77,31 +100,36 @@ pub use args::{AgentCommand, ApprovalModeArg, Cli, Command, CompletionShell, Con
 /// - Other unix: `RLIMIT_CORE=0` where supported.
 /// - Non-unix: no-op.
 ///
-/// Every call is cfg-guarded and failure-ignored: this is best-effort
+/// Every syscall is cfg-guarded and failure-ignored: this is best-effort
 /// hardening and must never break startup on unsupported platforms. Loader
 /// variables (`LD_PRELOAD`, `LD_LIBRARY_PATH`) are consumed by the dynamic
 /// loader before `main` runs and cannot be sanitized after the fact; child
 /// processes already rebuild their environments (pi-coding tools and
 /// extensions).
 pub fn harden_process() {
-    // Deny ptrace attach and /proc/<pid>/mem access even to same-user
-    // debuggers (Linux-only; nix gates the safe prctl wrapper on linux).
-    #[cfg(target_os = "linux")]
-    {
-        use nix::sys::prctl::set_dumpable;
-        let _ = set_dumpable(false);
-    }
-    // Disable core dumps: RLIMIT_CORE = 0 (unix, including Linux).
     #[cfg(unix)]
-    {
-        use nix::sys::resource::{Resource, setrlimit};
-        let _ = setrlimit(Resource::RLIMIT_CORE, 0, 0);
-    }
+    pi_sandbox::harden_current_process();
+}
+#[cfg(unix)]
+pub fn sandbox_child_main() -> Result<std::convert::Infallible, pi_sandbox::SandboxError> {
+    pi_sandbox::exec_child_target(3, 4)
+}
+
+/// Detect the exact `__sandbox-child` sentinel argument slice used by the
+/// binary entry point to short-circuit into [`sandbox_child_main`] before
+/// normal CLI startup.
+#[cfg(unix)]
+pub fn is_sandbox_child_dispatch(args: &[std::ffi::OsString]) -> bool {
+    args == [
+        std::ffi::OsString::from("__sandbox-child"),
+        std::ffi::OsString::from("3"),
+        std::ffi::OsString::from("4"),
+    ]
 }
 
 /// Dispatch a parsed [`Cli`]. Subcommands run synchronously; top-level flags
 /// select structured, print, Web-listener, TUI, or line-REPL execution.
-pub async fn run(cli: Cli) -> Result<()> {
+pub async fn run(mut cli: Cli) -> Result<()> {
     cli.validate().map_err(anyhow::Error::msg)?;
     session_run::set_offline(cli.offline);
     // Resolve and install the active config profile (CLI `--profile` wins
@@ -110,32 +138,47 @@ pub async fn run(cli: Cli) -> Result<()> {
     // under `<base>/profiles/<name>`.
     session_run::activate_profile(&cli)?;
     if let Some(search) = cli.list_models.as_deref() {
-        return commands::list_models((!search.is_empty()).then_some(search)).await;
+        let application = session_run::build_operator_application(&cli).await?;
+        let result =
+            commands::list_models((!search.is_empty()).then_some(search), &application).await;
+        application.cleanup().await;
+        return result;
     }
     // Top-level `--export SESSION_PATH` mirrors the `export` subcommand (same
     // session -> HTML/JSONL path, honoring `-o/--output` and `--jsonl`).
     if let Some(session) = cli.export.as_deref() {
         return commands::export_session_command(session, cli.output.as_deref(), cli.jsonl);
     }
-    match cli.command {
+    // Detach the subcommand before dispatch so payloads can move into their
+    // handlers while the remaining CLI options stay borrowable for the one
+    // normal Application/session build.
+    let command = cli.command.take();
+    match command {
         // `rpi rpc` ≡ `rpi --mode rpc` (the successor of the removed `rpi-rpc`
         // companion binary): force RPC headless mode and dispatch through the
         // top-level mode path. A conflicting explicit `--mode` was already
-        // rejected by `validate`. The clone nulls the subcommand so `main_run`
-        // dispatches on the forced mode instead of re-entering this match.
+        // rejected by `validate`; the detached command keeps `main_run` from
+        // re-entering this match.
         Some(Command::Rpc) => {
-            let mut rpc_cli = cli.clone();
-            rpc_cli.command = None;
-            rpc_cli.mode = Some(Mode::Rpc);
-            main_run(&rpc_cli).await
+            cli.mode = Some(Mode::Rpc);
+            main_run(&cli).await
         }
-        Some(Command::Login { provider, scope }) => {
-            auth_commands::login_cli(provider.as_deref(), scope.as_deref()).await
+        Some(Command::Login { provider, scope, json }) => {
+            if json {
+                auth_json::login(provider.as_deref(), scope.as_deref()).await
+            } else {
+                auth_commands::login_cli(provider.as_deref(), scope.as_deref()).await
+            }
         }
         Some(Command::Logout { provider, scope }) => {
             auth_commands::logout_cli(provider.as_deref(), scope.as_deref()).await
         }
-        Some(Command::Models { filter }) => commands::list_models(filter.as_deref()).await,
+        Some(Command::Models { filter }) => {
+            let application = session_run::build_operator_application(&cli).await?;
+            let result = commands::list_models(filter.as_deref(), &application).await;
+            application.cleanup().await;
+            result
+        }
         Some(Command::Sessions) => commands::list_sessions(&cli),
         Some(Command::ImportSession {
             ref source,
@@ -151,16 +194,32 @@ pub async fn run(cli: Cli) -> Result<()> {
             output,
             jsonl,
         }) => commands::export_session_command(&session, output.as_deref(), jsonl),
-        Some(Command::Llama { command }) => llama_commands::run(command).await,
+        Some(Command::Llama { command }) => {
+            let application = session_run::build_operator_application(&cli).await?;
+            let result = llama_commands::run(command, &application).await;
+            application.cleanup().await;
+            result
+        }
         Some(Command::Plugin { command }) => {
             let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
-            plugin_commands::run(command, &cwd).await
+            let application = session_run::build_operator_application(&cli).await?;
+            let process = application.governed_process_context();
+            let http = pi_coding::plugin::PluginHttpExecutors::new(
+                application.http_executor(pi_coding::HostHttpClass::PluginMarketplace),
+                application.http_executor(pi_coding::HostHttpClass::PluginArchive),
+                application.http_executor(pi_coding::HostHttpClass::NpmRegistry),
+                application.http_executor(pi_coding::HostHttpClass::NpmTarball),
+            );
+            let result = plugin_commands::run(command, &cwd, process, http).await;
+            application.cleanup().await;
+            result
         }
         Some(Command::Agent { ref command }) => match command {
             crate::args::AgentCommand::Stdio => modes::acp::run_stdio(cli.clone()).await,
-            crate::args::AgentCommand::Serve { address, token_file } => {
-                modes::acp::run_serve(cli.clone(), *address, token_file.clone()).await
-            }
+            crate::args::AgentCommand::Serve {
+                address,
+                token_file,
+            } => modes::acp::run_serve(cli.clone(), *address, token_file.clone()).await,
         },
         Some(Command::Mcp { command }) => {
             let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
@@ -168,7 +227,11 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         Some(Command::Install { source, local }) => {
             let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
-            package_commands::install_package(&source, local, &cwd)
+            let application = session_run::build_operator_application(&cli).await?;
+            let process = application.governed_process_context();
+            let result = package_commands::install_package(&source, local, &cwd, process);
+            application.cleanup().await;
+            result
         }
         Some(Command::Remove { source, local }) => {
             let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
@@ -176,7 +239,11 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         Some(Command::List) => {
             let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
-            package_commands::list_packages(&cwd)
+            let application = session_run::build_operator_application(&cli).await?;
+            let process = application.governed_process_context();
+            let result = package_commands::list_packages(&cwd, process);
+            application.cleanup().await;
+            result
         }
         Some(Command::Config { local, command }) => {
             let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
@@ -197,26 +264,29 @@ pub async fn run(cli: Cli) -> Result<()> {
         }) => {
             let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
             if models {
-                return commands::refresh_model_catalogs().await;
+                let application = session_run::build_operator_application(&cli).await?;
+                let result = commands::refresh_model_catalogs(&application).await;
+                application.cleanup().await;
+                return result;
             }
-            if let Some(extension) = extension {
-                return package_commands::update_package(&extension, &cwd);
-            }
-            if let Some(package) = package {
-                if matches!(package.as_str(), "self" | "rpi") {
-                    if extensions {
-                        package_commands::update_packages(&cwd)?;
-                    }
-                    return self_update::update_self(force).await;
+            let package_operation = extension.as_deref().or_else(|| {
+                package
+                    .as_deref()
+                    .filter(|package| !matches!(*package, "self" | "rpi"))
+            });
+            if package_operation.is_some() || extensions || all {
+                let application = session_run::build_operator_application(&cli).await?;
+                let process = application.governed_process_context();
+                let package_result = if let Some(source) = package_operation {
+                    package_commands::update_package(source, &cwd, process)
+                } else {
+                    package_commands::update_packages(&cwd, process)
+                };
+                application.cleanup().await;
+                package_result?;
+                if package_operation.is_some() || (extensions && !self_update && !all) {
+                    return Ok(());
                 }
-                return package_commands::update_package(&package, &cwd);
-            }
-            if all || (self_update && extensions) {
-                package_commands::update_packages(&cwd)?;
-                return self_update::update_self(force).await;
-            }
-            if extensions {
-                return package_commands::update_packages(&cwd);
             }
             self_update::update_self(force).await
         }
@@ -236,9 +306,7 @@ async fn main_run(cli: &Cli) -> Result<()> {
         Some(Mode::Json) => run_structured(|| modes::json::run(cli)).await,
         Some(Mode::Rpc) => run_structured(|| modes::rpc::run(cli)).await,
         _ if cli.is_print_mode()
-            || (cli.listen.is_none()
-                && (!stdin_tty || !stdout_tty)
-                && !cli.prompt.is_empty()) =>
+            || (cli.listen.is_none() && (!stdin_tty || !stdout_tty) && !cli.prompt.is_empty()) =>
         {
             session_run::print_mode(cli).await
         }
@@ -249,6 +317,8 @@ async fn main_run(cli: &Cli) -> Result<()> {
                 extension_ui,
                 scoped_models,
                 startup_warnings,
+                resume_notice,
+                todo_child_service,
                 ..
             } = session_run::build_session(cli).await?;
             let initial_prompts = cli.prompt.clone();
@@ -259,47 +329,183 @@ async fn main_run(cli: &Cli) -> Result<()> {
                     scoped_models,
                     initial_prompts,
                     startup_warnings,
+                    resume_notice,
                     None,
                 )
                 .await
             } else {
-                repl::interactive(application.clone(), initial_prompts, None).await
+                repl::interactive(application.clone(), initial_prompts, None)
+                    .await
+                    .map(|()| tui::TuiExit::Terminal)
             };
-            application.cleanup().await;
-            result
+            if result
+                .as_ref()
+                .is_ok_and(|exit| *exit == tui::TuiExit::Restart)
+            {
+                if let Err(error) = pi_coding::Application::checkpoint_process_for_restart(
+                    std::slice::from_ref(&application),
+                    Some(todo_child_service.as_ref()),
+                ) {
+                    let shutdown = todo_child_service.shutdown().await.context(
+                        "shutting down Todo child service after TUI restart checkpoint failure",
+                    );
+                    let cleanup = application.cleanup().await;
+                    return combine_tui_shutdown(
+                        Err(error.context("checkpointing TUI process restart")),
+                        shutdown,
+                        cleanup,
+                    );
+                }
+                return Ok(());
+            }
+            let shutdown = todo_child_service
+                .shutdown()
+                .await
+                .context("shutting down Todo child service");
+            combine_tui_shutdown(result.map(|_| ()), shutdown, application.cleanup().await)
         }
+    }
+}
+fn combine_tui_shutdown(
+    run_result: Result<()>,
+    todo_shutdown: Result<()>,
+    cleanup: Result<()>,
+) -> Result<()> {
+    let mut errors = Vec::new();
+    if let Err(error) = run_result {
+        errors.push(format!("{error:#}"));
+    }
+    if let Err(error) = todo_shutdown {
+        errors.push(format!("shutting down Todo child service: {error:#}"));
+    }
+    if let Err(error) = cleanup {
+        errors.push(format!("cleaning up primary application: {error:#}"));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(errors.join("; ")))
     }
 }
 
 /// Run `--listen` as a Web-only backend. Standard input is deliberately never
 /// read: a closed pipe must not stop the service, and a terminal must never be
 /// acquired. The listener owns the live application until a process signal.
+/// Process host shutdown stops the listener, shuts the host-owned Todo child
+/// service, then runs parent `application.cleanup`. Per-session close and
+/// WebSocket disconnect never reach this path.
 async fn run_listener_mode(cli: &Cli) -> Result<()> {
     let mut shutdown = ListenerShutdownSignals::new()?;
     let session_run::RunSession {
         application,
         extension_ui,
         spawner,
+        todo_child_service,
         ..
     } = session_run::build_session(cli).await?;
     let handle = match start_listen(cli, &application, &extension_ui, spawner).await {
         Ok(Some(handle)) => handle,
         Ok(None) => unreachable!("listener mode requires --listen"),
         Err(error) => {
+            let error = error.context("starting control plane listener");
+            let shutdown = todo_child_service
+                .shutdown()
+                .await
+                .context("shutting down Todo child service");
             application.cleanup().await;
-            return Err(error.context("starting control plane listener"));
+            return match shutdown {
+                Ok(()) => Err(error),
+                Err(shutdown_error) => Err(error.context(format!(
+                    "Todo child service shutdown also failed: {shutdown_error:#}"
+                ))),
+            };
         }
     };
-    shutdown.wait().await;
-    let stop_result = handle.stop().await.context("stopping control plane listener");
-    application.cleanup().await;
-    stop_result
+    let is_restart = shutdown.wait().await == ListenerShutdownIntent::Restart;
+    let stop_result = handle.stop(is_restart).await;
+    if is_restart {
+        // A successful restart checkpoint detaches alone: the checkpointed
+        // process state survives for the successor, so the primary
+        // application and the host-owned Todo child service are never torn
+        // down. A failed checkpoint is terminal: the manager has already
+        // terminally cleaned its owned secondaries and published the exact
+        // checkpoint Err — this side runs the same primary/Todo cleanup the
+        // terminal path runs and returns that error RAW. It is never
+        // re-contextualized (no "stopping control plane listener" layer on
+        // top): the terminal cause is the checkpoint failure itself. Cleanup
+        // failures are diagnostics on stderr so the exact Err stays exact.
+        return match stop_result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if let Err(shutdown) = todo_child_service.shutdown().await {
+                    eprintln!(
+                        "listener_shutdown category=todo_shutdown_after_restart_checkpoint_failure error={shutdown:#}"
+                    );
+                }
+                if let Err(cleanup) = application.cleanup().await {
+                    eprintln!(
+                        "listener_shutdown category=primary_cleanup_after_restart_checkpoint_failure error={cleanup}"
+                    );
+                }
+                Err(error)
+            }
+        };
+    }
+    let stop_result = stop_result.context("stopping control plane listener");
+    let shutdown = todo_child_service
+        .shutdown()
+        .await
+        .context("shutting down Todo child service");
+    let cleanup = application.cleanup().await;
+    combine_listener_shutdown(stop_result, shutdown, cleanup)
+}
+
+fn combine_listener_shutdown(
+    stop_result: Result<()>,
+    todo_shutdown: Result<()>,
+    cleanup: Result<()>,
+) -> Result<()> {
+    let mut errors = Vec::new();
+    if let Err(error) = stop_result {
+        errors.push(format!("stopping control plane listener: {error:#}"));
+    }
+    if let Err(error) = todo_shutdown {
+        errors.push(format!("shutting down Todo child service: {error:#}"));
+    }
+    if let Err(error) = cleanup {
+        errors.push(format!("cleaning up primary application: {error:#}"));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(errors.join("; ")))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListenerShutdownIntent {
+    Terminal,
+    Restart,
+}
+
+#[cfg(unix)]
+fn listener_shutdown_intent_for_signal(
+    signal: tokio::signal::unix::SignalKind,
+) -> ListenerShutdownIntent {
+    use tokio::signal::unix::SignalKind;
+
+    if signal == SignalKind::interrupt() {
+        ListenerShutdownIntent::Terminal
+    } else {
+        ListenerShutdownIntent::Restart
+    }
 }
 
 #[cfg(unix)]
 struct ListenerShutdownSignals {
     interrupt: tokio::signal::unix::Signal,
     terminate: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
 }
 
 #[cfg(unix)]
@@ -310,13 +516,15 @@ impl ListenerShutdownSignals {
         Ok(Self {
             interrupt: signal(SignalKind::interrupt()).context("installing SIGINT handler")?,
             terminate: signal(SignalKind::terminate()).context("installing SIGTERM handler")?,
+            hangup: signal(SignalKind::hangup()).context("installing SIGHUP handler")?,
         })
     }
 
-    async fn wait(&mut self) {
+    async fn wait(&mut self) -> ListenerShutdownIntent {
         tokio::select! {
-            _ = self.interrupt.recv() => {}
-            _ = self.terminate.recv() => {}
+            _ = self.interrupt.recv() => listener_shutdown_intent_for_signal(tokio::signal::unix::SignalKind::interrupt()),
+            _ = self.terminate.recv() => listener_shutdown_intent_for_signal(tokio::signal::unix::SignalKind::terminate()),
+            _ = self.hangup.recv() => listener_shutdown_intent_for_signal(tokio::signal::unix::SignalKind::hangup()),
         }
     }
 }
@@ -330,17 +538,31 @@ impl ListenerShutdownSignals {
         Ok(Self)
     }
 
-    async fn wait(&mut self) {
+    async fn wait(&mut self) -> ListenerShutdownIntent {
         let _ = tokio::signal::ctrl_c().await;
+        ListenerShutdownIntent::Terminal
     }
+}
+
+fn pairing_qr(url: &str) -> String {
+    qrcode::QrCode::new(url.as_bytes())
+        .map(|code| {
+            code.render::<qrcode::render::unicode::Dense1x2>()
+                .quiet_zone(true)
+                .build()
+        })
+        .map(|rendered| format!("\n{rendered}"))
+        .unwrap_or_default()
 }
 
 /// Start the opt-in `--listen` control plane.
 ///
 /// The listener shares the Web-only mode's live [`Application`] and remains
-/// active until a process signal, then stops before `application.cleanup`.
+/// active until a process signal, then stops. Host shutdown then shuts the
+/// shared Todo child service before `application.cleanup`.
 /// [`RunSessionSpawner`] builds manager-owned session runtimes for the Web
-/// control plane. Bind, auth, and read failures are startup errors.
+/// control plane from the same host service Arc. Bind, auth, and read
+/// failures are startup errors.
 async fn start_listen(
     cli: &Cli,
     application: &pi_coding::Application,
@@ -356,6 +578,7 @@ async fn start_listen(
         token_file: cli.listen_token_file.clone(),
         allow_insecure_remote: cli.listen_allow_insecure_remote,
         advertised_origin: cli.listen_advertised_origin.clone(),
+        runner_codename_override: cli.listen_codename.clone(),
         plaintext: cli.listen_plaintext,
         tls_cert: cli.listen_cert.clone(),
         tls_key: cli.listen_key.clone(),
@@ -371,7 +594,22 @@ async fn start_listen(
     // display path is human-facing only.
     let port = addr.port();
     let web_line = match handle.display_web_url() {
-        Some(base) => format!(" Web UI: {base}/web"),
+        Some(base) => {
+            let token = cli.listen_token_file.as_deref()
+                .map(std::fs::read_to_string)
+                .transpose()
+                .ok()
+                .flatten()
+                .map(|t| t.trim().to_owned())
+                .unwrap_or_default();
+            if token.is_empty() {
+                format!(" Web UI: {base}/web")
+            } else {
+                let pair_url = format!("{base}/chat#{token}");
+                let qr_line = pairing_qr(&pair_url);
+                format!(" Web UI: {base}/web#{token}\n        (scan or open this URL — the token pairs automatically){qr_line}")
+            }
+        }
         None => format!(" Web UI: use this machine's LAN IP on port {port}"),
     };
     let auth = if cli.listen_token_file.is_some() {
@@ -379,10 +617,12 @@ async fn start_listen(
     } else {
         "tokenless"
     };
-    let scheme = if cli.listen_plaintext { "http" } else { "https" };
-    eprintln!(
-        "Control plane listening on {scheme}://{addr} ({auth}).{web_line}"
-    );
+    let scheme = if cli.listen_plaintext {
+        "http"
+    } else {
+        "https"
+    };
+    eprintln!("Control plane listening on {scheme}://{addr} ({auth}).{web_line}");
     Ok(Some(handle))
 }
 
@@ -473,6 +713,70 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn listener_signal_intents_match_restart_contract() {
+        use tokio::signal::unix::SignalKind;
+
+        assert_eq!(
+            listener_shutdown_intent_for_signal(SignalKind::interrupt()),
+            ListenerShutdownIntent::Terminal,
+        );
+        assert_eq!(
+            listener_shutdown_intent_for_signal(SignalKind::terminate()),
+            ListenerShutdownIntent::Restart,
+        );
+        assert_eq!(
+            listener_shutdown_intent_for_signal(SignalKind::hangup()),
+            ListenerShutdownIntent::Restart,
+        );
+    }
+
+    #[test]
+    fn tui_shutdown_combines_context_from_every_failure() {
+        let error = combine_tui_shutdown(
+            Err(anyhow!("run root").context("run context")),
+            Err(anyhow!("todo root").context("todo context")),
+            Err(anyhow!("cleanup root").context("cleanup context")),
+        )
+        .expect_err("combined shutdown must retain every failure");
+        let message = error.to_string();
+        assert!(message.contains("run context: run root"), "{message}");
+        assert!(message.contains("todo context: todo root"), "{message}");
+        assert!(
+            message.contains("cleanup context: cleanup root"),
+            "{message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_child_dispatch_sentinel_is_exact() {
+        use std::ffi::OsString;
+        // Only the exact 3-argument sentinel dispatches; any deviation
+        // falls through to normal CLI parsing.
+        assert!(is_sandbox_child_dispatch(&[
+            OsString::from("__sandbox-child"),
+            OsString::from("3"),
+            OsString::from("4"),
+        ]));
+        assert!(!is_sandbox_child_dispatch(&[]));
+        assert!(!is_sandbox_child_dispatch(&[OsString::from(
+            "__sandbox-child"
+        ),]));
+        assert!(!is_sandbox_child_dispatch(&[
+            OsString::from("__sandbox-child"),
+            OsString::from("3"),
+        ]));
+        assert!(!is_sandbox_child_dispatch(&[
+            OsString::from("__sandbox-child"),
+            OsString::from("3"),
+            OsString::from("4"),
+            OsString::from("extra"),
+        ]));
+        assert!(!is_sandbox_child_dispatch(&[OsString::from("--help"),]));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn harden_process_runs_without_panic() {
         // Best-effort hardening is invoked at startup on every unix platform
         // and must never panic or otherwise break the entry point, even when
@@ -511,5 +815,39 @@ mod tests {
             "exported page must be self-contained html"
         );
         assert!(html.len() > 1024, "exported html unexpectedly small");
+    }
+
+    #[test]
+    fn pairing_qr_renders_unicode_blocks_for_dummy_url() {
+        let url = "https://192.0.2.10:8765/chat#example-token";
+        let qr = pairing_qr(url);
+        assert!(!qr.is_empty(), "{url}");
+        assert!(
+            qr.contains('\u{2580}') || qr.contains('\u{2584}') || qr.contains('\u{2588}'),
+            "{url}"
+        );
+    }
+
+    #[test]
+    fn pairing_qr_empty_or_overlong_does_not_panic() {
+        let empty = pairing_qr("");
+        let _ = empty.len();
+        let overlong = pairing_qr(&"x".repeat(8_192));
+        let _ = overlong.len();
+    }
+
+    #[test]
+    fn listen_banner_keeps_scan_hint_next_to_pairing_qr() {
+        let src = include_str!("lib.rs");
+        let qr_at = src
+            .find("pairing_qr(&pair_url)")
+            .expect("listen banner must call pairing_qr");
+        let hint_at = src
+            .find("(scan or open this URL")
+            .expect("listen banner must keep scan hint");
+        assert!(
+            qr_at.abs_diff(hint_at) < 200,
+            "scan hint must sit next to pairing_qr call"
+        );
     }
 }

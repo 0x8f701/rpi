@@ -18,18 +18,20 @@
 //! server that fails to initialize reports why instead of failing silently.
 
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::str::FromStr;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
+use lsp_types::Uri;
 use lsp_types::notification::Notification;
 use lsp_types::request::Request;
-use lsp_types::Uri;
 use parking_lot::Mutex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+
+use crate::process::{GovernedChild, ProcessSignal};
+#[cfg(test)]
+use tokio::process::Command;
 use url::Url;
 
 /// Default timeout for a single JSON-RPC request (matches OMP's
@@ -74,12 +76,12 @@ fn diagnostics_are_empty(params: &Value) -> bool {
         .map_or(true, Vec::is_empty)
 }
 
-/// Re-export of the shared `Content-Length` framing writer (see `framing`).
-pub(crate) use super::framing::encode_message;
 /// Cap on non-header junk lines scanned before the Content-Length header
 /// (mirrors OMP's framing resync: embedded tooling noise must not wedge the
 /// client).
 pub(crate) use super::framing::MAX_JUNK_HEADER_LINES;
+/// Re-export of the shared `Content-Length` framing writer (see `framing`).
+pub(crate) use super::framing::encode_message;
 
 /// Reads one `Content-Length` framed JSON-RPC message from `reader` with
 /// LSP-flavored error wording. The framing logic itself is shared with the
@@ -90,7 +92,8 @@ pub(crate) async fn read_message(reader: &mut (impl AsyncBufRead + Unpin)) -> Re
 
 /// Converts a local filesystem path to an LSP `file://` URI.
 pub(crate) fn path_to_uri(path: &str) -> Result<Uri> {
-    let url = Url::from_file_path(path).map_err(|_| anyhow!("invalid file path for URI: {path}"))?;
+    let url =
+        Url::from_file_path(path).map_err(|_| anyhow!("invalid file path for URI: {path}"))?;
     Uri::from_str(url.as_str()).map_err(|e| anyhow!("invalid file URI for {path}: {e}"))
 }
 
@@ -105,38 +108,38 @@ pub(crate) fn uri_to_path(uri: &str) -> Result<PathBuf> {
     if url.scheme() != "file" {
         return Err(anyhow!("not a file:// uri: {uri}"));
     }
-    url.to_file_path().map_err(|_| anyhow!("not a file:// uri: {uri}"))
+    url.to_file_path()
+        .map_err(|_| anyhow!("not a file:// uri: {uri}"))
 }
 
 /// A per-invocation LSP server session: spawned child + framed stdin/stdout.
 pub(crate) struct LspClient {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    _generation: Option<std::sync::Arc<crate::application::generation::ApplicationGeneration>>,
+    child: Option<GovernedChild>,
+    #[cfg(test)]
+    raw_child: Option<tokio::process::Child>,
+    stdin: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+    stdout: BufReader<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
     next_id: i64,
-    /// `textDocument/publishDiagnostics` notifications observed while waiting
-    /// for responses, in arrival order.
     pub(crate) diagnostics: Vec<Value>,
-    /// Server capabilities returned by `initialize`.
     pub(crate) capabilities: Value,
-    /// Bounded tail of the server's stderr, surfaced in error messages.
     stderr_tail: std::sync::Arc<Mutex<String>>,
 }
 
 impl LspClient {
-    /// Spawns an already-fully-configured command as an LSP server (used by
-    /// `tools/lsp.rs` with the resolved binary, and by tests to point at a
-    /// fake server process).
-    pub(crate) async fn spawn_command(mut command: Command) -> Result<Self> {
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(false);
-        let mut child = command.spawn().context("spawning LSP server process")?;
-        let stdin = child.stdin.take().context("LSP server stdin unavailable")?;
-        let stdout = child.stdout.take().context("LSP server stdout unavailable")?;
-        let stderr = child.stderr.take().context("LSP server stderr unavailable")?;
+    /// Adopts a governed split-pipe language-server child and preserves the
+    /// existing LSP framing and bounded stderr capture.
+    pub(crate) fn from_governed(
+        generation: std::sync::Arc<crate::application::generation::ApplicationGeneration>,
+        mut child: GovernedChild,
+    ) -> Result<Self> {
+        let stdin = child.take_stdin().context("LSP server stdin unavailable")?;
+        let stdout = child
+            .take_stdout()
+            .context("LSP server stdout unavailable")?;
+        let stderr = child
+            .take_stderr()
+            .context("LSP server stderr unavailable")?;
         let stderr_tail = std::sync::Arc::new(Mutex::new(String::new()));
         {
             let tail = stderr_tail.clone();
@@ -159,9 +162,63 @@ impl LspClient {
             });
         }
         Ok(Self {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
+            _generation: Some(generation),
+            child: Some(child),
+            #[cfg(test)]
+            raw_child: None,
+            stdin: Box::new(stdin),
+            stdout: BufReader::new(Box::new(stdout)),
+            next_id: 0,
+            diagnostics: Vec::new(),
+            capabilities: Value::Null,
+            stderr_tail,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn spawn_command(mut command: tokio::process::Command) -> Result<Self> {
+        use std::process::Stdio;
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .context("spawning test LSP server process")?;
+        let stdin = child.stdin.take().context("LSP server stdin unavailable")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("LSP server stdout unavailable")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("LSP server stderr unavailable")?;
+        let stderr_tail = std::sync::Arc::new(Mutex::new(String::new()));
+        let tail = stderr_tail.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let mut reader = BufReader::new(stderr);
+            loop {
+                match reader.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let mut guard = tail.lock();
+                        guard.push_str(&String::from_utf8_lossy(&buf[..n]));
+                        if guard.len() > STDERR_CAP {
+                            let overflow = guard.len() - STDERR_CAP;
+                            guard.drain(..overflow);
+                        }
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            _generation: None,
+            child: None,
+            raw_child: Some(child),
+            stdin: Box::new(stdin),
+            stdout: BufReader::new(Box::new(stdout)),
             next_id: 0,
             diagnostics: Vec::new(),
             capabilities: Value::Null,
@@ -225,8 +282,10 @@ impl LspClient {
                 Ok(result) => return Ok(result),
                 Err(error) if attempt < CONTENT_MODIFIED_RETRIES && is_content_modified(&error) => {
                     attempt += 1;
-                    tokio::time::sleep(Duration::from_millis(200 * u64::try_from(attempt).unwrap_or(1)))
-                        .await;
+                    tokio::time::sleep(Duration::from_millis(
+                        200 * u64::try_from(attempt).unwrap_or(1),
+                    ))
+                    .await;
                 }
                 Err(error) => return Err(error),
             }
@@ -242,9 +301,8 @@ impl LspClient {
                 if message.get("method").and_then(Value::as_str)
                     == Some("textDocument/publishDiagnostics")
                 {
-                    self.diagnostics.push(
-                        message.get("params").cloned().unwrap_or(Value::Null),
-                    );
+                    self.diagnostics
+                        .push(message.get("params").cloned().unwrap_or(Value::Null));
                 }
                 continue;
             }
@@ -283,7 +341,11 @@ impl LspClient {
             "workspaceFolders": [{ "uri": root_uri, "name": "rpi-workspace" }]
         });
         let result = self
-            .request_timeout(lsp_types::request::Initialize::METHOD, params, REQUEST_TIMEOUT)
+            .request_timeout(
+                lsp_types::request::Initialize::METHOD,
+                params,
+                REQUEST_TIMEOUT,
+            )
             .await?;
         self.capabilities = result.clone();
         self.notify(lsp_types::notification::Initialized::METHOD, json!({}))
@@ -308,15 +370,14 @@ impl LspClient {
                     DIAGNOSTICS_TIMEOUT.as_secs()
                 );
             }
-            let message = match tokio::time::timeout(remaining, read_message(&mut self.stdout))
-                .await
-            {
-                Ok(result) => result?,
-                Err(_) => bail!(
-                    "timed out after {}s waiting for diagnostics for {uri}",
-                    DIAGNOSTICS_TIMEOUT.as_secs()
-                ),
-            };
+            let message =
+                match tokio::time::timeout(remaining, read_message(&mut self.stdout)).await {
+                    Ok(result) => result?,
+                    Err(_) => bail!(
+                        "timed out after {}s waiting for diagnostics for {uri}",
+                        DIAGNOSTICS_TIMEOUT.as_secs()
+                    ),
+                };
             if message.get("id").is_some() {
                 continue; // stray response — not expected while waiting
             }
@@ -382,25 +443,38 @@ impl LspClient {
     }
 
     /// Best-effort LSP shutdown handshake, then reaps (and if necessary
-    /// kills) the child. Never fails the caller: a wedged server must not
-    /// hang the tool.
+    /// kills) the child. Never fails the caller: a wedged server must not hang
+    /// the tool.
     pub(crate) async fn shutdown(&mut self) {
         let _ = tokio::time::timeout(
             SHUTDOWN_TIMEOUT,
             self.request(lsp_types::request::Shutdown::METHOD, json!(null)),
         )
         .await;
-        let _ = self.notify(lsp_types::notification::Exit::METHOD, json!(null)).await;
-        match tokio::time::timeout(EXIT_TIMEOUT, self.child.wait()).await {
-            Ok(Ok(_)) => {}
-            _ => {
-                let _ = self.child.kill().await;
-                let _ = self.child.wait().await;
+        let _ = self
+            .notify(lsp_types::notification::Exit::METHOD, json!(null))
+            .await;
+        if let Some(mut child) = self.child.take() {
+            match tokio::time::timeout(EXIT_TIMEOUT, child.wait()).await {
+                Ok(Ok(_)) => {}
+                _ => {
+                    let _ = child.signal(ProcessSignal::Sigkill);
+                    let _ = child.wait().await;
+                }
+            }
+        }
+        #[cfg(test)]
+        if let Some(raw_child) = self.raw_child.as_mut() {
+            match tokio::time::timeout(EXIT_TIMEOUT, raw_child.wait()).await {
+                Ok(Ok(_)) => {}
+                _ => {
+                    let _ = raw_child.kill().await;
+                    let _ = raw_child.wait().await;
+                }
             }
         }
     }
 
-    /// Bounded tail of the server's stderr (for diagnostics in error paths).
     pub(crate) fn stderr_tail(&self) -> String {
         self.stderr_tail.lock().clone()
     }
@@ -408,9 +482,16 @@ impl LspClient {
 
 impl Drop for LspClient {
     fn drop(&mut self) {
-        // Never leak a server process, even on panic/abort paths.
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.start_kill();
+        if let Some(child) = self.child.as_ref()
+            && child.exit_status().is_none()
+        {
+            let _ = child.signal(ProcessSignal::Sigkill);
+        }
+        #[cfg(test)]
+        if let Some(child) = self.raw_child.as_mut()
+            && child.try_wait().ok().flatten().is_none()
+        {
+            let _ = child.start_kill();
         }
     }
 }
@@ -462,7 +543,11 @@ mod tests {
         // The body is multibyte, so the byte length must exceed the character
         // count — proving Content-Length counts bytes, not characters.
         let text_chars = body["text"].as_str().unwrap().chars().count();
-        assert!(serialized.len() > text_chars, "bytes {} vs chars {text_chars}", serialized.len());
+        assert!(
+            serialized.len() > text_chars,
+            "bytes {} vs chars {text_chars}",
+            serialized.len()
+        );
         assert_eq!(&bytes[header.len()..], &serialized[..]);
     }
 
@@ -560,8 +645,13 @@ mod tests {
         // redaction in the LSP initialize-failure error path.
         let boom = std::env::var_os("PI_FAKE_LSP_BOOM").is_some();
         if boom {
-            let github_token =
-                ["gh", "p_", "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghij0123456789"].concat();
+            let github_token = [
+                "gh",
+                "p_",
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+                "abcdefghij0123456789",
+            ]
+            .concat();
             let api_token = ["s", "k-", "abcdefghijklmnop", "1234"].concat();
             eprintln!("fake lsp server: token={github_token} {api_token}");
             // Let the client's stderr reader drain the line before the
@@ -807,9 +897,10 @@ mod tests {
             }
             if let Some((name, value)) = header.trim_end().split_once(':') {
                 if name.trim().eq_ignore_ascii_case("Content-Length") {
-                    content_length = Some(value.trim().parse().map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-                    })?);
+                    content_length =
+                        Some(value.trim().parse().map_err(|e| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                        })?);
                 }
             }
         }
@@ -838,7 +929,9 @@ mod tests {
         for (key, value) in extra {
             command.env(key, value);
         }
-        LspClient::spawn_command(command).await.expect("fake server spawn")
+        LspClient::spawn_command(command)
+            .await
+            .expect("fake server spawn")
     }
 
     /// Spawns the fake server in its default (non-progressive) mode.
@@ -858,7 +951,8 @@ mod tests {
                 .expect("initialize handshake");
 
             assert_eq!(
-                caps.pointer("/capabilities/hoverProvider").and_then(Value::as_bool),
+                caps.pointer("/capabilities/hoverProvider")
+                    .and_then(Value::as_bool),
                 Some(true)
             );
 
@@ -881,7 +975,10 @@ mod tests {
                 .wait_for_diagnostics("file:///tmp/fake.rs")
                 .await
                 .expect("pushed diagnostics");
-            assert_eq!(diagnostics["diagnostics"][0]["message"], "fake diagnostic message");
+            assert_eq!(
+                diagnostics["diagnostics"][0]["message"],
+                "fake diagnostic message"
+            );
 
             // hover parses the markdown result.
             let hover = client
@@ -895,7 +992,10 @@ mod tests {
                 )
                 .await
                 .expect("hover request");
-            assert_eq!(hover["contents"]["value"], "**Fake hover**\n\nproduced by fake server");
+            assert_eq!(
+                hover["contents"]["value"],
+                "**Fake hover**\n\nproduced by fake server"
+            );
 
             // definition returns locations.
             let definitions = client
@@ -921,7 +1021,10 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         rt.block_on(async {
             let mut client = spawn_fake_server_with(&[("PI_FAKE_LSP_PROGRESSIVE", "1")]).await;
-            client.initialize("/tmp").await.expect("initialize handshake");
+            client
+                .initialize("/tmp")
+                .await
+                .expect("initialize handshake");
 
             client
                 .notify(
@@ -950,7 +1053,9 @@ mod tests {
                 "progressive real diagnostic"
             );
             assert!(
-                params["diagnostics"].as_array().is_some_and(|list| !list.is_empty()),
+                params["diagnostics"]
+                    .as_array()
+                    .is_some_and(|list| !list.is_empty()),
                 "readiness must not report the initial empty push"
             );
 

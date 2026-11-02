@@ -28,8 +28,8 @@ fn run(agent_dir: &Path, cwd: &Path, args: &[&str]) -> (bool, String, String) {
         .env("PI_CODING_AGENT_DIR", agent_dir)
         .env("HOME", agent_dir)
         .env("USERPROFILE", agent_dir)
-        .env("PI_SKIP_VERSION_CHECK", "1")
-        .env_remove("PI_OFFLINE")
+        .env("RPI_SKIP_VERSION_CHECK", "1")
+        .env_remove("RPI_OFFLINE")
         .env_remove("PI_PROFILE")
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("OPENAI_API_KEY")
@@ -82,15 +82,24 @@ fn plugin_install_list_remove_round_trip() {
     fs::create_dir_all(&cwd).unwrap();
     write_quickjs_plugin(&source, "demo", "1.0.0");
 
-    let (installed, out, install_err) =
-        run(&agent_dir, &cwd, &["plugin", "install", source.to_str().unwrap()]);
+    let (installed, out, install_err) = run(
+        &agent_dir,
+        &cwd,
+        &["plugin", "install", source.to_str().unwrap()],
+    );
     assert!(installed, "install must exit 0: {install_err}");
     assert!(
         out.contains("installed demo 1.0.0 (quickjs runtime)"),
         "install report: {out}"
     );
-    assert!(out.contains("trusted and loadable"), "install report: {out}");
-    let manifest = agent_dir.join("extensions").join("demo").join("pi-extension.json");
+    assert!(
+        out.contains("trusted and loadable"),
+        "install report: {out}"
+    );
+    let manifest = agent_dir
+        .join("extensions")
+        .join("demo")
+        .join("pi-extension.json");
     assert!(manifest.is_file(), "plugin must land under extensions/demo");
 
     let (listed, list_out, list_err) = run(&agent_dir, &cwd, &["plugin", "list"]);
@@ -102,7 +111,10 @@ fn plugin_install_list_remove_round_trip() {
 
     let (removed, remove_out, remove_err) = run(&agent_dir, &cwd, &["plugin", "remove", "demo"]);
     assert!(removed, "remove must exit 0: {remove_err}");
-    assert!(remove_out.contains("removed plugin demo"), "remove report: {remove_out}");
+    assert!(
+        remove_out.contains("removed plugin demo"),
+        "remove report: {remove_out}"
+    );
     assert!(
         !agent_dir.join("extensions").join("demo").exists(),
         "remove must delete the installed plugin directory"
@@ -110,7 +122,10 @@ fn plugin_install_list_remove_round_trip() {
 
     let (listed_after, after_out, after_err) = run(&agent_dir, &cwd, &["plugin", "list"]);
     assert!(listed_after, "list after remove must exit 0: {after_err}");
-    assert!(after_out.contains("No plugins installed."), "after remove: {after_out}");
+    assert!(
+        after_out.contains("No plugins installed."),
+        "after remove: {after_out}"
+    );
 }
 
 /// Contract: installing a package whose manifest fails validation (here:
@@ -138,7 +153,11 @@ fn plugin_install_rejects_invalid_manifest() {
     )
     .expect("write manifest");
 
-    let (ok, _out, err) = run(&agent_dir, &cwd, &["plugin", "install", source.to_str().unwrap()]);
+    let (ok, _out, err) = run(
+        &agent_dir,
+        &cwd,
+        &["plugin", "install", source.to_str().unwrap()],
+    );
     assert!(!ok, "invalid manifest install must fail");
     assert!(
         err.contains("installing plugin from") && err.contains("invalid plugin manifest"),
@@ -166,8 +185,11 @@ fn plugin_update_uses_local_index_and_keeps_trust() {
     write_quickjs_plugin(&v1, "demo", "1.0.0");
     write_quickjs_plugin(&v2, "demo", "2.0.0");
 
-    let (installed, _, install_err) =
-        run(&agent_dir, &cwd, &["plugin", "install", v1.to_str().unwrap()]);
+    let (installed, _, install_err) = run(
+        &agent_dir,
+        &cwd,
+        &["plugin", "install", v1.to_str().unwrap()],
+    );
     assert!(installed, "install v1: {install_err}");
 
     let index_path = sandbox.path().join("marketplace-index.json");
@@ -191,8 +213,7 @@ fn plugin_update_uses_local_index_and_keeps_trust() {
     )
     .expect("write settings");
 
-    let (previewed, preview, preview_err) =
-        run(&agent_dir, &cwd, &["plugin", "list", "--updates"]);
+    let (previewed, preview, preview_err) = run(&agent_dir, &cwd, &["plugin", "list", "--updates"]);
     assert!(previewed, "list --updates must exit 0: {preview_err}");
     assert!(
         preview.contains("demo  1.0.0 -> 2.0.0"),
@@ -201,7 +222,10 @@ fn plugin_update_uses_local_index_and_keeps_trust() {
 
     let (updated, update_out, update_err) = run(&agent_dir, &cwd, &["plugin", "update", "demo"]);
     assert!(updated, "update must exit 0: {update_err}");
-    assert!(update_out.contains("updated demo to 2.0.0"), "update report: {update_out}");
+    assert!(
+        update_out.contains("updated demo to 2.0.0"),
+        "update report: {update_out}"
+    );
 
     let (listed, list_out, list_err) = run(&agent_dir, &cwd, &["plugin", "list"]);
     assert!(listed, "list after update must exit 0: {list_err}");
@@ -270,24 +294,36 @@ fn plugin_install_from_local_tarball_extracts_and_lists() {
         &archive,
         &[
             ("tar-demo-3.1.4/pi-extension.json", manifest.as_slice()),
-            ("tar-demo-3.1.4/index.mjs", b"export default function (pi) {}\n".as_slice()),
+            (
+                "tar-demo-3.1.4/index.mjs",
+                b"export default function (pi) {}\n".as_slice(),
+            ),
         ],
     );
 
-    let (installed, out, err) =
-        run(&agent_dir, &cwd, &["plugin", "install", archive.to_str().unwrap()]);
+    let (installed, out, err) = run(
+        &agent_dir,
+        &cwd,
+        &["plugin", "install", archive.to_str().unwrap()],
+    );
     assert!(installed, "install must exit 0: {err}");
     assert!(
         out.contains("installed tar-demo 3.1.4 (quickjs runtime)"),
         "install report: {out}"
     );
-    assert!(out.contains("trusted and loadable"), "install report: {out}");
+    assert!(
+        out.contains("trusted and loadable"),
+        "install report: {out}"
+    );
     let root = agent_dir.join("extensions").join("tar-demo");
     assert!(
         root.join("pi-extension.json").is_file(),
         "manifest must land at the extension root (top dir stripped)"
     );
-    assert!(root.join("index.mjs").is_file(), "entry must land at the extension root");
+    assert!(
+        root.join("index.mjs").is_file(),
+        "entry must land at the extension root"
+    );
     assert!(
         !root.join("tar-demo-3.1.4").exists(),
         "shared top directory must be stripped"
@@ -315,17 +351,28 @@ fn plugin_install_from_tarball_without_manifest_fails_cleanly() {
     let archive = sandbox.path().join("no-manifest.tgz");
     write_tarball(
         &archive,
-        &[("no-manifest/README.md", b"no extension manifest here\n".as_slice())],
+        &[(
+            "no-manifest/README.md",
+            b"no extension manifest here\n".as_slice(),
+        )],
     );
 
-    let (ok, _out, err) = run(&agent_dir, &cwd, &["plugin", "install", archive.to_str().unwrap()]);
+    let (ok, _out, err) = run(
+        &agent_dir,
+        &cwd,
+        &["plugin", "install", archive.to_str().unwrap()],
+    );
     assert!(!ok, "missing-manifest tarball must fail install");
     assert!(
         err.contains("pi-extension.json"),
         "error must name the missing manifest: {err}"
     );
     assert!(
-        !agent_dir.join("extensions").exists() || fs::read_dir(agent_dir.join("extensions")).unwrap().next().is_none(),
+        !agent_dir.join("extensions").exists()
+            || fs::read_dir(agent_dir.join("extensions"))
+                .unwrap()
+                .next()
+                .is_none(),
         "failed install must not leave a plugin directory"
     );
 }

@@ -7,9 +7,17 @@
 //! `--no-require-git`) and grep's `requireGit=true` (rg) semantics match pi
 //! exactly, including nested-repo boundaries and `.git` always being skipped.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
+use anyhow::Result;
+
+use crate::application::generation::ApplicationGeneration;
+use crate::process::{
+    GovernedProcessContext, GovernedProcessSpec, TrustedToolProbe, run_trusted_tool_probe,
+};
 /// Expands `{a,b}` alternations (globset semantics). Nested braces are expanded
 /// recursively. Patterns without braces are returned as-is.
 pub(crate) fn expand_braces(pattern: &str) -> Vec<String> {
@@ -274,7 +282,10 @@ pub(crate) fn match_fd_glob(pattern: &str, rel: &str, abs: &str) -> bool {
     if !pattern.contains('/') {
         return glob_match_path(
             &pattern,
-            Path::new(rel).file_name().and_then(|s| s.to_str()).unwrap_or(""),
+            Path::new(rel)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(""),
             fold,
         );
     }
@@ -296,7 +307,10 @@ pub(crate) fn match_rg_glob(pattern: &str, rel: &str) -> bool {
     if !pattern.contains('/') {
         return glob_match_path(
             &pattern,
-            Path::new(&rel).file_name().and_then(|s| s.to_str()).unwrap_or(""),
+            Path::new(&rel)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(""),
             false,
         );
     }
@@ -344,6 +358,7 @@ struct IgnoreSource {
 ///   apply, as do `.gitignore` files between the repo root and the search root.
 pub(crate) struct IgnoreStack {
     root: String,
+    fs: Option<Arc<crate::fs::PolicyFs>>,
     use_gitignore: bool,
     repo_root: String,
     /// When set, outer-repo ignore rules stop at nested repository boundaries.
@@ -354,8 +369,14 @@ pub(crate) struct IgnoreStack {
 }
 
 impl IgnoreStack {
-    pub(crate) fn new(root: &str, require_git: bool, respect_nested_repos: bool) -> IgnoreStack {
+    pub(crate) async fn new(
+        generation: Arc<ApplicationGeneration>,
+        root: &str,
+        require_git: bool,
+        respect_nested_repos: bool,
+    ) -> Result<IgnoreStack> {
         let mut s = IgnoreStack {
+            fs: Some(generation.sandbox().fs().confined()?.clone()),
             root: root.to_string(),
             use_gitignore: false,
             repo_root: String::new(),
@@ -364,16 +385,16 @@ impl IgnoreStack {
             loaded: HashMap::new(),
             git_dir: HashMap::new(),
         };
-        s.repo_root = find_repo_root(root);
+        s.repo_root = s.find_repo_root(root);
         s.use_gitignore = !require_git || !s.repo_root.is_empty();
         // Nested-repo boundaries only apply in git-aware mode (search root inside
         // a repo). Under `--no-require-git` outside a repo, fd ignores boundaries.
         s.boundaries = respect_nested_repos && !s.repo_root.is_empty();
         if !s.repo_root.is_empty() && s.use_gitignore {
             // Lowest precedence first; later sources win on conflicts.
-            let g = global_excludes_path();
+            let g = global_excludes_path(generation, &s.repo_root).await;
             if !g.is_empty() {
-                if let Ok(data) = std::fs::read(&g) {
+                if let Some(data) = s.read_optional(Path::new(&g)) {
                     s.static_sources.push(IgnoreSource {
                         base_abs: s.repo_root.clone(),
                         pats: parse_gitignore(&data),
@@ -382,7 +403,7 @@ impl IgnoreStack {
                 }
             }
             let info_exclude = format!("{}/.git/info/exclude", s.repo_root);
-            if let Ok(data) = std::fs::read(&info_exclude) {
+            if let Some(data) = s.read_optional(Path::new(&info_exclude)) {
                 s.static_sources.push(IgnoreSource {
                     base_abs: s.repo_root.clone(),
                     pats: parse_gitignore(&data),
@@ -401,7 +422,7 @@ impl IgnoreStack {
                     dir = parent_dir(&dir);
                 }
                 for i in (0..ancs.len()).rev() {
-                    if let Ok(data) = std::fs::read(format!("{}/.gitignore", ancs[i])) {
+                    if let Some(data) = s.read_optional(&Path::new(&ancs[i]).join(".gitignore")) {
                         s.static_sources.push(IgnoreSource {
                             base_abs: ancs[i].clone(),
                             pats: parse_gitignore(&data),
@@ -411,13 +432,25 @@ impl IgnoreStack {
                 }
             }
         }
-        s
+        Ok(s)
+    }
+
+    pub(crate) fn without_generation(
+        root: &str,
+        require_git: bool,
+        respect_nested_repos: bool,
+    ) -> IgnoreStack {
+        let mut stack = IgnoreStack::without_gitignore(root);
+        stack.use_gitignore = !require_git;
+        stack.boundaries = respect_nested_repos && !stack.repo_root.is_empty();
+        stack
     }
 
     /// Builds a stack that never applies gitignore rules (still skips `.git`
     /// via [`Self::ignored`]).
     pub(crate) fn without_gitignore(root: &str) -> IgnoreStack {
         IgnoreStack {
+            fs: None,
             root: root.to_string(),
             use_gitignore: false,
             repo_root: String::new(),
@@ -439,7 +472,7 @@ impl IgnoreStack {
         } else {
             format!("{}/{}", self.root, rel_dir.replace('\\', "/"))
         };
-        let v = std::fs::metadata(format!("{abs}/.git")).is_ok();
+        let v = self.metadata_exists(Path::new(&abs).join(".git").as_path());
         self.git_dir.insert(rel_dir.to_string(), v);
         v
     }
@@ -475,12 +508,34 @@ impl IgnoreStack {
         } else {
             format!("{}/{}", self.root, rel_dir.replace('\\', "/"))
         };
-        let entry = self.loaded.entry(rel_dir.to_string()).or_insert_with(|| {
-            std::fs::read(format!("{abs}/.gitignore"))
-                .map(|d| parse_gitignore(&d))
-                .unwrap_or_default()
-        });
+        let patterns = self
+            .read_optional(&Path::new(&abs).join(".gitignore"))
+            .map(|data| parse_gitignore(&data))
+            .unwrap_or_default();
+        let entry = self.loaded.entry(rel_dir.to_string()).or_insert(patterns);
         entry
+    }
+
+    fn metadata_exists(&self, path: &Path) -> bool {
+        self.fs.as_ref().is_some_and(|fs| fs.metadata(path).is_ok())
+    }
+
+    fn read_optional(&self, path: &Path) -> Option<Vec<u8>> {
+        self.fs.as_ref()?.read_bounded(path, 8 * 1024 * 1024).ok()
+    }
+
+    fn find_repo_root(&self, dir: &str) -> String {
+        let mut dir = dir.to_string();
+        loop {
+            if self.metadata_exists(Path::new(&dir).join(".git").as_path()) {
+                return dir;
+            }
+            let parent = parent_dir(&dir);
+            if parent == dir {
+                return String::new();
+            }
+            dir = parent;
+        }
     }
 
     /// Reports whether the path is ignored.
@@ -520,7 +575,9 @@ impl IgnoreStack {
             let rel_to_dir = if dir.is_empty() {
                 rel.clone()
             } else {
-                rel.strip_prefix(&format!("{dir}/")).unwrap_or(&rel).to_string()
+                rel.strip_prefix(&format!("{dir}/"))
+                    .unwrap_or(&rel)
+                    .to_string()
             };
             let pats = self.patterns_for(&dir).clone();
             for p in &pats {
@@ -541,44 +598,57 @@ fn parent_dir(dir: &str) -> String {
     }
 }
 
-/// Walks up from `dir` looking for a `.git` entry (dir or file).
-pub(crate) fn find_repo_root(dir: &str) -> String {
-    let mut dir = dir.to_string();
-    loop {
-        if std::fs::metadata(format!("{dir}/.git")).is_ok() {
-            return dir;
-        }
-        let parent = parent_dir(&dir);
-        if parent == dir {
-            return String::new();
-        }
-        dir = parent;
-    }
-}
-
-/// Resolves git's global excludes file: `core.excludesFile` if configured, else
-/// `$XDG_CONFIG_HOME/git/ignore`, else `~/.config/git/ignore`.
-fn global_excludes_path() -> String {
-    if let Ok(out) = std::process::Command::new("git")
-        .args(["config", "--path", "--get", "core.excludesFile"])
-        .output()
-    {
-        if let Ok(s) = String::from_utf8(out.stdout) {
-            let p = s.trim().to_string();
-            if !p.is_empty() {
-                return p;
+/// Resolves git's global excludes file through the governed RepositoryHelper,
+/// falling back to the conventional XDG/home locations.
+async fn global_excludes_path(generation: Arc<ApplicationGeneration>, repo_root: &str) -> String {
+    if let Ok(git) = run_trusted_tool_probe(&generation, TrustedToolProbe::Git) {
+        let output = GovernedProcessContext::new(generation, None)
+            .run(
+                pi_sandbox::SpawnFamily::RepositoryHelper,
+                GovernedProcessSpec {
+                    program: git.as_path().to_path_buf(),
+                    args: ["config", "--path", "--get", "core.excludesFile"]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                    cwd: Path::new(repo_root).to_path_buf(),
+                    environment: BTreeMap::new(),
+                    timeout: Duration::from_secs(5),
+                    stdout_bytes: 16 * 1024,
+                    stderr_bytes: 16 * 1024,
+                    #[cfg(unix)]
+                    mount_sources: Vec::new(),
+                    #[cfg(unix)]
+                    retained_executable: None,
+                    #[cfg(unix)]
+                    retained_working_directory: None,
+                },
+            )
+            .await;
+        if let Ok(output) = output
+            && output.status == Some(0)
+            && !output.timed_out
+            && !output.cancelled
+        {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if !path.is_empty() {
+                return path;
             }
         }
     }
-    if let Ok(x) = std::env::var("XDG_CONFIG_HOME") {
-        if !x.is_empty() {
-            return format!("{x}/git/ignore");
-        }
+    fallback_global_excludes_path()
+}
+
+fn fallback_global_excludes_path() -> String {
+    if let Ok(x) = std::env::var("XDG_CONFIG_HOME")
+        && !x.is_empty()
+    {
+        return format!("{x}/git/ignore");
     }
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() {
-            return format!("{home}/.config/git/ignore");
-        }
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        return format!("{home}/.config/git/ignore");
     }
     String::new()
 }
@@ -694,6 +764,99 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
+    struct GenerationFixture {
+        _agent: tempfile::TempDir,
+        _sessions: tempfile::TempDir,
+        _resources: crate::ResourceManager,
+        _session: crate::Session,
+        _application: crate::Application,
+        _faux: pi_ai::providers::FauxProviderRegistration,
+        generation: Arc<ApplicationGeneration>,
+    }
+
+    async fn generation_fixture(cwd: &Path) -> GenerationFixture {
+        let agent = tempfile::tempdir().expect("agent dir");
+        let sessions = tempfile::tempdir().expect("session dir");
+        // Explicit danger-full-access so the sandbox stages under the local
+        // Bubblewrap (0.9.0) without trusted-launcher probe validation.
+        fs::write(
+            agent.path().join("settings.json"),
+            r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+        )
+        .expect("sandbox settings");
+        let mut resource_options = crate::ResourceManagerOptions::new(cwd);
+        resource_options.agent_dir = agent.path().to_path_buf();
+        resource_options.project_trust_override = Some(true);
+        resource_options.disable_extensions = true;
+        resource_options.disable_skills = true;
+        resource_options.disable_prompt_templates = true;
+        resource_options.disable_themes = true;
+        resource_options.disable_context_files = true;
+        let resources = crate::ResourceManager::new(resource_options).expect("resources");
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let api = format!("glob-{suffix}");
+        let provider = format!("glob-{suffix}");
+        let model = pi_ai::Model {
+            id: format!("glob-{suffix}"),
+            api: api.clone(),
+            provider: provider.clone(),
+            ..pi_ai::Model::default()
+        };
+        let faux =
+            pi_ai::providers::register_faux_provider(pi_ai::providers::FauxProviderOptions {
+                api,
+                provider,
+                models: vec![model.clone()],
+                chunk_size: 1,
+            });
+        let workspace =
+            crate::WorkspaceRoots::new(cwd, Vec::<std::path::PathBuf>::new()).expect("workspace");
+        let session =
+            crate::Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
+                crate::SessionOptions {
+                    model,
+                    cwd: cwd.to_path_buf(),
+                    system_prompt: String::new(),
+                    thinking_level: pi_agent::ThinkingLevel::Off,
+                    api_key: String::new(),
+                    compaction: None,
+                    stream_options: Default::default(),
+                    tools: Some(Vec::new()),
+                    before_tool_call: None,
+                    after_tool_call: None,
+                    stream_fn: None,
+                    auth_resolver: None,
+                    auth_manager: None,
+                },
+                Vec::new(),
+                crate::ToolSelection::default(),
+                crate::ResourceDiscovery::Disabled,
+                workspace,
+                None,
+            )
+            .expect("session");
+        session.set_session_dir(sessions.path().to_path_buf());
+        session
+            .attach_resources(resources.clone())
+            .await
+            .expect("attach resources");
+        let application = crate::Application::from_runtime_candidate(
+            crate::ApplicationRuntimeCandidate::new(session.clone()),
+        )
+        .await
+        .expect("publish glob application");
+        let generation = application.capture_generation();
+        GenerationFixture {
+            _agent: agent,
+            _sessions: sessions,
+            _resources: resources,
+            _session: session,
+            _application: application,
+            _faux: faux,
+            generation,
+        }
+    }
+
     fn tmp() -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("pi-glob-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&d).unwrap();
@@ -701,10 +864,24 @@ mod tests {
     }
 
     #[test]
+    fn governed_repository_helper_family_is_exact() {
+        assert_eq!(
+            pi_sandbox::SpawnFamily::RepositoryHelper.as_str(),
+            "repository-helper"
+        );
+    }
+
+    #[test]
     fn expand_braces_simple() {
         assert_eq!(expand_braces("a"), vec!["a".to_string()]);
-        assert_eq!(expand_braces("{a,b}"), vec!["a".to_string(), "b".to_string()]);
-        assert_eq!(expand_braces("x{a,b}y"), vec!["xay".to_string(), "xby".to_string()]);
+        assert_eq!(
+            expand_braces("{a,b}"),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(
+            expand_braces("x{a,b}y"),
+            vec!["xay".to_string(), "xby".to_string()]
+        );
     }
 
     #[test]
@@ -736,7 +913,11 @@ mod tests {
 
     #[test]
     fn match_fd_glob_full_path_with_slash() {
-        assert!(match_fd_glob("**/*.spec.ts", "src/a.spec.ts", "/proj/src/a.spec.ts"));
+        assert!(match_fd_glob(
+            "**/*.spec.ts",
+            "src/a.spec.ts",
+            "/proj/src/a.spec.ts"
+        ));
         // smart-case: an all-lowercase pattern matches a differently-cased basename.
         assert!(match_fd_glob("readme", "README", "/proj/README"));
     }
@@ -758,11 +939,14 @@ mod tests {
         assert!(pats[3].dir_only && pats[3].pattern == "dist" && pats[3].anchored);
     }
 
-    #[test]
-    fn ignore_stack_skips_git_always() {
+    #[tokio::test]
+    async fn ignore_stack_skips_git_always() {
         let d = tmp();
         fs::write(d.join(".gitignore"), b("*.tmp\n")).unwrap();
-        let mut ig = IgnoreStack::new(&d.to_string_lossy(), false, true);
+        let fixture = generation_fixture(&d).await;
+        let mut ig = IgnoreStack::new(fixture.generation, &d.to_string_lossy(), false, true)
+            .await
+            .expect("generation-bound ignore stack");
         // .git itself always skipped regardless of gitignore.
         assert!(ig.ignored(&d.join(".git").to_string_lossy(), ".git", true));
         // ignored by *.tmp
@@ -771,27 +955,54 @@ mod tests {
         assert!(!ig.ignored(&d.join("a.rs").to_string_lossy(), "a.rs", false));
     }
 
-    #[test]
-    fn ignore_stack_grep_requires_git() {
+    #[tokio::test]
+    async fn ignore_stack_grep_requires_git() {
         let d = tmp();
         fs::write(d.join(".gitignore"), b("ignored.txt\n")).unwrap();
         // No .git → requireGit=true means gitignore does NOT apply.
-        let mut ig = IgnoreStack::new(&d.to_string_lossy(), true, false);
-        assert!(!ig.ignored(&d.join("ignored.txt").to_string_lossy(), "ignored.txt", false));
-        // Add a .git marker → now in a repo, gitignore applies.
-        fs::write(d.join(".git"), b("")).unwrap();
-        let mut ig2 = IgnoreStack::new(&d.to_string_lossy(), true, false);
-        assert!(ig2.ignored(&d.join("ignored.txt").to_string_lossy(), "ignored.txt", false));
+        let fixture = generation_fixture(&d).await;
+        let mut ig = IgnoreStack::new(
+            fixture.generation.clone(),
+            &d.to_string_lossy(),
+            true,
+            false,
+        )
+        .await
+        .expect("generation-bound ignore stack");
+        assert!(!ig.ignored(
+            &d.join("ignored.txt").to_string_lossy(),
+            "ignored.txt",
+            false
+        ));
+        // Add a valid repository marker → now in a repo, gitignore applies.
+        fs::create_dir(d.join(".git")).unwrap();
+        fs::write(d.join(".git/HEAD"), b"ref: refs/heads/test\n").unwrap();
+        let mut ig2 = IgnoreStack::new(fixture.generation, &d.to_string_lossy(), true, false)
+            .await
+            .expect("generation-bound repository ignore stack");
+        assert!(ig2.ignored(
+            &d.join("ignored.txt").to_string_lossy(),
+            "ignored.txt",
+            false
+        ));
     }
 
-    #[test]
-    fn ignore_stack_negation() {
+    #[tokio::test]
+    async fn ignore_stack_negation() {
         let d = tmp();
-        fs::write(d.join(".git"), b("")).unwrap();
-        fs::write(d.join(".gitignore"), b("*.log\n!important.log\n")).unwrap();
-        let mut ig = IgnoreStack::new(&d.to_string_lossy(), false, true);
+        fs::create_dir(d.join(".git")).unwrap();
+        fs::write(d.join(".git/HEAD"), b"ref: refs/heads/test\n").unwrap();
+        fs::write(d.join(".gitignore"), b"*.log\n!important.log\n").unwrap();
+        let fixture = generation_fixture(&d).await;
+        let mut ig = IgnoreStack::new(fixture.generation, &d.to_string_lossy(), false, true)
+            .await
+            .expect("generation-bound ignore stack");
         assert!(ig.ignored(&d.join("a.log").to_string_lossy(), "a.log", false));
-        assert!(!ig.ignored(&d.join("important.log").to_string_lossy(), "important.log", false));
+        assert!(!ig.ignored(
+            &d.join("important.log").to_string_lossy(),
+            "important.log",
+            false
+        ));
     }
 
     fn b(s: &str) -> Vec<u8> {

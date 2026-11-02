@@ -91,6 +91,12 @@ from disk.
   usable Chromium FAILS the lane (exit 1 = setup failure, exit 2+ =
   assertion failure) and the runner exits non-zero when any lane fails.
   Lanes run against the real binary + loopback mock provider.
+- Code Review toasts anchor below the header, visible mobile section tabs, and
+  visible TLDR summary header, with their height bounded above the composer.
+  The `code_review_operations` lane checks live-toast geometry and summary
+  Stop/Close hit targets on desktop and mobile, clicks Diff after resizing with
+  the same action-error toast live, and exercises summary Stop/Close without
+  waiting for toast expiry or extending its lifetime.
 - Measured coverage: `bash E2E.d/web/coverage.sh` builds a TEMPORARY
   conditionally-instrumented bundle (`vite.coverage.config.ts`) into the
   evidence root, serves it via `RPI_WEB_DEV_DIR`, and drives it with the

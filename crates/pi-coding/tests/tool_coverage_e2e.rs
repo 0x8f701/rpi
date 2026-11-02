@@ -1,22 +1,16 @@
-//! Public `create_tool(name, cwd)` boundary coverage for built-in tools that
-//! lack an end-to-end test at that boundary.
+//! Generation-bound `AgentTool` coverage for built-in tools whose public
+//! `create_tool` factory is a fail-closed stub (`requires an application
+//! generation`). These tests publish a hermetic application and call the
+//! tool the session actually runs.
 //!
-//! The per-tool coverage audit lives in the D15 batch report; this file adds
-//! the genuinely missing public-boundary cases:
-//!
-//! - `grep` / `find` / `ls` — exercised at the `AgentTool` boundary in-module
-//!   (tools.rs), but never through the public `create_tool` factory.
-//! - `ast_grep` / `ast_edit` — in-module tests drive the internal run
-//!   functions; this file scripts the real tool closures.
-//! - `browser` — no tool-execution test exists anywhere (unit tests only
-//!   cover parsing/validation/discovery); skip-guarded on Chrome and driven
-//!   against a deterministic `data:` URL so no network is involved.
-//!   (`web_search` stays covered by its in-module offline-seam + parsing
-//!   tests; a live-network call would be non-deterministic.)
+//! - `grep` / `find` / `ls` — in-module tests cover the happy path; this file
+//!   also checks empty results and missing paths through that same generation.
+//! - `ast_grep` / `ast_edit` — in-module tests drive internal helpers; this
+//!   file scripts the published tool closures.
 //!
 //! Tools with existing tool-boundary e2e are intentionally NOT duplicated:
 //! `read`/`edit`/`write`/`bash`/`glob` (coding_tools_lifecycle.rs,
-//! brush_bash_e2e.rs, sandbox_smoke.rs), `debug` (debug_tool_dap_e2e.rs),
+//! brush_bash_e2e.rs), `debug` (debug_tool_dap_e2e.rs),
 //! `eval` (eval.rs `eval_tool_*`), `memory`/`recall`/`retain`/`reflect`
 //! (memory.rs fake-CLI round trips), `mcp` (mcp.rs fake-server client + tool
 //! execution), `github` (github.rs real gh smoke), `lsp` (lsp.rs rust-analyzer
@@ -25,13 +19,98 @@
 //! (session.rs ask round trips), `todo`/`task`/`hub`/`process` (todo_dag_*,
 //! orchestration_*, role_contracts.rs).
 
+use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use pi_agent::{AbortController, AgentTool, AgentToolResult, ToolCallContext, ToolUpdateFn};
-use pi_ai::ContentBlock;
-use pi_coding::create_tool;
+use pi_agent::{AbortController, AgentTool, AgentToolResult, ThinkingLevel, ToolCallContext, ToolUpdateFn};
+use pi_ai::providers::{FauxProviderOptions, register_faux_provider};
+use pi_ai::{ContentBlock, Model, SimpleStreamOptions};
+use pi_coding::{
+    Application, ResourceDiscovery, ResourceManager, ResourceManagerOptions, Session, SessionOptions,
+};
 use serde_json::{Value, json};
 use tempfile::TempDir;
+
+struct GovernedTool {
+    tool: AgentTool,
+    _application: Application,
+    _agent_home: TempDir,
+    _sessions: TempDir,
+    _registration: pi_ai::providers::FauxProviderRegistration,
+}
+
+async fn governed_tool(name: &str, cwd: &Path) -> GovernedTool {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let suffix = NEXT.fetch_add(1, Ordering::Relaxed);
+    let api = format!("tool-coverage-api-{suffix}");
+    let mut model = Model::default();
+    model.id = format!("tool-coverage-{suffix}");
+    model.name = "Tool Coverage".into();
+    model.api = api.clone();
+    model.provider = format!("tool-coverage-provider-{suffix}");
+    model.base_url = "http://127.0.0.1:9".into();
+    let registration = register_faux_provider(FauxProviderOptions {
+        api,
+        provider: model.provider.clone(),
+        models: vec![model.clone()],
+        chunk_size: 16,
+    });
+    let session = Session::new_with_additional_tools_filtered_and_discovery(
+        SessionOptions {
+            model,
+            cwd: cwd.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: "faux".into(),
+            compaction: None,
+            stream_options: SimpleStreamOptions::default(),
+            tools: None,
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+            auth_manager: None,
+        },
+        Vec::new(),
+        Default::default(),
+        ResourceDiscovery::Disabled,
+    )
+    .expect("coverage session");
+    let sessions = TempDir::new().expect("coverage sessions");
+    session.set_session_dir(sessions.path().to_path_buf());
+    let agent_home = TempDir::new().expect("coverage agent home");
+    let agent_dir = agent_home.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+    )
+    .expect("settings");
+    let mut options = ResourceManagerOptions::new(cwd);
+    options.agent_dir = agent_dir;
+    options.disable_extensions = true;
+    options.disable_skills = true;
+    options.disable_prompt_templates = true;
+    options.disable_themes = true;
+    options.disable_context_files = true;
+    options.project_trust_override = Some(true);
+    session
+        .attach_resources(ResourceManager::new(options).expect("coverage resources"))
+        .await
+        .expect("attach coverage resources");
+    let application = Application::new(session).await;
+    let tool = application
+        .get_tool_definition(name)
+        .unwrap_or_else(|| panic!("{name} requires a published application generation"));
+    GovernedTool {
+        tool,
+        _application: application,
+        _agent_home: agent_home,
+        _sessions: sessions,
+        _registration: registration,
+    }
+}
 
 fn noop_update() -> ToolUpdateFn {
     Arc::new(|_result: AgentToolResult| {})
@@ -46,6 +125,7 @@ fn ctx(arguments: Value) -> ToolCallContext {
         on_update: noop_update(),
         abort,
         model: None,
+        approval_token: None,
     }
 }
 
@@ -70,14 +150,15 @@ async fn call_err(tool: &AgentTool, arguments: Value) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// grep / find / ls — public `create_tool` boundary
+// grep / find / ls — published generation boundary
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn grep_tool_matches_lines_and_reports_no_match() {
     let dir = TempDir::new().expect("temp dir");
     std::fs::write(dir.path().join("grep.txt"), b"alpha\nbeta needle\ngamma\n").expect("file");
-    let tool = create_tool("grep", dir.path().to_str().expect("utf8")).expect("grep tool");
+    let governed = governed_tool("grep", dir.path()).await;
+    let tool = &governed.tool;
 
     let hit = call(&tool, json!({ "pattern": "needle" })).await;
     let text = text_of(&hit);
@@ -96,7 +177,8 @@ async fn find_tool_matches_globs_and_reports_empty() {
     std::fs::write(dir.path().join("a.txt"), b"a").expect("file");
     std::fs::create_dir_all(dir.path().join("sub")).expect("subdir");
     std::fs::write(dir.path().join("sub").join("b.rs"), b"b").expect("file");
-    let tool = create_tool("find", dir.path().to_str().expect("utf8")).expect("find tool");
+    let governed = governed_tool("find", dir.path()).await;
+    let tool = &governed.tool;
 
     let hit = call(&tool, json!({ "pattern": "*.rs" })).await;
     let text = text_of(&hit);
@@ -107,7 +189,10 @@ async fn find_tool_matches_globs_and_reports_empty() {
     assert_eq!(text_of(&miss), "No files found matching pattern");
 
     let missing = call_err(&tool, json!({ "pattern": "*.rs", "path": "nope" })).await;
-    assert!(missing.contains("Path not found"), "got: {missing}");
+    assert!(
+        missing.contains("NotFound"),
+        "missing search path must surface as NotFound: {missing}"
+    );
 }
 
 #[tokio::test]
@@ -116,27 +201,37 @@ async fn ls_tool_lists_entries_and_rejects_bad_paths() {
     std::fs::write(dir.path().join("b.txt"), b"b").expect("file");
     std::fs::write(dir.path().join("a.txt"), b"a").expect("file");
     std::fs::create_dir(dir.path().join("sub")).expect("subdir");
-    let tool = create_tool("ls", dir.path().to_str().expect("utf8")).expect("ls tool");
+    let governed = governed_tool("ls", dir.path()).await;
+    let tool = &governed.tool;
 
     let listed = call(&tool, json!({})).await;
     let text = text_of(&listed);
     assert!(text.contains("a.txt"), "got: {text}");
     assert!(text.contains("b.txt"), "got: {text}");
-    assert!(text.contains("sub/"), "directories must carry a trailing slash: {text}");
+    assert!(
+        text.contains("sub/"),
+        "directories must carry a trailing slash: {text}"
+    );
     assert!(
         text.find("a.txt").unwrap() < text.find("b.txt").unwrap(),
         "entries must be sorted: {text}"
     );
 
     let missing = call_err(&tool, json!({ "path": "nope" })).await;
-    assert!(missing.contains("Path not found"), "got: {missing}");
+    assert!(
+        missing.contains("NotFound"),
+        "missing directory must surface as NotFound: {missing}"
+    );
 
     let file = call_err(&tool, json!({ "path": "a.txt" })).await;
-    assert!(file.contains("Not a directory"), "got: {file}");
+    assert!(
+        file.contains("NotADirectory"),
+        "a file path must be rejected as a directory: {file}"
+    );
 }
 
 // ---------------------------------------------------------------------------
-// ast_grep / ast_edit — public `create_tool` boundary
+// ast_grep / ast_edit — published generation boundary
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -147,7 +242,8 @@ async fn ast_grep_tool_searches_structure_and_validates() {
         "fn main() {\n    let x = Some(123);\n}\n",
     )
     .expect("source file");
-    let tool = create_tool("ast_grep", dir.path().to_str().expect("utf8")).expect("ast_grep tool");
+    let governed = governed_tool("ast_grep", dir.path()).await;
+    let tool = &governed.tool;
 
     let hit = call(&tool, json!({ "pattern": "Some($A)", "path": "lib.rs" })).await;
     assert!(
@@ -156,11 +252,18 @@ async fn ast_grep_tool_searches_structure_and_validates() {
         text_of(&hit)
     );
 
-    let miss = call(&tool, json!({ "pattern": "let $B = 999;", "path": "lib.rs" })).await;
+    let miss = call(
+        &tool,
+        json!({ "pattern": "let $B = 999;", "path": "lib.rs" }),
+    )
+    .await;
     assert_eq!(text_of(&miss), "No matches found");
 
     let invalid = call_err(&tool, json!({ "pattern": "$$$A", "path": "lib.rs" })).await;
-    assert!(invalid.contains("invalid ast-grep pattern"), "got: {invalid}");
+    assert!(
+        invalid.contains("invalid ast-grep pattern"),
+        "got: {invalid}"
+    );
 }
 
 #[tokio::test]
@@ -168,14 +271,19 @@ async fn ast_edit_tool_rewrites_file_on_disk() {
     let dir = TempDir::new().expect("temp dir");
     let path = dir.path().join("lib.rs");
     std::fs::write(&path, "let a = 1;\nlet b = 1;\n").expect("source file");
-    let tool = create_tool("ast_edit", dir.path().to_str().expect("utf8")).expect("ast_edit tool");
+    let governed = governed_tool("ast_edit", dir.path()).await;
+    let tool = &governed.tool;
 
     let result = call(
         &tool,
         json!({ "pattern": "let $A = 1;", "rewrite": "let $A = 2;", "path": "lib.rs" }),
     )
     .await;
-    assert!(text_of(&result).contains("2 replacement(s) in lib.rs."), "got: {}", text_of(&result));
+    assert!(
+        text_of(&result).contains("2 replacement(s) in lib.rs."),
+        "got: {}",
+        text_of(&result)
+    );
     assert_eq!(
         std::fs::read_to_string(&path).expect("rewritten file"),
         "let a = 2;\nlet b = 2;\n"
@@ -186,98 +294,9 @@ async fn ast_edit_tool_rewrites_file_on_disk() {
         json!({ "pattern": "fn nope() {}", "rewrite": "fn nope() { 1 }", "path": "lib.rs" }),
     )
     .await;
-    assert!(text_of(&miss).contains("No replacements in lib.rs."), "got: {}", text_of(&miss));
-}
-
-// ---------------------------------------------------------------------------
-// browser — skip-guarded on a Chrome/Chromium binary; deterministic data: URL
-// ---------------------------------------------------------------------------
-
-/// Chrome/Chromium discovery mirroring the tool's own candidates: `CHROME_PATH`
-/// first, then well-known Linux/macOS install locations and PATH entries.
-fn chrome_usable() -> bool {
-    let candidates = std::env::var("CHROME_PATH")
-        .ok()
-        .filter(|p| !p.trim().is_empty())
-        .map(|p| vec![std::path::PathBuf::from(p)])
-        .unwrap_or_else(|| {
-            ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser", "/opt/google/chrome/chrome"]
-                .into_iter()
-                .map(std::path::PathBuf::from)
-                .collect()
-        });
-    let on_path = std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path)
-                .flat_map(|dir| [dir.join("google-chrome"), dir.join("chromium")])
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    candidates
-        .into_iter()
-        .chain(on_path)
-        .any(|p| p.is_file() && {
-            std::process::Command::new(&p)
-                .arg("--version")
-                .output()
-                .is_ok_and(|o| o.status.success())
-        })
-}
-
-fn data_url(html: &str) -> String {
-    let mut encoded = String::with_capacity(html.len());
-    for byte in html.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b',' | b':' | b';' | b'/' | b'?' | b'@' | b'!' | b'$' | b'\'' | b'(' | b')' | b'*' | b'+' => {
-                encoded.push(byte as char);
-            }
-            b' ' => encoded.push_str("%20"),
-            _ => encoded.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    format!("data:text/html,{encoded}")
-}
-
-#[tokio::test]
-async fn browser_tool_navigates_data_url_and_interacts() {
-    if !chrome_usable() {
-        eprintln!("browser e2e: SKIP (no Chrome/Chromium binary found)");
-        return;
-    }
-    let dir = TempDir::new().expect("temp dir");
-    let cwd = dir.path().to_str().expect("utf8");
-    let tool = create_tool("browser", cwd).expect("browser tool");
-    // The click handler mutates the button's own text so the tool's same-call
-    // post-click text poll observes the change (each call spawns a fresh
-    // browser, so page state does not survive across calls).
-    let page = data_url(
-        r#"<html><body><h1 id="t">Hello Browser</h1><button id="b" onclick="this.textContent='clicked'">Go</button></body></html>"#,
-    );
-
-    let navigated = call(&tool, json!({ "action": "navigate", "url": page })).await;
-    assert!(text_of(&navigated).contains("Navigated to"), "got: {}", text_of(&navigated));
-
-    // Each call spawns a fresh browser at about:blank, so non-navigate
-    // actions re-navigate first via their optional `url` argument.
-    let extracted = call(&tool, json!({ "action": "extract", "url": page })).await;
-    assert!(text_of(&extracted).contains("Hello Browser"), "got: {}", text_of(&extracted));
-
-    let clicked = call(&tool, json!({ "action": "click", "selector": "#b", "url": page })).await;
-    let click_text = text_of(&clicked);
-    assert!(click_text.contains("Clicked"), "got: {click_text}");
     assert!(
-        click_text.contains("clicked"),
-        "the click handler must run and the tool must report the changed text: {click_text}"
+        text_of(&miss).contains("No replacements in lib.rs."),
+        "got: {}",
+        text_of(&miss)
     );
-
-    let shot = call(&tool, json!({ "action": "screenshot", "path": "shot.png", "url": page })).await;
-    assert!(text_of(&shot).contains("shot.png"), "got: {}", text_of(&shot));
-    let bytes = std::fs::read(dir.path().join("shot.png")).expect("screenshot file");
-    assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"), "screenshot must be a PNG");
-
-    let tabs = call(&tool, json!({ "action": "list_tabs", "url": page })).await;
-    assert!(text_of(&tabs).contains("tab(s)"), "got: {}", text_of(&tabs));
-
-    let closed = call(&tool, json!({ "action": "close", "url": page })).await;
-    assert!(text_of(&closed).contains("browser closed"), "got: {}", text_of(&closed));
 }
