@@ -13,3 +13,7 @@ if (typeof Promise.withResolvers !== 'function') {
 if (typeof globalThis.navigator === 'undefined') {
   globalThis.navigator = { userAgent: 'node' };
 }
+
+if (typeof globalThis.WebSocket === 'undefined') {
+  globalThis.WebSocket = { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 };
+}
