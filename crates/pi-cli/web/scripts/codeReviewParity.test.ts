@@ -763,7 +763,7 @@ function check(name: string, cond: unknown, detail = ''): void {
   check(
     'hunk composer keeps the submit glyph and Stop language of the main composer',
     idle.includes('➤')
-      && idle.includes('Comment')
+      && idle.includes('Send')
       && cancellable.includes('code-review__action--stop')
       && cancellable.includes('Stop generating (Esc)')
       && cancellable.includes('■')
