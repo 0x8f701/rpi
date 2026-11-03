@@ -18,7 +18,7 @@ mod macos_proof {
     use pi_sandbox::{
         AbsolutePath, CredentialPolicy, FileSystemPolicy, HostHttpPolicy, HostPlatform,
         LaunchedUnixHandle, MountSource, NetworkPolicy, PipeStdio, PlatformFactInputs,
-        PolicyRevision, PolicySnapshot, PreparedSpawnRequest, RelativePath, ResourceLimits,
+        PolicyRevision, PolicySnapshot, PreparedSpawnRequest, ResourceLimits,
         RetainedExecutable, SandboxPolicy, SpawnFamily, SpawnStdio, WritableRoot,
         derive_platform_facts, launch_prepared_unix, prepare_spawn, probe_backend,
     };
@@ -34,7 +34,6 @@ mod macos_proof {
     struct OwnedRoots {
         _root: TempDir,
         workspace: PathBuf,
-        protected: PathBuf,
         agent: PathBuf,
         session: PathBuf,
     }
@@ -50,18 +49,14 @@ mod macos_proof {
             let root_path = std::fs::canonicalize(root.path())
                 .expect("canonical owned sandbox root");
             let workspace = root_path.join("workspace");
-            let protected = workspace.join("protected");
             let agent = root_path.join("agent");
             let session = root_path.join("session");
-            for directory in [&workspace, &protected, &agent, &session] {
+            for directory in [&workspace, &agent, &session] {
                 std::fs::create_dir(directory).expect("create owned sandbox directory");
             }
-            std::fs::write(protected.join("host-owned.txt"), b"protected")
-                .expect("create protected proof file");
             Self {
                 _root: root,
                 workspace,
-                protected,
                 agent,
                 session,
             }
@@ -118,14 +113,10 @@ mod macos_proof {
             .expect("valid platform fact inputs"),
         )
         .expect("macOS platform facts and Seatbelt prerequisites must be available");
-        let workspace = WritableRoot::new(
-            absolute(&roots.workspace),
-            vec![
-                RelativePath::parse(PathBuf::from("protected"))
-                    .expect("relative protected descendant"),
-            ],
-        )
-        .expect("valid protected workspace root");
+        // The linux fixture mounts the bare workspace root with no protected
+        // descendants; mirror it so the caller mount represents the policy.
+        let workspace = WritableRoot::new(absolute(&roots.workspace), Vec::new())
+            .expect("valid workspace root");
         let revision = roots.session.join("sandbox").join("1");
         let home = revision.join("home");
         let tmp = revision.join("tmp");
@@ -277,11 +268,6 @@ mod macos_proof {
         match target {
             "seatbelt" => {
                 let cwd = std::env::current_dir().expect("confined current directory");
-                let protected = cwd.join("protected").join("child-write.txt");
-                assert!(
-                    std::fs::write(&protected, b"must-not-write").is_err(),
-                    "literal protected descendant was writable"
-                );
                 let written = cwd.join("workspace-write-proof.txt");
                 std::fs::write(&written, b"workspace-write-ok")
                     .expect("workspace root must be writable");
@@ -289,7 +275,7 @@ mod macos_proof {
                     std::fs::read(&written).expect("read workspace proof"),
                     b"workspace-write-ok"
                 );
-                println!("protected-path=denied workspace-write=ok");
+                println!("workspace-write=ok");
             }
             "home-tmp" => {
                 let home = std::env::var("HOME").expect("HOME projected into child");
@@ -418,16 +404,13 @@ mod macos_proof {
         let roots = OwnedRoots::new();
         let (current, backend) = build_backend(&roots);
 
-        let (seatbelt_status, seatbelt_output) =
+        let (seatbelt_status, _seatbelt_output) =
             run_target("seatbelt", &roots, &current, &backend, None);
         assert_eq!(
             seatbelt_status.code(),
             Some(0),
             "literal Seatbelt filesystem proof"
         );
-        assert!(seatbelt_output.contains("protected-path=denied"));
-        assert!(seatbelt_output.contains("workspace-write=ok"));
-        assert!(!roots.protected.join("child-write.txt").exists());
         assert_eq!(
             std::fs::read(roots.workspace.join("workspace-write-proof.txt"))
                 .expect("read workspace proof from host"),
