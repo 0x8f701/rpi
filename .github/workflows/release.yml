@@ -800,7 +800,7 @@ jobs:
           while IFS= read -r spec; do
             [ -z "$spec" ] && continue
             if ! cargo +1.88.0 test --locked $spec -- --nocapture > "$RUNNER_TEMP/proof.log" 2>&1; then
-              { printf '%s\n' "$spec"; grep -am 9 '^error' "$RUNNER_TEMP/proof.log"; printf '%s\n' '--- last lines ---'; tail -n 5 "$RUNNER_TEMP/proof.log"; } | grep -aviE 'api[_-]?key|authorization|bearer |sk-[a-z0-9]{8}|ghp_[a-z0-9]|gho_[a-z0-9]|password|private key' | head -n 10 | while IFS= read -r line; do printf '::error title=macos proof::%s\n' "$line"; done
+              { printf '%s\n' "$spec"; grep -am 9 '^error' "$RUNNER_TEMP/proof.log"; printf '%s\n' '--- last lines ---'; tail -n 5 "$RUNNER_TEMP/proof.log"; } | grep -aviE 'api[_-]?key[ =:]|authorization[ =:]|bearer [a-z0-9]|sk-[a-z0-9]{16}|ghp_[a-z0-9]|gho_[a-z0-9]|github_pat_|password[ =:]|BEGIN [A-Z]+ PRIVATE' | head -n 10 | while IFS= read -r line; do printf '::error title=macos proof::%s\n' "$line"; done
               failed=1
             fi
           done <<'PROOFS'
