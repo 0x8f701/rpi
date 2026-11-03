@@ -407,6 +407,21 @@ fn unsafe_fstat(descriptor: RawFd, status: *mut libc::stat) -> i32 {
     unsafe { libc::fstat(descriptor, status) }
 }
 
+pub(crate) fn descriptor_file_identity(
+    descriptor: RawFd,
+) -> Result<(u64, u64, bool), SandboxError> {
+    let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe_fstat(descriptor, status.as_mut_ptr()) != 0 {
+        return Err(SandboxError::from_io(
+            SandboxIoOperation::InspectDescriptor,
+            &std::io::Error::last_os_error(),
+        ));
+    }
+    let status = unsafe_assume_stat(status);
+    let is_file = status.st_mode as u32 & (libc::S_IFMT as u32) == (libc::S_IFREG as u32);
+    Ok((status.st_dev as u64, status.st_ino as u64, is_file))
+}
+
 #[allow(unsafe_code)]
 fn unsafe_assume_stat(status: std::mem::MaybeUninit<libc::stat>) -> libc::stat {
     unsafe { status.assume_init() }

@@ -234,7 +234,7 @@ fn represent_macos_policy(
 
     Ok(RepresentedMacosPolicy {
         current_executable,
-        current_fd_path: fd_path(input.current_transport_fd)?,
+        current_fd_path: fd_path(crate::child::SANDBOX_SELF_EXE_FD)?,
         target_executable,
         target_fd_path: fd_path(input.target_transport_fd)?,
         runtime_read_filters,
@@ -385,15 +385,13 @@ fn executable_path_and_fd(path: &AbsolutePath, fd: RawFd) -> Result<String, Sand
     ensure_canonical_existing(path, EntryKind::ExecutableFile, || {
         PolicyRepresentabilityError::TargetNotReadable
     })?;
-    let descriptor_path = fd_path(fd)?;
+    fd_path(fd)?;
     let path_metadata = fs::metadata(path.as_path())
         .map_err(|_| unrepresentable(PolicyRepresentabilityError::TargetNotReadable))?;
-    let descriptor_metadata = fs::metadata(&descriptor_path)
+    // fdesc stat of /dev/fd/N is not the file identity; fstat the descriptor.
+    let (device, inode, is_file) = crate::launcher::descriptor_file_identity(fd)
         .map_err(|_| unrepresentable(PolicyRepresentabilityError::DescriptorExecUnsupported))?;
-    if path_metadata.dev() != descriptor_metadata.dev()
-        || path_metadata.ino() != descriptor_metadata.ino()
-        || !descriptor_metadata.is_file()
-    {
+    if path_metadata.dev() != device || path_metadata.ino() != inode || !is_file {
         return Err(unrepresentable(
             PolicyRepresentabilityError::DescriptorExecUnsupported,
         ));

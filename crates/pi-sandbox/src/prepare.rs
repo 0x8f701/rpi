@@ -599,7 +599,7 @@ impl MacosPreparedSpawn {
                 network: self.network,
                 filesystem: &self.filesystem,
                 current_executable: self.current_executable.canonical_path(),
-                current_transport_fd: crate::child::SANDBOX_SELF_EXE_FD,
+                current_transport_fd: self.current_executable.raw_fd(),
                 target_executable: self.target_executable.canonical_path(),
                 target_transport_fd: target_fd,
                 cwd: &self.cwd,

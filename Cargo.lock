@@ -2853,7 +2853,7 @@ dependencies = [
 
 [[package]]
 name = "pi-agent"
-version = "1.1.15"
+version = "1.1.16"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2870,7 +2870,7 @@ dependencies = [
 
 [[package]]
 name = "pi-ai"
-version = "1.1.15"
+version = "1.1.16"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2895,7 +2895,7 @@ dependencies = [
 
 [[package]]
 name = "pi-cli"
-version = "1.1.15"
+version = "1.1.16"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2941,7 +2941,7 @@ dependencies = [
 
 [[package]]
 name = "pi-coding"
-version = "1.1.15"
+version = "1.1.16"
 dependencies = [
  "agent-loader",
  "anyhow",
@@ -2998,7 +2998,7 @@ dependencies = [
 
 [[package]]
 name = "pi-sandbox"
-version = "1.1.15"
+version = "1.1.16"
 dependencies = [
  "libc",
  "nix 0.29.0",
