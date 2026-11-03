@@ -477,10 +477,10 @@ pub(crate) fn fork_sandbox_child(
         Err(stage) => stage,
     };
     if stage != WrapperStage::ExecuteWrapper {
-        write_wrapper_failure(wrapper_error_fd, stage);
+        write_wrapper_failure(SANDBOX_WRAPPER_ERROR_FD, stage);
         unsafe { libc::_exit(WRAPPER_FAILURE_EXIT_CODE) };
     }
-    exec_prepared_wrapper(wrapper, wrapper_error_fd)
+    exec_prepared_wrapper(wrapper)
 }
 
 fn prepare_wrapper_child(
@@ -517,7 +517,7 @@ fn prepare_wrapper_child(
     Ok(())
 }
 
-pub(crate) fn exec_prepared_wrapper(wrapper: &PreparedWrapper, wrapper_error_fd: RawFd) -> ! {
+pub(crate) fn exec_prepared_wrapper(wrapper: &PreparedWrapper) -> ! {
     #[cfg(target_os = "linux")]
     unsafe {
         libc::syscall(
@@ -537,7 +537,7 @@ pub(crate) fn exec_prepared_wrapper(wrapper: &PreparedWrapper, wrapper_error_fd:
             wrapper.environment_pointers.as_ptr(),
         );
     }
-    write_wrapper_failure(wrapper_error_fd, WrapperStage::ExecuteWrapper);
+    write_wrapper_failure(SANDBOX_WRAPPER_ERROR_FD, WrapperStage::ExecuteWrapper);
     unsafe { libc::_exit(WRAPPER_FAILURE_EXIT_CODE) }
 }
 
