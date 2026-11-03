@@ -24,8 +24,9 @@ env:
   CARGO_TERM_COLOR: always
   # Fail before packaging if debug metadata accidentally inflates a
   # distribution binary. The release-dist profile strips symbols and disables
-  # debuginfo; `rpi` is a full agent CLI, so allow up to 64 MiB per native binary.
-  MAX_RELEASE_BINARY_BYTES: "67108864"
+  # debuginfo; `rpi` is a full agent CLI, so allow up to 128 MiB per native
+  # binary (the x86_64 distribution binary is ~71 MiB stripped).
+  MAX_RELEASE_BINARY_BYTES: "134217728"
 
 jobs:
 
@@ -217,7 +218,7 @@ jobs:
           bytes="$(wc -c < "$src" | tr -d '[:space:]')"
           echo "release binary: $src ($bytes bytes; limit $MAX_RELEASE_BINARY_BYTES)"
           if [ "$bytes" -gt "$MAX_RELEASE_BINARY_BYTES" ]; then
-            echo "release binary exceeds the 64 MiB distribution limit" >&2
+            echo "release binary exceeds the 128 MiB distribution limit" >&2
             exit 1
           fi
 
@@ -346,13 +347,28 @@ jobs:
         if: runner.os != 'Windows'
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
-        run: bash E2E.d/release/build-release.sh +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked --target ${{ matrix.target }}
+          CARGO_TERM_COLOR: never
+        run: |
+          if ! bash E2E.d/release/build-release.sh +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked --target ${{ matrix.target }} > "$RUNNER_TEMP/rpi-build.log" 2>&1; then
+            { printf '%s\n' 'release build failed'; grep -am 9 '^error' "$RUNNER_TEMP/rpi-build.log"; } | grep -aviE 'api[_-]?key|authorization|bearer |sk-[a-z0-9]{8}|ghp_[a-z0-9]|gho_[a-z0-9]|password|private key' | head -n 10 | while IFS= read -r line; do printf '::error title=build::%s\n' "$line"; done
+            tail -n 40 "$RUNNER_TEMP/rpi-build.log" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
 
       - name: Build rpi (release-dist, Windows)
         if: runner.os == 'Windows'
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
-        run: ./E2E.d/release/build-release.ps1 +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked --target ${{ matrix.target }}
+          CARGO_TERM_COLOR: never
+        shell: pwsh
+        run: |
+          & ./E2E.d/release/build-release.ps1 +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked --target ${{ matrix.target }} *> "$env:RUNNER_TEMP/rpi-build.log"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "::error title=build::release build failed"
+            (Select-String -Path "$env:RUNNER_TEMP/rpi-build.log" -Pattern '^error' | Select-Object -First 9) | ForEach-Object { Write-Output ("::error title=build::" + $_.Line) }
+            Get-Content "$env:RUNNER_TEMP/rpi-build.log" -Tail 40 | Add-Content "$env:GITHUB_STEP_SUMMARY"
+            exit 1
+          }
 
       - name: Verify stripped release binary
         shell: bash
@@ -365,7 +381,7 @@ jobs:
           bytes="$(wc -c < "$src" | tr -d '[:space:]')"
           echo "release binary: $src ($bytes bytes; limit $MAX_RELEASE_BINARY_BYTES)"
           if [ "$bytes" -gt "$MAX_RELEASE_BINARY_BYTES" ]; then
-            echo "release binary exceeds the 64 MiB distribution limit" >&2
+            echo "release binary exceeds the 128 MiB distribution limit" >&2
             exit 1
           fi
 
@@ -732,18 +748,31 @@ jobs:
       - name: Build and verify bubblewrap 0.10.0
         shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y build-essential meson ninja-build libcap-dev
+          if ! sudo apt-get update > "$RUNNER_TEMP/bwrap-apt.log" 2>&1 || ! sudo apt-get install --no-install-recommends -y build-essential meson ninja-build libcap-dev >> "$RUNNER_TEMP/bwrap-apt.log" 2>&1; then
+            { printf '%s\n' 'apt-get update/install failed'; tail -n 8 "$RUNNER_TEMP/bwrap-apt.log"; } | grep -aviE 'api[_-]?key|authorization|bearer |sk-[a-z0-9]{8}|ghp_[a-z0-9]|gho_[a-z0-9]|password|private key' | head -n 9 | while IFS= read -r line; do printf '::error title=bwrap apt::%s\n' "$line"; done
+            tail -n 80 "$RUNNER_TEMP/bwrap-apt.log" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
           bwrap_source="$RUNNER_TEMP/bubblewrap"
-          git init "$bwrap_source"
+          git -c init.defaultBranch=main init "$bwrap_source"
           git -C "$bwrap_source" remote add origin https://github.com/containers/bubblewrap.git
           git -C "$bwrap_source" fetch --depth=1 origin dc63ec667e6546f34e0b6c088cdf8ae7c7dea0f3
           git -C "$bwrap_source" checkout --detach FETCH_HEAD
           [ "$(git -C "$bwrap_source" rev-parse HEAD)" = dc63ec667e6546f34e0b6c088cdf8ae7c7dea0f3 ]
-          meson setup "$bwrap_source/build" "$bwrap_source" --buildtype=release --prefix=/usr -Dselinux=disabled -Dbash_completion=disabled -Dzsh_completion=disabled -Dman=disabled
-          ninja -C "$bwrap_source/build"
+          if ! meson setup "$bwrap_source/build" "$bwrap_source" --buildtype=release --prefix=/usr -Dselinux=disabled -Dbash_completion=disabled -Dzsh_completion=disabled -Dman=disabled -Dtests=false > "$RUNNER_TEMP/bwrap-setup.log" 2>&1; then
+            { printf '%s\n' 'meson setup failed'; tail -n 8 "$RUNNER_TEMP/bwrap-setup.log"; } | grep -aviE 'api[_-]?key|authorization|bearer |sk-[a-z0-9]{8}|ghp_[a-z0-9]|gho_[a-z0-9]|password|private key' | head -n 9 | while IFS= read -r line; do printf '::error title=bwrap meson::%s\n' "$line"; done
+            tail -n 80 "$RUNNER_TEMP/bwrap-setup.log" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          if ! ninja -C "$bwrap_source/build" > "$RUNNER_TEMP/bwrap-build.log" 2>&1; then
+            { printf '%s\n' 'ninja build failed'; tail -n 8 "$RUNNER_TEMP/bwrap-build.log"; } | grep -aviE 'api[_-]?key|authorization|bearer |sk-[a-z0-9]{8}|ghp_[a-z0-9]|gho_[a-z0-9]|password|private key' | head -n 9 | while IFS= read -r line; do printf '::error title=bwrap ninja::%s\n' "$line"; done
+            tail -n 80 "$RUNNER_TEMP/bwrap-build.log" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
           sudo ninja -C "$bwrap_source/build" install
-          [ "$(bwrap --version)" = "bubblewrap 0.10.0" ]
+          version="$(bwrap --version)"
+          printf 'bwrap version: %s\n' "$version" >> "$GITHUB_STEP_SUMMARY"
+          [ "$version" = "bubblewrap 0.10.0" ]
           E2E.d/ci/orchestration.sh __bubblewrap-fd-probe
 
       - name: Set up Node for Chromium

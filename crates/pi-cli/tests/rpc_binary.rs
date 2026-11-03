@@ -594,9 +594,11 @@ fn prompt_emits_response_events_and_agent_settled() {
         let is_settled = value.get("type").and_then(Value::as_str) == Some("agent_settled");
         if is_response(&value) && value.get("id").and_then(Value::as_str) == Some("prompt-1") {
             assert_success(&value, "prompt", "prompt-1");
+            let data = value.get("data").cloned().unwrap_or(Value::Null);
             assert!(
-                value.get("data").is_none() || value.get("data") == Some(&Value::Null),
-                "prompt success data must be null/omitted: {value}"
+                data.get("turnId").and_then(Value::as_str).is_some_and(|turn_id| !turn_id.is_empty())
+                    && data.get("model").and_then(|model| model.get("id")).and_then(Value::as_str) == Some("faux-1"),
+                "prompt success data must carry the accepted turn and model: {value}"
             );
             saw_prompt_response = true;
         }

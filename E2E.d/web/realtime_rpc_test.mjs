@@ -359,8 +359,8 @@ async function main() {
     await page.screenshot({ path: `${evidence}/realtime-active.png`, fullPage: true });
 
     // ---- R3b: realtime event journey over the oai-events data channel.
-    // The post-connect session.update must preserve the same AVAS-compatible
-    // shape as create-call: audio.input absent, output voice present.
+    // The post-connect session.update must carry ONLY the mutable session
+    // fields: audio.input and immutable instructions absent, voice present.
     await page.evaluate(() => window.__realtimeOwnerTest.openChannel());
     const sessionUpdate = await page.evaluate(() => {
       const frames = [];
@@ -373,8 +373,9 @@ async function main() {
     if ('input' in (sessionUpdate.session?.audio || {})) {
       fail(`R3b: session.update sent rejected audio.input (${JSON.stringify(sessionUpdate.session?.audio)})`);
     }
-    if ('model' in sessionUpdate.session || 'type' in sessionUpdate.session) {
-      fail('R3b: session.update re-introduced legacy model/type fields');
+    if ('model' in sessionUpdate.session || 'type' in sessionUpdate.session
+      || 'instructions' in sessionUpdate.session) {
+      fail('R3b: session.update re-introduced immutable/legacy fields (model/type/instructions)');
     }
     await page.evaluate(() => window.__realtimeOwnerTest.sendFrame({ type: 'conversation.item.input_audio_transcription.delta', delta: 'realtime ' }));
     await waitFor(

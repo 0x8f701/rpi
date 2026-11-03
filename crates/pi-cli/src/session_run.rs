@@ -1124,7 +1124,7 @@ fn child_session_options(source: &Application, cwd: &Path) -> SessionOptions {
 /// target cwd — those keep their explicit bounded failure. Log lines are
 /// path-free so absolute filesystem paths never leak into stderr.
 fn heal_missing_recorded_cwd(recorded_cwd: &Path) {
-    if recorded_cwd.as_os_str().is_empty() || std::fs::metadata(recorded_cwd).is_ok() {
+    if recorded_cwd.as_os_str().is_empty() || pi_coding::inspect_operator_directory(recorded_cwd).is_ok() {
         return;
     }
     let (Some(parent), Some(leaf)) = (recorded_cwd.parent(), recorded_cwd.file_name()) else {

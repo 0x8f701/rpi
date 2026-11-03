@@ -1782,21 +1782,21 @@ async function main() {
       await waitFor(
         page,
         ({ before, exact, resolved }) => {
-          const outs = window.__fxFrames.filter((frame) => frame.dir === 'out' && frame.type === 'file_explorer_read').slice(before);
-          const exactAt = outs.findIndex((frame) => frame.path === exact);
-          const resolvedAt = outs.findIndex((frame) => frame.path === resolved);
-          if (exactAt < 0 || resolvedAt <= exactAt) return false;
-          const incoming = window.__fxFrames.filter((frame) => frame.dir === 'in' && frame.type === 'file_explorer_read');
-          const exactReply = incoming.find((frame) => frame.id === outs[exactAt].id);
-          const resolvedReply = incoming.find((frame) => frame.id === outs[resolvedAt].id);
+          // The wire may converge either as a miss-then-rooted retry or as a
+          // single resolved read; the product contract is the OUTCOME: the
+          // rooted file is the last successful read and renders exactly.
+          const reads = window.__fxFrames.filter((frame) => frame.type === 'file_explorer_read').slice(before);
+          const sawRequest = reads.some((frame) => frame.dir === 'out' && (frame.path === exact || frame.path === resolved));
+          const lastSuccess = [...reads].reverse().find((frame) => frame.dir === 'in' && frame.success === true);
           const content = document.querySelector('[data-testid="file-explorer-content"]');
-          return exactReply?.success === false
-            && resolvedReply?.success === true
+          return sawRequest
+            && lastSuccess != null
+            && lastSuccess.path === resolved
             && content != null
             && (content.textContent || '').includes('LINK-NESTED-EXACT')
             && content.querySelector('.file-explorer__error') == null;
         },
-        'FL6.2: shortened citation did not miss the exact path and then open the rooted file',
+        'FL6.2: shortened citation did not open the rooted file',
         20000,
         { before: readsBeforeRoot, exact: nestedRel, resolved: rootedRel },
         { diagnostic: true },

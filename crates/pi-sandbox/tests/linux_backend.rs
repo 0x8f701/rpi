@@ -212,10 +212,9 @@ mod linux_proof {
         let stderr = stderr_reader
             .join()
             .expect("join hosted proof stderr reader");
-        assert!(
-            stderr.is_empty(),
-            "hosted proof target emitted stderr for {target}: {stderr:?}"
-        );
+        if !stderr.is_empty() {
+            panic!("hosted-proof-stderr target={target} stderr={stderr:?}");
+        }
         (status, stdout)
     }
 

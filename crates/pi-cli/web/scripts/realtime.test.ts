@@ -11,7 +11,7 @@
 // These assertions exercise BEHAVIOR (constructed objects, classification
 // decisions, extracted text), never source strings.
 import {
-  buildRealtimeSessionConfig,
+  buildRealtimeSessionUpdate,
   setupRealtimeCall,
   REALTIME_EVENT_CHANNEL,
   REALTIME_ICE_GATHER_TIMEOUT_MS,
@@ -49,21 +49,21 @@ function check(name, cond, detail) {
   if (!cond) failures.push(`${name}${detail ? `: ${detail}` : ''}`);
 }
 
-// ---- buildRealtimeSessionConfig: exact frameless v3 session.update shape ----
+// ---- buildRealtimeSessionUpdate: mutable-only frameless v3 session.update shape ----
 {
-  const session = buildRealtimeSessionConfig('gpt-realtime-1.5', 'sol');
-  check('session.instructions empty', session.instructions === '');
+  const session = buildRealtimeSessionUpdate('gpt-realtime-1.5', 'sol');
+  check('session omits immutable instructions', !('instructions' in session));
   check('session.audio.output.voice propagated', session.audio.output.voice === 'sol');
   check('session.delegation.type client', session.delegation.type === 'client');
   const frame = { type: 'session.update', session };
   check('session.update frame type', frame.type === 'session.update');
-  check('session.update frame carries the full nested session object', frame.session === session);
+  check('session.update frame carries the nested session object', frame.session === session);
   check('session.update omits model', !('model' in frame.session));
   check('session.update omits legacy quicksilver type', !('type' in session));
   check('session.update omits rejected audio input config', !('input' in session.audio));
   check('no top-level voice on session', !('voice' in session));
   check('session carries no id', !('id' in session));
-  const other = buildRealtimeSessionConfig('gpt-4o-realtime', 'marin');
+  const other = buildRealtimeSessionUpdate('gpt-4o-realtime', 'marin');
   check('other voice propagates without model', other.audio.output.voice === 'marin' && !('model' in other));
 }
 

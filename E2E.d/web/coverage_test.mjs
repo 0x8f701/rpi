@@ -1136,7 +1136,8 @@ async function main() {
     });
     if (!sessionUpdate) fail('realtime: no session.update frame sent on the oai-events channel');
     if ('input' in (sessionUpdate.session?.audio || {})
-      || 'model' in sessionUpdate.session || 'type' in sessionUpdate.session) {
+      || 'model' in sessionUpdate.session || 'type' in sessionUpdate.session
+      || 'instructions' in sessionUpdate.session) {
       fail(`realtime: session.update sent a rejected field (${JSON.stringify(sessionUpdate.session)})`);
     }
     record('realtime.session-update-transcription');
@@ -2854,6 +2855,7 @@ async function main() {
       || 'input' in (sessionUpdateFrame.session?.audio || {})
       || 'model' in sessionUpdateFrame.session
       || 'type' in sessionUpdateFrame.session
+      || 'instructions' in sessionUpdateFrame.session
       || !sessionUpdateFrame.session.audio?.output?.voice
     ) {
       fail(`realtime#2: session.update frame is not AVAS-compatible: ${JSON.stringify(sessionUpdateFrame)}`);

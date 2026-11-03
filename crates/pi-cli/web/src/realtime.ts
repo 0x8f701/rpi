@@ -8,10 +8,12 @@
  * dependency so `esbuild --platform=node` can bundle the test in isolation
  * (mirroring src/transcript.ts + scripts/transcript.test.ts).
  *
- * The session object here is the frameless v3 shape used by both the Rust
- * create-call POST and the web `session.update` event over the `oai-events`
- * RTCDataChannel. It carries instructions, output voice, and client
- * delegation; model selection stays server/proxy-owned.
+ * The Rust create-call POST owns session initialization (instructions, voice,
+ * delegation). The web `session.update` event over the `oai-events`
+ * RTCDataChannel carries ONLY the mutable fields — output voice and client
+ * delegation — because the provider rejects immutable-field updates
+ * (`instructions`) after initialization; model selection stays
+ * server/proxy-owned.
  *
  * Create/stop/cleanup RPCs always stamp the session captured at call start,
  * never the post-switch current session — switching A→B must not leak A's
@@ -32,10 +34,11 @@ export function firstString(...values: unknown[]): string {
   return '';
 }
 
-/** The frameless v3 realtime session object used by both create-call and the
- *  retained idempotent `session.update` data-channel frame. */
-export interface RealtimeSessionConfig {
-  instructions: string;
+/** The mutable fields of the frameless v3 realtime session, re-advertised by
+ *  the retained idempotent `session.update` data-channel frame. The
+ *  create-call POST owns initialization; the provider rejects immutable
+ *  fields (`instructions`) in post-init updates. */
+export interface RealtimeSessionUpdate {
   audio: {
     output: { voice: string };
   };
@@ -45,12 +48,12 @@ export interface RealtimeSessionConfig {
 }
 
 
-/** Build the frameless realtime session config. Model selection stays
- *  proxy-owned; the create-call endpoint accepts output voice and client
- *  delegation but rejects `audio.input` in AVAS session data. */
-export function buildRealtimeSessionConfig(_model: string, voice: string): RealtimeSessionConfig {
+/** Build the mutable session fields for the retained `session.update`
+ *  frame. Model selection stays proxy-owned; the provider rejects
+ *  `instructions` and `audio.input` here (instructions are immutable after
+ *  initialization; AVAS rejects `audio.input` in session data). */
+export function buildRealtimeSessionUpdate(_model: string, voice: string): RealtimeSessionUpdate {
   return {
-    instructions: '',
     audio: { output: { voice } },
     delegation: { type: 'client' },
   };

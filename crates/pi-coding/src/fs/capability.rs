@@ -165,6 +165,7 @@ pub(crate) enum CapabilityRootPurpose {
     OrchestrationArtifacts,
     PersonaStore,
     OperatorImport,
+    ScratchStore,
     OperatorExport,
     OperatorAuth,
 }
@@ -1480,6 +1481,7 @@ impl CapabilityRootLease {
             file,
         })
     }
+
 
     pub(crate) fn open_directory(&self, relative: &Path) -> Result<CapabilityDirectory, FsError> {
         validate_relative(relative)?;

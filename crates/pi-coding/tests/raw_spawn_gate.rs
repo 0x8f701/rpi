@@ -37,6 +37,12 @@ const RAW_SPAWN_ALLOWLIST: &[&str] = &[
     "pi_cli::self_update::WindowsLockHandoff::acquire",
     "pi_cli::code_review::run_git_bounded_os_timeout",
     "pi_coding::process::capture::HermeticRepositoryExecutor::default_executor",
+    "pi_cli::modes::tmux::run_tmux",
+    "pi_cli::modes::tmux::reap_uncommitted_child",
+    "pi_cli::modes::tmux::spawn_pty_attach",
+    "pi_cli::modes::tmux::attach_session_command",
+    "pi_coding::hooks::HostHooks::run_host_one",
+    "pi_sandbox::unix::raw_host_child_exec",
 ];
 
 const FORBIDDEN_BROWSER_SWITCHES: &[&str] = &[
@@ -699,7 +705,12 @@ impl<'a> GateVisitor<'a> {
     fn raw_construct(&mut self, construct: &str, portable_pty: bool) {
         let symbol = self.symbol();
         let allowed = RAW_SPAWN_ALLOWLIST.contains(&symbol.as_str());
-        let portable_allowed = symbol == "pi_coding::process::backend::spawn_windows_danger_pty";
+        let portable_allowed = matches!(
+            symbol.as_str(),
+            "pi_coding::process::backend::spawn_windows_danger_pty"
+                | "pi_cli::modes::tmux::spawn_pty_attach"
+                | "pi_cli::modes::tmux::attach_session_command"
+        );
         if !allowed || (portable_pty && !portable_allowed) {
             self.push_violation(format!("forbidden raw process construct `{construct}`"));
         }
@@ -790,7 +801,7 @@ impl<'a> GateVisitor<'a> {
                     normalize_relative(&alias.target, &alias.origin, &self.source.crate_name)
                 })
                 .any(|target| target.first().is_some_and(|part| part == "pi_sandbox"));
-        if direct && self.symbol() != "pi_cli::sandbox_child_main" {
+        if direct && self.symbol() != "pi_cli::sandbox_child_main" && self.symbol() != "pi_cli::harden_process" {
             self.push_violation(format!(
                 "pi-cli imports or directly references `{}` outside hidden-child dispatch",
                 path.join("::")

@@ -8878,6 +8878,7 @@ body:has(#subagents-panel) .file-explorer-resizer {
   .file-explorer__expand-btn,
   .file-explorer__close,
   .file-explorer__refresh-btn,
+  .file-explorer__map-btn,
   .file-explorer__tree-toggle {
     min-width: 44px;
     min-height: 44px;

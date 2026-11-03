@@ -356,6 +356,11 @@ pub enum LaunchedUnixHandle {
 }
 
 pub fn launch_prepared_unix(prepared: PreparedSpawn) -> Result<LaunchedUnixHandle, SandboxError> {
+    #[cfg(target_os = "macos")]
+    let _spawn = {
+        static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        SPAWN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    };
     match prepared.into_unix_plan() {
         #[cfg(target_os = "linux")]
         PreparedUnixPlan::Linux(plan) => launch_confined(plan.stage_wrapper()?),
@@ -711,11 +716,20 @@ fn raw_host_child_exec(
     let argv_ptrs = cstring_pointers(argv);
     let env_ptrs = cstring_pointers(environment);
     unsafe {
+        #[cfg(target_os = "linux")]
         libc::fexecve(
             executable.as_raw_fd(),
             argv_ptrs.as_ptr(),
             env_ptrs.as_ptr(),
         );
+        #[cfg(target_os = "macos")]
+        {
+            let path = format!("/dev/fd/{}", executable.as_raw_fd());
+            let Ok(c_path) = std::ffi::CString::new(path) else {
+                raw_host_child_failure(error_fd, RawHostStage::PrepareExecutable, None);
+            };
+            libc::execve(c_path.as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr());
+        }
     }
     raw_host_child_failure(error_fd, RawHostStage::ExecuteTarget, None);
 }
@@ -794,12 +808,7 @@ fn atomic_cloexec_pipe() -> Result<CloexecPipe, SandboxError> {
     let result = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
     #[cfg(target_os = "macos")]
     let result = unsafe {
-        libc::socketpair(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-            0,
-            fds.as_mut_ptr(),
-        )
+        libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr())
     };
     if result < 0 {
         let error = io::Error::last_os_error();
@@ -813,6 +822,22 @@ fn atomic_cloexec_pipe() -> Result<CloexecPipe, SandboxError> {
             SandboxIoOperation::CreateChannel,
             &error,
         ));
+    }
+    #[cfg(target_os = "macos")]
+    for fd in fds {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+            let error = io::Error::last_os_error();
+            for open in fds {
+                if open >= 0 {
+                    unsafe { libc::close(open) };
+                }
+            }
+            return Err(SandboxError::from_io(
+                SandboxIoOperation::CreateChannel,
+                &error,
+            ));
+        }
     }
     Ok(CloexecPipe {
         read: unsafe { OwnedFd::from_raw_fd(fds[0]) },
@@ -842,18 +867,41 @@ fn open_cloexec_pty(size: TerminalSize) -> Result<PtyPair, SandboxError> {
             &io::Error::last_os_error(),
         ));
     }
-    let mut name = [0_i8; 256];
-    if unsafe { libc::ptsname_r(master.as_raw_fd(), name.as_mut_ptr(), name.len()) } != 0 {
-        return Err(SandboxError::from_io(
-            SandboxIoOperation::CreateChannel,
-            &io::Error::last_os_error(),
-        ));
-    }
+    #[cfg(target_os = "linux")]
+    let name_owned = {
+        let mut name = [0_u8; 256];
+        if unsafe { libc::ptsname_r(master.as_raw_fd(), name.as_mut_ptr().cast(), name.len()) } != 0 {
+            return Err(SandboxError::from_io(
+                SandboxIoOperation::CreateChannel,
+                &io::Error::last_os_error(),
+            ));
+        }
+        let end = name.iter().position(|byte| *byte == 0).unwrap_or(name.len());
+        std::ffi::CString::new(&name[..end]).map_err(|_| {
+            SandboxError::from_io(SandboxIoOperation::CreateChannel, &io::Error::other("pty name"))
+        })?
+    };
+    #[cfg(target_os = "linux")]
+    let name_ptr = name_owned.as_ptr();
+    #[cfg(target_os = "macos")]
+    let name_owned = {
+        static PTY_NAME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = PTY_NAME.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ptr = unsafe { libc::ptsname(master.as_raw_fd()) };
+        if ptr.is_null() {
+            return Err(SandboxError::from_io(
+                SandboxIoOperation::CreateChannel,
+                &io::Error::last_os_error(),
+            ));
+        }
+        let owned = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_owned();
+        drop(_guard);
+        owned
+    };
+    #[cfg(target_os = "macos")]
+    let name_ptr = name_owned.as_ptr();
     let slave_raw = unsafe {
-        libc::open(
-            name.as_ptr(),
-            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
-        )
+        libc::open(name_ptr, libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC)
     };
     if slave_raw < 0 {
         return Err(SandboxError::from_io(
@@ -912,7 +960,7 @@ fn prepare_pty_process(slave: RawFd) -> Result<(), SandboxError> {
         ));
     }
     map_descriptors_cycle_safe(&[(slave, 0), (slave, 1), (slave, 2)])?;
-    if unsafe { libc::ioctl(0, libc::TIOCSCTTY, 0) } < 0 {
+    if unsafe { libc::ioctl(0, libc::TIOCSCTTY as _, 0) } < 0 {
         return Err(SandboxError::from_io(
             SandboxIoOperation::MapDescriptor,
             &io::Error::last_os_error(),

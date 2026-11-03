@@ -1372,7 +1372,7 @@ enum ManagedDisposition {
 /// otherwise the lexically cleaned literal path (the checkout has moved away
 /// and the recorded bytes are the only remaining identity).
 fn rebind_namespace_cwd(cwd: &Path) -> PathBuf {
-    std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.components().collect::<PathBuf>())
+    crate::fs::canonicalize_existing_path(cwd).unwrap_or_else(|| cwd.components().collect::<PathBuf>())
 }
 
 /// Relative store/managed root paths for one session namespace digest.
@@ -1723,7 +1723,7 @@ pub fn prepare_session_worktree_root_rebind(
 
     // The durable layout digests the cwd bytes the runtime was launched with.
     let old_literal = old_cwd.components().collect::<PathBuf>();
-    let canonical_old = std::fs::canonicalize(old_cwd).ok();
+    let canonical_old = crate::fs::canonicalize_existing_path(old_cwd);
     let mut old_candidates = vec![old_literal.clone()];
     if canonical_old.as_ref().is_some_and(|canonical| *canonical != old_literal) {
         old_candidates.push(canonical_old.clone().expect("canonical old cwd"));

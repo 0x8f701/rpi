@@ -3,7 +3,7 @@ members = ["crates/pi-ai", "crates/pi-agent", "crates/pi-coding", "crates/pi-cli
 resolver = "2"
 
 [workspace.package]
-version = "1.0.0"
+version = "1.1.6"
 edition = "2024"
 license = "MIT"
 rust-version = "1.88"
@@ -126,7 +126,7 @@ qrcode = { version = "0.14", default-features = false }
 inherits = "release"
 # Whole-program LTO (measured: -5.6% on Linux; conservatively projected
 # -2.7 MiB on the Windows x86_64 MSVC artifact) keeps distribution binaries
-# under the 64 MiB cap without changing code size targets or runtime behavior.
+# under the 128 MiB cap without changing code size targets or runtime behavior.
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
@@ -134,7 +134,9 @@ debug = 0
 split-debuginfo = "off"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# Deny (not forbid) so the two platform FFI modules can re-allow the lint
+# deliberately; stray unsafe anywhere else still fails the build.
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

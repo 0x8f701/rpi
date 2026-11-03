@@ -2779,7 +2779,7 @@ fn bounded_new_session_failure(error: &anyhow::Error) -> String {
             return "new session cwd must be an absolute directory path".to_owned();
         }
         if source
-            .downcast_ref::<pi_sandbox::PolicyValidationError>()
+            .downcast_ref::<pi_coding::SandboxConfigError>()
             .is_some()
         {
             return "new session directory path is invalid".to_owned();
@@ -2972,7 +2972,7 @@ pub(crate) fn classify_new_session_failure(error: &anyhow::Error) -> SwitchFailu
             return switch_failure_class("trust_denied", false, "project_trust_denied");
         }
         if source
-            .downcast_ref::<pi_sandbox::PolicyValidationError>()
+            .downcast_ref::<pi_coding::SandboxConfigError>()
             .is_some()
         {
             return switch_failure_class("cwd_invalid", false, "cwd_invalid");
@@ -8593,10 +8593,12 @@ mod tests {
                 "new session path must not be a symbolic link"
             );
         }
-        let malformed = anyhow::Error::new(pi_sandbox::PolicyValidationError::InvalidField {
-            field: "path",
-            reason: "must not contain NUL",
-        })
+        let malformed = anyhow::Error::new(pi_coding::SandboxConfigError::from(
+            pi_sandbox::PolicyValidationError::InvalidField {
+                field: "path",
+                reason: "must not contain NUL",
+            },
+        ))
         .context(format!("validating new session cwd for {selected}"));
         assert_eq!(
             bounded_new_session_failure(&malformed),

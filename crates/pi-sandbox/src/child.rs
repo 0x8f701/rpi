@@ -536,25 +536,25 @@ fn prepare_child_target(
         .map_err(|error| ChildFailure::new(status_fd, ChildStage::InstallTargetMappings, error))?;
     apply_limit(
         status_fd,
-        libc::RLIMIT_AS,
+        rlimit_resource(status_fd, libc::RLIMIT_AS, ChildStage::ApplyAddressSpace)?,
         request.limits.address_space_bytes(),
         ChildStage::ApplyAddressSpace,
     )?;
     apply_limit(
         status_fd,
-        libc::RLIMIT_CPU,
+        rlimit_resource(status_fd, libc::RLIMIT_CPU, ChildStage::ApplyCpu)?,
         request.limits.cpu_seconds(),
         ChildStage::ApplyCpu,
     )?;
     apply_limit(
         status_fd,
-        libc::RLIMIT_FSIZE,
+        rlimit_resource(status_fd, libc::RLIMIT_FSIZE, ChildStage::ApplyFileSize)?,
         request.limits.file_size_bytes(),
         ChildStage::ApplyFileSize,
     )?;
     apply_limit(
         status_fd,
-        libc::RLIMIT_NOFILE,
+        rlimit_resource(status_fd, libc::RLIMIT_NOFILE, ChildStage::ApplyOpenFiles)?,
         request.limits.open_files(),
         ChildStage::ApplyOpenFiles,
     )?;
@@ -886,9 +886,23 @@ fn runtime_directory_identity_matches(
     }
 }
 
+fn rlimit_resource(
+    status_fd: RawFd,
+    resource: impl TryInto<u32>,
+    stage: ChildStage,
+) -> Result<u32, ChildFailure> {
+    resource.try_into().map_err(|_| {
+        ChildFailure::new(
+            status_fd,
+            stage,
+            protocol_error(ChildProtocolError::InvalidResourceLimit),
+        )
+    })
+}
+
 fn apply_limit(
     status_fd: RawFd,
-    resource: libc::__rlimit_resource_t,
+    resource: u32,
     value: u64,
     stage: ChildStage,
 ) -> Result<(), ChildFailure> {
@@ -903,7 +917,17 @@ fn apply_limit(
         rlim_cur: value,
         rlim_max: value,
     };
-    if unsafe { libc::setrlimit(resource, &limit) } != 0 {
+    #[cfg(target_os = "linux")]
+    let resource_arg = resource;
+    #[cfg(target_os = "macos")]
+    let resource_arg = libc::c_int::try_from(resource).map_err(|_| {
+        ChildFailure::new(
+            status_fd,
+            stage,
+            protocol_error(ChildProtocolError::InvalidResourceLimit),
+        )
+    })?;
+    if unsafe { libc::setrlimit(resource_arg, &limit) } != 0 {
         return Err(ChildFailure::new(
             status_fd,
             stage,

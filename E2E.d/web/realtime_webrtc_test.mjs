@@ -275,7 +275,7 @@ const SETUP_LOOPBACK = async () => {
       onDataChannel: (_pc, dcArg) => {
         // Mirror the production wiring: send session.update on open.
         dcArg.onopen = () => {
-          try { dcArg.send(JSON.stringify({ type: 'session.update', session: H.buildRealtimeSessionConfig('gpt-realtime-1.5', 'sol') })); }
+          try { dcArg.send(JSON.stringify({ type: 'session.update', session: H.buildRealtimeSessionUpdate('gpt-realtime-1.5', 'sol') })); }
           catch (e) { out.errors.push('session.update send: ' + String(e)); }
         };
       },

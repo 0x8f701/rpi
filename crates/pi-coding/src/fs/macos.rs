@@ -1,3 +1,8 @@
+//! Raw macOS libc FFI for fd-anchored capability operations. The platform's
+//! own file-safety invariants (NOFOLLOW, CLOEXEC, identity recheck) wrap each
+//! call, so the module-level unsafe allowance is deliberate.
+#![allow(unsafe_code)]
+
 use std::ffi::{CString, OsStr};
 use std::fs::File;
 use std::io;
@@ -170,7 +175,7 @@ pub(super) fn managed_link_identity(
         return Err(FsError::IdentityChanged);
     }
     Ok(super::ManagedLinkIdentity {
-        device: status.st_dev,
+        device: status.st_dev as u64,
         inode: status.st_ino,
     })
 }
@@ -357,7 +362,7 @@ fn openat(
     operation: FsOperation,
 ) -> Result<File, FsError> {
     let name = cstring(name)?;
-    let descriptor = unsafe { libc::openat(directory, name.as_ptr(), flags, mode) };
+    let descriptor = unsafe { libc::openat(directory, name.as_ptr(), flags, libc::c_uint::from(mode)) };
     owned_file(descriptor, operation)
 }
 
@@ -401,7 +406,7 @@ fn identity_from_stat(status: libc::stat) -> Result<FileIdentity, FsError> {
         _ => return Err(FsError::UnsupportedEntryType),
     };
     Ok(FileIdentity::Unix {
-        device: status.st_dev,
+        device: status.st_dev as u64,
         inode: status.st_ino,
         kind,
     })

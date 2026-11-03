@@ -168,7 +168,7 @@ import {
   transcriptPathContext,
 } from './transcript';
 import {
-  buildRealtimeSessionConfig,
+  buildRealtimeSessionUpdate,
   setupRealtimeCall,
   isRealtimeLiveMode,
   reduceRealtimeVoiceFrame,
@@ -8046,12 +8046,13 @@ export function App() {
           realtimeDcRef.current = dcArg;
           dcArg.binaryType = 'arraybuffer';
           dcArg.onopen = () => {
-            // Re-advertise the same V1 session config sent during create-call
-            // so the established data-channel path applies the configured
-            // model and voice after connection. The update is idempotent;
-            // voice remains nested at audio.output.voice.
+            // Re-advertise the MUTABLE session fields after connection. The
+            // create-call POST owns initialization; the provider rejects
+            // immutable fields (`instructions`) in post-init updates
+            // ([immutable_field_update]). Voice remains nested at
+            // audio.output.voice.
             try {
-              dcArg.send(JSON.stringify({ type: 'session.update', session: buildRealtimeSessionConfig(model, voice) }));
+              dcArg.send(JSON.stringify({ type: 'session.update', session: buildRealtimeSessionUpdate(model, voice) }));
             } catch {
               /* channel closed between open and send; onclose handles teardown */
             }

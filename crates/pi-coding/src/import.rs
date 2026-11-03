@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::fs::{CapabilityFs, CapabilityRootLease, CapabilityRootPurpose, FsError};
+use crate::fs::{CapabilityAccess, CapabilityFs, CapabilityRootLease, CapabilityRootPurpose, FsError, RootCreation};
 
 use self::parsers::{ParsedSession, parse_source, source_id};
 use crate::default_session_dir;
@@ -1047,13 +1047,14 @@ fn loader_tool(source: SourceSessionFormat) -> agent_loader::domain::SourceTool 
 }
 
 struct LoaderStaging {
-    dir: PathBuf,
+    temp_root: CapabilityRootLease,
+    relative: PathBuf,
     entry: PathBuf,
 }
 
 impl Drop for LoaderStaging {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
+        let _ = self.temp_root.remove_tree(&self.relative);
     }
 }
 
@@ -1071,47 +1072,69 @@ fn stage_opened_source(
         });
     }
     let parts = opened.into_parts();
-    let dir = std::env::temp_dir().join(format!("rpi-loader-{}", Uuid::new_v4()));
-    fs::create_dir(&dir).map_err(|source_error| ImportSessionError::Io {
-        path: dir.clone(),
-        source: source_error,
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).map_err(
-            |source_error| ImportSessionError::Io {
-                path: dir.clone(),
-                source: source_error,
-            },
-        )?;
-    }
-    let entry = if source == SourceSessionFormat::Grok {
-        copy_opened_handle(&parts.primary, &dir.join("summary.json"), &parts.path)?;
+    let temp_root = open_scratch_root()?;
+    let name = format!("rpi-loader-{}", Uuid::new_v4());
+    let lease = temp_root
+        .create_directory_exclusive(Path::new(&name), crate::fs::CapabilityAccess::PrivateReadWrite)
+        .map_err(|error| ImportSessionError::Io {
+            path: temp_root.display_root().join(&name),
+            source: std::io::Error::other(error.to_string()),
+        })?;
+    let dir = temp_root.display_root().join(&name);
+    let entry_relative = if source == SourceSessionFormat::Grok {
+        copy_opened_handle(&lease, Path::new("summary.json"), &parts.primary, &parts.path)?;
         if let Some(chat) = parts.grok_chat.as_ref() {
             copy_opened_handle(
+                &lease,
+                Path::new("chat_history.jsonl"),
                 chat,
-                &dir.join("chat_history.jsonl"),
                 &parts.path.with_file_name("chat_history.jsonl"),
             )?;
         }
-        dir.join("summary.json")
+        PathBuf::from("summary.json")
     } else {
         let name = parts
             .path
             .file_name()
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("session.jsonl"));
-        let dest = dir.join(name);
-        copy_opened_handle(&parts.primary, &dest, &parts.path)?;
-        dest
+        copy_opened_handle(&lease, &name, &parts.primary, &parts.path)?;
+        name
     };
-    Ok(LoaderStaging { dir, entry })
+    Ok(LoaderStaging {
+        temp_root,
+        relative: PathBuf::from(&name),
+        entry: dir.join(&entry_relative),
+    })
+}
+
+fn open_scratch_root() -> Result<CapabilityRootLease, ImportSessionError> {
+    let temp = std::env::temp_dir();
+    let absolute = AbsolutePath::parse(temp).map_err(|_| ImportSessionError::Io {
+        path: PathBuf::from("temporary directory"),
+        source: std::io::Error::other("temporary directory path is not absolute UTF-8"),
+    })?;
+    crate::fs::CapabilityFs::new()
+        .map_err(|error| ImportSessionError::Io {
+            path: PathBuf::from("temporary directory"),
+            source: std::io::Error::other(error.to_string()),
+        })?
+        .open_root(
+            CapabilityRootPurpose::ScratchStore,
+            absolute,
+            crate::fs::CapabilityAccess::PrivateReadWrite,
+            crate::fs::RootCreation::Existing,
+        )
+        .map_err(|error| ImportSessionError::Io {
+            path: PathBuf::from("temporary directory"),
+            source: std::io::Error::other(error.to_string()),
+        })
 }
 
 fn copy_opened_handle(
+    lease: &CapabilityRootLease,
+    relative: &Path,
     file: &fs::File,
-    dest: &Path,
     display: &Path,
 ) -> Result<(), ImportSessionError> {
     let mut src = file.try_clone().map_err(|source| ImportSessionError::Io {
@@ -1138,29 +1161,113 @@ fn copy_opened_handle(
             ),
         });
     }
-    fs::write(dest, bytes).map_err(|source| ImportSessionError::Io {
-        path: dest.to_path_buf(),
-        source,
-    })
+    let mut dest = lease
+        .create_new(relative, crate::fs::FileMode::Private)
+        .map_err(|error| ImportSessionError::Io {
+            path: lease.display_root().join(relative),
+            source: std::io::Error::other(error.to_string()),
+        })?;
+    dest.write_all(&bytes).map_err(|error| {
+        ImportSessionError::Io {
+            path: lease.display_root().join(relative),
+            source: std::io::Error::other(error.to_string()),
+        }
+    })?;
+    dest.finish().map_err(|error| ImportSessionError::Io {
+        path: lease.display_root().join(relative),
+        source: std::io::Error::other(error.to_string()),
+    })?;
+    Ok(())
 }
 
-fn staged_is_blank(path: &Path) -> bool {
-    fs::read_to_string(path)
+fn staged_entry_relative(staging: &LoaderStaging) -> PathBuf {
+    staging
+        .entry
+        .strip_prefix(staging.temp_root.display_root())
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| staging.entry.clone())
+}
+
+fn staged_is_blank(staging: &LoaderStaging) -> bool {
+    lease_read_to_string(&staging.temp_root, &staged_entry_relative(staging))
         .ok()
         .is_some_and(|body| body.trim().is_empty())
 }
+
+fn lease_read_to_string(
+    lease: &CapabilityRootLease,
+    relative: &Path,
+) -> Result<String, ImportSessionError> {
+    let file = lease.open_file(relative).map_err(|error| {
+        ImportSessionError::Io {
+            path: lease.display_root().join(relative),
+            source: std::io::Error::other(error.to_string()),
+        }
+    })?;
+    let mut std_file = file.try_clone_std().map_err(|source| {
+        ImportSessionError::Io {
+            path: lease.display_root().join(relative),
+            source,
+        }
+    })?;
+    let mut body = String::new();
+    std_file.read_to_string(&mut body).map_err(|source| {
+        ImportSessionError::Io {
+            path: lease.display_root().join(relative),
+            source,
+        }
+    })?;
+    Ok(body)
+}
+
+fn lease_write_string(
+    lease: &CapabilityRootLease,
+    relative: &Path,
+    body: &str,
+) -> Result<(), ImportSessionError> {
+    let scratch_name = relative
+        .file_name()
+        .map(|name| format!("{}.dedup-tmp", name.to_string_lossy()))
+        .ok_or_else(|| ImportSessionError::Io {
+            path: relative.to_path_buf(),
+            source: std::io::Error::other("staged entry has no file name"),
+        })?;
+    let scratch_relative = relative.with_file_name(scratch_name);
+    let mut scratch = lease
+        .create_new(&scratch_relative, crate::fs::FileMode::Private)
+        .map_err(|error| ImportSessionError::Io {
+            path: lease.display_root().join(&scratch_relative),
+            source: std::io::Error::other(error.to_string()),
+        })?;
+    scratch.write_all(body.as_bytes()).map_err(|error| {
+        ImportSessionError::Io {
+            path: lease.display_root().join(&scratch_relative),
+            source: std::io::Error::other(error.to_string()),
+        }
+    })?;
+    scratch.finish().map_err(|error| ImportSessionError::Io {
+        path: lease.display_root().join(&scratch_relative),
+        source: std::io::Error::other(error.to_string()),
+    })?;
+    lease.rename(&scratch_relative, relative).map_err(|error| {
+        ImportSessionError::Io {
+            path: lease.display_root().join(relative),
+            source: std::io::Error::other(error.to_string()),
+        }
+    })
+}
+
+
 
 /// Cross-member identity dedup for staged OMP rotation chains (root -> leaf
 /// staging order): a message record copied verbatim from an earlier member
 /// (same entry id) is dropped so the library's per-file parse cannot emit it
 /// twice. First occurrence wins, matching the authoritative chain merge.
-fn dedup_staged_omp_chain_entries(entries: &[PathBuf]) -> Result<(), ImportSessionError> {
+fn dedup_staged_omp_chain_entries(stagings: &[LoaderStaging]) -> Result<(), ImportSessionError> {
     let mut seen_ids = std::collections::HashSet::new();
-    for entry in entries {
-        let body = fs::read_to_string(entry).map_err(|source| ImportSessionError::Io {
-            path: entry.clone(),
-            source,
-        })?;
+    for staging in stagings {
+        let relative = staged_entry_relative(staging);
+        let body = lease_read_to_string(&staging.temp_root, &relative)?;
         let mut kept: Vec<String> = Vec::new();
         for line in body.lines() {
             let trimmed = line.trim();
@@ -1184,10 +1291,7 @@ fn dedup_staged_omp_chain_entries(entries: &[PathBuf]) -> Result<(), ImportSessi
         } else {
             kept.join("\n") + "\n"
         };
-        fs::write(entry, body).map_err(|source| ImportSessionError::Io {
-            path: entry.clone(),
-            source,
-        })?;
+        lease_write_string(&staging.temp_root, &relative, &body)?;
     }
     Ok(())
 }
@@ -1208,12 +1312,10 @@ fn convert_opened_members(
     ImportSessionError,
 > {
     let mut stagings = Vec::new();
-    let mut entries = Vec::new();
     let is_chain = source == SourceSessionFormat::Omp;
     for opened in members {
         match stage_opened_source(source, opened) {
             Ok(staging) => {
-                entries.push(staging.entry.clone());
                 stagings.push(staging);
             }
             // A chain member beyond the per-file source cap is excluded from
@@ -1224,22 +1326,25 @@ fn convert_opened_members(
             Err(error) => return Err(error),
         }
     }
-    if entries.is_empty() {
+    if stagings.is_empty() {
         return Err(ImportSessionError::NoConvertibleMessages {
             format: source,
             path: source_path.to_path_buf(),
         });
     }
-    if entries.len() > 1 {
-        dedup_staged_omp_chain_entries(&entries)?;
+    if stagings.len() > 1 {
+        dedup_staged_omp_chain_entries(&stagings)?;
     }
-    if entries.iter().all(|path| staged_is_blank(path)) {
+    if stagings.iter().all(staged_is_blank) {
         return Err(ImportSessionError::NoConvertibleMessages {
             format: source,
             path: source_path.to_path_buf(),
         });
     }
-    let paths: Vec<&Path> = entries.iter().map(PathBuf::as_path).collect();
+    let paths: Vec<&Path> = stagings
+        .iter()
+        .map(|staging| staging.entry.as_path())
+        .collect();
     let session = crate::agent_loader_convert::parse_staged_sources(loader_tool(source), &paths)
         .map_err(|error| map_loader_error(source, source_path, error))?;
     let messages = imported_messages(&session);

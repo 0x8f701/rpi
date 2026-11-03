@@ -6828,26 +6828,72 @@ impl OrchestrationRuntime {
         if self.main_agent_id() != CODE_REVIEW_PARENT_AGENT_ID {
             return Ok(());
         }
+        // The retained artifact lease is rooted at <cwd>/.pi/review/<id>/
+        // artifacts; a lease cannot unlink its own root and cap-std denies
+        // parent traversal, so the cleanup opens a SECOND scoped root one
+        // review level higher and removes the review id directory relatively.
         let artifact_dir = &self.inner.config.artifact_dir;
-        match std::fs::remove_dir_all(artifact_dir) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).context("removing review orchestration artifact directory");
-            }
-        }
-        let Some(review_dir) = artifact_dir.parent() else {
+        let Some(review_id_dir) = artifact_dir.parent() else {
             return Ok(());
         };
-        match std::fs::remove_dir(review_dir) {
-            Ok(()) => Ok(()),
+        let Some(review_base) = review_id_dir.parent() else {
+            return Ok(());
+        };
+        let Some(review_id_name) = review_id_dir.file_name() else {
+            return Ok(());
+        };
+        let review_base = pi_sandbox::AbsolutePath::parse(review_base.to_path_buf())
+            .map_err(|_| anyhow!("invalid review orchestration base directory"))?;
+        let filesystem = CapabilityFs::new().context("initializing review cleanup filesystem")?;
+        let lease = match filesystem.open_root(
+            CapabilityRootPurpose::OrchestrationArtifacts,
+            review_base,
+            CapabilityAccess::PrivateReadWrite,
+            RootCreation::Existing,
+        ) {
+            Ok(lease) => lease,
             Err(error)
-                if error.kind() == std::io::ErrorKind::NotFound
-                    || error.kind() == std::io::ErrorKind::DirectoryNotEmpty =>
+                if matches!(
+                    &error,
+                    crate::fs::FsError::System {
+                        kind: std::io::ErrorKind::NotFound,
+                        ..
+                    }
+                ) =>
             {
-                Ok(())
+                return Ok(());
             }
-            Err(error) => Err(error).context("removing review orchestration directory"),
+            Err(error) => {
+                return Err(anyhow::Error::new(error))
+                    .context("opening the review orchestration base capability");
+            }
+        };
+        let artifacts_relative = std::path::Path::new(review_id_name).join("artifacts");
+        match lease.remove_tree(&artifacts_relative) {
+            Ok(())
+            | Err(
+                crate::fs::FsError::System {
+                    kind: std::io::ErrorKind::NotFound,
+                    ..
+                }
+                | crate::fs::FsError::InvalidPath,
+            ) => {}
+            Err(error) => {
+                return Err(anyhow::Error::new(error))
+                    .context("removing review orchestration artifact directory");
+            }
+        }
+        match lease.remove_directory(std::path::Path::new(review_id_name)) {
+            Ok(())
+            | Err(
+                crate::fs::FsError::System {
+                    kind: std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty,
+                    ..
+                }
+                | crate::fs::FsError::InvalidPath,
+            ) => Ok(()),
+            Err(error) => Err(anyhow::Error::new(error))
+                .context("removing review orchestration directory"),
         }
     }
 
@@ -12626,6 +12672,31 @@ mod prompt_size_tests {
         assert!(!artifact.display_path().exists());
         assert!(resolver.resolve_file("artifact://Owned").is_err());
     }
+
+    #[tokio::test]
+    async fn review_parent_shutdown_removes_the_review_artifact_tree() {
+        let root = tempfile::tempdir().expect("root");
+        let review_root = root.path().join("review").join("rev-1");
+        let artifact_dir = review_root.join("artifacts");
+        let definition = super::super::definitions::parse_agent_definition(
+            Path::new("task.md"),
+            "---\nname: task\ndescription: task\n---\nprompt",
+            super::super::AgentDefinitionSource::Bundled,
+            true,
+        )
+        .expect("definition");
+        let mut config =
+            OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition]), &artifact_dir);
+        config.main_agent_id = CODE_REVIEW_PARENT_AGENT_ID.to_owned();
+        let runtime = OrchestrationRuntime::new(config, Arc::new(|_| Box::pin(async { unreachable!() })))
+            .expect("review runtime");
+        std::fs::write(artifact_dir.join("job-1.md"), b"artifact").expect("artifact file");
+        runtime.shutdown().await.expect("review shutdown");
+        assert!(!artifact_dir.exists(), "artifacts tree must be removed");
+        assert!(!review_root.exists(), "the emptied review id directory must be removed");
+        assert!(root.path().join("review").exists(), "the review base stays");
+    }
+
 
     fn runtime_with_skill(path: PathBuf) -> OrchestrationRuntime {
         try_runtime_with_skill_source(path, crate::SkillSource::Explicit).expect("runtime")

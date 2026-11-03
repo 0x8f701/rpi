@@ -51,7 +51,14 @@ pub fn probe_backend(
     facts: PlatformFacts,
     snapshot: SharedPolicySnapshot,
 ) -> Result<SandboxBackend, SandboxError> {
-    probe_backend_with_roots(facts, snapshot, None)
+    #[cfg(unix)]
+    {
+        probe_backend_with_roots(facts, snapshot, None)
+    }
+    #[cfg(not(unix))]
+    {
+        probe_backend_with_roots(facts, snapshot)
+    }
 }
 
 #[cfg(unix)]

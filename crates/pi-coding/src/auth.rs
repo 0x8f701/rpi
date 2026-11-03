@@ -481,7 +481,7 @@ impl AuthLockOwner {
             pid: std::process::id(),
             host_fingerprint: local_host_fingerprint(),
             boot_id: local_boot_id(),
-            process_start: process_start_identity(std::process::id()).ok().flatten(),
+            process_start: current_process_start_identity(),
             token: Uuid::new_v4().to_string(),
         }
     }
@@ -758,6 +758,16 @@ fn local_boot_id() -> Option<String> {
 
 #[cfg(not(target_os = "linux"))]
 fn local_boot_id() -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn current_process_start_identity() -> Option<String> {
+    process_start_identity(std::process::id()).ok().flatten()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn current_process_start_identity() -> Option<String> {
     None
 }
 

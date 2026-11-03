@@ -1,3 +1,8 @@
+//! Raw Windows handle FFI for the identity syscalls cap-std does not expose.
+//! Callers recheck identity after every operation, so the module-level
+//! unsafe allowance is deliberate.
+#![allow(unsafe_code)]
+
 use std::fs::File;
 use std::io;
 use std::mem::MaybeUninit;

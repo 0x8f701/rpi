@@ -24,11 +24,20 @@ fn absolute(path: &Path) -> AbsolutePath {
 fn pipe_pair() -> (File, OwnedFd) {
     let mut descriptors = [-1; 2];
     assert_eq!(
-        unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) },
+        unsafe { libc::pipe(descriptors.as_mut_ptr()) },
         0,
-        "create close-on-exec pipe: {}",
+        "create pipe: {}",
         std::io::Error::last_os_error()
     );
+    for fd in descriptors {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0, "read pipe flags");
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) },
+            0,
+            "mark pipe close-on-exec"
+        );
+    }
     let read = unsafe { File::from_raw_fd(descriptors[0]) };
     let write = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
     (read, write)

@@ -193,7 +193,7 @@ pub fn prepare_operator_directory(path: &Path) -> Result<PreparedOperatorDirecto
     }
     let absolute = lexical_absolute(path)?;
     let capabilities = crate::fs::CapabilityFs::new()?;
-    let absolute_path = pi_sandbox::AbsolutePath::parse(absolute)?;
+    let absolute_path = pi_sandbox::AbsolutePath::parse(absolute).map_err(crate::SandboxConfigError::from)?;
     let (parent, name) = capabilities.open_exact_parent(
         crate::fs::CapabilityRootPurpose::ProjectResources,
         absolute_path,
@@ -295,7 +295,7 @@ pub fn prepare_or_create_operator_directory(path: &Path) -> Result<PreparedOpera
             Some(parent) if parent != ancestor => parent.to_path_buf(),
             _ => bail!("operator directory path is invalid"),
         };
-        let parent_absolute = pi_sandbox::AbsolutePath::parse(parent.clone())?;
+        let parent_absolute = pi_sandbox::AbsolutePath::parse(parent.clone()).map_err(crate::SandboxConfigError::from)?;
         match capabilities.open_root(
             crate::fs::CapabilityRootPurpose::ProjectResources,
             parent_absolute,

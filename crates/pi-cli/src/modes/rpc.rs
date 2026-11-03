@@ -14600,12 +14600,12 @@ mod tests {
         assert_eq!(skill["source"], "builtin");
         assert_eq!(skill["argumentHint"], "<name>");
         assert_eq!(skill["requiresArguments"], true);
-        let code_review = commands
+        let review = commands
             .iter()
-            .find(|command| command["name"] == "code-review")
-            .expect("code-review is a visible primary command");
-        assert_eq!(code_review["argumentHint"], "[<base> | <from> <to>]");
-        assert_eq!(code_review["requiresArguments"], false);
+            .find(|command| command["name"] == "review")
+            .expect("review is a visible primary command");
+        assert_eq!(review["argumentHint"], "[<repo>] [<base> | <from> <to>]");
+        assert_eq!(review["requiresArguments"], false);
         app.cleanup().await;
     }
 

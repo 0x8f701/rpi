@@ -30,7 +30,7 @@ impl ExecutableIdentity {
         Self {
             device: metadata.dev(),
             inode: metadata.ino(),
-            mode: metadata.mode(),
+            mode: metadata.mode() as u32,
             owner_uid: metadata.uid(),
             owner_gid: metadata.gid(),
             size: metadata.size(),
@@ -53,7 +53,7 @@ impl ExecutableIdentity {
         Ok(Self {
             device: status.st_dev as u64,
             inode: status.st_ino as u64,
-            mode: status.st_mode,
+            mode: status.st_mode as u32,
             owner_uid: status.st_uid,
             owner_gid: status.st_gid,
             size: status.st_size as u64,
@@ -69,7 +69,7 @@ impl ExecutableIdentity {
         Self {
             device,
             inode,
-            mode: libc::S_IFREG | 0o755,
+            mode: (libc::S_IFREG | 0o755) as u32,
             owner_uid: 0,
             owner_gid: 0,
             size: 1,
@@ -128,7 +128,7 @@ impl ExecutableIdentity {
         let current = Self::from_fd(descriptor)?;
         Ok(self.device == current.device
             && self.inode == current.inode
-            && (self.mode & libc::S_IFMT) == (current.mode & libc::S_IFMT)
+            && (self.mode & u32::from(libc::S_IFMT)) == (current.mode & u32::from(libc::S_IFMT))
             && ownership_matches(self.owner_uid, current.owner_uid, owner_view)
             && ownership_matches(self.owner_gid, current.owner_gid, owner_view))
     }
@@ -288,7 +288,7 @@ fn open_trusted(path: &str, launcher: LauncherKind) -> Result<TrustedExecutable,
     let metadata = file
         .metadata()
         .map_err(|error| SandboxError::from_io(SandboxIoOperation::InspectDescriptor, &error))?;
-    if !metadata.is_file() || metadata.mode() & 0o111 == 0 {
+    if !metadata.is_file() || metadata.mode() as u32 & 0o111 == 0 {
         return Err(SandboxError::LauncherUntrusted {
             launcher,
             failure: LauncherTrustFailure::NotRegular,
@@ -300,7 +300,7 @@ fn open_trusted(path: &str, launcher: LauncherKind) -> Result<TrustedExecutable,
             failure: LauncherTrustFailure::WrongOwner,
         });
     }
-    if metadata.mode() & 0o022 != 0 {
+    if metadata.mode() as u32 & 0o022 != 0 {
         return Err(SandboxError::LauncherUntrusted {
             launcher,
             failure: LauncherTrustFailure::WritableByGroupOrOther,
@@ -321,7 +321,7 @@ fn validate_ancestors(path: &Path, launcher: LauncherKind) -> Result<(), Sandbox
         let metadata = std::fs::symlink_metadata(ancestor).map_err(|error| {
             SandboxError::from_io(SandboxIoOperation::InspectDescriptor, &error)
         })?;
-        if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        if metadata.uid() != 0 || metadata.mode() as u32 & 0o022 != 0 {
             return Err(SandboxError::LauncherUntrusted {
                 launcher,
                 failure: LauncherTrustFailure::UnsafeAncestor,
@@ -381,7 +381,7 @@ pub(crate) fn open_pinned_executable(
     let metadata = file
         .metadata()
         .map_err(|error| SandboxError::from_io(SandboxIoOperation::InspectDescriptor, &error))?;
-    if !metadata.is_file() || metadata.mode() & 0o111 == 0 {
+    if !metadata.is_file() || metadata.mode() as u32 & 0o111 == 0 {
         return Err(SandboxError::from_io(
             SandboxIoOperation::OpenExecutable,
             &std::io::Error::from_raw_os_error(libc::EACCES),

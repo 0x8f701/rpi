@@ -739,19 +739,28 @@ jobs:
       - name: Build and verify bubblewrap 0.10.0
         shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y build-essential meson ninja-build libcap-dev
+          if ! sudo apt-get update > "$RUNNER_TEMP/bwrap-apt.log" 2>&1 || ! sudo apt-get install --no-install-recommends -y build-essential meson ninja-build libcap-dev >> "$RUNNER_TEMP/bwrap-apt.log" 2>&1; then
+            tail -n 80 "$RUNNER_TEMP/bwrap-apt.log" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
           bwrap_source="$RUNNER_TEMP/bubblewrap"
-          git init "$bwrap_source"
+          git -c init.defaultBranch=main init "$bwrap_source"
           git -C "$bwrap_source" remote add origin https://github.com/containers/bubblewrap.git
           git -C "$bwrap_source" fetch --depth=1 origin dc63ec667e6546f34e0b6c088cdf8ae7c7dea0f3
           git -C "$bwrap_source" checkout --detach FETCH_HEAD
           [ "$(git -C "$bwrap_source" rev-parse HEAD)" = dc63ec667e6546f34e0b6c088cdf8ae7c7dea0f3 ]
-          meson setup "$bwrap_source/build" "$bwrap_source" --buildtype=release --prefix=/usr -Dselinux=disabled -Dbash_completion=disabled -Dzsh_completion=disabled -Dman=disabled
-          ninja -C "$bwrap_source/build"
+          if ! meson setup "$bwrap_source/build" "$bwrap_source" --buildtype=release --prefix=/usr -Dselinux=disabled -Dbash_completion=disabled -Dzsh_completion=disabled -Dman=disabled -Dtests=false > "$RUNNER_TEMP/bwrap-setup.log" 2>&1; then
+            tail -n 80 "$RUNNER_TEMP/bwrap-setup.log" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          if ! ninja -C "$bwrap_source/build" > "$RUNNER_TEMP/bwrap-build.log" 2>&1; then
+            tail -n 80 "$RUNNER_TEMP/bwrap-build.log" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
           sudo ninja -C "$bwrap_source/build" install
-          [ "$(bwrap --version)" = "bubblewrap 0.10.0" ]
-          E2E.d/ci/orchestration.sh __bubblewrap-fd-probe
+          version="$(bwrap --version)"
+          printf 'bwrap version: %s\n' "$version" >> "$GITHUB_STEP_SUMMARY"
+          [ "$version" = "bubblewrap 0.10.0" ]
 
       - name: Set up Node for Chromium
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -773,26 +782,52 @@ jobs:
       - name: Run Linux sandbox hosted proofs
         shell: bash
         run: |
-          cargo +1.88.0 test --locked -p pi-sandbox --test linux_backend
-          cargo +1.88.0 test --locked -p pi-sandbox --lib spawn::tests::owned_spawn_parts_are_consumed_exactly_once -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib unix::tests::wrapper_exec_preserves_only_declared_transport_fds -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib prepare::linux::tests::every_bwrap_argv_fd_survives_wrapper_exec -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib child::tests::linux_descriptor_exec_uses_prepared_inode_after_path_replacement -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib child::tests::all_governed_mappings_survive_and_sources_close_after_install -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib child::tests::status_eof_follows_exec_armed_frame_and_target_exec -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib unix::tests::wrapper_and_child_error_channels_have_distinct_close_owners -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib unix::tests::unrelated_fd_does_not_cross_wrapper_or_target_exec -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib spawn::tests::browser_target_fd_contract_is_exact -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib prepare::linux::tests::target_resolution_pins_inode -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib prepare::linux::tests::current_binary_uses_proc_self_exe_fd -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib bwrap::tests::argv_has_empty_root_and_literal_order -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib bwrap::tests::every_mount_source_is_fd_backed -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib launcher::tests::exec_uses_opened_bwrap_identity -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib prepare::linux::tests::prepared_plan_owns_duplicated_launcher -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib child::tests::child_request_rejects_zero_and_above_default_limits -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib child::tests::hidden_child_applies_limits_nnp_seccomp_then_exec -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --test pty_launcher -- --nocapture
-          cargo +1.88.0 test --locked -p pi-coding --test browser_native_sandbox governed_debugging_pipe_returns_browser_version -- --nocapture
+          set +e
+          failed=0
+          while IFS= read -r spec; do
+            [ -z "$spec" ] && continue
+            if ! cargo +1.88.0 test --locked $spec -- --nocapture > "$RUNNER_TEMP/proof.log" 2>&1; then
+              mkdir -p "$GITHUB_WORKSPACE/proof-failures"
+              cp "$RUNNER_TEMP/proof.log" "$GITHUB_WORKSPACE/proof-failures/linux-${{ matrix.arch }}.log"
+              {
+                printf '%s\n' "$spec"
+                awk '/^error(\[|:)/ {print; want=2; next} want > 0 && /^  *--> / {print; want=0; next} want > 0 {want--} /FAILED|panicked|test result:/ {print; pmsg=1; next} pmsg == 1 {print; pmsg=0}' "$RUNNER_TEMP/proof.log"
+                printf '%s\n' '--- last lines ---'
+                tail -n 5 "$RUNNER_TEMP/proof.log"
+              } | grep -aviE 'api[_-]?key|authorization|bearer |sk-[a-z0-9]{8}|ghp_[a-z0-9]|gho_[a-z0-9]|password|private key' > "$RUNNER_TEMP/proof-report.txt" || true
+              head -n 9 "$RUNNER_TEMP/proof-report.txt" | while IFS= read -r line; do printf '::error title=linux proof::%s\n' "$line"; done
+              cat "$RUNNER_TEMP/proof-report.txt" >> "$GITHUB_STEP_SUMMARY"
+              failed=1
+            fi
+          done <<'PROOFS'
+          -p pi-sandbox --test linux_backend
+          -p pi-sandbox --lib spawn::tests::owned_spawn_parts_are_consumed_exactly_once
+          -p pi-sandbox --lib unix::tests::wrapper_exec_preserves_only_declared_transport_fds
+          -p pi-sandbox --lib prepare::linux::tests::every_bwrap_argv_fd_survives_wrapper_exec
+          -p pi-sandbox --lib child::tests::linux_descriptor_exec_uses_prepared_inode_after_path_replacement
+          -p pi-sandbox --lib child::tests::all_governed_mappings_survive_and_sources_close_after_install
+          -p pi-sandbox --lib child::tests::status_eof_follows_exec_armed_frame_and_target_exec
+          -p pi-sandbox --lib unix::tests::wrapper_and_child_error_channels_have_distinct_close_owners
+          -p pi-sandbox --lib unix::tests::unrelated_fd_does_not_cross_wrapper_or_target_exec
+          -p pi-sandbox --lib spawn::tests::browser_target_fd_contract_is_exact
+          -p pi-sandbox --lib prepare::linux::tests::target_resolution_pins_inode
+          -p pi-sandbox --lib prepare::linux::tests::current_binary_uses_proc_self_exe_fd
+          -p pi-sandbox --lib bwrap::tests::argv_has_empty_root_and_literal_order
+          -p pi-sandbox --lib bwrap::tests::every_mount_source_is_fd_backed
+          -p pi-sandbox --lib launcher::tests::exec_uses_opened_bwrap_identity
+          -p pi-sandbox --lib prepare::linux::tests::prepared_plan_owns_duplicated_launcher
+          -p pi-sandbox --lib child::tests::child_request_rejects_zero_and_above_default_limits
+          -p pi-sandbox --lib child::tests::hidden_child_applies_limits_nnp_seccomp_then_exec
+          -p pi-sandbox --test pty_launcher
+          -p pi-coding --test browser_native_sandbox governed_debugging_pipe_returns_browser_version
+          PROOFS
+          exit "$failed"
+      - name: Upload Linux proof failure log
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: linux-proof-${{ matrix.arch }}
+          path: proof-failures/
 
   sandbox-macos-hosted:
     name: sandbox macOS hosted proof (${{ matrix.os }})
@@ -840,11 +875,29 @@ jobs:
       - name: Run macOS sandbox hosted proofs
         shell: bash
         run: |
-          cargo +1.88.0 test --locked -p pi-sandbox --test macos_backend
-          cargo +1.88.0 test --locked -p pi-sandbox --lib prepare::macos::tests::pinned_target_fd_survives_sandbox_exec_and_path_replacement -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib seatbelt::tests::descriptor_process_exec_representation_is_exact -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib unix::tests::wrapper_and_child_error_channels_have_distinct_close_owners -- --nocapture
-          cargo +1.88.0 test --locked -p pi-coding --test browser_native_sandbox governed_debugging_pipe_returns_browser_version -- --nocapture
+          set +e
+          failed=0
+          while IFS= read -r spec; do
+            [ -z "$spec" ] && continue
+            if ! cargo +1.88.0 test --locked $spec -- --nocapture > "$RUNNER_TEMP/proof.log" 2>&1; then
+              {
+                printf '%s\n' "$spec"
+                awk '/^error(\[|:)/ {print; want=2; next} want > 0 && /^  *--> / {print; want=0; next} want > 0 {want--} /FAILED|panicked|test result:/ {print; pmsg=1; next} pmsg == 1 {print; pmsg=0}' "$RUNNER_TEMP/proof.log"
+                printf '%s\n' '--- last lines ---'
+                tail -n 5 "$RUNNER_TEMP/proof.log"
+              } | grep -aviE 'api[_-]?key|authorization|bearer |sk-[a-z0-9]{8}|ghp_[a-z0-9]|gho_[a-z0-9]|password|private key' > "$RUNNER_TEMP/proof-report.txt" || true
+              head -n 9 "$RUNNER_TEMP/proof-report.txt" | while IFS= read -r line; do printf '::error title=macos proof::%s\n' "$line"; done
+              cat "$RUNNER_TEMP/proof-report.txt" >> "$GITHUB_STEP_SUMMARY"
+              failed=1
+            fi
+          done <<'PROOFS'
+          -p pi-sandbox --test macos_backend
+          -p pi-sandbox --lib prepare::macos::tests::pinned_target_fd_survives_sandbox_exec_and_path_replacement
+          -p pi-sandbox --lib seatbelt::tests::descriptor_process_exec_representation_is_exact
+          -p pi-sandbox --lib unix::tests::wrapper_and_child_error_channels_have_distinct_close_owners
+          -p pi-coding --test browser_native_sandbox governed_debugging_pipe_returns_browser_version
+          PROOFS
+          exit "$failed"
 
   sandbox-windows-hosted:
     name: sandbox Windows hosted proof

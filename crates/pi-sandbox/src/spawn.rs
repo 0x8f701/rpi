@@ -301,7 +301,7 @@ impl RetainedExecutable {
             SandboxError::from_io(crate::SandboxIoOperation::InspectDescriptor, &error)
         })?;
         use std::os::unix::fs::MetadataExt as _;
-        if !metadata.is_file() || metadata.mode() & 0o111 == 0 {
+        if !metadata.is_file() || metadata.mode() as u32 & 0o111 == 0 {
             return Err(SandboxError::InvalidSpawn {
                 failure: SpawnValidationError::InvalidRetainedExecutable,
             });
