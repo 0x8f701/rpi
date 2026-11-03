@@ -808,7 +808,7 @@ jobs:
               cp "$RUNNER_TEMP/proof.log" "$GITHUB_WORKSPACE/proof-failures/linux-${{ matrix.arch }}.log"
               {
                 printf '%s\n' "$spec"
-                awk '/^error(\[|:)/ {print; want=2; next} want > 0 && /^  *--> / {print; want=0; next} want > 0 {want--} /FAILED|panicked|test result:/ {print; pmsg=1; next} pmsg == 1 {print; pmsg=0}' "$RUNNER_TEMP/proof.log"
+                awk '/^error(\[|:)/ {print; want=2; next} want > 0 && /^  *--> / {print; want=0; next} want > 0 {want--} /panicked at/ {print; pmsg=3; next} pmsg > 0 {print; pmsg--}' "$RUNNER_TEMP/proof.log"
                 printf '%s\n' '--- last lines ---'
                 tail -n 5 "$RUNNER_TEMP/proof.log"
               } | grep -aviE 'api[_-]?key[ =:]|authorization[ =:]|bearer [a-z0-9]|sk-[a-z0-9]{16}|ghp_[a-z0-9]|gho_[a-z0-9]|github_pat_|password[ =:]|BEGIN [A-Z]+ PRIVATE' > "$RUNNER_TEMP/proof-report.txt" || true
@@ -899,7 +899,7 @@ jobs:
             if ! cargo +1.88.0 test --locked $spec -- --nocapture > "$RUNNER_TEMP/proof.log" 2>&1; then
               {
                 printf '%s\n' "$spec"
-                awk '/^error(\[|:)/ {print; want=2; next} want > 0 && /^  *--> / {print; want=0; next} want > 0 {want--} /FAILED|panicked|test result:/ {print; pmsg=1; next} pmsg == 1 {print; pmsg=0}' "$RUNNER_TEMP/proof.log"
+                awk '/^error(\[|:)/ {print; want=2; next} want > 0 && /^  *--> / {print; want=0; next} want > 0 {want--} /panicked at/ {print; pmsg=3; next} pmsg > 0 {print; pmsg--}' "$RUNNER_TEMP/proof.log"
                 printf '%s\n' '--- last lines ---'
                 tail -n 5 "$RUNNER_TEMP/proof.log"
               } | grep -aviE 'api[_-]?key[ =:]|authorization[ =:]|bearer [a-z0-9]|sk-[a-z0-9]{16}|ghp_[a-z0-9]|gho_[a-z0-9]|github_pat_|password[ =:]|BEGIN [A-Z]+ PRIVATE' > "$RUNNER_TEMP/proof-report.txt" || true
