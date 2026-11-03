@@ -48,7 +48,15 @@ pub(super) fn derive_macos_platform_facts(
     runtime_roots.extend(
         OPTIONAL_RUNTIME
             .iter()
-            .filter(|path| std::fs::symlink_metadata(path).is_ok())
+            // Seatbelt rejects symlinked roots outright, so a path that only
+            // exists as a symlink (macOS 15 moved /usr/share/zoneinfo) must be
+            // excluded here and never reach the policy.
+            .filter(|path| {
+                matches!(
+                    std::fs::symlink_metadata(path),
+                    Ok(metadata) if !metadata.file_type().is_symlink()
+                )
+            })
             .map(|path| AbsolutePath::parse(PathBuf::from(path)))
             .collect::<Result<Vec<_>, _>>()?,
     );

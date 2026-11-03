@@ -293,7 +293,11 @@ fn required_device_path(path: &str) -> Result<String, SandboxError> {
 fn optional_runtime_directory(path: &str) -> Result<Option<String>, SandboxError> {
     let absolute = parse_fixed_path(path)?;
     match fs::symlink_metadata(absolute.as_path()) {
+        // A symlinked optional root (macOS 15 moved /usr/share/zoneinfo) is
+        // skipped exactly like a missing one: the profile can never declare
+        // it, and the canonical data location covers the same files.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Ok(metadata) if metadata.file_type().is_symlink() => Ok(None),
         Err(_) => Err(unrepresentable(
             PolicyRepresentabilityError::MissingPolicyRoot { path: absolute },
         )),
