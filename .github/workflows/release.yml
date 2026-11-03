@@ -1,17 +1,16 @@
 name: Release
-
 # On tag push v*, validate the release identity, build the embedded web bundle
 # once, and publish three products:
-#   CLI: rpi-<version>-<target>.{tar.gz|zip} for the five native targets
+#   CLI: rpi-<version>-<target>.tar.gz for the four native targets
 #     (x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu,
-#     aarch64-apple-darwin, x86_64-apple-darwin, x86_64-pc-windows-msvc).
-#   Desktop: Linux amd64/arm64 .deb, macOS arm64/x86_64 .zip, and Windows
-#     x86_64 .zip. Each bundles the matching CLI binary. Packages are unsigned.
+#     aarch64-apple-darwin, x86_64-apple-darwin).
+#   Desktop: Linux amd64/arm64 .deb and macOS arm64/x86_64 .zip. Each bundles
+#     the matching CLI binary. Packages are unsigned.
 #   Mobile: one Android release APK, rpi-chat-<version>-android.apk, containing
 #     armeabi-v7a, arm64-v8a, x86, and x86_64. Signed with the checked-in debug
 #     keystore unless android/keystore.properties supplies another. iOS is not published.
-# Publication requires the static sandbox contracts plus Linux, macOS x64/arm64,
-# and Windows runtime proofs, as well as every CLI, desktop, and Android asset.
+# Publication requires the static sandbox contracts plus Linux and macOS
+# runtime proofs, as well as every CLI, desktop, and Android asset.
 
 on:
   push:
@@ -204,8 +203,7 @@ jobs:
       # build-release.sh composes stable rustc --remap-path-prefix for the
       # workspace, HOME, CARGO_HOME and RUSTUP_HOME roots (Cargo 1.88 rejects
       # the unstable trim-paths profile key) and hands them to cargo via
-      # CARGO_ENCODED_RUSTFLAGS, preserving incoming RUSTFLAGS such as the
-      # Windows -C target-feature=+crt-static matrix flag.
+      # CARGO_ENCODED_RUSTFLAGS, preserving incoming RUSTFLAGS.
       - name: Build rpi (release-dist)
         run: bash E2E.d/release/build-release.sh +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked --target ${{ matrix.target }}
 
@@ -282,10 +280,6 @@ jobs:
           - target: x86_64-apple-darwin
             os: macos-15-intel
             expected_arch: x86_64
-          - target: x86_64-pc-windows-msvc
-            os: windows-2022
-            expected_arch: AMD64
-            rustflags: "-C target-feature=+crt-static"
     runs-on: ${{ matrix.os }}
     needs: [validate-release, build-web]
     timeout-minutes: 90
@@ -338,15 +332,12 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # build-release.sh/.ps1 compose stable rustc --remap-path-prefix for the
+      # build-release.sh composes stable rustc --remap-path-prefix for the
       # workspace, HOME, CARGO_HOME and RUSTUP_HOME roots (Cargo 1.88 rejects
-      # the unstable trim-paths profile key) and hand them to cargo via
-      # CARGO_ENCODED_RUSTFLAGS, preserving the incoming matrix RUSTFLAGS
-      # (-C target-feature=+crt-static on Windows).
+      # the unstable trim-paths profile key) and hands them to cargo via
+      # CARGO_ENCODED_RUSTFLAGS.
       - name: Build rpi (release-dist, macOS)
-        if: runner.os != 'Windows'
         env:
-          RUSTFLAGS: ${{ matrix.rustflags }}
           CARGO_TERM_COLOR: never
         run: |
           if ! bash E2E.d/release/build-release.sh +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked --target ${{ matrix.target }} > "$RUNNER_TEMP/rpi-build.log" 2>&1; then
@@ -355,27 +346,10 @@ jobs:
             exit 1
           fi
 
-      - name: Build rpi (release-dist, Windows)
-        if: runner.os == 'Windows'
-        env:
-          RUSTFLAGS: ${{ matrix.rustflags }}
-          CARGO_TERM_COLOR: never
-        shell: pwsh
-        run: |
-          & ./E2E.d/release/build-release.ps1 +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked --target ${{ matrix.target }} *> "$env:RUNNER_TEMP/rpi-build.log"
-          if ($LASTEXITCODE -ne 0) {
-            Write-Output "::error title=build::release build failed"
-            (Select-String -Path "$env:RUNNER_TEMP/rpi-build.log" -Pattern '^error' | Select-Object -First 9) | ForEach-Object { Write-Output ("::error title=build::" + $_.Line) }
-            Get-Content "$env:RUNNER_TEMP/rpi-build.log" -Tail 40 | Add-Content "$env:GITHUB_STEP_SUMMARY"
-            exit 1
-          }
-
       - name: Verify stripped release binary
         shell: bash
         run: |
-          suffix=""
-          if [ "${{ runner.os }}" = "Windows" ]; then suffix=".exe"; fi
-          src="target/${{ matrix.target }}/release-dist/rpi${suffix}"
+          src="target/${{ matrix.target }}/release-dist/rpi"
           [ -f "$src" ] || { echo "rpi binary not found at $src" >&2; exit 1; }
 
           bytes="$(wc -c < "$src" | tr -d '[:space:]')"
@@ -387,8 +361,7 @@ jobs:
 
       # Fails on any count above zero; prints counts per category only, never
       # the matching strings (the prefixes are builder paths).
-      - name: Verify no builder path leakage (macOS)
-        if: runner.os != 'Windows'
+      - name: Verify no builder path leakage
         shell: bash
         run: |
           cargo_home="${CARGO_HOME:-$HOME/.cargo}"
@@ -400,27 +373,9 @@ jobs:
             "CARGO_HOME=$cargo_home" \
             "RUSTUP_HOME=$rustup_home"
 
-      - name: Verify no builder path leakage (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME '.cargo' }
-          $rustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { Join-Path $HOME '.rustup' }
-          & ./E2E.d/release/path-leak-check.ps1 "target/${{ matrix.target }}/release-dist/rpi.exe" "HOME=$HOME" "WORKSPACE=$env:GITHUB_WORKSPACE" "CARGO_HOME=$cargoHome" "RUSTUP_HOME=$rustupHome"
-
-      - name: Smoke-test the native binary (macOS)
-        if: runner.os != 'Windows'
+      - name: Smoke-test the native binary
         shell: bash
         run: target/${{ matrix.target }}/release-dist/rpi --version
-
-      - name: Smoke-test the native binary (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $src = "target/${{ matrix.target }}/release-dist/rpi.exe"
-          if (-not (Test-Path -LiteralPath $src)) { throw "rpi binary not found at $src" }
-          & $src --version
-          if ($LASTEXITCODE -ne 0) { throw "rpi --version exited $LASTEXITCODE" }
 
       - name: Package archive (tar.gz)
         if: runner.os != 'Windows'
@@ -442,23 +397,6 @@ jobs:
             shasum -a 256 "$archive"
           fi
           echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
-
-      - name: Package archive (zip)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $version = $env:GITHUB_REF_NAME.TrimStart("v")
-          $archive = "rpi-$version-${{ matrix.target }}.zip"
-          $staging = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP "staging") -Force
-          if (-not (Test-Path -Path LICENSE -PathType Leaf)) {
-            throw "LICENSE is required in release archives"
-          }
-          Copy-Item "target/${{ matrix.target }}/release-dist/rpi.exe" (Join-Path $staging "rpi.exe")
-          Copy-Item LICENSE $staging
-          if (Test-Path -Path NOTICE -PathType Leaf) { Copy-Item NOTICE $staging }
-          Compress-Archive -Path (Join-Path $staging "*") -DestinationPath $archive
-          Get-FileHash -Algorithm SHA256 $archive
-          Add-Content -Path $env:GITHUB_ENV -Value "ARCHIVE=$archive"
 
       - name: Upload artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
@@ -496,11 +434,6 @@ jobs:
             kind: mac
             asset_arch: x86_64-apple-darwin
             expected_arch: x86_64
-          - os: windows-2022
-            target: x86_64-pc-windows-msvc
-            kind: win
-            asset_arch: x86_64-pc-windows-msvc
-            expected_arch: AMD64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -590,19 +523,6 @@ jobs:
           bash crates/pi-cli/desktop/package-mac.sh "$asset"
           shasum -a 256 "$asset"
           echo "ARCHIVE=$asset" >> "$GITHUB_ENV"
-
-      - name: Package Windows zip
-        if: matrix.kind == 'win'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $env:VERSION = $env:RELEASE_VERSION
-          $env:RPI_BINARY = Join-Path $env:GITHUB_WORKSPACE 'target\release-dist\rpi.exe'
-          $asset = "rpi-desktop-$env:RELEASE_VERSION-${{ matrix.asset_arch }}.zip"
-          & ./crates/pi-cli/desktop/package-win.ps1 $asset
-          if ($LASTEXITCODE -ne 0) { throw "package-win.ps1 exited $LASTEXITCODE" }
-          Get-FileHash -Algorithm SHA256 $asset
-          Add-Content -Path $env:GITHUB_ENV -Value "ARCHIVE=$asset"
 
       - name: Upload desktop package
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
@@ -868,39 +788,6 @@ jobs:
           cargo +1.88.0 test --locked -p pi-sandbox --lib unix::tests::wrapper_and_child_error_channels_have_distinct_close_owners -- --nocapture
           cargo +1.88.0 test --locked -p pi-coding --test browser_native_sandbox governed_debugging_pipe_returns_browser_version -- --nocapture
 
-  sandbox-windows-release:
-    name: sandbox Windows release proof
-    needs: [validate-release, build-web]
-    runs-on: windows-2022
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          ref: ${{ github.sha }}
-
-      - name: Download embedded Web bundle
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          name: web-dist
-          path: crates/pi-cli/web/dist
-
-      - name: Install Rust 1.88.0
-        shell: pwsh
-        run: |
-          rustup toolchain install 1.88.0 --profile minimal
-          $rustcVersion = rustc +1.88.0 --version
-          Write-Host $rustcVersion
-          if (-not $rustcVersion.StartsWith('rustc 1.88.0 ')) { throw 'Expected rustc 1.88.0' }
-
-
-      - name: Run Windows sandbox release proofs
-        shell: pwsh
-        run: |
-          cargo +1.88.0 test --locked -p pi-cli --test windows_confined_unsupported
-          cargo +1.88.0 test --locked -p pi-coding --test browser_native_sandbox windows_browser_is_rejected_before_approval -- --nocapture
-          cargo +1.88.0 test --locked -p pi-coding --test policy_fs windows_file_identity_preserves_all_128_bits -- --nocapture
-          cargo +1.88.0 test --locked -p pi-coding --test policy_fs windows_enumerated_and_opened_high_bits_cannot_collide -- --nocapture
-          cargo +1.88.0 test --locked -p pi-coding --test policy_fs windows_replacement_rejects_high_bits_identity_swap -- --nocapture
 
   release:
     name: publish GitHub Release
@@ -913,7 +800,6 @@ jobs:
       - package-android
       - sandbox-linux-release
       - sandbox-macos-release
-      - sandbox-windows-release
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -925,7 +811,7 @@ jobs:
       # Download every CLI, desktop, and Android release file. `web-dist`
       # (the embedded web bundle shared into the build jobs) must NOT land in
       # the release staging dir. The exact-inventory check below requires the
-      # eleven product files and nothing else.
+      # nine product files and nothing else.
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           path: dist
@@ -949,20 +835,18 @@ jobs:
             "rpi-${version}-aarch64-apple-darwin.tar.gz"
             "rpi-${version}-aarch64-unknown-linux-gnu.tar.gz"
             "rpi-${version}-x86_64-apple-darwin.tar.gz"
-            "rpi-${version}-x86_64-pc-windows-msvc.zip"
             "rpi-${version}-x86_64-unknown-linux-gnu.tar.gz"
             "rpi-desktop-${version}-aarch64-apple-darwin.zip"
             "rpi-desktop-${version}-amd64.deb"
             "rpi-desktop-${version}-arm64.deb"
             "rpi-desktop-${version}-x86_64-apple-darwin.zip"
-            "rpi-desktop-${version}-x86_64-pc-windows-msvc.zip"
             "rpi-chat-${version}-android.apk"
           )
 
           printf '%s\n' "${expected[@]}" | LC_ALL=C sort > "$RUNNER_TEMP/expected-assets.txt"
           find . -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort > "$RUNNER_TEMP/actual-assets.txt"
           if ! diff -u "$RUNNER_TEMP/expected-assets.txt" "$RUNNER_TEMP/actual-assets.txt"; then
-            echo "Local release inventory is not exactly the eleven expected product files" >&2
+            echo "Local release inventory is not exactly the nine expected product files" >&2
             exit 1
           fi
 
@@ -1030,25 +914,19 @@ jobs:
 
             ### CLI
 
-            Platforms: Linux x86_64, Linux aarch64, macOS arm64, macOS x86_64, Windows x86_64.
+            Platforms: Linux x86_64, Linux aarch64, macOS arm64, macOS x86_64.
 
-            Archives are `rpi-<version>-<target-triple>.tar.gz` (Windows is `.zip`). Each contains `rpi` or `rpi.exe` plus `LICENSE`.
+            Archives are `rpi-<version>-<target-triple>.tar.gz`. Each contains `rpi` plus `LICENSE`.
 
             ```sh
             # macOS / Linux — installer source pinned to this release commit; candidate pinned to this release tag
             curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/${{ github.sha }}/install.sh | bash -s -- --version ${{ github.ref_name }}
             ```
-
-            ```powershell
-            # Windows PowerShell — installer source pinned to this release commit; candidate pinned to this release tag
-            & ([scriptblock]::Create((irm https://raw.githubusercontent.com/0x8f701/rpi/${{ github.sha }}/install.ps1))) -Version ${{ github.ref_name }}
-            ```
-
             ### Desktop
 
-            Platforms: Linux amd64 `.deb`, Linux arm64 `.deb`, macOS arm64 `.zip`, macOS x86_64 `.zip`, Windows x86_64 `.zip`.
+            Platforms: Linux amd64 `.deb`, Linux arm64 `.deb`, macOS arm64 `.zip`, macOS x86_64 `.zip`.
 
-            Each desktop package bundles the CLI binary for that same platform. Linux: `dpkg -i rpi-desktop-<version>-amd64.deb` or `dpkg -i rpi-desktop-<version>-arm64.deb`. macOS: unzip `rpi-desktop-<version>-aarch64-apple-darwin.zip` or the x86_64 zip and open `rpi-desktop.app`. Windows: unzip `rpi-desktop-<version>-x86_64-pc-windows-msvc.zip` and run `rpi-desktop\electron.exe`. These desktop packages are not code-signed or notarized.
+            Each desktop package bundles the CLI binary for that same platform. Linux: `dpkg -i rpi-desktop-<version>-amd64.deb` or `dpkg -i rpi-desktop-<version>-arm64.deb`. macOS: unzip `rpi-desktop-<version>-aarch64-apple-darwin.zip` or the x86_64 zip and open `rpi-desktop.app`. These desktop packages are not code-signed or notarized.
 
             ### Mobile
 
@@ -1065,13 +943,11 @@ jobs:
             "rpi-${version}-aarch64-apple-darwin.tar.gz"
             "rpi-${version}-aarch64-unknown-linux-gnu.tar.gz"
             "rpi-${version}-x86_64-apple-darwin.tar.gz"
-            "rpi-${version}-x86_64-pc-windows-msvc.zip"
             "rpi-${version}-x86_64-unknown-linux-gnu.tar.gz"
             "rpi-desktop-${version}-aarch64-apple-darwin.zip"
             "rpi-desktop-${version}-amd64.deb"
             "rpi-desktop-${version}-arm64.deb"
             "rpi-desktop-${version}-x86_64-apple-darwin.zip"
-            "rpi-desktop-${version}-x86_64-pc-windows-msvc.zip"
             "rpi-chat-${version}-android.apk"
           )
           release_id="${{ steps.draft_release.outputs.id }}"
@@ -1094,7 +970,7 @@ jobs:
           printf '%s\n' "${expected[@]}" | LC_ALL=C sort > "$RUNNER_TEMP/expected-remote-assets.txt"
           jq -r '.assets[].name' <<< "$release_json" | LC_ALL=C sort > "$RUNNER_TEMP/actual-remote-assets.txt"
           if ! diff -u "$RUNNER_TEMP/expected-remote-assets.txt" "$RUNNER_TEMP/actual-remote-assets.txt"; then
-            echo "Remote draft inventory is not exactly the eleven product files plus SHA256SUMS" >&2
+            echo "Remote draft inventory is not exactly the nine product files plus SHA256SUMS" >&2
             exit 1
           fi
 
