@@ -5929,45 +5929,11 @@ body:has(#subagents-panel) .file-explorer-resizer {
   border-radius: var(--radius-sm);
   background: var(--bg-deep);
 }
-.file-conversation__head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex: none;
-  min-height: 32px;
-  font-weight: 600;
-  font-size: 12px;
-  color: var(--muted);
-  letter-spacing: 0.3px;
-}
-.file-conversation__expand {
-  margin-left: auto;
-  width: 32px;
-  height: 32px;
-  border: 1px solid var(--border);
-  border-radius: 0;
-  background: transparent;
-  color: var(--muted);
-}
-.file-conversation__expand:hover {
-  color: var(--fg);
-  border-color: var(--border-strong);
-  background: var(--bg-hover);
-}
-.file-explorer--ask-expanded .file-explorer__tree-viewport,
-.file-explorer--ask-expanded .file-explorer__divider,
-.file-explorer--ask-expanded .file-explorer__content-viewport {
-  display: none;
-}
 .file-explorer__body > .file-conversation {
   flex: 1 1 240px;
   width: auto;
   min-width: 180px;
   max-width: 360px;
-}
-.file-explorer--ask-expanded .file-explorer__body > .file-conversation {
-  flex: 1 1 auto;
-  width: 100%;
 }
 .file-conversation__context {
   flex: none;

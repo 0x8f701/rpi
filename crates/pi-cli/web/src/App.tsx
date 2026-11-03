@@ -2362,11 +2362,6 @@ export function App() {
     });
   }, []);
 
-  const openFileInDrawer = useCallback((path: string, line?: number, ownerSessionId?: string, view: FileExplorerTab['view'] = 'file') => {
-    const sid = ownerSessionId?.trim();
-    if (!sid || !path.trim()) return;
-    patchFileExplorer(sid, (slot) => applyOpenPath(slot, path, line, view));
-  }, [patchFileExplorer]);
 
 
   const toggleFileExplorer = useCallback(() => {
@@ -2378,7 +2373,12 @@ export function App() {
       opening = next === 'open';
       return applyDrawerMode(slot, next);
     });
-    if (opening) setActivePanel('');
+    if (opening) {
+      setActivePanel('');
+      // Every open starts fullscreen; the in-drawer ⛶ shrinks it for this
+      // open only.
+      setFileExplorerExpanded(true);
+    }
   }, [patchFileExplorer]);
 
 
@@ -2539,19 +2539,27 @@ export function App() {
   }, [patchFileExplorer]);
 
   // Any non-empty activePanel (feature-nav toggle, Manage session, /code-review
-  // slash command) collapses the mobile drawer at <=720px before paint; the
-  // drawer-close is keyed off state here instead of firing from inside
-  // openPanel's updater. Desktop (>=721px) keeps the rail open.
-  // File explorer FULL-APP expand (user requirement): the same-row ⛶ button
-  // toggles an app-layout class that hides the sidebar + transcript +
-  // composer so the file tree + content viewports fill the entire app area.
-  // Resets when the drawer closes (the open-branch unmount owns the panel).
-  const [fileExplorerExpanded, setFileExplorerExpanded] = useState(false);
+  // slash command) collapses the mobile drawer at <=720px before paint.
+  // File explorer FULL-APP expand (user requirement): the drawer OPENS
+  // fullscreen; the same-row ⛶ button shrinks it back. The class hides the
+  // sidebar + transcript + composer so the file tree + content viewports
+  // fill the entire app area.
+  const [fileExplorerExpanded, setFileExplorerExpanded] = useState(true);
   useLayoutEffect(() => {
     if (activePanel !== '' && window.matchMedia('(max-width: 720px)').matches) {
       setSidebarOpen(false);
     }
   }, [activePanel]);
+
+  const openFileInDrawer = useCallback((path: string, line?: number, ownerSessionId?: string, view: FileExplorerTab['view'] = 'file') => {
+    const sid = ownerSessionId?.trim();
+    if (!sid || !path.trim()) return;
+    patchFileExplorer(sid, (slot) => {
+      const opening = slot.mode !== 'open';
+      if (opening) setFileExplorerExpanded(true);
+      return applyOpenPath(slot, path, line, view);
+    });
+  }, [patchFileExplorer, setFileExplorerExpanded]);
 
   // ONE top authority: the measured height is rounded to an integer and
   // written as --app-header-height (applyHeaderHeight); the header, the

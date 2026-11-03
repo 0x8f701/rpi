@@ -120,7 +120,7 @@ function headerSlice(html: string): string {
 {
   const html = renderExplorer({ onToggleExpanded: () => {} });
   const head = headerSlice(html);
-  check('a11y: fullscreen control is absent from the header', !head.includes('expand-btn') && !head.includes('Expand file explorer to the full app area'));
+  check('a11y: fullscreen control expands and shrinks the drawer', head.includes('file-explorer__expand-btn') && head.includes('Expand file explorer to the full app area') && head.includes(FILE_EXPLORER_CLOSE_BTN_ID));
   check('a11y: close stays in the header actions', head.includes(FILE_EXPLORER_CLOSE_BTN_ID));
 }
 

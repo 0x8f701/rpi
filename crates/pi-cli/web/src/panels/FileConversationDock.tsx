@@ -186,17 +186,6 @@ export function FileConversationDock({
       data-session-id={ownerSessionId}
       data-workspace-cwd={ownerCwd}
     >
-      <div className="file-conversation__head">
-        <button
-          type="button"
-          className="file-conversation__expand"
-          title="Expand Ask"
-          aria-label="Expand Ask"
-          onClick={() => document.querySelector('.file-explorer')?.classList.toggle('file-explorer--ask-expanded')}
-        >
-          ⛶
-        </button>
-      </div>
       {disclosure && (
         <div className="file-conversation__context">{disclosure}</div>
       )}

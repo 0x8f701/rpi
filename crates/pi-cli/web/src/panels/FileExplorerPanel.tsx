@@ -684,6 +684,8 @@ export function FileExplorerPanel({
   markdownMappingId,
   connectionEpoch,
   toggleId = FILE_EXPLORER_TOGGLE_ID,
+  expanded,
+  onToggleExpanded,
   exclusivePanes = false,
 }: FileExplorerPanelProps) {
   const [changes, setChanges] = useState<FileExplorerChange[]>([]);
@@ -2182,6 +2184,18 @@ export function FileExplorerPanel({
             <span className="file-explorer__refresh-glyph" aria-hidden="true">⟳</span>
           </button>
 
+          {onToggleExpanded != null && (
+            <button
+              type="button"
+              id={fileExplorerControlId(toggleId, 'expand-btn')}
+              className={`file-explorer__expand-btn${expanded ? ' is-active' : ''}`}
+              title={expanded ? 'Shrink file explorer back to the panel' : 'Expand file explorer to the full app area'}
+              aria-label={expanded ? 'Shrink file explorer back to the panel' : 'Expand file explorer to the full app area'}
+              onClick={onToggleExpanded}
+            >
+              <span className="file-explorer__action-glyph" aria-hidden="true">⛶</span>
+            </button>
+          )}
           <button
             type="button"
             id={fileExplorerControlId(toggleId, 'drawer-close-btn')}
