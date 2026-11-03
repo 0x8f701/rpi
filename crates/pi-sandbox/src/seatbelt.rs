@@ -157,6 +157,17 @@ fn represent_macos_policy(
         policy_write_filters.push(SeatbeltFilter::Subpath(represented));
     }
     for root in &input.caller_writable_roots {
+        // The prepare contract only admits caller mounts whose destination IS
+        // a declared writable root, so that root's read/write filters were
+        // already pushed above; re-adding them trips the duplicate check.
+        if input
+            .filesystem
+            .writable_roots()
+            .iter()
+            .any(|writable| writable.root() == root)
+        {
+            continue;
+        }
         let represented = policy_directory(root)?;
         readable_roots.push(root.as_path());
         writable_roots.push(root.as_path());

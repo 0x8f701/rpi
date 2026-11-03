@@ -8,7 +8,9 @@ use super::{
     derive_mandatory_paths,
 };
 
-const REQUIRED_RUNTIME: [&str; 11] = [
+// Device nodes are NOT here: REQUIRED_DEVICES owns them, and duplicating a
+// path into the read-only policy roots fails the profile's duplicate check.
+const REQUIRED_RUNTIME: [&str; 7] = [
     "/System/Library/Frameworks",
     "/System/Library/PrivateFrameworks",
     "/System/Library/CoreServices",
@@ -16,10 +18,6 @@ const REQUIRED_RUNTIME: [&str; 11] = [
     "/usr/libexec",
     "/private/etc/passwd",
     "/usr/bin/sandbox-exec",
-    "/dev/null",
-    "/dev/random",
-    "/dev/urandom",
-    "/dev/tty",
 ];
 const OPTIONAL_RUNTIME: [&str; 8] = [
     "/usr/share/icu",
