@@ -627,7 +627,7 @@ const activeMapping: ActiveMapping = {
     appIds.has('file-explorer-refresh-btn')
       && appIds.has('file-explorer-tree-toggle')
       && appIds.has('file-explorer-drawer-close-btn')
-      && !appIds.has('file-explorer-expand-btn')
+      && appIds.has('file-explorer-expand-btn')
       && appIds.has('file-explorer-line-1')
       && !appIds.has('file-explorer-hide-btn'),
   );

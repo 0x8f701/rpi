@@ -1419,7 +1419,7 @@ await (async () => {
   const markdownHandler = mdStart >= 0 && mdEnd > mdStart ? app.slice(mdStart, mdEnd) : '';
   check('Files toggle is independent of activePanel', app.includes('id="file-explorer-toggle-btn"') && app.includes('toggleFileExplorer'));
   check('opening a feature panel closes the file explorer', app.includes("if (sid) patchFileExplorer(sid, (slot) => applyDrawerMode(slot, 'closed'))"));
-  check('opening the file explorer closes the feature panel', app.includes("if (opening) setActivePanel('')"));
+  check('opening the file explorer closes the feature panel and starts fullscreen', app.includes("if (opening) {") && app.includes("setActivePanel('');") && app.includes("setFileExplorerExpanded(true);"));
   check('drawer close is the one in-drawer full close', panel.includes(`FILE_EXPLORER_CLOSE_BTN_ID = 'file-explorer-drawer-close-btn'`) && panel.includes('aria-label="Close file explorer"') && panel.includes('title="Close file explorer"') && panel.includes('className="file-explorer__close"') && !panel.includes('className="file-explorer__title-button"') && !panel.includes('className="file-explorer__hide"') && !panel.includes('FILE_EXPLORER_HIDE_BTN_ID') && panel.includes('const closeDrawer = useCallback') && panel.includes('onClick={closeDrawer}'));
   check('App Files toggle reopens the drawer', app.includes(`id="${FILE_EXPLORER_TOGGLE_ID}"`) && panel.includes(`FILE_EXPLORER_TOGGLE_ID = '${FILE_EXPLORER_TOGGLE_ID}'`));
   check('Files toggle closes and reopens the same session slot', app.includes("slot.mode === 'closed' ? 'open' : 'closed'"));
@@ -1545,9 +1545,10 @@ await (async () => {
     /\.file-explorer\s*\{[^}]*top\s*:\s*var\(--app-header-height\)[^}]*height\s*:\s*auto[^}]*max-height\s*:\s*none/.test(css),
   );
   check(
-    'the panel has no fullscreen expand button',
-    !panel.includes('file-explorer-expand-btn')
-      && !panel.includes('Expand file explorer to the full app area'),
+    'the panel renders the fullscreen expand control when owned',
+    panel.includes(`fileExplorerControlId(toggleId, 'expand-btn')`)
+      && panel.includes('Expand file explorer to the full app area')
+      && panel.includes('Shrink file explorer back to the panel'),
   );
   check(
     'App markdown probe names the bounded referenced path only on the post-retry missing-file verdict',
