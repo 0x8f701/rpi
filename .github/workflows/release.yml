@@ -668,6 +668,10 @@ jobs:
       - name: Build and verify bubblewrap 0.10.0
         shell: bash
         run: |
+          # Ubuntu 24.04 denies unprivileged user namespaces by default
+          # (apparmor_restrict_unprivileged_userns), which breaks bwrap's uid
+          # map setup. Lift it for the proof.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           if ! sudo apt-get update > "$RUNNER_TEMP/bwrap-apt.log" 2>&1 || ! sudo apt-get install --no-install-recommends -y build-essential meson ninja-build libcap-dev >> "$RUNNER_TEMP/bwrap-apt.log" 2>&1; then
             { printf '%s\n' 'apt-get update/install failed'; tail -n 8 "$RUNNER_TEMP/bwrap-apt.log"; } | grep -aviE 'api[_-]?key|authorization|bearer |sk-[a-z0-9]{8}|ghp_[a-z0-9]|gho_[a-z0-9]|password|private key' | head -n 9 | while IFS= read -r line; do printf '::error title=bwrap apt::%s\n' "$line"; done
             tail -n 80 "$RUNNER_TEMP/bwrap-apt.log" >> "$GITHUB_STEP_SUMMARY"
@@ -791,12 +795,22 @@ jobs:
       - name: Run macOS sandbox release proofs
         shell: bash
         run: |
-          cargo +1.88.0 test --locked -p pi-sandbox --test macos_backend
-          cargo +1.88.0 test --locked -p pi-sandbox --lib prepare::macos::tests::pinned_target_fd_survives_sandbox_exec_and_path_replacement -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib seatbelt::tests::descriptor_process_exec_representation_is_exact -- --nocapture
-          cargo +1.88.0 test --locked -p pi-sandbox --lib unix::tests::wrapper_and_child_error_channels_have_distinct_close_owners -- --nocapture
-          cargo +1.88.0 test --locked -p pi-coding --test browser_native_sandbox governed_debugging_pipe_returns_browser_version -- --nocapture
-
+          set +e
+          failed=0
+          while IFS= read -r spec; do
+            [ -z "$spec" ] && continue
+            if ! cargo +1.88.0 test --locked $spec -- --nocapture > "$RUNNER_TEMP/proof.log" 2>&1; then
+              { printf '%s\n' "$spec"; grep -am 9 '^error' "$RUNNER_TEMP/proof.log"; printf '%s\n' '--- last lines ---'; tail -n 5 "$RUNNER_TEMP/proof.log"; } | grep -aviE 'api[_-]?key|authorization|bearer |sk-[a-z0-9]{8}|ghp_[a-z0-9]|gho_[a-z0-9]|password|private key' | head -n 10 | while IFS= read -r line; do printf '::error title=macos proof::%s\n' "$line"; done
+              failed=1
+            fi
+          done <<'PROOFS'
+          -p pi-sandbox --test macos_backend
+          -p pi-sandbox --lib prepare::macos::tests::pinned_target_fd_survives_sandbox_exec_and_path_replacement
+          -p pi-sandbox --lib seatbelt::tests::descriptor_process_exec_representation_is_exact
+          -p pi-sandbox --lib unix::tests::wrapper_and_child_error_channels_have_distinct_close_owners
+          -p pi-coding --test browser_native_sandbox governed_debugging_pipe_returns_browser_version
+          PROOFS
+          exit "$failed"
 
   release:
     name: publish GitHub Release

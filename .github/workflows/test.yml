@@ -739,6 +739,10 @@ jobs:
       - name: Build and verify bubblewrap 0.10.0
         shell: bash
         run: |
+          # Ubuntu 24.04 denies unprivileged user namespaces by default
+          # (apparmor_restrict_unprivileged_userns), which breaks bwrap's uid
+          # map setup. Lift it for the proof.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           if ! sudo apt-get update > "$RUNNER_TEMP/bwrap-apt.log" 2>&1 || ! sudo apt-get install --no-install-recommends -y build-essential meson ninja-build libcap-dev >> "$RUNNER_TEMP/bwrap-apt.log" 2>&1; then
             { printf '%s\n' 'apt-get update/install failed'; tail -n 8 "$RUNNER_TEMP/bwrap-apt.log"; } | grep -aviE 'api[_-]?key|authorization|bearer |sk-[a-z0-9]{8}|ghp_[a-z0-9]|gho_[a-z0-9]|password|private key' | head -n 9 | while IFS= read -r line; do printf '::error title=bwrap apt::%s\n' "$line"; done
             tail -n 80 "$RUNNER_TEMP/bwrap-apt.log" >> "$GITHUB_STEP_SUMMARY"
