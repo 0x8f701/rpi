@@ -224,13 +224,6 @@ fn represent_macos_policy(
         executable_path_and_fd(input.current_executable, input.current_transport_fd)?;
     let target_executable =
         executable_path_and_fd(input.target_executable, input.target_transport_fd)?;
-    if !covered_by(input.target_executable.as_path(), &readable_roots)
-        && !runtime_filter_covers(input.target_executable.as_path(), &runtime_read_filters)
-    {
-        return Err(unrepresentable(
-            PolicyRepresentabilityError::TargetNotReadable,
-        ));
-    }
 
     Ok(RepresentedMacosPolicy {
         current_executable,
@@ -468,12 +461,6 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
     left.starts_with(right) || right.starts_with(left)
 }
 
-fn runtime_filter_covers(path: &Path, filters: &[SeatbeltFilter]) -> bool {
-    filters.iter().any(|filter| match filter {
-        SeatbeltFilter::Literal(candidate) => path == Path::new(candidate),
-        SeatbeltFilter::Subpath(candidate) => path.starts_with(Path::new(candidate)),
-    })
-}
 
 fn sort_and_reject_duplicates(
     field: &'static str,
