@@ -129,7 +129,7 @@ fn represent_macos_policy(
     let mut protected_paths = Vec::new();
 
     for root in input.filesystem.read_only_roots() {
-        let represented = policy_directory(root)?;
+        let represented = policy_existing_path(root)?;
         readable_roots.push(root.as_path());
         policy_read_filters.push(SeatbeltFilter::Subpath(represented));
     }
@@ -314,6 +314,15 @@ fn optional_runtime_directory(path: &str) -> Result<Option<String>, SandboxError
 
 fn policy_directory(path: &AbsolutePath) -> Result<String, SandboxError> {
     ensure_canonical_existing(path, EntryKind::Directory, || {
+        PolicyRepresentabilityError::MissingPolicyRoot { path: path.clone() }
+    })?;
+    path_to_string(path)
+}
+
+fn policy_existing_path(path: &AbsolutePath) -> Result<String, SandboxError> {
+    // Read-only supports include device nodes (/dev/null), so existence plus
+    // canonical form is the only contract here; kind stays unchecked.
+    ensure_canonical_existing(path, EntryKind::Any, || {
         PolicyRepresentabilityError::MissingPolicyRoot { path: path.clone() }
     })?;
     path_to_string(path)
