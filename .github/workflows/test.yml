@@ -740,6 +740,7 @@ jobs:
         shell: bash
         run: |
           if ! sudo apt-get update > "$RUNNER_TEMP/bwrap-apt.log" 2>&1 || ! sudo apt-get install --no-install-recommends -y build-essential meson ninja-build libcap-dev >> "$RUNNER_TEMP/bwrap-apt.log" 2>&1; then
+            { printf '%s\n' 'apt-get update/install failed'; tail -n 8 "$RUNNER_TEMP/bwrap-apt.log"; } | grep -aviE 'api[_-]?key|authorization|bearer |sk-[a-z0-9]{8}|ghp_[a-z0-9]|gho_[a-z0-9]|password|private key' | head -n 9 | while IFS= read -r line; do printf '::error title=bwrap apt::%s\n' "$line"; done
             tail -n 80 "$RUNNER_TEMP/bwrap-apt.log" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
@@ -750,17 +751,29 @@ jobs:
           git -C "$bwrap_source" checkout --detach FETCH_HEAD
           [ "$(git -C "$bwrap_source" rev-parse HEAD)" = dc63ec667e6546f34e0b6c088cdf8ae7c7dea0f3 ]
           if ! meson setup "$bwrap_source/build" "$bwrap_source" --buildtype=release --prefix=/usr -Dselinux=disabled -Dbash_completion=disabled -Dzsh_completion=disabled -Dman=disabled -Dtests=false > "$RUNNER_TEMP/bwrap-setup.log" 2>&1; then
+            { printf '%s\n' 'meson setup failed'; tail -n 8 "$RUNNER_TEMP/bwrap-setup.log"; } | grep -aviE 'api[_-]?key|authorization|bearer |sk-[a-z0-9]{8}|ghp_[a-z0-9]|gho_[a-z0-9]|password|private key' | head -n 9 | while IFS= read -r line; do printf '::error title=bwrap meson::%s\n' "$line"; done
             tail -n 80 "$RUNNER_TEMP/bwrap-setup.log" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
           if ! ninja -C "$bwrap_source/build" > "$RUNNER_TEMP/bwrap-build.log" 2>&1; then
+            { printf '%s\n' 'ninja build failed'; tail -n 8 "$RUNNER_TEMP/bwrap-build.log"; } | grep -aviE 'api[_-]?key|authorization|bearer |sk-[a-z0-9]{8}|ghp_[a-z0-9]|gho_[a-z0-9]|password|private key' | head -n 9 | while IFS= read -r line; do printf '::error title=bwrap ninja::%s\n' "$line"; done
             tail -n 80 "$RUNNER_TEMP/bwrap-build.log" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
-          sudo ninja -C "$bwrap_source/build" install
+          if ! sudo ninja -C "$bwrap_source/build" install > "$RUNNER_TEMP/bwrap-install.log" 2>&1; then
+            { printf '%s\n' 'ninja install failed'; tail -n 8 "$RUNNER_TEMP/bwrap-install.log"; } | grep -aviE 'api[_-]?key|authorization|bearer |sk-[a-z0-9]{8}|ghp_[a-z0-9]|gho_[a-z0-9]|password|private key' | head -n 9 | while IFS= read -r line; do printf '::error title=bwrap install::%s\n' "$line"; done
+            exit 1
+          fi
           version="$(bwrap --version)"
           printf 'bwrap version: %s\n' "$version" >> "$GITHUB_STEP_SUMMARY"
-          [ "$version" = "bubblewrap 0.10.0" ]
+          if [ "$version" != "bubblewrap 0.10.0" ]; then
+            printf '::error title=bwrap version::got %s\n' "$version"
+            exit 1
+          fi
+          if ! E2E.d/ci/orchestration.sh __bubblewrap-fd-probe > "$RUNNER_TEMP/bwrap-probe.log" 2>&1; then
+            { printf '%s\n' 'fd probe failed'; tail -n 8 "$RUNNER_TEMP/bwrap-probe.log"; } | grep -aviE 'api[_-]?key|authorization|bearer |sk-[a-z0-9]{8}|ghp_[a-z0-9]|gho_[a-z0-9]|password|private key' | head -n 9 | while IFS= read -r line; do printf '::error title=bwrap probe::%s\n' "$line"; done
+            exit 1
+          fi
 
       - name: Set up Node for Chromium
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0

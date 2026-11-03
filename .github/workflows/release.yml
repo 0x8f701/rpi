@@ -689,11 +689,20 @@ jobs:
             tail -n 80 "$RUNNER_TEMP/bwrap-build.log" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
-          sudo ninja -C "$bwrap_source/build" install
+          if ! sudo ninja -C "$bwrap_source/build" install > "$RUNNER_TEMP/bwrap-install.log" 2>&1; then
+            { printf '%s\n' 'ninja install failed'; tail -n 8 "$RUNNER_TEMP/bwrap-install.log"; } | grep -aviE 'api[_-]?key|authorization|bearer |sk-[a-z0-9]{8}|ghp_[a-z0-9]|gho_[a-z0-9]|password|private key' | head -n 9 | while IFS= read -r line; do printf '::error title=bwrap install::%s\n' "$line"; done
+            exit 1
+          fi
           version="$(bwrap --version)"
           printf 'bwrap version: %s\n' "$version" >> "$GITHUB_STEP_SUMMARY"
-          [ "$version" = "bubblewrap 0.10.0" ]
-          E2E.d/ci/orchestration.sh __bubblewrap-fd-probe
+          if [ "$version" != "bubblewrap 0.10.0" ]; then
+            printf '::error title=bwrap version::got %s\n' "$version"
+            exit 1
+          fi
+          if ! E2E.d/ci/orchestration.sh __bubblewrap-fd-probe > "$RUNNER_TEMP/bwrap-probe.log" 2>&1; then
+            { printf '%s\n' 'fd probe failed'; tail -n 8 "$RUNNER_TEMP/bwrap-probe.log"; } | grep -aviE 'api[_-]?key|authorization|bearer |sk-[a-z0-9]{8}|ghp_[a-z0-9]|gho_[a-z0-9]|password|private key' | head -n 9 | while IFS= read -r line; do printf '::error title=bwrap probe::%s\n' "$line"; done
+            exit 1
+          fi
 
       - name: Set up Node for Chromium
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
