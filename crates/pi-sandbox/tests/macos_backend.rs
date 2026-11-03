@@ -45,10 +45,14 @@ mod macos_proof {
                 .prefix("pi-macos-backend-")
                 .tempdir()
                 .expect("create deterministic owned sandbox roots");
-            let workspace = root.path().join("workspace");
+            // Seatbelt policy roots must match their canonical form: /var/folders
+            // is a symlink to /private/var/folders, so declare the resolved path.
+            let root_path = std::fs::canonicalize(root.path())
+                .expect("canonical owned sandbox root");
+            let workspace = root_path.join("workspace");
             let protected = workspace.join("protected");
-            let agent = root.path().join("agent");
-            let session = root.path().join("session");
+            let agent = root_path.join("agent");
+            let session = root_path.join("session");
             for directory in [&workspace, &protected, &agent, &session] {
                 std::fs::create_dir(directory).expect("create owned sandbox directory");
             }
