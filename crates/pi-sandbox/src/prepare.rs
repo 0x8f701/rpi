@@ -617,7 +617,7 @@ impl MacosPreparedSpawn {
                     .map(|mount| mount.destination)
                     .collect(),
             })?;
-        let launcher_path = format!("/dev/fd/{}", launcher.as_raw_fd());
+        let launcher_path = "/usr/bin/sandbox-exec".to_owned();
         let argv = vec![
             CString::new(launcher_path).map_err(|_| SandboxError::InvalidChildProtocol {
                 failure: crate::ChildProtocolError::EmbeddedNul,
